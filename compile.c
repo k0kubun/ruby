@@ -692,7 +692,8 @@ rb_iseq_translate_threaded_code(rb_iseq_t *iseq)
 }
 
 #if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
-static int
+RUBY_SYMBOL_EXPORT_BEGIN
+int
 rb_vm_insn_addr2insn(const void *addr) /* cold path */
 {
     int insn;
@@ -705,6 +706,7 @@ rb_vm_insn_addr2insn(const void *addr) /* cold path */
     }
     rb_bug("rb_vm_insn_addr2insn: invalid insn address: %p", addr);
 }
+RUBY_SYMBOL_EXPORT_END
 #endif
 
 VALUE *
