@@ -1308,7 +1308,8 @@ rb_equal_opt(VALUE obj1, VALUE obj2)
 
 static VALUE vm_call0(rb_thread_t*, VALUE, ID, int, const VALUE*, const rb_callable_method_entry_t *);
 
-static VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 check_match(VALUE pattern, VALUE target, enum vm_check_match_type type)
 {
     switch (type) {
@@ -1333,6 +1334,7 @@ check_match(VALUE pattern, VALUE target, enum vm_check_match_type type)
 	rb_bug("check_match: unreachable");
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 
 #if defined(_MSC_VER) && _MSC_VER < 1300
