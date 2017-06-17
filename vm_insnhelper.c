@@ -394,7 +394,8 @@ svar_new(VALUE obj)
     return (struct vm_svar *)rb_imemo_new(imemo_svar, Qnil, Qnil, Qnil, obj);
 }
 
-static void
+RUBY_SYMBOL_EXPORT_BEGIN
+void
 lep_svar_set(rb_thread_t *th, const VALUE *lep, rb_num_t key, VALUE val)
 {
     struct vm_svar *svar = lep_svar(th, lep);
@@ -421,7 +422,7 @@ lep_svar_set(rb_thread_t *th, const VALUE *lep, rb_num_t key, VALUE val)
     }
 }
 
-static inline VALUE
+VALUE
 vm_getspecial(rb_thread_t *th, const VALUE *lep, rb_num_t key, rb_num_t type)
 {
     VALUE val;
@@ -456,6 +457,7 @@ vm_getspecial(rb_thread_t *th, const VALUE *lep, rb_num_t key, rb_num_t type)
     }
     return val;
 }
+RUBY_SYMBOL_EXPORT_END
 
 PUREFUNC(static rb_callable_method_entry_t *check_method_entry(VALUE obj, int can_be_svar));
 static rb_callable_method_entry_t *
