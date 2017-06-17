@@ -699,7 +699,8 @@ vm_cref_push(rb_thread_t *th, VALUE klass, const VALUE *ep, int pushed_by_eval)
     return vm_cref_new(klass, METHOD_VISI_PUBLIC, FALSE, prev_cref, pushed_by_eval);
 }
 
-static inline VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_get_cbase(const VALUE *ep)
 {
     const rb_cref_t *cref = rb_vm_get_cref(ep);
@@ -714,8 +715,10 @@ vm_get_cbase(const VALUE *ep)
 
     return klass;
 }
+RUBY_SYMBOL_EXPORT_END
 
-static inline VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_get_const_base(const VALUE *ep)
 {
     const rb_cref_t *cref = rb_vm_get_cref(ep);
@@ -731,6 +734,7 @@ vm_get_const_base(const VALUE *ep)
 
     return klass;
 }
+RUBY_SYMBOL_EXPORT_END
 
 static inline void
 vm_check_if_namespace(VALUE klass)
