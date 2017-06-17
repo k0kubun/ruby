@@ -2723,7 +2723,8 @@ check_respond_to_missing(VALUE obj, VALUE v)
     }
 }
 
-static VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_defined(rb_thread_t *th, rb_control_frame_t *reg_cfp, rb_num_t op_type, VALUE obj, VALUE needstr, VALUE v)
 {
     VALUE klass;
@@ -2833,3 +2834,4 @@ vm_defined(rb_thread_t *th, rb_control_frame_t *reg_cfp, rb_num_t op_type, VALUE
 	return Qnil;
     }
 }
+RUBY_SYMBOL_EXPORT_END
