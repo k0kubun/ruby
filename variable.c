@@ -787,12 +787,14 @@ rb_f_untrace_var(int argc, const VALUE *argv)
     return Qnil;
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 rb_gvar_get(struct rb_global_entry *entry)
 {
     struct rb_global_variable *var = entry->var;
     return (*var->getter)(entry->id, var->data, var);
 }
+RUBY_SYMBOL_EXPORT_END
 
 struct trace_data {
     struct trace_var *trace;
@@ -820,6 +822,7 @@ trace_en(struct rb_global_variable *var)
     return Qnil;		/* not reached */
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 rb_gvar_set(struct rb_global_entry *entry, VALUE val)
 {
@@ -836,6 +839,7 @@ rb_gvar_set(struct rb_global_entry *entry, VALUE val)
     }
     return val;
 }
+RUBY_SYMBOL_EXPORT_END
 
 VALUE
 rb_gv_set(const char *name, VALUE val)
