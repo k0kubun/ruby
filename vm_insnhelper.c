@@ -498,7 +498,8 @@ rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
     return check_method_entry(ep[VM_ENV_DATA_INDEX_ME_CREF], TRUE);
 }
 
-static rb_cref_t *
+RUBY_SYMBOL_EXPORT_BEGIN
+rb_cref_t *
 method_entry_cref(rb_callable_method_entry_t *me)
 {
     switch (me->def->type) {
@@ -508,6 +509,7 @@ method_entry_cref(rb_callable_method_entry_t *me)
 	return NULL;
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 #if VM_CHECK_MODE == 0
 PUREFUNC(static rb_cref_t *check_cref(VALUE, int));
@@ -631,7 +633,8 @@ vm_cref_replace_with_duplicated_cref(const VALUE *ep)
 }
 
 
-static rb_cref_t *
+RUBY_SYMBOL_EXPORT_BEGIN
+rb_cref_t *
 rb_vm_get_cref(const VALUE *ep)
 {
     rb_cref_t *cref = vm_env_cref(ep);
@@ -643,6 +646,7 @@ rb_vm_get_cref(const VALUE *ep)
 	rb_bug("rb_vm_get_cref: unreachable");
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 static const rb_cref_t *
 vm_get_const_key_cref(const VALUE *ep)
@@ -836,7 +840,8 @@ vm_get_ev_const(rb_thread_t *th, VALUE orig_klass, ID id, int is_defined)
     }
 }
 
-static inline VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_get_cvar_base(const rb_cref_t *cref, rb_control_frame_t *cfp)
 {
     VALUE klass;
@@ -861,6 +866,7 @@ vm_get_cvar_base(const rb_cref_t *cref, rb_control_frame_t *cfp)
     }
     return klass;
 }
+RUBY_SYMBOL_EXPORT_END
 
 static VALUE
 vm_search_const_defined_class(const VALUE cbase, ID id)
