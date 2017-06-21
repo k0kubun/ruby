@@ -251,11 +251,13 @@ vm_pop_frame(rb_thread_t *th, rb_control_frame_t *cfp, const VALUE *ep)
     return flags & VM_FRAME_FLAG_FINISH;
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 void
 rb_vm_pop_frame(rb_thread_t *th)
 {
     vm_pop_frame(th, th->cfp, th->cfp->ep);
 }
+RUBY_SYMBOL_EXPORT_END
 
 /* method dispatch */
 static inline VALUE
