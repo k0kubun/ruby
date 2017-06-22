@@ -307,11 +307,13 @@ vm_env_write(const VALUE *ep, int index, VALUE v)
     }
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 void
 rb_vm_env_write(const VALUE *ep, int index, VALUE v)
 {
     vm_env_write(ep, index, v);
 }
+RUBY_SYMBOL_EXPORT_END
 
 
 /* svar */
