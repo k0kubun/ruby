@@ -768,7 +768,8 @@ vm_get_iclass(rb_control_frame_t *cfp, VALUE klass)
     return klass;
 }
 
-static inline VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_get_ev_const(rb_thread_t *th, VALUE orig_klass, ID id, int is_defined)
 {
     void rb_const_warn_if_deprecated(const rb_const_entry_t *ce, VALUE klass, ID id);
@@ -846,7 +847,6 @@ vm_get_ev_const(rb_thread_t *th, VALUE orig_klass, ID id, int is_defined)
     }
 }
 
-RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 vm_get_cvar_base(const rb_cref_t *cref, rb_control_frame_t *cfp)
 {
