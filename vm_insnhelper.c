@@ -1232,7 +1232,8 @@ vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
 
 static VALUE vm_call_general(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
 
-static void
+RUBY_SYMBOL_EXPORT_BEGIN
+void
 vm_search_method(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE recv)
 {
     VALUE klass = CLASS_OF(recv);
@@ -1253,6 +1254,7 @@ vm_search_method(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE 
     cc->class_serial = RCLASS_SERIAL(klass);
 #endif
 }
+RUBY_SYMBOL_EXPORT_END
 
 static inline int
 check_cfunc(const rb_callable_method_entry_t *me, VALUE (*func)())
