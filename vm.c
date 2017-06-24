@@ -312,8 +312,8 @@ VALUE ruby_vm_const_missing_count = 0;
 RUBY_SYMBOL_EXPORT_BEGIN
 rb_thread_t *ruby_current_thread = 0;
 rb_vm_t *ruby_current_vm = 0;
-RUBY_SYMBOL_EXPORT_END
 rb_event_flag_t ruby_vm_event_flags;
+RUBY_SYMBOL_EXPORT_END
 
 static void thread_free(void *ptr);
 
