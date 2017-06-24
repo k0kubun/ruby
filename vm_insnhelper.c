@@ -1151,7 +1151,8 @@ vm_throw_start(rb_thread_t *const th, rb_control_frame_t *const reg_cfp, enum ru
     return (VALUE)THROW_DATA_NEW(throwobj, escape_cfp, state);
 }
 
-static VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_throw(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 	 rb_num_t throw_state, VALUE throwobj)
 {
@@ -1166,6 +1167,7 @@ vm_throw(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 	return vm_throw_continue(th, throwobj);
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 static inline void
 vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
