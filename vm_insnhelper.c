@@ -2358,7 +2358,8 @@ vm_super_outside(void)
     rb_raise(rb_eNoMethodError, "super called outside of method");
 }
 
-static void
+RUBY_SYMBOL_EXPORT_BEGIN
+void
 vm_search_super_method(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 		       struct rb_calling_info *calling, struct rb_call_info *ci, struct rb_call_cache *cc)
 {
@@ -2410,6 +2411,7 @@ vm_search_super_method(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 	CI_SET_FASTPATH(cc, vm_call_super_method, 1);
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 /* yield */
 
