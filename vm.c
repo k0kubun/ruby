@@ -313,6 +313,7 @@ RUBY_SYMBOL_EXPORT_BEGIN
 rb_thread_t *ruby_current_thread = 0;
 rb_vm_t *ruby_current_vm = 0;
 rb_event_flag_t ruby_vm_event_flags;
+VALUE vm_exec(rb_thread_t *th);
 RUBY_SYMBOL_EXPORT_END
 
 static void thread_free(void *ptr);
@@ -1714,7 +1715,7 @@ hook_before_rewind(rb_thread_t *th, rb_control_frame_t *cfp, int will_finish_vm_
   };
  */
 
-static VALUE
+VALUE
 vm_exec(rb_thread_t *th)
 {
     int state;
