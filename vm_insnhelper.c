@@ -2646,7 +2646,8 @@ vm_proc_to_block_handler(VALUE procval)
     return Qundef;
 }
 
-static VALUE
+RUBY_SYMBOL_EXPORT_BEGIN
+VALUE
 vm_invoke_block(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci)
 {
     VALUE block_handler = VM_CF_BLOCK_HANDLER(reg_cfp);
@@ -2680,6 +2681,7 @@ vm_invoke_block(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb_calling_
     VM_UNREACHABLE(vm_invoke_block: unreachable);
     return Qnil;
 }
+RUBY_SYMBOL_EXPORT_END
 
 static VALUE
 vm_make_proc_with_iseq(const rb_iseq_t *blockiseq)
