@@ -2101,6 +2101,7 @@ rb_hash_values(VALUE hash)
  *  See also Enumerable#include?
  */
 
+RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 rb_hash_has_key(VALUE hash, VALUE key)
 {
@@ -2111,6 +2112,7 @@ rb_hash_has_key(VALUE hash, VALUE key)
     }
     return Qfalse;
 }
+RUBY_SYMBOL_EXPORT_END
 
 static int
 rb_hash_search_value(VALUE key, VALUE value, VALUE arg)
