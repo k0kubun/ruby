@@ -2016,6 +2016,7 @@ threadptr_get_interrupts(rb_thread_t *th)
     return interrupt & (rb_atomic_t)~th->interrupt_mask;
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 void
 rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 {
@@ -2088,6 +2089,7 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 	}
     }
 }
+RUBY_SYMBOL_EXPORT_END
 
 void
 rb_thread_execute_interrupts(VALUE thval)
