@@ -490,6 +490,7 @@ check_method_entry(VALUE obj, int can_be_svar)
     }
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 {
@@ -504,7 +505,6 @@ rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
     return check_method_entry(ep[VM_ENV_DATA_INDEX_ME_CREF], TRUE);
 }
 
-RUBY_SYMBOL_EXPORT_BEGIN
 rb_cref_t *
 method_entry_cref(rb_callable_method_entry_t *me)
 {
