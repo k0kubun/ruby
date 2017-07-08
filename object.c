@@ -196,12 +196,14 @@ rb_obj_not(VALUE obj)
  *  Returns true if two objects are not-equal, otherwise false.
  */
 
+RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 rb_obj_not_equal(VALUE obj1, VALUE obj2)
 {
     VALUE result = rb_funcall(obj1, id_eq, 1, obj2);
     return RTEST(result) ? Qfalse : Qtrue;
 }
+RUBY_SYMBOL_EXPORT_END
 
 VALUE
 rb_class_real(VALUE cl)
