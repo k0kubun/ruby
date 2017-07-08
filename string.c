@@ -9620,11 +9620,13 @@ rb_str_quote_unprintable(VALUE str)
     return str;
 }
 
+RUBY_SYMBOL_EXPORT_BEGIN
 VALUE
 rb_id_quote_unprintable(ID id)
 {
     return rb_str_quote_unprintable(rb_id2str(id));
 }
+RUBY_SYMBOL_EXPORT_END
 
 /*
  *  call-seq:
