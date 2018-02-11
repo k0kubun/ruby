@@ -17,9 +17,6 @@
 % #
 % expand_simple_macros = lambda do |arg_expr|
 %   arg_expr.dup.tap do |expr|
-%     # For `opt_xxx`'s fallbacks.
-%     expr.gsub!(/\bDISPATCH_ORIGINAL_INSN\([^)]+\);/, 'return Qundef; /* cancel JIT */')
-%
 %     # For `leave`. We can't proceed next ISeq in the same JIT function.
 %     expr.gsub!(/^(?<indent>\s*)RESTORE_REGS\(\);\n/) do
 %       indent = Regexp.last_match[:indent]
@@ -32,6 +29,19 @@
 %         #endif
 %       RESTORE_REGS
 %     end
+%
+%     # reg_cfp->sp
+%     expr.gsub!(/\bGET_SP\(\)/, '(stack + stack_size)')
+%
+%     # #define STACK_ADDR_FROM_TOP(n) (GET_SP()-(n))
+%     expr.gsub!(/\bSTACK_ADDR_FROM_TOP\((?<num>[^)]+)\)/) do
+%       "stack + (stack_size - (#{Regexp.last_match[:num]}))"
+%     end
+%
+%     # #define TOPN(n) (*(GET_SP()-(n)-1))
+%     expr.gsub!(/\bTOPN\((?<num>[^)]+)\)/) do
+%       "*(stack + (stack_size - (#{Regexp.last_match[:num]}) - 1))"
+%     end
 %   end
 % end
 %
@@ -42,7 +52,8 @@
 %   #
 %   # Expand dynamic macro here (only JUMP for now)
 %   #
-%   if line =~ /\A\s+JUMP\((?<dest>[^)]+)\);\s+\z/
+%   case line
+%   when /\A\s+JUMP\((?<dest>[^)]+)\);\s+\z/
 %     dest = Regexp.last_match[:dest]
 %
 %     if insn.name == 'opt_case_dispatch' # special case... TODO: use another macro to avoid checking name
@@ -68,6 +79,10 @@
         next_pos = pos + insn_len(insn) + (unsigned int)<%= dest %>;
         fprintf(f, "            goto label_%d;\n", next_pos);
 %     end
+%   when /\A\s+DISPATCH_ORIGINAL_INSN\([^)]+\);\s+\z/
+%     # For `opt_xxx`'s fallbacks.
+        fprintf(f, "            reg_cfp->sp = (VALUE *)reg_cfp->bp + %d;\n", b->stack_size + 1);
+        fprintf(f, "            goto cancel;\n");
 %   else
         fprintf(f, <%= to_cstr.call(line) %>);
 %   end
