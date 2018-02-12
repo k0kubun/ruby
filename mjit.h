@@ -59,7 +59,7 @@ extern void mjit_add_iseq_to_process(const rb_iseq_t *iseq);
 extern mjit_func_t mjit_get_iseq_func(const struct rb_iseq_constant_body *body);
 RUBY_SYMBOL_EXPORT_END
 
-extern int mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *funcname);
+extern int mjit_compile(FILE *f, struct rb_iseq_constant_body *body, const char *funcname);
 extern void mjit_init(struct mjit_options *opts);
 extern void mjit_finish(void);
 extern void mjit_gc_start_hook(void);
@@ -71,6 +71,7 @@ extern void mjit_cont_free(struct mjit_cont *cont);
 extern void mjit_add_class_serial(rb_serial_t class_serial);
 extern void mjit_remove_class_serial(rb_serial_t class_serial);
 extern int mjit_valid_class_serial_p(rb_serial_t class_serial);
+extern void mjit_preserve_stack(void);
 
 /* A threshold used to reject long iseqs from JITting as such iseqs
    takes too much time to be compiled.  */

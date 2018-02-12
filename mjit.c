@@ -1436,3 +1436,67 @@ mjit_valid_class_serial_p(rb_serial_t class_serial)
     CRITICAL_SECTION_FINISH(3, "in valid_class_serial_p");
     return found_p;
 }
+
+/* All `sp`s from base_cfp to top_cfp are increased by `size`. */
+static void
+mjit_extend_stack(const rb_control_frame_t *base_cfp, const rb_control_frame_t *top_cfp, unsigned int size)
+{
+    rb_control_frame_t *cfp;
+    if (size == 0)
+        return;
+
+    for (cfp = (rb_control_frame_t *)RUBY_VM_NEXT_CONTROL_FRAME(base_cfp); cfp >= top_cfp; cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
+        const VALUE *prev_ep;
+        cfp->sp += size;
+        cfp->bp += size;
+
+        /* If `VM_ENV_PREV_EP(cfp->ep)` will be moved, its pointer should be updated. */
+        if (VM_ENV_LOCAL_P(cfp->ep) == 0 /* have previous ep */
+            && !VM_ENV_ESCAPED_P(prev_ep = VM_ENV_PREV_EP(cfp->ep)) /* prev_ep is in not heap but VM stack */
+            && base_cfp->bp < prev_ep /* extended range includes prev_ep  */) {
+            VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_SPECVAL], VM_GUARDED_PREV_EP(prev_ep + size));
+        }
+
+        if (!VM_ENV_ESCAPED_P(cfp->ep)) { /* cfp->ep will be moved */
+            cfp->ep += size;
+        }
+    }
+    memmove(base_cfp->sp + size, base_cfp->sp, sizeof(VALUE) * (top_cfp->sp - base_cfp->sp));
+}
+
+/* Preserve JIT's function-local variables to VM's value stack, which are going to be
+   expired by ruby_longjmp(), and restore cfp->sp. */
+MJIT_FUNC_EXPORTED void
+mjit_preserve_stack(void)
+{
+    const rb_iseq_t *iseq;
+    ptrdiff_t i, size;
+    rb_control_frame_t *cfp;
+    const rb_control_frame_t *end_cfp;
+    rb_execution_context_t *ec;
+
+    if (!mjit_init_p)
+        return;
+    ec = GET_EC();
+    if (ec->vm_stack == NULL)
+        return;
+
+    end_cfp = RUBY_VM_END_CONTROL_FRAME(ec);
+    size = end_cfp - ec->cfp;
+    for (i = 0, cfp = (rb_control_frame_t *)end_cfp - 1; i < size; i++, cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
+        if (cfp->pc && (iseq = cfp->iseq) != NULL
+            && imemo_type((VALUE)iseq) == imemo_iseq
+            && cfp->jit_stack != NULL && iseq->body->pc_sp_offsets != NULL) {
+            unsigned int i, stack_size = iseq->body->pc_sp_offsets[cfp->pc - iseq->body->iseq_encoded];
+            if (stack_size == 0)
+                continue;
+
+            if (cfp != ec->cfp) /* if it's not the top frame, higher stacks should be moved */
+                mjit_extend_stack(cfp, ec->cfp, (cfp->ep + 1 + stack_size) - cfp->sp);
+            cfp->sp = (VALUE *)cfp->ep + 1;
+            for (i = 0; i < stack_size; i++) {
+                *(cfp->sp++) = cfp->jit_stack[i];
+            }
+        }
+    }
+}

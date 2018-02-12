@@ -20,6 +20,7 @@
 struct compile_status {
     int success; /* has TRUE if compilation has had no issue */
     int *compiled_for_pos; /* compiled_for_pos[pos] has TRUE if the pos is compiled */
+    unsigned int *pc_sp_offsets;
 };
 
 /* Storage to keep data which is consistent in each conditional branch.
@@ -165,11 +166,12 @@ compile_cancel_handler(FILE *f, const struct rb_iseq_constant_body *body)
 
 /* Compile ISeq to C code in F.  It returns 1 if it succeeds to compile. */
 int
-mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *funcname)
+mjit_compile(FILE *f, struct rb_iseq_constant_body *body, const char *funcname)
 {
     struct compile_status status;
     status.success = TRUE;
     status.compiled_for_pos = ZALLOC_N(int, body->iseq_size);
+    status.pc_sp_offsets = ZALLOC_N(unsigned int, body->iseq_size + 1); /* +1 for final next_pos */
 
 #ifdef _WIN32
     fprintf(f, "__declspec(dllexport)\n");
@@ -203,6 +205,12 @@ mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *func
     compile_cancel_handler(f, body);
     fprintf(f, "\n} /* end of %s */\n", funcname);
 
+    if (status.success) {
+        body->pc_sp_offsets = status.pc_sp_offsets;
+    }
+    else {
+        xfree(status.pc_sp_offsets);
+    }
     xfree(status.compiled_for_pos);
     return status.success;
 }
