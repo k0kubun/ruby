@@ -423,6 +423,7 @@ struct rb_iseq_constant_body {
     VALUE (*jit_func)(struct rb_execution_context_struct *,
                       struct rb_control_frame_struct *); /* function pointer for loaded native code */
     long unsigned total_calls; /* number of total calls with `mjit_exec()` */
+    unsigned int *pc_sp_offsets; /* `iseq_size` buffer, which has pc offset in sp offset index. */
     struct rb_mjit_unit *jit_unit;
 };
 
@@ -689,9 +690,10 @@ typedef struct rb_control_frame_struct {
     const VALUE *ep;		/* cfp[4] / block[1] */
     const void *block_code;     /* cfp[5] / block[2] */ /* iseq or ifunc */
     const VALUE *bp;		/* cfp[6] */
+    VALUE *jit_stack;           /* cfp[7] */ /* local variables in jit_func */
 
 #if VM_DEBUG_BP_CHECK
-    VALUE *bp_check;		/* cfp[7] */
+    VALUE *bp_check;            /* cfp[8] */
 #endif
 } rb_control_frame_t;
 

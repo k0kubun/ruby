@@ -453,7 +453,7 @@ expandarray
 (...)
 // attr rb_snum_t sp_inc = num - 1 + (flag & 1 ? 1 : 0);
 {
-    vm_expandarray(GET_CFP(), ary, num, (int)flag);
+    vm_expandarray(GET_SP(), ary, num, (int)flag);
 }
 
 /* concat two arrays */
