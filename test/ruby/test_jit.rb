@@ -131,7 +131,15 @@ class TestJIT < Test::Unit::TestCase
     assert_compile_once('/#{true}/ =~ "true"', result_inspect: '0')
   end
 
-  def test_compile_insn_intern_newarray_duparray
+  def test_compile_insn_newarray
+    assert_compile_once("#{<<~"begin;"}\n#{<<~"end;"}", result_inspect: '[1, 2, 3]')
+    begin;
+      a, b, c = 1, 2, 3
+      [a, b, c]
+    end;
+  end
+
+  def test_compile_insn_intern_duparray
     assert_compile_once('[:"#{0}"] + [1,2,3]', result_inspect: '[:"0", 1, 2, 3]')
   end
 
