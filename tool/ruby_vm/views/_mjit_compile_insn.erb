@@ -21,7 +21,7 @@
 % end
 %
 % # JIT: Declare stack_size to be used in some macro of _mjit_compile_insn_body.erb
-        if (status->local_stack_p) {
+        if (status->stack_opt >= STACK_OPT_ARRAY_LVAR) {
             fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = %u;\n", b->stack_size);
         }
 %
@@ -53,7 +53,7 @@
 %
 % # JIT: Initialize popped values
 % insn.pops.reverse_each.with_index.reverse_each do |pop, i|
-        fprintf(f, "    <%= pop.fetch(:name) %> = stack[%d];\n", b->stack_size - <%= i + 1 %>);
+        fprintf(f, "    <%= pop.fetch(:name) %> = stack_ref(%d);\n", b->stack_size - <%= i + 1 %>);
 % end
 %
 % # JIT: move sp and pc if necessary
@@ -66,7 +66,7 @@
 % unless dispatched
 %   insn.rets.reverse_each.with_index do |ret, i|
 %     # TOPN(n) = ...
-        fprintf(f, "    stack[%d] = <%= ret.fetch(:name) %>;\n", b->stack_size + (int)<%= insn.call_attribute('sp_inc') %> - <%= i + 1 %>);
+        fprintf(f, "    stack_ref(%d) = <%= ret.fetch(:name) %>;\n", b->stack_size + (int)<%= insn.call_attribute('sp_inc') %> - <%= i + 1 %>);
 %   end
 % end
 %

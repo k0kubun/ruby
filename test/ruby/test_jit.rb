@@ -497,7 +497,7 @@ class TestJIT < Test::Unit::TestCase
       end
 
       # This method is simple enough to have false in catch_except_p.
-      # So local_stack_p would be true in JIT compiler.
+      # So stack_opt would be >= STACK_OPT_ARRAY_LVAR in JIT compiler.
       def a
         m = method(:b)
 

@@ -13,7 +13,7 @@
 % end
 %
 % # JIT: move sp to use or preserve stack variables
-        if (status->local_stack_p) {
+        if (status->stack_opt >= STACK_OPT_ARRAY_LVAR) {
 % # sp motion is optimized away for `handles_frame? #=> false` case.
 % # Thus sp should be set properly before `goto cancel`.
 % if insn.handles_frame?
@@ -24,7 +24,7 @@
                 rb_snum_t i, push_size;
                 push_size = -<%= insn.call_attribute('sp_inc') %> + <%= insn.rets.size %> - <%= insn.pops.size %>;
                 for (i = 0; i < push_size; i++) { /* TODO: use memcpy? */
-                    fprintf(f, "    *(reg_cfp->sp + %ld) = stack[%ld];\n", i - push_size, (rb_snum_t)b->stack_size - push_size + i);
+                    fprintf(f, "    *(reg_cfp->sp + %ld) = stack_ref(%ld);\n", i - push_size, (rb_snum_t)b->stack_size - push_size + i);
                 }
             }
 % end

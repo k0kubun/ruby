@@ -1,0 +1,29 @@
+%# -*- mode:c; style:ruby; coding: utf-8; indent-tabs-mode: nil -*-
+%# Copyright (c) 2018 Takashi Kokubun.  All rights reserved.
+%#
+%# This file is a part of  the programming language Ruby.  Permission is hereby
+%# granted, to either  redistribute and/or modify this file,  provided that the
+%# conditions mentioned  in the  file COPYING  are met.   Consult the  file for
+%# details.
+%#
+PUREFUNC(MAYBE_UNUSED(static int insn_stack_address_needed(int insn)));
+
+/* If insn requires address of stack pointer, this function returns TRUE. */
+static int
+insn_stack_address_needed(int insn)
+{
+    switch (insn) {
+% # This list is the same as mjit_compile.inc.erb
+% (RubyVM::BareInstructions.to_a + RubyVM::OperandsUnifications.to_a).each do |i|
+%   expr = i.expr.expr
+%   # TODO: opt_aset_with's `TOPN(0) =` should be ignored
+%   if expr.match(/\bGET_SP\(\)/) || expr.match(/\bSTACK_ADDR_FROM_TOP\(([^)]+)\)/) || expr.match(/TOPN\([^\)]+\) +=/) ||
+%     (expr.match(/TOPN\([^\)]+\)/) && !i.handles_frame?) # If handles_frame?, TOPN can be used normally.
+      case <%= i.bin %>:
+%   end
+% end
+        return TRUE;
+      default:
+        return FALSE;
+    }
+}

@@ -919,7 +919,8 @@ $(srcs_vpath)opt_sc.inc: $(srcdir)/tool/ruby_vm/views/opt_sc.inc.erb
 $(srcs_vpath)optinsn.inc: $(srcdir)/tool/ruby_vm/views/optinsn.inc.erb
 $(srcs_vpath)optunifs.inc: $(srcdir)/tool/ruby_vm/views/optunifs.inc.erb
 $(srcs_vpath)insns.inc: $(srcdir)/tool/ruby_vm/views/insns.inc.erb
-$(srcs_vpath)insns_info.inc: $(srcdir)/tool/ruby_vm/views/insns_info.inc.erb
+$(srcs_vpath)insns_info.inc: $(srcdir)/tool/ruby_vm/views/insns_info.inc.erb \
+  $(srcdir)/tool/ruby_vm/views/_insn_stack_address.erb
 $(srcs_vpath)vmtc.inc: $(srcdir)/tool/ruby_vm/views/vmtc.inc.erb
 $(srcs_vpath)vm.inc: $(srcdir)/tool/ruby_vm/views/vm.inc.erb
 $(srcs_vpath)mjit_compile.inc: $(srcdir)/tool/ruby_vm/views/mjit_compile.inc.erb \

@@ -14,15 +14,21 @@
 #include "insns_info.inc"
 #include "vm_insnhelper.h"
 
+enum stack_optimization_level {
+    STACK_OPT_CFP_SP = 0,     /* Use cfp->sp normally. The slowest. */
+    STACK_OPT_ARRAY_LVAR = 1, /* Use an array local variable. Faster. */
+    STACK_OPT_LVARS = 2       /* Use independent local variables. The fastest. */
+};
+
 /* Storage to keep compiler's status.  This should have information
    which is global during one `mjit_compile` call.  Ones conditional
    in each branch should be stored in `compile_branch`.  */
 struct compile_status {
     int success; /* has TRUE if compilation has had no issue */
     int *compiled_for_pos; /* compiled_for_pos[pos] has TRUE if the pos is compiled */
-    /* If TRUE, JIT-ed code will use local variables to store pushed values instead of
-       using VM's stack and moving stack pointer. */
-    int local_stack_p;
+    /* If stack_opt >= STACK_OPT_ARRAY_LVAR, JIT-ed code will use local variables to store
+       pushed values instead of using VM's stack and moving stack pointer. */
+    enum stack_optimization_level stack_opt;
 };
 
 /* Storage to keep data which is consistent in each conditional branch.
@@ -154,15 +160,44 @@ compile_insns(FILE *f, const struct rb_iseq_constant_body *body, unsigned int st
     }
 }
 
+/* Judge how we can optimize stack for this ISeq. */
+static enum stack_optimization_level
+decide_stack_optimization_level(const struct rb_iseq_constant_body *body)
+{
+    int insn;
+    unsigned int pos = 0;
+
+    if (body->catch_except_p) {
+        /* Even after JIT-ed frame is thrown away by longjmp, stack values should be available
+           when its ISeq is executed from exception handler. */
+        return STACK_OPT_CFP_SP;
+    }
+
+    while (pos < body->iseq_size) {
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+        insn = rb_vm_insn_addr2insn((void *)body->iseq_encoded[pos]);
+#else
+        insn = (int)body->iseq_encoded[pos];
+#endif
+        if (insn_stack_address_needed(insn)) {
+            /* If insn depends on the values are in an array, we can't split values into
+               independent variables. */
+            return STACK_OPT_ARRAY_LVAR;
+        }
+        pos += insn_len(insn);
+    }
+    return STACK_OPT_LVARS;
+}
+
 /* Print the block to cancel JIT execution. */
 static void
 compile_cancel_handler(FILE *f, const struct rb_iseq_constant_body *body, struct compile_status *status)
 {
     unsigned int i;
     fprintf(f, "\ncancel:\n");
-    if (status->local_stack_p) {
+    if (status->stack_opt >= STACK_OPT_ARRAY_LVAR) {
         for (i = 0; i < body->stack_max; i++) {
-            fprintf(f, "    *((VALUE *)reg_cfp->bp + %d) = stack[%d];\n", i + 1, i);
+            fprintf(f, "    *((VALUE *)reg_cfp->bp + %d) = stack_ref(%d);\n", i + 1, i);
         }
     }
     fprintf(f, "    return Qundef;\n");
@@ -175,17 +210,30 @@ mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *func
     struct compile_status status;
     status.success = TRUE;
     status.compiled_for_pos = ZALLOC_N(int, body->iseq_size);
-    status.local_stack_p = !body->catch_except_p;
+    status.stack_opt = decide_stack_optimization_level(body);
 
 #ifdef _WIN32
     fprintf(f, "__declspec(dllexport)\n");
 #endif
     fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
-    if (status.local_stack_p) {
-        fprintf(f, "    VALUE stack[%d];\n", body->stack_max);
-    }
-    else {
+    switch (status.stack_opt) {
+      case STACK_OPT_CFP_SP:
         fprintf(f, "    VALUE *stack = reg_cfp->sp;\n");
+        fprintf(f, "#define stack_ref(i) stack[i]\n");
+        break;
+      case STACK_OPT_ARRAY_LVAR:
+        fprintf(f, "    VALUE stack[%d];\n", body->stack_max);
+        fprintf(f, "#define stack_ref(i) stack[i]\n");
+        break;
+      case STACK_OPT_LVARS:
+        {
+            unsigned int i;
+            for (i = 0; i < body->stack_max; i++) {
+                fprintf(f, "    VALUE stack%d;\n", i);
+            }
+            fprintf(f, "#define stack_ref(i) stack##i\n");
+        }
+        break;
     }
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n",
             (VALUE)body->iseq_encoded);

@@ -24,7 +24,7 @@
 
             fprintf(f, "{\n");
 % # JIT: Declare stack_size to be used in some macro of _mjit_compile_insn_body.erb
-            if (status->local_stack_p) {
+            if (status->stack_opt >= STACK_OPT_ARRAY_LVAR) {
                 fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = %u;\n", b->stack_size);
             }
 
@@ -33,7 +33,7 @@
 
 % # JIT: Invalidate call cache if it requires vm_search_method. This allows to inline some of following things.
             fprintf(f, "    if (UNLIKELY(GET_GLOBAL_METHOD_STATE() != %"PRI_SERIALT_PREFIX"u ||\n", cc->method_state);
-            fprintf(f, "        RCLASS_SERIAL(CLASS_OF(stack[%d])) != %"PRI_SERIALT_PREFIX"u)) {\n", b->stack_size - 1 - argc, cc->class_serial);
+            fprintf(f, "        RCLASS_SERIAL(CLASS_OF(stack_ref(%d))) != %"PRI_SERIALT_PREFIX"u)) {\n", b->stack_size - 1 - argc, cc->class_serial);
             fprintf(f, "        reg_cfp->pc = original_body_iseq + %d;\n", pos);
             fprintf(f, "        goto cancel;\n");
             fprintf(f, "    }\n");
@@ -47,7 +47,7 @@
             fprintf(f, "        calling.block_handler = VM_BLOCK_HANDLER_NONE;\n");
 % end
             fprintf(f, "        calling.argc = %d;\n", ci->orig_argc);
-            fprintf(f, "        calling.recv = stack[%d];\n", b->stack_size - 1 - argc);
+            fprintf(f, "        calling.recv = stack_ref(%d);\n", b->stack_size - 1 - argc);
 
 % # JIT: Special CALL_METHOD. Inline vm_call_iseq_setup_normal for vm_call_iseq_setup_func FASTPATH. TODO: modify VM to share code with here
             fprintf(f, "        {\n");
@@ -67,7 +67,7 @@
                 fprintf(f, "                v = vm_exec(ec, FALSE);\n");
                 fprintf(f, "            }\n");
             }
-            fprintf(f, "            stack[%d] = v;\n", b->stack_size - argc - 1);
+            fprintf(f, "            stack_ref(%d) = v;\n", b->stack_size - argc - 1);
             fprintf(f, "        }\n");
 
             fprintf(f, "    }\n");
