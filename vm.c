@@ -2873,6 +2873,10 @@ Init_VM(void)
     /* RubyVM::MJIT */
     mjit = rb_define_module_under(rb_cRubyVM, "MJIT");
     rb_define_singleton_method(mjit, "enabled?", mjit_enabled_p, 0);
+    {
+        extern VALUE mjit_stop(void);
+        rb_define_singleton_method(mjit, "stop", mjit_stop, 0);
+    }
 
     /*
      * Document-class: Thread
