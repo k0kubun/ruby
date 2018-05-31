@@ -227,6 +227,35 @@ mjit_compile_body(FILE *f, const struct rb_iseq_constant_body *body, const struc
     return status.success;
 }
 
+/* Very experimental broken implementation which can generate a function with the duplicated `pos` */
+static int
+precompile_yielded_iseqs(FILE *f, const struct rb_iseq_constant_body *body, const struct rb_iseq_constant_body *yielded_iseq, const struct rb_iseq_constant_body **yielded_iseq_for_pos)
+{
+    int result = TRUE;
+    unsigned int pos = 0;
+    int insn;
+
+    while (pos < body->iseq_size) {
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+        insn = rb_vm_insn_addr2insn((void *)body->iseq_encoded[pos]);
+#else
+        insn = (int)body->iseq_encoded[pos];
+#endif
+
+        if (insn == BIN(invokeblock)) {
+            yielded_iseq_for_pos[pos] = yielded_iseq;
+
+            fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_yielded_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp));\n", pos);
+            fprintf(f, "static inline VALUE\n_mjit_yielded_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", pos);
+            result &= mjit_compile_body(f, yielded_iseq, NULL);
+            fprintf(f, "\n} /* end of _mjit_yielded_%d */\n\n", pos);
+        }
+        pos += insn_len(insn);
+    }
+
+    return result;
+}
+
 /* Compile inlinable ISeqs to C code in F.  It returns 1 if it succeeds to compile them. */
 static int
 precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, const struct rb_iseq_constant_body **iseq_for_pos)
@@ -250,13 +279,21 @@ precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, co
             if (has_valid_method_type(cc)
                 && cc->me->def->type == VM_METHOD_TYPE_ISEQ
                 && inlinable_iseq_p(ci, cc, iseq = rb_iseq_check(cc->me->def->body.iseq.iseqptr))) {
+                ISEQ blockiseq;
+                const struct rb_iseq_constant_body **yielded_iseq_for_pos = ZALLOC_N(const struct rb_iseq_constant_body *, iseq->body->iseq_size);
+
+                if (insn == BIN(send) && !(ci->flag & VM_CALL_ARGS_BLOCKARG) && (blockiseq = (ISEQ)body->iseq_encoded[pos + 3]) != NULL) {
+                    precompile_yielded_iseqs(f, iseq->body, blockiseq->body, yielded_iseq_for_pos);
+                }
 
                 iseq_for_pos[pos] = iseq->body;
 
                 fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp));\n", pos);
                 fprintf(f, "static inline VALUE\n_mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", pos);
-                result &= mjit_compile_body(f, iseq->body, NULL);
+                result &= mjit_compile_body(f, iseq->body, yielded_iseq_for_pos);
                 fprintf(f, "\n} /* end of _mjit_inlined_%d */\n\n", pos);
+
+                xfree(yielded_iseq_for_pos);
             }
         }
         pos += insn_len(insn);
@@ -289,5 +326,6 @@ mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *func
     result &= mjit_compile_body(f, body, iseq_for_pos);
     fprintf(f, "\n} /* end of %s */\n", funcname);
 
+    xfree(iseq_for_pos);
     return result;
 }
