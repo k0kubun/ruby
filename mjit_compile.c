@@ -27,6 +27,8 @@ struct compile_status {
     /* If TRUE, JIT-ed code will use local variables to store pushed values instead of
        using VM's stack and moving stack pointer. */
     int local_stack_p;
+    /* If `iseq_for_pos[pos]` is not NULL, `mjit_compile_body` tries to inline ISeq there. */
+    const struct rb_iseq_constant_body **iseq_for_pos;
 };
 
 /* Storage to keep data which is consistent in each conditional branch.
@@ -119,7 +121,7 @@ compile_insn(FILE *f, const struct rb_iseq_constant_body *body, const int insn, 
     unsigned int next_pos = pos + insn_len(insn);
 
 /*****************/
- #include "mjit_compile.inc"
+#include "mjit_compile.inc"
 /*****************/
 
     /* If next_pos is already compiled and this branch is not finished yet,
@@ -185,26 +187,16 @@ compile_cancel_handler(FILE *f, const struct rb_iseq_constant_body *body, struct
     fprintf(f, "    return Qundef;\n");
 }
 
-/* Compile ISeq to C code in F.  It returns 1 if it succeeds to compile. */
-int
-mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *funcname)
+static int
+mjit_compile_body(FILE *f, const struct rb_iseq_constant_body *body, const struct rb_iseq_constant_body **iseq_for_pos)
 {
     struct compile_status status;
     status.success = TRUE;
     status.local_stack_p = !body->catch_except_p;
     status.stack_size_for_pos = ALLOC_N(int, body->iseq_size);
+    status.iseq_for_pos = iseq_for_pos;
     memset(status.stack_size_for_pos, NOT_COMPILED_STACK_SIZE, sizeof(int) * body->iseq_size);
 
-    /* For performance, we verify stack size only on compilation time (mjit_compile.inc.erb) without --jit-debug */
-    if (!mjit_opts.debug) {
-        fprintf(f, "#undef OPT_CHECKED_RUN\n");
-        fprintf(f, "#define OPT_CHECKED_RUN 0\n\n");
-    }
-
-#ifdef _WIN32
-    fprintf(f, "__declspec(dllexport)\n");
-#endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
     if (status.local_stack_p) {
         fprintf(f, "    VALUE stack[%d];\n", body->stack_max);
     }
@@ -230,8 +222,72 @@ mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *func
 
     compile_insns(f, body, 0, 0, &status);
     compile_cancel_handler(f, body, &status);
-    fprintf(f, "\n} /* end of %s */\n", funcname);
 
     xfree(status.stack_size_for_pos);
     return status.success;
+}
+
+/* Compile inlinable ISeqs to C code in F.  It returns 1 if it succeeds to compile them. */
+static int
+precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, const struct rb_iseq_constant_body **iseq_for_pos)
+{
+    int result = TRUE;
+    unsigned int pos = 0;
+    int insn;
+
+    while (pos < body->iseq_size) {
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+        insn = rb_vm_insn_addr2insn((void *)body->iseq_encoded[pos]);
+#else
+        insn = (int)body->iseq_encoded[pos];
+#endif
+
+        if (insn == BIN(opt_send_without_block) || insn == BIN(send)) {
+            const rb_iseq_t *iseq;
+            CALL_INFO ci = (CALL_INFO)body->iseq_encoded[pos + 1];
+            CALL_CACHE cc = (CALL_CACHE)body->iseq_encoded[pos + 2];
+
+            if (has_valid_method_type(cc)
+                && cc->me->def->type == VM_METHOD_TYPE_ISEQ
+                && inlinable_iseq_p(ci, cc, iseq = rb_iseq_check(cc->me->def->body.iseq.iseqptr))) {
+
+                iseq_for_pos[pos] = iseq->body;
+
+                fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp));\n", pos);
+                fprintf(f, "static inline VALUE\n_mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", pos);
+                result &= mjit_compile_body(f, iseq->body, NULL);
+                fprintf(f, "\n} /* end of _mjit_inlined_%d */\n\n", pos);
+            }
+        }
+        pos += insn_len(insn);
+    }
+
+    return result;
+}
+
+/* Compile ISeq to C code in F.  It returns 1 if it succeeds to compile. */
+int
+mjit_compile(FILE *f, const struct rb_iseq_constant_body *body, const char *funcname)
+{
+    int result;
+    const struct rb_iseq_constant_body **iseq_for_pos = ZALLOC_N(const struct rb_iseq_constant_body *, body->iseq_size);
+
+    /* For performance, we verify stack size only on compilation time (mjit_compile.inc.erb) without --jit-debug */
+    if (!mjit_opts.debug) {
+        fprintf(f, "#undef OPT_CHECKED_RUN\n");
+        fprintf(f, "#define OPT_CHECKED_RUN 0\n\n");
+    }
+
+    /* Precompile inlinable ISeqs */
+    result = precompile_inlinable_iseqs(f, body, iseq_for_pos);
+
+    /* Compile main function */
+#ifdef _WIN32
+    fprintf(f, "__declspec(dllexport)\n");
+#endif
+    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+    result &= mjit_compile_body(f, body, iseq_for_pos);
+    fprintf(f, "\n} /* end of %s */\n", funcname);
+
+    return result;
 }
