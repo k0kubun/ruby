@@ -164,7 +164,7 @@ enum vm_regan_acttype {
 #endif
 
 #define CALL_METHOD(calling, ci, cc) do { \
-    VALUE v = (*(cc)->call)(ec, GET_CFP(), (calling), (ci), (cc)); \
+    VALUE v = (*(cc)->call_body)(ec, GET_CFP(), (calling), (ci), (cc)); \
     if (v == Qundef) { \
         EXEC_EC_CFP(val); \
     } \
@@ -178,7 +178,7 @@ enum vm_regan_acttype {
  */
 
 #define CC_SET_FASTPATH(cc, func, enabled) do { \
-    if (LIKELY(enabled)) ((cc)->call = (func)); \
+    if (LIKELY(enabled)) ((cc)->call_body = (func)); \
 } while (0)
 
 #define GET_BLOCK_HANDLER() (GET_LEP()[VM_ENV_DATA_INDEX_SPECVAL])

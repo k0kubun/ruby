@@ -1306,7 +1306,7 @@ rb_vm_search_method_slowpath(const struct rb_call_info *ci, struct rb_call_cache
 {
     cc->me = rb_callable_method_entry(klass, ci->mid);
     VM_ASSERT(callable_method_entry_p(cc->me));
-    cc->call = vm_call_general;
+    cc->call_body = vm_call_general;
 #if OPT_INLINE_METHOD_CACHE
     cc->method_state = GET_GLOBAL_METHOD_STATE();
     cc->class_serial = RCLASS_SERIAL(klass);
@@ -1327,7 +1327,7 @@ vm_search_method(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE 
 	       RB_DEBUG_COUNTER_INC_UNLESS(mc_class_serial_miss,
 					   RCLASS_SERIAL(klass) == cc->class_serial))) {
 	/* cache hit! */
-	VM_ASSERT(cc->call != NULL);
+	VM_ASSERT(cc->call_body != NULL);
 	RB_DEBUG_COUNTER_INC(mc_inline_hit);
 	return;
     }
@@ -2333,7 +2333,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	ref_me = rb_callable_method_entry(refinement, ci->mid);
 
 	if (ref_me) {
-	    if (cc->call == vm_call_super_method) {
+	    if (cc->call_body == vm_call_super_method) {
 		const rb_control_frame_t *top_cfp = current_method_entry(ec, cfp);
 		const rb_callable_method_entry_t *top_me = rb_vm_frame_method_entry(top_cfp);
 		if (top_me && rb_method_definition_eq(ref_me->def, top_me->def)) {
@@ -2443,7 +2443,7 @@ static VALUE
 vm_call_super_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
 {
     /* this check is required to distinguish with other functions. */
-    if (cc->call != vm_call_super_method) rb_bug("bug");
+    if (cc->call_body != vm_call_super_method) rb_bug("bug");
     return vm_call_method(ec, reg_cfp, calling, ci, cc);
 }
 
