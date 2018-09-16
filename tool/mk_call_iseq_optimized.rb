@@ -33,7 +33,7 @@ static VALUE
         return #{fname(param, local)}(ec, cfp, calling, ci, cc);
     }
     else {
-        return vm_send_method(ec, cfp, calling, ci, cc);
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
     }
 }
 EOS

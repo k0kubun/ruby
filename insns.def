@@ -747,7 +747,7 @@ send
 
     calling.block_handler = vm_caller_setup_arg_block(ec, reg_cfp, ci, blockiseq, FALSE);
     calling.recv = TOPN(calling.argc = ci->orig_argc);
-    if (UNLIKELY(!cc->call)) cc->call = vm_send_method;
+    if (UNLIKELY(!cc->call)) cc->call = rb_vm_send_method;
     CALL_METHOD(&calling, ci, cc);
 }
 
@@ -819,7 +819,7 @@ opt_send_without_block
     struct rb_calling_info calling;
     calling.block_handler = VM_BLOCK_HANDLER_NONE;
     calling.recv = TOPN(calling.argc = ci->orig_argc);
-    if (UNLIKELY(!cc->call)) cc->call = vm_send_method;
+    if (UNLIKELY(!cc->call)) cc->call = rb_vm_send_method;
     CALL_METHOD(&calling, ci, cc);
 }
 

@@ -1300,14 +1300,14 @@ vm_expandarray(VALUE *sp, VALUE ary, rb_num_t num, int flag)
 }
 
 static VALUE vm_call_general(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
-static VALUE vm_send_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
+extern VALUE rb_vm_send_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
 
 MJIT_FUNC_EXPORTED void
 rb_vm_search_method_slowpath(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE klass)
 {
     cc->me = rb_callable_method_entry(klass, ci->mid);
     VM_ASSERT(callable_method_entry_p(cc->me));
-    cc->call = vm_send_method;
+    cc->call = rb_vm_send_method;
 #if OPT_INLINE_METHOD_CACHE
     cc->method_state = GET_GLOBAL_METHOD_STATE();
     cc->class_serial = RCLASS_SERIAL(klass);
@@ -2267,7 +2267,7 @@ refined_method_callable_without_refinement(const rb_callable_method_entry_t *me)
             return funcname(ec, reg_cfp, calling, ci, cc); \
         } \
         else { \
-            return vm_send_method(ec, reg_cfp, calling, ci, cc); \
+            return rb_vm_send_method(ec, reg_cfp, calling, ci, cc); \
         } \
     }
 DEFINE_FASTPATH(vm_call_iseq_setup)
@@ -2475,8 +2475,8 @@ vm_call_super_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, st
 }
 
 /* Entrypoint function of cc->call for send and opt_send_without_block insns. */
-static VALUE
-vm_send_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+MJIT_FUNC_EXPORTED VALUE
+rb_vm_send_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
 {
     vm_search_method(ci, cc, calling->recv);
     return vm_call_method(ec, reg_cfp, calling, ci, cc);
