@@ -1580,6 +1580,7 @@ static VALUE vm_call_method_each_type(rb_execution_context_t *ec, rb_control_fra
 static inline VALUE vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
 
 static vm_call_handler vm_call_iseq_setup_func(const struct rb_call_info *ci, const int param_size, const int local_size);
+static vm_call_handler vm_call_iseq_setup_fastpath_func(const struct rb_call_info *ci, const int param_size, const int local_size);
 
 static const rb_iseq_t *
 def_iseq_ptr(rb_method_definition_t *def)
@@ -1632,6 +1633,9 @@ vm_callee_setup_arg(rb_execution_context_t *ec, struct rb_calling_info *calling,
         CC_SET_CALL_BODY(cc, vm_call_iseq_setup_func(ci, param_size, local_size),
 			(!IS_ARGS_SPLAT(ci) && !IS_ARGS_KEYWORD(ci) &&
 			 !(METHOD_ENTRY_VISI(cc->me) == METHOD_VISI_PROTECTED)));
+        CI_SET_FASTPATH(cc, vm_call_iseq_setup_fastpath_func(ci, param_size, local_size),
+                        (!IS_ARGS_SPLAT(ci) && !IS_ARGS_KEYWORD(ci) &&
+                        !(METHOD_ENTRY_VISI(cc->me) == METHOD_VISI_PROTECTED)));
 	return 0;
     }
     else {
@@ -2260,16 +2264,29 @@ refined_method_callable_without_refinement(const rb_callable_method_entry_t *me)
     return cme;
 }
 
-static VALUE
-vm_call_iseq_setup_fastpath(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
-{
-    if (LIKELY(INLINE_CACHE_HIT(cc, CLASS_OF(calling->recv)))) {
-        return vm_call_iseq_setup(ec, reg_cfp, calling, ci, cc);
+#define DEFINE_FASTPATH(funcname) \
+    static VALUE \
+    funcname ## _fastpath(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc) \
+    { \
+        if (LIKELY(INLINE_CACHE_HIT(cc, CLASS_OF(calling->recv)))) { \
+            return funcname(ec, reg_cfp, calling, ci, cc); \
+        } \
+        else { \
+            return vm_send_method(ec, reg_cfp, calling, ci, cc); \
+        } \
     }
-    else {
-        return vm_send_method(ec, reg_cfp, calling, ci, cc);
-    }
-}
+DEFINE_FASTPATH(vm_call_iseq_setup)
+DEFINE_FASTPATH(vm_call_iseq_setup_normal_0start)
+DEFINE_FASTPATH(vm_call_iseq_setup_tailcall_0start)
+DEFINE_FASTPATH(vm_call_cfunc)
+DEFINE_FASTPATH(vm_call_attrset)
+DEFINE_FASTPATH(vm_call_ivar)
+DEFINE_FASTPATH(vm_call_method_missing)
+DEFINE_FASTPATH(vm_call_bmethod)
+DEFINE_FASTPATH(vm_call_opt_send)
+DEFINE_FASTPATH(vm_call_opt_call)
+DEFINE_FASTPATH(vm_call_opt_block_call)
+#undef DEFINE_FASTPATH
 
 static VALUE
 vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
@@ -2284,6 +2301,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
       case VM_METHOD_TYPE_CFUNC:
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_cfunc, TRUE);
+        CC_SET_FASTPATH(cc, vm_call_cfunc_fastpath, TRUE);
 	return vm_call_cfunc(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_ATTRSET:
@@ -2292,6 +2310,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	cc->aux.index = 0;
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_attrset, !((ci->flag & VM_CALL_ARGS_SPLAT) || (ci->flag & VM_CALL_KWARG)));
+        CC_SET_FASTPATH(cc, vm_call_attrset_fastpath, !((ci->flag & VM_CALL_ARGS_SPLAT) || (ci->flag & VM_CALL_KWARG)));
 	return vm_call_attrset(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_IVAR:
@@ -2300,17 +2319,20 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	cc->aux.index = 0;
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_ivar, !(ci->flag & VM_CALL_ARGS_SPLAT));
+        CC_SET_FASTPATH(cc, vm_call_ivar_fastpath, !(ci->flag & VM_CALL_ARGS_SPLAT));
 	return vm_call_ivar(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_MISSING:
 	cc->aux.method_missing_reason = 0;
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
+        CC_SET_FASTPATH(cc, vm_call_method_missing_fastpath, TRUE);
 	return vm_call_method_missing(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_BMETHOD:
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_bmethod, TRUE);
+        CC_SET_FASTPATH(cc, vm_call_bmethod_fastpath, TRUE);
 	return vm_call_bmethod(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_ALIAS:
@@ -2323,14 +2345,17 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	  case OPTIMIZED_METHOD_TYPE_SEND:
             cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_send, TRUE);
+            CC_SET_FASTPATH(cc, vm_call_opt_send_fastpath, TRUE);
 	    return vm_call_opt_send(ec, cfp, calling, ci, cc);
 	  case OPTIMIZED_METHOD_TYPE_CALL:
             cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_call, TRUE);
+            CC_SET_FASTPATH(cc, vm_call_opt_call_fastpath, TRUE);
 	    return vm_call_opt_call(ec, cfp, calling, ci, cc);
 	  case OPTIMIZED_METHOD_TYPE_BLOCK_CALL:
             cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_block_call, TRUE);
+            CC_SET_FASTPATH(cc, vm_call_opt_block_call_fastpath, TRUE);
 	    return vm_call_opt_block_call(ec, cfp, calling, ci, cc);
 	  default:
 	    rb_bug("vm_call_method: unsupported optimized method type (%d)",
@@ -2406,6 +2431,7 @@ vm_call_method_nome(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct 
 	cc->aux.method_missing_reason = stat;
         cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
+        CC_SET_FASTPATH(cc, vm_call_method_missing_fastpath, TRUE);
 	return vm_call_method_missing(ec, cfp, calling, ci, cc);
     }
 }
@@ -2428,6 +2454,7 @@ vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_ca
 		cc->aux.method_missing_reason = stat;
                 cc->call = vm_send_method;
                 CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
+                CC_SET_FASTPATH(cc, vm_call_method_missing_fastpath, TRUE);
 		return vm_call_method_missing(ec, cfp, calling, ci, cc);
 	    }
 	    return vm_call_method_each_type(ec, cfp, calling, ci, cc);
