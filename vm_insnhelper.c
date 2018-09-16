@@ -1300,18 +1300,26 @@ vm_expandarray(VALUE *sp, VALUE ary, rb_num_t num, int flag)
 }
 
 static VALUE vm_call_general(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
+static VALUE vm_send_method(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc);
 
 MJIT_FUNC_EXPORTED void
 rb_vm_search_method_slowpath(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE klass)
 {
     cc->me = rb_callable_method_entry(klass, ci->mid);
     VM_ASSERT(callable_method_entry_p(cc->me));
+    cc->call = vm_send_method;
     cc->call_body = vm_call_general;
 #if OPT_INLINE_METHOD_CACHE
     cc->method_state = GET_GLOBAL_METHOD_STATE();
     cc->class_serial = RCLASS_SERIAL(klass);
 #endif
 }
+
+#define INLINE_CACHE_HIT(cc, klass) \
+    RB_DEBUG_COUNTER_INC_UNLESS(mc_global_state_miss, \
+                                GET_GLOBAL_METHOD_STATE() == cc->method_state) && \
+    RB_DEBUG_COUNTER_INC_UNLESS(mc_class_serial_miss, \
+                                RCLASS_SERIAL(klass) == cc->class_serial)
 
 static void
 vm_search_method(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE recv)
@@ -1322,12 +1330,8 @@ vm_search_method(const struct rb_call_info *ci, struct rb_call_cache *cc, VALUE 
     VM_ASSERT(RBASIC_CLASS(klass) == 0 || rb_obj_is_kind_of(klass, rb_cClass));
 
 #if OPT_INLINE_METHOD_CACHE
-    if (LIKELY(RB_DEBUG_COUNTER_INC_UNLESS(mc_global_state_miss,
-					   GET_GLOBAL_METHOD_STATE() == cc->method_state) &&
-	       RB_DEBUG_COUNTER_INC_UNLESS(mc_class_serial_miss,
-					   RCLASS_SERIAL(klass) == cc->class_serial))) {
-	/* cache hit! */
-	VM_ASSERT(cc->call_body != NULL);
+    if (LIKELY(INLINE_CACHE_HIT(cc, klass))) {
+        VM_ASSERT(cc->call_body != NULL);
 	RB_DEBUG_COUNTER_INC(mc_inline_hit);
 	return;
     }
@@ -2257,15 +2261,28 @@ refined_method_callable_without_refinement(const rb_callable_method_entry_t *me)
 }
 
 static VALUE
+vm_call_iseq_setup_fastpath(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    if (LIKELY(INLINE_CACHE_HIT(cc, CLASS_OF(calling->recv)))) {
+        return vm_call_iseq_setup(ec, reg_cfp, calling, ci, cc);
+    }
+    else {
+        return vm_send_method(ec, reg_cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
 vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
 {
     switch (cc->me->def->type) {
       case VM_METHOD_TYPE_ISEQ:
         CC_SET_CALL_BODY(cc, vm_call_iseq_setup, TRUE);
+        CC_SET_FASTPATH(cc, vm_call_iseq_setup_fastpath, TRUE);
 	return vm_call_iseq_setup(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_NOTIMPLEMENTED:
       case VM_METHOD_TYPE_CFUNC:
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_cfunc, TRUE);
 	return vm_call_cfunc(ec, cfp, calling, ci, cc);
 
@@ -2273,6 +2290,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	CALLER_SETUP_ARG(cfp, calling, ci);
 	rb_check_arity(calling->argc, 1, 1);
 	cc->aux.index = 0;
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_attrset, !((ci->flag & VM_CALL_ARGS_SPLAT) || (ci->flag & VM_CALL_KWARG)));
 	return vm_call_attrset(ec, cfp, calling, ci, cc);
 
@@ -2280,15 +2298,18 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
 	CALLER_SETUP_ARG(cfp, calling, ci);
 	rb_check_arity(calling->argc, 0, 0);
 	cc->aux.index = 0;
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_ivar, !(ci->flag & VM_CALL_ARGS_SPLAT));
 	return vm_call_ivar(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_MISSING:
 	cc->aux.method_missing_reason = 0;
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
 	return vm_call_method_missing(ec, cfp, calling, ci, cc);
 
       case VM_METHOD_TYPE_BMETHOD:
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_bmethod, TRUE);
 	return vm_call_bmethod(ec, cfp, calling, ci, cc);
 
@@ -2300,12 +2321,15 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
       case VM_METHOD_TYPE_OPTIMIZED:
 	switch (cc->me->def->body.optimize_type) {
 	  case OPTIMIZED_METHOD_TYPE_SEND:
+            cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_send, TRUE);
 	    return vm_call_opt_send(ec, cfp, calling, ci, cc);
 	  case OPTIMIZED_METHOD_TYPE_CALL:
+            cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_call, TRUE);
 	    return vm_call_opt_call(ec, cfp, calling, ci, cc);
 	  case OPTIMIZED_METHOD_TYPE_BLOCK_CALL:
+            cc->call = vm_send_method;
             CC_SET_CALL_BODY(cc, vm_call_opt_block_call, TRUE);
 	    return vm_call_opt_block_call(ec, cfp, calling, ci, cc);
 	  default:
@@ -2380,6 +2404,7 @@ vm_call_method_nome(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct 
     }
     else {
 	cc->aux.method_missing_reason = stat;
+        cc->call = vm_send_method;
         CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
 	return vm_call_method_missing(ec, cfp, calling, ci, cc);
     }
@@ -2401,6 +2426,7 @@ vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_ca
 		if (ci->flag & VM_CALL_VCALL) stat |= MISSING_VCALL;
 
 		cc->aux.method_missing_reason = stat;
+                cc->call = vm_send_method;
                 CC_SET_CALL_BODY(cc, vm_call_method_missing, TRUE);
 		return vm_call_method_missing(ec, cfp, calling, ci, cc);
 	    }
