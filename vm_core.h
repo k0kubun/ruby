@@ -269,7 +269,6 @@ struct rb_call_cache {
     const rb_callable_method_entry_t *me;
 
     vm_call_handler call;
-    vm_call_handler call_body;
 
     union {
 	unsigned int index; /* used by ivar */

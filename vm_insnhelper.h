@@ -180,9 +180,6 @@ enum vm_regan_acttype {
 #define CC_SET_FASTPATH(cc, func, enabled) do { \
     if (LIKELY(enabled)) ((cc)->call = (func)); \
 } while (0)
-#define CC_SET_CALL_BODY(cc, func, enabled) do { \
-    if (LIKELY(enabled)) ((cc)->call_body = (func)); \
-} while (0)
 
 #define GET_BLOCK_HANDLER() (GET_LEP()[VM_ENV_DATA_INDEX_SPECVAL])
 

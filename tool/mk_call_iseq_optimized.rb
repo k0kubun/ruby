@@ -53,25 +53,6 @@ static const vm_call_handler vm_call_iseq_fastpath_handlers[][#{L.to_a.size}] = 
 };
 
 static inline vm_call_handler
-vm_call_iseq_setup_func(const struct rb_call_info *ci, const int param_size, const int local_size)
-{
-    if (UNLIKELY(ci->flag & VM_CALL_TAILCALL)) {
-	return &vm_call_iseq_setup_tailcall_0start;
-    }
-    else if (0) { /* to disable optimize */
-        return &vm_call_iseq_setup_normal_0start;
-    }
-    else {
-	if (param_size <= #{P.end} &&
-	    local_size <= #{L.end}) {
-	    VM_ASSERT(local_size >= 0);
-	    return vm_call_iseq_handlers[param_size][local_size];
-	}
-	return &vm_call_iseq_setup_normal_0start;
-    }
-}
-
-static inline vm_call_handler
 vm_call_iseq_setup_fastpath_func(const struct rb_call_info *ci, const int param_size, const int local_size)
 {
     if (UNLIKELY(ci->flag & VM_CALL_TAILCALL)) {
