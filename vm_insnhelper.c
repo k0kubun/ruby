@@ -3458,7 +3458,8 @@ vm_opt_plus_float(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb
 {
     VALUE recv = *(cfp->sp - 2);
     VALUE obj = *(cfp->sp - 1);
-    if (RBASIC_CLASS(recv) == rb_cFloat &&
+    if (!SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat &&
         RBASIC_CLASS(obj)  == rb_cFloat &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
         cfp->sp -= 2;
@@ -3474,7 +3475,8 @@ vm_opt_plus_string(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct r
 {
     VALUE recv = *(cfp->sp - 2);
     VALUE obj = *(cfp->sp - 1);
-    if (RBASIC_CLASS(recv) == rb_cString &&
+    if (!SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cString &&
         RBASIC_CLASS(obj) == rb_cString &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG)) {
         cfp->sp -= 2;
@@ -3490,7 +3492,8 @@ vm_opt_plus_array(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb
 {
     VALUE recv = *(cfp->sp - 2);
     VALUE obj = *(cfp->sp - 1);
-    if (RBASIC_CLASS(recv) == rb_cArray &&
+    if (!SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cArray &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG)) {
         cfp->sp -= 2;
         return rb_ary_plus(recv, obj);
