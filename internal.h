@@ -1907,6 +1907,7 @@ bool rb_gvar_is_traced(const struct rb_global_entry *);
 
 /* vm_insnhelper.h */
 rb_serial_t rb_next_class_serial(void);
+void rb_vm_set_cc_call(VALUE call_cache, ID mid);
 
 /* vm.c */
 VALUE rb_obj_is_thread(VALUE obj);

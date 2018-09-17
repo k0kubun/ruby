@@ -3423,36 +3423,43 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 #endif
 }
 
-static VALUE
-vm_opt_plus(VALUE recv, VALUE obj)
+static inline VALUE
+vm_opt_plus(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
 {
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
 	return rb_fix_plus_fix(recv, obj);
     }
     else if (FLONUM_2_P(recv, obj) &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
 	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
     }
     else if (RBASIC_CLASS(recv) == rb_cFloat &&
 	     RBASIC_CLASS(obj)  == rb_cFloat &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
 	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
     }
     else if (RBASIC_CLASS(recv) == rb_cString &&
 	     RBASIC_CLASS(obj) == rb_cString &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
 	return rb_str_plus(recv, obj);
     }
     else if (RBASIC_CLASS(recv) == rb_cArray &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
 	return rb_ary_plus(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
     }
 }
 
@@ -3854,6 +3861,15 @@ vm_opt_regexpmatch2(VALUE recv, VALUE obj)
     }
     else {
 	return Qundef;
+    }
+}
+
+void
+rb_vm_set_cc_call(VALUE call_cache, ID mid)
+{
+    struct rb_call_cache *cc = (struct rb_call_cache *)call_cache;
+    switch (mid) {
+      case idPLUS: cc->call = vm_opt_plus; break;
     }
 }
 

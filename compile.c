@@ -1187,12 +1187,21 @@ new_callinfo(rb_iseq_t *iseq, ID mid, int argc, unsigned int flag, struct rb_cal
     return ci;
 }
 
+/* The allocated cc is used to set cc->call in `iseq_specialized_instruction` */
+static struct rb_call_cache *
+new_callcache(rb_iseq_t *iseq)
+{
+    void *buf = compile_data_alloc(iseq, sizeof(struct rb_call_cache));
+    memset(buf, 0, sizeof(struct rb_call_cache));
+    return (struct rb_call_cache *)buf;
+}
+
 static INSN *
 new_insn_send(rb_iseq_t *iseq, int line_no, ID id, VALUE argc, const rb_iseq_t *blockiseq, VALUE flag, struct rb_call_info_kw_arg *keywords)
 {
     VALUE *operands = (VALUE *)compile_data_alloc(iseq, sizeof(VALUE) * 3);
     operands[0] = (VALUE)new_callinfo(iseq, id, FIX2INT(argc), FIX2INT(flag), keywords, blockiseq != NULL);
-    operands[1] = Qfalse; /* cache */
+    operands[1] = (VALUE)new_callcache(iseq);
     operands[2] = (VALUE)blockiseq;
     return new_insn_core(iseq, line_no, BIN(send), 3, operands);
 }
@@ -2166,6 +2175,10 @@ iseq_set_sequence(rb_iseq_t *iseq, LINK_ANCHOR *const anchor)
 		      case TS_CALLCACHE:
 			{
 			    struct rb_call_cache *cc = &body->cc_entries[ISEQ_COMPILE_DATA(iseq)->ci_index + ISEQ_COMPILE_DATA(iseq)->ci_kw_index - 1];
+                            if (operands[j] != Qfalse && operands[j] != Qnil && operands[j] != Qundef) {
+                                struct rb_call_cache *base_cc = (struct rb_call_cache *)operands[j];
+                                *cc = *base_cc;
+                            }
 			    generated_iseq[code_index + 1 + j] = (VALUE)cc;
 			    break;
 			}
@@ -3216,6 +3229,7 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 
     if (IS_INSN_ID(iobj, send)) {
 	struct rb_call_info *ci = (struct rb_call_info *)OPERAND_AT(iobj, 0);
+        VALUE cc = OPERAND_AT(iobj, 1); /* struct rb_call_cache * */
 	const rb_iseq_t *blockiseq = (rb_iseq_t *)OPERAND_AT(iobj, 2);
 
 #define SP_INSN(opt) insn_set_specialized_instruction(iseq, iobj, BIN(opt_##opt))
@@ -3232,7 +3246,7 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		break;
 	      case 1:
 		switch (ci->mid) {
-		  case idPLUS:	 SP_INSN(plus);	  return COMPILE_OK;
+                  case idPLUS:   rb_vm_set_cc_call(cc, ci->mid); return COMPILE_OK;
 		  case idMINUS:	 SP_INSN(minus);  return COMPILE_OK;
 		  case idMULT:	 SP_INSN(mult);	  return COMPILE_OK;
 		  case idDIV:	 SP_INSN(div);	  return COMPILE_OK;
