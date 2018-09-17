@@ -3423,20 +3423,97 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 #endif
 }
 
-static inline VALUE
+static VALUE
+vm_opt_plus_fix(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
+    if (FIXNUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
+        return rb_fix_plus_fix(recv, obj);
+    }
+    else {
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
+vm_opt_plus_flonum(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
+        return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+    }
+    else {
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
+vm_opt_plus_float(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
+    if (RBASIC_CLASS(recv) == rb_cFloat &&
+        RBASIC_CLASS(obj)  == rb_cFloat &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
+        return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+    }
+    else {
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
+vm_opt_plus_string(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
+    if (RBASIC_CLASS(recv) == rb_cString &&
+        RBASIC_CLASS(obj) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
+        return rb_str_plus(recv, obj);
+    }
+    else {
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
+vm_opt_plus_array(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
+{
+    VALUE recv = *(cfp->sp - 2);
+    VALUE obj = *(cfp->sp - 1);
+    if (RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG)) {
+        cfp->sp -= 2;
+        return rb_ary_plus(recv, obj);
+    }
+    else {
+        return rb_vm_send_method(ec, cfp, calling, ci, cc);
+    }
+}
+
+static VALUE
 vm_opt_plus(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc)
 {
     VALUE recv = *(cfp->sp - 2);
     VALUE obj = *(cfp->sp - 1);
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG)) {
-        cfp->sp -= 2;
-	return rb_fix_plus_fix(recv, obj);
+        cc->call = vm_opt_plus_fix;
+        return vm_opt_plus_fix(ec, cfp, calling, ci, cc);
     }
     else if (FLONUM_2_P(recv, obj) &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
-        cfp->sp -= 2;
-	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+        cc->call = vm_opt_plus_flonum;
+        return vm_opt_plus_flonum(ec, cfp, calling, ci, cc);
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
         return rb_vm_send_method(ec, cfp, calling, ci, cc);
@@ -3444,19 +3521,19 @@ vm_opt_plus(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calli
     else if (RBASIC_CLASS(recv) == rb_cFloat &&
 	     RBASIC_CLASS(obj)  == rb_cFloat &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
-        cfp->sp -= 2;
-	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+        cc->call = vm_opt_plus_float;
+        return vm_opt_plus_float(ec, cfp, calling, ci, cc);
     }
     else if (RBASIC_CLASS(recv) == rb_cString &&
 	     RBASIC_CLASS(obj) == rb_cString &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG)) {
-        cfp->sp -= 2;
-	return rb_str_plus(recv, obj);
+        cc->call = vm_opt_plus_string;
+        return vm_opt_plus_string(ec, cfp, calling, ci, cc);
     }
     else if (RBASIC_CLASS(recv) == rb_cArray &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG)) {
-        cfp->sp -= 2;
-	return rb_ary_plus(recv, obj);
+        cc->call = vm_opt_plus_array;
+        return vm_opt_plus_array(ec, cfp, calling, ci, cc);
     }
     else {
         return rb_vm_send_method(ec, cfp, calling, ci, cc);
