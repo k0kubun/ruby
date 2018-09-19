@@ -305,6 +305,7 @@ static VALUE vm_invoke_proc(rb_execution_context_t *ec, rb_proc_t *proc, VALUE s
 static VALUE rb_block_param_proxy;
 
 #include "mjit.h"
+#include "insns.inc"
 #include "vm_insnhelper.h"
 #include "vm_exec.h"
 #include "vm_insnhelper.c"

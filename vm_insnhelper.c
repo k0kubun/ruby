@@ -9,7 +9,6 @@
 **********************************************************************/
 
 /* finish iseq array */
-#include "insns.inc"
 #ifndef MJIT_HEADER
 #include "insns_info.inc"
 #endif
@@ -3421,6 +3420,63 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 #else
     rb_bug(stack_consistency_error, nsp, nbp);
 #endif
+}
+
+static inline VALUE
+rb_flo_plus_flo(VALUE recv, VALUE obj)
+{
+    return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+}
+
+RB_DEFINE_FASTPATH(rb_fix_plus_fix, 2, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_flo_plus_flo, 2, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_str_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cString && RBASIC_CLASS(obj) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_ary_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cArray && RBASIC_CLASS(obj) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG));
+
+VALUE
+rb_opt_int_plus(VALUE recv, VALUE obj)
+{
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fix_plus_fix);
+        return rb_fix_plus_fix(recv, obj);
+    }
+    else {
+        return rb_int_plus(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_plus(VALUE recv, VALUE obj)
+{
+    if (FLONUM_P(obj) || (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat)) {
+        RB_SET_FASTPATH(rb_flo_plus_flo);
+        return rb_flo_plus_flo(recv, obj);
+    }
+    else {
+        return rb_flo_plus(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_str_plus(VALUE recv, VALUE obj)
+{
+    if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cString) {
+        RB_SET_FASTPATH(rb_str_plus);
+    }
+    return rb_str_plus(recv, obj);
+}
+
+VALUE
+rb_opt_ary_plus(VALUE recv, VALUE obj)
+{
+    if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cArray) {
+        RB_SET_FASTPATH(rb_ary_plus);
+    }
+    return rb_ary_plus(recv, obj);
 }
 
 static VALUE

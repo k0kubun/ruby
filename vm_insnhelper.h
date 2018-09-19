@@ -313,4 +313,34 @@ THROW_DATA_CONSUMED_SET(struct vm_throw_data *obj)
     if (UNLIKELY(IS_ARGS_KEYWORD(ci))) vm_caller_setup_arg_kw((cfp), (calling), (ci)); \
 } while (0)
 
+static inline void
+rb_set_fastpath(vm_call_handler fastpath)
+{
+    const rb_control_frame_t *caller_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(GET_EC()->cfp);
+    if (caller_cfp->iseq == NULL || (caller_cfp->ep[0] & VM_FRAME_MAGIC_MASK) == VM_FRAME_MAGIC_IFUNC)
+        return;
+
+    if ((void *)(*(caller_cfp->pc - 3)) == rb_vm_insn_insn2addr(BIN(opt_send_without_block))) {
+        struct rb_call_cache *cc = (struct rb_call_cache *)(*(caller_cfp->pc - 1));
+        cc->call = fastpath;
+    }
+}
+
+#define RB_SET_FASTPATH(funcname) rb_set_fastpath(funcname ## _fastpath)
+#define RB_DEFINE_FASTPATH(funcname, argc, condition) RB_DEFINE_FASTPATH_ARG ## argc (funcname, condition)
+#define RB_DEFINE_FASTPATH_ARG2(funcname, condition) \
+    static VALUE \
+    funcname ## _fastpath (rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc) \
+    { \
+        VALUE recv = *(cfp->sp - 2); \
+        VALUE obj = *(cfp->sp - 1); \
+        if (condition) { \
+            cfp->sp -= 2; \
+            return funcname(recv, obj); \
+        } \
+        else { \
+            return rb_vm_send_method(ec, cfp, calling, ci, cc); \
+        } \
+    }
+
 #endif /* RUBY_INSNHELPER_H */

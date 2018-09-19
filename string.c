@@ -10925,7 +10925,7 @@ Init_String(void)
     rb_define_method(rb_cString, "hash", rb_str_hash_m, 0);
     rb_define_method(rb_cString, "casecmp", rb_str_casecmp, 1);
     rb_define_method(rb_cString, "casecmp?", rb_str_casecmp_p, 1);
-    rb_define_method(rb_cString, "+", rb_str_plus, 1);
+    rb_define_method(rb_cString, "+", rb_opt_str_plus, 1);
     rb_define_method(rb_cString, "*", rb_str_times, 1);
     rb_define_method(rb_cString, "%", rb_str_format_m, 1);
     rb_define_method(rb_cString, "[]", rb_str_aref_m, -1);

@@ -183,6 +183,8 @@ void rb_iseq_code_location(const rb_iseq_t *iseq, int *first_lineno, int *first_
 
 void rb_iseq_remove_coverage_all(void);
 
+void *rb_vm_insn_insn2addr(int insn);
+
 /* proc.c */
 const rb_iseq_t *rb_method_iseq(VALUE body);
 const rb_iseq_t *rb_proc_get_iseq(VALUE proc, int *is_proc);
