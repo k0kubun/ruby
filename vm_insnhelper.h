@@ -328,7 +328,14 @@ rb_set_fastpath(vm_call_handler fastpath)
 
 #define RB_SET_FASTPATH(funcname) rb_set_fastpath(funcname ## _fastpath)
 #define RB_DEFINE_FASTPATH(funcname, argc, condition) RB_DEFINE_FASTPATH_ARG ## argc (funcname, condition)
+
 #define RB_DEFINE_FASTPATH_ARG2(funcname, condition) \
+    static inline int \
+    funcname ## _fastpath_p (VALUE recv, VALUE obj) \
+    { \
+        return condition; \
+    } \
+    \
     static VALUE \
     funcname ## _fastpath (rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_calling_info *calling, const struct rb_call_info *ci, struct rb_call_cache *cc) \
     { \

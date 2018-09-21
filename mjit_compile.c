@@ -18,6 +18,8 @@
 #include "insns_info.inc"
 #include "vm_insnhelper.h"
 
+extern const char *rb_vm_fastpath_funcname(vm_call_handler call);
+
 /* Macros to check if a position is already compiled using compile_status.stack_size_for_pos */
 #define NOT_COMPILED_STACK_SIZE -1
 #define ALREADY_COMPILED_P(status, pos) (status->stack_size_for_pos[pos] != NOT_COMPILED_STACK_SIZE)

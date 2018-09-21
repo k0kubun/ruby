@@ -3423,13 +3423,23 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 }
 
 static inline VALUE
-rb_flo_plus_flo(VALUE recv, VALUE obj)
+rb_flonum_plus(VALUE recv, VALUE obj)
+{
+    return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
+}
+
+/* same as rb_flonum_plus, but needed for different fastpath condition */
+static inline VALUE
+rb_float_plus(VALUE recv, VALUE obj)
 {
     return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
 }
 
 RB_DEFINE_FASTPATH(rb_fix_plus_fix, 2, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG));
-RB_DEFINE_FASTPATH(rb_flo_plus_flo, 2, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_flonum_plus, 2, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_float_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
 RB_DEFINE_FASTPATH(rb_str_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
         RBASIC_CLASS(recv) == rb_cString && RBASIC_CLASS(obj) == rb_cString &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG));
@@ -3452,9 +3462,13 @@ rb_opt_int_plus(VALUE recv, VALUE obj)
 VALUE
 rb_opt_flo_plus(VALUE recv, VALUE obj)
 {
-    if (FLONUM_P(obj) || (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat)) {
-        RB_SET_FASTPATH(rb_flo_plus_flo);
-        return rb_flo_plus_flo(recv, obj);
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_plus);
+        return rb_flonum_plus(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_plus);
+        return rb_float_plus(recv, obj);
     }
     else {
         return rb_flo_plus(recv, obj);
@@ -3878,6 +3892,21 @@ vm_opt_regexpmatch2(VALUE recv, VALUE obj)
     else {
 	return Qundef;
     }
+}
+
+/* Return internal function name from fastpath function pointer for inlining on JIT */
+const char *
+rb_vm_fastpath_funcname(vm_call_handler call)
+{
+#define DETECT_FASTPATH(funcname) if (call == funcname ## _fastpath) return #funcname ;
+    /* List up ONLY `RB_DEFINE_FASTPATH`-ed fastpaths */
+    DETECT_FASTPATH(rb_fix_plus_fix);
+    DETECT_FASTPATH(rb_flonum_plus);
+    DETECT_FASTPATH(rb_float_plus);
+    DETECT_FASTPATH(rb_str_plus);
+    DETECT_FASTPATH(rb_ary_plus);
+    return NULL;
+#undef DETECT_FASTPATH
 }
 
 rb_event_flag_t rb_iseq_event_flags(const rb_iseq_t *iseq, size_t pos);
