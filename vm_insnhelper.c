@@ -3426,15 +3426,12 @@ RB_DEFINE_FASTPATH(rb_fix_plus_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEF
 RB_DEFINE_FASTPATH_INLINE(rb_flonum_plus, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG),
         DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj)));
 RB_DEFINE_FASTPATH_INLINE(rb_float_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
-        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat &&
-        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG),
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG),
         DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj)));
 RB_DEFINE_FASTPATH(rb_str_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
-        RBASIC_CLASS(recv) == rb_cString && RBASIC_CLASS(obj) == rb_cString &&
-        BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG));
+        RBASIC_CLASS(recv) == rb_cString && RBASIC_CLASS(obj) == rb_cString && BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG));
 RB_DEFINE_FASTPATH(rb_ary_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
-        RBASIC_CLASS(recv) == rb_cArray && RBASIC_CLASS(obj) == rb_cArray &&
-        BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG));
+        RBASIC_CLASS(recv) == rb_cArray && RBASIC_CLASS(obj) == rb_cArray && BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG));
 
 VALUE
 rb_opt_int_plus(VALUE recv, VALUE obj)
@@ -3482,27 +3479,38 @@ rb_opt_ary_plus(VALUE recv, VALUE obj)
     return rb_ary_plus(recv, obj);
 }
 
-static VALUE
-vm_opt_minus(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH(rb_fix_minus_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MINUS, INTEGER_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_minus, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) - RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH_INLINE(rb_float_minus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) - RFLOAT_VALUE(obj)));
+
+VALUE
+rb_opt_int_minus(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_MINUS, INTEGER_REDEFINED_OP_FLAG)) {
-	return rb_fix_minus_fix(recv, obj);
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) - RFLOAT_VALUE(obj));
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) - RFLOAT_VALUE(obj));
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fix_minus_fix);
+        return rb_fix_minus_fix(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_minus(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_minus(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_minus);
+        return rb_flonum_minus(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_minus);
+        return rb_float_minus(recv, obj);
+    }
+    else {
+        return rb_flo_minus(recv, obj);
     }
 }
 
@@ -3888,12 +3896,16 @@ const char *
 rb_vm_fastpath_funcname(vm_call_handler call)
 {
 #define DETECT_FASTPATH(funcname) if (call == funcname ## _fastpath) return #funcname ;
-    /* List up ONLY `RB_DEFINE_FASTPATH`-ed fastpaths */
+    /* List up ONLY `RB_DEFINE_FASTPATH`-ed fastpaths.
+       TODO: create st and insert this entry by `RB_DEFINE_FASTPATH` to make this faster and remove this list. */
     DETECT_FASTPATH(rb_fix_plus_fix);
     DETECT_FASTPATH(rb_flonum_plus);
     DETECT_FASTPATH(rb_float_plus);
     DETECT_FASTPATH(rb_str_plus);
     DETECT_FASTPATH(rb_ary_plus);
+    DETECT_FASTPATH(rb_fix_minus_fix);
+    DETECT_FASTPATH(rb_flonum_minus);
+    DETECT_FASTPATH(rb_float_minus);
     return NULL;
 #undef DETECT_FASTPATH
 }
