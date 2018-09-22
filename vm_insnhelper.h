@@ -330,11 +330,14 @@ rb_set_fastpath(vm_call_handler fastpath)
 
 #define RB_DEFINE_FASTPATH_INLINE(funcname, argc, condition, definition) RB_DEFINE_FASTPATH_INLINE_ARG ## argc (funcname, condition, definition)
 #define RB_DEFINE_FASTPATH_INLINE_ARG1(funcname, condition, definition) \
+    ALWAYS_INLINE(static VALUE funcname (VALUE recv, VALUE obj)); \
     static inline VALUE funcname (VALUE recv, VALUE obj) { return definition; } \
+    \
     RB_DEFINE_FASTPATH_ARG1(funcname, condition)
 
 #define RB_DEFINE_FASTPATH(funcname, argc, condition) RB_DEFINE_FASTPATH_ARG ## argc (funcname, condition)
 #define RB_DEFINE_FASTPATH_ARG1(funcname, condition) \
+    ALWAYS_INLINE(static int funcname ## _fastpath_p (VALUE recv, VALUE obj)); \
     static inline int funcname ## _fastpath_p (VALUE recv, VALUE obj) { return condition; } \
     \
     static VALUE \
