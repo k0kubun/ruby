@@ -3422,28 +3422,17 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 #endif
 }
 
-static inline VALUE
-rb_flonum_plus(VALUE recv, VALUE obj)
-{
-    return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
-}
-
-/* same as rb_flonum_plus, but needed for different fastpath condition */
-static inline VALUE
-rb_float_plus(VALUE recv, VALUE obj)
-{
-    return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
-}
-
-RB_DEFINE_FASTPATH(rb_fix_plus_fix, 2, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG));
-RB_DEFINE_FASTPATH(rb_flonum_plus, 2, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
-RB_DEFINE_FASTPATH(rb_float_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+RB_DEFINE_FASTPATH(rb_fix_plus_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_plus, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH_INLINE(rb_float_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
         RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat &&
-        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG));
-RB_DEFINE_FASTPATH(rb_str_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH(rb_str_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
         RBASIC_CLASS(recv) == rb_cString && RBASIC_CLASS(obj) == rb_cString &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG));
-RB_DEFINE_FASTPATH(rb_ary_plus, 2, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+RB_DEFINE_FASTPATH(rb_ary_plus, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
         RBASIC_CLASS(recv) == rb_cArray && RBASIC_CLASS(obj) == rb_cArray &&
         BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG));
 
