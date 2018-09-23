@@ -10938,7 +10938,7 @@ Init_String(void)
     rb_define_method(rb_cString, "=~", rb_str_match, 1);
     rb_define_method(rb_cString, "match", rb_str_match_m, -1);
     rb_define_method(rb_cString, "match?", rb_str_match_m_p, -1);
-    rb_define_method(rb_cString, "succ", rb_str_succ, 0);
+    rb_define_method(rb_cString, "succ", rb_opt_str_succ, 0);
     rb_define_method(rb_cString, "succ!", rb_str_succ_bang, 0);
     rb_define_method(rb_cString, "next", rb_str_succ, 0);
     rb_define_method(rb_cString, "next!", rb_str_succ_bang, 0);

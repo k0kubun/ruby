@@ -3223,7 +3223,6 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 	    switch (ci->orig_argc) {
 	      case 0:
 		switch (ci->mid) {
-		  case idSucc:	 SP_INSN(succ);	  return COMPILE_OK;
 		  case idNot:	 SP_INSN(not);	  return COMPILE_OK;
 		}
 		break;

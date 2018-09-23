@@ -3965,29 +3965,28 @@ rb_opt_hash_empty_p(VALUE recv)
     return rb_hash_empty_p_inline(recv);
 }
 
-static VALUE
-vm_opt_succ(VALUE recv)
+RB_DEFINE_FASTPATH_INLINE(rb_fix_succ, 0, FIXNUM_P(recv) && BASIC_OP_UNREDEFINED_P(BOP_SUCC, INTEGER_REDEFINED_OP_FLAG),
+        recv == LONG2FIX(FIXNUM_MAX) ? LONG2NUM(FIXNUM_MAX + 1) : recv - 1 + INT2FIX(1));
+RB_DEFINE_FASTPATH(rb_str_succ, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_SUCC, STRING_REDEFINED_OP_FLAG));
+
+VALUE
+rb_opt_int_succ(VALUE recv)
 {
-    if (FIXNUM_P(recv) &&
-	BASIC_OP_UNREDEFINED_P(BOP_SUCC, INTEGER_REDEFINED_OP_FLAG)) {
-	/* fixnum + INT2FIX(1) */
-	if (recv == LONG2FIX(FIXNUM_MAX)) {
-	    return LONG2NUM(FIXNUM_MAX + 1);
-	}
-	else {
-	    return recv - 1 + INT2FIX(1);
-	}
-    }
-    else if (SPECIAL_CONST_P(recv)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cString &&
-	     BASIC_OP_UNREDEFINED_P(BOP_SUCC, STRING_REDEFINED_OP_FLAG)) {
-	return rb_str_succ(recv);
+    if (FIXNUM_P(recv)) {
+        RB_SET_FASTPATH(rb_fix_succ, idSucc);
+        return rb_fix_succ(recv);
     }
     else {
-	return Qundef;
+        return rb_int_succ(recv);
     }
+}
+
+VALUE
+rb_opt_str_succ(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_str_succ, idSucc);
+    return rb_str_succ(recv);
 }
 
 static VALUE
@@ -4072,6 +4071,8 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_str_empty_p);
     DETECT_FASTPATH(rb_ary_empty_p_inline);
     DETECT_FASTPATH(rb_hash_empty_p_inline);
+    DETECT_FASTPATH(rb_fix_succ);
+    DETECT_FASTPATH(rb_str_succ);
     return NULL;
 #undef DETECT_FASTPATH
 }

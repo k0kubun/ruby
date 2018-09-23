@@ -1147,20 +1147,6 @@ opt_aref_with
     }
 }
 
-/* optimized succ */
-DEFINE_INSN
-opt_succ
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv)
-(VALUE val)
-{
-    val = vm_opt_succ(recv);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
 /* optimized not */
 DEFINE_INSN
 opt_not

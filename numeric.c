@@ -5461,7 +5461,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, "upto", int_upto, 1);
     rb_define_method(rb_cInteger, "downto", int_downto, 1);
     rb_define_method(rb_cInteger, "times", int_dotimes, 0);
-    rb_define_method(rb_cInteger, "succ", int_succ, 0);
+    rb_define_method(rb_cInteger, "succ", rb_opt_int_succ, 0);
     rb_define_method(rb_cInteger, "next", int_succ, 0);
     rb_define_method(rb_cInteger, "pred", int_pred, 0);
     rb_define_method(rb_cInteger, "chr", int_chr, -1);

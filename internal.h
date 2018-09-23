@@ -1991,6 +1991,8 @@ VALUE rb_opt_hash_size(VALUE recv);
 VALUE rb_opt_str_empty_p(VALUE recv);
 VALUE rb_opt_ary_empty_p(VALUE recv);
 VALUE rb_opt_hash_empty_p(VALUE recv);
+VALUE rb_opt_int_succ(VALUE recv);
+VALUE rb_opt_str_succ(VALUE recv);
 void Init_vm_stack_canary(void);
 
 /* vm_method.c */
