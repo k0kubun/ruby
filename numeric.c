@@ -1188,8 +1188,8 @@ ruby_float_mod(double x, double y)
  *     6543.21.modulo(137.24)   #=> 92.92999999999961
  */
 
-static VALUE
-flo_mod(VALUE x, VALUE y)
+VALUE
+rb_flo_mod(VALUE x, VALUE y)
 {
     double fy;
 
@@ -5481,7 +5481,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, "*", rb_opt_int_mul, 1);
     rb_define_method(rb_cInteger, "/", rb_opt_int_div, 1);
     rb_define_method(rb_cInteger, "div", rb_int_idiv, 1);
-    rb_define_method(rb_cInteger, "%", rb_int_modulo, 1);
+    rb_define_method(rb_cInteger, "%", rb_opt_int_mod, 1);
     rb_define_method(rb_cInteger, "modulo", rb_int_modulo, 1);
     rb_define_method(rb_cInteger, "remainder", int_remainder, 1);
     rb_define_method(rb_cInteger, "divmod", rb_int_divmod, 1);
@@ -5630,8 +5630,8 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "/", rb_opt_flo_div, 1);
     rb_define_method(rb_cFloat, "quo", flo_quo, 1);
     rb_define_method(rb_cFloat, "fdiv", flo_quo, 1);
-    rb_define_method(rb_cFloat, "%", flo_mod, 1);
-    rb_define_method(rb_cFloat, "modulo", flo_mod, 1);
+    rb_define_method(rb_cFloat, "%", rb_opt_flo_mod, 1);
+    rb_define_method(rb_cFloat, "modulo", rb_flo_mod, 1);
     rb_define_method(rb_cFloat, "divmod", flo_divmod, 1);
     rb_define_method(rb_cFloat, "**", rb_float_pow, 1);
     rb_define_method(rb_cFloat, "==", flo_eq, 1);

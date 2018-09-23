@@ -3232,7 +3232,6 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		break;
 	      case 1:
 		switch (ci->mid) {
-		  case idMOD:	 SP_INSN(mod);	  return COMPILE_OK;
 		  case idEq:	 SP_INSN(eq);	  return COMPILE_OK;
 		  case idNeq:	 SP_INSN(neq);	  return COMPILE_OK;
 		  case idLT:	 SP_INSN(lt);	  return COMPILE_OK;

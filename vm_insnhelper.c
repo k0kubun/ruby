@@ -3584,27 +3584,38 @@ rb_opt_flo_div(VALUE recv, VALUE obj)
     }
 }
 
-static VALUE
-vm_opt_mod(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH(rb_fix_mod_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MOD, INTEGER_REDEFINED_OP_FLAG) && FIX2LONG(obj) != 0);
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_mod, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH_INLINE(rb_float_mod, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+
+VALUE
+rb_opt_int_mod(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_MOD, INTEGER_REDEFINED_OP_FLAG)) {
-	return (FIX2LONG(obj) == 0) ? Qundef : rb_fix_mod_fix(recv, obj);
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(ruby_float_mod(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj)));
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(ruby_float_mod(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj)));
+    if (FIXNUM_2_P(recv, obj) && FIX2LONG(obj) != 0) {
+        RB_SET_FASTPATH(rb_fix_mod_fix);
+        return rb_fix_mod_fix(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_modulo(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_mod(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) && FIX2LONG(obj) != 0) {
+        RB_SET_FASTPATH(rb_flonum_mod);
+        return rb_flonum_mod(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_mod);
+        return rb_float_mod(recv, obj);
+    }
+    else {
+        return rb_flo_mod(recv, obj);
     }
 }
 
@@ -3918,7 +3929,7 @@ const char *
 rb_vm_fastpath_funcname(vm_call_handler call)
 {
 #define DETECT_FASTPATH(funcname) if (call == funcname ## _fastpath) return #funcname ;
-    /* List up ONLY `RB_DEFINE_FASTPATH`-ed fastpaths.
+    /* List up ONLY `RB_DEFINE_FASTPATH(|_INLINE)`-ed fastpaths.
        TODO: create st and insert this entry by `RB_DEFINE_FASTPATH` to make this faster and remove this list. */
     DETECT_FASTPATH(rb_fix_plus_fix);
     DETECT_FASTPATH(rb_flonum_plus);
@@ -3931,6 +3942,12 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_fix_mul_fix);
     DETECT_FASTPATH(rb_flonum_mul);
     DETECT_FASTPATH(rb_float_mul);
+    DETECT_FASTPATH(rb_fix_div_fix);
+    DETECT_FASTPATH(rb_flonum_div);
+    DETECT_FASTPATH(rb_float_div);
+    DETECT_FASTPATH(rb_fix_mod_fix);
+    DETECT_FASTPATH(rb_flonum_mod);
+    DETECT_FASTPATH(rb_float_mod);
     return NULL;
 #undef DETECT_FASTPATH
 }
