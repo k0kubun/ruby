@@ -3235,7 +3235,6 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		  case idEq:	 SP_INSN(eq);	  return COMPILE_OK;
 		  case idNeq:	 SP_INSN(neq);	  return COMPILE_OK;
 		  case idLTLT:	 SP_INSN(ltlt);	  return COMPILE_OK;
-		  case idAREF:	 SP_INSN(aref);	  return COMPILE_OK;
 		}
 		break;
 	      case 2:

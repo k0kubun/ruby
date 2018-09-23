@@ -3801,28 +3801,36 @@ vm_opt_ltlt(VALUE recv, VALUE obj)
     }
 }
 
-static VALUE
-vm_opt_aref(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH_INLINE(rb_ary_entry_inline, 1, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_AREF, ARRAY_REDEFINED_OP_FLAG) && FIXNUM_P(obj),
+        rb_ary_entry_internal(recv, FIX2LONG(obj)));
+RB_DEFINE_FASTPATH(rb_ary_aref1, 1, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_AREF, ARRAY_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH(rb_hash_aref, 1, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cHash &&
+        BASIC_OP_UNREDEFINED_P(BOP_AREF, HASH_REDEFINED_OP_FLAG));
+
+VALUE
+rb_opt_ary_aref(int argc, const VALUE *argv, VALUE ary)
 {
-    if (SPECIAL_CONST_P(recv)) {
-	return Qundef;
+    rb_check_arity(argc, 1, 2);
+    if (argc == 2) {
+        return rb_ary_aref2(ary, argv[0], argv[1]);
     }
-    else if (RBASIC_CLASS(recv) == rb_cArray &&
-	     BASIC_OP_UNREDEFINED_P(BOP_AREF, ARRAY_REDEFINED_OP_FLAG)) {
-        if (FIXNUM_P(obj)) {
-            return rb_ary_entry_internal(recv, FIX2LONG(obj));
-        }
-        else {
-            return rb_ary_aref1(recv, obj);
-        }
-    }
-    else if (RBASIC_CLASS(recv) == rb_cHash &&
-	     BASIC_OP_UNREDEFINED_P(BOP_AREF, HASH_REDEFINED_OP_FLAG)) {
-	return rb_hash_aref(recv, obj);
+    if (FIXNUM_P(argv[0])) {
+        RB_SET_FASTPATH(rb_ary_entry_inline);
+        return rb_ary_entry_inline(ary, argv[0]);
     }
     else {
-	return Qundef;
+        RB_SET_FASTPATH(rb_ary_aref1);
+        return rb_ary_aref1(ary, argv[0]);
     }
+}
+
+VALUE
+rb_opt_hash_aref(VALUE hash, VALUE key)
+{
+    RB_SET_FASTPATH(rb_hash_aref);
+    return rb_hash_aref(hash, key);
 }
 
 static VALUE
@@ -4006,6 +4014,9 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_float_ge);
     DETECT_FASTPATH(rb_flonum_ge);
     DETECT_FASTPATH(rb_float_ge);
+    DETECT_FASTPATH(rb_ary_entry_inline);
+    DETECT_FASTPATH(rb_ary_aref1);
+    DETECT_FASTPATH(rb_hash_aref);
     return NULL;
 #undef DETECT_FASTPATH
 }

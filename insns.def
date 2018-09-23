@@ -1088,25 +1088,6 @@ opt_ltlt
     }
 }
 
-/* [] */
-DEFINE_INSN
-opt_aref
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv, VALUE obj)
-(VALUE val)
-/* This is complicated.  In case of hash, vm_opt_aref() resorts to
- * rb_hash_aref().  If `recv` has no `obj`, this function then yields
- * default_proc.  This is a method call.  So opt_aref is
- * (surprisingly) not leaf. */
-// attr bool leaf = false; /* has rb_funcall() */ /* calls #yield */
-{
-    val = vm_opt_aref(recv, obj);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
 /* recv[obj] = set */
 DEFINE_INSN
 opt_aset

@@ -1980,6 +1980,8 @@ VALUE rb_opt_int_gt(VALUE recv, VALUE obj);
 VALUE rb_opt_flo_gt(VALUE recv, VALUE obj);
 VALUE rb_opt_int_ge(VALUE recv, VALUE obj);
 VALUE rb_opt_flo_ge(VALUE recv, VALUE obj);
+VALUE rb_opt_ary_aref(int argc, const VALUE *argv, VALUE ary);
+VALUE rb_opt_hash_aref(VALUE recv, VALUE obj);
 void Init_vm_stack_canary(void);
 
 /* vm_method.c */

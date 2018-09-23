@@ -4717,7 +4717,7 @@ Init_Hash(void)
     rb_define_method(rb_cHash, "to_proc", rb_hash_to_proc, 0);
 
     rb_define_method(rb_cHash, "==", rb_hash_equal, 1);
-    rb_define_method(rb_cHash, "[]", rb_hash_aref, 1);
+    rb_define_method(rb_cHash, "[]", rb_opt_hash_aref, 1);
     rb_define_method(rb_cHash, "hash", rb_hash_hash, 0);
     rb_define_method(rb_cHash, "eql?", rb_hash_eql, 1);
     rb_define_method(rb_cHash, "fetch", rb_hash_fetch_m, -1);

@@ -6289,7 +6289,7 @@ Init_Array(void)
     rb_define_method(rb_cArray, "eql?", rb_ary_eql, 1);
     rb_define_method(rb_cArray, "hash", rb_ary_hash, 0);
 
-    rb_define_method(rb_cArray, "[]", rb_ary_aref, -1);
+    rb_define_method(rb_cArray, "[]", rb_opt_ary_aref, -1);
     rb_define_method(rb_cArray, "[]=", rb_ary_aset, -1);
     rb_define_method(rb_cArray, "at", rb_ary_at, 1);
     rb_define_method(rb_cArray, "fetch", rb_ary_fetch, -1);
