@@ -3439,7 +3439,7 @@ VALUE
 rb_opt_int_plus(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fix_plus_fix);
+        RB_SET_FASTPATH(rb_fix_plus_fix, idPLUS);
         return rb_fix_plus_fix(recv, obj);
     }
     else {
@@ -3451,11 +3451,11 @@ VALUE
 rb_opt_flo_plus(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_plus);
+        RB_SET_FASTPATH(rb_flonum_plus, idPLUS);
         return rb_flonum_plus(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_plus);
+        RB_SET_FASTPATH(rb_float_plus, idPLUS);
         return rb_float_plus(recv, obj);
     }
     else {
@@ -3467,7 +3467,7 @@ VALUE
 rb_opt_str_plus(VALUE recv, VALUE obj)
 {
     if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cString) {
-        RB_SET_FASTPATH(rb_str_plus);
+        RB_SET_FASTPATH(rb_str_plus, idPLUS);
     }
     return rb_str_plus(recv, obj);
 }
@@ -3476,7 +3476,7 @@ VALUE
 rb_opt_ary_plus(VALUE recv, VALUE obj)
 {
     if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cArray) {
-        RB_SET_FASTPATH(rb_ary_plus);
+        RB_SET_FASTPATH(rb_ary_plus, idPLUS);
     }
     return rb_ary_plus(recv, obj);
 }
@@ -3492,7 +3492,7 @@ VALUE
 rb_opt_int_minus(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fix_minus_fix);
+        RB_SET_FASTPATH(rb_fix_minus_fix, idMINUS);
         return rb_fix_minus_fix(recv, obj);
     }
     else {
@@ -3504,11 +3504,11 @@ VALUE
 rb_opt_flo_minus(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_minus);
+        RB_SET_FASTPATH(rb_flonum_minus, idMINUS);
         return rb_flonum_minus(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_minus);
+        RB_SET_FASTPATH(rb_float_minus, idMINUS);
         return rb_float_minus(recv, obj);
     }
     else {
@@ -3527,7 +3527,7 @@ VALUE
 rb_opt_int_mul(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fix_mul_fix);
+        RB_SET_FASTPATH(rb_fix_mul_fix, idMULT);
         return rb_fix_mul_fix(recv, obj);
     }
     else {
@@ -3539,11 +3539,11 @@ VALUE
 rb_opt_flo_mul(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_mul);
+        RB_SET_FASTPATH(rb_flonum_mul, idMULT);
         return rb_flonum_mul(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_mul);
+        RB_SET_FASTPATH(rb_float_mul, idMULT);
         return rb_float_mul(recv, obj);
     }
     else {
@@ -3562,7 +3562,7 @@ VALUE
 rb_opt_int_div(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fix_div_fix);
+        RB_SET_FASTPATH(rb_fix_div_fix, idDIV);
         return rb_fix_div_fix(recv, obj);
     }
     else {
@@ -3574,11 +3574,11 @@ VALUE
 rb_opt_flo_div(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_div);
+        RB_SET_FASTPATH(rb_flonum_div, idDIV);
         return rb_flonum_div(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_div);
+        RB_SET_FASTPATH(rb_float_div, idDIV);
         return rb_float_div(recv, obj);
     }
     else {
@@ -3597,7 +3597,7 @@ VALUE
 rb_opt_int_mod(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) && FIX2LONG(obj) != 0) {
-        RB_SET_FASTPATH(rb_fix_mod_fix);
+        RB_SET_FASTPATH(rb_fix_mod_fix, idMOD);
         return rb_fix_mod_fix(recv, obj);
     }
     else {
@@ -3609,11 +3609,11 @@ VALUE
 rb_opt_flo_mod(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj) && FIX2LONG(obj) != 0) {
-        RB_SET_FASTPATH(rb_flonum_mod);
+        RB_SET_FASTPATH(rb_flonum_mod, idMOD);
         return rb_flonum_mod(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_mod);
+        RB_SET_FASTPATH(rb_float_mod, idMOD);
         return rb_float_mod(recv, obj);
     }
     else {
@@ -3649,7 +3649,7 @@ VALUE
 rb_opt_int_lt(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fixnum_lt);
+        RB_SET_FASTPATH(rb_fixnum_lt, idLT);
         return rb_fixnum_lt(recv, obj);
     }
     else {
@@ -3661,11 +3661,11 @@ VALUE
 rb_opt_flo_lt(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_lt);
+        RB_SET_FASTPATH(rb_flonum_lt, idLT);
         return rb_flonum_lt(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_lt);
+        RB_SET_FASTPATH(rb_float_lt, idLT);
         return rb_float_lt(recv, obj);
     }
     else {
@@ -3685,7 +3685,7 @@ VALUE
 rb_opt_int_le(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fixnum_le);
+        RB_SET_FASTPATH(rb_fixnum_le, idLE);
         return rb_fixnum_le(recv, obj);
     }
     else {
@@ -3697,11 +3697,11 @@ VALUE
 rb_opt_flo_le(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_le);
+        RB_SET_FASTPATH(rb_flonum_le, idLE);
         return rb_flonum_le(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_le);
+        RB_SET_FASTPATH(rb_float_le, idLE);
         return rb_float_le(recv, obj);
     }
     else {
@@ -3721,7 +3721,7 @@ VALUE
 rb_opt_int_gt(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fixnum_gt);
+        RB_SET_FASTPATH(rb_fixnum_gt, idGT);
         return rb_fixnum_gt(recv, obj);
     }
     else {
@@ -3733,11 +3733,11 @@ VALUE
 rb_opt_flo_gt(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_gt);
+        RB_SET_FASTPATH(rb_flonum_gt, idGT);
         return rb_flonum_gt(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_gt);
+        RB_SET_FASTPATH(rb_float_gt, idGT);
         return rb_float_gt(recv, obj);
     }
     else {
@@ -3757,7 +3757,7 @@ VALUE
 rb_opt_int_ge(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_fixnum_ge);
+        RB_SET_FASTPATH(rb_fixnum_ge, idGE);
         return rb_fixnum_ge(recv, obj);
     }
     else {
@@ -3769,11 +3769,11 @@ VALUE
 rb_opt_flo_ge(VALUE recv, VALUE obj)
 {
     if (FLONUM_2_P(recv, obj)) {
-        RB_SET_FASTPATH(rb_flonum_ge);
+        RB_SET_FASTPATH(rb_flonum_ge, idGE);
         return rb_flonum_ge(recv, obj);
     }
     else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
-        RB_SET_FASTPATH(rb_float_ge);
+        RB_SET_FASTPATH(rb_float_ge, idGE);
         return rb_float_ge(recv, obj);
     }
     else {
@@ -3817,11 +3817,11 @@ rb_opt_ary_aref(int argc, const VALUE *argv, VALUE ary)
         return rb_ary_aref2(ary, argv[0], argv[1]);
     }
     if (FIXNUM_P(argv[0])) {
-        RB_SET_FASTPATH(rb_ary_entry_inline);
+        RB_SET_FASTPATH(rb_ary_entry_inline, idAREF);
         return rb_ary_entry_inline(ary, argv[0]);
     }
     else {
-        RB_SET_FASTPATH(rb_ary_aref1);
+        RB_SET_FASTPATH(rb_ary_aref1, idAREF);
         return rb_ary_aref1(ary, argv[0]);
     }
 }
@@ -3829,7 +3829,7 @@ rb_opt_ary_aref(int argc, const VALUE *argv, VALUE ary)
 VALUE
 rb_opt_hash_aref(VALUE hash, VALUE key)
 {
-    RB_SET_FASTPATH(rb_hash_aref);
+    RB_SET_FASTPATH(rb_hash_aref, idAREF);
     return rb_hash_aref(hash, key);
 }
 
@@ -3891,21 +3891,21 @@ RB_DEFINE_FASTPATH_INLINE(rb_hash_length_inline, 0, !SPECIAL_CONST_P(recv) && RB
 VALUE
 rb_opt_str_length(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_str_length);
+    RB_SET_FASTPATH(rb_str_length, idLength);
     return rb_str_length(recv);
 }
 
 VALUE
 rb_opt_ary_length(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_ary_length_inline);
+    RB_SET_FASTPATH(rb_ary_length_inline, idLength);
     return rb_ary_length_inline(recv);
 }
 
 VALUE
 rb_opt_hash_length(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_hash_length_inline);
+    RB_SET_FASTPATH(rb_hash_length_inline, idLength);
     return rb_hash_length_inline(recv);
 }
 
@@ -3919,21 +3919,21 @@ RB_DEFINE_FASTPATH_INLINE(rb_hash_size_inline, 0, !SPECIAL_CONST_P(recv) && RBAS
 VALUE
 rb_opt_str_size(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_str_size);
+    RB_SET_FASTPATH(rb_str_size, idSize);
     return rb_str_size(recv);
 }
 
 VALUE
 rb_opt_ary_size(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_ary_size_inline);
+    RB_SET_FASTPATH(rb_ary_size_inline, idSize);
     return rb_ary_size_inline(recv);
 }
 
 VALUE
 rb_opt_hash_size(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_hash_size_inline);
+    RB_SET_FASTPATH(rb_hash_size_inline, idSize);
     return rb_hash_size_inline(recv);
 }
 
@@ -3947,21 +3947,21 @@ RB_DEFINE_FASTPATH_INLINE(rb_hash_empty_p_inline, 0, !SPECIAL_CONST_P(recv) && R
 VALUE
 rb_opt_str_empty_p(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_str_empty_p);
+    RB_SET_FASTPATH(rb_str_empty_p, idEmptyP);
     return rb_str_empty_p(recv);
 }
 
 VALUE
 rb_opt_ary_empty_p(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_ary_empty_p_inline);
+    RB_SET_FASTPATH(rb_ary_empty_p_inline, idEmptyP);
     return rb_ary_empty_p_inline(recv);
 }
 
 VALUE
 rb_opt_hash_empty_p(VALUE recv)
 {
-    RB_SET_FASTPATH(rb_hash_empty_p_inline);
+    RB_SET_FASTPATH(rb_hash_empty_p_inline, idEmptyP);
     return rb_hash_empty_p_inline(recv);
 }
 

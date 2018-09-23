@@ -314,19 +314,22 @@ THROW_DATA_CONSUMED_SET(struct vm_throw_data *obj)
 } while (0)
 
 static inline void
-rb_set_fastpath(vm_call_handler fastpath)
+rb_set_fastpath(vm_call_handler fastpath, ID mid)
 {
     const rb_control_frame_t *caller_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(GET_EC()->cfp);
     if (caller_cfp->iseq == NULL || (caller_cfp->ep[0] & VM_FRAME_MAGIC_MASK) == VM_FRAME_MAGIC_IFUNC)
         return;
 
     if ((void *)(*(caller_cfp->pc - 3)) == rb_vm_insn_insn2addr(BIN(opt_send_without_block))) {
-        struct rb_call_cache *cc = (struct rb_call_cache *)(*(caller_cfp->pc - 1));
-        cc->call = fastpath;
+        struct rb_call_info *ci = (struct rb_call_info *)(*(caller_cfp->pc - 2));
+        if (ci->mid == mid) { /* guard against __send__ */
+            struct rb_call_cache *cc = (struct rb_call_cache *)(*(caller_cfp->pc - 1));
+            cc->call = fastpath;
+        }
     }
 }
 
-#define RB_SET_FASTPATH(funcname) rb_set_fastpath(funcname ## _fastpath)
+#define RB_SET_FASTPATH(funcname, mid) rb_set_fastpath(funcname ## _fastpath, mid)
 
 #define RB_DEFINE_FASTPATH_INLINE(funcname, argc, condition, definition) RB_DEFINE_FASTPATH_INLINE_ARG ## argc (funcname, condition, definition)
 #define RB_DEFINE_FASTPATH_INLINE_ARG0(funcname, condition, definition) \
