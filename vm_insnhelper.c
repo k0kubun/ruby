@@ -3549,27 +3549,38 @@ rb_opt_flo_mul(VALUE recv, VALUE obj)
     }
 }
 
-static VALUE
-vm_opt_div(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH(rb_fix_div_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_DIV, INTEGER_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_div, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_DIV, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH_INLINE(rb_float_div, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_DIV, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+
+VALUE
+rb_opt_int_div(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_DIV, INTEGER_REDEFINED_OP_FLAG)) {
-	return (FIX2LONG(obj) == 0) ? Qundef : rb_fix_div_fix(recv, obj);
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_DIV, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj));
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_DIV, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj));
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fix_div_fix);
+        return rb_fix_div_fix(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_div(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_div(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_div);
+        return rb_flonum_div(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_div);
+        return rb_float_div(recv, obj);
+    }
+    else {
+        return rb_flo_div(recv, obj);
     }
 }
 
