@@ -1147,48 +1147,6 @@ opt_aref_with
     }
 }
 
-/* optimized length */
-DEFINE_INSN
-opt_length
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv)
-(VALUE val)
-{
-    val = vm_opt_length(recv, BOP_LENGTH);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* optimized size */
-DEFINE_INSN
-opt_size
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv)
-(VALUE val)
-{
-    val = vm_opt_length(recv, BOP_SIZE);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* optimized empty? */
-DEFINE_INSN
-opt_empty_p
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv)
-(VALUE val)
-{
-    val = vm_opt_empty_p(recv);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
 /* optimized succ */
 DEFINE_INSN
 opt_succ

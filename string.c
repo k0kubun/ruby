@@ -10931,10 +10931,10 @@ Init_String(void)
     rb_define_method(rb_cString, "[]", rb_str_aref_m, -1);
     rb_define_method(rb_cString, "[]=", rb_str_aset_m, -1);
     rb_define_method(rb_cString, "insert", rb_str_insert, 2);
-    rb_define_method(rb_cString, "length", rb_str_length, 0);
-    rb_define_method(rb_cString, "size", rb_str_length, 0);
+    rb_define_method(rb_cString, "length", rb_opt_str_length, 0);
+    rb_define_method(rb_cString, "size", rb_opt_str_size, 0);
     rb_define_method(rb_cString, "bytesize", rb_str_bytesize, 0);
-    rb_define_method(rb_cString, "empty?", rb_str_empty, 0);
+    rb_define_method(rb_cString, "empty?", rb_opt_str_empty_p, 0);
     rb_define_method(rb_cString, "=~", rb_str_match, 1);
     rb_define_method(rb_cString, "match", rb_str_match_m, -1);
     rb_define_method(rb_cString, "match?", rb_str_match_m_p, -1);

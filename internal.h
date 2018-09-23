@@ -1982,6 +1982,15 @@ VALUE rb_opt_int_ge(VALUE recv, VALUE obj);
 VALUE rb_opt_flo_ge(VALUE recv, VALUE obj);
 VALUE rb_opt_ary_aref(int argc, const VALUE *argv, VALUE ary);
 VALUE rb_opt_hash_aref(VALUE recv, VALUE obj);
+VALUE rb_opt_str_length(VALUE recv);
+VALUE rb_opt_ary_length(VALUE recv);
+VALUE rb_opt_hash_length(VALUE recv);
+VALUE rb_opt_str_size(VALUE recv);
+VALUE rb_opt_ary_size(VALUE recv);
+VALUE rb_opt_hash_size(VALUE recv);
+VALUE rb_opt_str_empty_p(VALUE recv);
+VALUE rb_opt_ary_empty_p(VALUE recv);
+VALUE rb_opt_hash_empty_p(VALUE recv);
 void Init_vm_stack_canary(void);
 
 /* vm_method.c */

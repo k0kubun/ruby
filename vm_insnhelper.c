@@ -3881,42 +3881,88 @@ vm_opt_aset_with(VALUE recv, VALUE key, VALUE val)
     }
 }
 
-static VALUE
-vm_opt_length(VALUE recv, int bop)
+RB_DEFINE_FASTPATH(rb_str_length, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_LENGTH, STRING_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH_INLINE(rb_ary_length_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_LENGTH, ARRAY_REDEFINED_OP_FLAG), LONG2NUM(RARRAY_LEN(recv)));
+RB_DEFINE_FASTPATH_INLINE(rb_hash_length_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cHash &&
+        BASIC_OP_UNREDEFINED_P(BOP_LENGTH, HASH_REDEFINED_OP_FLAG), INT2FIX(RHASH_SIZE(recv)));
+
+VALUE
+rb_opt_str_length(VALUE recv)
 {
-    if (SPECIAL_CONST_P(recv)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cString &&
-	     BASIC_OP_UNREDEFINED_P(bop, STRING_REDEFINED_OP_FLAG)) {
-	if (bop == BOP_EMPTY_P) {
-	    return LONG2NUM(RSTRING_LEN(recv));
-	}
-	else {
-	    return rb_str_length(recv);
-	}
-    }
-    else if (RBASIC_CLASS(recv) == rb_cArray &&
-	     BASIC_OP_UNREDEFINED_P(bop, ARRAY_REDEFINED_OP_FLAG)) {
-	return LONG2NUM(RARRAY_LEN(recv));
-    }
-    else if (RBASIC_CLASS(recv) == rb_cHash &&
-	     BASIC_OP_UNREDEFINED_P(bop, HASH_REDEFINED_OP_FLAG)) {
-	return INT2FIX(RHASH_SIZE(recv));
-    }
-    else {
-	return Qundef;
-    }
+    RB_SET_FASTPATH(rb_str_length);
+    return rb_str_length(recv);
 }
 
-static VALUE
-vm_opt_empty_p(VALUE recv)
+VALUE
+rb_opt_ary_length(VALUE recv)
 {
-    switch (vm_opt_length(recv, BOP_EMPTY_P)) {
-      case Qundef: return Qundef;
-      case INT2FIX(0): return Qtrue;
-      default: return Qfalse;
-    }
+    RB_SET_FASTPATH(rb_ary_length_inline);
+    return rb_ary_length_inline(recv);
+}
+
+VALUE
+rb_opt_hash_length(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_hash_length_inline);
+    return rb_hash_length_inline(recv);
+}
+
+RB_DEFINE_FASTPATH_INLINE(rb_str_size, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_SIZE, STRING_REDEFINED_OP_FLAG), rb_str_length(recv));
+RB_DEFINE_FASTPATH_INLINE(rb_ary_size_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_SIZE, ARRAY_REDEFINED_OP_FLAG), LONG2NUM(RARRAY_LEN(recv)));
+RB_DEFINE_FASTPATH_INLINE(rb_hash_size_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cHash &&
+        BASIC_OP_UNREDEFINED_P(BOP_SIZE, HASH_REDEFINED_OP_FLAG), INT2FIX(RHASH_SIZE(recv)));
+
+VALUE
+rb_opt_str_size(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_str_size);
+    return rb_str_size(recv);
+}
+
+VALUE
+rb_opt_ary_size(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_ary_size_inline);
+    return rb_ary_size_inline(recv);
+}
+
+VALUE
+rb_opt_hash_size(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_hash_size_inline);
+    return rb_hash_size_inline(recv);
+}
+
+RB_DEFINE_FASTPATH_INLINE(rb_str_empty_p, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cString &&
+        BASIC_OP_UNREDEFINED_P(BOP_EMPTY_P, STRING_REDEFINED_OP_FLAG), RSTRING_LEN(recv) == 0 ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_ary_empty_p_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cArray &&
+        BASIC_OP_UNREDEFINED_P(BOP_EMPTY_P, ARRAY_REDEFINED_OP_FLAG), RARRAY_LEN(recv) == 0 ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_hash_empty_p_inline, 0, !SPECIAL_CONST_P(recv) && RBASIC_CLASS(recv) == rb_cHash &&
+        BASIC_OP_UNREDEFINED_P(BOP_EMPTY_P, HASH_REDEFINED_OP_FLAG), RHASH_EMPTY_P(recv) ? Qtrue : Qfalse);
+
+VALUE
+rb_opt_str_empty_p(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_str_empty_p);
+    return rb_str_empty_p(recv);
+}
+
+VALUE
+rb_opt_ary_empty_p(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_ary_empty_p_inline);
+    return rb_ary_empty_p_inline(recv);
+}
+
+VALUE
+rb_opt_hash_empty_p(VALUE recv)
+{
+    RB_SET_FASTPATH(rb_hash_empty_p_inline);
+    return rb_hash_empty_p_inline(recv);
 }
 
 static VALUE
@@ -4017,6 +4063,15 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_ary_entry_inline);
     DETECT_FASTPATH(rb_ary_aref1);
     DETECT_FASTPATH(rb_hash_aref);
+    DETECT_FASTPATH(rb_str_length);
+    DETECT_FASTPATH(rb_ary_length_inline);
+    DETECT_FASTPATH(rb_hash_length_inline);
+    DETECT_FASTPATH(rb_str_size);
+    DETECT_FASTPATH(rb_ary_size_inline);
+    DETECT_FASTPATH(rb_hash_size_inline);
+    DETECT_FASTPATH(rb_str_empty_p);
+    DETECT_FASTPATH(rb_ary_empty_p_inline);
+    DETECT_FASTPATH(rb_hash_empty_p_inline);
     return NULL;
 #undef DETECT_FASTPATH
 }

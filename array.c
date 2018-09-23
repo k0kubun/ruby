@@ -1913,23 +1913,6 @@ rb_ary_length(VALUE ary)
     return LONG2NUM(len);
 }
 
-/*
- *  call-seq:
- *     ary.empty?   -> true or false
- *
- *  Returns +true+ if +self+ contains no elements.
- *
- *     [].empty?   #=> true
- */
-
-static VALUE
-rb_ary_empty_p(VALUE ary)
-{
-    if (RARRAY_LEN(ary) == 0)
-	return Qtrue;
-    return Qfalse;
-}
-
 VALUE
 rb_ary_dup(VALUE ary)
 {
@@ -6307,9 +6290,9 @@ Init_Array(void)
     rb_define_method(rb_cArray, "each", rb_ary_each, 0);
     rb_define_method(rb_cArray, "each_index", rb_ary_each_index, 0);
     rb_define_method(rb_cArray, "reverse_each", rb_ary_reverse_each, 0);
-    rb_define_method(rb_cArray, "length", rb_ary_length, 0);
-    rb_define_alias(rb_cArray,  "size", "length");
-    rb_define_method(rb_cArray, "empty?", rb_ary_empty_p, 0);
+    rb_define_method(rb_cArray, "length", rb_opt_ary_length, 0);
+    rb_define_method(rb_cArray, "size", rb_opt_ary_size, 0);
+    rb_define_method(rb_cArray, "empty?", rb_opt_ary_empty_p, 0);
     rb_define_method(rb_cArray, "find_index", rb_ary_index, -1);
     rb_define_method(rb_cArray, "index", rb_ary_index, -1);
     rb_define_method(rb_cArray, "rindex", rb_ary_rindex, -1);

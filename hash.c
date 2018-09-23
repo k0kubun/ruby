@@ -1749,22 +1749,6 @@ rb_hash_size(VALUE hash)
 }
 
 
-/*
- *  call-seq:
- *     hsh.empty?    -> true or false
- *
- *  Returns <code>true</code> if <i>hsh</i> contains no key-value pairs.
- *
- *     {}.empty?   #=> true
- *
- */
-
-static VALUE
-rb_hash_empty_p(VALUE hash)
-{
-    return RHASH_EMPTY_P(hash) ? Qtrue : Qfalse;
-}
-
 static int
 each_value_i(VALUE key, VALUE value)
 {
@@ -4729,9 +4713,9 @@ Init_Hash(void)
     rb_define_method(rb_cHash, "default_proc=", rb_hash_set_default_proc, 1);
     rb_define_method(rb_cHash, "key", rb_hash_key, 1);
     rb_define_method(rb_cHash, "index", rb_hash_index, 1);
-    rb_define_method(rb_cHash, "size", rb_hash_size, 0);
-    rb_define_method(rb_cHash, "length", rb_hash_size, 0);
-    rb_define_method(rb_cHash, "empty?", rb_hash_empty_p, 0);
+    rb_define_method(rb_cHash, "size", rb_opt_hash_size, 0);
+    rb_define_method(rb_cHash, "length", rb_opt_hash_length, 0);
+    rb_define_method(rb_cHash, "empty?", rb_opt_hash_empty_p, 0);
 
     rb_define_method(rb_cHash, "each_value", rb_hash_each_value, 0);
     rb_define_method(rb_cHash, "each_key", rb_hash_each_key, 0);
