@@ -3588,10 +3588,10 @@ rb_opt_flo_div(VALUE recv, VALUE obj)
 
 RB_DEFINE_FASTPATH(rb_fix_mod_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MOD, INTEGER_REDEFINED_OP_FLAG) && FIX2LONG(obj) != 0);
 RB_DEFINE_FASTPATH_INLINE(rb_flonum_mod, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG),
-        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+        DBL2NUM(ruby_float_mod(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj))));
 RB_DEFINE_FASTPATH_INLINE(rb_float_mod, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
         RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG),
-        DBL2NUM(RFLOAT_VALUE(recv) / RFLOAT_VALUE(obj)));
+        DBL2NUM(ruby_float_mod(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj))));
 
 VALUE
 rb_opt_int_mod(VALUE recv, VALUE obj)
