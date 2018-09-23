@@ -1507,8 +1507,10 @@ check_match(rb_execution_context_t *ec, VALUE pattern, VALUE target, enum vm_che
 
 #if defined(_MSC_VER) && _MSC_VER < 1300
 #define CHECK_CMP_NAN(a, b) if (isnan(a) || isnan(b)) return Qfalse;
+#define WITH_CMP_NAN_CHECK(a, b, cond) (isnan(a) || isnan(b)) ? Qfalse : cond
 #else
 #define CHECK_CMP_NAN(a, b) /* do nothing */
+#define WITH_CMP_NAN_CHECK(a, b, cond) cond
 #endif
 
 static inline VALUE
@@ -3635,103 +3637,147 @@ vm_opt_neq(CALL_INFO ci, CALL_CACHE cc,
     return Qundef;
 }
 
-static VALUE
-vm_opt_lt(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH_INLINE(rb_fixnum_lt, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_LT, INTEGER_REDEFINED_OP_FLAG),
+        (SIGNED_VALUE)recv < (SIGNED_VALUE)obj ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_lt, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_LT, FLOAT_REDEFINED_OP_FLAG),
+        RFLOAT_VALUE(recv) < RFLOAT_VALUE(obj) ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_float_lt, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_LT, FLOAT_REDEFINED_OP_FLAG),
+        WITH_CMP_NAN_CHECK(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj), RFLOAT_VALUE(recv) < RFLOAT_VALUE(obj) ? Qtrue : Qfalse));
+
+VALUE
+rb_opt_int_lt(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_LT, INTEGER_REDEFINED_OP_FLAG)) {
-	return (SIGNED_VALUE)recv < (SIGNED_VALUE)obj ? Qtrue : Qfalse;
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_LT, FLOAT_REDEFINED_OP_FLAG)) {
-	return RFLOAT_VALUE(recv) < RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_LT, FLOAT_REDEFINED_OP_FLAG)) {
-	CHECK_CMP_NAN(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj));
-	return RFLOAT_VALUE(recv) < RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fixnum_lt);
+        return rb_fixnum_lt(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_lt(recv, obj);
     }
 }
 
-static VALUE
-vm_opt_le(VALUE recv, VALUE obj)
+VALUE
+rb_opt_flo_lt(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_LE, INTEGER_REDEFINED_OP_FLAG)) {
-	return (SIGNED_VALUE)recv <= (SIGNED_VALUE)obj ? Qtrue : Qfalse;
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_lt);
+        return rb_flonum_lt(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_LE, FLOAT_REDEFINED_OP_FLAG)) {
-	return RFLOAT_VALUE(recv) <= RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_LE, FLOAT_REDEFINED_OP_FLAG)) {
-	CHECK_CMP_NAN(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj));
-	return RFLOAT_VALUE(recv) <= RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_lt);
+        return rb_float_lt(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_flo_lt(recv, obj);
     }
 }
 
-static VALUE
-vm_opt_gt(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH_INLINE(rb_fixnum_le, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_LE, INTEGER_REDEFINED_OP_FLAG),
+        (SIGNED_VALUE)recv <= (SIGNED_VALUE)obj ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_le, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_LE, FLOAT_REDEFINED_OP_FLAG),
+        RFLOAT_VALUE(recv) <= RFLOAT_VALUE(obj) ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_float_le, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_LE, FLOAT_REDEFINED_OP_FLAG),
+        WITH_CMP_NAN_CHECK(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj), RFLOAT_VALUE(recv) <= RFLOAT_VALUE(obj) ? Qtrue : Qfalse));
+
+VALUE
+rb_opt_int_le(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_GT, INTEGER_REDEFINED_OP_FLAG)) {
-	return (SIGNED_VALUE)recv > (SIGNED_VALUE)obj ? Qtrue : Qfalse;
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG)) {
-	return RFLOAT_VALUE(recv) > RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG)) {
-	CHECK_CMP_NAN(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj));
-	return RFLOAT_VALUE(recv) > RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fixnum_le);
+        return rb_fixnum_le(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_le(recv, obj);
     }
 }
 
-static VALUE
-vm_opt_ge(VALUE recv, VALUE obj)
+VALUE
+rb_opt_flo_le(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_GE, INTEGER_REDEFINED_OP_FLAG)) {
-	return (SIGNED_VALUE)recv >= (SIGNED_VALUE)obj ? Qtrue : Qfalse;
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_le);
+        return rb_flonum_le(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_GE, FLOAT_REDEFINED_OP_FLAG)) {
-	return RFLOAT_VALUE(recv) >= RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_GE, FLOAT_REDEFINED_OP_FLAG)) {
-	CHECK_CMP_NAN(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj));
-	return RFLOAT_VALUE(recv) >= RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_le);
+        return rb_float_le(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_flo_le(recv, obj);
+    }
+}
+
+RB_DEFINE_FASTPATH_INLINE(rb_fixnum_gt, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_GT, INTEGER_REDEFINED_OP_FLAG),
+        (SIGNED_VALUE)recv > (SIGNED_VALUE)obj ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_gt, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG),
+        RFLOAT_VALUE(recv) > RFLOAT_VALUE(obj) ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_float_gt, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG),
+        WITH_CMP_NAN_CHECK(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj), RFLOAT_VALUE(recv) > RFLOAT_VALUE(obj) ? Qtrue : Qfalse));
+
+VALUE
+rb_opt_int_gt(VALUE recv, VALUE obj)
+{
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fixnum_gt);
+        return rb_fixnum_gt(recv, obj);
+    }
+    else {
+        return rb_int_gt(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_gt(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_gt);
+        return rb_flonum_gt(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_gt);
+        return rb_float_gt(recv, obj);
+    }
+    else {
+        return rb_flo_gt(recv, obj);
+    }
+}
+
+RB_DEFINE_FASTPATH_INLINE(rb_fixnum_ge, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_GE, INTEGER_REDEFINED_OP_FLAG),
+        (SIGNED_VALUE)recv >= (SIGNED_VALUE)obj ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_ge, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_GE, FLOAT_REDEFINED_OP_FLAG),
+        RFLOAT_VALUE(recv) >= RFLOAT_VALUE(obj) ? Qtrue : Qfalse);
+RB_DEFINE_FASTPATH_INLINE(rb_float_ge, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_GE, FLOAT_REDEFINED_OP_FLAG),
+        WITH_CMP_NAN_CHECK(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj), RFLOAT_VALUE(recv) >= RFLOAT_VALUE(obj) ? Qtrue : Qfalse));
+
+VALUE
+rb_opt_int_ge(VALUE recv, VALUE obj)
+{
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fixnum_ge);
+        return rb_fixnum_ge(recv, obj);
+    }
+    else {
+        return rb_int_ge(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_ge(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_ge);
+        return rb_flonum_ge(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_ge);
+        return rb_float_ge(recv, obj);
+    }
+    else {
+        return rb_flo_ge(recv, obj);
     }
 }
 
@@ -3948,6 +3994,18 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_fix_mod_fix);
     DETECT_FASTPATH(rb_flonum_mod);
     DETECT_FASTPATH(rb_float_mod);
+    DETECT_FASTPATH(rb_float_lt);
+    DETECT_FASTPATH(rb_flonum_lt);
+    DETECT_FASTPATH(rb_float_lt);
+    DETECT_FASTPATH(rb_float_le);
+    DETECT_FASTPATH(rb_flonum_le);
+    DETECT_FASTPATH(rb_float_le);
+    DETECT_FASTPATH(rb_float_gt);
+    DETECT_FASTPATH(rb_flonum_gt);
+    DETECT_FASTPATH(rb_float_gt);
+    DETECT_FASTPATH(rb_float_ge);
+    DETECT_FASTPATH(rb_flonum_ge);
+    DETECT_FASTPATH(rb_float_ge);
     return NULL;
 #undef DETECT_FASTPATH
 }

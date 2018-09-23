@@ -3234,10 +3234,6 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		switch (ci->mid) {
 		  case idEq:	 SP_INSN(eq);	  return COMPILE_OK;
 		  case idNeq:	 SP_INSN(neq);	  return COMPILE_OK;
-		  case idLT:	 SP_INSN(lt);	  return COMPILE_OK;
-		  case idLE:	 SP_INSN(le);	  return COMPILE_OK;
-		  case idGT:	 SP_INSN(gt);	  return COMPILE_OK;
-		  case idGE:	 SP_INSN(ge);	  return COMPILE_OK;
 		  case idLTLT:	 SP_INSN(ltlt);	  return COMPILE_OK;
 		  case idAREF:	 SP_INSN(aref);	  return COMPILE_OK;
 		}

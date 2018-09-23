@@ -1074,62 +1074,6 @@ opt_neq
     }
 }
 
-/* optimized X<Y. */
-DEFINE_INSN
-opt_lt
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv, VALUE obj)
-(VALUE val)
-{
-    val = vm_opt_lt(recv, obj);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* optimized X<=Y. */
-DEFINE_INSN
-opt_le
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv, VALUE obj)
-(VALUE val)
-{
-    val = vm_opt_le(recv, obj);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* optimized X>Y. */
-DEFINE_INSN
-opt_gt
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv, VALUE obj)
-(VALUE val)
-{
-    val = vm_opt_gt(recv, obj);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* optimized X>=Y. */
-DEFINE_INSN
-opt_ge
-(CALL_INFO ci, CALL_CACHE cc)
-(VALUE recv, VALUE obj)
-(VALUE val)
-{
-    val = vm_opt_ge(recv, obj);
-
-    if (val == Qundef) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
 /* << */
 DEFINE_INSN
 opt_ltlt

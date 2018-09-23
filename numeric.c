@@ -1465,7 +1465,7 @@ rb_float_cmp(VALUE x, VALUE y)
  */
 
 VALUE
-rb_float_gt(VALUE x, VALUE y)
+rb_flo_gt(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -1501,8 +1501,8 @@ rb_float_gt(VALUE x, VALUE y)
  * so an implementation-dependent value is returned.
  */
 
-static VALUE
-flo_ge(VALUE x, VALUE y)
+VALUE
+rb_flo_ge(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -1538,8 +1538,8 @@ flo_ge(VALUE x, VALUE y)
  * so an implementation-dependent value is returned.
  */
 
-static VALUE
-flo_lt(VALUE x, VALUE y)
+VALUE
+rb_flo_lt(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -1575,8 +1575,8 @@ flo_lt(VALUE x, VALUE y)
  * so an implementation-dependent value is returned.
  */
 
-static VALUE
-flo_le(VALUE x, VALUE y)
+VALUE
+rb_flo_le(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -4267,8 +4267,8 @@ fix_lt(VALUE x, VALUE y)
     }
 }
 
-static VALUE
-int_lt(VALUE x, VALUE y)
+VALUE
+rb_int_lt(VALUE x, VALUE y)
 {
     if (FIXNUM_P(x)) {
 	return fix_lt(x, y);
@@ -4307,8 +4307,8 @@ fix_le(VALUE x, VALUE y)
     }
 }
 
-static VALUE
-int_le(VALUE x, VALUE y)
+VALUE
+rb_int_le(VALUE x, VALUE y)
 {
     if (FIXNUM_P(x)) {
 	return fix_le(x, y);
@@ -5495,10 +5495,10 @@ Init_Numeric(void)
 
     rb_define_method(rb_cInteger, "===", rb_int_equal, 1);
     rb_define_method(rb_cInteger, "==", rb_int_equal, 1);
-    rb_define_method(rb_cInteger, ">", rb_int_gt, 1);
-    rb_define_method(rb_cInteger, ">=", rb_int_ge, 1);
-    rb_define_method(rb_cInteger, "<", int_lt, 1);
-    rb_define_method(rb_cInteger, "<=", int_le, 1);
+    rb_define_method(rb_cInteger, ">", rb_opt_int_gt, 1);
+    rb_define_method(rb_cInteger, ">=", rb_opt_int_ge, 1);
+    rb_define_method(rb_cInteger, "<", rb_opt_int_lt, 1);
+    rb_define_method(rb_cInteger, "<=", rb_opt_int_le, 1);
 
     rb_define_method(rb_cInteger, "~", int_comp, 0);
     rb_define_method(rb_cInteger, "&", rb_int_and, 1);
@@ -5637,10 +5637,10 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "==", flo_eq, 1);
     rb_define_method(rb_cFloat, "===", flo_eq, 1);
     rb_define_method(rb_cFloat, "<=>", flo_cmp, 1);
-    rb_define_method(rb_cFloat, ">",  rb_float_gt, 1);
-    rb_define_method(rb_cFloat, ">=", flo_ge, 1);
-    rb_define_method(rb_cFloat, "<",  flo_lt, 1);
-    rb_define_method(rb_cFloat, "<=", flo_le, 1);
+    rb_define_method(rb_cFloat, ">",  rb_opt_flo_gt, 1);
+    rb_define_method(rb_cFloat, ">=", rb_opt_flo_ge, 1);
+    rb_define_method(rb_cFloat, "<",  rb_opt_flo_lt, 1);
+    rb_define_method(rb_cFloat, "<=", rb_opt_flo_le, 1);
     rb_define_method(rb_cFloat, "eql?", flo_eql, 1);
     rb_define_method(rb_cFloat, "hash", flo_hash, 0);
     rb_define_method(rb_cFloat, "to_f", flo_to_f, 0);

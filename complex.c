@@ -98,7 +98,7 @@ f_gt_p(VALUE x, VALUE y)
         return RTEST(rb_int_gt(x, y));
     }
     else if (RB_FLOAT_TYPE_P(x))
-        return RTEST(rb_float_gt(x, y));
+        return RTEST(rb_flo_gt(x, y));
     else if (RB_TYPE_P(x, T_RATIONAL)) {
         int const cmp = rb_cmpint(rb_rational_cmp(x, y), x, y);
         return cmp > 0;
