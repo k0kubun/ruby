@@ -1066,8 +1066,8 @@ rb_flo_minus(VALUE x, VALUE y)
  * Returns a new Float which is the product of +float+ and +other+.
  */
 
-static VALUE
-flo_mul(VALUE x, VALUE y)
+VALUE
+rb_flo_mul(VALUE x, VALUE y)
 {
     if (RB_TYPE_P(y, T_FIXNUM)) {
 	return DBL2NUM(RFLOAT_VALUE(x) * (double)FIX2LONG(y));
@@ -5478,7 +5478,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, "-@", rb_int_uminus, 0);
     rb_define_method(rb_cInteger, "+", rb_opt_int_plus, 1);
     rb_define_method(rb_cInteger, "-", rb_opt_int_minus, 1);
-    rb_define_method(rb_cInteger, "*", rb_int_mul, 1);
+    rb_define_method(rb_cInteger, "*", rb_opt_int_mul, 1);
     rb_define_method(rb_cInteger, "/", rb_int_div, 1);
     rb_define_method(rb_cInteger, "div", rb_int_idiv, 1);
     rb_define_method(rb_cInteger, "%", rb_int_modulo, 1);
@@ -5626,7 +5626,7 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "-@", rb_float_uminus, 0);
     rb_define_method(rb_cFloat, "+", rb_opt_flo_plus, 1);
     rb_define_method(rb_cFloat, "-", rb_opt_flo_minus, 1);
-    rb_define_method(rb_cFloat, "*", flo_mul, 1);
+    rb_define_method(rb_cFloat, "*", rb_opt_flo_mul, 1);
     rb_define_method(rb_cFloat, "/", flo_div, 1);
     rb_define_method(rb_cFloat, "quo", flo_quo, 1);
     rb_define_method(rb_cFloat, "fdiv", flo_quo, 1);

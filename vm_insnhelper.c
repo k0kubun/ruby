@@ -3514,27 +3514,38 @@ rb_opt_flo_minus(VALUE recv, VALUE obj)
     }
 }
 
-static VALUE
-vm_opt_mult(VALUE recv, VALUE obj)
+RB_DEFINE_FASTPATH(rb_fix_mul_fix, 1, FIXNUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MULT, INTEGER_REDEFINED_OP_FLAG));
+RB_DEFINE_FASTPATH_INLINE(rb_flonum_mul, 1, FLONUM_2_P(recv, obj) && BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) * RFLOAT_VALUE(obj)));
+RB_DEFINE_FASTPATH_INLINE(rb_float_mul, 1, !SPECIAL_CONST_P(recv) && !SPECIAL_CONST_P(obj) &&
+        RBASIC_CLASS(recv) == rb_cFloat && RBASIC_CLASS(obj) == rb_cFloat && BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG),
+        DBL2NUM(RFLOAT_VALUE(recv) * RFLOAT_VALUE(obj)));
+
+VALUE
+rb_opt_int_mul(VALUE recv, VALUE obj)
 {
-    if (FIXNUM_2_P(recv, obj) &&
-	BASIC_OP_UNREDEFINED_P(BOP_MULT, INTEGER_REDEFINED_OP_FLAG)) {
-	return rb_fix_mul_fix(recv, obj);
-    }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) * RFLOAT_VALUE(obj));
-    }
-    else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
-	return Qundef;
-    }
-    else if (RBASIC_CLASS(recv) == rb_cFloat &&
-	     RBASIC_CLASS(obj)  == rb_cFloat &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG)) {
-	return DBL2NUM(RFLOAT_VALUE(recv) * RFLOAT_VALUE(obj));
+    if (FIXNUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_fix_mul_fix);
+        return rb_fix_mul_fix(recv, obj);
     }
     else {
-	return Qundef;
+        return rb_int_mul(recv, obj);
+    }
+}
+
+VALUE
+rb_opt_flo_mul(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj)) {
+        RB_SET_FASTPATH(rb_flonum_mul);
+        return rb_flonum_mul(recv, obj);
+    }
+    else if (!SPECIAL_CONST_P(obj) && RBASIC_CLASS(obj) == rb_cFloat) {
+        RB_SET_FASTPATH(rb_float_mul);
+        return rb_float_mul(recv, obj);
+    }
+    else {
+        return rb_flo_mul(recv, obj);
     }
 }
 
@@ -3906,6 +3917,9 @@ rb_vm_fastpath_funcname(vm_call_handler call)
     DETECT_FASTPATH(rb_fix_minus_fix);
     DETECT_FASTPATH(rb_flonum_minus);
     DETECT_FASTPATH(rb_float_minus);
+    DETECT_FASTPATH(rb_fix_mul_fix);
+    DETECT_FASTPATH(rb_flonum_mul);
+    DETECT_FASTPATH(rb_float_mul);
     return NULL;
 #undef DETECT_FASTPATH
 }
