@@ -18,7 +18,23 @@
 %
 % if insn.name == 'opt_send_without_block'
     if ((fastpath = rb_vm_fastpath_funcname(cc->call)) != NULL) {
-        if (argc == 1) {
+        if (argc == 0) {
+            fprintf(f, "{\n");
+            fprintf(f, "    VALUE recv = stack[%d];\n", b->stack_size - 1);
+            fprintf(f, "    if (LIKELY(%s_fastpath_p(recv))) {\n", fastpath);
+            fprintf(f, "        stack[%d] = %s(recv);\n", b->stack_size - 1, fastpath);
+            fprintf(f, "    }\n");
+            fprintf(f, "    else {\n");
+            fprintf(f, "        reg_cfp->sp = (VALUE *)reg_cfp->bp + %d;\n", b->stack_size + 1);
+            if (!pc_moved_p) {
+                fprintf(f, "        reg_cfp->pc = original_body_iseq + %d;\n", pos);
+            }
+            fprintf(f, "        goto cancel;\n");
+            fprintf(f, "    }\n");
+            fprintf(f, "}\n");
+            break;
+        }
+        else if (argc == 1) {
             fprintf(f, "{\n");
             fprintf(f, "    VALUE recv = stack[%d];\n", b->stack_size - 2);
             fprintf(f, "    VALUE obj = stack[%d];\n", b->stack_size - 1);
