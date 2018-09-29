@@ -3871,7 +3871,7 @@ vm_opt_empty_p(VALUE recv)
 }
 
 static VALUE
-vm_opt_succ(VALUE recv)
+vm_opt_succ_int(VALUE recv)
 {
     if (FIXNUM_P(recv) &&
 	BASIC_OP_UNREDEFINED_P(BOP_SUCC, INTEGER_REDEFINED_OP_FLAG)) {
@@ -3883,7 +3883,13 @@ vm_opt_succ(VALUE recv)
 	    return recv - 1 + INT2FIX(1);
 	}
     }
-    else if (SPECIAL_CONST_P(recv)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_succ_string(VALUE recv)
+{
+    if (SPECIAL_CONST_P(recv)) {
 	return Qundef;
     }
     else if (RBASIC_CLASS(recv) == rb_cString &&
@@ -3960,8 +3966,13 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
         switch (ci->orig_argc) {
           case 0:
             switch (ci->mid) {
-              case idEmptyP: SP_INSN0(empty_p); break;
-              case idSucc:   SP_INSN0(succ); break;
+              case idEmptyP:
+                SP_INSN0(empty_p);
+                break;
+              case idSucc:
+                SP_INSN0(succ_int);
+                SP_INSN0(succ_string);
+                break;
             }
             break;
           case 1:
@@ -4008,8 +4019,12 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(ltlt_string);
                 SP_INSN1(ltlt_array);
                 break;
-              case idAnd:   SP_INSN1(and);   break;
-              case idOr:    SP_INSN1(or);    break;
+              case idAnd:
+                SP_INSN1(and);
+                break;
+              case idOr:
+                SP_INSN1(or);
+                break;
             }
             break;
         }

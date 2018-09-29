@@ -1562,15 +1562,29 @@ opt_empty_p
 
 /* optimized succ */
 DEFINE_INSN
-opt_succ
+opt_succ_int
 (CALL_INFO ci, CALL_CACHE cc)
 (VALUE recv)
 (VALUE val)
 {
-    val = vm_opt_succ(recv);
+    val = vm_opt_succ_int(recv);
 
     if (val == Qundef) {
-        vm_change_insn(GET_CFP(), PC_OFFSET(opt_succ, ci, cc), BIN(opt_send_without_block));
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_succ_int, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_succ_string
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv)
+(VALUE val)
+{
+    val = vm_opt_succ_string(recv);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_succ_string, ci, cc), BIN(opt_send_without_block));
         CALL_SIMPLE_METHOD();
     }
 }
