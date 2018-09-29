@@ -3448,14 +3448,20 @@ vm_opt_plus_array(VALUE recv, VALUE obj)
 }
 
 static VALUE
-vm_opt_minus(VALUE recv, VALUE obj)
+vm_opt_minus_int(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_MINUS, INTEGER_REDEFINED_OP_FLAG)) {
 	return rb_fix_minus_fix(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_minus_float(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_MINUS, FLOAT_REDEFINED_OP_FLAG)) {
 	return DBL2NUM(RFLOAT_VALUE(recv) - RFLOAT_VALUE(obj));
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
@@ -3915,7 +3921,10 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(plus_string);
                 SP_INSN1(plus_array);
                 break;
-              case idMINUS: SP_INSN1(minus); break;
+              case idMINUS:
+                SP_INSN1(minus_int);
+                SP_INSN1(minus_float);
+                break;
               case idMULT:  SP_INSN1(mult);  break;
               case idDIV:   SP_INSN1(div);   break;
               case idMOD:   SP_INSN1(mod);   break;
