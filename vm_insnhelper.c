@@ -3478,14 +3478,20 @@ vm_opt_minus_float(VALUE recv, VALUE obj)
 }
 
 static VALUE
-vm_opt_mult(VALUE recv, VALUE obj)
+vm_opt_mult_int(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_MULT, INTEGER_REDEFINED_OP_FLAG)) {
 	return rb_fix_mul_fix(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_mult_float(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_MULT, FLOAT_REDEFINED_OP_FLAG)) {
 	return DBL2NUM(RFLOAT_VALUE(recv) * RFLOAT_VALUE(obj));
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
@@ -3925,7 +3931,10 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(minus_int);
                 SP_INSN1(minus_float);
                 break;
-              case idMULT:  SP_INSN1(mult);  break;
+              case idMULT:
+                SP_INSN1(mult_int);
+                SP_INSN1(mult_float);
+                break;
               case idDIV:   SP_INSN1(div);   break;
               case idMOD:   SP_INSN1(mod);   break;
               case idLT:    SP_INSN1(lt);    break;
