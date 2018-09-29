@@ -3709,7 +3709,7 @@ vm_opt_ge_float(VALUE recv, VALUE obj)
 
 
 static VALUE
-vm_opt_ltlt(VALUE recv, VALUE obj)
+vm_opt_ltlt_string(VALUE recv, VALUE obj)
 {
     if (SPECIAL_CONST_P(recv)) {
 	return Qundef;
@@ -3717,6 +3717,15 @@ vm_opt_ltlt(VALUE recv, VALUE obj)
     else if (RBASIC_CLASS(recv) == rb_cString &&
 	     BASIC_OP_UNREDEFINED_P(BOP_LTLT, STRING_REDEFINED_OP_FLAG)) {
 	return rb_str_concat(recv, obj);
+    }
+    return Qundef;
+}
+
+static VALUE
+vm_opt_ltlt_array(VALUE recv, VALUE obj)
+{
+    if (SPECIAL_CONST_P(recv)) {
+        return Qundef;
     }
     else if (RBASIC_CLASS(recv) == rb_cArray &&
 	     BASIC_OP_UNREDEFINED_P(BOP_LTLT, ARRAY_REDEFINED_OP_FLAG)) {
@@ -3995,7 +4004,10 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(ge_int);
                 SP_INSN1(ge_float);
                 break;
-              case idLTLT:  SP_INSN1(ltlt);  break;
+              case idLTLT:
+                SP_INSN1(ltlt_string);
+                SP_INSN1(ltlt_array);
+                break;
               case idAnd:   SP_INSN1(and);   break;
               case idOr:    SP_INSN1(or);    break;
             }

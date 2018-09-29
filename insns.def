@@ -1382,15 +1382,29 @@ opt_ge_float
 
 /* << */
 DEFINE_INSN
-opt_ltlt
+opt_ltlt_string
 (CALL_INFO ci, CALL_CACHE cc)
 (VALUE recv, VALUE obj)
 (VALUE val)
 {
-    val = vm_opt_ltlt(recv, obj);
+    val = vm_opt_ltlt_string(recv, obj);
 
     if (val == Qundef) {
-        vm_change_insn(GET_CFP(), PC_OFFSET(opt_ltlt, ci, cc), BIN(opt_send_without_block));
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_ltlt_string, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_ltlt_array
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+{
+    val = vm_opt_ltlt_array(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_ltlt_array, ci, cc), BIN(opt_send_without_block));
         CALL_SIMPLE_METHOD();
     }
 }
