@@ -3646,14 +3646,20 @@ vm_opt_le_float(VALUE recv, VALUE obj)
 }
 
 static VALUE
-vm_opt_gt(VALUE recv, VALUE obj)
+vm_opt_gt_int(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_GT, INTEGER_REDEFINED_OP_FLAG)) {
 	return (SIGNED_VALUE)recv > (SIGNED_VALUE)obj ? Qtrue : Qfalse;
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_gt_float(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_GT, FLOAT_REDEFINED_OP_FLAG)) {
 	return RFLOAT_VALUE(recv) > RFLOAT_VALUE(obj) ? Qtrue : Qfalse;
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
@@ -3975,7 +3981,10 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(le_int);
                 SP_INSN1(le_float);
                 break;
-              case idGT:    SP_INSN1(gt);    break;
+              case idGT:
+                SP_INSN1(gt_int);
+                SP_INSN1(gt_float);
+                break;
               case idGE:    SP_INSN1(ge);    break;
               case idLTLT:  SP_INSN1(ltlt);  break;
               case idAnd:   SP_INSN1(and);   break;

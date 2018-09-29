@@ -1324,15 +1324,29 @@ opt_le_float
 
 /* optimized X>Y. */
 DEFINE_INSN
-opt_gt
+opt_gt_int
 (CALL_INFO ci, CALL_CACHE cc)
 (VALUE recv, VALUE obj)
 (VALUE val)
 {
-    val = vm_opt_gt(recv, obj);
+    val = vm_opt_gt_int(recv, obj);
 
     if (val == Qundef) {
-        vm_change_insn(GET_CFP(), PC_OFFSET(opt_gt, ci, cc), BIN(opt_send_without_block));
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_gt_int, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_gt_float
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+{
+    val = vm_opt_gt_float(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_gt_float, ci, cc), BIN(opt_send_without_block));
         CALL_SIMPLE_METHOD();
     }
 }
