@@ -1053,7 +1053,21 @@ opt_case_dispatch
 
 /* optimized X+Y. */
 DEFINE_INSN
-opt_plus
+opt_plus_int
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+{
+    val = vm_opt_plus_int(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_plus_int, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_plus_float
 (CALL_INFO ci, CALL_CACHE cc)
 (VALUE recv, VALUE obj)
 (VALUE val)
@@ -1061,10 +1075,41 @@ opt_plus
  * anything is converted into array using #to_ary. */
 // attr bool leaf = false; /* has rb_to_array_type() */
 {
-    val = vm_opt_plus(recv, obj);
+    val = vm_opt_plus_float(recv, obj);
 
     if (val == Qundef) {
-        vm_change_insn(GET_CFP(), PC_OFFSET(opt_plus, ci, cc), BIN(opt_send_without_block));
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_plus_float, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_plus_string
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+{
+    val = vm_opt_plus_string(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_plus_string, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_plus_array
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+/* Array + anything can be handled inside of opt_plus, and that
+ * anything is converted into array using #to_ary. */
+// attr bool leaf = false; /* has rb_to_array_type() */
+{
+    val = vm_opt_plus_array(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_plus_array, ci, cc), BIN(opt_send_without_block));
         CALL_SIMPLE_METHOD();
     }
 }

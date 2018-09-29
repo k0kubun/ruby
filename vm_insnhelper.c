@@ -3391,14 +3391,20 @@ vm_stack_consistency_error(const rb_execution_context_t *ec,
 }
 
 static VALUE
-vm_opt_plus(VALUE recv, VALUE obj)
+vm_opt_plus_int(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_PLUS, INTEGER_REDEFINED_OP_FLAG)) {
 	return rb_fix_plus_fix(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_plus_float(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
 	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
@@ -3409,10 +3415,28 @@ vm_opt_plus(VALUE recv, VALUE obj)
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, FLOAT_REDEFINED_OP_FLAG)) {
 	return DBL2NUM(RFLOAT_VALUE(recv) + RFLOAT_VALUE(obj));
     }
+    return Qundef;
+}
+
+static VALUE
+vm_opt_plus_string(VALUE recv, VALUE obj)
+{
+    if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
+        return Qundef;
+    }
     else if (RBASIC_CLASS(recv) == rb_cString &&
 	     RBASIC_CLASS(obj) == rb_cString &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, STRING_REDEFINED_OP_FLAG)) {
 	return rb_str_plus(recv, obj);
+    }
+    return Qundef;
+}
+
+static VALUE
+vm_opt_plus_array(VALUE recv, VALUE obj)
+{
+    if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
+        return Qundef;
     }
     else if (RBASIC_CLASS(recv) == rb_cArray &&
 	     BASIC_OP_UNREDEFINED_P(BOP_PLUS, ARRAY_REDEFINED_OP_FLAG)) {
@@ -3885,7 +3909,12 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
             break;
           case 1:
             switch (ci->mid) {
-              case idPLUS:  SP_INSN1(plus);  break;
+              case idPLUS:
+                SP_INSN1(plus_int);
+                SP_INSN1(plus_float);
+                SP_INSN1(plus_string);
+                SP_INSN1(plus_array);
+                break;
               case idMINUS: SP_INSN1(minus); break;
               case idMULT:  SP_INSN1(mult);  break;
               case idDIV:   SP_INSN1(div);   break;

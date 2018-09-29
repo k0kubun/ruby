@@ -41,7 +41,10 @@ module MJITHeader
   ]
 
   ALWAYS_INLINED_FUNCTIONS = [
-    'vm_opt_plus',
+    'vm_opt_plus_int',
+    'vm_opt_plus_float',
+    'vm_opt_plus_string',
+    'vm_opt_plus_array',
     'vm_opt_minus',
     'vm_opt_mult',
     'vm_opt_div',
