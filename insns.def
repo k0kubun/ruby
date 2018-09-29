@@ -1203,15 +1203,29 @@ opt_div_float
 
 /* optimized X%Y. */
 DEFINE_INSN
-opt_mod
+opt_mod_int
 (CALL_INFO ci, CALL_CACHE cc)
 (VALUE recv, VALUE obj)
 (VALUE val)
 {
-    val = vm_opt_mod(recv, obj);
+    val = vm_opt_mod_int(recv, obj);
 
     if (val == Qundef) {
-        vm_change_insn(GET_CFP(), PC_OFFSET(opt_mod, ci, cc), BIN(opt_send_without_block));
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_mod_int, ci, cc), BIN(opt_send_without_block));
+        CALL_SIMPLE_METHOD();
+    }
+}
+
+DEFINE_INSN
+opt_mod_float
+(CALL_INFO ci, CALL_CACHE cc)
+(VALUE recv, VALUE obj)
+(VALUE val)
+{
+    val = vm_opt_mod_float(recv, obj);
+
+    if (val == Qundef) {
+        vm_change_insn(GET_CFP(), PC_OFFSET(opt_mod_float, ci, cc), BIN(opt_send_without_block));
         CALL_SIMPLE_METHOD();
     }
 }

@@ -3538,14 +3538,20 @@ vm_opt_div_float(VALUE recv, VALUE obj)
 }
 
 static VALUE
-vm_opt_mod(VALUE recv, VALUE obj)
+vm_opt_mod_int(VALUE recv, VALUE obj)
 {
     if (FIXNUM_2_P(recv, obj) &&
 	BASIC_OP_UNREDEFINED_P(BOP_MOD, INTEGER_REDEFINED_OP_FLAG)) {
 	return (FIX2LONG(obj) == 0) ? Qundef : rb_fix_mod_fix(recv, obj);
     }
-    else if (FLONUM_2_P(recv, obj) &&
-	     BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG)) {
+    return Qundef;
+}
+
+static VALUE
+vm_opt_mod_float(VALUE recv, VALUE obj)
+{
+    if (FLONUM_2_P(recv, obj) &&
+        BASIC_OP_UNREDEFINED_P(BOP_MOD, FLOAT_REDEFINED_OP_FLAG)) {
 	return DBL2NUM(ruby_float_mod(RFLOAT_VALUE(recv), RFLOAT_VALUE(obj)));
     }
     else if (SPECIAL_CONST_P(recv) || SPECIAL_CONST_P(obj)) {
@@ -3945,7 +3951,10 @@ vm_specialize_insn(rb_control_frame_t *cfp, int pc_offset, const struct rb_call_
                 SP_INSN1(div_int);
                 SP_INSN1(div_float);
                 break;
-              case idMOD:   SP_INSN1(mod);   break;
+              case idMOD:
+                SP_INSN1(mod_int);
+                SP_INSN1(mod_float);
+                break;
               case idLT:    SP_INSN1(lt);    break;
               case idLE:    SP_INSN1(le);    break;
               case idGT:    SP_INSN1(gt);    break;
