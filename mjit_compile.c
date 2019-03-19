@@ -198,9 +198,8 @@ compile_cancel_handler(FILE *f, const struct rb_iseq_constant_body *body, struct
 
 extern bool mjit_copy_cache_from_main_thread(const rb_iseq_t *iseq, struct rb_call_cache *cc_entries, union iseq_inline_storage_entry *is_entries);
 
-// Compile ISeq to C code in `f`. It returns true if it succeeds to compile.
-bool
-mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
+static bool
+mjit_compile_body(FILE *f, const rb_iseq_t *iseq)
 {
     const struct rb_iseq_constant_body *body = iseq->body;
     struct compile_status status = {
@@ -217,16 +216,6 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
             && !mjit_copy_cache_from_main_thread(iseq, status.cc_entries, status.is_entries))
         return false;
 
-    /* For performance, we verify stack size only on compilation time (mjit_compile.inc.erb) without --jit-debug */
-    if (!mjit_opts.debug) {
-        fprintf(f, "#undef OPT_CHECKED_RUN\n");
-        fprintf(f, "#define OPT_CHECKED_RUN 0\n\n");
-    }
-
-#ifdef _WIN32
-    fprintf(f, "__declspec(dllexport)\n");
-#endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
     if (status.local_stack_p) {
         fprintf(f, "    VALUE stack[%d];\n", body->stack_max);
     }
@@ -236,8 +225,8 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n",
             (VALUE)body->iseq_encoded);
 
-    /* Simulate `opt_pc` in setup_parameters_complex. Other PCs which may be passed by catch tables
-       are not considered since vm_exec doesn't call mjit_exec for catch tables. */
+    // Simulate `opt_pc` in setup_parameters_complex. Other PCs which may be passed by catch tables
+    // are not considered since vm_exec doesn't call mjit_exec for catch tables.
     if (body->param.flags.has_opt) {
         int i;
         fprintf(f, "\n");
@@ -252,8 +241,30 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
 
     compile_insns(f, body, 0, 0, &status);
     compile_cancel_handler(f, body, &status);
-    fprintf(f, "\n} /* end of %s */\n", funcname);
     return status.success;
+}
+
+// Compile ISeq to C code in `f`. It returns true if it succeeds to compile.
+bool
+mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
+{
+    bool result = true;
+
+    // For performance, we verify stack size only on compilation time (mjit_compile.inc.erb) without --jit-debug
+    if (!mjit_opts.debug) {
+        fprintf(f, "#undef OPT_CHECKED_RUN\n");
+        fprintf(f, "#define OPT_CHECKED_RUN 0\n\n");
+    }
+
+    // Compile main function
+#ifdef _WIN32
+    fprintf(f, "__declspec(dllexport)\n");
+#endif
+    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+    result &= mjit_compile_body(f, iseq);
+    fprintf(f, "\n} /* end of %s */\n", funcname);
+
+    return result;
 }
 
 #endif /* USE_MJIT */
