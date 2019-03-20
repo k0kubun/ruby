@@ -66,7 +66,7 @@
             }
             else {
                 if (status->iseq_for_pos[pos] == iseq->body) {
-                    fprintf(f, "            if ((v = _mjit_inlined_%d(ec, ec->cfp)) == Qundef) {\n", pos);
+                    fprintf(f, "            if ((v = _mjit_inlined_"MJIT_INLINE_F(f, pos, status)"(ec, ec->cfp)) == Qundef) {\n");
                 }
                 else {
                     fprintf(f, "            if ((v = mjit_exec(ec)) == Qundef) {\n");

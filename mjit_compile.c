@@ -25,6 +25,12 @@
 #define NOT_COMPILED_STACK_SIZE -1
 #define ALREADY_COMPILED_P(status, pos) (status->stack_size_for_pos[pos] != NOT_COMPILED_STACK_SIZE)
 
+// Max depth of inlining
+#define JIT_MAX_INLINING_DEPTH 10
+
+// Max iseq_size to be inlined
+#define JIT_MAX_INLINED_ISEQ_SIZE 50
+
 /* Storage to keep compiler's status.  This should have information
    which is global during one `mjit_compile` call.  Ones conditional
    in each branch should be stored in `compile_branch`.  */
@@ -39,6 +45,8 @@ struct compile_status {
     struct rb_call_cache *cc_entries;
     // If `iseq_for_pos[pos]` is not NULL, `mjit_compile_body` tries to inline ISeq there.
     const struct rb_iseq_constant_body **iseq_for_pos;
+    int pos_stack_size; // size of `pos_stack` = current inlining depth
+    int* pos_stack; // history of inlined callsite index
 };
 
 /* Storage to keep data which is consistent in each conditional branch.
@@ -114,6 +122,19 @@ comment_id(FILE *f, ID id)
     }
     fputs("\" */", f);
 #endif
+}
+
+// Shorthand to inject `mjit_inline_f` call.
+#define MJIT_INLINE_F(f, pos, status) ); mjit_inline_f(f, pos, status); fprintf(f,
+
+// Print inlined function identifier to `f`.
+static void
+mjit_inline_f(FILE *f, int pos, struct compile_status *status)
+{
+    for (int i = 0; i < status->pos_stack_size; i++) {
+        fprintf(f, "%d_", status->pos_stack[i]);
+    }
+    fprintf(f, "%d", pos);
 }
 
 static void compile_insns(FILE *f, const struct rb_iseq_constant_body *body, unsigned int stack_size,
@@ -257,7 +278,10 @@ precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, st
             if (has_valid_method_type(cc_copy) &&
                     !(ci->flag & VM_CALL_TAILCALL) && // inlining only non-tailcall path
                     cc_copy->me->def->type == VM_METHOD_TYPE_ISEQ && inlinable_iseq_p(ci, cc_copy, child_iseq = def_iseq_ptr(cc_copy->me->def)) && // CC_SET_FASTPATH in vm_callee_setup_arg
-                    !child_iseq->body->catch_except_p) {
+                    !child_iseq->body->catch_except_p && // should insert vm_exec when catch_except_p, but it's hard
+                    child_iseq->body->iseq_size < JIT_MAX_INLINED_ISEQ_SIZE && // too big ISeq should not be inlined
+                    ((float)child_iseq->body->total_calls / (float)body->total_calls) > 0.9) { // only inline frequently-called methods
+                status->pos_stack[status->pos_stack_size] = pos;
                 status->iseq_for_pos[pos] = child_iseq->body;
 
                 struct compile_status child_status = {
@@ -267,6 +291,8 @@ precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, st
                         alloca(sizeof(struct rb_call_cache) * (child_iseq->body->ci_size + child_iseq->body->ci_kw_size)) : NULL,
                     .is_entries = (child_iseq->body->is_size > 0) ?
                         alloca(sizeof(union iseq_inline_storage_entry) * child_iseq->body->is_size) : NULL,
+                    .pos_stack_size = status->pos_stack_size + 1,
+                    .pos_stack = status->pos_stack,
                 };
                 memset(child_status.stack_size_for_pos, NOT_COMPILED_STACK_SIZE, sizeof(int) * child_iseq->body->iseq_size);
                 memset(child_status.iseq_for_pos, 0, sizeof(const struct rb_iseq_constant_body *) * child_iseq->body->iseq_size);
@@ -274,10 +300,18 @@ precompile_inlinable_iseqs(FILE *f, const struct rb_iseq_constant_body *body, st
                         && !mjit_copy_cache_from_main_thread(child_iseq, child_status.cc_entries, child_status.is_entries))
                     return false;
 
-                fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp));\n", pos);
-                fprintf(f, "static inline VALUE\n_mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", pos);
+                int inlining_threshold = JIT_MAX_INLINING_DEPTH;
+                if (body == child_iseq->body) // discourage inlining recursive call too much
+                    inlining_threshold /= 3;
+                if (status->pos_stack_size < inlining_threshold) {
+                    result &= precompile_inlinable_iseqs(f, child_iseq->body, &child_status);
+                }
+
+                fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_"MJIT_INLINE_F(f, pos, status)"(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp));\n");
+                fprintf(f, "static inline VALUE\n");
+                fprintf(f, "_mjit_inlined_"MJIT_INLINE_F(f, pos, status)"(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n");
                 result &= mjit_compile_body(f, child_iseq->body, &child_status);
-                fprintf(f, "\n} /* end of _mjit_inlined_%d */\n\n", pos);
+                fprintf(f, "\n} /* end of _mjit_inlined_"MJIT_INLINE_F(f, pos, status)" */\n\n");
             }
         }
         pos += insn_len(insn);
@@ -304,6 +338,8 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
             alloca(sizeof(struct rb_call_cache) * (body->ci_size + body->ci_kw_size)) : NULL,
         .is_entries = (body->is_size > 0) ?
             alloca(sizeof(union iseq_inline_storage_entry) * body->is_size) : NULL,
+        .pos_stack_size = 0,
+        .pos_stack = alloca(sizeof(int) * JIT_MAX_INLINING_DEPTH),
     };
     memset(status.stack_size_for_pos, NOT_COMPILED_STACK_SIZE, sizeof(int) * body->iseq_size);
     memset(status.iseq_for_pos, 0, sizeof(const struct rb_iseq_constant_body *) * iseq->body->iseq_size);
