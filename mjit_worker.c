@@ -131,6 +131,7 @@ struct rb_mjit_unit {
     const rb_iseq_t *iseq;
 #ifndef _MSC_VER
     /* This value is always set for `compact_all_jit_code`. Also used for lazy deletion. */
+    char *c_file;
     char *o_file;
     /* true if it's inherited from parent Ruby process and lazy deletion should be skipped.
        `o_file = NULL` can't be used to skip lazy deletion because `o_file` could be used
@@ -250,7 +251,7 @@ static char *libruby_pathflag;
 // Use `-nodefaultlibs -nostdlib` for GCC where possible, which does not work on mingw, cygwin, AIX, and OpenBSD.
 // This seems to improve MJIT performance on GCC.
 #if defined __GNUC__ && !defined __clang__ && !defined(_WIN32) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__OpenBSD__)
-# define GCC_NOSTDLIB_FLAGS "-nodefaultlibs", "-nostdlib",
+# define GCC_NOSTDLIB_FLAGS //"-nodefaultlibs", "-nostdlib",
 #else
 # define GCC_NOSTDLIB_FLAGS /* empty */
 #endif
@@ -357,8 +358,8 @@ clean_object_files(struct rb_mjit_unit *unit)
         unit->o_file = NULL;
         /* For compaction, unit->o_file is always set when compilation succeeds.
            So save_temps needs to be checked here. */
-        if (!mjit_opts.save_temps && !unit->o_file_inherited_p)
-            remove_file(o_file);
+        //if (!mjit_opts.save_temps && !unit->o_file_inherited_p)
+        //    remove_file(o_file);
         free(o_file);
     }
 #endif
@@ -778,24 +779,40 @@ make_pch(void)
 
 // Compile .c file to .o file. It returns true if it succeeds. (non-mswin)
 static bool
-compile_c_to_o(const char *c_file, const char *o_file)
+compile_c_to_o(const char *c_file, const char *o_file, bool profile_p)
 {
     int exit_code;
+    const char *profile_files[] = {
+        "-o", NULL, NULL,
+# ifdef __clang__
+        "-include-pch", NULL,
+# endif
+        "-fprofile-arcs", "-fprofile-generate", "-fbranch-probabilities",
+        "-c", NULL
+    };
     const char *files[] = {
         "-o", NULL, NULL,
 # ifdef __clang__
         "-include-pch", NULL,
 # endif
-        "-c", NULL
+        "-fprofile-use", "-c", NULL
     };
     char **args;
 
+    if (profile_p) {
+    profile_files[1] = o_file;
+    profile_files[2] = c_file;
+# ifdef __clang__
+    profile_files[4] = pch_file;
+# endif
+    } else {
     files[1] = o_file;
     files[2] = c_file;
 # ifdef __clang__
     files[4] = pch_file;
 # endif
-    args = form_args(5, cc_common_args, CC_CODEFLAG_ARGS, files, CC_LIBS, CC_DLDFLAGS_ARGS);
+    }
+    args = form_args(5, cc_common_args, CC_CODEFLAG_ARGS, (profile_p ? profile_files : files), CC_LIBS, CC_DLDFLAGS_ARGS);
     if (args == NULL)
         return false;
 
@@ -809,9 +826,16 @@ compile_c_to_o(const char *c_file, const char *o_file)
 
 // Link .o files to .so file. It returns true if it succeeds. (non-mswin)
 static bool
-link_o_to_so(const char **o_files, const char *so_file)
+link_o_to_so(const char **o_files, const char *so_file, bool profile_p)
 {
     int exit_code;
+    const char *profile_options[] = {
+        "-o", NULL,
+# ifdef _WIN32
+        libruby_pathflag,
+# endif
+        "-fprofile-arcs", NULL
+    };
     const char *options[] = {
         "-o", NULL,
 # ifdef _WIN32
@@ -821,9 +845,13 @@ link_o_to_so(const char **o_files, const char *so_file)
     };
     char **args;
 
+    if (profile_p) {
+    profile_options[1] = so_file;
+    } else {
     options[1] = so_file;
+    }
     args = form_args(6, CC_LDSHARED_ARGS, CC_CODEFLAG_ARGS,
-                     options, o_files, CC_LIBS, CC_DLDFLAGS_ARGS);
+                     (profile_p ? profile_options : options), o_files, CC_LIBS, CC_DLDFLAGS_ARGS);
     if (args == NULL)
         return false;
 
@@ -859,12 +887,13 @@ compact_all_jit_code(void)
     o_files[active_units.length] = NULL;
     CRITICAL_SECTION_START(3, "in compact_all_jit_code to keep .o files");
     list_for_each(&active_units.head, cur, unode) {
+        compile_c_to_o(cur->c_file, cur->o_file, false);
         o_files[i] = cur->o_file;
         i++;
     }
 
     start_time = real_ms_time();
-    bool success = link_o_to_so(o_files, so_file);
+    bool success = link_o_to_so(o_files, so_file, false);
     end_time = real_ms_time();
 
     /* TODO: Shrink this big critical section. For now, this is needed to prevent failure by missing .o files.
@@ -1089,12 +1118,13 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
     success = compile_c_to_so(c_file, so_file);
 #else
     /* splitting .c -> .o step and .o -> .so step, to cache .o files in the future */
-    if ((success = compile_c_to_o(c_file, o_file)) != false) {
+    if ((success = compile_c_to_o(c_file, o_file, true)) != false) {
         const char *o_files[2] = { NULL, NULL };
         o_files[0] = o_file;
-        success = link_o_to_so(o_files, so_file);
+        success = link_o_to_so(o_files, so_file, true);
 
         /* Always set o_file for compaction. The value is also used for lazy deletion. */
+        unit->c_file = strdup(c_file);
         unit->o_file = strdup(o_file);
         if (unit->o_file == NULL) {
             mjit_warning("failed to allocate memory to remember '%s' (%s), removing it...", o_file, strerror(errno));
@@ -1104,16 +1134,18 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 #endif
     end_time = real_ms_time();
 
-    if (!mjit_opts.save_temps)
-        remove_file(c_file);
+    //if (!mjit_opts.save_temps)
+    //    remove_file(c_file);
     if (!success) {
         verbose(2, "Failed to generate so: %s", so_file);
         return (mjit_func_t)NOT_COMPILED_JIT_ISEQ_FUNC;
     }
 
     func = load_func_from_so(so_file, funcname, unit);
-    if (!mjit_opts.save_temps)
+    if (!mjit_opts.save_temps) {
+        remove_file(o_file);
         remove_so_file(so_file, unit);
+    }
 
     if ((uintptr_t)func > (uintptr_t)LAST_JIT_ISEQ_FUNC) {
         CRITICAL_SECTION_START(3, "end of jit");
