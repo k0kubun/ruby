@@ -795,7 +795,7 @@ compile_c_to_o(const char *c_file, const char *o_file, bool profile_p)
 # ifdef __clang__
         "-include-pch", NULL,
 # endif
-        "-fprofile-use", "-c", NULL
+        "-fprofile-use", "-fprofile-correction", "-c", NULL
     };
     char **args;
 
