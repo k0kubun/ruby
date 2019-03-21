@@ -865,6 +865,8 @@ link_o_to_so(const char **o_files, const char *so_file, bool profile_p)
 
 /* Link all cached .o files and build a .so file. Reload all JIT func from it. This
    allows to avoid JIT code fragmentation and improve performance to call JIT-ed code.  */
+// ../configure --prefix="${HOME}/.rbenv/versions/fprofile-arcs" --disable-install-doc cflags="-fprofile-arcs" LDFLAGS="-fprofile-arcs" && make -j4 all install
+void __gcov_flush();
 static void
 compact_all_jit_code(void)
 {
@@ -881,6 +883,8 @@ compact_all_jit_code(void)
     if (unit == NULL) return;
     unit->id = current_unit_num++;
     sprint_uniq_filename(so_file, (int)sizeof(so_file), unit->id, MJIT_TMP_PREFIX, so_ext);
+
+    __gcov_flush();
 
     /* NULL-ending for form_args */
     o_files = alloca(sizeof(char *) * (active_units.length + 1));
