@@ -1505,6 +1505,7 @@ void rb_gc_writebarrier_remember(VALUE obj);
 #endif
 void ruby_gc_set_params(int safe_level);
 void rb_copy_wb_protected_attribute(VALUE dest, VALUE obj);
+size_t rb_gc_rvalue_size(void);
 
 #if defined(HAVE_MALLOC_USABLE_SIZE) || defined(HAVE_MALLOC_SIZE) || defined(_WIN32)
 #define ruby_sized_xrealloc(ptr, new_size, old_size) ruby_xrealloc(ptr, new_size)

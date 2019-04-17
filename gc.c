@@ -445,6 +445,12 @@ typedef struct RVALUE {
 #endif
 } RVALUE;
 
+MJIT_FUNC_EXPORTED size_t
+rb_gc_rvalue_size(void)
+{
+    return sizeof(RVALUE);
+}
+
 #if defined(_MSC_VER) || defined(__CYGWIN__)
 #pragma pack(pop)
 #endif
@@ -1951,10 +1957,9 @@ newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VAL
 }
 
 static inline VALUE
-newobj_of(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_protected)
+newobj_of_stack(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_protected, VALUE obj, bool stack_p)
 {
     rb_objspace_t *objspace = &rb_objspace;
-    VALUE obj;
 
     RB_DEBUG_COUNTER_INC(obj_newobj);
     (void)RB_DEBUG_COUNTER_INC_IF(obj_newobj_wb_unprotected, !wb_protected);
@@ -1970,7 +1975,7 @@ newobj_of(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_protect
     if (!(during_gc ||
 	  ruby_gc_stressful ||
 	  gc_event_hook_available_p(objspace)) &&
-	(obj = heap_get_freeobj_head(objspace, heap_eden)) != Qfalse) {
+	(stack_p || (obj = heap_get_freeobj_head(objspace, heap_eden)) != Qfalse)) {
 	return newobj_init(klass, flags, v1, v2, v3, wb_protected, objspace, obj);
     }
     else {
@@ -1980,6 +1985,12 @@ newobj_of(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_protect
 	  newobj_slowpath_wb_protected(klass, flags, v1, v2, v3, objspace) :
 	  newobj_slowpath_wb_unprotected(klass, flags, v1, v2, v3, objspace);
     }
+}
+
+static inline VALUE
+newobj_of(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_protected)
+{
+    return newobj_of_stack(klass, flags, v1, v2, v3, wb_protected, Qnil, false);
 }
 
 VALUE
@@ -2008,6 +2019,12 @@ VALUE
 rb_newobj_of(VALUE klass, VALUE flags)
 {
     return newobj_of(klass, flags & ~FL_WB_PROTECTED, 0, 0, 0, flags & FL_WB_PROTECTED);
+}
+
+VALUE
+rb_newobj_of_stack(VALUE klass, VALUE flags, VALUE obj)
+{
+    return newobj_of_stack(klass, flags & ~FL_WB_PROTECTED, 0, 0, 0, flags & FL_WB_PROTECTED, obj, true);
 }
 
 #define UNEXPECTED_NODE(func) \

@@ -777,6 +777,7 @@ VALUE rb_int2big(intptr_t);
 
 VALUE rb_newobj(void);
 VALUE rb_newobj_of(VALUE, VALUE);
+VALUE rb_newobj_of_stack(VALUE, VALUE, VALUE);
 VALUE rb_obj_setup(VALUE obj, VALUE klass, VALUE type);
 #define RB_NEWOBJ(obj,type) type *(obj) = (type*)rb_newobj()
 #define RB_NEWOBJ_OF(obj,type,klass,flags) type *(obj) = (type*)rb_newobj_of(klass, flags)

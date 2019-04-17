@@ -654,6 +654,13 @@ ary_alloc(VALUE klass)
 }
 
 static VALUE
+ary_alloc_stack(VALUE klass, VALUE obj)
+{
+    struct RArray *(ary) = (struct RArray*)rb_newobj_of_stack(klass, T_ARRAY | RARRAY_EMBED_FLAG | (RGENGC_WB_PROTECTED_ARRAY ? FL_WB_PROTECTED : 0), obj);
+    return (VALUE)ary;
+}
+
+static VALUE
 empty_ary_alloc(VALUE klass)
 {
     RUBY_DTRACE_CREATE_HOOK(ARRAY, 0);
@@ -2203,6 +2210,41 @@ VALUE
 rb_ary_resurrect(VALUE ary)
 {
     return ary_make_partial(ary, rb_cArray, 0, RARRAY_LEN(ary));
+}
+
+VALUE
+rb_ary_resurrect_stack(VALUE ary, VALUE obj)
+{
+    VALUE klass = rb_cArray;
+    long offset = 0;
+    long len = RARRAY_LEN(ary);
+
+    assert(offset >= 0);
+    assert(len >= 0);
+    assert(offset+len <= RARRAY_LEN(ary));
+
+    if (len <= RARRAY_EMBED_LEN_MAX) {
+        VALUE result = ary_alloc_stack(klass, obj);
+        ary_memcpy(result, 0, len, RARRAY_CONST_PTR_TRANSIENT(ary) + offset);
+        ARY_SET_EMBED_LEN(result, len);
+        return result;
+    }
+    else {
+        VALUE shared, result = ary_alloc_stack(klass, obj);
+        FL_UNSET_EMBED(result);
+
+        shared = ary_make_shared(ary);
+        ARY_SET_PTR(result, RARRAY_CONST_PTR_TRANSIENT(ary));
+        ARY_SET_LEN(result, RARRAY_LEN(ary));
+        rb_ary_set_shared(result, shared);
+
+        ARY_INCREASE_PTR(result, offset);
+        ARY_SET_LEN(result, len);
+
+        ary_verify(shared);
+        ary_verify(result);
+        return result;
+    }
 }
 
 extern VALUE rb_output_fs;

@@ -70,6 +70,7 @@ VALUE rb_ary_subseq(VALUE, long, long);
 void rb_ary_store(VALUE, long, VALUE);
 VALUE rb_ary_dup(VALUE);
 VALUE rb_ary_resurrect(VALUE ary);
+VALUE rb_ary_resurrect_stack(VALUE ary, VALUE obj);
 VALUE rb_ary_to_ary(VALUE);
 VALUE rb_ary_to_s(VALUE);
 VALUE rb_ary_cat(VALUE, const VALUE *, long);
