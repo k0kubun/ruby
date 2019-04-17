@@ -55,6 +55,9 @@
 % when 'duparray'
         fprintf(f, "    VALUE duparray_obj%d = alloca(rb_gc_rvalue_size());\n", pos);
         fprintf(f, "    val = rb_ary_resurrect_stack(ary, duparray_obj%d);\n", pos);
+% when 'putstring'
+        fprintf(f, "    VALUE putstring_obj%d = alloca(rb_gc_rvalue_size());\n", pos);
+        fprintf(f, "    val = rb_str_resurrect_stack(str, putstring_obj%d);\n", pos);
 % else
 <%= render 'mjit_compile_insn_body', locals: { insn: insn } -%>
 % end

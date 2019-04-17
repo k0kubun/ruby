@@ -760,6 +760,7 @@ VALUE rb_check_string_type(VALUE);
 void rb_must_asciicompat(VALUE);
 VALUE rb_str_dup(VALUE);
 VALUE rb_str_resurrect(VALUE str);
+VALUE rb_str_resurrect_stack(VALUE str, VALUE obj);
 VALUE rb_str_locktmp(VALUE);
 VALUE rb_str_unlocktmp(VALUE);
 VALUE rb_str_dup_frozen(VALUE);
