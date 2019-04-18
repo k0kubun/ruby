@@ -128,6 +128,45 @@ comment_id(FILE *f, ID id)
 #endif
 }
 
+static bool
+insn_escape_p(const struct rb_iseq_constant_body *body, int insn, unsigned int pos, struct compile_status *status, unsigned int stack_size)
+{
+    // assuming only putstring/duparray here for now. TODO: utilize attr properly
+    unsigned int stack_pos = stack_size;
+    stack_size++;
+
+    pos += insn_len(insn);
+    while (pos < body->iseq_size) {
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+        insn = rb_vm_insn_addr2insn((void *)body->iseq_encoded[pos]);
+#else
+        insn = (int)body->iseq_encoded[pos];
+#endif
+        // TODO: add insn attr to construct this switch-case automatically
+        switch (insn) {
+          case BIN(getlocal):
+          case BIN(getlocal_WC_0):
+          case BIN(getlocal_WC_1):
+            break; // ok (just increase stack)
+          case BIN(opt_send_without_block):
+            if (stack_size == stack_pos) // FIXME: this part is literally for PoC. check this by checking call cache, add attr to method, and read method entry's attribute.
+                return true;
+            return false; // TODO: handle others
+          case BIN(opt_eq):
+            if (stack_size == stack_pos + 1) // TODO: automate this by adding no-escape attr for arg
+                return true;
+            return false; // TODO: handle receiver case
+          default:
+            return true;
+            break;
+        }
+
+        stack_size = insn_stack_increase(stack_size, insn, body->iseq_encoded + pos + 1);
+        pos += insn_len(insn);
+    }
+    return true;
+}
+
 static void compile_insns(FILE *f, const struct rb_iseq_constant_body *body, unsigned int stack_size,
                           unsigned int pos, struct compile_status *status);
 

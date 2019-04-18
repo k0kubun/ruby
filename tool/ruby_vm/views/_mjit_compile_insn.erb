@@ -51,16 +51,23 @@
 <%= render 'mjit_compile_pc_and_sp', locals: { insn: insn } -%>
 %
 % # JIT: Print insn body in insns.def
-% case insn.name
-% when 'duparray'
+% analyze_escape = ['duparray', 'putstring'].include?(insn.name)
+% if analyze_escape
+    if (insn_escape_p(body, insn, pos, status, b->stack_size)) {
+        fprintf(stderr, "[no escape!]\n");
+%   case insn.name
+%   when 'duparray'
         fprintf(f, "    VALUE duparray_obj%d = alloca(rb_gc_rvalue_size());\n", pos);
         fprintf(f, "    val = rb_ary_resurrect_stack(ary, duparray_obj%d);\n", pos);
-% when 'putstring'
+%   when 'putstring'
         fprintf(f, "    VALUE putstring_obj%d = alloca(rb_gc_rvalue_size());\n", pos);
         fprintf(f, "    val = rb_str_resurrect_stack(str, putstring_obj%d);\n", pos);
-% else
-<%= render 'mjit_compile_insn_body', locals: { insn: insn } -%>
+%   end
+    }
+    else {
 % end
+<%= render 'mjit_compile_insn_body', locals: { insn: insn } -%>
+    <%= '}' if analyze_escape %>
 %
 % # JIT: Set return values
 % insn.rets.reverse_each.with_index do |ret, i|
