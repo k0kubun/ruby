@@ -671,7 +671,7 @@ static bool
 compile_c_to_so(const char *c_file, const char *so_file)
 {
     int exit_code;
-    const char *files[] = { NULL, NULL, NULL, NULL, NULL, NULL, "-link", libruby_pathflag, NULL };
+    const char *files[] = { NULL, NULL, NULL, NULL, NULL, NULL, "-link", libruby_pathflag, "-flto", NULL };
     char **args;
     char *p, *obj_file;
 
@@ -753,6 +753,7 @@ make_pch(void)
         // -nodefaultlibs is a linker flag, but it may affect cc1 behavior on Gentoo, which should NOT be changed on pch:
         // https://gitweb.gentoo.org/proj/gcc-patches.git/tree/7.3.0/gentoo/13_all_default-ssp-fix.patch
         GCC_NOSTDLIB_FLAGS
+        "-flto",
         "-o", NULL, NULL,
         NULL,
     };
@@ -797,7 +798,7 @@ compile_c_to_o(const char *c_file, const char *o_file)
 # ifdef __clang__
         "-include-pch", NULL,
 # endif
-        "-c", NULL
+        "-c", "-flto", NULL
     };
     char **args;
 
@@ -828,7 +829,7 @@ link_o_to_so(const char **o_files, const char *so_file)
 # ifdef _WIN32
         libruby_pathflag,
 # endif
-        NULL
+        "-flto", NULL
     };
     char **args;
 

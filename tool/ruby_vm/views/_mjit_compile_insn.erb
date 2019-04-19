@@ -51,7 +51,28 @@
 <%= render 'mjit_compile_pc_and_sp', locals: { insn: insn } -%>
 %
 % # JIT: Print insn body in insns.def
+% if insn.name == 'send'
+      Dl_info in;
+      if (dladdr(((CALL_CACHE)operands[1])->call, &in) != 0) {
+        fprintf(f, "    {\n");
+        fprintf(f, "        struct rb_calling_info calling;\n\n");
+        fprintf(f, "        calling.block_handler = vm_caller_setup_arg_block(ec, reg_cfp, ci, blockiseq, FALSE);\n");
+        fprintf(f, "        calling.recv = TOPN(calling.argc = ci->orig_argc);\n");
+        fprintf(f, "        vm_search_method(ci, cc, calling.recv);\n");
+        fprintf(f, "        VALUE v = %s(ec, GET_CFP(), &calling, ci, cc);\n", in.dli_sname);
+        fprintf(f, "        if (v == Qundef) {\n");
+        fprintf(f, "            EXEC_EC_CFP(val);\n");
+        fprintf(f, "        } else {\n");
+        fprintf(f, "            val = v;\n");
+        fprintf(f, "        }\n");
+        fprintf(f, "    }\n");
+      }
+      else {
+% end
 <%= render 'mjit_compile_insn_body', locals: { insn: insn } -%>
+% if insn.name == 'send'
+      }
+% end
 %
 % # JIT: Set return values
 % insn.rets.reverse_each.with_index do |ret, i|

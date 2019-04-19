@@ -20,6 +20,7 @@
 #include "insns.inc"
 #include "insns_info.inc"
 #include "vm_insnhelper.h"
+#include <dlfcn.h>
 
 // Macros to check if a position is already compiled using compile_status.stack_size_for_pos
 #define NOT_COMPILED_STACK_SIZE -1
