@@ -708,6 +708,14 @@ mjit_init(struct mjit_options *opts)
     if (mjit_opts.max_cache_size < MIN_CACHE_SIZE)
         mjit_opts.max_cache_size = MIN_CACHE_SIZE;
 
+#if MJIT_LLVM
+    // Required to generate native code.
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    LLVMInitializeNativeAsmParser();
+    LLVMLinkInMCJIT();
+#endif
+
     // Initialize variables for compilation
 #ifdef _MSC_VER
     pch_status = PCH_SUCCESS; // has prebuilt precompiled header

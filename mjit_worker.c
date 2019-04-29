@@ -99,6 +99,14 @@
 #include "ruby/util.h"
 #undef strdup // ruby_strdup may trigger GC
 
+#define MJIT_LLVM 1
+
+#if MJIT_LLVM
+# include "llvm-c/BitReader.h"
+# include "llvm-c/Core.h"
+# include "llvm-c/ExecutionEngine.h"
+#endif
+
 #ifndef MAXPATHLEN
 # define MAXPATHLEN 1024
 #endif
@@ -787,6 +795,80 @@ make_pch(void)
     CRITICAL_SECTION_FINISH(3, "in make_pch");
 }
 
+#if MJIT_LLVM
+
+static bool
+compile_c_to_ll(const char *c_file, const char *ll_file)
+{
+    int exit_code;
+    const char *files[] = {
+        "-o", NULL, NULL,
+        "-include-pch", NULL,
+        "-S", "-emit-llvm", NULL
+    };
+    char **args;
+
+    files[1] = ll_file;
+    files[2] = c_file;
+    files[4] = pch_file;
+    args = form_args(5, cc_common_args, CC_CODEFLAG_ARGS, files, CC_LIBS, CC_DLDFLAGS_ARGS);
+    if (args == NULL)
+        return false;
+
+    exit_code = exec_process(cc_path, args);
+    free(args);
+
+    if (exit_code != 0)
+        verbose(2, "compile_c_to_ll: compile error: %d", exit_code);
+    return exit_code == 0;
+}
+
+#define LLVM_AS "/usr/bin/llvm-as" // FIXME: do not hard-code this
+
+static bool
+compile_ll_to_bc(const char *ll_file, const char *bc_file)
+{
+    const char *args[] = { LLVM_AS, "-o", NULL, NULL, NULL };
+    args[2] = bc_file;
+    args[3] = ll_file;
+    int exit_code = exec_process(LLVM_AS, args);
+    if (exit_code != 0)
+        verbose(2, "compile_ll_to_bc: link error: %d", exit_code);
+    return exit_code == 0;
+}
+
+static void *
+load_func_from_bc(const char *bc_file, const char *funcname, struct rb_mjit_unit *unit)
+{
+    LLVMMemoryBufferRef buf;
+    char *error;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_file, &buf, &error)) {
+        if (error) {
+            mjit_warning("LLVMCreateMemoryBufferWithContentsOfFile failed: %s\n", error);
+            LLVMDisposeMessage(error);
+        }
+        return (void *)NOT_COMPILED_JIT_ISEQ_FUNC;
+    }
+
+    LLVMModuleRef mod;
+    if (LLVMParseBitcode2(buf, &mod)) {
+        mjit_warning("LLVMParseBitcode2 failed");
+    }
+    LLVMDisposeMemoryBuffer(buf);
+
+    LLVMExecutionEngineRef engine;
+    if (LLVMCreateJITCompilerForModule(&engine, mod, LLVMCodeGenLevelAggressive, &error)) {
+        if (error) {
+            mjit_warning("LLVMCreateJITCompilerForModule failed: %s\n", error);
+            LLVMDisposeMessage(error);
+        }
+        return (void *)NOT_COMPILED_JIT_ISEQ_FUNC;
+    }
+    return (void *)LLVMGetFunctionAddress(engine, funcname);
+}
+
+#else
+
 // Compile .c file to .o file. It returns true if it succeeds. (non-mswin)
 static bool
 compile_c_to_o(const char *c_file, const char *o_file)
@@ -924,7 +1006,7 @@ compact_all_jit_code(void)
     }
 # endif // _WIN32
 }
-
+#endif // MJIT_LLVM
 #endif // _MSC_VER
 
 static void *
@@ -1011,14 +1093,22 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
     double start_time, end_time;
     int c_file_len = (int)sizeof(c_file_buff);
     static const char c_ext[] = ".c";
+#if MJIT_LLVM
+    static const char so_ext[] = ".bc";
+#else
     static const char so_ext[] = DLEXT;
+#endif
     const int access_mode =
 #ifdef O_BINARY
         O_BINARY|
 #endif
         O_WRONLY|O_EXCL|O_CREAT;
 #ifndef _MSC_VER
+# if MJIT_LLVM
+    static const char o_ext[] = ".ll";
+# else
     static const char o_ext[] = ".o";
+# endif
     char *o_file;
 #endif
 
@@ -1103,6 +1193,10 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
     start_time = real_ms_time();
 #ifdef _MSC_VER
     success = compile_c_to_so(c_file, so_file);
+#elif MJIT_LLVM
+    success = compile_c_to_ll(c_file, o_file);
+    if (success)
+        success = compile_ll_to_bc(o_file, so_file);
 #else
     // splitting .c -> .o step and .o -> .so step, to cache .o files in the future
     if ((success = compile_c_to_o(c_file, o_file)) != false) {
@@ -1127,9 +1221,17 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
         return (mjit_func_t)NOT_COMPILED_JIT_ISEQ_FUNC;
     }
 
+#if MJIT_LLVM
+    func = load_func_from_bc(so_file, funcname, unit);
+    if (!mjit_opts.save_temps) {
+        remove_file(o_file);
+        remove_file(so_file);
+    }
+#else
     func = load_func_from_so(so_file, funcname, unit);
     if (!mjit_opts.save_temps)
         remove_so_file(so_file, unit);
+#endif
 
     if ((uintptr_t)func > (uintptr_t)LAST_JIT_ISEQ_FUNC) {
         CRITICAL_SECTION_START(3, "end of jit");
@@ -1268,7 +1370,7 @@ mjit_worker(void)
             }
             CRITICAL_SECTION_FINISH(3, "in jit func replace");
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !MJIT_LLVM
             // Combine .o files to one .so and reload all jit_func to improve memory locality
             if ((!mjit_opts.wait && unit_queue.length == 0 && active_units.length > 1)
                 || active_units.length == mjit_opts.max_cache_size) {
