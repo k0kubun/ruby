@@ -314,6 +314,13 @@ env:
     # -j randomly hangs.
     script: ruby -C spec/ruby ../mspec/bin/mspec .
 
+  - &baseruby
+    name: "BASERUBY: Ruby 1.8.7"
+    <<: *make-test-only
+    os: linux
+    dist: trusty # xenial no longer has ruby-1.8.7
+    rvm: ruby-1.8.7
+
   - &x86_64-darwin17
     name: x86_64-darwin17
     <<: *osx
@@ -342,6 +349,7 @@ matrix:
     - <<: *CALL_THREADED_CODE
     - <<: *NO_THREADED_CODE
     - <<: *rubyspec
+    - <<: *baseruby
   allow_failures:
     - name: -fsanitize=address
     - name: -fsanitize=memory
