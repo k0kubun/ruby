@@ -319,6 +319,7 @@ env:
     <<: *linux
     <<: *make-test-only
     dist: trusty # xenial no longer has ruby-1.8.7
+    language: ruby
     rvm: 1.8.7
 
   - &x86_64-darwin17
