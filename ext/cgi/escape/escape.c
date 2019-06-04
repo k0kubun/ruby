@@ -45,31 +45,48 @@ static VALUE
 optimized_escape_html(VALUE str)
 {
     const char *cstr = RSTRING_PTR(str);
-    const size_t cstr_size = RSTRING_LEN(str) + 1;
-    const char *end = cstr + cstr_size;
-    char *buf = ALLOCA_N(char, cstr_size * html_escape_max_len);
+    const char *end = cstr + RSTRING_LEN(str);
+    char *dest, *buf = NULL;
 
-    char *dest = buf;
+    // Try to skip allocating a buffer until we know it should be escaped.
+    int found = 0;
     while (cstr < end) {
-        const unsigned char c = *cstr++;
-        const char *escaped = html_escape_table[c];
-        if (escaped) {
-            size_t len = html_escape_len[c];
-            memcpy(dest, escaped, len);
-            dest += len;
+        if (html_escape_table[(unsigned char)*cstr]) {
+            // Lazily allocate a buffer if it's needed
+            dest = buf = ALLOCA_N(char, (RSTRING_LEN(str) + 1) * html_escape_max_len);
+            int skip_len = cstr - RSTRING_PTR(str) - 1;
+            if (skip_len > 0) {
+                memcpy(dest, RSTRING_PTR(str), skip_len);
+                dest += skip_len;
+            }
+
+            found = 1;
+            break;
         }
-        else {
-            *dest++ = c;
-        }
+        cstr++;
     }
 
-    if ((ptrdiff_t)cstr_size < (dest - buf)) {
-        VALUE escaped = rb_str_new_cstr(buf);
-        preserve_original_state(str, escaped);
-        return escaped;
+    if (found) {
+        // Proceed the rest in this quick loop with fewer branches.
+        while (cstr < end) {
+            const unsigned char c = *cstr++;
+            const char *escaped = html_escape_table[c];
+            if (escaped) {
+                memcpy(dest, escaped, html_escape_len[c]);
+                dest += html_escape_len[c];
+            }
+            else {
+                *dest++ = c;
+            }
+        }
+        *dest = '\0';
+
+        VALUE newstr = rb_str_new_cstr(buf);
+        preserve_original_state(str, newstr);
+        return newstr;
     }
     else {
-	return rb_str_dup(str);
+        return rb_str_dup(str);
     }
 }
 
