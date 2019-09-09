@@ -3064,6 +3064,17 @@ rb_vm_insn_addr2insn(const void *addr)
     rb_bug("rb_vm_insn_addr2insn: invalid insn address: %p", addr);
 }
 
+MJIT_FUNC_EXPORTED VALUE
+rb_vm_insn_insn2addr(int insn, int trace_p)
+{
+    if (trace_p) {
+        return (VALUE)insn_data[insn].trace_encoded_insn;
+    }
+    else {
+        return (VALUE)insn_data[insn].notrace_encoded_insn;
+    }
+}
+
 static inline int
 encoded_iseq_trace_instrument(VALUE *iseq_encoded_insn, rb_event_flag_t turnon)
 {

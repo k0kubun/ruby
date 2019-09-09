@@ -789,7 +789,7 @@ send
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(ci);
 {
     VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), ci, blockiseq, false);
-    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_method_wrap);
+    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_method_wrap, BIN(send));
 
     if (val == Qundef) {
         RESTORE_REGS();
@@ -807,11 +807,32 @@ opt_send_without_block
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(ci);
 {
     VALUE bh = VM_BLOCK_HANDLER_NONE;
-    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_method_wrap);
+    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_method_wrap, BIN(opt_send_without_block));
 
     if (val == Qundef) {
         RESTORE_REGS();
         NEXT_INSN();
+    }
+}
+
+DEFINE_INSN
+mjit_send
+(CALL_INFO ci, CALL_CACHE cc)
+(...)
+(VALUE val)
+// attr bool handles_sp = true;
+// attr rb_snum_t sp_inc = sp_inc_of_sendish(ci);
+{
+    int argc = ci->orig_argc;
+    VALUE recv = TOPN(argc);
+    VALUE klass = CLASS_OF(recv);
+    mjit_func_t func;
+    if (LIKELY(GET_GLOBAL_METHOD_STATE() == cc->method_state
+               && RCLASS_SERIAL(klass) == cc->class_serial
+               && (func = vm_mjit_send(ec, GET_CFP(), ci, cc, argc, recv, klass)) > LAST_JIT_ISEQ_FUNC)) {
+        val = func(ec, ec->cfp);
+    } else {
+        CALL_SIMPLE_METHOD();
     }
 }
 
@@ -893,7 +914,7 @@ invokesuper
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(ci);
 {
     VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), ci, blockiseq, true);
-    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_super_method);
+    val = vm_sendish(ec, GET_CFP(), ci, cc, bh, vm_search_super_method, BIN(invokesuper));
 
     if (val == Qundef) {
         RESTORE_REGS();
@@ -915,7 +936,7 @@ invokeblock
     };
 
     VALUE bh = VM_BLOCK_HANDLER_NONE;
-    val = vm_sendish(ec, GET_CFP(), ci, &cc, bh, vm_search_invokeblock);
+    val = vm_sendish(ec, GET_CFP(), ci, &cc, bh, vm_search_invokeblock, BIN(invokeblock));
 
     if (val == Qundef) {
         RESTORE_REGS();

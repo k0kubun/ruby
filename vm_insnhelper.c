@@ -3693,6 +3693,13 @@ vm_invokeblock_i(
     }
 }
 
+static void
+vm_change_insn(rb_control_frame_t *cfp, rb_num_t pc_offset, int insn)
+{
+    VALUE addr = rb_vm_insn_insn2addr(insn, ruby_vm_event_flags & ISEQ_TRACE_EVENTS);
+    *((VALUE *)cfp->pc - pc_offset) = addr;
+}
+
 static VALUE
 vm_sendish(
     struct rb_execution_context_struct *ec,
@@ -3704,7 +3711,8 @@ vm_sendish(
         const struct rb_control_frame_struct *reg_cfp,
         struct rb_call_info *ci,
         struct rb_call_cache *cc,
-        VALUE recv))
+        VALUE recv),
+    int insn)
 {
     VALUE val;
     int argc = ci->orig_argc;
@@ -3749,8 +3757,34 @@ vm_sendish(
     /* When calling from VM, longjmp in the callee won't purge any
        JIT-ed caller frames.  So it's safe to directly call
        mjit_exec. */
-    return mjit_exec(ec);
+    val = mjit_exec(ec);
+    struct rb_iseq_constant_body *body = GET_ISEQ()->body;
+    if (val != Qundef && cc->call == (void *)vm_call_iseq_setup_func(ci, body->param.size, body->local_table_size)) {
+        if (insn == BIN(opt_send_without_block)) {
+            vm_change_insn(RUBY_VM_PREVIOUS_CONTROL_FRAME(reg_cfp),
+                           attr_width_opt_send_without_block(ci, cc), BIN(mjit_send));
+        }
+    }
+    return val;
 #endif
+}
+
+static inline mjit_func_t
+vm_mjit_send(struct rb_execution_context_struct *ec, struct rb_control_frame_struct *reg_cfp,
+             struct rb_call_info *ci, struct rb_call_cache *cc, int argc, VALUE recv, VALUE klass)
+{
+    struct rb_calling_info calling;
+
+    calling.block_handler = VM_BLOCK_HANDLER_NONE;
+    calling.kw_splat = IS_ARGS_KW_SPLAT(ci);
+    calling.recv = recv;
+    calling.argc = argc;
+
+    struct rb_iseq_constant_body *body = def_iseq_ptr(cc->me->def)->body;
+    vm_call_iseq_setup_normal(ec, reg_cfp, &calling, cc->me, 0, body->param.size, body->local_table_size);
+
+    ++body->total_calls;
+    return body->jit_func;
 }
 
 static VALUE
