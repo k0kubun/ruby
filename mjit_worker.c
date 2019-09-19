@@ -146,6 +146,8 @@ struct rb_mjit_unit {
     struct list_node unode;
     // mjit_compile's optimization switches
     struct rb_mjit_compile_info compile_info;
+    // cc->call to wrap in JIT-ed code
+    rb_cc_call_t cc_call;
 };
 
 // Linked list of struct rb_mjit_unit.
@@ -1060,7 +1062,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
     verbose(2, "start compilation: %s@%s:%ld -> %s", iseq_label, iseq_path, iseq_lineno, c_file);
     fprintf(f, "/* %s@%s:%ld */\n\n", iseq_label, iseq_path, iseq_lineno);
-    bool success = mjit_compile(f, unit->iseq, funcname);
+    bool success = mjit_compile(f, unit->iseq, funcname, unit->cc_call);
 
     // release blocking mjit_gc_start_hook
     CRITICAL_SECTION_START(3, "after mjit_compile to wakeup client for GC");

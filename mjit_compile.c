@@ -447,7 +447,7 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
 
 // Compile ISeq to C code in `f`. It returns true if it succeeds to compile.
 bool
-mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
+mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, rb_cc_call_t cc_call)
 {
     // For performance, we verify stack size only on compilation time (mjit_compile.inc.erb) without --jit-debug
     if (!mjit_opts.debug) {
@@ -469,7 +469,16 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname)
 #ifdef _WIN32
     fprintf(f, "__declspec(dllexport)\n");
 #endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+
+    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, "
+            "struct rb_calling_info *calling, struct rb_call_data *cd)\n{\n", funcname);
+    if (cc_call != NULL) {
+        fprintf(f, "    if (cd != NULL) {\n");
+        fprintf(f, "       rb_cc_call_t cc_call = 0x%"PRIxVALUE";\n", (VALUE)cc_call);
+        fprintf(f, "       cc_call(ec, reg_cfp, calling, cd);\n");
+        fprintf(f, "       reg_cfp = ec->cfp;\n");
+        fprintf(f, "    }\n");
+    }
     bool success = mjit_compile_body(f, iseq, &status);
     fprintf(f, "\n} // end of %s\n", funcname);
     return success;

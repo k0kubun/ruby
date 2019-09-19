@@ -370,7 +370,7 @@ unload_units(void)
 }
 
 static void
-mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_info *compile_info)
+mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_info *compile_info, rb_cc_call_t cc_call)
 {
     if (!mjit_enabled || pch_status == PCH_FAILED)
         return;
@@ -382,6 +382,8 @@ mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_inf
         return;
     if (compile_info != NULL)
         iseq->body->jit_unit->compile_info = *compile_info;
+    if (cc_call != NULL)
+        iseq->body->jit_unit->cc_call = cc_call;
 
     CRITICAL_SECTION_START(3, "in add_iseq_to_process");
     add_to_list(iseq->body->jit_unit, &unit_queue);
@@ -396,9 +398,9 @@ mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_inf
 // Add ISEQ to be JITed in parallel with the current thread.
 // Unload some JIT codes if there are too many of them.
 void
-rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq)
+rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq, rb_cc_call_t cc_call)
 {
-    mjit_add_iseq_to_process(iseq, NULL);
+    mjit_add_iseq_to_process(iseq, NULL, cc_call);
 }
 
 // For this timeout seconds, --jit-wait will wait for JIT compilation finish.
@@ -437,7 +439,7 @@ rb_mjit_wait_call(rb_execution_context_t *ec, struct rb_iseq_constant_body *body
     if ((uintptr_t)body->jit_func <= (uintptr_t)LAST_JIT_ISEQ_FUNC) {
         return Qundef;
     }
-    return body->jit_func(ec, ec->cfp);
+    return body->jit_func(ec, ec->cfp, NULL, NULL);
 }
 
 struct rb_mjit_compile_info*
@@ -445,6 +447,13 @@ rb_mjit_iseq_compile_info(const struct rb_iseq_constant_body *body)
 {
     assert(body->jit_unit != NULL);
     return &body->jit_unit->compile_info;
+}
+
+rb_cc_call_t
+rb_mjit_iseq_cc_call(const struct rb_iseq_constant_body *body)
+{
+    assert(body->jit_unit != NULL);
+    return body->jit_unit->cc_call;
 }
 
 void
@@ -462,7 +471,7 @@ rb_mjit_recompile_iseq(const rb_iseq_t *iseq)
     add_to_list(iseq->body->jit_unit, &stale_units);
     CRITICAL_SECTION_FINISH(3, "in rb_mjit_recompile_iseq");
 
-    mjit_add_iseq_to_process(iseq, &iseq->body->jit_unit->compile_info);
+    mjit_add_iseq_to_process(iseq, &iseq->body->jit_unit->compile_info, iseq->body->jit_unit->cc_call);
     if (UNLIKELY(mjit_opts.wait)) {
         mjit_wait(iseq->body);
     }

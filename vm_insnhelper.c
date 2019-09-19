@@ -3990,7 +3990,7 @@ vm_sendish(
         VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
         return vm_exec(ec, true);
     }
-    else if ((val = mjit_exec(ec)) == Qundef) {
+    else if ((val = mjit_exec(ec, NULL)) == Qundef) {
         VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
         return vm_exec(ec, false);
     }
@@ -4001,7 +4001,7 @@ vm_sendish(
     /* When calling from VM, longjmp in the callee won't purge any
        JIT-ed caller frames.  So it's safe to directly call
        mjit_exec. */
-    return mjit_exec(ec);
+    return mjit_exec(ec, cc);
 #endif
 }
 

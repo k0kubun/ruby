@@ -2367,6 +2367,10 @@ struct rb_call_data;
  *   https://github.com/jemalloc/jemalloc/blob/dev/include/jemalloc/internal/jemalloc_internal_types.h
  */
 #define CACHELINE 64
+typedef VALUE (*rb_cc_call_t)(struct rb_execution_context_struct *ec,
+                              struct rb_control_frame_struct *cfp,
+                              struct rb_calling_info *calling,
+                              struct rb_call_data *cd);
 struct rb_call_cache {
     /* inline cache: keys */
     rb_serial_t method_state;
@@ -2388,10 +2392,7 @@ struct rb_call_cache {
     const struct rb_callable_method_entry_struct *me;
     const struct rb_method_definition_struct *def;
 
-    VALUE (*call)(struct rb_execution_context_struct *ec,
-                  struct rb_control_frame_struct *cfp,
-                  struct rb_calling_info *calling,
-                  struct rb_call_data *cd);
+    rb_cc_call_t call;
 
     union {
         unsigned int index; /* used by ivar */

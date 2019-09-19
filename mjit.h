@@ -65,19 +65,20 @@ struct rb_mjit_compile_info {
     bool disable_inlining;
 };
 
-typedef VALUE (*mjit_func_t)(rb_execution_context_t *, rb_control_frame_t *);
+typedef rb_cc_call_t mjit_func_t;
 
 RUBY_SYMBOL_EXPORT_BEGIN
 RUBY_EXTERN struct mjit_options mjit_opts;
 RUBY_EXTERN bool mjit_call_p;
 
-extern void rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq);
+extern void rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq, rb_cc_call_t cc_call);
 extern VALUE rb_mjit_wait_call(rb_execution_context_t *ec, struct rb_iseq_constant_body *body);
 extern struct rb_mjit_compile_info* rb_mjit_iseq_compile_info(const struct rb_iseq_constant_body *body);
+extern rb_cc_call_t rb_mjit_iseq_cc_call(const struct rb_iseq_constant_body *body);
 extern void rb_mjit_recompile_iseq(const rb_iseq_t *iseq);
 RUBY_SYMBOL_EXPORT_END
 
-extern bool mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname);
+extern bool mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, rb_cc_call_t cc_call);
 extern void mjit_init(struct mjit_options *opts);
 extern void mjit_postponed_job_register_start_hook(void);
 extern void mjit_postponed_job_register_finish_hook(void);
@@ -105,13 +106,13 @@ mjit_target_iseq_p(struct rb_iseq_constant_body *body)
 
 // Try to execute the current iseq in ec.  Use JIT code if it is ready.
 // If it is not, add ISEQ to the compilation queue and return Qundef.
+// `cc` should be passed only when it's from VM, to optimize `cc->call`.
 static inline VALUE
-mjit_exec(rb_execution_context_t *ec)
+mjit_exec(rb_execution_context_t *ec, struct rb_call_cache *cc)
 {
     const rb_iseq_t *iseq;
     struct rb_iseq_constant_body *body;
     long unsigned total_calls;
-    mjit_func_t func;
 
     if (!mjit_call_p)
         return Qundef;
@@ -121,7 +122,7 @@ mjit_exec(rb_execution_context_t *ec)
     body = iseq->body;
     total_calls = ++body->total_calls;
 
-    func = body->jit_func;
+    mjit_func_t func = body->jit_func;
     if (UNLIKELY((uintptr_t)func <= (uintptr_t)LAST_JIT_ISEQ_FUNC)) {
 #     ifdef MJIT_HEADER
         RB_DEBUG_COUNTER_INC(mjit_frame_JT2VM);
@@ -133,7 +134,8 @@ mjit_exec(rb_execution_context_t *ec)
             RB_DEBUG_COUNTER_INC(mjit_exec_not_added);
             if (total_calls == mjit_opts.min_calls && mjit_target_iseq_p(body)) {
                 RB_DEBUG_COUNTER_INC(mjit_exec_not_added_add_iseq);
-                rb_mjit_add_iseq_to_process(iseq);
+                rb_mjit_add_iseq_to_process(iseq,
+                        (cc != NULL && cc->me != NULL && cc->me->def != NULL && cc->me->def->type == VM_METHOD_TYPE_ISEQ) ? cc->call : NULL);
                 if (UNLIKELY(mjit_opts.wait)) {
                     return rb_mjit_wait_call(ec, body);
                 }
@@ -156,7 +158,11 @@ mjit_exec(rb_execution_context_t *ec)
       RB_DEBUG_COUNTER_INC(mjit_frame_VM2JT);
 #   endif
     RB_DEBUG_COUNTER_INC(mjit_exec_call_func);
-    return func(ec, ec->cfp);
+
+    if (cc != NULL && rb_mjit_iseq_cc_call(body) == cc->call) {
+        cc->call = func;
+    }
+    return func(ec, ec->cfp, NULL, NULL);
 }
 
 void mjit_child_after_fork(void);
@@ -172,7 +178,7 @@ static inline void mjit_free_iseq(const rb_iseq_t *iseq){}
 static inline void mjit_mark(void){}
 static inline void mjit_add_class_serial(rb_serial_t class_serial){}
 static inline void mjit_remove_class_serial(rb_serial_t class_serial){}
-static inline VALUE mjit_exec(rb_execution_context_t *ec) { return Qundef; /* unreachable */ }
+static inline VALUE mjit_exec(rb_execution_context_t *ec, struct rb_call_cache *cc) { return Qundef; /* unreachable */ }
 static inline void mjit_child_after_fork(void){}
 
 #endif // USE_MJIT

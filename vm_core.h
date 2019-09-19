@@ -439,8 +439,7 @@ struct rb_iseq_constant_body {
 
 #if USE_MJIT
     /* The following fields are MJIT related info.  */
-    VALUE (*jit_func)(struct rb_execution_context_struct *,
-                      struct rb_control_frame_struct *); /* function pointer for loaded native code */
+    rb_cc_call_t jit_func; /* function pointer for loaded native code */
     long unsigned total_calls; /* number of total calls with `mjit_exec()` */
     struct rb_mjit_unit *jit_unit;
 #endif
