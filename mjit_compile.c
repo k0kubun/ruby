@@ -454,30 +454,18 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n\n", (VALUE)iseq->body->iseq_encoded);
 
     fprintf(f, "label_0: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x5;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "    stack[0] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_2: /* opt_send_without_block */\n");
+    fprintf(f, "label_2: /* opt_send_without_block */\n"); // downcase
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[3]);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[3]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 4;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[0];\n");
     fprintf(f, "    {\n");
     fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
     fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        \n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            return val;\n");
     fprintf(f, "        }\n");
@@ -489,18 +477,16 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_4: /* opt_send_without_block */\n");
+    fprintf(f, "label_4: /* opt_send_without_block */\n"); // freeze
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[5]);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[5]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 6;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[0];\n");
     fprintf(f, "    {\n");
     fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
     fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        \n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            return val;\n");
     fprintf(f, "        }\n");
@@ -513,60 +499,30 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "}\n\n");
 
     fprintf(f, "label_6: /* setlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x3;\n");
-    fprintf(f, "    val = stack[0];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        vm_env_write(vm_get_ep(GET_EP(), level), -(int)idx, val);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "    vm_env_write(vm_get_ep(GET_EP(), 0), -(int)0x3, stack[0]);\n");
 
     fprintf(f, "label_8: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
-    fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    id = (ID)0x%"PRIxVALUE";\n", opes[9]);
-    fprintf(f, "    ic = (IC)0x%"PRIxVALUE";\n", opes[10]);
+    fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[9]);
+    fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[10]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 11;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_getinstancevariable(GET_SELF(), id, ic);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
+    fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), id, ic);\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_11: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x3;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_11: /* getlocal_WC_0 */\n"); // canonical
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
     fprintf(f, "label_13: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[14]);
-    fprintf(f, "    recv = stack[0];\n");
-    fprintf(f, "    obj = stack[1];\n");
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[14]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 15;\n");
     fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_opt_aref(recv, obj);\n");
-    fprintf(f, "        \n");
+    fprintf(f, "        val = vm_opt_aref(stack[0], stack[1]);\n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 13;\n");
@@ -582,16 +538,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_15: /* branchunless */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(OFFSET) dst;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    dst = (OFFSET)0x14;\n");
-    fprintf(f, "    val = stack[0];\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 17;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        if (!RTEST(val)) {\n");
-    fprintf(f, "            RUBY_VM_CHECK_INTS(ec);\n");
-    fprintf(f, "            goto label_37;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    if (!RTEST(stack[0])) {\n");
+    fprintf(f, "        RUBY_VM_CHECK_INTS(ec);\n");
+    fprintf(f, "        goto label_37;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
@@ -601,51 +551,30 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_17: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
-    fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    id = (ID)0x%"PRIxVALUE";\n", opes[18]);
-    fprintf(f, "    ic = (IC)0x%"PRIxVALUE";\n", opes[19]);
+    fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[18]);
+    fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[19]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 20;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_getinstancevariable(GET_SELF(), id, ic);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
+    fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), id, ic);\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_20: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x3;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_20: /* getlocal_WC_0 */\n"); // canonical
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
     fprintf(f, "label_22: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[23]);
-    fprintf(f, "    recv = stack[0];\n");
-    fprintf(f, "    obj = stack[1];\n");
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[23]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 24;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_opt_aref(recv, obj);\n");
-    fprintf(f, "        \n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
-    fprintf(f, "            reg_cfp->pc = original_body_iseq + 22;\n");
-    fprintf(f, "            goto cancel;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    val = vm_opt_aref(stack[0], stack[1]);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 22;\n");
+    fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -654,18 +583,8 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_24: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x5;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_24: /* getlocal_WC_0 */\n"); // k
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
     fprintf(f, "label_26: /* opt_neq */\n");
     fprintf(f, "{\n");
@@ -677,7 +596,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    obj = stack[1];\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = vm_opt_neq(cd, cd_eq, recv, obj);\n");
-    fprintf(f, "        \n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 26;\n");
@@ -689,16 +607,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_29: /* branchunless */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(OFFSET) dst;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    dst = (OFFSET)0x6;\n");
-    fprintf(f, "    val = stack[0];\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 31;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        if (!RTEST(val)) {\n");
-    fprintf(f, "            RUBY_VM_CHECK_INTS(ec);\n");
-    fprintf(f, "            goto label_37;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    if (!RTEST(stack[0])) {\n");
+    fprintf(f, "        RUBY_VM_CHECK_INTS(ec);\n");
+    fprintf(f, "        goto label_37;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
@@ -709,24 +621,13 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "label_31: /* putself */\n");
     fprintf(f, "    stack[0] = GET_SELF();\n");
 
-    fprintf(f, "label_32: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x5;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_32: /* getlocal_WC_0 */\n"); // k
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
     fprintf(f, "label_34: /* opt_send_without_block */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[35]);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[35]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 36;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "    *(reg_cfp->sp + -2) = stack[0];\n");
@@ -734,7 +635,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    {\n");
     fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
     fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        \n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            return val;\n");
     fprintf(f, "        }\n");
@@ -748,134 +648,61 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_37: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
-    fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    id = (ID)0x%"PRIxVALUE";\n", opes[38]);
-    fprintf(f, "    ic = (IC)0x%"PRIxVALUE";\n", opes[39]);
+    fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[38]);
+    fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[39]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 40;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_getinstancevariable(GET_SELF(), id, ic);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
+    fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), id, ic);\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_40: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x3;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_40: /* getlocal_WC_0 */\n"); // canonical
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
-    fprintf(f, "label_42: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x5;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[2] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_42: /* getlocal_WC_0 */\n"); // k
+    fprintf(f, "    stack[2] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
     fprintf(f, "label_44: /* opt_aset */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, set, val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[45]);
-    fprintf(f, "    recv = stack[0];\n");
-    fprintf(f, "    obj = stack[1];\n");
-    fprintf(f, "    set = stack[2];\n");
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[45]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 46;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_opt_aset(recv, obj, set);\n");
-    fprintf(f, "        \n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
-    fprintf(f, "            reg_cfp->pc = original_body_iseq + 44;\n");
-    fprintf(f, "            goto cancel;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    val = vm_opt_aset(stack[0], stack[1], stack[2]);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 44;\n");
+    fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "}\n\n");
-
-    fprintf(f, "label_46: /* pop */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    val = stack[0];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        (void)val;\n");
-    fprintf(f, "        /* none */\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
     fprintf(f, "label_47: /* putself */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = GET_SELF();\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "    stack[0] = GET_SELF();\n");
 
-    fprintf(f, "label_48: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x5;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[1] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_48: /* getlocal_WC_0 */\n"); // k
+    fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_50: /* getlocal_WC_0 */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
-    fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
-    fprintf(f, "    level = 0;\n");
-    fprintf(f, "    idx = (lindex_t)0x4;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[2] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "label_50: /* getlocal_WC_0 */\n"); // v
+    fprintf(f, "    stack[2] = *(vm_get_ep(GET_EP(), 0) - 0x4);\n");
 
     fprintf(f, "label_52: /* invokesuper */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
-    fprintf(f, "    MAYBE_UNUSED(ISEQ) blockiseq;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[53]);
-    fprintf(f, "    blockiseq = (ISEQ)0x0;\n");
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[53]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 55;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
     fprintf(f, "    *(reg_cfp->sp + -3) = stack[0];\n");
     fprintf(f, "    *(reg_cfp->sp + -2) = stack[1];\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[2];\n");
     fprintf(f, "    {\n");
-    fprintf(f, "        VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), &cd->ci, blockiseq, true);\n");
+    fprintf(f, "        VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), &cd->ci, 0, true);\n");
     fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_super_method);\n");
-    fprintf(f, "        \n");
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            return val;\n");
     fprintf(f, "        }\n");
@@ -889,34 +716,18 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_55: /* leave */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    val = stack[0];\n");
+    fprintf(f, "    VALUE val = stack[0];\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 56;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        if (OPT_CHECKED_RUN) {\n");
-    fprintf(f, "            const VALUE *const bp = vm_base_ptr(GET_CFP());\n");
-    fprintf(f, "            if (GET_SP() != bp) {\n");
-    fprintf(f, "                vm_stack_consistency_error(ec, GET_CFP(), bp);\n");
-    fprintf(f, "            }\n");
-    fprintf(f, "        }\n");
-    fprintf(f, "        \n");
-    fprintf(f, "        RUBY_VM_CHECK_INTS(ec);\n");
-    fprintf(f, "        \n");
-    fprintf(f, "        if (vm_pop_frame(ec, GET_CFP(), GET_EP())) {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
-    fprintf(f, "        else {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    RUBY_VM_CHECK_INTS(ec);\n");
+    fprintf(f, "    if (vm_pop_frame(ec, GET_CFP(), GET_EP())) {\n");
+    fprintf(f, "        return stack[0];\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
+    fprintf(f, "    else {\n");
+    fprintf(f, "        return stack[0];\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n");
-    fprintf(f, "goto label_37;\n");
+
     compile_cancel_handler(f, iseq->body, status);
 
     return true;
