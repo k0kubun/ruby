@@ -2447,6 +2447,7 @@ mjit_compile.$(OBJEXT): {$(VPATH)}method.h
 mjit_compile.$(OBJEXT): {$(VPATH)}missing.h
 mjit_compile.$(OBJEXT): {$(VPATH)}mjit.h
 mjit_compile.$(OBJEXT): {$(VPATH)}mjit_compile.c
+mjit_compile.$(OBJEXT): {$(VPATH)}mjit_compile_custom.c
 mjit_compile.$(OBJEXT): {$(VPATH)}mjit_compile.inc
 mjit_compile.$(OBJEXT): {$(VPATH)}node.h
 mjit_compile.$(OBJEXT): {$(VPATH)}ruby_assert.h
