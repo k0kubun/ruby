@@ -793,17 +793,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_36: /* pop */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    val = stack[0];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        (void)val;\n");
-    fprintf(f, "        /* none */\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "}\n\n");
-
     fprintf(f, "label_37: /* getinstancevariable */\n");
     fprintf(f, "{\n");
     fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
