@@ -17,10 +17,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    if (stack[0] == Qundef) {\n");
     fprintf(f, "        return Qundef;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_4: opt_send_without_block - #freeze
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 6;\n");
@@ -30,10 +26,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    if (stack[0] == Qundef) {\n");
     fprintf(f, "        return Qundef;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_6: setlocal - canonical
     fprintf(f, "    vm_env_write(vm_get_ep(GET_EP(), 0), -(int)0x3, stack[0]);\n");
@@ -41,10 +33,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     // label_8: getinstancevariable - @names
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 11;\n");
     fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[9], opes[10]);
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_11: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
@@ -57,10 +45,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        reg_cfp->pc = original_body_iseq + 13;\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_15: branchunless
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 17;\n");
@@ -68,18 +52,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        RUBY_VM_CHECK_INTS(ec);\n");
     fprintf(f, "        goto label_37;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_17: getinstancevariable - @names
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 20;\n");
     fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[18], opes[19]);
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_20: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
@@ -93,10 +69,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_24: getlocal_WC_0 - k
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
@@ -115,10 +87,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        RUBY_VM_CHECK_INTS(ec);\n");
     fprintf(f, "        goto label_37;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_31: putself
     fprintf(f, "    stack[0] = GET_SELF();\n");
@@ -135,18 +103,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    if (stack[0] == Qundef) {\n");
     fprintf(f, "        return Qundef;\n");
     fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     fprintf(f, "label_37: /* getinstancevariable */\n"); // @names
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 40;\n");
     fprintf(f, "    stack[0] = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[38], opes[39]);
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
 
     // label_40: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
@@ -160,10 +120,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    if (stack[0] == Qundef) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
     fprintf(f, "        reg_cfp->pc = original_body_iseq + 44;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
 
@@ -190,10 +146,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        return val;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
-    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        goto cancel;\n");
-    fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
     // label_55: leave
