@@ -455,7 +455,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_0: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -471,7 +470,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_2: /* opt_send_without_block */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[3]);
@@ -496,7 +494,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_4: /* opt_send_without_block */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[5]);
@@ -521,7 +518,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_6: /* setlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -537,7 +533,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_8: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
     fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
     fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
@@ -557,7 +552,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_11: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -573,7 +567,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_13: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[14]);
@@ -600,7 +593,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_15: /* branchunless */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(OFFSET) dst;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    dst = (OFFSET)0x14;\n");
@@ -621,7 +613,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_17: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
     fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
     fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
@@ -641,7 +632,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_20: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -657,7 +647,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_22: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[23]);
@@ -684,7 +673,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_24: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -700,7 +688,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_26: /* opt_neq */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd, cd_eq;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
     fprintf(f, "    cd_eq = (CALL_DATA)0x%"PRIxVALUE";\n", opes[27]);
@@ -722,7 +709,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_29: /* branchunless */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(OFFSET) dst;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    dst = (OFFSET)0x6;\n");
@@ -742,18 +728,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "}\n\n");
 
     fprintf(f, "label_31: /* putself */\n");
-    fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = GET_SELF();\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    stack[0] = val;\n");
-    fprintf(f, "}\n\n");
+    fprintf(f, "    stack[0] = GET_SELF();\n");
 
     fprintf(f, "label_32: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -769,7 +747,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_34: /* opt_send_without_block */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[35]);
@@ -795,7 +772,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_37: /* getinstancevariable */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
     fprintf(f, "    MAYBE_UNUSED(IC) ic;\n");
     fprintf(f, "    MAYBE_UNUSED(ID) id;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
@@ -815,7 +791,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_40: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -831,7 +806,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_42: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -847,7 +821,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_44: /* opt_aset */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 3;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, set, val;\n");
     fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[45]);
@@ -875,7 +848,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_46: /* pop */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    val = stack[0];\n");
     fprintf(f, "    {\n");
@@ -886,7 +858,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_47: /* putself */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 0;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = GET_SELF();\n");
@@ -896,7 +867,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_48: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -912,7 +882,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_50: /* getlocal_WC_0 */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 2;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    MAYBE_UNUSED(lindex_t) idx;\n");
     fprintf(f, "    MAYBE_UNUSED(rb_num_t) level;\n");
@@ -928,7 +897,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_52: /* invokesuper */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 3;\n");
     fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd;\n");
     fprintf(f, "    MAYBE_UNUSED(ISEQ) blockiseq;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
@@ -957,7 +925,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_55: /* leave */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(unsigned int) stack_size = 1;\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    val = stack[0];\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 56;\n");
