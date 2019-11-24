@@ -11,17 +11,14 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_2: /* opt_send_without_block */\n"); // downcase
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[3]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 4;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[0];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
-    fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
+    fprintf(f, "    VALUE val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        return val;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -32,17 +29,14 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_4: /* opt_send_without_block */\n"); // freeze
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[5]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 6;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[0];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
-    fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
+    fprintf(f, "    VALUE val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        return val;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -71,16 +65,13 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_13: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[14]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 15;\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_opt_aref(stack[0], stack[1]);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
-    fprintf(f, "            reg_cfp->pc = original_body_iseq + 13;\n");
-    fprintf(f, "            goto cancel;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    VALUE val = vm_opt_aref(stack[0], stack[1]);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 13;\n");
+    fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -104,7 +95,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_17: /* getinstancevariable */\n"); // @names
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[18]);
     fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[19]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 20;\n");
@@ -120,10 +110,9 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_22: /* opt_aref */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[23]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 24;\n");
-    fprintf(f, "    val = vm_opt_aref(stack[0], stack[1]);\n");
+    fprintf(f, "    VALUE val = vm_opt_aref(stack[0], stack[1]);\n");
     fprintf(f, "    if (val == Qundef) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "        reg_cfp->pc = original_body_iseq + 22;\n");
@@ -141,19 +130,13 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_26: /* opt_neq */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    MAYBE_UNUSED(CALL_DATA) cd, cd_eq;\n");
-    fprintf(f, "    MAYBE_UNUSED(VALUE) obj, recv, val;\n");
-    fprintf(f, "    cd_eq = (CALL_DATA)0x%"PRIxVALUE";\n", opes[27]);
-    fprintf(f, "    cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[28]);
-    fprintf(f, "    recv = stack[0];\n");
-    fprintf(f, "    obj = stack[1];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        val = vm_opt_neq(cd, cd_eq, recv, obj);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
-    fprintf(f, "            reg_cfp->pc = original_body_iseq + 26;\n");
-    fprintf(f, "            goto cancel;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    CALL_DATA cd_eq = (CALL_DATA)0x%"PRIxVALUE";\n", opes[27]);
+    fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[28]);
+    fprintf(f, "    VALUE val = vm_opt_neq(cd, cd_eq, stack[0], stack[1]);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 26;\n");
+    fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "}\n\n");
@@ -179,18 +162,15 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_34: /* opt_send_without_block */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[35]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 36;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "    *(reg_cfp->sp + -2) = stack[0];\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[1];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
-    fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    VALUE bh = VM_BLOCK_HANDLER_NONE;\n");
+    fprintf(f, "    VALUE val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_method_wrap);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        return val;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -219,10 +199,9 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_44: /* opt_aset */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[45]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 46;\n");
-    fprintf(f, "    val = vm_opt_aset(stack[0], stack[1], stack[2]);\n");
+    fprintf(f, "    VALUE val = vm_opt_aset(stack[0], stack[1], stack[2]);\n");
     fprintf(f, "    if (val == Qundef) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
     fprintf(f, "        reg_cfp->pc = original_body_iseq + 44;\n");
@@ -246,19 +225,16 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_52: /* invokesuper */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val;\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[53]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 55;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
     fprintf(f, "    *(reg_cfp->sp + -3) = stack[0];\n");
     fprintf(f, "    *(reg_cfp->sp + -2) = stack[1];\n");
     fprintf(f, "    *(reg_cfp->sp + -1) = stack[2];\n");
-    fprintf(f, "    {\n");
-    fprintf(f, "        VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), &cd->ci, 0, true);\n");
-    fprintf(f, "        val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_super_method);\n");
-    fprintf(f, "        if (val == Qundef) {\n");
-    fprintf(f, "            return val;\n");
-    fprintf(f, "        }\n");
+    fprintf(f, "    VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), &cd->ci, 0, true);\n");
+    fprintf(f, "    VALUE val = vm_sendish(ec, GET_CFP(), cd, bh, vm_search_super_method);\n");
+    fprintf(f, "    if (val == Qundef) {\n");
+    fprintf(f, "        return val;\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
@@ -269,16 +245,11 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
 
     fprintf(f, "label_55: /* leave */\n");
     fprintf(f, "{\n");
-    fprintf(f, "    VALUE val = stack[0];\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 56;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
     fprintf(f, "    RUBY_VM_CHECK_INTS(ec);\n");
-    fprintf(f, "    if (vm_pop_frame(ec, GET_CFP(), GET_EP())) {\n");
-    fprintf(f, "        return stack[0];\n");
-    fprintf(f, "    }\n");
-    fprintf(f, "    else {\n");
-    fprintf(f, "        return stack[0];\n");
-    fprintf(f, "    }\n");
+    fprintf(f, "    vm_pop_frame(ec, GET_CFP(), GET_EP());\n");
+    fprintf(f, "    return stack[0];\n");
     fprintf(f, "}\n");
 
     compile_cancel_handler(f, iseq->body, status);
