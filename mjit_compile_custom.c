@@ -6,7 +6,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    static const rb_iseq_t *original_iseq = (const rb_iseq_t *)0x%"PRIxVALUE";\n", (VALUE)iseq);
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n\n", (VALUE)iseq->body->iseq_encoded);
 
-    fprintf(f, "label_0: /* getlocal_WC_0 */\n");
+    fprintf(f, "label_0: /* getlocal_WC_0 */\n"); // k
     fprintf(f, "    stack[0] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
     fprintf(f, "label_2: /* opt_send_without_block */\n"); // downcase
@@ -54,7 +54,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "label_6: /* setlocal_WC_0 */\n");
     fprintf(f, "    vm_env_write(vm_get_ep(GET_EP(), 0), -(int)0x3, stack[0]);\n");
 
-    fprintf(f, "label_8: /* getinstancevariable */\n");
+    fprintf(f, "label_8: /* getinstancevariable */\n"); // @names
     fprintf(f, "{\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[9]);
     fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[10]);
@@ -102,7 +102,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_17: /* getinstancevariable */\n");
+    fprintf(f, "label_17: /* getinstancevariable */\n"); // @names
     fprintf(f, "{\n");
     fprintf(f, "    MAYBE_UNUSED(VALUE) val;\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[18]);
@@ -199,7 +199,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_37: /* getinstancevariable */\n");
+    fprintf(f, "label_37: /* getinstancevariable */\n"); // @names
     fprintf(f, "{\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[38]);
     fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[39]);
