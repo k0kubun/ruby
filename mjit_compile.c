@@ -462,8 +462,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x5;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "}\n\n");
@@ -487,7 +485,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -511,7 +508,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -526,8 +522,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    val = stack[0];\n");
     fprintf(f, "    {\n");
     fprintf(f, "        vm_env_write(vm_get_ep(GET_EP(), level), -(int)idx, val);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_set);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_set_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
@@ -545,7 +539,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -559,8 +552,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x3;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -579,14 +570,12 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 13;\n");
-    fprintf(f, "            RB_DEBUG_COUNTER_INC(mjit_cancel_opt_insn);\n");
     fprintf(f, "            goto cancel;\n");
     fprintf(f, "        }\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -606,7 +595,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -625,7 +613,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -639,8 +626,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x3;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -659,14 +644,12 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 22;\n");
-    fprintf(f, "            RB_DEBUG_COUNTER_INC(mjit_cancel_opt_insn);\n");
     fprintf(f, "            goto cancel;\n");
     fprintf(f, "        }\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -680,8 +663,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x5;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -700,7 +681,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 2;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 26;\n");
-    fprintf(f, "            RB_DEBUG_COUNTER_INC(mjit_cancel_opt_insn);\n");
     fprintf(f, "            goto cancel;\n");
     fprintf(f, "        }\n");
     fprintf(f, "    }\n");
@@ -722,7 +702,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -739,8 +718,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x5;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -765,7 +742,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -784,7 +760,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -798,8 +773,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x3;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -813,8 +786,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x5;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[2] = val;\n");
     fprintf(f, "}\n\n");
@@ -834,14 +805,12 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "        if (val == Qundef) {\n");
     fprintf(f, "            reg_cfp->sp = vm_base_ptr(reg_cfp) + 3;\n");
     fprintf(f, "            reg_cfp->pc = original_body_iseq + 44;\n");
-    fprintf(f, "            RB_DEBUG_COUNTER_INC(mjit_cancel_opt_insn);\n");
     fprintf(f, "            goto cancel;\n");
     fprintf(f, "        }\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -874,8 +843,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x5;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[1] = val;\n");
     fprintf(f, "}\n\n");
@@ -889,8 +856,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    idx = (lindex_t)0x4;\n");
     fprintf(f, "    {\n");
     fprintf(f, "        val = *(vm_get_ep(GET_EP(), level) - idx);\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(lvar_get);\n");
-    fprintf(f, "        (void)RB_DEBUG_COUNTER_INC_IF(lvar_get_dynamic, level > 0);\n");
     fprintf(f, "    }\n");
     fprintf(f, "    stack[2] = val;\n");
     fprintf(f, "}\n\n");
@@ -918,7 +883,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
@@ -949,7 +913,6 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "    if (UNLIKELY(!mjit_call_p)) {\n");
     fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 1;\n");
-    fprintf(f, "        RB_DEBUG_COUNTER_INC(mjit_cancel_invalidate_all);\n");
     fprintf(f, "        goto cancel;\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n");
