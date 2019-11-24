@@ -6,10 +6,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    static const rb_iseq_t *original_iseq = (const rb_iseq_t *)0x%"PRIxVALUE";\n", (VALUE)iseq);
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n\n", (VALUE)iseq->body->iseq_encoded);
 
-    fprintf(f, "label_0: /* getlocal_WC_0 */\n"); // k
+    // label_0: getlocal_WC_0 - k
     fprintf(f, "    stack[0] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_2: /* opt_send_without_block */\n"); // downcase
+    // label_2: opt_send_without_block - #downcase
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[3]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 4;\n");
@@ -27,7 +27,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_4: /* opt_send_without_block */\n"); // freeze
+    // label_4: opt_send_without_block - #freeze
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[5]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 6;\n");
@@ -45,10 +45,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_6: /* setlocal_WC_0 */\n");
+    // label_6: setlocal - canonical
     fprintf(f, "    vm_env_write(vm_get_ep(GET_EP(), 0), -(int)0x3, stack[0]);\n");
 
-    fprintf(f, "label_8: /* getinstancevariable */\n"); // @names
+    // label_8: getinstancevariable - @names
     fprintf(f, "{\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[9]);
     fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[10]);
@@ -60,10 +60,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_11: /* getlocal_WC_0 */\n"); // canonical
+    // label_11: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
-    fprintf(f, "label_13: /* opt_aref */\n");
+    // label_13: opt_aref
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[14]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 15;\n");
@@ -80,7 +80,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_15: /* branchunless */\n");
+    // label_15: branchunless
     fprintf(f, "{\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 17;\n");
     fprintf(f, "    if (!RTEST(stack[0])) {\n");
@@ -93,7 +93,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_17: /* getinstancevariable */\n"); // @names
+    // label_17: getinstancevariable - @names
     fprintf(f, "{\n");
     fprintf(f, "    ID id = (ID)0x%"PRIxVALUE";\n", opes[18]);
     fprintf(f, "    IC ic = (IC)0x%"PRIxVALUE";\n", opes[19]);
@@ -105,10 +105,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_20: /* getlocal_WC_0 */\n"); // canonical
+    // label_20: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
-    fprintf(f, "label_22: /* opt_aref */\n");
+    // label_22: opt_aref
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[23]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 24;\n");
@@ -125,10 +125,10 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_24: /* getlocal_WC_0 */\n"); // k
+    // label_24: getlocal_WC_0 - k
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_26: /* opt_neq */\n");
+    // label_26: opt_neq
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd_eq = (CALL_DATA)0x%"PRIxVALUE";\n", opes[27]);
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[28]);
@@ -141,7 +141,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    stack[0] = val;\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_29: /* branchunless */\n");
+    // label_29: branchunless
     fprintf(f, "{\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 31;\n");
     fprintf(f, "    if (!RTEST(stack[0])) {\n");
@@ -154,13 +154,13 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_31: /* putself */\n");
+    // label_31: putself
     fprintf(f, "    stack[0] = GET_SELF();\n");
 
-    fprintf(f, "label_32: /* getlocal_WC_0 */\n"); // k
+    // label_32: getlocal_WC_0 - k
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_34: /* opt_send_without_block */\n");
+    // label_34: opt_send_without_block
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[35]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 36;\n");
@@ -191,13 +191,13 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_40: /* getlocal_WC_0 */\n"); // canonical
+    // label_40: getlocal_WC_0 - canonical
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x3);\n");
 
-    fprintf(f, "label_42: /* getlocal_WC_0 */\n"); // k
+    // label_42: getlocal_WC_0 - k
     fprintf(f, "    stack[2] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_44: /* opt_aset */\n");
+    // label_44: opt_aset
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[45]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 46;\n");
@@ -214,16 +214,16 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_47: /* putself */\n");
+    // label_47: putself
     fprintf(f, "    stack[0] = GET_SELF();\n");
 
-    fprintf(f, "label_48: /* getlocal_WC_0 */\n"); // k
+    // label_48: getlocal_WC_0 - k
     fprintf(f, "    stack[1] = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
 
-    fprintf(f, "label_50: /* getlocal_WC_0 */\n"); // v
+    // label_50: getlocal_WC_0 - v
     fprintf(f, "    stack[2] = *(vm_get_ep(GET_EP(), 0) - 0x4);\n");
 
-    fprintf(f, "label_52: /* invokesuper */\n");
+    // label_52: invokesuper
     fprintf(f, "{\n");
     fprintf(f, "    CALL_DATA cd = (CALL_DATA)0x%"PRIxVALUE";\n", opes[53]);
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 55;\n");
@@ -243,7 +243,7 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
     fprintf(f, "}\n\n");
 
-    fprintf(f, "label_55: /* leave */\n");
+    // label_55: leave
     fprintf(f, "{\n");
     fprintf(f, "    reg_cfp->pc = original_body_iseq + 56;\n");
     fprintf(f, "    reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
