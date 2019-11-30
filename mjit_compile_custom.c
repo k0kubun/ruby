@@ -2,6 +2,7 @@ bool
 mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *status)
 {
     VALUE* opes = iseq->body->iseq_encoded;
+    IVC ic;
     fprintf(f, "    VALUE k = *(vm_get_ep(GET_EP(), 0) - 0x5);\n");
     fprintf(f, "    static const rb_iseq_t *original_iseq = (const rb_iseq_t *)0x%"PRIxVALUE";\n", (VALUE)iseq);
     fprintf(f, "    static const VALUE *const original_body_iseq = (VALUE *)0x%"PRIxVALUE";\n\n", (VALUE)iseq->body->iseq_encoded);
@@ -25,7 +26,22 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
 
     // label_8: getinstancevariable - @names
-    fprintf(f, "    stack_0 = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[9], opes[10]);
+    ic = (IVC)opes[10];
+    fprintf(f, "{\n");
+    fprintf(f, "    VALUE obj = GET_SELF();\n");
+    fprintf(f, "    const rb_serial_t ic_serial = (rb_serial_t)%"PRI_SERIALT_PREFIX"u;\n", ic->ic_serial);
+    fprintf(f, "    const st_index_t index = %"PRIuSIZE";\n", ic->index);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    struct gen_ivtbl *ivtbl;\n");
+    fprintf(f, "    if (LIKELY(!SPECIAL_CONST_P(obj) && FL_TEST_RAW(obj, FL_EXIVAR) && ic_serial == RCLASS_SERIAL(RBASIC(obj)->klass) && st_lookup(rb_ivar_generic_ivtbl(), (st_data_t)obj, (st_data_t *)&ivtbl) && index < ivtbl->numiv && (val = ivtbl->ivptr[index]) != Qundef)) {\n");
+    fprintf(f, "        stack_0 = val;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "    else {\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 8;\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
+    fprintf(f, "        goto ivar_cancel;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "}\n\n");
 
     // label_11: getlocal_WC_0 - canonical
     // label_13: opt_aref
@@ -43,7 +59,22 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
 
     // label_17: getinstancevariable - @names
-    fprintf(f, "    stack_0 = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[18], opes[19]);
+    ic = (IVC)opes[19];
+    fprintf(f, "{\n");
+    fprintf(f, "    VALUE obj = GET_SELF();\n");
+    fprintf(f, "    const rb_serial_t ic_serial = (rb_serial_t)%"PRI_SERIALT_PREFIX"u;\n", ic->ic_serial);
+    fprintf(f, "    const st_index_t index = %"PRIuSIZE";\n", ic->index);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    struct gen_ivtbl *ivtbl;\n");
+    fprintf(f, "    if (LIKELY(!SPECIAL_CONST_P(obj) && FL_TEST_RAW(obj, FL_EXIVAR) && ic_serial == RCLASS_SERIAL(RBASIC(obj)->klass) && st_lookup(rb_ivar_generic_ivtbl(), (st_data_t)obj, (st_data_t *)&ivtbl) && index < ivtbl->numiv && (val = ivtbl->ivptr[index]) != Qundef)) {\n");
+    fprintf(f, "        stack_0 = val;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "    else {\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 17;\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
+    fprintf(f, "        goto ivar_cancel;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "}\n\n");
 
     // label_20: getlocal_WC_0 - canonical
     // label_22: opt_aref
@@ -81,7 +112,22 @@ mjit_compile_custom(FILE *f, const rb_iseq_t *iseq, struct compile_status *statu
     fprintf(f, "    }\n");
 
     fprintf(f, "label_37: /* getinstancevariable */\n"); // @names
-    fprintf(f, "    stack_0 = vm_getinstancevariable(GET_SELF(), (ID)0x%"PRIxVALUE", (IC)0x%"PRIxVALUE");\n", opes[38], opes[39]);
+    ic = (IVC)opes[39];
+    fprintf(f, "{\n");
+    fprintf(f, "    VALUE obj = GET_SELF();\n");
+    fprintf(f, "    const rb_serial_t ic_serial = (rb_serial_t)%"PRI_SERIALT_PREFIX"u;\n", ic->ic_serial);
+    fprintf(f, "    const st_index_t index = %"PRIuSIZE";\n", ic->index);
+    fprintf(f, "    VALUE val;\n");
+    fprintf(f, "    struct gen_ivtbl *ivtbl;\n");
+    fprintf(f, "    if (LIKELY(!SPECIAL_CONST_P(obj) && FL_TEST_RAW(obj, FL_EXIVAR) && ic_serial == RCLASS_SERIAL(RBASIC(obj)->klass) && st_lookup(rb_ivar_generic_ivtbl(), (st_data_t)obj, (st_data_t *)&ivtbl) && index < ivtbl->numiv && (val = ivtbl->ivptr[index]) != Qundef)) {\n");
+    fprintf(f, "        stack_0 = val;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "    else {\n");
+    fprintf(f, "        reg_cfp->pc = original_body_iseq + 37;\n");
+    fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + 0;\n");
+    fprintf(f, "        goto ivar_cancel;\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "}\n\n");
 
     // label_40: getlocal_WC_0 - canonical
     // label_42: getlocal_WC_0 - k
