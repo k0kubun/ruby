@@ -54,6 +54,8 @@ switch (insn) {
 %   case insn.name
 %   when 'opt_send_without_block', 'send'
 <%=   render 'mjit_compile_send', locals: { insn: insn } -%>
+%   when 'invokesuper'
+<%=   render 'mjit_compile_super', locals: { insn: insn } -%>
 %   when *send_compatible_opt_insns
 %     # To avoid cancel, just emit `opt_send_without_block` instead of `opt_*` insn if call cache is populated.
 %     cd_index = insn.opes.index { |o| o.fetch(:type) == 'CALL_DATA' }
