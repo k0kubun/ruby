@@ -76,6 +76,8 @@ struct case_dispatch_var {
     VALUE last_value;
 };
 
+extern int mjit_iseq_unit_id(const struct rb_iseq_constant_body *const body);
+
 static size_t
 call_data_index(CALL_DATA cd, const struct rb_iseq_constant_body *body)
 {
@@ -452,12 +454,12 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
                     return false;
                 }
 
-                fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, const VALUE orig_self, const rb_iseq_t *original_iseq));\n", pos);
-                fprintf(f, "static inline VALUE\n_mjit_inlined_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, const VALUE orig_self, const rb_iseq_t *original_iseq)\n{\n", pos);
+                fprintf(f, "ALWAYS_INLINE(static VALUE _mjit_inlined_%d_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, const VALUE orig_self, const rb_iseq_t *original_iseq));\n", mjit_iseq_unit_id(status->compiled_iseq), pos);
+                fprintf(f, "static inline VALUE\n_mjit_inlined_%d_%d(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, const VALUE orig_self, const rb_iseq_t *original_iseq)\n{\n", mjit_iseq_unit_id(status->compiled_iseq), pos);
                 fprintf(f, "    const VALUE *orig_pc = reg_cfp->pc;\n");
                 fprintf(f, "    const VALUE *orig_sp = reg_cfp->sp;\n");
                 bool success = mjit_compile_body(f, child_iseq, &child_status);
-                fprintf(f, "\n} /* end of _mjit_inlined_%d */\n\n", pos);
+                fprintf(f, "\n} /* end of _mjit_inlined_%d_%d */\n\n", mjit_iseq_unit_id(status->compiled_iseq), pos);
 
                 if (!success)
                     return false;

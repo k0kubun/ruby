@@ -147,6 +147,7 @@ struct rb_mjit_unit {
 #ifndef _MSC_VER
     // This value is always set for `compact_all_jit_code`. Also used for lazy deletion.
     char *o_file;
+    char *c_file;
     // true if it's inherited from parent Ruby process and lazy deletion should be skipped.
     // `o_file = NULL` can't be used to skip lazy deletion because `o_file` could be used
     // by child for `compact_all_jit_code`.
@@ -893,6 +894,31 @@ link_o_to_so(const char **o_files, const char *so_file)
     return exit_code == 0;
 }
 
+static void compile_prelude(FILE *f);
+
+static void
+compile_compact_jit_code(char* c_file)
+{
+    const int access_mode =
+#ifdef O_BINARY
+        O_BINARY|
+#endif
+        O_WRONLY|O_EXCL|O_CREAT;
+    int fd = rb_cloexec_open(c_file, access_mode, 0600);
+    // TODO: check fd < 0
+    FILE *f = fdopen(fd, "w");
+    // TODO: check NULL
+
+    compile_prelude(f);
+
+    struct rb_mjit_unit *cur = 0;
+    list_for_each(&active_units.head, cur, unode) {
+        fprintf(f, "#include \"%s\"\n", cur->c_file);
+    }
+
+    fclose(f);
+}
+
 // Link all cached .o files and build a .so file. Reload all JIT func from it. This
 // allows to avoid JIT code fragmentation and improve performance to call JIT-ed code.
 static void
@@ -901,10 +927,9 @@ compact_all_jit_code(void)
 # ifndef _WIN32 // This requires header transformation but we don't transform header on Windows for now
     struct rb_mjit_unit *unit, *cur = 0;
     double start_time, end_time;
+    static const char c_ext[] = ".c";
     static const char so_ext[] = DLEXT;
-    char so_file[MAXPATHLEN];
-    const char **o_files;
-    int i = 0;
+    char c_file[MAXPATHLEN], so_file[MAXPATHLEN];
 
     // Abnormal use case of rb_mjit_unit that doesn't have ISeq
     unit = calloc(1, sizeof(struct rb_mjit_unit)); // To prevent GC, don't use ZALLOC
@@ -913,13 +938,10 @@ compact_all_jit_code(void)
     sprint_uniq_filename(so_file, (int)sizeof(so_file), unit->id, MJIT_TMP_PREFIX, so_ext);
 
     // NULL-ending for form_args
-    o_files = alloca(sizeof(char *) * (active_units.length + 1));
-    o_files[active_units.length] = NULL;
-    CRITICAL_SECTION_START(3, "in compact_all_jit_code to guard .o files from unload_units");
-    list_for_each(&active_units.head, cur, unode) {
-        o_files[i] = cur->o_file;
-        i++;
-    }
+    sprint_uniq_filename(c_file, (int)sizeof(c_file), unit->id, MJIT_TMP_PREFIX, c_ext);
+    const char *o_files[] = { c_file, NULL };
+    CRITICAL_SECTION_START(3, "in compact_all_jit_code to keep .o files");
+    compile_compact_jit_code(c_file);
     in_compact = true;
     CRITICAL_SECTION_FINISH(3, "in compact_all_jit_code to guard .o files from unload_units");
 
@@ -1015,6 +1037,8 @@ compile_prelude(FILE *f)
     const char *s = pch_file;
     const char *e = header_name_end(s);
 
+    fprintf(f, "#ifndef MJIT_PCH\n");
+    fprintf(f, "#define MJIT_PCH\n");
     fprintf(f, "#include \"");
     // print pch_file except .gch for gcc, but keep .pch for mswin
     for (; s < e; s++) {
@@ -1025,6 +1049,7 @@ compile_prelude(FILE *f)
         fputc(*s, f);
     }
     fprintf(f, "\"\n");
+    fprintf(f, "#endif\n");
 #endif
 
 #ifdef _WIN32
@@ -1147,6 +1172,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
         // Always set o_file for compaction. The value is also used for lazy deletion.
         unit->o_file = strdup(o_file);
+        unit->c_file = strdup(c_file);
         if (unit->o_file == NULL) {
             mjit_warning("failed to allocate memory to remember '%s' (%s), removing it...", o_file, strerror(errno));
             remove_file(o_file);
@@ -1155,8 +1181,9 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 #endif
     end_time = real_ms_time();
 
-    if (!mjit_opts.save_temps)
-        remove_file(c_file);
+    // TODO: remove it lazily
+    // if (!mjit_opts.save_temps)
+    //     remove_file(c_file);
     if (!success) {
         verbose(2, "Failed to generate so: %s", so_file);
         return (mjit_func_t)NOT_COMPILED_JIT_ISEQ_FUNC;
@@ -1193,6 +1220,12 @@ const struct rb_callcache **
 mjit_iseq_cc_entries(const struct rb_iseq_constant_body *const body)
 {
     return body->jit_unit->cc_entries;
+}
+
+int
+mjit_iseq_unit_id(const struct rb_iseq_constant_body *const body)
+{
+    return body->jit_unit->id;
 }
 
 // Capture cc entries of `captured_iseq` and append them to `compiled_iseq->jit_unit->cc_entries`.
