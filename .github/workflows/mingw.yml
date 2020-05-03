@@ -80,34 +80,12 @@ jobs:
           # Write-Host "-------------------------------------- config.log"
           # Get-Content ./config.log | foreach {Write-Output $_}
 
-      - name: download unicode, gems, etc
-        working-directory: build
-        run: |
-          $jobs = [int]$env:NUMBER_OF_PROCESSORS + 1
-          make -j $jobs update-unicode
-          make -j $jobs update-gems
-
       - name: make all
         timeout-minutes: 40
         working-directory: build
         run: |
           $jobs = [int]$env:NUMBER_OF_PROCESSORS + 1
           make -j $jobs
-
-      - name: make install
-        working-directory: build
-        run: |
-          # Actions uses UTF8, causes test failures, similar to normal OS setup
-          $PSDefaultParameterValues['*:Encoding'] = 'utf8'
-          [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding("IBM437")
-          [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding("IBM437")
-          make DESTDIR=.. install-nodoc
-
-      - name: test
-        timeout-minutes: 5
-        working-directory: build
-        run: |
-          make test
 
       - name: test-all
         timeout-minutes: 50
@@ -118,19 +96,7 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding("IBM437")
           [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding("IBM437")
           $jobs = [int]$env:NUMBER_OF_PROCESSORS
-          make test-all TESTOPTS="-j $jobs --retry --job-status=normal --show-skip --timeout-scale=1.5"
-
-      - name: test-spec
-        timeout-minutes: 10
-        working-directory: src/spec/ruby
-        run: |
-          $env:Path = "$pwd/../../../install/bin;$env:Path"
-          # Actions uses UTF8, causes test failures, similar to normal OS setup
-          $PSDefaultParameterValues['*:Encoding'] = 'utf8'
-          [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding("IBM437")
-          [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding("IBM437")
-          ruby -v
-          ruby ../mspec/bin/mspec -j
+          make test-all TESTS="../src/test/ruby/test_jit.rb" TESTOPTS="-j $jobs --retry --job-status=normal --show-skip --timeout-scale=1.5"
 
       - uses: k0kubun/action-slack@v2.0.0
         with:
