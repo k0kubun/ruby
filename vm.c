@@ -2901,6 +2901,14 @@ mjit_resume_m(VALUE _)
     return mjit_resume();
 }
 
+static VALUE
+mjit_profile_use_m(VALUE _)
+{
+    void compact_all_jit_code(bool profile_use);
+    compact_all_jit_code(true);
+    return Qnil;
+}
+
 extern VALUE *rb_gc_stack_start;
 extern size_t rb_gc_stack_maxsize;
 
@@ -3041,6 +3049,7 @@ Init_VM(void)
     rb_define_singleton_method(mjit, "enabled?", mjit_enabled_p, 0);
     rb_define_singleton_method(mjit, "pause", mjit_pause_m, -1);
     rb_define_singleton_method(mjit, "resume", mjit_resume_m, 0);
+    rb_define_singleton_method(mjit, "profile_use", mjit_profile_use_m, 0);
 
     /*
      * Document-class: Thread

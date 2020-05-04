@@ -276,7 +276,7 @@ static char *libruby_pathflag;
 // Use `-nodefaultlibs -nostdlib` for GCC where possible, which does not work on mingw, cygwin, AIX, and OpenBSD.
 // This seems to improve MJIT performance on GCC.
 #if defined __GNUC__ && !defined __clang__ && !defined(_WIN32) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__OpenBSD__)
-# define GCC_NOSTDLIB_FLAGS "-nodefaultlibs", "-nostdlib",
+# define GCC_NOSTDLIB_FLAGS // "-nodefaultlibs", "-nostdlib",
 #else
 # define GCC_NOSTDLIB_FLAGS // empty
 #endif
@@ -854,7 +854,7 @@ make_pch(void)
 // Not compiling .c to .so directly because it fails on MinGW, and this helps
 // to generate no .dSYM on macOS.
 static bool
-compile_c_to_so(const char *c_file, const char *so_file)
+compile_c_to_so(const char *c_file, const char *so_file, const char** o_extra, const char** so_extra)
 {
     char* o_file = alloca(strlen(c_file) + 1);
     strcpy(o_file, c_file);
@@ -867,7 +867,7 @@ compile_c_to_so(const char *c_file, const char *so_file)
 # endif
         "-c", NULL
     };
-    char **args = form_args(5, cc_common_args, CC_CODEFLAG_ARGS, cc_added_args, o_args, CC_LINKER_ARGS);
+    char **args = form_args(6, cc_common_args, CC_CODEFLAG_ARGS, cc_added_args, o_args, o_extra, CC_LINKER_ARGS);
     if (args == NULL) return false;
     int exit_code = exec_process(cc_path, args);
     free(args);
@@ -883,7 +883,7 @@ compile_c_to_so(const char *c_file, const char *so_file)
 # endif
         o_file, NULL
     };
-    args = form_args(6, CC_LDSHARED_ARGS, CC_CODEFLAG_ARGS, so_args, CC_LIBS, CC_DLDFLAGS_ARGS, CC_LINKER_ARGS);
+    args = form_args(7, CC_LDSHARED_ARGS, CC_CODEFLAG_ARGS, so_args, so_extra, CC_LIBS, CC_DLDFLAGS_ARGS, CC_LINKER_ARGS);
     if (args == NULL) return false;
     exit_code = exec_process(cc_path, args);
     free(args);
@@ -921,8 +921,9 @@ compile_compact_jit_code(char* c_file)
 
 // Compile all cached .c files and build a single .so file. Reload all JIT func from it.
 // This improves the code locality for better performance in terms of iTLB and iCache.
-static void
-compact_all_jit_code(void)
+void __gcov_flush();
+void
+compact_all_jit_code(bool profile_use)
 {
 # ifndef _WIN32 // This requires header transformation but we don't transform header on Windows for now
     struct rb_mjit_unit *unit, *cur = 0;
@@ -934,20 +935,31 @@ compact_all_jit_code(void)
     // Abnormal use case of rb_mjit_unit that doesn't have ISeq
     unit = calloc(1, sizeof(struct rb_mjit_unit)); // To prevent GC, don't use ZALLOC
     if (unit == NULL) return;
-    unit->id = current_unit_num++;
+    if (!profile_use) current_unit_num++;
+    unit->id = current_unit_num;
     sprint_uniq_filename(so_file, (int)sizeof(so_file), unit->id, MJIT_TMP_PREFIX, so_ext);
 
+    bool success = true;
     sprint_uniq_filename(c_file, (int)sizeof(c_file), unit->id, MJIT_TMP_PREFIX, c_ext);
     CRITICAL_SECTION_START(3, "in compact_all_jit_code to guard .c files from unload_units");
-    bool success = compile_compact_jit_code(c_file);
+    if (!profile_use) success = compile_compact_jit_code(c_file);
     in_compact = true;
     CRITICAL_SECTION_FINISH(3, "in compact_all_jit_code to guard .c files from unload_units");
 
     start_time = real_ms_time();
     if (success) {
-        success = compile_c_to_so(c_file, so_file);
-        if (!mjit_opts.save_temps)
-            remove_file(c_file);
+        if (profile_use) {
+            success = compile_c_to_so(c_file, so_file,
+                    (const char *[]){ "-nodefaultlibs", "-nostdlib", "-fprofile-use", NULL },
+                    (const char *[]){ "-nodefaultlibs", "-nostdlib", NULL });
+        }
+        else {
+            success = compile_c_to_so(c_file, so_file,
+                    (const char *[]){ "-fprofile-arcs", "-fprofile-generate", NULL },
+                    (const char *[]){ "-fprofile-arcs", NULL });
+        }
+        // if (!mjit_opts.save_temps)
+        //     remove_file(c_file);
     }
     end_time = real_ms_time();
 
@@ -1164,7 +1176,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
     }
 
     start_time = real_ms_time();
-    success = compile_c_to_so(c_file, so_file);
+    success = compile_c_to_so(c_file, so_file, (const char *[]){ NULL }, (const char *[]){ NULL });
 #ifdef _MSC_VER
     if (!mjit_opts.save_temps)
         remove_file(c_file);
@@ -1379,7 +1391,7 @@ mjit_worker(void)
             if (compact_units.length < max_compact_size
                 && ((!mjit_opts.wait && unit_queue.length == 0 && active_units.length > 1)
                     || active_units.length == mjit_opts.max_cache_size)) {
-                compact_all_jit_code();
+                compact_all_jit_code(false);
             }
 #endif
         }
