@@ -17,6 +17,7 @@ gc.rb
 integer.rb
 io.rb
 kernel.rb
+object.rb
 pack.rb
 trace_point.rb
 warning.rb

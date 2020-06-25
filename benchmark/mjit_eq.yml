@@ -1,0 +1,11 @@
+type: lib/benchmark_driver/runner/mjit
+prelude: |
+  def mjit_nil_eq(obj)
+    nil == obj
+  end
+
+benchmark:
+  - mjit_nil_eq(nil)
+  - mjit_nil_eq(1)
+
+loop_count: 40000000

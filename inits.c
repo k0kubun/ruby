@@ -87,6 +87,7 @@ rb_call_builtin_inits(void)
     BUILTIN(dir);
     BUILTIN(ast);
     BUILTIN(trace_point);
+    BUILTIN(object);
     BUILTIN(pack);
     BUILTIN(warning);
     BUILTIN(array);
