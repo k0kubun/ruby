@@ -1,0 +1,12 @@
+type: lib/benchmark_driver/runner/mjit
+prelude: |
+  str = ''
+
+  def mjit_to_s(str)
+    str.to_s
+  end
+
+benchmark:
+  - mjit_to_s(str)
+
+loop_count: 40000000

@@ -1012,6 +1012,7 @@ BUILTIN_RB_SRCS = \
 		$(srcdir)/io.rb \
 		$(srcdir)/dir.rb \
 		$(srcdir)/pack.rb \
+		$(srcdir)/string.rb \
 		$(srcdir)/trace_point.rb \
 		$(srcdir)/warning.rb \
 		$(srcdir)/array.rb \
@@ -8247,6 +8248,7 @@ miniinit.$(OBJEXT): {$(VPATH)}prelude.rb
 miniinit.$(OBJEXT): {$(VPATH)}ruby_assert.h
 miniinit.$(OBJEXT): {$(VPATH)}ruby_atomic.h
 miniinit.$(OBJEXT): {$(VPATH)}st.h
+miniinit.$(OBJEXT): {$(VPATH)}string.rb
 miniinit.$(OBJEXT): {$(VPATH)}subst.h
 miniinit.$(OBJEXT): {$(VPATH)}thread_$(THREAD_MODEL).h
 miniinit.$(OBJEXT): {$(VPATH)}thread_native.h
@@ -13112,6 +13114,8 @@ string.$(OBJEXT): {$(VPATH)}regex.h
 string.$(OBJEXT): {$(VPATH)}ruby_assert.h
 string.$(OBJEXT): {$(VPATH)}st.h
 string.$(OBJEXT): {$(VPATH)}string.c
+string.$(OBJEXT): {$(VPATH)}string.rb
+string.$(OBJEXT): {$(VPATH)}string.rbinc
 string.$(OBJEXT): {$(VPATH)}subst.h
 string.$(OBJEXT): {$(VPATH)}util.h
 strlcat.$(OBJEXT): {$(VPATH)}config.h

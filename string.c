@@ -11455,7 +11455,6 @@ Init_String(void)
 
     rb_define_method(rb_cString, "to_i", rb_str_to_i, -1);
     rb_define_method(rb_cString, "to_f", rb_str_to_f, 0);
-    rb_define_method(rb_cString, "to_s", rb_str_to_s, 0);
     rb_define_method(rb_cString, "to_str", rb_str_to_s, 0);
     rb_define_method(rb_cString, "inspect", rb_str_inspect, 0);
     rb_define_method(rb_cString, "dump", rb_str_dump, 0);
@@ -11609,3 +11608,5 @@ Init_String(void)
 
     rb_define_method(rb_cSymbol, "encoding", sym_encoding, 0);
 }
+
+#include "string.rbinc"
