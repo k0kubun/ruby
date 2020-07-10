@@ -6779,7 +6779,7 @@ rb_int_coerce(VALUE x, VALUE y)
     }
 }
 
-VALUE
+MJIT_FUNC_EXPORTED VALUE
 rb_big_abs(VALUE x)
 {
     if (BIGNUM_NEGATIVE_P(x)) {

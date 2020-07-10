@@ -3807,3 +3807,8 @@ rb_vm_empty_cc(void)
 #endif /* #ifndef MJIT_HEADER */
 
 #include "vm_call_iseq_optimized.inc" /* required from vm_insnhelper.c */
+
+/* for builtin inlining */
+#ifdef MJIT_HEADER
+#include "numeric.c"
+#endif

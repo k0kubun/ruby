@@ -9,6 +9,7 @@
 
 **********************************************************************/
 
+#ifndef MJIT_HEADER
 #include "ruby/internal/config.h"
 
 #include <assert.h>
@@ -4804,6 +4805,7 @@ int_to_f(VALUE num)
 
     return DBL2NUM(val);
 }
+#endif
 
 /*
  *  Document-method: Integer#abs
@@ -4843,6 +4845,7 @@ rb_int_abs(VALUE num)
     return Qnil;
 }
 
+#ifndef MJIT_HEADER
 /*
  *  Document-method: Integer#size
  *  call-seq:
@@ -5794,3 +5797,4 @@ rb_float_new(double d)
 }
 
 #include "integer.rbinc"
+#endif
