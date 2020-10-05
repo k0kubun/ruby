@@ -2372,16 +2372,25 @@ vm_call_iseq_setup_normal(rb_execution_context_t *ec, rb_control_frame_t *cfp, s
                           int opt_pc, int param_size, int local_size)
 {
     const rb_iseq_t *iseq = def_iseq_ptr(me->def);
+    struct rb_iseq_constant_body *body = iseq->body;
     VALUE *argv = cfp->sp - calling->argc;
     VALUE *sp = argv + param_size;
     cfp->sp = argv - 1 /* recv */;
 
     vm_push_frame(ec, iseq, VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL, calling->recv,
                   calling->block_handler, (VALUE)me,
-                  iseq->body->iseq_encoded + opt_pc, sp,
+                  body->iseq_encoded + opt_pc, sp,
                   local_size - param_size,
-                  iseq->body->stack_max);
-    return Qundef;
+                  body->stack_max);
+
+    body->total_calls++;
+    mjit_func_t func = body->jit_func;
+    if (LIKELY((uintptr_t)func > LAST_JIT_ISEQ_FUNC)) {
+        return func(ec, ec->cfp);
+    }
+    else {
+        return mjit_exec_slowpath(ec, iseq, iseq->body);
+    }
 }
 
 static inline VALUE
@@ -4213,32 +4222,8 @@ vm_sendish(
     }
     else {
         RESTORE_REGS();         /* CFP pushed in cc->call() */
-    }
-
-#ifdef MJIT_HEADER
-    /* When calling ISeq which may catch an exception from JIT-ed
-       code, we should not call mjit_exec directly to prevent the
-       caller frame from being canceled. That's because the caller
-       frame may have stack values in the local variables and the
-       cancelling the caller frame will purge them. But directly
-       calling mjit_exec is faster... */
-    if (GET_ISEQ()->body->catch_except_p) {
-        VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
-        return vm_exec(ec, true);
-    }
-    else if ((val = mjit_exec(ec)) == Qundef) {
-        VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
-        return vm_exec(ec, false);
-    }
-    else {
         return val;
     }
-#else
-    /* When calling from VM, longjmp in the callee won't purge any
-       JIT-ed caller frames.  So it's safe to directly call
-       mjit_exec. */
-    return mjit_exec(ec);
-#endif
 }
 
 static VALUE
