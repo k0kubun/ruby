@@ -570,7 +570,9 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
 #ifdef _WIN32
     fprintf(f, "__declspec(dllexport)\n");
 #endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, struct rb_call_data *cd)\n{\n", funcname);
+    fprintf(f, "    vm_call_iseq_setup_normal(ec, reg_cfp, calling, vm_cc_cme(cd->cc), 0, 0, 0);\n"); // XXX: param / local hard-coded
+    fprintf(f, "    reg_cfp = ec->cfp;\n"); // XXX: param / local hard-coded
     bool success = mjit_compile_body(f, iseq, &status);
     fprintf(f, "\n} // end of %s\n", funcname);
     return success;
