@@ -556,7 +556,7 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
 
 // Compile ISeq to C code in `f`. It returns true if it succeeds to compile.
 bool
-mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
+mjit_compile(FILE *f, const rb_iseq_t *iseq, struct rb_callcache *cc, const char *funcname, int id)
 {
     struct compile_status status = { .compiled_iseq = iseq->body, .compiled_id = id };
     INIT_COMPILE_STATUS(status, iseq->body, true);
@@ -567,14 +567,17 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
     init_ivar_compile_status(iseq->body, &status);
 
     if (!status.compile_info->disable_send_cache && !status.compile_info->disable_inlining) {
-        if (!precompile_inlinable_iseqs(f, iseq, &status))
+        if (false && !precompile_inlinable_iseqs(f, iseq, &status))
             return false;
     }
 
 #ifdef _WIN32
     fprintf(f, "__declspec(dllexport)\n");
 #endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, struct rb_call_data *cd)\n{\n", funcname);
+    fprintf(f, "    ((struct rb_callcache *)(cd->cc))->aux_.total_calls++;\n");
+    fprintf(f, "    vm_call_iseq_setup_normal(ec, reg_cfp, calling, (const rb_callable_method_entry_t *)0x%"PRIxVALUE", 0, %d, %d);\n", (VALUE)vm_cc_cme(cc), iseq->body->param.size, iseq->body->local_table_size);
+    fprintf(f, "    reg_cfp = ec->cfp;\n");
     bool success = mjit_compile_body(f, iseq, &status);
     fprintf(f, "\n} // end of %s\n", funcname);
     return success;

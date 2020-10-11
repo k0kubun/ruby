@@ -4188,7 +4188,7 @@ mjit_cc_call(const struct rb_callinfo *ci, struct rb_callcache *cc)
         return;
 
     if (UNLIKELY(++cc->aux_.total_calls == mjit_opts.min_calls)) {
-        extern void rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, const struct rb_callcache *cc);
+        extern void rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, struct rb_callcache *cc);
         rb_mjit_add_cc_to_process(ci, cc);
     }
 }

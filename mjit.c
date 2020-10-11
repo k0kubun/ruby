@@ -419,7 +419,7 @@ rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq)
 extern bool rb_fastpath_applied_iseq_p(const CALL_INFO ci, const CALL_CACHE cc, const rb_iseq_t *iseq);
 
 MJIT_FUNC_EXPORTED void
-rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, const struct rb_callcache *cc)
+rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, struct rb_callcache *cc)
 {
     const rb_callable_method_entry_t *me = vm_cc_cme(cc);
     if (me->def->type != VM_METHOD_TYPE_ISEQ)
@@ -434,6 +434,7 @@ rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, const struct rb_callcach
     create_unit(iseq);
     if (iseq->body->jit_unit == NULL) // Failure in creating the unit.
         return;
+    iseq->body->jit_unit->cc = cc;
 
     mjit_enqueue_unit(iseq->body->jit_unit);
 }

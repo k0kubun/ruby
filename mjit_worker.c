@@ -144,6 +144,7 @@ struct rb_mjit_unit {
     // Dlopen handle of the loaded object file.
     void *handle;
     rb_iseq_t *iseq;
+    struct rb_callcache *cc;
 #ifndef _MSC_VER
     // This value is always set for `compact_all_jit_code`. Also used for lazy deletion.
     char *c_file;
@@ -1154,7 +1155,8 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
     verbose(2, "start compilation: %s@%s:%ld -> %s", iseq_label, iseq_path, iseq_lineno, c_file);
     fprintf(f, "/* %s@%s:%ld */\n\n", iseq_label, iseq_path, iseq_lineno);
-    bool success = mjit_compile(f, unit->iseq, funcname, unit->id);
+    extern bool mjit_compile(FILE *f, const rb_iseq_t *iseq, struct rb_callcache *cc, const char *funcname, int id);
+    bool success = mjit_compile(f, unit->iseq, unit->cc, funcname, unit->id);
 
     // release blocking mjit_gc_start_hook
     CRITICAL_SECTION_START(3, "after mjit_compile to wakeup client for GC");
@@ -1384,9 +1386,8 @@ mjit_worker(void)
             if (unit->iseq) { // Check whether GCed or not
                 if ((uintptr_t)func > (uintptr_t)LAST_JIT_ISEQ_FUNC) {
                     add_to_list(unit, &active_units);
+                    vm_cc_call_set(unit->cc, (vm_call_handler)func);
                 }
-                // Usage of jit_code might be not in a critical section.
-                MJIT_ATOMIC_SET(unit->iseq->body->jit_func, func);
             }
             else {
                 free_unit(unit);

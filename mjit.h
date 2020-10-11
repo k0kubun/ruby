@@ -86,7 +86,6 @@ extern void rb_mjit_recompile_exivar(const rb_iseq_t *iseq);
 extern void rb_mjit_recompile_inlining(const rb_iseq_t *iseq);
 RUBY_SYMBOL_EXPORT_END
 
-extern bool mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id);
 extern void mjit_init(const struct mjit_options *opts);
 extern void mjit_gc_start_hook(void);
 extern void mjit_gc_exit_hook(void);
