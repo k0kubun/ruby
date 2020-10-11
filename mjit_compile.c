@@ -106,6 +106,7 @@ has_valid_method_type(CALL_CACHE cc)
     return vm_cc_cme(cc) != NULL;
 }
 
+/*
 // Returns true if MJIT thinks this cc's opt_* insn may fallback to opt_send_without_block.
 static bool
 has_cache_for_send(CALL_CACHE cc, int insn)
@@ -114,6 +115,7 @@ has_cache_for_send(CALL_CACHE cc, int insn)
     return has_valid_method_type(cc) &&
         !(vm_cc_cme(cc)->def->type == VM_METHOD_TYPE_CFUNC && rb_vm_opt_cfunc_p(cc, insn));
 }
+*/
 
 // Returns true if iseq can use fastpath for setup, otherwise NULL. This becomes true in the same condition
 // as CC_SET_FASTPATH (in vm_callee_setup_arg) is called from vm_call_iseq_setup.
@@ -127,6 +129,7 @@ fastpath_applied_iseq_p(const CALL_INFO ci, const CALL_CACHE cc, const rb_iseq_t
         && vm_call_iseq_optimizable_p(ci, cc); // CC_SET_FASTPATH condition
 }
 
+/*
 // Return true if an object of the klass may be a special const. See: rb_class_of
 static bool
 maybe_special_const_class_p(const VALUE klass)
@@ -138,6 +141,7 @@ maybe_special_const_class_p(const VALUE klass)
         || klass == rb_cSymbol
         || klass == rb_cFloat;
 }
+*/
 
 static int
 compile_case_dispatch_each(VALUE key, VALUE value, VALUE arg)

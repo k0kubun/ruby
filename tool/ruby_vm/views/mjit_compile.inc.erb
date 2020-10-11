@@ -51,16 +51,6 @@ switch (insn) {
   case BIN(<%= insn.name %>):
 %   # Instruction-specific behavior in JIT
 %   case insn.name
-%   when 'opt_send_without_block', 'send'
-<%=   render 'mjit_compile_send', locals: { insn: insn } -%>
-%   when *send_compatible_opt_insns
-%     # To avoid cancel, just emit `opt_send_without_block` instead of `opt_*` insn if call cache is populated.
-%     cd_index = insn.opes.index { |o| o.fetch(:type) == 'CALL_DATA' }
-      if (has_cache_for_send(captured_cc_entries(status)[call_data_index((CALL_DATA)operands[<%= cd_index %>], body)], BIN(<%= insn.name %>))) {
-<%=       render 'mjit_compile_send', locals: { insn: opt_send_without_block } -%>
-<%=       render 'mjit_compile_insn', locals: { insn: opt_send_without_block } -%>
-          break;
-      }
 %   when 'getinstancevariable', 'setinstancevariable'
 <%=   render 'mjit_compile_ivar', locals: { insn: insn } -%>
 %   when 'invokebuiltin', 'opt_invokebuiltin_delegate'

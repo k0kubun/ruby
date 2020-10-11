@@ -4192,7 +4192,6 @@ vm_sendish(
         struct rb_call_data *cd,
         VALUE recv))
 {
-    VALUE val;
     const struct rb_callinfo *ci = cd->ci;
     int argc = vm_ci_argc(ci);
     VALUE recv = TOPN(argc);
@@ -4206,39 +4205,7 @@ vm_sendish(
     method_explorer(GET_CFP(), cd, recv);
     const struct rb_callcache *cc = cd->cc;
 
-    val = vm_cc_call(cc)(ec, GET_CFP(), &calling, cd);
-
-    if (val != Qundef) {
-        return val;             /* CFUNC normal return */
-    }
-    else {
-        RESTORE_REGS();         /* CFP pushed in cc->call() */
-    }
-
-#ifdef MJIT_HEADER
-    /* When calling ISeq which may catch an exception from JIT-ed
-       code, we should not call mjit_exec directly to prevent the
-       caller frame from being canceled. That's because the caller
-       frame may have stack values in the local variables and the
-       cancelling the caller frame will purge them. But directly
-       calling mjit_exec is faster... */
-    if (GET_ISEQ()->body->catch_except_p) {
-        VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
-        return vm_exec(ec, true);
-    }
-    else if ((val = mjit_exec(ec)) == Qundef) {
-        VM_ENV_FLAGS_SET(GET_EP(), VM_FRAME_FLAG_FINISH);
-        return vm_exec(ec, false);
-    }
-    else {
-        return val;
-    }
-#else
-    /* When calling from VM, longjmp in the callee won't purge any
-       JIT-ed caller frames.  So it's safe to directly call
-       mjit_exec. */
-    return mjit_exec(ec);
-#endif
+    return vm_cc_call(cc)(ec, GET_CFP(), &calling, cd);
 }
 
 static VALUE
