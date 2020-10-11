@@ -432,6 +432,8 @@ rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, struct rb_callcache *cc)
         return; // Non-optimizable call->cc. Not supported for now
     if (iseq->body->jit_unit != NULL)
         return; // There's a different callinfo. Not supported for now
+    if (iseq->body->catch_except_p)
+        return; // not supported
 
     create_unit(iseq);
     if (iseq->body->jit_unit == NULL) // Failure in creating the unit.
