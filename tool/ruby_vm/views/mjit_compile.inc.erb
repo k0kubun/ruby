@@ -51,6 +51,8 @@ switch (insn) {
   case BIN(<%= insn.name %>):
 %   # Instruction-specific behavior in JIT
 %   case insn.name
+%   when 'opt_send_without_block', 'send'
+<%=   render 'mjit_compile_send', locals: { insn: insn } -%>
 %   when 'getinstancevariable', 'setinstancevariable'
 <%=   render 'mjit_compile_ivar', locals: { insn: insn } -%>
 %   when 'invokebuiltin', 'opt_invokebuiltin_delegate'

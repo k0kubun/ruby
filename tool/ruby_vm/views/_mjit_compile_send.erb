@@ -26,7 +26,7 @@
          && !rb_splat_or_kwargs_p(ci) && !kw_splat)
 %       # `CC_SET_FASTPATH(cc, vm_call_iseq_setup_func(...), vm_call_iseq_optimizable_p(...))` in `vm_callee_setup_arg`,
 %       # and support only non-VM_CALL_TAILCALL path inside it
-        || (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_ISEQ
+        || (false && vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_ISEQ
             && rb_fastpath_applied_iseq_p(ci, captured_cc, iseq = def_iseq_ptr(vm_cc_cme(captured_cc)->def))
             && !(vm_ci_flag(ci) & VM_CALL_TAILCALL))
     )) {
