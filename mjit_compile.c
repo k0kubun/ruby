@@ -117,10 +117,10 @@ has_cache_for_send(CALL_CACHE cc, int insn)
 }
 */
 
-// Returns true if iseq can use fastpath for setup, otherwise NULL. This becomes true in the same condition
+// Returns true if iseq can use fastpath for setup, otherwise false. This becomes true in the same condition
 // as CC_SET_FASTPATH (in vm_callee_setup_arg) is called from vm_call_iseq_setup.
-static bool
-fastpath_applied_iseq_p(const CALL_INFO ci, const CALL_CACHE cc, const rb_iseq_t *iseq)
+bool
+rb_fastpath_applied_iseq_p(const CALL_INFO ci, const CALL_CACHE cc, const rb_iseq_t *iseq)
 {
     extern bool rb_simple_iseq_p(const rb_iseq_t *iseq);
     return iseq != NULL
@@ -273,7 +273,7 @@ compile_inlined_cancel_handler(FILE *f, const struct rb_iseq_constant_body *body
     fprintf(f, "    calling.recv = reg_cfp->self;\n");
     fprintf(f, "    reg_cfp->self = orig_self;\n");
     fprintf(f, "    vm_call_iseq_setup_normal(ec, reg_cfp, &calling, (const rb_callable_method_entry_t *)0x%"PRIxVALUE", 0, %d, %d);\n\n",
-            inline_context->me, inline_context->param_size, inline_context->local_size); // fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
+            inline_context->me, inline_context->param_size, inline_context->local_size); // rb_fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
 
     // Start usual cancel from here.
     fprintf(f, "    reg_cfp = ec->cfp;\n"); // work on the new frame
@@ -512,7 +512,7 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
             if (has_valid_method_type(cc) &&
                 !(vm_ci_flag(ci) & VM_CALL_TAILCALL) && // inlining only non-tailcall path
                 vm_cc_cme(cc)->def->type == VM_METHOD_TYPE_ISEQ &&
-                fastpath_applied_iseq_p(ci, cc, child_iseq = def_iseq_ptr(vm_cc_cme(cc)->def)) &&
+                rb_fastpath_applied_iseq_p(ci, cc, child_iseq = def_iseq_ptr(vm_cc_cme(cc)->def)) &&
                 // CC_SET_FASTPATH in vm_callee_setup_arg
                 inlinable_iseq_p(child_iseq->body)) {
                 status->inlined_iseqs[pos] = child_iseq->body;

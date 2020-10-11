@@ -369,22 +369,10 @@ unload_units(void)
 }
 
 static void
-mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_info *compile_info)
+mjit_enqueue_unit(struct rb_mjit_unit *unit)
 {
-    if (!mjit_enabled || pch_status == PCH_FAILED)
-        return;
-
-    RB_DEBUG_COUNTER_INC(mjit_add_iseq_to_process);
-    iseq->body->jit_func = (mjit_func_t)NOT_READY_JIT_ISEQ_FUNC;
-    create_unit(iseq);
-    if (iseq->body->jit_unit == NULL)
-        // Failure in creating the unit.
-        return;
-    if (compile_info != NULL)
-        iseq->body->jit_unit->compile_info = *compile_info;
-
     CRITICAL_SECTION_START(3, "in add_iseq_to_process");
-    add_to_list(iseq->body->jit_unit, &unit_queue);
+    add_to_list(unit, &unit_queue);
     if (active_units.length >= mjit_opts.max_cache_size) {
         if (in_compact) {
             verbose(1, "Too many JIT code, but skipped unloading units for JIT compaction");
@@ -402,12 +390,52 @@ mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_inf
     CRITICAL_SECTION_FINISH(3, "in add_iseq_to_process");
 }
 
+static void
+mjit_add_iseq_to_process(const rb_iseq_t *iseq, const struct rb_mjit_compile_info *compile_info)
+{
+    if (!mjit_enabled || pch_status == PCH_FAILED)
+        return;
+
+    RB_DEBUG_COUNTER_INC(mjit_add_iseq_to_process);
+    iseq->body->jit_func = (mjit_func_t)NOT_READY_JIT_ISEQ_FUNC;
+    create_unit(iseq);
+    if (iseq->body->jit_unit == NULL)
+        // Failure in creating the unit.
+        return;
+    if (compile_info != NULL)
+        iseq->body->jit_unit->compile_info = *compile_info;
+
+    mjit_enqueue_unit(iseq->body->jit_unit);
+}
+
 // Add ISEQ to be JITed in parallel with the current thread.
 // Unload some JIT codes if there are too many of them.
 void
 rb_mjit_add_iseq_to_process(const rb_iseq_t *iseq)
 {
     mjit_add_iseq_to_process(iseq, NULL);
+}
+
+extern bool rb_fastpath_applied_iseq_p(const CALL_INFO ci, const CALL_CACHE cc, const rb_iseq_t *iseq);
+
+MJIT_FUNC_EXPORTED void
+rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, const struct rb_callcache *cc)
+{
+    const rb_callable_method_entry_t *me = vm_cc_cme(cc);
+    if (me->def->type != VM_METHOD_TYPE_ISEQ)
+        return; // VM_METHOD_TYPE_OPTIMIZED. Not supported for now
+
+    const rb_iseq_t *iseq = def_iseq_ptr(me->def);
+    if (!rb_fastpath_applied_iseq_p(ci, cc, iseq))
+        return; // Non-optimizable call->cc. Not supported for now
+    if (iseq->body->jit_unit != NULL)
+        return; // There's a different callinfo. Not supported for now
+
+    create_unit(iseq);
+    if (iseq->body->jit_unit == NULL) // Failure in creating the unit.
+        return;
+
+    mjit_enqueue_unit(iseq->body->jit_unit);
 }
 
 // For this timeout seconds, --jit-wait will wait for JIT compilation finish.

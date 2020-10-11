@@ -27,7 +27,7 @@
 %       # `CC_SET_FASTPATH(cc, vm_call_iseq_setup_func(...), vm_call_iseq_optimizable_p(...))` in `vm_callee_setup_arg`,
 %       # and support only non-VM_CALL_TAILCALL path inside it
         || (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_ISEQ
-            && fastpath_applied_iseq_p(ci, captured_cc, iseq = def_iseq_ptr(vm_cc_cme(captured_cc)->def))
+            && rb_fastpath_applied_iseq_p(ci, captured_cc, iseq = def_iseq_ptr(vm_cc_cme(captured_cc)->def))
             && !(vm_ci_flag(ci) & VM_CALL_TAILCALL))
     )) {
         if (false && vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_CFUNC)
@@ -79,7 +79,7 @@
                 fprintf(f, "        val = vm_call_cfunc_with_frame(ec, reg_cfp, &calling, &cc_cd);\n");
             }
             else { // VM_METHOD_TYPE_ISEQ
-%               # fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
+%               # rb_fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
                 fprintf(f, "        vm_call_iseq_setup_normal(ec, reg_cfp, &calling, cc_cme, 0, %d, %d);\n", iseq->body->param.size, iseq->body->local_table_size);
                 if (iseq->body->catch_except_p) {
                     fprintf(f, "        VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);\n");

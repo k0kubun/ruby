@@ -4182,12 +4182,15 @@ vm_invokeblock_i(
 }
 
 static inline void
-mjit_cc_call(struct rb_callcache *cc)
+mjit_cc_call(const struct rb_callinfo *ci, struct rb_callcache *cc)
 {
     if (!mjit_call_p)
         return;
 
-    cc->aux_.total_calls++;
+    if (UNLIKELY(++cc->aux_.total_calls == mjit_opts.min_calls)) {
+        extern void rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, const struct rb_callcache *cc);
+        rb_mjit_add_cc_to_process(ci, cc);
+    }
 }
 
 static VALUE
@@ -4216,7 +4219,7 @@ vm_sendish(
 
     VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling, cd);
     if (val == Qundef) {
-        mjit_cc_call((struct rb_callcache *)cc);
+        mjit_cc_call(ci, (struct rb_callcache *)cc);
     }
     return val;
 }
