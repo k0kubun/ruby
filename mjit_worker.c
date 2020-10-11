@@ -992,7 +992,7 @@ compact_all_jit_code(void)
 
             if (cur->iseq) { // Check whether GCed or not
                 // Usage of jit_code might be not in a critical section.
-                MJIT_ATOMIC_SET(cur->iseq->body->jit_func, (mjit_func_t)func);
+                vm_cc_call_set(cur->cc, (vm_call_handler)func);
             }
         }
         CRITICAL_SECTION_FINISH(3, "in compact_all_jit_code to read list");
