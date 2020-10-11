@@ -422,6 +422,8 @@ MJIT_FUNC_EXPORTED void
 rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, struct rb_callcache *cc)
 {
     const rb_callable_method_entry_t *me = vm_cc_cme(cc);
+    if (me == NULL)
+        return; // invokeyield. Not supported for now
     if (me->def->type != VM_METHOD_TYPE_ISEQ)
         return; // VM_METHOD_TYPE_OPTIMIZED. Not supported for now
 

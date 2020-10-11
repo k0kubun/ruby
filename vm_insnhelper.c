@@ -4187,7 +4187,11 @@ mjit_cc_call(const struct rb_callinfo *ci, struct rb_callcache *cc)
     if (!mjit_call_p)
         return;
 
-    if (UNLIKELY(++cc->aux_.total_calls == mjit_opts.min_calls)) {
+#ifdef MJIT_HEADER
+    if (UNLIKELY(cc != rb_vm_empty_cc() && ++cc->aux_.total_calls == mjit_opts.min_calls)) {
+#else
+    if (UNLIKELY(cc != &vm_empty_cc && ++cc->aux_.total_calls == mjit_opts.min_calls)) {
+#endif
         extern void rb_mjit_add_cc_to_process(const struct rb_callinfo *ci, struct rb_callcache *cc);
         rb_mjit_add_cc_to_process(ci, cc);
     }
