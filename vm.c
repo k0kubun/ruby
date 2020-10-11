@@ -395,7 +395,7 @@ static const struct rb_callcache vm_empty_cc = {
     .cme_  = NULL,
     .call_ = vm_call_general,
     .aux_  = {
-        .v = Qfalse,
+        .total_calls = 0,
     }
 };
 

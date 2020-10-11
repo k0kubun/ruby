@@ -287,7 +287,7 @@ struct rb_callcache {
     union {
         const unsigned int attr_index;
         const enum method_missing_reason method_missing_reason; /* used by method_missing */
-        VALUE v;
+        VALUE total_calls;
     } aux_;
 };
 

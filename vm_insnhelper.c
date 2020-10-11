@@ -4181,6 +4181,15 @@ vm_invokeblock_i(
     }
 }
 
+static inline void
+mjit_cc_call(struct rb_callcache *cc)
+{
+    if (!mjit_call_p)
+        return;
+
+    cc->aux_.total_calls++;
+}
+
 static VALUE
 vm_sendish(
     struct rb_execution_context_struct *ec,
@@ -4205,7 +4214,11 @@ vm_sendish(
     method_explorer(GET_CFP(), cd, recv);
     const struct rb_callcache *cc = cd->cc;
 
-    return vm_cc_call(cc)(ec, GET_CFP(), &calling, cd);
+    VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling, cd);
+    if (val == Qundef) {
+        mjit_cc_call((struct rb_callcache *)cc);
+    }
+    return val;
 }
 
 static VALUE
