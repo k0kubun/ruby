@@ -680,12 +680,11 @@ remove_so_file(const char *so_file, struct rb_mjit_unit *unit)
 }
 
 // Print _mjitX, but make a human-readable funcname when --jit-debug is used
-static void
-sprint_funcname(char *funcname, const struct rb_mjit_unit *unit)
+void
+mjit_sprint_funcname(char *funcname, int id, const rb_iseq_t *iseq)
 {
-    const rb_iseq_t *iseq = unit->iseq;
     if (iseq == NULL || (!mjit_opts.debug && !mjit_opts.debug_flags)) {
-        sprintf(funcname, "_mjit%d", unit->id);
+        sprintf(funcname, "_mjit%d", id);
         return;
     }
 
@@ -704,7 +703,7 @@ sprint_funcname(char *funcname, const struct rb_mjit_unit *unit)
     if (!strcmp(method, "[]=")) method = "ASET";
 
     // Print and normalize
-    sprintf(funcname, "_mjit%d_%s_%s", unit->id, path, method);
+    sprintf(funcname, "_mjit%d_%s_%s", id, path, method);
     for (size_t i = 0; i < strlen(funcname); i++) {
         char c = funcname[i];
         if (!(('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9') || c == '_')) {
@@ -931,7 +930,7 @@ compile_compact_jit_code(char* c_file)
     bool success = true;
     list_for_each(&active_units.head, child_unit, unode) {
         char funcname[MAXPATHLEN];
-        sprint_funcname(funcname, child_unit);
+        mjit_sprint_funcname(funcname, child_unit->id, child_unit->iseq);
 
         long iseq_lineno = 0;
         if (FIXNUM_P(child_unit->iseq->body->location.first_lineno))
@@ -942,7 +941,7 @@ compile_compact_jit_code(char* c_file)
         const char *iseq_path = RSTRING_PTR(rb_iseq_path(child_unit->iseq));
         if (!iseq_label) iseq_label = sep = "";
         fprintf(f, "\n/* %s%s%s:%ld */\n", iseq_label, sep, iseq_path, iseq_lineno);
-        success &= mjit_compile(f, child_unit->iseq, funcname, child_unit->id);
+        success &= mjit_compile(f, child_unit->iseq, funcname, child_unit->id, true);
     }
 
     // release blocking mjit_gc_start_hook
@@ -1009,7 +1008,7 @@ compact_all_jit_code(void)
         list_for_each(&active_units.head, cur, unode) {
             void *func;
             char funcname[MAXPATHLEN];
-            sprint_funcname(funcname, cur);
+            mjit_sprint_funcname(funcname, cur->id, cur->iseq);
 
             if ((func = dlsym(handle, funcname)) == NULL) {
                 mjit_warning("skipping to reload '%s' from '%s': %s", funcname, so_file, dlerror());
@@ -1101,7 +1100,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
     sprint_uniq_filename(c_file, (int)sizeof(c_file), unit->id, MJIT_TMP_PREFIX, c_ext);
     sprint_uniq_filename(so_file, (int)sizeof(so_file), unit->id, MJIT_TMP_PREFIX, so_ext);
-    sprint_funcname(funcname, unit);
+    mjit_sprint_funcname(funcname, unit->id, unit->iseq);
 
     FILE *f;
     int fd = rb_cloexec_open(c_file, c_file_access_mode, 0600);
@@ -1143,7 +1142,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
     verbose(2, "start compilation: %s@%s:%ld -> %s", iseq_label, iseq_path, iseq_lineno, c_file);
     fprintf(f, "/* %s@%s:%ld */\n\n", iseq_label, iseq_path, iseq_lineno);
-    bool success = mjit_compile(f, unit->iseq, funcname, unit->id);
+    bool success = mjit_compile(f, unit->iseq, funcname, unit->id, false);
 
     // release blocking mjit_gc_start_hook
     CRITICAL_SECTION_START(3, "after mjit_compile to wakeup client for GC");
@@ -1226,6 +1225,18 @@ mjit_capture_cc_entries(const struct rb_iseq_constant_body *compiled_iseq, const
     }
 
     return cc_entries_index;
+}
+
+// Return jit_unit->id if its JIT-ed code exists. Return -1 if otherwise.
+int
+mjit_iseq_unit_id(const struct rb_iseq_constant_body *body)
+{
+    if (body->jit_unit && (uintptr_t)(body->jit_func) > LAST_JIT_ISEQ_FUNC) {
+        return body->jit_unit->id;
+    }
+    else {
+        return -1;
+    }
 }
 
 // The function implementing a worker. It is executed in a separate

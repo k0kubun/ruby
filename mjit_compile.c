@@ -65,6 +65,7 @@ struct compile_status {
     // If `inlined_iseqs[pos]` is not NULL, `mjit_compile_body` tries to inline ISeq there.
     const struct rb_iseq_constant_body **inlined_iseqs;
     struct inlined_call_context inline_context;
+    bool compact_p; // has true if it's called from compile_compact_jit_code
 };
 
 // Storage to keep data which is consistent in each conditional branch.
@@ -485,6 +486,7 @@ init_ivar_compile_status(const struct rb_iseq_constant_body *body, struct compil
             alloca(sizeof(union iseq_inline_storage_entry) * body->is_size) : NULL, \
         .cc_entries_index = (body->ci_size > 0) ? \
             mjit_capture_cc_entries(status.compiled_iseq, body) : -1, \
+        .compact_p = status.compact_p, \
         .compiled_id = status.compiled_id, \
         .compiled_iseq = status.compiled_iseq, \
         .compile_info = compile_root_p ? \
@@ -530,7 +532,8 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
                             RSTRING_PTR(iseq->body->location.label),
                             RSTRING_PTR(rb_iseq_path(iseq)), FIX2INT(iseq->body->location.first_lineno));
 
-                struct compile_status child_status = { .compiled_iseq = status->compiled_iseq, .compiled_id = status->compiled_id };
+                struct compile_status child_status = {
+                    .compiled_iseq = status->compiled_iseq, .compiled_id = status->compiled_id, .compact_p = status->compact_p };
                 INIT_COMPILE_STATUS(child_status, child_iseq->body, false);
                 child_status.inline_context = (struct inlined_call_context){
                     .orig_argc = vm_ci_argc(ci),
@@ -561,9 +564,9 @@ precompile_inlinable_iseqs(FILE *f, const rb_iseq_t *iseq, struct compile_status
 
 // Compile ISeq to C code in `f`. It returns true if it succeeds to compile.
 bool
-mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
+mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id, bool compact_p)
 {
-    struct compile_status status = { .compiled_iseq = iseq->body, .compiled_id = id };
+    struct compile_status status = { .compiled_iseq = iseq->body, .compiled_id = id, .compact_p = compact_p };
     INIT_COMPILE_STATUS(status, iseq->body, true);
     if (iseq->body->ci_size > 0 && status.cc_entries_index == -1) {
         return false;

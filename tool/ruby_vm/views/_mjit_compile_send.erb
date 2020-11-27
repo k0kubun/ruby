@@ -80,11 +80,22 @@
                 fprintf(f, "        val = vm_call_cfunc_with_frame(ec, reg_cfp, &calling, &cc_cd);\n");
             }
             else { // VM_METHOD_TYPE_ISEQ
+                int unit_id;
+                extern int mjit_iseq_unit_id(const struct rb_iseq_constant_body *body);
 %               # fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
                 fprintf(f, "        vm_call_iseq_setup_normal(ec, reg_cfp, &calling, cc_cme, 0, %d, %d);\n", iseq->body->param.size, iseq->body->local_table_size);
                 if (iseq->body->catch_except_p) {
                     fprintf(f, "        VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);\n");
                     fprintf(f, "        val = vm_exec(ec, TRUE);\n");
+                }
+                else if (status->compact_p && (unit_id = mjit_iseq_unit_id(iseq->body)) > 0) {
+                    extern void mjit_sprint_funcname(char *funcname, int id, const rb_iseq_t *iseq);
+                    char funcname[1024]; // MAXPATHLEN
+                    mjit_sprint_funcname(funcname, unit_id, iseq);
+                    fprintf(f, "        struct rb_iseq_constant_body *body = (struct rb_iseq_constant_body *)0x%"PRIxVALUE";\n", (VALUE)iseq->body);
+                    fprintf(f, "        body->total_calls++;\n");
+                    fprintf(f, "        VALUE %s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp);\n", funcname);
+                    fprintf(f, "        val = %s(ec, ec->cfp);\n", funcname);
                 }
                 else {
                     fprintf(f, "        if ((val = mjit_exec(ec)) == Qundef) {\n");
