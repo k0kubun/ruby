@@ -29,6 +29,8 @@
         || (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_ISEQ
             && fastpath_applied_iseq_p(ci, captured_cc, iseq = def_iseq_ptr(vm_cc_cme(captured_cc)->def))
             && !(vm_ci_flag(ci) & VM_CALL_TAILCALL))
+        || (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_IVAR
+            && !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT)) && vm_cc_attr_index(captured_cc) > 0)
     )) {
         const bool cfunc_debug = false; // Set true when you want to see inlined cfunc
         if (cfunc_debug && vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_CFUNC)
@@ -42,7 +44,11 @@
         fprintf(f, "    const struct rb_callcache *cc = (const struct rb_callcache *)0x%"PRIxVALUE";\n", (VALUE)captured_cc);
         fprintf(f, "    const rb_callable_method_entry_t *cc_cme = (const rb_callable_method_entry_t *)0x%"PRIxVALUE";\n", (VALUE)vm_cc_cme(captured_cc));
         fprintf(f, "    const VALUE recv = stack[%d];\n", b->stack_size + sp_inc - 1);
-        fprintf(f, "    if (UNLIKELY(%s || !vm_cc_valid_p(cc, cc_cme, %s(recv)))) {\n", opt_class_of ? "RB_SPECIAL_CONST_P(recv)" : "false", opt_class_of ? "RBASIC_CLASS" : "CLASS_OF");
+        if (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_IVAR) {
+            fprintf(f, "    const uint32_t index = %d - 1;\n", vm_cc_attr_index(captured_cc));
+        }
+        fprintf(f, "    if (UNLIKELY(%s || !vm_cc_valid_p(cc, cc_cme, %s(recv)) || %s)) {\n", opt_class_of ? "RB_SPECIAL_CONST_P(recv)" : "false", opt_class_of ? "RBASIC_CLASS" : "CLASS_OF",
+                vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_IVAR ? "!(RB_TYPE_P(recv, T_OBJECT) && index < ROBJECT_NUMIV(recv))" : "false");
         fprintf(f, "        reg_cfp->pc = original_body_iseq + %d;\n", pos);
         fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + %d;\n", b->stack_size);
         fprintf(f, "        goto send_cancel;\n");
@@ -52,7 +58,10 @@
 <%= render 'mjit_compile_pc_and_sp', locals: { insn: insn } -%>
 
 % # JIT: If ISeq is inlinable, call the inlined method without pushing a frame.
-        if (iseq && status->inlined_iseqs != NULL && iseq->body == status->inlined_iseqs[pos]) {
+        if (vm_cc_cme(captured_cc)->def->type == VM_METHOD_TYPE_IVAR) {
+            fprintf(f, "    stack[%d] = ROBJECT_IVPTR(recv)[index];\n", b->stack_size - sp_inc - 1);
+        }
+        else if (iseq && status->inlined_iseqs != NULL && iseq->body == status->inlined_iseqs[pos]) {
             fprintf(f, "    {\n");
             fprintf(f, "        VALUE orig_self = reg_cfp->self;\n");
             fprintf(f, "        reg_cfp->self = stack[%d];\n", b->stack_size + sp_inc - 1);
