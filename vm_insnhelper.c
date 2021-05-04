@@ -390,6 +390,7 @@ vm_push_frame(rb_execution_context_t *ec,
 #if VM_DEBUG_BP_CHECK
         .bp_check   = sp,
 #endif
+        .jit_return = NULL
     };
 
     ec->cfp = cfp;
@@ -1094,6 +1095,12 @@ iv_index_tbl_lookup(struct st_table *iv_index_tbl, ID id, struct rb_iv_index_tbl
     RB_VM_LOCK_LEAVE();
 
     return found ? true : false;
+}
+
+bool
+rb_iv_index_tbl_lookup(struct st_table *iv_index_tbl, ID id, struct rb_iv_index_tbl_entry **ent)
+{
+    return iv_index_tbl_lookup(iv_index_tbl, id, ent);
 }
 
 ALWAYS_INLINE(static void fill_ivar_cache(const rb_iseq_t *iseq, IVC ic, const struct rb_callcache *cc, int is_attr, struct rb_iv_index_tbl_entry *ent));
@@ -2180,7 +2187,7 @@ rb_simple_iseq_p(const rb_iseq_t *iseq)
 	   iseq->body->param.flags.has_block == FALSE;
 }
 
-static bool
+bool
 rb_iseq_only_optparam_p(const rb_iseq_t *iseq)
 {
     return iseq->body->param.flags.has_opt == TRUE &&
@@ -2192,7 +2199,7 @@ rb_iseq_only_optparam_p(const rb_iseq_t *iseq)
            iseq->body->param.flags.has_block == FALSE;
 }
 
-static bool
+bool
 rb_iseq_only_kwparam_p(const rb_iseq_t *iseq)
 {
     return iseq->body->param.flags.has_opt == FALSE &&
@@ -4662,6 +4669,9 @@ vm_ic_update(const rb_iseq_t *iseq, IC ic, VALUE val, const VALUE *reg_ep)
     if (rb_ractor_shareable_p(val)) ice->flags |= IMEMO_CONST_CACHE_SHAREABLE;
     ruby_vm_const_missing_count = 0;
     RB_OBJ_WRITE(iseq, &ic->entry, ice);
+#ifndef MJIT_HEADER
+    yjit_constant_ic_update(iseq, ic);
+#endif
 }
 
 static VALUE

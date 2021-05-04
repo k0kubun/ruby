@@ -13,10 +13,13 @@
 require_relative 'bare_instructions'
 require_relative 'operands_unifications'
 require_relative 'instructions_unifications'
+require_relative 'micro_jit'
 
 RubyVM::Instructions = RubyVM::BareInstructions.to_a + \
                        RubyVM::OperandsUnifications.to_a + \
-                       RubyVM::InstructionsUnifications.to_a
+                       RubyVM::InstructionsUnifications.to_a + \
+                       RubyVM::MicroJIT::ExampleInstructions.to_a
+
 
 require_relative 'trace_instructions'
 RubyVM::Instructions.freeze

@@ -13,6 +13,7 @@
 #include "version.h"
 #include "vm_core.h"
 #include "mjit.h"
+#include "yjit.h"
 #include <stdio.h>
 
 #ifndef EXIT_SUCCESS
@@ -123,6 +124,10 @@ ruby_show_version(void)
     }
     else {
         PRINT(description);
+    }
+
+    if (rb_yjit_enabled_p()) {
+        fputs("YJIT is enabled\n", stdout);
     }
 #ifdef RUBY_LAST_COMMIT_TITLE
     fputs("last_commit=" RUBY_LAST_COMMIT_TITLE, stdout);

@@ -3,6 +3,7 @@
  */
 
 #include "id_table.h"
+#include "yjit.h"
 
 #define METHOD_DEBUG 0
 
@@ -113,6 +114,18 @@ rb_vm_mtbl_dump(const char *msg, VALUE klass, ID target_mid)
     vm_mtbl_dump(klass, target_mid);
 }
 
+void
+rb_vm_cc_invalidate(const struct rb_callcache *cc)
+{
+    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+    VM_ASSERT(cc != vm_cc_empty());
+    VM_ASSERT(cc->klass != 0); // should be enable
+
+    *(VALUE *)&cc->klass = 0;
+    RB_DEBUG_COUNTER_INC(cc_ent_invalidate);
+}
+
+
 static inline void
 vm_cme_invalidate(rb_callable_method_entry_t *cme)
 {
@@ -120,11 +133,14 @@ vm_cme_invalidate(rb_callable_method_entry_t *cme)
     VM_ASSERT(callable_method_entry_p(cme));
     METHOD_ENTRY_INVALIDATED_SET(cme);
     RB_DEBUG_COUNTER_INC(cc_cme_invalidate);
+
+    rb_yjit_cme_invalidate((VALUE)cme);
 }
 
 void
 rb_clear_constant_cache(void)
 {
+    rb_yjit_constant_state_changed();
     INC_GLOBAL_CONSTANT_STATE();
 }
 
@@ -212,6 +228,8 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
             invalidate_negative_cache(mid);
         }
     }
+
+    rb_yjit_method_lookup_change(klass, mid);
 }
 
 static void
@@ -279,6 +297,8 @@ void
 rb_clear_method_cache_all(void)
 {
     rb_objspace_each_objects(invalidate_all_cc, NULL);
+
+    rb_yjit_invalidate_all_method_lookup_assumptions();
 }
 
 void

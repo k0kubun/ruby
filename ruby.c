@@ -59,6 +59,7 @@
 #include "internal/process.h"
 #include "internal/variable.h"
 #include "mjit.h"
+#include "yjit.h"
 #include "ruby/encoding.h"
 #include "ruby/thread.h"
 #include "ruby/util.h"
@@ -101,6 +102,8 @@ void rb_warning_category_update(unsigned int mask, unsigned int bits);
     X(frozen_string_literal) \
     SEP \
     X(jit) \
+    SEP \
+    X(yjit)
     /* END OF FEATURES */
 #define EACH_DEBUG_FEATURES(X, SEP) \
     X(frozen_string_literal) \
@@ -184,6 +187,8 @@ struct ruby_cmdline_options {
 #if USE_MJIT
     struct mjit_options mjit;
 #endif
+    struct rb_yjit_options yjit;
+
     int sflag, xflag;
     unsigned int warning: 1;
     unsigned int verbose: 1;
@@ -227,6 +232,7 @@ cmdline_options_init(ruby_cmdline_options_t *opt)
 #ifdef MJIT_FORCE_ENABLE /* to use with: ./configure cppflags="-DMJIT_FORCE_ENABLE" */
     opt->features.set |= FEATURE_BIT(jit);
 #endif
+    opt->features.set |= FEATURE_BIT(yjit);
     return opt;
 }
 
@@ -324,6 +330,7 @@ usage(const char *name, int help, int highlight, int columns)
 	M("rubyopt", "",        "RUBYOPT environment variable (default: enabled)"),
 	M("frozen-string-literal", "", "freeze all string literals (default: disabled)"),
         M("jit", "",            "JIT compiler (default: disabled)"),
+        M("yjit", "",           "in-process JIT compiler (default: enabled)"),
     };
     static const struct message warn_categories[] = {
         M("deprecated", "",       "deprecated features"),
@@ -1008,10 +1015,6 @@ set_option_encoding_once(const char *type, VALUE *name, const char *e, long elen
 #define set_source_encoding_once(opt, e, elen) \
     set_option_encoding_once("source", &(opt)->src.enc.name, (e), (elen))
 
-#if USE_MJIT
-static void
-setup_mjit_options(const char *s, struct mjit_options *mjit_opt)
-{
 #define opt_match(s, l, name) \
     ((((l) > rb_strlen_lit(name)) ? (s)[rb_strlen_lit(name)] == '=' : \
       (l) == rb_strlen_lit(name)) && \
@@ -1021,6 +1024,35 @@ setup_mjit_options(const char *s, struct mjit_options *mjit_opt)
     opt_match(s, l, name) && (*(s) ? (rb_warn("argument to --jit-" name " is ignored"), 1) : 1)
 #define opt_match_arg(s, l, name) \
     opt_match(s, l, name) && (*(s) ? 1 : (rb_raise(rb_eRuntimeError, "--jit-" name " needs an argument"), 0))
+
+static void
+setup_yjit_options(const char *s, struct rb_yjit_options *yjit_opt)
+{
+    if (*s != '-') return;
+    const size_t l = strlen(++s);
+
+    if (opt_match_arg(s, l, "call-threshold")) {
+        yjit_opt->call_threshold = atoi(s + 1);
+    }
+    else if (opt_match_arg(s, l, "version-limit")) {
+        yjit_opt->version_limit = atoi(s + 1);
+    }
+    else if (opt_match_noarg(s, l, "greedy-versioning")) {
+        yjit_opt->greedy_versioning = true;
+    }
+    else if (opt_match_noarg(s, l, "stats")) {
+        yjit_opt->gen_stats = true;
+    }
+    else {
+        rb_raise(rb_eRuntimeError,
+                 "invalid yjit option `%s' (--help will show valid yjit options)", s);
+    }
+}
+
+#if USE_MJIT
+static void
+setup_mjit_options(const char *s, struct mjit_options *mjit_opt)
+{
     if (*s != '-') return;
     const size_t l = strlen(++s);
     if (*s == 0) return;
@@ -1430,6 +1462,10 @@ proc_options(long argc, char **argv, ruby_cmdline_options_t *opt, int envopt)
                 rb_warn("MJIT support is disabled.");
 #endif
             }
+            else if (strncmp("yjit", s, 4) == 0) {
+                FEATURE_SET(opt->features, FEATURE_BIT(yjit));
+                setup_yjit_options(s + 4, &opt->yjit);
+            }
 	    else if (strcmp("yydebug", s) == 0) {
 		if (envopt) goto noenvopt_long;
 		opt->dump |= DUMP_BIT(yydebug);
@@ -1774,6 +1810,8 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
          */
         rb_warning("-K is specified; it is for 1.8 compatibility and may cause odd behavior");
 
+    if (opt->features.set & FEATURE_BIT(yjit))
+        rb_yjit_init(&opt->yjit);
 #if USE_MJIT
     if (opt->features.set & FEATURE_BIT(jit)) {
         opt->mjit.on = TRUE; /* set mjit.on for ruby_show_version() API and check to call mjit_init() */

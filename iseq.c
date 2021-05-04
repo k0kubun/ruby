@@ -38,6 +38,7 @@
 #include "ruby/util.h"
 #include "vm_core.h"
 #include "vm_callinfo.h"
+#include "yjit.h"
 
 #include "builtin.h"
 #include "insns.inc"
@@ -109,6 +110,7 @@ rb_iseq_free(const rb_iseq_t *iseq)
     if (iseq && iseq->body) {
 	struct rb_iseq_constant_body *const body = iseq->body;
 	mjit_free_iseq(iseq); /* Notify MJIT */
+        rb_yjit_iseq_free(body);
 	ruby_xfree((void *)body->iseq_encoded);
 	ruby_xfree((void *)body->insns_info.body);
 	if (body->insns_info.positions) ruby_xfree((void *)body->insns_info.positions);
@@ -162,6 +164,9 @@ static int
 iseq_extract_values(VALUE *code, size_t pos, iseq_value_itr_t * func, void *data, rb_vm_insns_translator_t * translator)
 {
     VALUE insn = translator((void *)code[pos]);
+#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+    if (insn >= VM_INSTRUCTION_SIZE) rb_bug("invalid insn. translator=%p addr2insn=%p", (void *)translator, (void*)rb_vm_insn_addr2insn2);
+#endif
     int len = insn_len(insn);
     int op_no;
     const char *types = insn_op_types(insn);
@@ -318,6 +323,7 @@ rb_iseq_update_references(rb_iseq_t *iseq)
 #if USE_MJIT
         mjit_update_references(iseq);
 #endif
+        rb_yjit_iseq_update_references(body);
     }
 }
 
@@ -398,6 +404,7 @@ rb_iseq_mark(const rb_iseq_t *iseq)
 #if USE_MJIT
         mjit_mark_cc_entries(body);
 #endif
+        rb_yjit_iseq_mark(body);
     }
 
     if (FL_TEST_RAW((VALUE)iseq, ISEQ_NOT_LOADED_YET)) {
@@ -3112,7 +3119,7 @@ rb_iseq_defined_string(enum defined_type type)
 /* A map from encoded_insn to insn_data: decoded insn number, its len,
  * non-trace version of encoded insn, and trace version. */
 
-static st_table *encoded_insn_data;
+st_table *rb_encoded_insn_data;
 typedef struct insn_data_struct {
     int insn;
     int insn_len;
@@ -3120,6 +3127,14 @@ typedef struct insn_data_struct {
     void *trace_encoded_insn;
 } insn_data_t;
 static insn_data_t insn_data[VM_INSTRUCTION_SIZE/2];
+
+
+
+
+#include "yjit_asm.h"
+
+
+
 
 void
 rb_vm_encoded_insn_data_table_init(void)
@@ -3131,7 +3146,7 @@ rb_vm_encoded_insn_data_table_init(void)
 #define INSN_CODE(insn) (insn)
 #endif
     st_data_t insn;
-    encoded_insn_data = st_init_numtable_with_size(VM_INSTRUCTION_SIZE / 2);
+    rb_encoded_insn_data = st_init_numtable_with_size(VM_INSTRUCTION_SIZE / 2);
 
     for (insn = 0; insn < VM_INSTRUCTION_SIZE/2; insn++) {
         st_data_t key1 = (st_data_t)INSN_CODE(insn);
@@ -3149,8 +3164,8 @@ rb_vm_encoded_insn_data_table_init(void)
             insn_data[insn].trace_encoded_insn = (void *) INSN_CODE(BIN(opt_invokebuiltin_delegate) + VM_INSTRUCTION_SIZE/2);
         }
 
-        st_add_direct(encoded_insn_data, key1, (st_data_t)&insn_data[insn]);
-        st_add_direct(encoded_insn_data, key2, (st_data_t)&insn_data[insn]);
+        st_add_direct(rb_encoded_insn_data, key1, (st_data_t)&insn_data[insn]);
+        st_add_direct(rb_encoded_insn_data, key2, (st_data_t)&insn_data[insn]);
     }
 }
 
@@ -3160,12 +3175,31 @@ rb_vm_insn_addr2insn(const void *addr)
     st_data_t key = (st_data_t)addr;
     st_data_t val;
 
-    if (st_lookup(encoded_insn_data, key, &val)) {
+    if (st_lookup(rb_encoded_insn_data, key, &val)) {
         insn_data_t *e = (insn_data_t *)val;
         return (int)e->insn;
     }
 
     rb_bug("rb_vm_insn_addr2insn: invalid insn address: %p", addr);
+}
+
+// Unlike rb_vm_insn_addr2insn, this function can return trace opcode variants.
+int
+rb_vm_insn_addr2opcode(const void *addr)
+{
+    st_data_t key = (st_data_t)addr;
+    st_data_t val;
+
+    if (st_lookup(rb_encoded_insn_data, key, &val)) {
+        insn_data_t *e = (insn_data_t *)val;
+        int opcode = e->insn;
+        if (addr == e->trace_encoded_insn) {
+            opcode += VM_INSTRUCTION_SIZE/2;
+        }
+        return opcode;
+    }
+
+    rb_bug("rb_vm_insn_addr2opcode: invalid insn address: %p", addr);
 }
 
 static inline int
@@ -3174,7 +3208,7 @@ encoded_iseq_trace_instrument(VALUE *iseq_encoded_insn, rb_event_flag_t turnon, 
     st_data_t key = (st_data_t)*iseq_encoded_insn;
     st_data_t val;
 
-    if (st_lookup(encoded_insn_data, key, &val)) {
+    if (st_lookup(rb_encoded_insn_data, key, &val)) {
         insn_data_t *e = (insn_data_t *)val;
         if (remain_current_trace && key == (st_data_t)e->trace_encoded_insn) {
             turnon = 1;
@@ -3362,6 +3396,14 @@ trace_set_i(void *vstart, void *vend, size_t stride, void *data)
 }
 
 void
+rb_yjit_empty_func_with_ec(rb_control_frame_t *cfp, rb_execution_context_t *ec)
+{
+    // it's put in this file instead of say, compile.c to dodge long C compile time.
+    // it just needs to be in a different unit from vm.o so the compiler can't see the definition
+    // and is forced to emit a call that respects the calling convention.
+}
+
+void
 rb_iseq_trace_set_all(rb_event_flag_t turnon_events)
 {
     rb_objspace_each_objects(trace_set_i, &turnon_events);
@@ -3476,7 +3518,6 @@ struct succ_index_table {
 #define imm_block_rank_get(v, i) (((int)((v) >> ((i) * 7))) & 0x7f)
 #define small_block_rank_set(v, i, r) (v) |= (uint64_t)(r) << (9 * ((i) - 1))
 #define small_block_rank_get(v, i) ((i) == 0 ? 0 : (((int)((v) >> (((i) - 1) * 9))) & 0x1ff))
-
 static struct succ_index_table *
 succ_index_table_create(int max_pos, int *data, int size)
 {

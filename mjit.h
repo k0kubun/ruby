@@ -16,6 +16,8 @@
 
 #include "debug_counter.h"
 #include "ruby.h"
+#include "vm_core.h"
+#include "yjit.h"
 
 // Special address values of a function generated from the
 // corresponding iseq by MJIT:
@@ -142,16 +144,24 @@ mjit_exec_slowpath(rb_execution_context_t *ec, const rb_iseq_t *iseq, struct rb_
 static inline VALUE
 mjit_exec(rb_execution_context_t *ec)
 {
-    const rb_iseq_t *iseq;
-    struct rb_iseq_constant_body *body;
+    const rb_iseq_t *iseq = ec->cfp->iseq;
+    struct rb_iseq_constant_body *body = iseq->body;
+
+    if (mjit_call_p || rb_yjit_enabled_p()) {
+        body->total_calls++;
+    }
+
+#ifndef MJIT_HEADER
+    if (rb_yjit_enabled_p() && !mjit_call_p && body->total_calls == rb_yjit_call_threshold())  {
+        rb_yjit_compile_iseq(iseq, ec);
+        return Qundef;
+    }
+#endif
 
     if (!mjit_call_p)
         return Qundef;
-    RB_DEBUG_COUNTER_INC(mjit_exec);
 
-    iseq = ec->cfp->iseq;
-    body = iseq->body;
-    body->total_calls++;
+    RB_DEBUG_COUNTER_INC(mjit_exec);
 
     mjit_func_t func = body->jit_func;
     if (UNLIKELY((uintptr_t)func <= LAST_JIT_ISEQ_FUNC)) {

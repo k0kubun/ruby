@@ -36,6 +36,7 @@
 #include "vm_insnhelper.h"
 #include "ractor_core.h"
 #include "vm_sync.h"
+#include "yjit.h"
 
 #include "builtin.h"
 
@@ -200,7 +201,7 @@ VM_CAPTURED_BLOCK_TO_CFP(const struct rb_captured_block *captured)
 {
     rb_control_frame_t *cfp = ((rb_control_frame_t *)((VALUE *)(captured) - 3));
     VM_ASSERT(!VM_CFP_IN_HEAP_P(GET_EC(), cfp));
-    VM_ASSERT(sizeof(rb_control_frame_t)/sizeof(VALUE) == 7 + VM_DEBUG_BP_CHECK ? 1 : 0);
+    VM_ASSERT(sizeof(rb_control_frame_t)/sizeof(VALUE) == 8 + VM_DEBUG_BP_CHECK ? 1 : 0);
     return cfp;
 }
 
@@ -341,6 +342,10 @@ vm_bind_update_env(VALUE bindval, rb_binding_t *bind, VALUE envval)
 static void vm_collect_usage_operand(int insn, int n, VALUE op);
 static void vm_collect_usage_insn(int insn);
 static void vm_collect_usage_register(int reg, int isset);
+#endif
+
+#if RUBY_DEBUG
+static void vm_yjit_collect_usage_insn(int insn);
 #endif
 
 static VALUE vm_make_env_object(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
@@ -1849,6 +1854,7 @@ rb_vm_check_redefinition_opt_method(const rb_method_entry_t *me, VALUE klass)
     if (vm_redefinition_check_method_type(me->def)) {
 	if (st_lookup(vm_opt_method_table, (st_data_t)me, &bop)) {
 	    int flag = vm_redefinition_check_flag(klass);
+            rb_yjit_bop_redefined(klass, me, (enum ruby_basic_operators)bop);
 
 	    ruby_vm_redefined_flag[bop] |= flag;
 	}
@@ -4047,6 +4053,14 @@ MAYBE_UNUSED(static void (*ruby_vm_collect_usage_func_insn)(int insn)) = 0;
 MAYBE_UNUSED(static void (*ruby_vm_collect_usage_func_operand)(int insn, int n, VALUE op)) = 0;
 MAYBE_UNUSED(static void (*ruby_vm_collect_usage_func_register)(int reg, int isset)) = 0;
 
+#endif
+
+#if RUBY_DEBUG
+static void
+vm_yjit_collect_usage_insn(int insn)
+{
+    rb_yjit_collect_vm_usage_insn(insn);
+}
 #endif
 
 #if VM_COLLECT_USAGE_DETAILS

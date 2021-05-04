@@ -161,6 +161,8 @@ const rb_iseq_t *rb_iseq_load_iseq(VALUE fname);
 unsigned int *rb_iseq_insns_info_decode_positions(const struct rb_iseq_constant_body *body);
 #endif
 
+int rb_vm_insn_addr2opcode(const void *addr);
+
 RUBY_SYMBOL_EXPORT_BEGIN
 
 /* compile.c */
@@ -299,6 +301,8 @@ VALUE rb_iseq_defined_string(enum defined_type type);
 
 /* vm.c */
 VALUE rb_iseq_local_variables(const rb_iseq_t *iseq);
+
+NOINLINE(void rb_yjit_empty_func_with_ec(rb_control_frame_t *cfp, rb_execution_context_t *ec));
 
 RUBY_SYMBOL_EXPORT_END
 
