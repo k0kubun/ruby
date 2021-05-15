@@ -3136,7 +3136,7 @@ rb_iseq_defined_string(enum defined_type type)
 /* A map from encoded_insn to insn_data: decoded insn number, its len,
  * non-trace version of encoded insn, and trace version. */
 
-static st_table *encoded_insn_data;
+st_table *encoded_insn_data;
 typedef struct insn_data_struct {
     int insn;
     int insn_len;
@@ -3383,6 +3383,14 @@ trace_set_i(void *vstart, void *vend, size_t stride, void *data)
         asan_poison_object_if(ptr, v);
     }
     return 0;
+}
+
+void
+rb_mjit_empty_func_with_ec(rb_execution_context_t *ec, rb_control_frame_t *cfp)
+{
+    // it's put in this file instead of say, compile.c to dodge long C compile time.
+    // it just needs to be in a different unit from vm.o so the compiler can't see the definition
+    // and is forced to emit a call that respects the calling convention.
 }
 
 void

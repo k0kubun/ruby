@@ -87,8 +87,13 @@ switch (insn) {
         fprintf(f, "        rb_threadptr_execute_interrupts(rb_ec_thread_ptr(ec), 0);\n");
         fprintf(f, "    }\n");
         fprintf(f, "    ec->cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(reg_cfp);\n"); // vm_pop_frame
+        fprintf(f, "    *ec->cfp->sp = stack[0];\n");
+        fprintf(f, "    ec->cfp->sp = ec->cfp->sp + 1;\n");
+        fprintf(f, "    return;\n");
     }
-    fprintf(f, "    return stack[0];\n");
+    else {
+        fprintf(f, "    return stack[0];\n");
+    }
     b->stack_size += <%= insn.call_attribute('sp_inc') %>;
     b->finish_p = TRUE;
     break;

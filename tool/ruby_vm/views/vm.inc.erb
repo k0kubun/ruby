@@ -25,6 +25,20 @@
 <%= render 'insn_entry', locals: { insn: insn } -%>
 % end
 %
+% RubyVM::ExampleInstructions.to_a.each do |insn|
+INSN_ENTRY(mjit_call_example_with_ec)
+{
+    START_OF_ORIGINAL_INSN(mjit_call_example_with_ec);
+#if OPT_DIRECT_THREADED_CODE && USE_MACHINE_REGS
+    // assumes USE_MACHINE_REGS, aka reg_pc setup,
+    // aka #define SET_PC(x) (reg_cfp->pc = reg_pc = (x))
+    rb_mjit_empty_func_with_ec(ec, GET_CFP());
+    RESTORE_REGS();
+#endif
+    END_INSN(yjit_call_example_with_ec);
+}
+% end
+%
 % RubyVM::TraceInstructions.to_a.each do |insn|
 <%= render 'trace_instruction', locals: { insn: insn } -%>
 % end

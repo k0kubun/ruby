@@ -331,7 +331,8 @@ rb_mjit_wait_call(rb_execution_context_t *ec, struct rb_iseq_constant_body *body
     if ((uintptr_t)body->jit_func <= (uintptr_t)LAST_JIT_ISEQ_FUNC) {
         return Qundef;
     }
-    return body->jit_func(ec, ec->cfp);
+    return Qundef;
+    //return body->jit_func(ec, ec->cfp);
 }
 
 struct rb_mjit_compile_info*

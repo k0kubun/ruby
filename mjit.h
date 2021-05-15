@@ -169,7 +169,8 @@ mjit_exec(rb_execution_context_t *ec)
     RB_DEBUG_COUNTER_INC(mjit_frame_VM2JT);
 #  endif
     RB_DEBUG_COUNTER_INC(mjit_exec_call_func);
-    return func(ec, ec->cfp);
+    return Qundef;
+    //return func(ec, ec->cfp);
 }
 
 void mjit_child_after_fork(void);

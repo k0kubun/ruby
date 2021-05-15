@@ -582,12 +582,36 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
             return false;
     }
 
-#ifdef _WIN32
-    fprintf(f, "__declspec(dllexport)\n");
-#endif
-    fprintf(f, "VALUE\n%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
+    fprintf(f, "static void\n_%s(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp)\n{\n", funcname);
     bool success = mjit_compile_body(f, iseq, &status);
     fprintf(f, "\n} // end of %s\n", funcname);
+
+    fprintf(f, "\nvoid *__%s = (void *)_%s;\n", funcname, funcname);
+
+    /*
+    1ec0d:       f3 0f 1e fa             endbr64
+    1ec11:       48 8b 5c 24 10          mov    0x10(%rsp),%rbx
+    1ec16:       4c 89 fe                mov    %r15,%rsi
+    1ec19:       48 89 df                mov    %rbx,%rdi
+    1ec1c:       e8 00 00 00 00          call   1ec21 <vm_exec_core+0x1681>
+    1ec21:       4c 8b 7b 10             mov    0x10(%rbx),%r15
+    1ec25:       4d 8b 37                mov    (%r15),%r14
+    1ec28:       41 ff 26                jmp    *(%r14)
+    1ec2b:       f3 0f 1e fa             endbr64
+    */
+    fprintf(f, "\n__asm__(\n");
+    fprintf(f, "    \".global %s\\n\"\n", funcname);
+    fprintf(f, "    \"%s:\\n\\t\"\n", funcname);
+    fprintf(f, "    \"%s\\n\\t\"\n", "endbr64");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov 0x10(%rsp),%rbx");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov %r15,%rsi");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov %rbx,%rdi");
+    fprintf(f, "    \"call _%s\\n\\t\"\n", funcname);
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov 0x10(%rbx),%r15");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov (%r15),%r14");
+    fprintf(f, "    \"%s\\n\\t\"\n", "jmp *(%r14)");
+    fprintf(f, ");\n");
+
     return success;
 }
 

@@ -1332,6 +1332,21 @@ unload_units(void)
     }
 }
 
+static inline void
+map_addr2insn(void *code_ptr, int insn)
+{
+    extern st_table *encoded_insn_data;
+    const void * const *table = rb_vm_get_insns_address_table();
+    const void * const translated_address = table[insn];
+    st_data_t insn_data;
+    if (st_lookup(encoded_insn_data, (st_data_t)translated_address, &insn_data)) {
+        st_insert(encoded_insn_data, (st_data_t)code_ptr, insn_data);
+    }
+    else {
+        rb_bug("failed to find info for original instruction while dealing with addr2insn");
+    }
+}
+
 // The function implementing a worker. It is executed in a separate
 // thread by rb_thread_create_mjit_thread. It compiles precompiled header
 // and then compiles requested ISeqs.
@@ -1423,8 +1438,12 @@ mjit_worker(void)
                 if ((uintptr_t)func > (uintptr_t)LAST_JIT_ISEQ_FUNC) {
                     add_to_list(unit, &active_units);
                 }
-                // Usage of jit_code might be not in a critical section.
-                MJIT_ATOMIC_SET(unit->iseq->body->jit_func, func);
+                VALUE *encoded = (VALUE *)unit->iseq->body->iseq_encoded;
+                //extern int rb_vm_insn_addr2insn(const void *);
+                //int insn = rb_vm_insn_addr2insn(&encoded[0]); // TODO: support trace_*
+                //map_addr2insn((void *)func, insn);
+                encoded[0] = (VALUE)func;
+                MJIT_ATOMIC_SET(unit->iseq->body->jit_func, func); // not called, but just mark it as compiled
             }
             else {
                 free_unit(unit);
