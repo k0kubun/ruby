@@ -99,7 +99,7 @@ static void align_code(obj_handle* obj, size_t align) {
 }
 
 static void init(void) {
-  code = (char*)mmap(NULL, 1024 * 1024 * 1024,
+  code = (char*)mmap(NULL, 128 * 1024 * 1024,
                      PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS,
                      -1, 0);
