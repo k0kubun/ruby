@@ -118,6 +118,12 @@
 # define MAXPATHLEN 1024
 #endif
 
+#include "objfcn.h"
+#define dlopen(name,flag) objopen(name,flag)
+#define dlerror() objerror()
+#define dlsym(handle,name) objsym(handle,name)
+#define dlclose(handle) objclose(handle)
+
 #ifdef _WIN32
 #define dlopen(name,flag) ((void*)LoadLibrary(name))
 #define dlerror() strerror(rb_w32_map_errno(GetLastError()))
@@ -143,7 +149,7 @@ typedef intptr_t pid_t;
 #ifdef _WIN32
 # define USE_JIT_COMPACTION 0
 #else
-# define USE_JIT_COMPACTION 1
+# define USE_JIT_COMPACTION 0
 #endif
 
 // The unit structure that holds metadata of ISeq for MJIT.
@@ -848,12 +854,8 @@ make_pch(void)
 static bool
 compile_c_to_so(const char *c_file, const char *so_file)
 {
-    char* o_file = alloca(strlen(c_file) + 1);
-    strcpy(o_file, c_file);
-    o_file[strlen(c_file) - 1] = 'o';
-
     const char *o_args[] = {
-        "-o", o_file, c_file,
+        "-o", so_file, c_file,
 # ifdef __clang__
         "-include-pch", pch_file,
 # endif
@@ -866,22 +868,6 @@ compile_c_to_so(const char *c_file, const char *so_file)
     if (exit_code != 0) {
         verbose(2, "compile_c_to_so: failed to compile .c to .o: %d", exit_code);
         return false;
-    }
-
-    const char *so_args[] = {
-        "-o", so_file,
-# ifdef _WIN32
-        libruby_pathflag,
-# endif
-        o_file, NULL
-    };
-    args = form_args(6, CC_LDSHARED_ARGS, CC_CODEFLAG_ARGS, so_args, CC_LIBS, CC_DLDFLAGS_ARGS, CC_LINKER_ARGS);
-    if (args == NULL) return false;
-    exit_code = exec_process(cc_path, args);
-    free(args);
-    if (!mjit_opts.save_temps) remove_file(o_file);
-    if (exit_code != 0) {
-        verbose(2, "compile_c_to_so: failed to link .o to .so: %d", exit_code);
     }
     return exit_code == 0;
 }
