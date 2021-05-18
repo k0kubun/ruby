@@ -586,8 +586,6 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
     bool success = mjit_compile_body(f, iseq, &status);
     fprintf(f, "\n} // end of %s\n", funcname);
 
-    fprintf(f, "\nvoid *__%s = (void *)_%s;\n", funcname, funcname);
-
     /*
     1ec0d:       f3 0f 1e fa             endbr64
     1ec11:       48 8b 5c 24 10          mov    0x10(%rsp),%rbx
@@ -603,13 +601,43 @@ mjit_compile(FILE *f, const rb_iseq_t *iseq, const char *funcname, int id)
     fprintf(f, "    \".global %s\\n\"\n", funcname);
     fprintf(f, "    \"%s:\\n\\t\"\n", funcname);
     fprintf(f, "    \"%s\\n\\t\"\n", "endbr64");
-    fprintf(f, "    \"%s\\n\\t\"\n", "mov 0x10(%rsp),%rbx");
-    fprintf(f, "    \"%s\\n\\t\"\n", "mov %r15,%rsi");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x10(%rsp),%rbx");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %r15,%rsi");
     fprintf(f, "    \"%s\\n\\t\"\n", "mov %rbx,%rdi");
-    fprintf(f, "    \"call _%s\\n\\t\"\n", funcname);
-    fprintf(f, "    \"%s\\n\\t\"\n", "mov 0x10(%rbx),%r15");
-    fprintf(f, "    \"%s\\n\\t\"\n", "mov (%r15),%r14");
-    fprintf(f, "    \"%s\\n\\t\"\n", "jmp *(%r14)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "push   %rbp");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rdi,%rbp");
+    fprintf(f, "    \"%s\\n\\t\"\n", "push   %rbx");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rsi,%rbx");
+    fprintf(f, "    \"%s\\n\\t\"\n", "sub    $0x8,%rsp");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x2c(%rdi),%eax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "not    %eax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "and    0x28(%rdi),%eax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "jne    label_60");
+    fprintf(f, "    \"%s\\n\\t\"\n", "label_3a:");
+    fprintf(f, "    \"%s\\n\\t\"\n", "lea    0x38(%rbx),%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rax,0x10(%rbp)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x40(%rbx),%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "movq   $0x8,(%rax)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "add    $0x8,%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rax,0x40(%rbx)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "add    $0x8,%rsp");
+    fprintf(f, "    \"%s\\n\\t\"\n", "pop    %rbx");
+    fprintf(f, "    \"%s\\n\\t\"\n", "pop    %rbp");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x10(%rbx),%r15");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    (%r15),%r14");
+    fprintf(f, "    \"%s\\n\\t\"\n", "jmp    *(%r14)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "nopl   0x0(%rax)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "label_60:");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x30(%rsi),%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    0x38(%rdi),%rdi");
+    fprintf(f, "    \"%s\\n\\t\"\n", "add    $0x8,%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rax,0x8(%rsi)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "movabs $0x55ba37080078,%rax");
+    fprintf(f, "    \"%s\\n\\t\"\n", "mov    %rax,(%rsi)");
+    fprintf(f, "    \"%s\\n\\t\"\n", "xor    %esi,%esi");
+    fprintf(f, "    \"%s\\n\\t\"\n", "call   label_84");
+    fprintf(f, "    \"%s\\n\\t\"\n", "label_84:");
+    fprintf(f, "    \"%s\\n\\t\"\n", "jmp    label_3a");
     fprintf(f, ");\n");
 
     return success;
