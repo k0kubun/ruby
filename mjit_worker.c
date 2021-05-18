@@ -1019,6 +1019,8 @@ compact_all_jit_code(void)
 
             if (cur->iseq) { // Check whether GCed or not
                 // Usage of jit_code might be not in a critical section.
+                VALUE *encoded = (VALUE *)cur->iseq->body->iseq_encoded;
+                encoded[0] = (VALUE)func;
                 MJIT_ATOMIC_SET(cur->iseq->body->jit_func, (mjit_func_t)func);
             }
         }
@@ -1438,11 +1440,11 @@ mjit_worker(void)
                 if ((uintptr_t)func > (uintptr_t)LAST_JIT_ISEQ_FUNC) {
                     add_to_list(unit, &active_units);
                 }
-                VALUE *encoded = (VALUE *)unit->iseq->body->iseq_encoded;
+                //VALUE *encoded = (VALUE *)unit->iseq->body->iseq_encoded;
                 //extern int rb_vm_insn_addr2insn(const void *);
                 //int insn = rb_vm_insn_addr2insn(&encoded[0]); // TODO: support trace_*
                 //map_addr2insn((void *)func, insn);
-                encoded[0] = (VALUE)func;
+                //encoded[0] = (VALUE)func;
                 MJIT_ATOMIC_SET(unit->iseq->body->jit_func, func); // not called, but just mark it as compiled
             }
             else {
