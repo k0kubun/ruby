@@ -5,6 +5,7 @@ use crate::asm::x86_64::*;
 use crate::asm::*;
 use crate::core::*;
 use crate::cruby::*;
+use crate::disasm::disasm_addr_range;
 use crate::invariants::*;
 use crate::options::*;
 use crate::stats::*;
@@ -656,6 +657,15 @@ pub fn gen_entry_prologue(cb: &mut CodeBlock, iseq: IseqPtr, insn_idx: u32) -> O
     // Verify MAX_PROLOGUE_SIZE
     assert!(cb.get_write_pos() - old_write_pos <= MAX_PROLOGUE_SIZE);
 
+    #[cfg(feature = "disasm")]
+    if get_option!(dump_disasm) && !cb.outlined {
+        let last_ptr = cb.get_write_ptr();
+        let disasm = disasm_addr_range(cb, code_ptr.raw_ptr(), last_ptr.raw_ptr() as usize - code_ptr.raw_ptr() as usize);
+        if disasm.len() > 0 {
+            println!("{disasm}");
+        }
+    }
+
     return Some(code_ptr);
 }
 
@@ -869,6 +879,16 @@ pub fn gen_single_block(
         }
     }
     */
+
+    #[cfg(feature = "disasm")]
+    if get_option!(dump_disasm) && !cb.outlined {
+        let start_ptr = blockref.borrow().get_start_addr().unwrap();
+        let last_ptr = cb.get_write_ptr();
+        let disasm = disasm_addr_range(cb, start_ptr.raw_ptr(), last_ptr.raw_ptr() as usize - start_ptr.raw_ptr() as usize);
+        if disasm.len() > 0 {
+            println!("{disasm}");
+        }
+    }
 
     // Block compiled successfully
     Ok(blockref)

@@ -1520,6 +1520,16 @@ fn regenerate_branch(cb: &mut CodeBlock, branch: &mut Branch) {
     );
     branch.end_addr = Some(cb.get_write_ptr());
 
+    #[cfg(feature = "disasm")]
+    if get_option!(dump_disasm) && !cb.outlined {
+        let start_ptr = branch.start_addr.unwrap();
+        let last_ptr = branch.end_addr.unwrap();
+        let disasm = disasm_addr_range(cb, start_ptr.raw_ptr(), last_ptr.raw_ptr() as usize - start_ptr.raw_ptr() as usize);
+        if disasm.len() > 0 {
+            println!("{disasm}");
+        }
+    }
+
     // The block may have shrunk after the branch is rewritten
     if branch_terminates_block {
         // Adjust block size
