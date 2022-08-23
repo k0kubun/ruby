@@ -1509,6 +1509,9 @@ fn regenerate_branch(cb: &mut CodeBlock, branch: &mut Branch) {
     // Rewrite the branch
     assert!(branch.dst_addrs[0].is_some());
     cb.set_write_ptr(branch.start_addr.unwrap());
+
+    add_comment(cb, "regenerate_branch");
+
     (branch.gen_fn)(
         cb,
         branch.dst_addrs[0].unwrap(),

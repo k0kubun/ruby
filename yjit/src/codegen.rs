@@ -224,7 +224,7 @@ fn jit_peek_at_block_handler(jit: &JITState, level: u32) -> VALUE {
 }
 
 // Add a comment at the current position in the code block
-fn add_comment(cb: &mut CodeBlock, comment_str: &str) {
+pub fn add_comment(cb: &mut CodeBlock, comment_str: &str) {
     if cfg!(feature = "asm_comments") {
         cb.add_comment(comment_str);
     }
@@ -618,7 +618,11 @@ pub fn gen_entry_prologue(cb: &mut CodeBlock, iseq: IseqPtr, insn_idx: u32) -> O
     cb.align_pos(64);
 
     let code_ptr = cb.get_write_ptr();
-    add_comment(cb, "yjit entry");
+    if get_option!(dump_disasm) {
+        add_comment(cb, &format!("YJIT entry: {}", iseq_get_location(iseq)));
+    } else {
+        add_comment(cb, "YJIT entry");
+    }
 
     push(cb, REG_CFP);
     push(cb, REG_EC);
@@ -738,6 +742,11 @@ pub fn gen_single_block(
 
     // Mark the start position of the block
     blockref.borrow_mut().set_start_addr(cb.get_write_ptr());
+
+    #[cfg(feature = "disasm")]
+    if get_option!(dump_disasm) {
+        add_comment(cb, &format!("Block: {} (ISEQ offset: {})", iseq_get_location(blockid.iseq), blockid.idx));
+    }
 
     // For each instruction to compile
     // NOTE: could rewrite this loop with a std::iter::Iterator
@@ -6150,8 +6159,8 @@ impl CodegenGlobals {
                 half_size
             );
 
-            let cb = CodeBlock::new(first_half);
-            let ocb = OutlinedCb::wrap(CodeBlock::new(second_half));
+            let cb = CodeBlock::new(first_half, false);
+            let ocb = OutlinedCb::wrap(CodeBlock::new(second_half, true));
 
             (cb, ocb)
         };
