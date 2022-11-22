@@ -4382,6 +4382,7 @@ fn gen_return_branch(
     match shape {
         BranchShape::Next0 | BranchShape::Next1 => unreachable!(),
         BranchShape::Default => {
+            asm.comment("update cfp->jit_return");
             asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(target0.raw_ptr()));
         }
     }
@@ -4809,16 +4810,20 @@ fn gen_send_iseq(
         }
     }
 
+    let inline_method = true;
+
     // Stack overflow check
     // Note that vm_push_frame checks it against a decremented cfp, hence the multiply by 2.
     // #define CHECK_VM_STACK_OVERFLOW0(cfp, sp, margin)
-    asm.comment("stack overflow check");
-    let stack_max: i32 = unsafe { get_iseq_body_stack_max(iseq) }.try_into().unwrap();
-    let locals_offs =
-        (SIZEOF_VALUE as i32) * (num_locals + stack_max) + 2 * (RUBY_SIZEOF_CONTROL_FRAME as i32);
-    let stack_limit = asm.lea(ctx.sp_opnd(locals_offs as isize));
-    asm.cmp(CFP, stack_limit);
-    asm.jbe(counted_exit!(ocb, side_exit, send_se_cf_overflow).into());
+    if !inline_method {
+        asm.comment("stack overflow check");
+        let stack_max: i32 = unsafe { get_iseq_body_stack_max(iseq) }.try_into().unwrap();
+        let locals_offs =
+            (SIZEOF_VALUE as i32) * (num_locals + stack_max) + 2 * (RUBY_SIZEOF_CONTROL_FRAME as i32);
+        let stack_limit = asm.lea(ctx.sp_opnd(locals_offs as isize));
+        asm.cmp(CFP, stack_limit);
+        asm.jbe(counted_exit!(ocb, side_exit, send_se_cf_overflow).into());
+    }
 
     // push_splat_args does stack manipulation so we can no longer side exit
     if flags & VM_CALL_ARGS_SPLAT != 0 {
@@ -4980,45 +4985,47 @@ fn gen_send_iseq(
     let captured_self = captured_opnd.is_some();
     let sp_offset = (argc as isize) + if captured_self { 0 } else { 1 };
 
-    // Store the updated SP on the current frame (pop arguments and receiver)
-    asm.comment("store caller sp");
-    let caller_sp = asm.lea(ctx.sp_opnd((SIZEOF_VALUE as isize) * -sp_offset));
-    asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), caller_sp);
+    if !inline_method {
+        // Store the updated SP on the current frame (pop arguments and receiver)
+        asm.comment("store caller sp");
+        let caller_sp = asm.lea(ctx.sp_opnd((SIZEOF_VALUE as isize) * -sp_offset));
+        asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), caller_sp);
 
-    // Store the next PC in the current frame
-    jit_save_pc(jit, asm);
+        // Store the next PC in the current frame
+        jit_save_pc(jit, asm);
 
-    // Adjust the callee's stack pointer
-    let offs =
-        (SIZEOF_VALUE as isize) * (3 + (num_locals as isize) + if doing_kw_call { 1 } else { 0 });
-    let callee_sp = asm.lea(ctx.sp_opnd(offs));
+        // Adjust the callee's stack pointer
+        let offs =
+            (SIZEOF_VALUE as isize) * (3 + (num_locals as isize) + if doing_kw_call { 1 } else { 0 });
+        let callee_sp = asm.lea(ctx.sp_opnd(offs));
 
-    let specval = if let Some(prev_ep) = prev_ep {
-        // We've already side-exited if the callee expects a block, so we
-        // ignore any supplied block here
-        SpecVal::PrevEP(prev_ep)
-    } else if let Some(captured_opnd) = captured_opnd {
-        let ep_opnd = asm.load(Opnd::mem(64, captured_opnd, SIZEOF_VALUE_I32)); // captured->ep
-        SpecVal::PrevEPOpnd(ep_opnd)
-    } else if block_arg_type == Some(Type::BlockParamProxy) {
-        SpecVal::BlockParamProxy
-    } else if let Some(block_val) = block {
-        SpecVal::BlockISeq(block_val)
-    } else {
-        SpecVal::None
-    };
+        let specval = if let Some(prev_ep) = prev_ep {
+            // We've already side-exited if the callee expects a block, so we
+            // ignore any supplied block here
+            SpecVal::PrevEP(prev_ep)
+        } else if let Some(captured_opnd) = captured_opnd {
+            let ep_opnd = asm.load(Opnd::mem(64, captured_opnd, SIZEOF_VALUE_I32)); // captured->ep
+            SpecVal::PrevEPOpnd(ep_opnd)
+        } else if block_arg_type == Some(Type::BlockParamProxy) {
+            SpecVal::BlockParamProxy
+        } else if let Some(block_val) = block {
+            SpecVal::BlockISeq(block_val)
+        } else {
+            SpecVal::None
+        };
 
-    // Setup the new frame
-    gen_push_frame(jit, ctx, asm, true, ControlFrame {
-        frame_type,
-        specval,
-        cme,
-        recv,
-        sp: callee_sp,
-        iseq: Some(iseq),
-        pc: None, // We are calling into jitted code, which will set the PC as necessary
-        local_size: num_locals
-    });
+        // Setup the new frame
+        gen_push_frame(jit, ctx, asm, true, ControlFrame {
+            frame_type,
+            specval,
+            cme,
+            recv,
+            sp: callee_sp,
+            iseq: Some(iseq),
+            pc: None, // We are calling into jitted code, which will set the PC as necessary
+            local_size: num_locals
+        });
+    }
 
     // No need to set cfp->pc since the callee sets it whenever calling into routines
     // that could look at it through jit_save_pc().
@@ -5060,17 +5067,19 @@ fn gen_send_iseq(
     return_ctx.set_sp_offset(1);
     return_ctx.reset_chain_depth();
 
-    // Write the JIT return address on the callee frame
-    gen_branch(
-        jit,
-        asm,
-        ocb,
-        return_block,
-        &return_ctx,
-        Some(return_block),
-        Some(&return_ctx),
-        gen_return_branch,
-    );
+    if !inline_method {
+        // Write the JIT return address on the callee frame
+        gen_branch(
+            jit,
+            asm,
+            ocb,
+            return_block,
+            &return_ctx,
+            Some(return_block),
+            Some(&return_ctx),
+            gen_return_branch,
+        );
+    }
 
     //print_str(cb, "calling Ruby func:");
     //print_str(cb, rb_id2name(vm_ci_mid(ci)));
@@ -5924,28 +5933,32 @@ fn gen_leave(
     gen_check_ints(asm, counted_exit!(ocb, side_exit, leave_se_interrupt));
     ocb_asm.compile(ocb.unwrap());
 
-    // Pop the current frame (ec->cfp++)
-    // Note: the return PC is already in the previous CFP
-    asm.comment("pop stack frame");
-    let incr_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, incr_cfp);
-    asm.mov(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    let inline_method = true;
 
-    // Load the return value
-    let retval_opnd = ctx.stack_pop(1);
+    if !inline_method {
+        // Pop the current frame (ec->cfp++)
+        // Note: the return PC is already in the previous CFP
+        asm.comment("pop stack frame");
+        let incr_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+        asm.mov(CFP, incr_cfp);
+        asm.mov(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
 
-    // Move the return value into the C return register for gen_leave_exit()
-    asm.mov(C_RET_OPND, retval_opnd);
+        // Load the return value
+        let retval_opnd = ctx.stack_pop(1);
 
-    // Reload REG_SP for the caller and write the return value.
-    // Top of the stack is REG_SP[0] since the caller has sp_offset=1.
-    asm.mov(SP, Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP));
-    asm.mov(Opnd::mem(64, SP, 0), C_RET_OPND);
+        // Move the return value into the C return register for gen_leave_exit()
+        asm.mov(C_RET_OPND, retval_opnd);
 
-    // Jump to the JIT return address on the frame that was just popped
-    let offset_to_jit_return =
-        -(RUBY_SIZEOF_CONTROL_FRAME as i32) + (RUBY_OFFSET_CFP_JIT_RETURN as i32);
-    asm.jmp_opnd(Opnd::mem(64, CFP, offset_to_jit_return));
+        // Reload REG_SP for the caller and write the return value.
+        // Top of the stack is REG_SP[0] since the caller has sp_offset=1.
+        asm.mov(SP, Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP));
+        asm.mov(Opnd::mem(64, SP, 0), C_RET_OPND);
+
+        // Jump to the JIT return address on the frame that was just popped
+        let offset_to_jit_return =
+            -(RUBY_SIZEOF_CONTROL_FRAME as i32) + (RUBY_OFFSET_CFP_JIT_RETURN as i32);
+        asm.jmp_opnd(Opnd::mem(64, CFP, offset_to_jit_return));
+    }
 
     EndBlock
 }
