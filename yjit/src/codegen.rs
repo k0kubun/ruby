@@ -387,6 +387,7 @@ fn gen_code_for_exit_from_stub(ocb: &mut OutlinedCb) -> CodePtr {
 
 /// Generate an exit to return to the interpreter
 fn gen_exit(exit_pc: *mut VALUE, ctx: &Context, asm: &mut Assembler) {
+    #[cfg(not(test))]
     if cfg!(feature = "disasm") {
         let opcode = unsafe { rb_vm_insn_addr2opcode((*exit_pc).as_ptr()) };
         asm.comment(&format!("exit to interpreter on {}", insn_name(opcode as usize)));
