@@ -4337,6 +4337,58 @@ fn jit_thread_s_current(
     true
 }
 
+fn jit_rb_hash_fetch(
+    jit: &mut JITState,
+    ctx: &mut Context,
+    asm: &mut Assembler,
+    _ocb: &mut OutlinedCb,
+    _ci: *const rb_callinfo,
+    _cme: *const rb_callable_method_entry_t,
+    block: Option<IseqPtr>,
+    argc: i32,
+    _known_recv_class: *const VALUE,
+) -> bool {
+    // Optimize the most common path: hash.fetch(key, default)
+    if argc != 2 || block.is_some() {
+        return false
+    }
+
+    // Some classes call #hash on rb_hash_stlike_lookup
+    jit_prepare_routine_call(jit, ctx, asm);
+
+    asm.comment("call rb_hash_stlike_lookup");
+    let recv_opnd = ctx.stack_opnd(2);
+    let key_opnd = ctx.stack_opnd(1);
+    let val_opnd = ctx.stack_opnd(-1);
+    let pval_opnd = asm.lea(val_opnd);
+    let found = asm.ccall(rb_hash_stlike_lookup as *const u8, vec![recv_opnd, key_opnd, pval_opnd]);
+
+    // Branch based on whether a key is found or not
+    let not_found_label = asm.new_label("not_found");
+    asm.test(found, found);
+    asm.jz(not_found_label);
+
+    // Found: Push a lookup result
+    let ret_label = asm.new_label("ret");
+    let ret_opnd = ctx.stack_opnd(2);
+    asm.comment("push a lookup result");
+    asm.mov(ret_opnd, val_opnd);
+    asm.jmp(ret_label);
+
+    // Not found: Push a default
+    let default_opnd = ctx.stack_opnd(0);
+    asm.write_label(not_found_label);
+    asm.mov(ret_opnd, default_opnd);
+    asm.write_label(ret_label);
+
+    // Pop the receiver, the key, and the default
+    ctx.stack_pop(3);
+    // Push the return value onto the stack
+    ctx.stack_push(Type::Unknown);
+
+    true
+}
+
 // Check if we know how to codegen for a particular cfunc method
 fn lookup_cfunc_codegen(def: *const rb_method_definition_t) -> Option<MethodGenFn> {
     let method_serial = unsafe { get_def_method_serial(def) };
@@ -7354,6 +7406,8 @@ impl CodegenGlobals {
                 "current",
                 jit_thread_s_current,
             );
+
+            self.yjit_reg_method(rb_cHash, "fetch", jit_rb_hash_fetch);
         }
     }
 
