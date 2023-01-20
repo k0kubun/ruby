@@ -250,15 +250,17 @@ impl JITState {
         });
     }
 
-    fn flush_perf_symbols(&self) {
+    fn flush_perf_symbols(&self, cb: &CodeBlock) {
         use std::io::Write;
         let pid = std::process::id();
         let path = format!("/tmp/perf-{pid}.map");
         let mut f = std::fs::File::options().create(true).append(true).open(path).unwrap();
         for sym in self.perf_syms.borrow().iter() {
             if let (start, Some(end), name) = sym {
-                let (start, end) = (start.into_usize(), end.into_usize());
-                writeln!(f, "{start:x} {end:x} {name}").unwrap();
+                // in case the code straddles two pages, part of it belongs to the symbol.
+                for (inline_start, inline_end) in cb.writable_addrs(*start, *end) {
+                    writeln!(f, "{inline_start:x} {inline_end:x} {name}").unwrap();
+                }
             }
         }
     }
@@ -1023,7 +1025,7 @@ pub fn gen_single_block(
         return Err(());
     }
 
-    jit.flush_perf_symbols();
+    jit.flush_perf_symbols(cb);
 
     // Block compiled successfully
     Ok(jit.into_block(end_insn_idx, block_start_addr, end_addr, gc_offsets))
