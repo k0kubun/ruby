@@ -97,6 +97,9 @@ pub struct JITState {
 
     /// When true, the block is valid only when there is a total of one ractor running
     pub block_assumes_single_ractor: bool,
+
+    /// address range for Linux perf's [JIT interface](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/jit-interface.txt)
+    perf_syms: std::rc::Rc::<std::cell::RefCell::<Vec<(CodePtr, Option<CodePtr>, String)>>>,
 }
 
 impl JITState {
@@ -118,6 +121,7 @@ impl JITState {
             bop_assumptions: vec![],
             stable_constant_names_assumption: None,
             block_assumes_single_ractor: false,
+            perf_syms: std::rc::Rc::default(),
         }
     }
 
@@ -230,6 +234,33 @@ impl JITState {
 
     pub fn queue_outgoing_branch(&mut self, branch: PendingBranchRef) {
         self.pending_outgoing.push(branch)
+    }
+
+    fn perf_symbol_range_start(&self, asm: &mut Assembler, symbol_name: String) {
+        let syms = self.perf_syms.clone();
+        asm.pos_marker(move |start| syms.borrow_mut().push((start, None, symbol_name.clone())));
+    }
+
+    fn perf_symbol_range_end(&self, asm: &mut Assembler) {
+        let syms = self.perf_syms.clone();
+        asm.pos_marker(move |end| {
+            if let Some((_, ref mut end_store, _)) = syms.borrow_mut().last_mut() {
+                *end_store = Some(end);
+            }
+        });
+    }
+
+    fn flush_perf_symbols(&self) {
+        use std::io::Write;
+        let pid = std::process::id();
+        let path = format!("/tmp/perf-{pid}.map");
+        let mut f = std::fs::File::options().create(true).append(true).open(path).unwrap();
+        for sym in self.perf_syms.borrow().iter() {
+            if let (start, Some(end), name) = sym {
+                let (start, end) = (start.into_usize(), end.into_usize());
+                writeln!(f, "{start:x} {end:x} {name}").unwrap();
+            }
+        }
     }
 }
 
@@ -991,6 +1022,8 @@ pub fn gen_single_block(
     if cb.has_dropped_bytes() || ocb.unwrap().has_dropped_bytes() {
         return Err(());
     }
+
+    jit.flush_perf_symbols();
 
     // Block compiled successfully
     Ok(jit.into_block(end_insn_idx, block_start_addr, end_addr, gc_offsets))
@@ -5427,6 +5460,8 @@ fn gen_send_cfunc(
     // Points to the receiver operand on the stack
     let recv = asm.stack_opnd(argc);
 
+    jit.perf_symbol_range_start(asm, "C method control frame push".to_string());
+
     // Store incremented PC into current control frame in case callee raises.
     jit_save_pc(jit, asm);
 
@@ -5458,6 +5493,8 @@ fn gen_send_cfunc(
         },
         iseq: None,
     });
+
+    jit.perf_symbol_range_end(asm);
 
     if !kw_arg.is_null() {
         // Build a hash from all kwargs passed
