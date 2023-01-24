@@ -259,7 +259,8 @@ impl JITState {
             if let (start, Some(end), name) = sym {
                 // in case the code straddles two pages, part of it belongs to the symbol.
                 for (inline_start, inline_end) in cb.writable_addrs(*start, *end) {
-                    writeln!(f, "{inline_start:x} {inline_end:x} {name}").unwrap();
+                    let code_size = inline_end - inline_start;
+                    writeln!(f, "{inline_start:x} {code_size:x} {name}").unwrap();
                 }
             }
         }
