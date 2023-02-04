@@ -4,7 +4,102 @@
 module RubyVM::MJIT # :nodoc: all
   # This `class << C` section is for calling C functions. For importing variables
   # or macros as is, please consider using tool/mjit/bindgen.rb instead.
-  class << C
+  class << C = Object.new
+    #========================================================================================
+    #
+    # New stuff
+    #
+    def mjit_mark_writable
+      Primitive.cstmt! %{
+        extern bool rb_yjit_mark_writable(void *mem_block, uint32_t mem_size);
+        rb_yjit_mark_writable(rb_mjit_mem_block, MJIT_CODE_SIZE);
+        return Qnil;
+      }
+    end
+
+    def mjit_mark_executable
+      Primitive.cstmt! %{
+        extern bool rb_yjit_mark_executable(void *mem_block, uint32_t mem_size);
+        rb_yjit_mark_executable(rb_mjit_mem_block, MJIT_CODE_SIZE);
+        return Qnil;
+      }
+    end
+
+    def mjit_insn_exits
+      addr = Primitive.cstmt! %{
+        #if MJIT_STATS
+          return SIZET2NUM((size_t)mjit_insn_exits);
+        #else
+          return SIZET2NUM(0);
+        #endif
+      }
+      CType::Immediate.parse("size_t").new(addr)
+    end
+
+    def rb_mjit_block_stub_hit
+      Primitive.cstmt! %{
+        extern void *rb_mjit_block_stub_hit(VALUE block_stub, int sp_offset);
+        return SIZET2NUM((size_t)rb_mjit_block_stub_hit);
+      }
+    end
+
+    def rb_mjit_branch_stub_hit
+      Primitive.cstmt! %{
+        extern void *rb_mjit_branch_stub_hit(VALUE branch_stub, int sp_offset, int branch_target_p);
+        return SIZET2NUM((size_t)rb_mjit_branch_stub_hit);
+      }
+    end
+
+    def rb_mjit_counters
+      addr = Primitive.cstmt! %{
+        #if MJIT_STATS
+          return SIZET2NUM((size_t)&rb_mjit_counters);
+        #else
+          return SIZET2NUM(0);
+        #endif
+      }
+      rb_mjit_runtime_counters.new(addr)
+    end
+
+    # @param from [Integer] - From address
+    # @param to [Integer]   - To address
+    def dump_disasm(from, to)
+      Primitive.dump_disasm(from, to)
+    end
+
+    # Convert a Ruby object to a VALUE in Integer
+    def to_value(obj)
+      Primitive.cexpr! 'SIZET2NUM((size_t)obj)'
+    end
+
+    def BASIC_OP_UNREDEFINED_P(op, klass)
+      Primitive.cexpr! 'RBOOL(BASIC_OP_UNREDEFINED_P(NUM2INT(op), NUM2INT(klass)))'
+    end
+
+    def rb_iseq_line_no(iseq, pos)
+      _iseq_addr = iseq.to_i
+      Primitive.cexpr! 'UINT2NUM(rb_iseq_line_no((const rb_iseq_t *)NUM2SIZET(_iseq_addr), NUM2SIZET(pos)))'
+    end
+
+    def rb_class_of(obj)
+      Primitive.cexpr! 'rb_class_of(obj)'
+    end
+
+    def rb_callable_method_entry(klass, mid)
+      cme_addr = Primitive.cexpr! 'SIZET2NUM((size_t)rb_callable_method_entry(klass, NUM2UINT(mid)))'
+      return nil if cme_addr == 0
+      rb_callable_method_entry_struct.new(cme_addr)
+    end
+
+    def METHOD_ENTRY_VISI(cme)
+      _cme_addr = cme.to_i
+      Primitive.cexpr! 'UINT2NUM(METHOD_ENTRY_VISI((const rb_callable_method_entry_t *)NUM2SIZET(_cme_addr)))'
+    end
+
+    #========================================================================================
+    #
+    # Old stuff
+    #
     def rb_hash_values(cdhash_addr)
       Primitive.cexpr! 'rb_hash_values((VALUE)NUM2PTR(cdhash_addr))'
     end
@@ -60,6 +155,11 @@ module RubyVM::MJIT # :nodoc: all
     def vm_ci_flag(ci)
       _ci_addr = ci.to_i
       Primitive.cexpr! 'UINT2NUM(vm_ci_flag((CALL_INFO)NUM2PTR(_ci_addr)))'
+    end
+
+    def vm_ci_mid(ci)
+      _ci_addr = ci.to_i
+      Primitive.cexpr! 'UINT2NUM(vm_ci_mid((CALL_INFO)NUM2PTR(_ci_addr)))'
     end
 
     def rb_splat_or_kwargs_p(ci)
@@ -153,28 +253,28 @@ module RubyVM::MJIT # :nodoc: all
     Primitive.cexpr! %q{ INT2NUM(NOT_COMPILED_STACK_SIZE) }
   end
 
-  def C.VM_CALL_KW_SPLAT
-    Primitive.cexpr! %q{ INT2NUM(VM_CALL_KW_SPLAT) }
+  def C.BOP_LT
+    Primitive.cexpr! %q{ UINT2NUM(BOP_LT) }
   end
 
-  def C.VM_CALL_KW_SPLAT_bit
-    Primitive.cexpr! %q{ INT2NUM(VM_CALL_KW_SPLAT_bit) }
+  def C.BOP_MINUS
+    Primitive.cexpr! %q{ UINT2NUM(BOP_MINUS) }
   end
 
-  def C.VM_CALL_TAILCALL
-    Primitive.cexpr! %q{ INT2NUM(VM_CALL_TAILCALL) }
+  def C.INTEGER_REDEFINED_OP_FLAG
+    Primitive.cexpr! %q{ UINT2NUM(INTEGER_REDEFINED_OP_FLAG) }
   end
 
-  def C.VM_CALL_TAILCALL_bit
-    Primitive.cexpr! %q{ INT2NUM(VM_CALL_TAILCALL_bit) }
+  def C.METHOD_VISI_PRIVATE
+    Primitive.cexpr! %q{ UINT2NUM(METHOD_VISI_PRIVATE) }
   end
 
-  def C.VM_METHOD_TYPE_CFUNC
-    Primitive.cexpr! %q{ INT2NUM(VM_METHOD_TYPE_CFUNC) }
+  def C.METHOD_VISI_PROTECTED
+    Primitive.cexpr! %q{ UINT2NUM(METHOD_VISI_PROTECTED) }
   end
 
-  def C.VM_METHOD_TYPE_ISEQ
-    Primitive.cexpr! %q{ INT2NUM(VM_METHOD_TYPE_ISEQ) }
+  def C.METHOD_VISI_PUBLIC
+    Primitive.cexpr! %q{ UINT2NUM(METHOD_VISI_PUBLIC) }
   end
 
   def C.RUBY_EVENT_CLASS
@@ -209,8 +309,60 @@ module RubyVM::MJIT # :nodoc: all
     Primitive.cexpr! %q{ UINT2NUM(SHAPE_ROOT) }
   end
 
+  def C.VM_BLOCK_HANDLER_NONE
+    Primitive.cexpr! %q{ UINT2NUM(VM_BLOCK_HANDLER_NONE) }
+  end
+
+  def C.VM_CALL_ARGS_BLOCKARG
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_ARGS_BLOCKARG) }
+  end
+
+  def C.VM_CALL_ARGS_SPLAT
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_ARGS_SPLAT) }
+  end
+
+  def C.VM_CALL_FCALL
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_FCALL) }
+  end
+
+  def C.VM_CALL_KW_SPLAT
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_KW_SPLAT) }
+  end
+
+  def C.VM_CALL_KW_SPLAT_bit
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_KW_SPLAT_bit) }
+  end
+
+  def C.VM_CALL_TAILCALL
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_TAILCALL) }
+  end
+
+  def C.VM_CALL_TAILCALL_bit
+    Primitive.cexpr! %q{ UINT2NUM(VM_CALL_TAILCALL_bit) }
+  end
+
+  def C.VM_ENV_FLAG_LOCAL
+    Primitive.cexpr! %q{ UINT2NUM(VM_ENV_FLAG_LOCAL) }
+  end
+
+  def C.VM_FRAME_MAGIC_METHOD
+    Primitive.cexpr! %q{ UINT2NUM(VM_FRAME_MAGIC_METHOD) }
+  end
+
+  def C.VM_METHOD_TYPE_CFUNC
+    Primitive.cexpr! %q{ UINT2NUM(VM_METHOD_TYPE_CFUNC) }
+  end
+
+  def C.VM_METHOD_TYPE_ISEQ
+    Primitive.cexpr! %q{ UINT2NUM(VM_METHOD_TYPE_ISEQ) }
+  end
+
   def C.INVALID_SHAPE_ID
     Primitive.cexpr! %q{ ULONG2NUM(INVALID_SHAPE_ID) }
+  end
+
+  def C.RUBY_FIXNUM_FLAG
+    Primitive.cexpr! %q{ ULONG2NUM(RUBY_FIXNUM_FLAG) }
   end
 
   def C.SHAPE_MASK
@@ -344,10 +496,12 @@ module RubyVM::MJIT # :nodoc: all
       debug_flags: [CType::Pointer.new { CType::Immediate.parse("char") }, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), debug_flags)")],
       wait: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), wait)")],
       call_threshold: [CType::Immediate.parse("unsigned int"), Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), call_threshold)")],
+      stats: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), stats)")],
       verbose: [CType::Immediate.parse("int"), Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), verbose)")],
       max_cache_size: [CType::Immediate.parse("int"), Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), max_cache_size)")],
       pause: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), pause)")],
       custom: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), custom)")],
+      dump_disasm: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct mjit_options *)NULL)), dump_disasm)")],
     )
   end
 
@@ -547,7 +701,7 @@ module RubyVM::MJIT # :nodoc: all
       pathobj: [self.VALUE, Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), pathobj)"), true],
       base_label: [self.VALUE, Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), base_label)"), true],
       label: [self.VALUE, Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), label)"), true],
-      first_lineno: [CType::Immediate.parse("int"), Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), first_lineno)"), true],
+      first_lineno: [CType::Immediate.parse("int"), Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), first_lineno)")],
       node_id: [CType::Immediate.parse("int"), Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), node_id)")],
       code_location: [self.rb_code_location_t, Primitive.cexpr!("OFFSETOF((*((struct rb_iseq_location_struct *)NULL)), code_location)")],
     )
@@ -623,6 +777,14 @@ module RubyVM::MJIT # :nodoc: all
       disable_send_cache: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct rb_mjit_compile_info *)NULL)), disable_send_cache)")],
       disable_inlining: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct rb_mjit_compile_info *)NULL)), disable_inlining)")],
       disable_const_cache: [self._Bool, Primitive.cexpr!("OFFSETOF((*((struct rb_mjit_compile_info *)NULL)), disable_const_cache)")],
+    )
+  end
+
+  def C.rb_mjit_runtime_counters
+    @rb_mjit_runtime_counters ||= CType::Struct.new(
+      "rb_mjit_runtime_counters", Primitive.cexpr!("SIZEOF(struct rb_mjit_runtime_counters)"),
+      vm_insns_count: [CType::Immediate.parse("size_t"), Primitive.cexpr!("OFFSETOF((*((struct rb_mjit_runtime_counters *)NULL)), vm_insns_count)")],
+      mjit_insns_count: [CType::Immediate.parse("size_t"), Primitive.cexpr!("OFFSETOF((*((struct rb_mjit_runtime_counters *)NULL)), mjit_insns_count)")],
     )
   end
 
@@ -804,4 +966,4 @@ module RubyVM::MJIT # :nodoc: all
   end
 
   ### MJIT bindgen end ###
-end if RubyVM::MJIT.enabled? && RubyVM::MJIT.const_defined?(:C) # not defined for miniruby
+end if Primitive.mjit_enabled_p

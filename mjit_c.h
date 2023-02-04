@@ -94,4 +94,22 @@ struct compile_status {
     struct inlined_call_context inline_context;
 };
 
+//================================================================================
+//
+// New stuff from here
+//
+
+// TODO: Make it configurable
+#define MJIT_CODE_SIZE 64 * 1024 * 1024
+
+extern uint8_t *rb_mjit_mem_block;
+
+#define MJIT_RUNTIME_COUNTERS(...) struct rb_mjit_runtime_counters { size_t __VA_ARGS__; };
+MJIT_RUNTIME_COUNTERS(
+    vm_insns_count,
+    mjit_insns_count
+)
+#undef MJIT_RUNTIME_COUNTERS
+extern struct rb_mjit_runtime_counters rb_mjit_counters;
+
 #endif /* MJIT_C_H */

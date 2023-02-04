@@ -345,14 +345,14 @@ generator = BindingGenerator.new(
   values: {
     INT: %w[
       NOT_COMPILED_STACK_SIZE
-      VM_CALL_KW_SPLAT
-      VM_CALL_KW_SPLAT_bit
-      VM_CALL_TAILCALL
-      VM_CALL_TAILCALL_bit
-      VM_METHOD_TYPE_CFUNC
-      VM_METHOD_TYPE_ISEQ
     ],
     UINT: %w[
+      BOP_LT
+      BOP_MINUS
+      INTEGER_REDEFINED_OP_FLAG
+      METHOD_VISI_PRIVATE
+      METHOD_VISI_PROTECTED
+      METHOD_VISI_PUBLIC
       RUBY_EVENT_CLASS
       SHAPE_CAPACITY_CHANGE
       SHAPE_FLAG_SHIFT
@@ -361,9 +361,22 @@ generator = BindingGenerator.new(
       SHAPE_INITIAL_CAPACITY
       SHAPE_IVAR
       SHAPE_ROOT
+      VM_BLOCK_HANDLER_NONE
+      VM_CALL_ARGS_BLOCKARG
+      VM_CALL_ARGS_SPLAT
+      VM_CALL_FCALL
+      VM_CALL_KW_SPLAT
+      VM_CALL_KW_SPLAT_bit
+      VM_CALL_TAILCALL
+      VM_CALL_TAILCALL_bit
+      VM_ENV_FLAG_LOCAL
+      VM_FRAME_MAGIC_METHOD
+      VM_METHOD_TYPE_CFUNC
+      VM_METHOD_TYPE_ISEQ
     ],
     ULONG: %w[
       INVALID_SHAPE_ID
+      RUBY_FIXNUM_FLAG
       SHAPE_MASK
     ],
     PTR: %w[
@@ -406,6 +419,7 @@ generator = BindingGenerator.new(
     rb_method_iseq_t
     rb_method_type_t
     rb_mjit_compile_info
+    rb_mjit_runtime_counters
     rb_mjit_unit
     rb_serial_t
     rb_shape
@@ -423,7 +437,6 @@ generator = BindingGenerator.new(
   ruby_fields: {
     rb_iseq_location_struct: %w[
       base_label
-      first_lineno
       label
       pathobj
     ]
