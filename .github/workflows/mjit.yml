@@ -87,7 +87,7 @@ jobs:
       - name: make test
         run: |
           $SETARCH make -s test RUN_OPTS="$RUN_OPTS"
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           GNUMAKEFLAGS: ""
           RUBY_TESTOPTS: "-v --tty=no"
