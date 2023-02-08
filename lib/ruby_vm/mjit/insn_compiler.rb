@@ -724,11 +724,9 @@ module RubyVM::MJIT
         asm.incr_counter(:send_kw_splat)
         return CantCompile
       end
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-      recv_depth = argc + ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1)
-      recv_index = ctx.stack_size - 1 - recv_depth
+      recv_index = argc + ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1)
 
-      comptime_recv = jit.peek_at_stack(recv_depth)
+      comptime_recv = jit.peek_at_stack(recv_index)
       comptime_recv_klass = C.rb_class_of(comptime_recv)
 
       # Guard the receiver class (part of vm_search_method_fastpath)
@@ -812,8 +810,7 @@ module RubyVM::MJIT
     def jit_call_iseq_setup_normal(jit, ctx, asm, ci, cme, flags, argc, iseq)
       # Save caller SP and PC before pushing a callee frame for backtrace and side exits
       asm.comment('save SP to caller CFP')
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-      sp_index = ctx.stack_size - 1 - argc - ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1) # Pop receiver and arguments for side exits
+      sp_index = ctx.sp_offset - 1 - argc - ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1) # Pop receiver and arguments for side exits
       asm.lea(:rax, [SP, C.VALUE.size * sp_index])
       asm.mov([CFP, C.rb_control_frame_t.offsetof(:sp)], :rax)
 
@@ -836,13 +833,11 @@ module RubyVM::MJIT
       local_size = iseq.body.local_table_size - iseq.body.param.size
       local_size.times do |i|
         asm.comment('set local variables') if i == 0
-        assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-        local_index = ctx.stack_size + i
+        local_index = ctx.sp_offset + i
         asm.mov([SP, C.VALUE.size * local_index], Qnil)
       end
 
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-      sp_offset = ctx.stack_size + local_size + 3
+      sp_offset = ctx.sp_offset + local_size + 3
       asm.add(SP, C.VALUE.size * sp_offset)
 
       asm.comment('set cme')
