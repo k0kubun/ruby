@@ -175,20 +175,16 @@ module RubyVM::MJIT
     # @param ctx [RubyVM::MJIT::Context]
     # @param asm [RubyVM::MJIT::Assembler]
     def putnil(jit, ctx, asm)
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-      asm.mov([SP, C.VALUE.size * ctx.stack_size], Qnil)
-      ctx.stack_push(1)
-      KeepCompiling
+      putobject(jit, ctx, asm, val: Qnil)
     end
 
     # @param jit [RubyVM::MJIT::JITState]
     # @param ctx [RubyVM::MJIT::Context]
     # @param asm [RubyVM::MJIT::Assembler]
     def putself(jit, ctx, asm)
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
+      stack_top = ctx.stack_push
       asm.mov(:rax, [CFP, C.rb_control_frame_t.offsetof(:self)])
-      asm.mov([SP, C.VALUE.size * ctx.stack_size], :rax)
-      ctx.stack_push(1)
+      asm.mov(stack_top, :rax)
       KeepCompiling
     end
 
@@ -197,16 +193,15 @@ module RubyVM::MJIT
     # @param asm [RubyVM::MJIT::Assembler]
     def putobject(jit, ctx, asm, val: jit.operand(0))
       # Push it to the stack
-      # TODO: GC offsets
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
+      stack_top = ctx.stack_push
       if asm.imm32?(val)
-        asm.mov([SP, C.VALUE.size * ctx.stack_size], val)
+        asm.mov(stack_top, val)
       else # 64-bit immediates can't be directly written to memory
         asm.mov(:rax, val)
-        asm.mov([SP, C.VALUE.size * ctx.stack_size], :rax)
+        asm.mov(stack_top, :rax)
       end
+      # TODO: GC offsets?
 
-      ctx.stack_push(1)
       KeepCompiling
     end
 
@@ -397,35 +392,37 @@ module RubyVM::MJIT
         return EndBlock
       end
 
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
       comptime_recv = jit.peek_at_stack(1)
       comptime_obj  = jit.peek_at_stack(0)
 
       if fixnum?(comptime_recv) && fixnum?(comptime_obj)
+        # Generate a side exit before popping operands
+        side_exit = side_exit(jit, ctx)
+
         unless @invariants.assume_bop_not_redefined(jit, C.INTEGER_REDEFINED_OP_FLAG, C.BOP_MINUS)
           return CantCompile
         end
 
-        assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-        recv_index = ctx.stack_size - 2
-        obj_index  = ctx.stack_size - 1
+        obj_opnd  = ctx.stack_pop
+        recv_opnd = ctx.stack_pop
 
         asm.comment('guard recv is fixnum') # TODO: skip this with type information
-        asm.test([SP, C.VALUE.size * recv_index], C.RUBY_FIXNUM_FLAG)
-        asm.jz(side_exit(jit, ctx))
+        asm.test(recv_opnd, C.RUBY_FIXNUM_FLAG)
+        asm.jz(side_exit)
 
         asm.comment('guard obj is fixnum') # TODO: skip this with type information
-        asm.test([SP, C.VALUE.size * obj_index], C.RUBY_FIXNUM_FLAG)
-        asm.jz(side_exit(jit, ctx))
+        asm.test(obj_opnd, C.RUBY_FIXNUM_FLAG)
+        asm.jz(side_exit)
 
-        asm.mov(:rax, [SP, C.VALUE.size * recv_index])
-        asm.mov(:rcx, [SP, C.VALUE.size * obj_index])
+        asm.mov(:rax, recv_opnd)
+        asm.mov(:rcx, obj_opnd)
         asm.sub(:rax, :rcx)
-        asm.jo(side_exit(jit, ctx))
+        asm.jo(side_exit)
         asm.add(:rax, 1) # re-tag
-        asm.mov([SP, C.VALUE.size * recv_index], :rax)
 
-        ctx.stack_pop(1)
+        dst_opnd = ctx.stack_push
+        asm.mov(dst_opnd, :rax)
+
         KeepCompiling
       else
         CantCompile # TODO: delegate to send
@@ -447,35 +444,37 @@ module RubyVM::MJIT
         return EndBlock
       end
 
-      assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
       comptime_recv = jit.peek_at_stack(1)
       comptime_obj  = jit.peek_at_stack(0)
 
       if fixnum?(comptime_recv) && fixnum?(comptime_obj)
+        # Generate a side exit before popping operands
+        side_exit = side_exit(jit, ctx)
+
         unless @invariants.assume_bop_not_redefined(jit, C.INTEGER_REDEFINED_OP_FLAG, C.BOP_LT)
           return CantCompile
         end
 
-        assert_equal(ctx.sp_offset, ctx.stack_size) # TODO: support SP motion
-        recv_index = ctx.stack_size - 2
-        obj_index  = ctx.stack_size - 1
+        obj_opnd  = ctx.stack_pop
+        recv_opnd = ctx.stack_pop
 
         asm.comment('guard recv is fixnum') # TODO: skip this with type information
-        asm.test([SP, C.VALUE.size * recv_index], C.RUBY_FIXNUM_FLAG)
-        asm.jz(side_exit(jit, ctx))
+        asm.test(recv_opnd, C.RUBY_FIXNUM_FLAG)
+        asm.jz(side_exit)
 
         asm.comment('guard obj is fixnum') # TODO: skip this with type information
-        asm.test([SP, C.VALUE.size * obj_index], C.RUBY_FIXNUM_FLAG)
-        asm.jz(side_exit(jit, ctx))
+        asm.test(obj_opnd, C.RUBY_FIXNUM_FLAG)
+        asm.jz(side_exit)
 
-        asm.mov(:rax, [SP, C.VALUE.size * obj_index])
-        asm.cmp([SP, C.VALUE.size * recv_index], :rax)
+        asm.mov(:rax, obj_opnd)
+        asm.cmp(recv_opnd, :rax)
         asm.mov(:rax, Qfalse)
         asm.mov(:rcx, Qtrue)
         asm.cmovl(:rax, :rcx)
-        asm.mov([SP, C.VALUE.size * recv_index], :rax)
 
-        ctx.stack_pop(1)
+        dst_opnd = ctx.stack_push
+        asm.mov(dst_opnd, :rax)
+
         KeepCompiling
       else
         CantCompile # TODO: delegate to send
