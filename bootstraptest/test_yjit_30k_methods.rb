@@ -121015,4 +121015,4 @@ end
 
 @count
 
-}
+} unless ENV.fetch('RUN_OPTS', '').include?('mjit') # speed up MJIT CI
