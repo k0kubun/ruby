@@ -3,6 +3,9 @@ module RubyVM::MJIT
   # 32-bit memory access
   class DwordPtr < Data.define(:reg, :disp); end
 
+  # C call argument registers
+  C_ARG_OPNDS = [:rdi, :rsi, :rdx, :rcx, :r8, :r9]
+
   # https://www.intel.com/content/dam/develop/public/us/en/documents/325383-sdm-vol-2abcd.pdf
   # Mostly an x86_64 assembler, but this also has some stuff that is useful for any architecture.
   class Assembler

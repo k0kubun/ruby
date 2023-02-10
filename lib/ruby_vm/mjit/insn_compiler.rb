@@ -1066,8 +1066,7 @@ module RubyVM::MJIT
         jit_call_iseq_setup(jit, ctx, asm, ci, cme, flags, argc)
       # when C.VM_METHOD_TYPE_NOTIMPLEMENTED
       when C.VM_METHOD_TYPE_CFUNC
-        asm.incr_counter(:send_cfunc)
-        return CantCompile
+        jit_call_cfunc(jit, ctx, asm, ci, cme, flags, argc)
       when C.VM_METHOD_TYPE_ATTRSET
         asm.incr_counter(:send_attrset)
         return CantCompile
@@ -1147,6 +1146,69 @@ module RubyVM::MJIT
       EndBlock
     end
 
+    # vm_call_cfunc
+    # @param jit [RubyVM::MJIT::JITState]
+    # @param ctx [RubyVM::MJIT::Context]
+    # @param asm [RubyVM::MJIT::Assembler]
+    def jit_call_cfunc(jit, ctx, asm, ci, cme, flags, argc)
+      if jit_caller_setup_arg(jit, ctx, asm, flags) == CantCompile
+        return CantCompile
+      end
+      if jit_caller_remove_empty_kw_splat(jit, ctx, asm, flags) == CantCompile
+        return CantCompile
+      end
+
+      return CantCompile
+
+      jit_call_cfunc_with_frame(jit, ctx, asm, ci, cme, flags, argc)
+    end
+
+    # jit_call_cfunc_with_frame
+    # @param jit [RubyVM::MJIT::JITState]
+    # @param ctx [RubyVM::MJIT::Context]
+    # @param asm [RubyVM::MJIT::Assembler]
+    def jit_call_cfunc_with_frame(jit, ctx, asm, ci, cme, flags, argc)
+      cfunc = cme.def.body.cfunc
+
+      # TODO: support them
+      if cfunc.argc < 0
+        asm.incr_counter(:send_cfunc_variadic)
+        return CantCompile
+      end
+      if argc + 1 > 6
+        asm.incr_counter(:send_cfunc_too_many_args)
+        return CantCompile
+      end
+
+      frame_type = C.VM_FRAME_MAGIC_CFUNC | C.VM_FRAME_FLAG_CFRAME | C.VM_ENV_FLAG_LOCAL
+      if flags & C.VM_CALL_KW_SPLAT != 0
+        frame_type |= C.VM_FRAME_FLAG_CFRAME_KW
+      end
+
+      # rb_check_arity
+      if argc != cfunc.argc
+        asm.incr_counter(:send_arity)
+        return CantCompile
+      end
+
+      jit_push_frame(jit, ctx, asm, ci, cme, flags, argc, frame_type)
+
+      asm.comment('call C function')
+      # Push receiver and args
+      (1 + argc).times do |i|
+        asm.mov(C_ARG_OPNDS[i], [SP, C.VALUE.size * -(1 + argc + 3)])
+      end
+      asm.call(cfunc.func)
+
+      # Push the return value
+      stack_ret = ctx.stack_push
+      asm.mov(stack_ret, :rax)
+
+      # Let guard chains share the same successor
+      jump_to_next_insn(jit, ctx, asm)
+      EndBlock
+    end
+
     # vm_call_ivar
     # @param jit [RubyVM::MJIT::JITState]
     # @param ctx [RubyVM::MJIT::Context]
@@ -1205,24 +1267,22 @@ module RubyVM::MJIT
       asm.mov([SP, C.VALUE.size * (ep_offset - 1)], C.VM_BLOCK_HANDLER_NONE)
       asm.mov([SP, C.VALUE.size * (ep_offset - 0)], frame_type)
 
-      # This moves SP register. Don't side-exit after this.
-      asm.comment('move SP register to callee stack')
-      sp_offset = ctx.sp_offset + local_size + 3
-      asm.add(SP, C.VALUE.size * sp_offset)
-
       asm.comment('set up new frame')
       cfp_offset = -C.rb_control_frame_t.size # callee CFP
       # Not setting PC since JIT code will do that as needed
-      asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:sp)], SP)
       asm.mov(:rax, iseq.to_i)
       asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:iseq)], :rax)
-      self_index = -(1 + argc + ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1) + local_size + 3)
+      self_index = ctx.sp_offset - (1 + argc + ((flags & C.VM_CALL_ARGS_BLOCKARG == 0) ? 0 : 1))
       asm.mov(:rax, [SP, C.VALUE.size * self_index])
       asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:self)], :rax)
-      asm.lea(:rax, [SP, C.VALUE.size * -1])
+      asm.lea(:rax, [SP, ep_offset])
       asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:ep)], :rax)
       asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:block_code)], 0)
-      asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:__bp__)], SP) # TODO: get rid of this!!
+      # Update SP register only for ISEQ calls. SP-relative operations should be done above this.
+      sp_reg = iseq ? SP : :rax
+      asm.lea(sp_reg, [SP, C.VALUE.size * (ctx.sp_offset + local_size + 3)])
+      asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:sp)], sp_reg)
+      asm.mov([CFP, cfp_offset + C.rb_control_frame_t.offsetof(:__bp__)], sp_reg) # TODO: get rid of this!!
 
       # cfp->jit_return is used only for ISEQs
       if iseq
@@ -1253,8 +1313,10 @@ module RubyVM::MJIT
       end
 
       asm.comment('switch to callee CFP')
-      asm.sub(CFP, C.rb_control_frame_t.size)
-      asm.mov([EC, C.rb_execution_context_t.offsetof(:cfp)], CFP)
+      # Update CFP register only for ISEQ calls
+      cfp_reg = iseq ? CFP : :rax
+      asm.lea(cfp_reg, [CFP, cfp_offset])
+      asm.mov([EC, C.rb_execution_context_t.offsetof(:cfp)], cfp_reg)
     end
 
     # vm_callee_setup_arg: Set up args and return opt_pc (or CantCompile)
