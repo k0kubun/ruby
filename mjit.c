@@ -71,6 +71,30 @@ bool mjit_cancel_p = false;
 
 #include "mjit_config.h"
 
+static int compile_count = 0;
+static int stub_count = 0;
+
+static double
+real_ms_time(void)
+{
+# ifdef HAVE_CLOCK_GETTIME
+    struct timespec  tv;
+#  ifdef CLOCK_MONOTONIC
+    const clockid_t c = CLOCK_MONOTONIC;
+#  else
+    const clockid_t c = CLOCK_REALTIME;
+#  endif
+
+    clock_gettime(c, &tv);
+    return tv.tv_nsec / 1000000.0 + tv.tv_sec * 1000.0;
+# else
+    struct timeval  tv;
+
+    gettimeofday(&tv, NULL);
+    return tv.tv_usec / 1000.0 + tv.tv_sec * 1000.0;
+# endif
+}
+
 // Print the arguments according to FORMAT to stderr only if MJIT
 // verbose option value is more or equal to LEVEL.
 PRINTF_ARGS(static void, 2, 3)
@@ -385,6 +409,8 @@ rb_mjit_iseq_new(rb_iseq_t *iseq)
 void
 rb_mjit_compile(const rb_iseq_t *iseq)
 {
+    double before = real_ms_time();
+
     RB_VM_LOCK_ENTER();
     rb_vm_barrier();
 
@@ -395,11 +421,16 @@ rb_mjit_compile(const rb_iseq_t *iseq)
     });
 
     RB_VM_LOCK_LEAVE();
+
+    double after = real_ms_time();
+    compile_count++;
+    fprintf(stderr, "rb_mjit_compile[%5d]: %.1fms\n", compile_count, after - before);
 }
 
 void *
-rb_mjit_branch_stub_hit(VALUE branch_stub, int sp_offset, int target0_p)
+rb_mjit_branch_stub_hit(VALUE branch_stub, int sp_offset, int target0_p, void *ptr)
 {
+    double before = real_ms_time();
     VALUE result;
 
     RB_VM_LOCK_ENTER();
@@ -417,6 +448,9 @@ rb_mjit_branch_stub_hit(VALUE branch_stub, int sp_offset, int target0_p)
 
     RB_VM_LOCK_LEAVE();
 
+    double after = real_ms_time();
+    stub_count++;
+    fprintf(stderr, "rb_mjit_branch_stub_hit[%5d]: %.1fms (%ld)\n", stub_count, after - before, (long)ptr);
     return (void *)NUM2SIZET(result);
 }
 

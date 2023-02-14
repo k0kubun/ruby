@@ -86,10 +86,11 @@ module RubyVM::MJIT
     # @param target0_p [TrueClass,FalseClass]
     def compile_branch_stub(ctx, asm, branch_stub, target0_p)
       # Call rb_mjit_branch_stub_hit
-      asm.comment("branch stub hit: #{branch_stub.iseq.body.location.label}@#{C.rb_iseq_path(branch_stub.iseq)}:#{iseq_lineno(branch_stub.iseq, target0_p ? branch_stub.target0.pc : branch_stub.target1.pc)}")
+      asm.comment("branch stub hit (#{branch_stub.object_id}): #{branch_stub.iseq.body.location.label}@#{C.rb_iseq_path(branch_stub.iseq)}:#{iseq_lineno(branch_stub.iseq, target0_p ? branch_stub.target0.pc : branch_stub.target1.pc)}")
       asm.mov(:rdi, to_value(branch_stub))
       asm.mov(:esi, ctx.sp_offset)
       asm.mov(:edx, target0_p ? 1 : 0)
+      asm.mov(:rcx, branch_stub.object_id)
       asm.call(C.rb_mjit_branch_stub_hit)
 
       # Jump to the address returned by rb_mjit_stub_hit
