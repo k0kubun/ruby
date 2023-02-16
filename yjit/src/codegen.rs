@@ -14,6 +14,7 @@ use YARVOpnd::*;
 
 use std::cmp;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::mem::{self, size_of};
 use std::os::raw::{c_int, c_uint};
@@ -7716,7 +7717,7 @@ pub struct CodegenGlobals {
     code_gc_count: usize,
 
     /// Shared contexts for deduplication.
-    contexts: HashMap<Rc<Context>, Rc<Context>>,
+    contexts: HashSet<Rc<Context>>,
 }
 
 /// For implementing global code invalidation. A position in the inline
@@ -7810,7 +7811,7 @@ impl CodegenGlobals {
             method_codegen_table: HashMap::new(),
             ocb_pages,
             code_gc_count: 0,
-            contexts: HashMap::new(),
+            contexts: HashSet::new(),
         };
 
         // Register the method codegen functions
@@ -7980,7 +7981,7 @@ impl CodegenGlobals {
             Some(ctxref) => ctxref.clone(),
             None => {
                 let ctxref = Rc::new(ctx.clone());
-                CodegenGlobals::get_instance().contexts.insert(ctxref.clone(), ctxref.clone());
+                CodegenGlobals::get_instance().contexts.insert(ctxref.clone());
                 ctxref
             }
         }
