@@ -7716,7 +7716,7 @@ pub struct CodegenGlobals {
     code_gc_count: usize,
 
     /// Shared contexts for deduplication.
-    contexts: HashMap<Context, Rc<Context>>,
+    contexts: HashMap<Rc<Context>, Rc<Context>>,
 }
 
 /// For implementing global code invalidation. A position in the inline
@@ -7980,7 +7980,7 @@ impl CodegenGlobals {
             Some(ctxref) => ctxref.clone(),
             None => {
                 let ctxref = Rc::new(ctx.clone());
-                CodegenGlobals::get_instance().contexts.insert(ctx.clone(), ctxref.clone());
+                CodegenGlobals::get_instance().contexts.insert(ctxref.clone(), ctxref.clone());
                 ctxref
             }
         }
