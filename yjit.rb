@@ -279,6 +279,8 @@ module RubyVM::YJIT
       $stderr.puts "yjit_alloc_size:       " + format_number(13, stats[:yjit_alloc_size]) if stats.key?(:yjit_alloc_size)
       $stderr.puts "live_context_size:     " + format_number(13, stats[:live_context_size])
       $stderr.puts "live_context_count:    " + format_number(13, stats[:live_context_count])
+      $stderr.puts "context_table_size:    " + format_number(13, stats[:context_table_size])
+      $stderr.puts "context_table_count:   " + format_number(13, stats[:context_table_count])
       $stderr.puts "live_page_count:       " + format_number(13, stats[:live_page_count])
       $stderr.puts "freed_page_count:      " + format_number(13, stats[:freed_page_count])
       $stderr.puts "code_gc_count:         " + format_number(13, stats[:code_gc_count])

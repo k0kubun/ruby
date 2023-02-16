@@ -18,6 +18,7 @@ use std::ffi::CStr;
 use std::mem::{self, size_of};
 use std::os::raw::{c_int, c_uint};
 use std::ptr;
+use std::rc::Rc;
 use std::slice;
 
 pub use crate::virtualmem::CodePtr;
@@ -7713,6 +7714,9 @@ pub struct CodegenGlobals {
 
     /// How many times code GC has been executed.
     code_gc_count: usize,
+
+    /// Shared contexts for deduplication.
+    contexts: HashMap<Context, Rc<Context>>,
 }
 
 /// For implementing global code invalidation. A position in the inline
@@ -7736,7 +7740,6 @@ impl CodegenGlobals {
         #[cfg(not(test))]
         let (mut cb, mut ocb) = {
             use std::cell::RefCell;
-            use std::rc::Rc;
 
             let virt_block: *mut u8 = unsafe { rb_yjit_reserve_addr_space(mem_size as u32) };
 
@@ -7807,6 +7810,7 @@ impl CodegenGlobals {
             method_codegen_table: HashMap::new(),
             ocb_pages,
             code_gc_count: 0,
+            contexts: HashMap::new(),
         };
 
         // Register the method codegen functions
@@ -7968,6 +7972,28 @@ impl CodegenGlobals {
 
     pub fn get_code_gc_count() -> usize {
         CodegenGlobals::get_instance().code_gc_count
+    }
+
+    /// Return an existing Rc<Context> for any Context that has been used here
+    pub fn deduplicate_context(ctx: &Context) -> Rc<Context> {
+        match CodegenGlobals::get_instance().contexts.get(ctx) {
+            Some(ctxref) => ctxref.clone(),
+            None => {
+                let ctxref = Rc::new(ctx.clone());
+                CodegenGlobals::get_instance().contexts.insert(ctx.clone(), ctxref.clone());
+                ctxref
+            }
+        }
+    }
+
+    pub fn get_contexts_count() -> usize {
+        CodegenGlobals::get_instance().contexts.len()
+    }
+
+    pub fn get_contexts_size() -> usize {
+        // https://github.com/servo/servo/issues/6908
+        let capacity = CodegenGlobals::get_instance().contexts.capacity();
+        (capacity * 11 / 10).next_power_of_two() * (size_of::<Context>() + size_of::<Rc<Context>>() + size_of::<u64>())
     }
 }
 
