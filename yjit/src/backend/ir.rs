@@ -937,6 +937,16 @@ impl Assembler
     /// Allocate registers or memory oprands to Stack operands
     pub fn alloc_temp_regs(mut self, regs: Vec<Reg>) -> Assembler
     {
+        // Count the max stack size to allocate registers from the stack top
+        let mut stack_max = 0;
+        for insn in self.insns.iter() {
+            for opnd in insn.opnd_iter() {
+                if let Opnd::Stack { stack_size, .. } = opnd {
+                    stack_max = u8::max(stack_max, *stack_size);
+                }
+            }
+        }
+
         let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.spilled_temps);
         let mut iterator = self.into_draining_iter();
 
@@ -946,9 +956,10 @@ impl Assembler
                     // Using u8::max to spill only registers that have not been spilled
                     for stack_idx in u8::max(asm.spilled_temps, spilled_temps)..stack_size {
                         // Spill if a register is allocated to the index
-                        if let Some(&reg) = regs.get(stack_idx as usize) {
+                        let reg_idx = stack_idx as isize - (stack_max as isize - regs.len() as isize);
+                        if (0..regs.len() as isize).contains(&reg_idx) {
                             let offset = sp_offset - (stack_size as i8) + (stack_idx as i8);
-                            asm.mov(Opnd::mem(64, SP, (offset as i32) * SIZEOF_VALUE_I32), Opnd::Reg(reg));
+                            asm.mov(Opnd::mem(64, SP, (offset as i32) * SIZEOF_VALUE_I32), Opnd::Reg(regs[reg_idx as usize]));
                         }
                     }
                     // For simplicity, never reuse registers that have been spilled in the same Assembler
@@ -959,11 +970,13 @@ impl Assembler
                     while let Some(opnd) = opnd_iter.next() {
                         *opnd = iterator.map_opnd(*opnd);
                         if let Opnd::Stack { idx, stack_size, sp_offset, num_bits } = *opnd {
-                            let stack_idx = (stack_size as i32 - idx - 1) as usize;
-                            *opnd = match regs.get(stack_idx) {
-                                // Use a register if it's allocated to the index and not spilled yet
-                                Some(&reg) if (asm.spilled_temps <= stack_idx as u8) => Opnd::Reg(reg).with_num_bits(num_bits).unwrap(),
-                                _ => Opnd::mem(num_bits, SP, (sp_offset as i32 - idx - 1) * SIZEOF_VALUE_I32),
+                            let stack_idx = (stack_size as i32 - idx - 1) as isize;
+                            // Allocate registers from the stack top
+                            let reg_idx = stack_idx - (stack_max as isize - regs.len() as isize);
+                            *opnd = if (0..regs.len() as isize).contains(&reg_idx) && asm.spilled_temps <= stack_idx as u8 {
+                                Opnd::Reg(regs[reg_idx as usize]).with_num_bits(num_bits).unwrap()
+                            } else {
+                                Opnd::mem(num_bits, SP, (sp_offset as i32 - idx - 1) * SIZEOF_VALUE_I32)
                             };
                         }
                     }
