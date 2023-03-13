@@ -97,8 +97,6 @@ module RubyVM::RJIT
       asm.jmp(:rax)
     end
 
-    private
-
     def pc_to_insn(pc)
       Compiler.decode_insn(C.VALUE.new(pc).*)
     end
@@ -112,11 +110,11 @@ module RubyVM::RJIT
         asm.mov(:rax, (C.rjit_insn_exits + insn.bin).to_i)
         asm.add([:rax], 1) # TODO: lock
       end
-      if C.rjit_opts.trace_exits
-        asm.comment('rjit_record_exit_stack')
-        asm.mov(C_ARGS[0], pc)
-        asm.call(C.rjit_record_exit_stack)
-      end
+      #if C.rjit_opts.trace_exits
+      #  asm.comment('rjit_record_exit_stack')
+      #  asm.mov(C_ARGS[0], pc)
+      #  asm.call(C.rjit_record_exit_stack)
+      #end
     end
 
     # @param jit [RubyVM::RJIT::JITState]

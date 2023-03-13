@@ -2999,7 +2999,19 @@ module RubyVM::RJIT
 
       # Guard the receiver class (part of vm_search_method_fastpath)
       recv_opnd = ctx.stack_opnd(recv_idx)
-      megamorphic_exit = counted_exit(side_exit, :send_klass_megamorphic)
+      #megamorphic_exit = counted_exit(side_exit, :send_klass_megamorphic)
+      megamorphic_exit = Assembler.new.then do |asm|
+        @exit_compiler.save_pc_and_sp(jit.pc, ctx.dup, asm) # dup to avoid sp_offset update
+        asm.mov(C_ARGS[0], jit.pc)
+        asm.call(C.rjit_record_exit_stack)
+        asm.pop(SP)
+        asm.pop(EC)
+        asm.pop(CFP)
+
+        asm.mov(C_RET, Qundef)
+        asm.ret
+        @ocb.write(asm)
+      end
       jit_guard_known_klass(jit, ctx, asm, comptime_recv_klass, recv_opnd, comptime_recv, megamorphic_exit)
 
       # Do method lookup (vm_cc_cme(cc) != NULL)
