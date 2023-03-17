@@ -2031,6 +2031,12 @@ pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr) -> Option<CodePtr> {
         iseq,
         idx: insn_idx,
     };
+    let mut ctx = Context::default();
+    let cfp = unsafe { get_ec_cfp(ec) };
+    let sp = unsafe { get_cfp_sp(cfp) } as usize;
+    let bp = unsafe { get_cfp_bp(cfp) } as usize;
+    let stack_size = sp - bp;
+    ctx.stack_size = u8::try_from(stack_size).ok()?;
 
     // Get the inline and outlined code blocks
     let cb = CodegenGlobals::get_inline_cb();
@@ -2040,7 +2046,7 @@ pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr) -> Option<CodePtr> {
     let code_ptr = gen_entry_prologue(cb, ocb, iseq, insn_idx);
 
     // Try to generate code for the entry block
-    let block = gen_block_series(blockid, &Context::default(), ec, cb, ocb);
+    let block = gen_block_series(blockid, &ctx, ec, cb, ocb);
 
     cb.mark_all_executable();
     ocb.unwrap().mark_all_executable();

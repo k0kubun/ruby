@@ -686,7 +686,7 @@ pub fn gen_entry_prologue(cb: &mut CodeBlock, ocb: &mut OutlinedCb, iseq: IseqPt
     // compiled for is the same PC that the interpreter wants us to run with.
     // If they don't match, then we'll jump to an entry stub and generate
     // another PC check and entry there.
-    let pending_entry = if unsafe { get_iseq_flags_has_opt(iseq) } {
+    let pending_entry = if true {
         Some(gen_entry_chain_guard(&mut asm, ocb, iseq, insn_idx)?)
     } else {
         None

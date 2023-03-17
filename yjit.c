@@ -716,6 +716,29 @@ rb_get_iseq_body_param_opt_table(const rb_iseq_t *iseq)
     return iseq->body->param.opt_table;
 }
 
+bool
+rb_get_iseq_body_catch_except_p(const rb_iseq_t *iseq)
+{
+    return iseq->body->catch_except_p;
+}
+
+// Consult ISEQ's catch table and return entry->sp if entry->cont matches insn_idx.
+// Return 0 if no matching entry is found.
+unsigned int
+rb_iseq_stack_size_at_insn_idx(const rb_iseq_t *iseq, unsigned int insn_idx)
+{
+    const struct iseq_catch_table *ct = ISEQ_BODY(iseq)->catch_table;
+    if (ct) {
+        for (unsigned int i = 0; i < ct->size; i++) {
+            const struct iseq_catch_table_entry *entry = UNALIGNED_MEMBER_PTR(ct, entries[i]);
+            if (entry->cont == insn_idx) {
+                return entry->sp;
+            }
+        }
+    }
+    return 0;
+}
+
 VALUE
 rb_optimized_call(VALUE *recv, rb_execution_context_t *ec, int argc, VALUE *argv, int kw_splat, VALUE block_handler)
 {
@@ -781,6 +804,12 @@ VALUE *
 rb_get_cfp_sp(struct rb_control_frame_struct *cfp)
 {
     return cfp->sp;
+}
+
+VALUE *
+rb_get_cfp_bp(struct rb_control_frame_struct *cfp)
+{
+    return cfp->__bp__;
 }
 
 void

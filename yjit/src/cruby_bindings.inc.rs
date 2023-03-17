@@ -1271,6 +1271,11 @@ extern "C" {
     pub fn rb_get_iseq_body_param_lead_num(iseq: *const rb_iseq_t) -> ::std::os::raw::c_int;
     pub fn rb_get_iseq_body_param_opt_num(iseq: *const rb_iseq_t) -> ::std::os::raw::c_int;
     pub fn rb_get_iseq_body_param_opt_table(iseq: *const rb_iseq_t) -> *const VALUE;
+    pub fn rb_get_iseq_body_catch_except_p(iseq: *const rb_iseq_t) -> bool;
+    pub fn rb_iseq_stack_size_at_insn_idx(
+        iseq: *const rb_iseq_t,
+        insn_idx: ::std::os::raw::c_uint,
+    ) -> ::std::os::raw::c_uint;
     pub fn rb_optimized_call(
         recv: *mut VALUE,
         ec: *mut rb_execution_context_t,
@@ -1286,6 +1291,7 @@ extern "C" {
     pub fn rb_get_cfp_iseq(cfp: *mut rb_control_frame_struct) -> *const rb_iseq_t;
     pub fn rb_get_cfp_pc(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
     pub fn rb_get_cfp_sp(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
+    pub fn rb_get_cfp_bp(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
     pub fn rb_set_cfp_pc(cfp: *mut rb_control_frame_struct, pc: *const VALUE);
     pub fn rb_set_cfp_sp(cfp: *mut rb_control_frame_struct, sp: *mut VALUE);
     pub fn rb_cfp_get_iseq(cfp: *mut rb_control_frame_struct) -> *mut rb_iseq_t;
