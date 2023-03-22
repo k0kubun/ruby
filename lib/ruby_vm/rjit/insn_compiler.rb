@@ -4028,7 +4028,7 @@ module RubyVM::RJIT
       end
     end
 
-    # vm_call_iseq_setup
+    # vm_call_iseq_setup (ISEQ only)
     # @param jit [RubyVM::RJIT::JITState]
     # @param ctx [RubyVM::RJIT::Context]
     # @param asm [RubyVM::RJIT::Assembler]
@@ -4051,7 +4051,12 @@ module RubyVM::RJIT
     # @param ctx [RubyVM::RJIT::Context]
     # @param asm [RubyVM::RJIT::Assembler]
     def jit_call_iseq_setup_normal(jit, ctx, asm, cme, flags, argc, iseq, block_handler, opt_pc, send_shift:, frame_type:, prev_ep: nil)
-      # We will not have side exits from here. Adjust the stack.
+      # Push splat args, which was skipped in jit_caller_setup_arg.
+      if flags & C::VM_CALL_ARGS_SPLAT != 0
+        jit_caller_setup_arg_splat(jit, ctx, asm)
+      end
+
+      # We will not have side exits from here. Adjust the stack, which was skipped in jit_call_opt_send.
       if flags & C::VM_CALL_OPT_SEND != 0
         jit_call_opt_send_shift_stack(ctx, asm, argc, send_shift:)
       end
@@ -4316,8 +4321,7 @@ module RubyVM::RJIT
         asm.incr_counter(:send_optimized_send_send)
         return CantCompile
       end
-      # Ideally, we want to shift the stack here, but it's not safe until you reach the point
-      # where you never exit. `send_shift` signals to lazily shift the stack by this amount.
+      # Lazily handle stack shift in jit_call_iseq_setup_normal
       send_shift += 1
 
       kw_splat = flags & C::VM_CALL_KW_SPLAT != 0
@@ -4426,6 +4430,7 @@ module RubyVM::RJIT
       EndBlock
     end
 
+    # vm_call_opt_send (lazy part)
     # @param ctx [RubyVM::RJIT::Context]
     # @param asm [RubyVM::RJIT::Assembler]
     def jit_call_opt_send_shift_stack(ctx, asm, argc, send_shift:)
@@ -4613,14 +4618,14 @@ module RubyVM::RJIT
       asm.mov([EC, C.rb_execution_context_t.offsetof(:cfp)], cfp_reg)
     end
 
-    # vm_callee_setup_arg: Set up args and return opt_pc (or CantCompile)
+    # vm_callee_setup_arg (ISEQ only): Set up args and return opt_pc (or CantCompile)
     # @param jit [RubyVM::RJIT::JITState]
     # @param ctx [RubyVM::RJIT::Context]
     # @param asm [RubyVM::RJIT::Assembler]
     def jit_callee_setup_arg(jit, ctx, asm, flags, argc, iseq)
       if flags & C::VM_CALL_KW_SPLAT == 0
         if C.rb_simple_iseq_p(iseq)
-          if jit_caller_setup_arg(jit, ctx, asm, flags) == CantCompile
+          if jit_caller_setup_arg(jit, ctx, asm, flags, splat: true) == CantCompile
             return CantCompile
           end
           if jit_caller_remove_empty_kw_splat(jit, ctx, asm, flags) == CantCompile
@@ -4806,19 +4811,120 @@ module RubyVM::RJIT
     # @param jit [RubyVM::RJIT::JITState]
     # @param ctx [RubyVM::RJIT::Context]
     # @param asm [RubyVM::RJIT::Assembler]
-    def jit_caller_setup_arg(jit, ctx, asm, flags)
+    def jit_caller_setup_arg(jit, ctx, asm, flags, splat: false)
       if flags & C::VM_CALL_ARGS_SPLAT != 0 && flags & C::VM_CALL_KW_SPLAT != 0
         asm.incr_counter(:send_args_splat_kw_splat)
         return CantCompile
       elsif flags & C::VM_CALL_ARGS_SPLAT != 0
-        asm.incr_counter(:send_args_splat)
-        return CantCompile
+        if splat
+          # Lazily handle splat in jit_call_iseq_setup_normal
+        else
+          # splat is not supported in this path
+          asm.incr_counter(:send_args_splat)
+          return CantCompile
+        end
       elsif flags & C::VM_CALL_KW_SPLAT != 0
         asm.incr_counter(:send_args_kw_splat)
         return CantCompile
       elsif flags & C::VM_CALL_KWARG != 0
         asm.incr_counter(:send_kwarg)
         return CantCompile
+      end
+    end
+
+    # vm_caller_setup_arg_splat (+ CALLER_SETUP_ARG):
+    # Pushes arguments from an array to the stack that are passed with a splat (i.e. *args).
+    # It optimistically compiles to a static size that is the exact number of arguments needed for the function.
+    # @param jit [RubyVM::RJIT::JITState]
+    # @param ctx [RubyVM::RJIT::Context]
+    # @param asm [RubyVM::RJIT::Assembler]
+    def jit_caller_setup_arg_splat(jit, ctx, asm)
+      side_exit = side_exit(jit, ctx)
+
+      asm.comment('push_splat_args')
+
+      array_opnd = ctx.stack_opnd(0);
+      array_reg = asm.load(array_opnd);
+
+      guard_object_is_array(
+          ctx,
+          asm,
+          array_reg,
+          array_opnd.into(),
+          counted_exit!(ocb, side_exit, send_splat_not_array),
+      );
+
+      asm.comment('Get array length for embedded or heap');
+
+      # Pull out the embed flag to check if it's an embedded array.
+      flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+
+      # Get the length of the array
+      emb_len_opnd = asm.and(flags_opnd, (RARRAY_EMBED_LEN_MASK).into());
+      emb_len_opnd = asm.rshift(emb_len_opnd, (RARRAY_EMBED_LEN_SHIFT).into());
+
+      # Conditionally move the length of the heap array
+      flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+      asm.test(flags_opnd, (RARRAY_EMBED_FLAG).into());
+
+      # Need to repeat this here to deal with register allocation
+      array_opnd = ctx.stack_opnd(0);
+      array_reg = asm.load(array_opnd);
+
+      array_len_opnd = Opnd::mem(
+          std::os::raw::c_long::BITS,
+          array_reg,
+          RUBY_OFFSET_RARRAY_AS_HEAP_LEN,
+      );
+      array_len_opnd = asm.csel_nz(emb_len_opnd, array_len_opnd);
+
+      asm.comment('Side exit if length is not equal to remaining args');
+      asm.cmp(array_len_opnd, required_args.into());
+      asm.jne(counted_exit(side_exit, :send_splatarray_length_not_equal))
+
+      asm.comment("Check last argument is not ruby2keyword hash");
+
+      # Need to repeat this here to deal with register allocation
+      array_reg = asm.load(ctx.stack_opnd(0))
+
+      ary_opnd = get_array_ptr(asm, array_reg)
+
+      last_array_value = asm.load(Opnd::mem(64, ary_opnd, (required_args - 1) * (SIZEOF_VALUE)));
+
+      guard_object_is_not_ruby2_keyword_hash(
+          asm,
+          last_array_value,
+          counted_exit(side_exit, :send_splatarray_last_ruby_2_keywords)
+      );
+
+      asm.comment("Push arguments from array");
+      array_opnd = ctx.stack_pop(1)
+
+      if required_args > 0
+        # Load the address of the embedded array
+        # (struct RArray *)(obj)->as.ary
+        array_reg = asm.load(array_opnd);
+
+        # Conditionally load the address of the heap array
+        # (struct RArray *)(obj)->as.heap.ptr
+        flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+        asm.test(flags_opnd, Opnd::UImm(RARRAY_EMBED_FLAG));
+        heap_ptr_opnd = Opnd::mem(
+            usize::BITS,
+            array_reg,
+            RUBY_OFFSET_RARRAY_AS_HEAP_PTR,
+        );
+        # Load the address of the embedded array
+        # (struct RArray *)(obj)->as.ary
+        ary_opnd = asm.lea(Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RARRAY_AS_ARY));
+        ary_opnd = asm.csel_nz(ary_opnd, heap_ptr_opnd);
+
+        for i in 0..required_args
+          let top = ctx.stack_push(Type::Unknown);
+          asm.mov(top, Opnd::mem(64, ary_opnd, i * SIZEOF_VALUE_I32));
+        end
+
+        asm.comment('end push_each')
       end
     end
 
