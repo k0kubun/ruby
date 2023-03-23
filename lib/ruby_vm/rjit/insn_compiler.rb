@@ -4843,21 +4843,17 @@ module RubyVM::RJIT
 
       asm.comment('push_splat_args')
 
-      array_opnd = ctx.stack_opnd(0);
-      array_reg = asm.load(array_opnd);
+      array_opnd = ctx.stack_opnd(0)
+      array_reg = :rax
+      asm.mov(array_reg, array_opnd)
 
-      guard_object_is_array(
-          ctx,
-          asm,
-          array_reg,
-          array_opnd.into(),
-          counted_exit!(ocb, side_exit, send_splat_not_array),
-      );
+      guard_object_is_array(asm, array_reg, :rcx, counted_exit(side_exit, :send_args_splat_not_array))
 
-      asm.comment('Get array length for embedded or heap');
+      asm.comment('Get array length for embedded or heap')
 
       # Pull out the embed flag to check if it's an embedded array.
       flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+      flags_opnd = [array_reg, C.RBasic.offsetof(:flags)]
 
       # Get the length of the array
       emb_len_opnd = asm.and(flags_opnd, (RARRAY_EMBED_LEN_MASK).into());
