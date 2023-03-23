@@ -4849,43 +4849,20 @@ module RubyVM::RJIT
 
       guard_object_is_array(asm, array_reg, :rcx, counted_exit(side_exit, :send_args_splat_not_array))
 
-      asm.comment('Get array length for embedded or heap')
+      array_len_opnd = :rcx
+      jit_array_len(asm, array_reg, array_len_opnd)
 
-      # Pull out the embed flag to check if it's an embedded array.
-      flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
-      flags_opnd = [array_reg, C.RBasic.offsetof(:flags)]
+      asm.comment('Side exit if length is not equal to remaining args')
+      asm.cmp(array_len_opnd, required_args)
+      asm.jne(counted_exit(side_exit, :send_args_splat_length_not_equal))
 
-      # Get the length of the array
-      emb_len_opnd = asm.and(flags_opnd, (RARRAY_EMBED_LEN_MASK).into());
-      emb_len_opnd = asm.rshift(emb_len_opnd, (RARRAY_EMBED_LEN_SHIFT).into());
+      asm.comment('Check last argument is not ruby2keyword hash')
 
-      # Conditionally move the length of the heap array
-      flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
-      asm.test(flags_opnd, (RARRAY_EMBED_FLAG).into());
+      ary_opnd = :rcx
+      jit_array_ptr(asm, array_reg, ary_opnd) # clobbers array_reg
 
-      # Need to repeat this here to deal with register allocation
-      array_opnd = ctx.stack_opnd(0);
-      array_reg = asm.load(array_opnd);
-
-      array_len_opnd = Opnd::mem(
-          std::os::raw::c_long::BITS,
-          array_reg,
-          RUBY_OFFSET_RARRAY_AS_HEAP_LEN,
-      );
-      array_len_opnd = asm.csel_nz(emb_len_opnd, array_len_opnd);
-
-      asm.comment('Side exit if length is not equal to remaining args');
-      asm.cmp(array_len_opnd, required_args.into());
-      asm.jne(counted_exit(side_exit, :send_splatarray_length_not_equal))
-
-      asm.comment("Check last argument is not ruby2keyword hash");
-
-      # Need to repeat this here to deal with register allocation
-      array_reg = asm.load(ctx.stack_opnd(0))
-
-      ary_opnd = get_array_ptr(asm, array_reg)
-
-      last_array_value = asm.load(Opnd::mem(64, ary_opnd, (required_args - 1) * (SIZEOF_VALUE)));
+      last_array_value = :rax
+      asm.mov(last_array_value, [ary_opnd, (required_args - 1) * C.VALUE.size])
 
       guard_object_is_not_ruby2_keyword_hash(
           asm,
@@ -4893,7 +4870,7 @@ module RubyVM::RJIT
           counted_exit(side_exit, :send_splatarray_last_ruby_2_keywords)
       );
 
-      asm.comment("Push arguments from array");
+      asm.comment('Push arguments from array')
       array_opnd = ctx.stack_pop(1)
 
       if required_args > 0
@@ -4953,6 +4930,20 @@ module RubyVM::RJIT
 
       # Select the array length value
       asm.cmovz(len_reg, [array_reg, C.RArray.offsetof(:as, :heap, :len)])
+    end
+
+    # Generate RARRAY_CONST_PTR_TRANSIENT (part of RARRAY_AREF)
+    def jit_array_ptr(asm, array_reg, ary_opnd)
+      asm.comment('get array pointer for embedded or heap')
+
+      flags_opnd = [array_reg, C.RBasic.offsetof(:flags)]
+      asm.test(flags_opnd, C::RARRAY_EMBED_FLAG)
+      heap_ptr_opnd = [array_reg, C.RArray.offsetof(:as, :heap, :ptr)]
+      # Load the address of the embedded array
+      # (struct RArray *)(obj)->as.ary
+      asm.lea(array_reg, [array_reg, C.RArray.offsetof(:as, :ary)])
+      asm.mov(ary_opnd, heap_ptr_opnd)
+      asm.cmovnz(ary_opnd, array_reg)
     end
 
     def assert_equal(left, right)
