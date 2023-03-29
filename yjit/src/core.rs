@@ -1516,6 +1516,16 @@ impl Context {
         self.stack_size
     }
 
+    /// Create a new Context instance with a given stack_size and sp_offset adjusted
+    /// accordingly. This is useful when you want to virtually rewind the stack_size
+    /// for generating a side exit.
+    pub fn with_stack_size(&self, stack_size: u8) -> Context {
+        let mut ctx = self.clone();
+        ctx.sp_offset -= (ctx.get_stack_size() as isize - stack_size as isize) as i8;
+        ctx.stack_size = stack_size;
+        ctx
+    }
+
     pub fn get_sp_offset(&self) -> i8 {
         self.sp_offset
     }
