@@ -1239,7 +1239,7 @@ fn gen_opt_plus(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands from the stack
         let arg1 = ctx.stack_pop(1);
@@ -2679,7 +2679,6 @@ fn guard_two_fixnums(
     ctx: &mut Context,
     asm: &mut Assembler,
     ocb: &mut OutlinedCb,
-    side_exit: Target
 ) {
     // Get stack operands without popping them
     let arg1 = ctx.stack_opnd(0);
@@ -2691,19 +2690,19 @@ fn guard_two_fixnums(
 
     if arg0_type.is_heap() || arg1_type.is_heap() {
         asm.comment("arg is heap object");
-        asm.jmp(side_exit);
+        asm.jmp(side_exit(jit, ctx, ocb));
         return;
     }
 
     if arg0_type != Type::Fixnum && arg0_type.is_specific() {
         asm.comment("arg0 not fixnum");
-        asm.jmp(side_exit);
+        asm.jmp(side_exit(jit, ctx, ocb));
         return;
     }
 
     if arg1_type != Type::Fixnum && arg1_type.is_specific() {
         asm.comment("arg1 not fixnum");
-        asm.jmp(side_exit);
+        asm.jmp(side_exit(jit, ctx, ocb));
         return;
     }
 
@@ -2724,7 +2723,7 @@ fn guard_two_fixnums(
             asm,
             ocb,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
     }
     if arg1_type != Type::Fixnum {
@@ -2738,7 +2737,7 @@ fn guard_two_fixnums(
             asm,
             ocb,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
     }
 
@@ -2777,7 +2776,7 @@ fn gen_fixnum_cmp(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands from the stack
         let arg1 = ctx.stack_pop(1);
@@ -2860,7 +2859,7 @@ fn gen_equality_specialized(
             return Some(false);
         }
 
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         asm.cmp(a_opnd, b_opnd);
         let val = if gen_eq {
@@ -3241,7 +3240,7 @@ fn gen_opt_and(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands and destination from the stack
         let arg1 = ctx.stack_pop(1);
@@ -3286,7 +3285,7 @@ fn gen_opt_or(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands and destination from the stack
         let arg1 = ctx.stack_pop(1);
@@ -3331,7 +3330,7 @@ fn gen_opt_minus(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands and destination from the stack
         let arg1 = ctx.stack_pop(1);
@@ -3398,7 +3397,7 @@ fn gen_opt_mod(
         }
 
         // Check that both operands are fixnums
-        guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+        guard_two_fixnums(jit, ctx, asm, ocb);
 
         // Get the operands and destination from the stack
         let arg1 = ctx.stack_pop(1);
@@ -4368,7 +4367,7 @@ fn jit_rb_int_equal(
     let side_exit = side_exit(jit, ctx, ocb);
 
     // Check that both operands are fixnums
-    guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
+    guard_two_fixnums(jit, ctx, asm, ocb);
 
     // Compare the arguments
     asm.comment("rb_int_equal");
