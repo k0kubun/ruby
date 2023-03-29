@@ -529,7 +529,7 @@ fn gen_outlined_exit(exit_pc: *mut VALUE, ctx: &Context, ocb: &mut OutlinedCb) -
 // moment, so there is one unique side exit for each context. Note that
 // it's incorrect to jump to the side exit after any ctx stack push operations
 // since they change the logic required for reconstructing interpreter state.
-fn get_side_exit(jit: &mut JITState, ocb: &mut OutlinedCb, ctx: &Context) -> Target {
+fn side_exit(jit: &mut JITState, ocb: &mut OutlinedCb, ctx: &Context) -> Target {
     match jit.side_exit_for_pc.get(&ctx.get_sp_offset()) {
         None => {
             let exit_code = gen_outlined_exit(jit.pc, ctx, ocb);
@@ -552,7 +552,7 @@ pub fn jit_ensure_block_entry_exit(jit: &mut JITState, ocb: &mut OutlinedCb) {
     // If we're compiling the first instruction in the block.
     if jit.insn_idx == jit.starting_insn_idx {
         // Generate the exit with the cache in jitstate.
-        let entry_exit = get_side_exit(jit, ocb, block_starting_context).unwrap_code_ptr();
+        let entry_exit = side_exit(jit, ocb, block_starting_context).unwrap_code_ptr();
         jit.block_entry_exit = Some(entry_exit);
     } else {
         let block_entry_pc = unsafe { rb_iseq_pc_at_idx(jit.iseq, jit.starting_insn_idx.into()) };
@@ -1170,7 +1170,7 @@ fn gen_opt_plus(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_PLUS) {
             return CantCompile;
@@ -1510,7 +1510,7 @@ fn gen_expandarray(
         return CantCompile;
     }
 
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     let array_opnd = ctx.stack_opnd(0);
 
@@ -1721,7 +1721,7 @@ fn gen_setlocal_generic(
         asm.test(flags_opnd, VM_ENV_FLAG_WB_REQUIRED.into());
 
         // Create a side-exit to fall back to the interpreter
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         // if (flags & VM_ENV_FLAG_WB_REQUIRED) != 0
         asm.jnz(side_exit);
@@ -2144,7 +2144,7 @@ fn gen_getinstancevariable(
     let comptime_val = jit.peek_at_self();
 
     // Generate a side exit
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Guard that the receiver has the same class as the one from compile time.
     let self_asm_opnd = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF);
@@ -2282,7 +2282,7 @@ fn gen_setinstancevariable(
         let recv_opnd = SelfOpnd;
 
         // Generate a side exit
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         // Upgrade type
         guard_object_is_heap(ctx, asm, recv, recv_opnd, side_exit);
@@ -2501,7 +2501,7 @@ fn gen_definedivar(
         rb_shape_get_iv_index(shape, ivar_name, &mut ivar_index)
     };
 
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Guard heap object (recv_opnd must be used before stack_pop)
     guard_object_is_heap(ctx, asm, recv, SelfOpnd, side_exit);
@@ -2708,7 +2708,7 @@ fn gen_fixnum_cmp(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, bop) {
             return CantCompile;
@@ -2782,7 +2782,7 @@ fn gen_equality_specialized(
     gen_eq: bool,
 ) -> Option<bool> {
     // Create a side-exit to fall back to the interpreter
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     let a_opnd = ctx.stack_opnd(1);
     let b_opnd = ctx.stack_opnd(0);
@@ -2951,7 +2951,7 @@ fn gen_opt_aref(
     let comptime_recv = jit.peek_at_stack(ctx, 1);
 
     // Create a side-exit to fall back to the interpreter
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     if comptime_recv.class_of() == unsafe { rb_cArray } && comptime_idx.fixnum_p() {
         if !assume_bop_not_redefined(jit, ocb, ARRAY_REDEFINED_OP_FLAG, BOP_AREF) {
@@ -3065,7 +3065,7 @@ fn gen_opt_aset(
     let _val = ctx.stack_opnd(0);
 
     if comptime_recv.class_of() == unsafe { rb_cArray } && comptime_key.fixnum_p() {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         // Guard receiver is an Array
         jit_guard_known_klass(
@@ -3117,7 +3117,7 @@ fn gen_opt_aset(
         jump_to_next_insn(jit, ctx, asm, ocb);
         return EndBlock;
     } else if comptime_recv.class_of() == unsafe { rb_cHash } {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         // Guard receiver is a Hash
         jit_guard_known_klass(
@@ -3172,7 +3172,7 @@ fn gen_opt_and(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_AND) {
             return CantCompile;
@@ -3217,7 +3217,7 @@ fn gen_opt_or(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_OR) {
             return CantCompile;
@@ -3262,7 +3262,7 @@ fn gen_opt_minus(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_MINUS) {
             return CantCompile;
@@ -3329,7 +3329,7 @@ fn gen_opt_mod(
     if two_fixnums {
         // Create a side-exit to fall back to the interpreter
         // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_MOD) {
             return CantCompile;
@@ -3598,7 +3598,7 @@ fn gen_opt_case_dispatch(
 
         // Check if the key is the same value
         asm.cmp(key_opnd, comptime_key.into());
-        let side_exit = get_side_exit(jit, ocb, &ctx);
+        let side_exit = side_exit(jit, ocb, &ctx);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -3641,7 +3641,7 @@ fn gen_branchif(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         gen_check_ints(asm, side_exit);
     }
 
@@ -3697,7 +3697,7 @@ fn gen_branchunless(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         gen_check_ints(asm, side_exit);
     }
 
@@ -3754,7 +3754,7 @@ fn gen_branchnil(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         gen_check_ints(asm, side_exit);
     }
 
@@ -3842,7 +3842,7 @@ fn gen_jump(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         gen_check_ints(asm, side_exit);
     }
 
@@ -4142,7 +4142,7 @@ fn jit_rb_kernel_is_a(
     }
     let sample_is_a = unsafe { rb_obj_is_kind_of(sample_lhs, sample_rhs) == Qtrue };
 
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
     asm.comment("Kernel#is_a?");
     asm.cmp(ctx.stack_opnd(0), sample_rhs.into());
     asm.jne(counted_exit!(ocb, side_exit, send_is_a_class_mismatch));
@@ -4203,7 +4203,7 @@ fn jit_rb_kernel_instance_of(
 
     let sample_instance_of = sample_lhs_real_class == sample_rhs;
 
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
     asm.comment("Kernel#instance_of?");
     asm.cmp(ctx.stack_opnd(0), sample_rhs.into());
     asm.jne(counted_exit!(ocb, side_exit, send_instance_of_class_mismatch));
@@ -4307,7 +4307,7 @@ fn jit_rb_int_equal(
     _argc: i32,
     _known_recv_class: *const VALUE,
 ) -> bool {
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Check that both operands are fixnums
     guard_two_fixnums(jit, ctx, asm, ocb, side_exit);
@@ -4471,7 +4471,7 @@ fn jit_rb_str_concat(
     }
 
     // Generate a side exit
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Guard that the concat argument is a string
     guard_object_is_string(ctx, asm, ctx.stack_opnd(0), StackOpnd(0), side_exit);
@@ -4623,7 +4623,7 @@ fn jit_obj_respond_to(
     jit.assume_method_lookup_stable(ocb, target_cme);
 
     // Generate a side exit
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     if argc == 2 {
         // pop include_all argument (we only use its type info)
@@ -4907,7 +4907,7 @@ fn gen_send_cfunc(
     let mut argc = argc;
 
     // Create a side-exit to fall back to the interpreter
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // If the function expects a Ruby array of arguments
     if cfunc_argc < 0 && cfunc_argc != -1 {
@@ -5416,7 +5416,7 @@ fn gen_send_iseq(
     let mut argc = argc;
 
     // Create a side-exit to fall back to the interpreter
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // When you have keyword arguments, there is an extra object that gets
     // placed on the stack the represents a bitmap of the keywords that were not
@@ -6313,7 +6313,7 @@ fn gen_send_general(
     let comptime_recv_klass = comptime_recv.class_of();
 
     // Guard that the receiver has the same class as the one from compile time
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Points to the receiver operand on the stack
     let recv = ctx.stack_opnd(recv_idx);
@@ -6820,7 +6820,7 @@ fn gen_invokeblock(
         );
 
         asm.comment("guard block_handler type");
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x1.into()); // VM_BH_ISEQ_BLOCK_P
         let tag_changed_exit = counted_exit!(ocb, side_exit, invokeblock_tag_changed);
@@ -6885,7 +6885,7 @@ fn gen_invokeblock(
         );
 
         asm.comment("guard block_handler type");
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x3.into()); // VM_BH_IFUNC_P
         let tag_changed_exit = counted_exit!(ocb, side_exit, invokeblock_tag_changed);
@@ -7019,7 +7019,7 @@ fn gen_invokesuper(
     }
 
     // Guard that the receiver has the same class as the one from compile time
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     asm.comment("guard known me");
     let lep_opnd = gen_get_lep(jit, asm);
@@ -7081,7 +7081,7 @@ fn gen_leave(
     assert_eq!(1, ctx.get_stack_size());
 
     // Create a side-exit to fall back to the interpreter
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
     let ocb_asm = Assembler::new();
 
     // Check for interrupts
@@ -7195,7 +7195,7 @@ fn gen_objtostring(
     let comptime_recv = jit.peek_at_stack(ctx, 0);
 
     if unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRING) } {
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         jit_guard_known_klass(
             jit,
@@ -7473,7 +7473,7 @@ fn gen_opt_getconstant_path(
 
     if !unsafe { (*ice).ic_cref }.is_null() {
         // Cache is keyed on a certain lexical scope. Use the interpreter's cache.
-        let side_exit = get_side_exit(jit, ocb, ctx);
+        let side_exit = side_exit(jit, ocb, ctx);
 
         let inline_cache = asm.load(Opnd::const_ptr(ic as *const u8));
 
@@ -7538,7 +7538,7 @@ fn gen_getblockparamproxy(
 
     // A mirror of the interpreter code. Checking for the case
     // where it's pushing rb_block_param_proxy.
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // EP level
     let level = jit.get_arg(1).as_u32();
@@ -7629,7 +7629,7 @@ fn gen_getblockparam(
 
     // A mirror of the interpreter code. Checking for the case
     // where it's pushing rb_block_param_proxy.
-    let side_exit = get_side_exit(jit, ocb, ctx);
+    let side_exit = side_exit(jit, ocb, ctx);
 
     // Load environment pointer EP from CFP
     let ep_opnd = gen_get_ep(asm, level);
@@ -8230,7 +8230,7 @@ mod tests {
     #[test]
     fn test_get_side_exit() {
         let (mut jit, ctx, _, _, mut ocb) = setup_codegen();
-         get_side_exit(&mut jit, &mut ocb, &ctx);
+        side_exit(&mut jit, &mut ocb, &ctx);
         assert!(ocb.unwrap().get_write_pos() > 0);
     }
 
