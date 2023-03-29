@@ -65,7 +65,8 @@ pub struct JITState {
     pc: *mut VALUE,
 
     /// Side exit to the instruction being compiled. See :side-exit:.
-    side_exit_for_pc: Option<CodePtr>,
+    /// For the current PC, CodePtr is cached for each sp_offset key.
+    side_exit_for_pc: HashMap<i8, CodePtr>,
 
     /// Execution context when compilation started
     /// This allows us to peek at run-time values
@@ -110,7 +111,7 @@ impl JITState {
             insn_idx: 0,
             opcode: 0,
             pc: ptr::null_mut::<VALUE>(),
-            side_exit_for_pc: None,
+            side_exit_for_pc: HashMap::new(),
             pending_outgoing: vec![],
             ec,
             record_boundary_patch_point: false,
@@ -529,10 +530,10 @@ fn gen_outlined_exit(exit_pc: *mut VALUE, ctx: &Context, ocb: &mut OutlinedCb) -
 // it's incorrect to jump to the side exit after any ctx stack push operations
 // since they change the logic required for reconstructing interpreter state.
 fn get_side_exit(jit: &mut JITState, ocb: &mut OutlinedCb, ctx: &Context) -> Target {
-    match jit.side_exit_for_pc {
+    match jit.side_exit_for_pc.get(&ctx.get_sp_offset()) {
         None => {
             let exit_code = gen_outlined_exit(jit.pc, ctx, ocb);
-            jit.side_exit_for_pc = Some(exit_code);
+            jit.side_exit_for_pc.insert(ctx.get_sp_offset(), exit_code);
             exit_code.as_side_exit()
         }
         Some(code_ptr) => code_ptr.as_side_exit()
@@ -828,7 +829,7 @@ pub fn gen_single_block(
         jit.insn_idx = insn_idx;
         jit.opcode = opcode;
         jit.pc = pc;
-        jit.side_exit_for_pc = None;
+        jit.side_exit_for_pc.clear();
 
         // If previous instruction requested to record the boundary
         if jit.record_boundary_patch_point {
