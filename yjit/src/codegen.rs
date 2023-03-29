@@ -2764,10 +2764,6 @@ fn gen_fixnum_cmp(
     };
 
     if two_fixnums {
-        // Create a side-exit to fall back to the interpreter
-        // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = side_exit(jit, ctx, ocb);
-
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, bop) {
             return CantCompile;
         }
@@ -2839,9 +2835,6 @@ fn gen_equality_specialized(
     ocb: &mut OutlinedCb,
     gen_eq: bool,
 ) -> Option<bool> {
-    // Create a side-exit to fall back to the interpreter
-    let side_exit = side_exit(jit, ctx, ocb);
-
     let a_opnd = ctx.stack_opnd(1);
     let b_opnd = ctx.stack_opnd(0);
 
@@ -2896,7 +2889,7 @@ fn gen_equality_specialized(
             a_opnd.into(),
             comptime_a,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         let equal = asm.new_label("equal");
@@ -2921,7 +2914,7 @@ fn gen_equality_specialized(
                 b_opnd.into(),
                 comptime_b,
                 SEND_MAX_DEPTH,
-                side_exit,
+                None,
             );
         }
 
@@ -3032,7 +3025,7 @@ fn gen_opt_aref(
             recv_opnd.into(),
             comptime_recv,
             OPT_AREF_MAX_CHAIN_DEPTH,
-            side_exit,
+            None,
         );
 
         // Bail if idx is not a FIXNUM
@@ -3075,7 +3068,7 @@ fn gen_opt_aref(
             recv_opnd.into(),
             comptime_recv,
             OPT_AREF_MAX_CHAIN_DEPTH,
-            side_exit,
+            None,
         );
 
         // Prepare to call rb_hash_aref(). It might call #hash on the key.
@@ -3123,8 +3116,6 @@ fn gen_opt_aset(
     let _val = ctx.stack_opnd(0);
 
     if comptime_recv.class_of() == unsafe { rb_cArray } && comptime_key.fixnum_p() {
-        let side_exit = side_exit(jit, ctx, ocb);
-
         // Guard receiver is an Array
         jit_guard_known_klass(
             jit,
@@ -3136,7 +3127,7 @@ fn gen_opt_aset(
             recv.into(),
             comptime_recv,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         // Guard key is a fixnum
@@ -3150,7 +3141,7 @@ fn gen_opt_aset(
             key.into(),
             comptime_key,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         // We might allocate or raise
@@ -3175,8 +3166,6 @@ fn gen_opt_aset(
         jump_to_next_insn(jit, ctx, asm, ocb);
         return EndBlock;
     } else if comptime_recv.class_of() == unsafe { rb_cHash } {
-        let side_exit = side_exit(jit, ctx, ocb);
-
         // Guard receiver is a Hash
         jit_guard_known_klass(
             jit,
@@ -3188,7 +3177,7 @@ fn gen_opt_aset(
             recv.into(),
             comptime_recv,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         // We might allocate or raise
@@ -3228,10 +3217,6 @@ fn gen_opt_and(
     };
 
     if two_fixnums {
-        // Create a side-exit to fall back to the interpreter
-        // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = side_exit(jit, ctx, ocb);
-
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_AND) {
             return CantCompile;
         }
@@ -3273,10 +3258,6 @@ fn gen_opt_or(
     };
 
     if two_fixnums {
-        // Create a side-exit to fall back to the interpreter
-        // Note: we generate the side-exit before popping operands from the stack
-        let side_exit = side_exit(jit, ctx, ocb);
-
         if !assume_bop_not_redefined(jit, ocb, INTEGER_REDEFINED_OP_FLAG, BOP_OR) {
             return CantCompile;
         }
@@ -3928,7 +3909,7 @@ fn jit_guard_known_klass(
     insn_opnd: YARVOpnd,
     sample_instance: VALUE,
     max_chain_depth: i32,
-    side_exit: Target,
+    counter: Option<ExitCounter>,
 ) {
     let val_type = ctx.get_opnd_type(insn_opnd);
 
@@ -3943,7 +3924,7 @@ fn jit_guard_known_klass(
 
         asm.comment("guard object is nil");
         asm.cmp(obj_opnd, Qnil.into());
-        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
 
         ctx.upgrade_opnd_type(insn_opnd, Type::Nil);
     } else if unsafe { known_klass == rb_cTrueClass } {
@@ -3952,7 +3933,7 @@ fn jit_guard_known_klass(
 
         asm.comment("guard object is true");
         asm.cmp(obj_opnd, Qtrue.into());
-        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
 
         ctx.upgrade_opnd_type(insn_opnd, Type::True);
     } else if unsafe { known_klass == rb_cFalseClass } {
@@ -3962,7 +3943,7 @@ fn jit_guard_known_klass(
         asm.comment("guard object is false");
         assert!(Qfalse.as_i32() == 0);
         asm.test(obj_opnd, obj_opnd);
-        jit_chain_guard(JCC_JNZ, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JNZ, jit, ctx, asm, ocb, max_chain_depth, counter);
 
         ctx.upgrade_opnd_type(insn_opnd, Type::False);
     } else if unsafe { known_klass == rb_cInteger } && sample_instance.fixnum_p() {
@@ -3972,7 +3953,7 @@ fn jit_guard_known_klass(
 
         asm.comment("guard object is fixnum");
         asm.test(obj_opnd, Opnd::Imm(RUBY_FIXNUM_FLAG as i64));
-        jit_chain_guard(JCC_JZ, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JZ, jit, ctx, asm, ocb, max_chain_depth, counter);
         ctx.upgrade_opnd_type(insn_opnd, Type::Fixnum);
     } else if unsafe { known_klass == rb_cSymbol } && sample_instance.static_sym_p() {
         assert!(!val_type.is_heap());
@@ -3984,7 +3965,7 @@ fn jit_guard_known_klass(
             asm.comment("guard object is static symbol");
             assert!(RUBY_SPECIAL_SHIFT == 8);
             asm.cmp(obj_opnd.with_num_bits(8).unwrap(), Opnd::UImm(RUBY_SYMBOL_FLAG as u64));
-            jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+            jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
             ctx.upgrade_opnd_type(insn_opnd, Type::ImmSymbol);
         }
     } else if unsafe { known_klass == rb_cFloat } && sample_instance.flonum_p() {
@@ -3996,7 +3977,7 @@ fn jit_guard_known_klass(
             asm.comment("guard object is flonum");
             let flag_bits = asm.and(obj_opnd, Opnd::UImm(RUBY_FLONUM_MASK as u64));
             asm.cmp(flag_bits, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
-            jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+            jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
             ctx.upgrade_opnd_type(insn_opnd, Type::Flonum);
         }
     } else if unsafe {
@@ -4015,7 +3996,7 @@ fn jit_guard_known_klass(
         // this situation.
         asm.comment("guard known object with singleton class");
         asm.cmp(obj_opnd, sample_instance.into());
-        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
     } else if val_type == Type::CString && unsafe { known_klass == rb_cString } {
         // guard elided because the context says we've already checked
         unsafe {
@@ -4029,9 +4010,9 @@ fn jit_guard_known_klass(
         if !val_type.is_heap() {
             asm.comment("guard not immediate");
             asm.test(obj_opnd, (RUBY_IMMEDIATE_MASK as u64).into());
-            jit_chain_guard(JCC_JNZ, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+            jit_chain_guard(JCC_JNZ, jit, ctx, asm, ocb, max_chain_depth, counter.clone());
             asm.cmp(obj_opnd, Qfalse.into());
-            jit_chain_guard(JCC_JE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+            jit_chain_guard(JCC_JE, jit, ctx, asm, ocb, max_chain_depth, counter.clone());
 
             ctx.upgrade_opnd_type(insn_opnd, Type::UnknownHeap);
         }
@@ -4047,7 +4028,7 @@ fn jit_guard_known_klass(
         // TODO: jit_mov_gc_ptr keeps a strong reference, which leaks the class.
         asm.comment("guard known class");
         asm.cmp(klass_opnd, known_klass.into());
-        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, side_exit);
+        jit_chain_guard(JCC_JNE, jit, ctx, asm, ocb, max_chain_depth, counter);
 
         if known_klass == unsafe { rb_cString } {
             ctx.upgrade_opnd_type(insn_opnd, Type::CString);
@@ -4360,8 +4341,6 @@ fn jit_rb_int_equal(
     _argc: i32,
     _known_recv_class: *const VALUE,
 ) -> bool {
-    let side_exit = side_exit(jit, ctx, ocb);
-
     // Check that both operands are fixnums
     guard_two_fixnums(jit, ctx, asm, ocb);
 
@@ -6394,7 +6373,6 @@ fn gen_send_general(
         gen_counter_incr!(asm, num_send_polymorphic);
     }
 
-    let megamorphic_exit = counted_exit!(ocb, side_exit, send_klass_megamorphic);
     jit_guard_known_klass(
         jit,
         ctx,
@@ -6405,7 +6383,7 @@ fn gen_send_general(
         recv_opnd,
         comptime_recv,
         SEND_MAX_DEPTH,
-        megamorphic_exit,
+        get_counter!(send_klass_megamorphic),
     );
 
     // Do method lookup
@@ -6612,17 +6590,17 @@ fn gen_send_general(
 
                         jit.assume_method_lookup_stable(ocb, cme);
 
-                        let (known_class, type_mismatch_exit) = {
+                        let (known_class, type_mismatch_counter) = {
                             if compile_time_name.string_p() {
                                 (
                                     unsafe { rb_cString },
-                                    counted_exit!(ocb, side_exit, send_send_chain_not_string),
+                                    get_counter!(send_send_chain_not_string),
 
                                 )
                             } else {
                                 (
                                     unsafe { rb_cSymbol },
-                                    counted_exit!(ocb, side_exit, send_send_chain_not_sym),
+                                    get_counter!(send_send_chain_not_sym),
                                 )
                             }
                         };
@@ -6638,7 +6616,7 @@ fn gen_send_general(
                             name_opnd.into(),
                             compile_time_name,
                             2, // We have string or symbol, so max depth is 2
-                            type_mismatch_exit
+                            type_mismatch_counter
                         );
 
                         // Need to do this here so we don't have too many live
@@ -6872,7 +6850,6 @@ fn gen_invokeblock(
         );
 
         asm.comment("guard block_handler type");
-        let side_exit = side_exit(jit, ctx, ocb);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x1.into()); // VM_BH_ISEQ_BLOCK_P
         jit_chain_guard(
@@ -6935,7 +6912,6 @@ fn gen_invokeblock(
         );
 
         asm.comment("guard block_handler type");
-        let side_exit = side_exit(jit, ctx, ocb);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x3.into()); // VM_BH_IFUNC_P
         jit_chain_guard(
@@ -7242,8 +7218,6 @@ fn gen_objtostring(
     let comptime_recv = jit.peek_at_stack(ctx, 0);
 
     if unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRING) } {
-        let side_exit = side_exit(jit, ctx, ocb);
-
         jit_guard_known_klass(
             jit,
             ctx,
@@ -7254,7 +7228,7 @@ fn gen_objtostring(
             recv.into(),
             comptime_recv,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         // No work needed. The string value is already on the top of the stack.
