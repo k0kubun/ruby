@@ -1958,7 +1958,7 @@ fn jit_chain_guard(
     asm: &mut Assembler,
     ocb: &mut OutlinedCb,
     depth_limit: i32,
-    side_exit: Target,
+    counter: Option<ExitCounter>,
 ) {
     let target0_gen_fn = match jcc {
         JCC_JNE | JCC_JNZ => BranchGenFn::JNZToTarget0,
@@ -1976,7 +1976,7 @@ fn jit_chain_guard(
 
         gen_branch(jit, asm, ocb, bid, &deeper, None, None, target0_gen_fn);
     } else {
-        target0_gen_fn.call(asm, side_exit.unwrap_code_ptr(), None);
+        target0_gen_fn.call(asm, counted_exit(jit, ctx, ocb, counter).unwrap_code_ptr(), None);
     }
 }
 
@@ -2134,7 +2134,6 @@ fn gen_get_ivar(
 
     asm.comment("guard shape");
     asm.cmp(shape_opnd, Opnd::UImm(expected_shape as u64));
-    let megamorphic_side_exit = counted_exit!(ocb, side_exit, getivar_megamorphic);
     jit_chain_guard(
         JCC_JNE,
         jit,
@@ -2142,7 +2141,7 @@ fn gen_get_ivar(
         asm,
         ocb,
         max_chain_depth,
-        megamorphic_side_exit,
+        get_counter!(getivar_megamorphic),
     );
 
     // Pop receiver if it's on the temp stack
@@ -2355,7 +2354,6 @@ fn gen_setinstancevariable(
 
         asm.comment("guard shape");
         asm.cmp(shape_opnd, Opnd::UImm(expected_shape as u64));
-        let megamorphic_side_exit = counted_exit!(ocb, side_exit, setivar_megamorphic);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -2363,7 +2361,7 @@ fn gen_setinstancevariable(
             asm,
             ocb,
             SET_IVAR_MAX_DEPTH,
-            megamorphic_side_exit,
+            get_counter!(setivar_megamorphic),
         );
 
         let write_val;
@@ -2573,7 +2571,6 @@ fn gen_definedivar(
 
     asm.comment("guard shape");
     asm.cmp(shape_opnd, Opnd::UImm(shape_id as u64));
-    let megamorphic_side_exit = counted_exit!(ocb, side_exit, getivar_megamorphic);
     jit_chain_guard(
         JCC_JNE,
         jit,
@@ -2581,7 +2578,7 @@ fn gen_definedivar(
         asm,
         ocb,
         GET_IVAR_MAX_DEPTH,
-        megamorphic_side_exit,
+        None,
     );
 
     let result = if ivar_exists { pushval } else { Qnil };
@@ -3659,7 +3656,6 @@ fn gen_opt_case_dispatch(
 
         // Check if the key is the same value
         asm.cmp(key_opnd, comptime_key.into());
-        let side_exit = side_exit(jit, &ctx, ocb);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -3667,7 +3663,7 @@ fn gen_opt_case_dispatch(
             asm,
             ocb,
             CASE_WHEN_MAX_DEPTH,
-            side_exit,
+            None,
         );
         ctx.stack_pop(1); // Pop key_opnd
 
@@ -6652,7 +6648,6 @@ fn gen_send_general(
                         let symbol_id_opnd = asm.ccall(rb_get_symbol_id as *const u8, vec![name_opnd]);
 
                         asm.comment("chain_guard_send");
-                        let chain_exit = counted_exit!(ocb, side_exit, send_send_chain);
                         asm.cmp(symbol_id_opnd, mid.into());
                         jit_chain_guard(
                             JCC_JNE,
@@ -6661,7 +6656,7 @@ fn gen_send_general(
                             asm,
                             ocb,
                             SEND_MAX_CHAIN_DEPTH,
-                            chain_exit,
+                            get_counter!(send_send_chain),
                         );
 
                         // We have changed the argc, flags, mid, and cme, so we need to re-enter the match
@@ -6880,7 +6875,6 @@ fn gen_invokeblock(
         let side_exit = side_exit(jit, ctx, ocb);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x1.into()); // VM_BH_ISEQ_BLOCK_P
-        let tag_changed_exit = counted_exit!(ocb, side_exit, invokeblock_tag_changed);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -6888,7 +6882,7 @@ fn gen_invokeblock(
             asm,
             ocb,
             SEND_MAX_CHAIN_DEPTH,
-            tag_changed_exit,
+            get_counter!(invokeblock_tag_changed),
         );
 
         let comptime_captured = unsafe { ((comptime_handler.0 & !0x3) as *const rb_captured_block).as_ref().unwrap() };
@@ -6898,7 +6892,6 @@ fn gen_invokeblock(
         let captured_opnd = asm.and(block_handler_opnd, Opnd::Imm(!0x3));
         let iseq_opnd = asm.load(Opnd::mem(64, captured_opnd, SIZEOF_VALUE_I32 * 2));
         asm.cmp(iseq_opnd, (comptime_iseq as usize).into());
-        let block_changed_exit = counted_exit!(ocb, side_exit, invokeblock_iseq_block_changed);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -6906,7 +6899,7 @@ fn gen_invokeblock(
             asm,
             ocb,
             SEND_MAX_CHAIN_DEPTH,
-            block_changed_exit,
+            get_counter!(invokeblock_iseq_block_changed),
         );
 
         gen_send_iseq(
@@ -6945,7 +6938,6 @@ fn gen_invokeblock(
         let side_exit = side_exit(jit, ctx, ocb);
         let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
         asm.cmp(tag_opnd, 0x3.into()); // VM_BH_IFUNC_P
-        let tag_changed_exit = counted_exit!(ocb, side_exit, invokeblock_tag_changed);
         jit_chain_guard(
             JCC_JNE,
             jit,
@@ -6953,7 +6945,7 @@ fn gen_invokeblock(
             asm,
             ocb,
             SEND_MAX_CHAIN_DEPTH,
-            tag_changed_exit,
+            get_counter!(invokeblock_tag_changed),
         );
 
         // The cfunc may not be leaf
@@ -7637,7 +7629,7 @@ fn gen_getblockparamproxy(
             asm,
             ocb,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         jit_putobject(jit, ctx, asm, Qnil);
@@ -7655,7 +7647,7 @@ fn gen_getblockparamproxy(
             asm,
             ocb,
             SEND_MAX_DEPTH,
-            side_exit,
+            None,
         );
 
         // Push rb_block_param_proxy. It's a root, so no need to use jit_mov_gc_ptr.
