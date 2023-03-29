@@ -247,6 +247,28 @@ pub enum JCCKinds {
     JCC_JNA,
 }
 
+/// Counter used by get_counted_exit to count the number of exits with --yjit-stats.
+#[derive(Clone)]
+struct ExitCounter {
+    ptr: *const u8,
+    name: String,
+}
+
+/// Macro to get an ExitCounter for helpers with side exits.
+macro_rules! get_counter {
+    ($counter_name:ident) => {
+        if (get_option!(gen_stats)) {
+            let counter = ExitCounter {
+                ptr: ptr_to_counter!($counter_name) as *const u8,
+                name: stringify!($counter_name).to_string(),
+            };
+            Some(counter)
+        } else {
+            None
+        }
+    };
+}
+
 macro_rules! gen_counter_incr {
     ($asm:tt, $counter_name:ident) => {
         if (get_option!(gen_stats)) {
@@ -540,6 +562,40 @@ fn side_exit(jit: &mut JITState, ctx: &Context, ocb: &mut OutlinedCb) -> Target 
     }
 }
 
+/// Get a side exit. Increment a counter in it if --yjit-stats is enabled.
+fn counted_exit(jit: &mut JITState, ctx: &Context, ocb: &mut OutlinedCb, counter: Option<ExitCounter>) -> Target {
+    let side_exit = side_exit(jit, ctx, ocb);
+
+    // The counter is only incremented when stats are enabled
+    if !get_option!(gen_stats) {
+        return side_exit;
+    }
+    let counter = match counter {
+        Some(counter) => counter,
+        None => return side_exit,
+    };
+
+    let ocb = ocb.unwrap();
+    let code_ptr = ocb.get_write_ptr();
+
+    let mut asm = Assembler::new();
+
+    // Load the pointer into a register
+    asm.comment(&format!("increment counter {}", counter.name));
+    let ptr_reg = asm.load(Opnd::const_ptr(counter.ptr));
+    let counter_opnd = Opnd::mem(64, ptr_reg, 0);
+
+    // Increment and store the updated value
+    asm.incr_counter(counter_opnd, Opnd::UImm(1));
+
+    // Jump to the existing side exit
+    asm.jmp(side_exit);
+    asm.compile(ocb);
+
+    // Pointer to the side-exit code
+    code_ptr.as_side_exit()
+}
+
 // Ensure that there is an exit for the start of the block being compiled.
 // Block invalidation uses this exit.
 pub fn jit_ensure_block_entry_exit(jit: &mut JITState, ocb: &mut OutlinedCb) {
@@ -715,7 +771,13 @@ pub fn gen_entry_prologue(cb: &mut CodeBlock, ocb: &mut OutlinedCb, iseq: IseqPt
 
 // Generate code to check for interrupts and take a side-exit.
 // Warning: this function clobbers REG0
-fn gen_check_ints(asm: &mut Assembler, side_exit: Target) {
+fn gen_check_ints(
+    jit: &mut JITState,
+    ctx: &Context,
+    asm: &mut Assembler,
+    ocb: &mut OutlinedCb,
+    counter: Option<ExitCounter>,
+) {
     // Check for interrupts
     // see RUBY_VM_CHECK_INTS(ec) macro
     asm.comment("RUBY_VM_CHECK_INTS(ec)");
@@ -725,7 +787,7 @@ fn gen_check_ints(asm: &mut Assembler, side_exit: Target) {
     let interrupt_flag = asm.load(Opnd::mem(32, EC, RUBY_OFFSET_EC_INTERRUPT_FLAG));
     asm.test(interrupt_flag, interrupt_flag);
 
-    asm.jnz(side_exit);
+    asm.jnz(counted_exit(jit, ctx, ocb, counter));
 }
 
 // Generate a stubbed unconditional jump to the next bytecode instruction.
@@ -3641,8 +3703,7 @@ fn gen_branchif(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = side_exit(jit, ctx, ocb);
-        gen_check_ints(asm, side_exit);
+        gen_check_ints(jit, ctx, asm, ocb, None);
     }
 
     // Get the branch target instruction offsets
@@ -3697,8 +3758,7 @@ fn gen_branchunless(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = side_exit(jit, ctx, ocb);
-        gen_check_ints(asm, side_exit);
+        gen_check_ints(jit, ctx, asm, ocb, None);
     }
 
     // Get the branch target instruction offsets
@@ -3754,8 +3814,7 @@ fn gen_branchnil(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = side_exit(jit, ctx, ocb);
-        gen_check_ints(asm, side_exit);
+        gen_check_ints(jit, ctx, asm, ocb, None);
     }
 
     // Get the branch target instruction offsets
@@ -3842,8 +3901,7 @@ fn gen_jump(
 
     // Check for interrupts, but only on backward branches that may create loops
     if jump_offset < 0 {
-        let side_exit = side_exit(jit, ctx, ocb);
-        gen_check_ints(asm, side_exit);
+        gen_check_ints(jit, ctx, asm, ocb, None);
     }
 
     // Get the branch target instruction offsets
@@ -4974,7 +5032,7 @@ fn gen_send_cfunc(
     }
 
     // Check for interrupts
-    gen_check_ints(asm, side_exit);
+    gen_check_ints(jit, ctx, asm, ocb, None);
 
     // Stack overflow check
     // #define CHECK_VM_STACK_OVERFLOW0(cfp, sp, margin)
@@ -7080,12 +7138,10 @@ fn gen_leave(
     // Only the return value should be on the stack
     assert_eq!(1, ctx.get_stack_size());
 
-    // Create a side-exit to fall back to the interpreter
-    let side_exit = side_exit(jit, ctx, ocb);
     let ocb_asm = Assembler::new();
 
     // Check for interrupts
-    gen_check_ints(asm, counted_exit!(ocb, side_exit, leave_se_interrupt));
+    gen_check_ints(jit, ctx, asm, ocb, get_counter!(leave_se_interrupt));
     ocb_asm.compile(ocb.unwrap());
 
     // Pop the current frame (ec->cfp++)
@@ -8236,9 +8292,8 @@ mod tests {
 
     #[test]
     fn test_gen_check_ints() {
-        let (_, _ctx, mut asm, _cb, mut ocb) = setup_codegen();
-        let side_exit = ocb.unwrap().get_write_ptr().as_side_exit();
-        gen_check_ints(&mut asm, side_exit);
+        let (mut jit, ctx, mut asm, _cb, mut ocb) = setup_codegen();
+        gen_check_ints(&mut jit, &ctx, &mut asm, &mut ocb, None);
     }
 
     #[test]
