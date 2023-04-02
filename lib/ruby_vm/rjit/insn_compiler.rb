@@ -4248,6 +4248,25 @@ module RubyVM::RJIT
         splat_array_length = false
         asm.incr_counter(:send_iseq_splat)
         return CantCompile
+
+        ## If block_arg0_splat, we still need side exits after this, but
+        ## doing push_splat_args here disallows it. So bail out.
+        #if block_arg0_splat
+        #  gen_counter_incr!(asm, invokeblock_iseq_arg0_args_splat)
+        #  return CantCompile
+        #end
+
+        #array = jit.peek_at_stack(ctx, block_arg ? 1 : 0)
+        #array_length = if array == Qnil
+        #  0
+        #else
+        #  rb_yjit_array_len(array)
+        #end
+
+        #if opt_num == 0 && required_num != array_length + argc - 1
+        #  gen_counter_incr!(asm, send_iseq_splat_arity_error)
+        #  return CantCompile
+        #end
       end
 
       # We will not have CantCompile from here.
@@ -4279,6 +4298,26 @@ module RubyVM::RJIT
       if splat_array_length
         asm.incr_counter(:send_iseq_splat)
         return CantCompile
+        #remaining_opt = (opt_num + required_num).saturating_sub(array_length + (argc - 1))
+
+        #if opt_num > 0
+        #  # We are going to jump to the correct offset based on how many optional
+        #  # params are remaining.
+        #  opt_table = get_iseq_body_param_opt_table(iseq)
+        #  offset = (opt_num - remaining_opt)
+        #  start_pc_offset = opt_table.offset(offset)
+        #end
+        ## We are going to assume that the splat fills
+        ## all the remaining arguments. In the generated code
+        ## we test if this is true and if not side exit.
+        #argc = argc - 1 + array_length + remaining_opt
+        #push_splat_args(array_length, ctx, asm, ocb, side_exit)
+
+        #for _ in 0..remaining_opt
+        #  # We need to push nil for the optional arguments
+        #  stack_ret = ctx.stack_push
+        #  asm.mov(stack_ret, Qnil.into())
+        #end
       end
 
       # This is a .send call and we need to adjust the stack
@@ -4375,6 +4414,72 @@ module RubyVM::RJIT
       if doing_kw_call
         asm.incr_counter(:send_iseq_kw_call)
         return CantCompile
+        ## Here we're calling a method with keyword arguments and specifying
+        ## keyword arguments at this call site.
+
+        ## This struct represents the metadata about the callee-specified
+        ## keyword parameters.
+        #keyword = get_iseq_body_param_keyword(iseq)
+        #keyword_num = (keyword).num
+        #keyword_required_num = (keyword).required_num
+
+        #required_kwargs_filled = 0
+
+        #if keyword_num > 30
+        #  # We have so many keywords that (1 << num) encoded as a FIXNUM
+        #  # (which shifts it left one more) no longer fits inside a 32-bit
+        #  # immediate.
+        #  gen_counter_incr!(asm, send_iseq_too_many_kwargs)
+        #  return CantCompile
+        #end
+
+        ## Check that the kwargs being passed are valid
+        #if supplying_kws
+        #  # This is the list of keyword arguments that the callee specified
+        #  # in its initial declaration.
+        #  # SAFETY: see compile.c for sizing of this slice.
+        #  callee_kwargs = slice::from_raw_parts((keyword).table, keyword_num)
+
+        #  # Here we're going to build up a list of the IDs that correspond to
+        #  # the caller-specified keyword arguments. If they're not in the
+        #  # same order as the order specified in the callee declaration, then
+        #  # we're going to need to generate some code to swap values around
+        #  # on the stack.
+        #  kw_arg_keyword_lend = get_cikw_keyword_len(kw_arg)
+        #  caller_kwargs = [0] * kw_arg_keyword_len
+        #  for kwarg_idx in 0..kw_arg_keyword_len
+        #    sym = get_cikw_keywords_idx(kw_arg, kwarg_idx.try_into().unwrap())
+        #    caller_kwargs[kwarg_idx] = rb_sym2id(sym)
+        #  end
+
+        #  # First, we're going to be sure that the names of every
+        #  # caller-specified keyword argument correspond to a name in the
+        #  # list of callee-specified keyword parameters.
+        #  for caller_kwarg in caller_kwargs
+        #    search_result = callee_kwargs
+        #      .iter()
+        #      .enumerate() # inject element index
+        #      .find { |(_, kwarg)| kwarg == caller_kwarg }
+
+        #    case search_result
+        #    in nil
+        #      # If the keyword was never found, then we know we have a
+        #      # mismatch in the names of the keyword arguments, so we need to
+        #      # bail.
+        #      gen_counter_incr!(asm, send_iseq_kwargs_mismatch)
+        #      return CantCompile
+        #    in [callee_idx, _] if callee_idx < keyword_required_num
+        #      # Keep a count to ensure all required kwargs are specified
+        #      required_kwargs_filled += 1
+        #    else
+        #    end
+        #  end
+        #end
+        #assert!(required_kwargs_filled <= keyword_required_num);
+        #if required_kwargs_filled != keyword_required_num
+        #  gen_counter_incr!(asm, send_iseq_kwargs_mismatch)
+        #  return CantCompile
+        #end
       end
 
       # Same as vm_callee_setup_block_arg_arg0_check and vm_callee_setup_block_arg_arg0_splat
@@ -4385,6 +4490,27 @@ module RubyVM::RJIT
       if block_arg0_splat
         asm.incr_counter(:send_iseq_block_arg0_splat)
         return CantCompile
+        #arg0_opnd = ctx.stack_opnd(0);
+
+        ## Only handle the case that you don't need to_ary conversion
+        #not_array_exit = counted_exit!(ocb, side_exit, invokeblock_iseq_arg0_not_array);
+        #guard_object_is_array(ctx, asm, arg0_opnd, arg0_opnd.into(), not_array_exit);
+
+        ## Only handle the same that the array length == ISEQ's lead_num (most common)
+        #arg0_len_opnd = get_array_len(asm, arg0_opnd)
+        #lead_num = rb_get_iseq_body_param_lead_num(iseq)
+        #asm.cmp(arg0_len_opnd, lead_num.into());
+        #asm.jne(counted_exit!(ocb, side_exit, invokeblock_iseq_arg0_wrong_len));
+
+        #arg0_reg = asm.load(arg0_opnd);
+        #array_opnd = get_array_ptr(asm, arg0_reg);
+        #asm.comment("push splat arg0 onto the stack");
+        #ctx.stack_pop(argc.try_into().unwrap());
+        #for i in 0..lead_num
+        #  stack_opnd = ctx.stack_push(Type::Unknown);
+        #  asm.mov(stack_opnd, Opnd::mem(64, array_opnd, SIZEOF_VALUE_I32 * i));
+        #end
+        #argc = lead_num
       end
 
       # Setup the new frame
