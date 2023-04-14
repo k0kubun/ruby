@@ -1130,10 +1130,6 @@ impl Assembler
                         nop(cb);
                     }
                 }
-                Insn::SideExitContext { pc, stack_size } => {
-                    side_exit_context.pc = *pc;
-                    side_exit_stack_size = *stack_size;
-                }
             };
 
             // On failure, jump to the next page and retry the current insn
