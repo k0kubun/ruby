@@ -1124,15 +1124,12 @@ impl Assembler
 
         // Spill live stack temps
         if self.ctx.get_reg_temps() != RegTemps::default() {
-            self.comment(&format!("spill_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), RegTemps::default().as_u8()));
             for stack_idx in 0..u8::min(MAX_REG_TEMPS, self.ctx.get_stack_size()) {
                 if self.ctx.get_reg_temps().get(stack_idx) {
                     let idx = self.ctx.get_stack_size() - 1 - stack_idx;
                     self.spill_temp(self.stack_opnd(idx.into()));
-                    reg_temps.set(stack_idx, false);
                 }
             }
-            self.ctx.set_reg_temps(reg_temps);
         }
 
         // Every stack temp should have been spilled
@@ -1151,14 +1148,48 @@ impl Assembler
         // Move the stack operand from a register to memory
         match opnd {
             Opnd::Stack { idx, num_bits, stack_size, sp_offset, .. } => {
+                self.comment(&format!("spill_temp: {:08b} -> {:08b}", reg_temps.as_u8(), mem_temps.as_u8()));
                 self.mov(
                     Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps) },
                     Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps) },
                 );
+                self.ctx.set_reg_temps(mem_temps);
             }
             _ => unreachable!(),
         }
         incr_counter!(temp_spill);
+    }
+
+    /// Attempt to load a spilled stack temp into a register.
+    ///
+    /// While ctx.stack_push() allocates a register by default, ctx.stack_pop()
+    /// doesn't do it because its reload overhead could be wasted.
+    /// This reload_temp() is useful for stack operands that are to be popped and
+    /// known to be read multiple times, which would offset the reload overhead.
+    pub fn reload_temp(&mut self, opnd: Opnd) {
+        if !self.ctx.get_reg_temps().get(opnd.stack_idx()) &&
+            opnd.stack_idx() < MAX_REG_TEMPS &&
+            !self.ctx.get_reg_temps().conflicts_with(opnd.stack_idx()) {
+
+            // Use different RegTemps for dest and src operands
+            let mem_temps = self.ctx.get_reg_temps();
+            let mut reg_temps = mem_temps;
+            reg_temps.set(opnd.stack_idx(), true);
+
+            // Move the stack operand from a register to memory
+            match opnd {
+                Opnd::Stack { idx, num_bits, stack_size, sp_offset, .. } => {
+                    self.comment(&format!("reload_temp: {:08b} -> {:08b}", mem_temps.as_u8(), reg_temps.as_u8()));
+                    self.mov(
+                        Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps) },
+                        Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps) },
+                    );
+                    self.ctx.set_reg_temps(reg_temps);
+                }
+                _ => unreachable!(),
+            }
+            incr_counter!(temp_reload);
+        }
     }
 
     /// Update which stack temps are in a register
@@ -1166,16 +1197,6 @@ impl Assembler
         if self.ctx.get_reg_temps() != reg_temps {
             self.comment(&format!("reg_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), reg_temps.as_u8()));
             self.ctx.set_reg_temps(reg_temps);
-            self.verify_reg_temps();
-        }
-    }
-
-    /// Assert there's no conflict in stack temp register allocation
-    fn verify_reg_temps(&self) {
-        for stack_idx in 0..MAX_REG_TEMPS {
-            if self.ctx.get_reg_temps().get(stack_idx) {
-                assert!(!self.ctx.get_reg_temps().conflicts_with(stack_idx));
-            }
         }
     }
 

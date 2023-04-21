@@ -2595,6 +2595,7 @@ fn guard_two_fixnums(
     // If not fixnums at run-time, fall back
     if arg0_type != Type::Fixnum {
         asm.comment("guard arg0 fixnum");
+        asm.reload_temp(arg0);
         asm.test(arg0, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
 
         jit_chain_guard(
@@ -2608,6 +2609,7 @@ fn guard_two_fixnums(
     }
     if arg1_type != Type::Fixnum {
         asm.comment("guard arg1 fixnum");
+        asm.reload_temp(arg1);
         asm.test(arg1, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
 
         jit_chain_guard(

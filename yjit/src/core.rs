@@ -412,6 +412,15 @@ impl RegTemps {
         }
         false
     }
+
+    /// Assert there's no conflict in stack temp register allocation
+    fn verify_reg_temps(&self) {
+        for stack_idx in 0..MAX_REG_TEMPS {
+            if self.get(stack_idx) {
+                assert!(!self.conflicts_with(stack_idx));
+            }
+        }
+    }
 }
 
 /// Code generation context
@@ -1599,6 +1608,7 @@ impl Context {
     }
 
     pub fn set_reg_temps(&mut self, reg_temps: RegTemps) {
+        reg_temps.verify_reg_temps();
         self.reg_temps = reg_temps;
     }
 
