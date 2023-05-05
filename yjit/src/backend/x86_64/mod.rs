@@ -292,6 +292,10 @@ impl Assembler
                 },
                 Insn::Mov { dest, src } => {
                     match (&dest, &src) {
+                        (Opnd::UImm(dest), Opnd::UImm(src)) if dest == src => {
+                            // Skip writing a known immediate in Opnd::Stack
+                            asm.comment(&format!("known immediate: 0x{:x}", dest))
+                        },
                         (Opnd::Mem(_), Opnd::Mem(_)) => {
                             // We load opnd1 because for mov, opnd0 is the output
                             let opnd1 = asm.load(*src);

@@ -13,6 +13,7 @@ use crate::cruby::{VALUE, SIZEOF_VALUE_I32};
 use crate::virtualmem::{CodePtr};
 use crate::asm::{CodeBlock, uimm_num_bits, imm_num_bits, OutlinedCb};
 use crate::core::{Context, Type, TempMapping, RegTemps, MAX_REG_TEMPS, MAX_TEMP_TYPES};
+use crate::core::YARVOpnd::*;
 use crate::options::*;
 use crate::stats::*;
 
@@ -85,8 +86,10 @@ pub enum Opnd
         stack_size: u8,
         /// ctx.sp_offset when this operand is made. Used with idx for Opnd::Mem.
         sp_offset: i8,
+        /// Immediate value if it's known by the Context.
+        known_imm: Option<VALUE>,
         /// ctx.reg_temps when this operand is read. Used for register allocation.
-        reg_temps: Option<RegTemps>
+        reg_temps: Option<RegTemps>,
     },
 
     // Low-level operands, for lowering
@@ -176,7 +179,8 @@ impl Opnd
             Opnd::Reg(reg) => Some(Opnd::Reg(reg.with_num_bits(num_bits))),
             Opnd::Mem(Mem { base, disp, .. }) => Some(Opnd::Mem(Mem { base, disp, num_bits })),
             Opnd::InsnOut { idx, .. } => Some(Opnd::InsnOut { idx, num_bits }),
-            Opnd::Stack { idx, stack_size, sp_offset, reg_temps, .. } => Some(Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps }),
+            Opnd::Stack { idx, stack_size, sp_offset, known_imm, reg_temps, .. } =>
+                Some(Opnd::Stack { idx, num_bits, stack_size, sp_offset, known_imm, reg_temps }),
             _ => None,
         }
     }
@@ -991,24 +995,25 @@ impl Assembler
         let mut insn = insn;
         let mut opnd_iter = insn.opnd_iter_mut();
         while let Some(opnd) = opnd_iter.next() {
-            match opnd {
+            match *opnd {
                 // If we find any InsnOut from previous instructions, we're going to update
                 // the live range of the previous instruction to point to this one.
                 Opnd::InsnOut { idx, .. } => {
-                    assert!(*idx < self.insns.len());
-                    self.live_ranges[*idx] = insn_idx;
+                    assert!(idx < self.insns.len());
+                    self.live_ranges[idx] = insn_idx;
                 }
                 Opnd::Mem(Mem { base: MemBase::InsnOut(idx), .. }) => {
-                    assert!(*idx < self.insns.len());
-                    self.live_ranges[*idx] = insn_idx;
+                    assert!(idx < self.insns.len());
+                    self.live_ranges[idx] = insn_idx;
                 }
-                // Set current ctx.reg_temps to Opnd::Stack.
-                Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: None } => {
+                // Set current ctx.reg_temps and a known value to Opnd::Stack.
+                Opnd::Stack { idx, num_bits, stack_size, sp_offset, known_imm, reg_temps: None } => {
                     *opnd = Opnd::Stack {
-                        idx: *idx,
-                        num_bits: *num_bits,
-                        stack_size: *stack_size,
-                        sp_offset: *sp_offset,
+                        idx,
+                        num_bits,
+                        stack_size,
+                        sp_offset,
+                        known_imm,
                         reg_temps: Some(self.ctx.get_reg_temps()),
                     };
                 }
@@ -1086,8 +1091,10 @@ impl Assembler
         }
 
         match opnd {
-            Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps } => {
-                if opnd.stack_idx() < MAX_REG_TEMPS && reg_temps.unwrap().get(opnd.stack_idx()) {
+            Opnd::Stack { idx, num_bits, stack_size, sp_offset, known_imm, reg_temps } => {
+                if known_imm.is_some() {
+                    Opnd::Value(known_imm.unwrap())
+                } else if opnd.stack_idx() < MAX_REG_TEMPS && reg_temps.unwrap().get(opnd.stack_idx()) {
                     reg_opnd(opnd)
                 } else {
                     mem_opnd(opnd)
@@ -1150,11 +1157,13 @@ impl Assembler
 
         // Move the stack operand from a register to memory
         match opnd {
-            Opnd::Stack { idx, num_bits, stack_size, sp_offset, .. } => {
-                self.mov(
-                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps) },
-                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps) },
-                );
+            Opnd::Stack { idx, num_bits, stack_size, sp_offset, known_imm, .. } => {
+                let src_opnd = if known_imm.is_some() {
+                    Opnd::Value(known_imm.unwrap())
+                } else {
+                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps), known_imm: None }
+                };
+                self.mov(Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps), known_imm: None }, src_opnd);
             }
             _ => unreachable!(),
         }
