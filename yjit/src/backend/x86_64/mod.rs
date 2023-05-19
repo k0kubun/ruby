@@ -176,7 +176,15 @@ impl Assembler
                 Insn::Or { left, right, out } |
                 Insn::Xor { left, right, out } => {
                     match (&left, &right, iterator.peek()) {
-                        // Merge this insn, e.g. `add REG, right -> out`, and `mov REG, out` if possible
+                        // Merge `add MEM, right -> out` and `mov MEM, out` if possible
+                        (Opnd::Mem(_), Opnd::Imm(value), Some(Insn::Mov { dest, src }))
+                        if out == src && left == dest && live_ranges[index] == index + 1 && imm_num_bits(*value) <= 32 => {
+                            *out = *dest;
+                            asm.push_insn(insn);
+                            iterator.map_insn_index(&mut asm);
+                            iterator.next_unmapped(); // Pop merged Insn::Mov
+                        }
+                        // Merge `add REG, right -> out` and `mov REG, out` if possible
                         (Opnd::Reg(_), Opnd::UImm(value), Some(Insn::Mov { dest, src }))
                         if out == src && left == dest && live_ranges[index] == index + 1 && uimm_num_bits(*value) <= 32 => {
                             *out = *dest;

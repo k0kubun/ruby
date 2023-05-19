@@ -426,6 +426,10 @@ pub struct Context {
     // This represents how far the JIT's SP is from the "real" SP
     sp_offset: i8,
 
+    // Some index of the interpreter PC relative to the ISEQ
+    // None if it has not been set to the frame yet
+    pc_idx: Option<IseqIdx>,
+
     /// Bitmap of which stack temps are in a register
     reg_temps: RegTemps,
 
@@ -1572,6 +1576,7 @@ impl Context {
         let mut generic_ctx = Context::default();
         generic_ctx.stack_size = self.stack_size;
         generic_ctx.sp_offset = self.sp_offset;
+        generic_ctx.pc_idx = self.pc_idx;
         generic_ctx.reg_temps = self.reg_temps;
         generic_ctx
     }
@@ -1592,6 +1597,14 @@ impl Context {
 
     pub fn set_sp_offset(&mut self, offset: i8) {
         self.sp_offset = offset;
+    }
+
+    pub fn get_pc_idx(&self) -> Option<IseqIdx> {
+        self.pc_idx
+    }
+
+    pub fn set_pc_idx(&mut self, pc_idx: Option<IseqIdx>) {
+        self.pc_idx = pc_idx;
     }
 
     pub fn get_reg_temps(&self) -> RegTemps {
@@ -1825,6 +1838,10 @@ impl Context {
         }
 
         if dst.sp_offset != src.sp_offset {
+            return TypeDiff::Incompatible;
+        }
+
+        if dst.pc_idx != src.pc_idx {
             return TypeDiff::Incompatible;
         }
 
@@ -2146,7 +2163,9 @@ pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr) -> Option<CodePtr> {
     let code_ptr = gen_entry_prologue(cb, ocb, iseq, insn_idx);
 
     // Try to generate code for the entry block
-    let block = gen_block_series(blockid, &Context::default(), ec, cb, ocb);
+    let mut ctx = Context::default();
+    ctx.pc_idx = Some(insn_idx);
+    let block = gen_block_series(blockid, &ctx, ec, cb, ocb);
 
     cb.mark_all_executable();
     ocb.unwrap().mark_all_executable();
@@ -2238,7 +2257,8 @@ fn entry_stub_hit_body(entry_ptr: *const c_void, ec: EcPtr) -> Option<*const u8>
 
     // Try to find an existing compiled version of this block
     let blockid = BlockId { iseq, idx: insn_idx };
-    let ctx = Context::default();
+    let mut ctx = Context::default();
+    ctx.pc_idx = Some(insn_idx);
     let blockref = match find_block_version(blockid, &ctx) {
         // If an existing block is found, generate a jump to the block.
         Some(blockref) => {
@@ -2443,8 +2463,9 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
     let cb = CodegenGlobals::get_inline_cb();
     let ocb = CodegenGlobals::get_outlined_cb();
 
-    let (cfp, original_interp_sp) = unsafe {
+    let (cfp, original_interp_pc, original_interp_sp) = unsafe {
         let cfp = get_ec_cfp(ec);
+        let original_interp_pc = get_cfp_pc(cfp);
         let original_interp_sp = get_cfp_sp(cfp);
 
         let running_iseq = rb_cfp_get_iseq(cfp);
@@ -2464,7 +2485,7 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
         // So we do it here instead.
         rb_set_cfp_sp(cfp, reconned_sp);
 
-        (cfp, original_interp_sp)
+        (cfp, original_interp_pc, original_interp_sp)
     };
 
     // Try to find an existing compiled version of this block
@@ -2521,7 +2542,8 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
             // Rewrite the branch with the new jump target address
             regenerate_branch(cb, branch);
 
-            // Restore interpreter sp, since the code hitting the stub expects the original.
+            // Restore interpreter PC and SP, since the code hitting the stub expects the original.
+            unsafe { rb_set_cfp_pc(cfp, original_interp_pc) };
             unsafe { rb_set_cfp_sp(cfp, original_interp_sp) };
 
             new_block.start_addr
