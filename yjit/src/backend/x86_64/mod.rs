@@ -1055,4 +1055,32 @@ mod tests {
 
         assert_eq!(format!("{:x}", cb), "4983f540");
     }
+
+    #[test]
+    fn test_insn_out_conflict() {
+        let (mut asm, mut cb) = setup_asm();
+
+        let rax = asm.load(Opnd::UImm(1));
+        let rcx = asm.load(Opnd::UImm(2));
+        let rdx = asm.load(Opnd::UImm(3));
+        asm.ccall(0 as _, vec![
+            rax, // mov rdi, rax (ok)
+            rcx, // mov rsi, rcx (ok)
+            rcx, // mov rdx, rcx (NG)
+            rdx, // mov rcx, rdx (this becomes 2, not 3)
+        ]);
+        asm.compile_with_num_regs(&mut cb, 3);
+
+        assert_disasm!(cb, "b801000000b902000000ba030000004889c74889ce4889ca4889d1b800000000ffd0", {"
+            0x0: mov eax, 1
+            0x5: mov ecx, 2
+            0xa: mov edx, 3
+            0xf: mov rdi, rax
+            0x12: mov rsi, rcx
+            0x15: mov rdx, rcx
+            0x18: mov rcx, rdx
+            0x1b: mov eax, 0
+            0x20: call rax
+        "});
+    }
 }
