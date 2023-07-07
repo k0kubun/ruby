@@ -43,6 +43,11 @@ enum rstring_offsets {
     RUBY_OFFSET_RSTRING_LEN = offsetof(struct RString, len)
 };
 
+enum ec_offsets {
+    RUBY_OFFSET_EC_TAG = offsetof(struct rb_execution_context_struct, tag),
+    RUBY_OFFSET_TAG_STATE = offsetof(struct rb_vm_tag, state),
+};
+
 // We need size_t to have a known size to simplify code generation and FFI.
 // TODO(alan): check this in configure.ac to fail fast on 32 bit platforms.
 STATIC_ASSERT(64b_size_t, SIZE_MAX == UINT64_MAX);

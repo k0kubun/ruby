@@ -5528,6 +5528,36 @@ vm_sendish(
     return val;
 }
 
+rb_snum_t
+rb_sp_inc_of_sendish(const struct rb_callinfo *ci)
+{
+    return sp_inc_of_sendish(ci);
+}
+
+static VALUE vm_exec_core(rb_execution_context_t *ec, VALUE initial);
+
+VALUE
+rb_yjit_opt_send_without_block(
+    struct rb_execution_context_struct *ec,
+    struct rb_control_frame_struct *cfp,
+    struct rb_call_data *cd
+) {
+    VALUE bh = VM_BLOCK_HANDLER_NONE;
+    VALUE val = vm_sendish(ec, cfp, cd, bh, mexp_search_method);
+
+    if (val == Qundef) {
+        VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);
+        rb_jit_func_t func;
+        if (LIKELY(func = jit_compile(ec))) {
+            val = func(ec, ec->cfp);
+        }
+        else {
+            val = vm_exec_core(ec, 0);
+        }
+    }
+    return val;
+}
+
 /* object.c */
 VALUE rb_nil_to_s(VALUE);
 VALUE rb_true_to_s(VALUE);

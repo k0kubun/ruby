@@ -17,6 +17,7 @@ use std::cmp;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::ffi::c_long;
 use std::mem;
 use std::os::raw::{c_int};
 use std::ptr;
@@ -6912,7 +6913,51 @@ fn gen_opt_send_without_block(
 ) -> Option<CodegenStatus> {
     let cd = jit.get_arg(0).as_ptr();
 
-    gen_send_general(jit, asm, ocb, cd, None)
+    // Generate optimized code if possible
+    let status = gen_send_general(jit, asm, ocb, cd, None);
+    if status.is_some() {
+        return status;
+    }
+
+    // If not, prepare for dynamic dispatch.
+    jit_prepare_routine_call(jit, asm);
+
+    // Pop arguments and a receiver
+    extern "C" {
+        fn rb_sp_inc_of_sendish(ci: *const rb_callinfo) -> c_long;
+    }
+    let sp_inc = unsafe { rb_sp_inc_of_sendish((*cd).ci) };
+    asm.stack_pop((1 - sp_inc) as usize);
+
+    // Call a method
+    extern "C" {
+        fn rb_yjit_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
+    }
+    let ret = asm.ccall(
+        rb_yjit_opt_send_without_block as *const u8,
+        vec![EC, CFP, VALUE(cd as usize).into()],
+    );
+
+    // Check if ec->tag->state is set
+    let tag = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_TAG as i32));
+    let state = asm.load(Opnd::mem(64, tag, RUBY_OFFSET_TAG_STATE as i32));
+    let ret_label = asm.new_label("stack_ret");
+    asm.test(state, state);
+    asm.jz(ret_label);
+
+    // If ec->tag->state is set, return to the interpreter for exception handling.
+    asm.cpop_into(SP);
+    asm.cpop_into(EC);
+    asm.cpop_into(CFP);
+    asm.frame_teardown();
+    asm.cret(ret);
+
+    // Push the return value
+    asm.write_label(ret_label);
+    let stack_ret = asm.stack_push(Type::Unknown);
+    asm.mov(stack_ret, ret);
+
+    Some(KeepCompiling)
 }
 
 fn gen_send(
