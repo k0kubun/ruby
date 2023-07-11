@@ -423,6 +423,7 @@ static inline VALUE jit_exec(rb_execution_context_t *ec) { return Qundef; }
 #include "vm_insnhelper.c"
 
 #include "vm_exec.c"
+#include "vm_exec.c"
 
 #include "vm_method.c"
 #include "vm_eval.c"
@@ -2371,6 +2372,25 @@ vm_exec(rb_execution_context_t *ec)
 
 #else
 
+static bool rb_yjit_stats_enabled = false;
+
+// to be called by YJIT
+void
+rb_yjit_enable_stats(void)
+{
+    rb_yjit_stats_enabled = true;
+}
+
+static inline VALUE
+vm_exec_core_wrap(rb_execution_context_t *ec, VALUE initial)
+{
+    if (rb_yjit_stats_enabled) {
+        return vm_exec_core2(ec, initial);
+    } else {
+        return vm_exec_core(ec, initial);
+    }
+}
+
 VALUE
 vm_exec(rb_execution_context_t *ec)
 {
@@ -2383,7 +2403,7 @@ vm_exec(rb_execution_context_t *ec)
     _tag.retval = Qnil;
     if ((state = EC_EXEC_TAG()) == TAG_NONE) {
         if (UNDEF_P(result = jit_exec(ec))) {
-            result = vm_exec_core(ec, initial);
+            result = vm_exec_core_wrap(ec, initial);
         }
         goto vm_loop_start; /* fallback to the VM */
     }
@@ -2392,7 +2412,7 @@ vm_exec(rb_execution_context_t *ec)
         rb_ec_raised_reset(ec, RAISED_STACKOVERFLOW | RAISED_NOMEMORY);
         while (UNDEF_P(result = vm_exec_handle_exception(ec, state, result, &initial))) {
             /* caught a jump, exec the handler */
-            result = vm_exec_core(ec, initial);
+            result = vm_exec_core_wrap(ec, initial);
           vm_loop_start:
             VM_ASSERT(ec->tag == &_tag);
             /* when caught `throw`, `tag.state` is set. */

@@ -41,7 +41,11 @@ RUBY_EXTERN rb_serial_t ruby_vm_global_cvar_state;
 #define COLLECT_USAGE_OPERAND(insn, n, op)	/* none */
 #define COLLECT_USAGE_REGISTER(reg, s)		/* none */
 #else
+#ifdef VM_EXEC_CORE2
+#define COLLECT_USAGE_INSN(insn)		rb_yjit_collect_vm_usage_insn(insn)
+#else
 #define COLLECT_USAGE_INSN(insn)		/* none */
+#endif
 #define COLLECT_USAGE_OPERAND(insn, n, op)	/* none */
 #define COLLECT_USAGE_REGISTER(reg, s)		/* none */
 #endif

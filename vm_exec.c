@@ -67,8 +67,14 @@ static void vm_insns_counter_count_insn(int insn) {}
 /* #define DECL_SC_REG(r, reg) VALUE reg_##r */
 
 #if !OPT_CALL_THREADED_CODE
+#ifdef VM_EXEC_CORE2
+static COLDFUNC VALUE
+vm_exec_core2(rb_execution_context_t *ec, VALUE initial)
+#else
 static VALUE
 vm_exec_core(rb_execution_context_t *ec, VALUE initial)
+#define VM_EXEC_CORE2
+#endif
 {
 
 #if OPT_STACK_CACHING
@@ -152,11 +158,14 @@ vm_exec_core(rb_execution_context_t *ec, VALUE initial)
     goto first;
 }
 
+#ifndef VM_INSN_ADDRESS_TABLE
+#define VM_INSN_ADDRESS_TABLE
 const void **
 rb_vm_get_insns_address_table(void)
 {
     return (const void **)vm_exec_core(0, 0);
 }
+#endif
 
 #else /* OPT_CALL_THREADED_CODE */
 
