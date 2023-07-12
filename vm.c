@@ -422,7 +422,35 @@ static inline VALUE jit_exec(rb_execution_context_t *ec) { return Qundef; }
 
 #include "vm_insnhelper.c"
 
+// If true, count the number of insns executed on vm_exec_core.
+static bool rb_vm_exec_counter = false;
+
+// Enable counting insns executed on vm_exec_core.
+void rb_vm_exec_counter_enable(void) { rb_vm_exec_counter = true; }
+
+// Define vm_exec_core without a counter
 #include "vm_exec.c"
+
+// Define vm_exec_core with a counter
+#define VM_EXEC_COUNTER 1
+#include "vm_exec.c"
+#undef VM_EXEC_COUNTER
+
+static inline VALUE
+vm_exec_core(rb_execution_context_t *ec, VALUE initial)
+{
+    return (rb_vm_exec_counter ? vm_exec_with_counter : vm_exec_without_counter)(ec, initial);
+}
+
+const void **
+rb_vm_get_insns_address_table(void)
+{
+#if !OPT_CALL_THREADED_CODE
+    return (const void **)vm_exec_core(0, 0);
+#else
+    return (const void **)insns_address_table;
+#endif
+}
 
 #include "vm_method.c"
 #include "vm_eval.c"

@@ -35,6 +35,12 @@ static void vm_analysis_insn(int insn);
 #endif
 /* #define DECL_SC_REG(r, reg) VALUE reg_##r */
 
+#ifdef VM_EXEC_COUNTER
+#define vm_exec_core COLDFUNC vm_exec_with_counter
+#else
+#define vm_exec_core vm_exec_without_counter
+#endif
+
 #if !OPT_CALL_THREADED_CODE
 static VALUE
 vm_exec_core(rb_execution_context_t *ec, VALUE initial)
@@ -121,22 +127,10 @@ vm_exec_core(rb_execution_context_t *ec, VALUE initial)
     goto first;
 }
 
-const void **
-rb_vm_get_insns_address_table(void)
-{
-    return (const void **)vm_exec_core(0, 0);
-}
-
 #else /* OPT_CALL_THREADED_CODE */
 
 #include "vm.inc"
 #include "vmtc.inc"
-
-const void **
-rb_vm_get_insns_address_table(void)
-{
-    return (const void **)insns_address_table;
-}
 
 static VALUE
 vm_exec_core(rb_execution_context_t *ec, VALUE initial)
@@ -164,3 +158,5 @@ vm_exec_core(rb_execution_context_t *ec, VALUE initial)
     }
 }
 #endif
+
+#undef vm_exec_core
