@@ -5550,6 +5550,9 @@ rb_yjit_opt_send_without_block(
         rb_jit_func_t func;
         if (LIKELY(func = jit_compile(ec))) {
             val = func(ec, ec->cfp);
+            if (val == Qundef) {
+                val = vm_exec_core(ec, 0);
+            }
         }
         else {
             val = vm_exec_core(ec, 0);
