@@ -6935,25 +6935,25 @@ fn gen_opt_send_without_block(
     }
     let ret = asm.ccall(
         rb_yjit_opt_send_without_block as *const u8,
-        vec![EC, CFP, VALUE(cd as usize).into()],
+        vec![EC, CFP, (cd as usize).into()],
     );
 
-    // Check if ec->tag->state is set
-    let tag = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_TAG as i32));
-    let state = asm.load(Opnd::mem(64, tag, RUBY_OFFSET_TAG_STATE as i32));
-    let ret_label = asm.new_label("stack_ret");
-    asm.test(state, state);
-    asm.jz(ret_label);
+    // // Check if ec->tag->state is set
+    // let tag = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_TAG as i32));
+    // let state = asm.load(Opnd::mem(64, tag, RUBY_OFFSET_TAG_STATE as i32));
+    // let ret_label = asm.new_label("stack_ret");
+    // asm.test(state, state);
+    // asm.jz(ret_label);
 
-    // If ec->tag->state is set, return to the interpreter for exception handling.
-    asm.cpop_into(SP);
-    asm.cpop_into(EC);
-    asm.cpop_into(CFP);
-    asm.frame_teardown();
-    asm.cret(ret);
+    // // If ec->tag->state is set, return to the interpreter for exception handling.
+    // asm.cpop_into(SP);
+    // asm.cpop_into(EC);
+    // asm.cpop_into(CFP);
+    // asm.frame_teardown();
+    // asm.cret(ret);
 
-    // Push the return value
-    asm.write_label(ret_label);
+    // // Push the return value
+    // asm.write_label(ret_label);
     let stack_ret = asm.stack_push(Type::Unknown);
     asm.mov(stack_ret, ret);
 
