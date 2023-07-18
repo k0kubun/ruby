@@ -5547,16 +5547,18 @@ rb_yjit_opt_send_without_block(
 
     if (val == Qundef) {
         VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);
-        rb_jit_func_t func;
-        if (LIKELY(func = jit_compile(ec))) {
-            val = func(ec, ec->cfp);
-            if (val == Qundef) {
-                val = vm_exec_core(ec, 0);
-            }
-        }
-        else {
-            val = vm_exec_core(ec, 0);
-        }
+        val = vm_exec_core(ec, 0);
+
+        //rb_jit_func_t func;
+        //if (LIKELY(func = jit_compile(ec))) {
+        //    val = func(ec, ec->cfp);
+        //    if (val == Qundef) {
+        //        val = vm_exec_core(ec, 0);
+        //    }
+        //}
+        //else {
+        //    val = vm_exec_core(ec, 0);
+        //}
     }
     return val;
 }
