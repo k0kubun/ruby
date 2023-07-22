@@ -85,6 +85,7 @@ fn main() {
         .allowlist_type("RBasic")
 
         .allowlist_type("rstring_offsets")
+        .allowlist_type("ec_tag_offsets")
         .allowlist_type("ruby_rstring_flags")
 
         // From internal.h

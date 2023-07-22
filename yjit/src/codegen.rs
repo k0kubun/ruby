@@ -6434,7 +6434,7 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
     asm: &mut Assembler,
     cd: *const rb_call_data,
     sp_pops: usize,
-    vm_sendish: F,
+    call: F,
 ) -> Option<CodegenStatus> {
     // Our frame handling is not compatible with tailcall
     if unsafe { vm_ci_flag((*cd).ci) } & VM_CALL_TAILCALL != 0 {
@@ -6447,10 +6447,25 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
     // Pop arguments and a receiver
     asm.stack_pop(sp_pops);
 
-    // Dispatch a method
-    let ret = vm_sendish(asm);
+    // Call a method
+    let ret = call(asm);
+
+    // Check if ec->tag->state is set
+    let tag = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_TAG as i32));
+    let state = asm.load(Opnd::mem(64, tag, RUBY_OFFSET_TAG_STATE as i32));
+    let ret_label = asm.new_label("stack_ret");
+    asm.test(state, state);
+    asm.jz(ret_label);
+
+    // If ec->tag->state is set, return to the interpreter for handling exceptions
+    asm.cpop_into(SP);
+    asm.cpop_into(EC);
+    asm.cpop_into(CFP);
+    asm.frame_teardown();
+    asm.cret(ret);
 
     // Push the return value
+    asm.write_label(ret_label);
     let stack_ret = asm.stack_push(Type::Unknown);
     asm.mov(stack_ret, ret);
 

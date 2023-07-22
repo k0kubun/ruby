@@ -169,15 +169,19 @@ default:                        \
 #define THROW_EXCEPTION(exc) return (VALUE)(exc)
 #endif
 
-// Run the interpreter on JIT
+// This works like vm_exec() after vm_sendish()
 #define VM_EXEC(ec, val) do { \
+    rb_jit_func_t func; \
+    if ((func = jit_compile(ec))) { \
+        val = func(ec, ec->cfp); \
+    } \
     if (val == Qundef) { \
         VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH); \
-        val = vm_exec(ec); \
+        val = vm_exec_core(ec, 0); \
     } \
 } while (0)
 
-// Run JIT on the interpreter
+// Enter JIT code on the interpreter
 #define JIT_EXEC(ec, val) do { \
     rb_jit_func_t func; \
     if (val == Qundef && (func = jit_compile(ec))) { \

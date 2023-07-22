@@ -1062,6 +1062,9 @@ pub type rb_iseq_callback = ::std::option::Option<
 >;
 pub const RUBY_OFFSET_RSTRING_LEN: rstring_offsets = 16;
 pub type rstring_offsets = u32;
+pub const RUBY_OFFSET_EC_TAG: ec_tag_offsets = 24;
+pub const RUBY_OFFSET_TAG_STATE: ec_tag_offsets = 64;
+pub type ec_tag_offsets = u32;
 pub type rb_seq_param_keyword_struct = rb_iseq_constant_body__bindgen_ty_1_rb_iseq_param_keyword;
 extern "C" {
     pub fn rb_class_attached_object(klass: VALUE) -> VALUE;
