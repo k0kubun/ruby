@@ -379,30 +379,26 @@ jit_compile(rb_execution_context_t *ec)
     struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
     bool yjit_enabled = rb_yjit_compile_new_iseqs();
     if (yjit_enabled || rb_rjit_call_p) {
-        body->total_calls++;
+        body->jit_entry_calls++;
     }
     else {
-        return 0;
+        return NULL;
     }
 
-    // Don't try to compile the function if it's already compiled
-    if (body->jit_func) {
-        return body->jit_func;
-    }
-
-    // Trigger JIT compilation as needed
-    if (yjit_enabled) {
-        if (rb_yjit_threshold_hit(iseq)) {
-            rb_yjit_compile_iseq(iseq, ec);
+    // Trigger JIT compilation if not compiled
+    if (body->jit_entry == NULL) {
+        if (yjit_enabled) {
+            if (rb_yjit_threshold_hit(iseq, body->jit_entry_calls)) {
+                rb_yjit_compile_iseq(iseq, ec, false);
+            }
+        }
+        else { // rb_rjit_call_p
+            if (body->jit_entry_calls == rb_rjit_call_threshold()) {
+                rb_rjit_compile(iseq);
+            }
         }
     }
-    else { // rb_rjit_call_p
-        if (body->total_calls == rb_rjit_call_threshold()) {
-            rb_rjit_compile(iseq);
-        }
-    }
-
-    return body->jit_func;
+    return body->jit_entry;
 }
 
 // Try to execute the current iseq in ec.  Use JIT code if it is ready.
@@ -421,8 +417,46 @@ jit_exec(rb_execution_context_t *ec)
     }
 }
 #else
-static inline rb_jit_func_t jit_compile(rb_execution_context_t *ec) { return 0; }
+static inline rb_jit_func_t jit_compile(rb_execution_context_t *ec) { return NULL; }
 static inline VALUE jit_exec(rb_execution_context_t *ec) { return Qundef; }
+#endif
+
+#if USE_YJIT
+static inline rb_jit_func_t
+jit_compile_exception(rb_execution_context_t *ec)
+{
+    // Increment the ISEQ's call counter
+    const rb_iseq_t *iseq = ec->cfp->iseq;
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    if (rb_yjit_compile_new_iseqs()) {
+        body->jit_exception_calls++;
+    }
+    else {
+        return NULL;
+    }
+
+    // Trigger JIT compilation if not compiled
+    if (body->jit_exception == NULL && rb_yjit_threshold_hit(iseq, body->jit_exception_calls)) {
+        rb_yjit_compile_iseq(iseq, ec, true);
+    }
+    return body->jit_exception;
+}
+
+static inline VALUE
+jit_exec_exception(rb_execution_context_t *ec)
+{
+    rb_jit_func_t func = jit_compile_exception(ec);
+    if (func) {
+        // Call the JIT code
+        return func(ec, ec->cfp);
+    }
+    else {
+        return Qundef;
+    }
+}
+#else
+static inline rb_jit_func_t jit_compile_exception(rb_execution_context_t *ec) { return NULL; }
+static inline VALUE jit_exec_exception(rb_execution_context_t *ec) { return Qundef; }
 #endif
 
 #include "vm_insnhelper.c"
@@ -2394,7 +2428,9 @@ vm_exec(rb_execution_context_t *ec)
         rb_ec_raised_reset(ec, RAISED_STACKOVERFLOW | RAISED_NOMEMORY);
         while (UNDEF_P(result = vm_exec_handle_exception(ec, state, result))) {
             /* caught a jump, exec the handler */
-            result = vm_exec_core(ec);
+            if (UNDEF_P(result = jit_exec_exception(ec))) {
+                result = vm_exec_core(ec);
+            }
           vm_loop_start:
             VM_ASSERT(ec->tag == &_tag);
             /* when caught `throw`, `tag.state` is set. */

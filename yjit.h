@@ -27,12 +27,12 @@
 // Expose these as declarations since we are building YJIT.
 bool rb_yjit_enabled_p(void);
 bool rb_yjit_compile_new_iseqs(void);
-bool rb_yjit_threshold_hit(const rb_iseq_t *const iseq);
+bool rb_yjit_threshold_hit(const rb_iseq_t *const iseq, long unsigned);
 void rb_yjit_invalidate_all_method_lookup_assumptions(void);
 void rb_yjit_cme_invalidate(rb_callable_method_entry_t *cme);
 void rb_yjit_collect_binding_alloc(void);
 void rb_yjit_collect_binding_set(void);
-bool rb_yjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec);
+bool rb_yjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool);
 void rb_yjit_init(void);
 void rb_yjit_bop_redefined(int redefined_flag, enum ruby_basic_operators bop);
 void rb_yjit_constant_state_changed(ID id);

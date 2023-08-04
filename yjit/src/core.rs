@@ -2135,7 +2135,7 @@ fn gen_block_series_body(
 
 /// Generate a block version that is an entry point inserted into an iseq
 /// NOTE: this function assumes that the VM lock has been taken
-pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr) -> Option<CodePtr> {
+pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr, _jit_exception: bool) -> Option<CodePtr> {
     // Compute the current instruction index based on the current PC
     let insn_idx: u16 = unsafe {
         let ec_pc = get_cfp_pc(get_ec_cfp(ec));
