@@ -221,6 +221,18 @@ $(YARP_BUILD_DIR)/.time $(YARP_BUILD_DIR)/enc/.time $(YARP_BUILD_DIR)/util/.time
 	$(Q) $(MAKEDIRS) $(@D)
 	@$(NULLCMD) > $@
 
+$(top_srcdir)/yarp/api_node.c: $(tooldir)/templates/template.rb $(tooldir)/templates/ext/yarp/api_node.c.erb
+	$(Q) YARP_JAVA_SKIP=1 $(BASERUBY) $(tooldir)/templates/template.rb
+	$(MV) $(tooldir)/ext/yarp/api_node.c $(top_srcdir)/yarp/api_node.c
+
+#  "include/yarp/ast.h",
+#  "lib/yarp/node.rb",
+#  "lib/yarp/serialize.rb",
+#  "src/node.c",
+#  "src/prettyprint.c",
+#  "src/serialize.c",
+#  "src/token_type.c"
+
 EXPORTOBJS    = $(DLNOBJ) \
 		localeinit.$(OBJEXT) \
 		loadpath.$(OBJEXT) \

@@ -254,3 +254,13 @@ lcov*.info
 
 # /wasm/
 /wasm/tests/*.wasm
+
+# YARP
+/yarp/api_node.c
+/tool/ext/yarp/api_node.c
+/tool/lib/yarp/node.rb
+/tool/lib/yarp/serialize.rb
+/tool/src/node.c
+/tool/src/prettyprint.c
+/tool/src/serialize.c
+/tool/src/token_type.c
