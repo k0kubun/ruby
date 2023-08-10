@@ -3456,3 +3456,25 @@ assert_equal 'ok', %q{
 
   cw(4)
 }
+
+# Catch TAG_BREAK in a non-FINISH frame with JIT code
+assert_equal '1', %q{
+  def entry
+    catch_break
+  end
+
+  def catch_break
+    while_true do
+      break
+    end
+    1
+  end
+
+  def while_true
+    while true
+      yield
+    end
+  end
+
+  entry
+}
