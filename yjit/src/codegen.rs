@@ -2046,10 +2046,10 @@ pub const OPT_AREF_MAX_CHAIN_DEPTH: i32 = 2;
 pub const EXPANDARRAY_MAX_CHAIN_DEPTH: i32 = 4;
 
 // up to 10 different classes
-pub const SEND_MAX_DEPTH: i32 = 20;
+pub const SEND_MAX_DEPTH: i32 = 5;
 
 // up to 20 different methods for send
-pub const SEND_MAX_CHAIN_DEPTH: i32 = 20;
+pub const SEND_MAX_CHAIN_DEPTH: i32 = SEND_MAX_DEPTH;
 
 // up to 20 different offsets for case-when
 pub const CASE_WHEN_MAX_DEPTH: i32 = 20;
