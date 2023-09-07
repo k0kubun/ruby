@@ -2036,10 +2036,10 @@ fn jit_chain_guard(
 }
 
 // up to 10 different classes, and embedded or not for each
-pub const GET_IVAR_MAX_DEPTH: i32 = 5;
+pub const GET_IVAR_MAX_DEPTH: i32 = 8;
 
 // up to 10 different classes, and embedded or not for each
-pub const SET_IVAR_MAX_DEPTH: i32 = 5;
+pub const SET_IVAR_MAX_DEPTH: i32 = 8;
 
 // hashes and arrays
 pub const OPT_AREF_MAX_CHAIN_DEPTH: i32 = 2;
