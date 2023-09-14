@@ -174,9 +174,10 @@ macro_rules! make_counters {
 
 /// The list of counters that are available without --yjit-stats.
 /// They are incremented only by `incr_counter!` and don't use `gen_counter_incr`.
-pub const DEFAULT_COUNTERS: [&str; 7] = [
+pub const DEFAULT_COUNTERS: [&str; 8] = [
     "code_gc_count",
     "compiled_iseq_entry",
+    "compiled_iseq_entry_cold",
     "compiled_iseq_count",
     "compiled_blockid_count",
     "compiled_block_count",
@@ -349,6 +350,7 @@ make_counters! {
     binding_set,
 
     compiled_iseq_entry,
+    compiled_entry_cold,
     compiled_iseq_count,
     compiled_blockid_count,
     compiled_block_count,
