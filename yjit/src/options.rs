@@ -62,6 +62,9 @@ pub struct Options {
 
     /// Verify context objects (debug mode only)
     pub verify_ctx: bool,
+
+    /// Emit Linux perf symbols
+    pub perf_map: bool,
 }
 
 // Initialize the options to default values
@@ -80,6 +83,7 @@ pub static mut OPTIONS: Options = Options {
     dump_disasm: None,
     verify_ctx: false,
     dump_iseq_disasm: None,
+    perf_map: false,
 };
 
 /// YJIT option descriptions for `ruby --help`.
@@ -221,6 +225,12 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("trace-exits-sample-rate", sample_rate) => unsafe { OPTIONS.gen_trace_exits = true; OPTIONS.gen_stats = true; OPTIONS.trace_exits_sample_rate = sample_rate.parse().unwrap(); },
         ("dump-insns", "") => unsafe { OPTIONS.dump_insns = true },
         ("verify-ctx", "") => unsafe { OPTIONS.verify_ctx = true },
+        ("perf", "") => unsafe {
+            let perf_map = format!("/tmp/perf-{}.map", std::process::id());
+            let _ = std::fs::remove_file(&perf_map);
+            println!("YJIT perf map: {}", perf_map);
+            OPTIONS.perf_map = true
+        },
 
         // Option name not recognized
         _ => {
