@@ -1009,6 +1009,9 @@ pub struct Assembler {
 
     /// Stack size for Target::SideExit
     side_exit_stack_size: Option<u8>,
+
+    /// The next ccall should spill this number of stack slots if set.
+    ccall_spill_size: Option<u8>,
 }
 
 impl Assembler
@@ -1026,6 +1029,7 @@ impl Assembler
             side_exits,
             side_exit_pc: None,
             side_exit_stack_size: None,
+            ccall_spill_size: None,
         }
     }
 
@@ -1172,6 +1176,34 @@ impl Assembler
         } else {
             reg_temps.set(stack_idx, true);
             self.set_reg_temps(reg_temps);
+        }
+    }
+
+    /// Lazily spill the current stack temps at the next ccall. That makes sure
+    /// operands popped after this call get spilled for the ccall while letting
+    /// asm.ccall() use registers for passing them.
+    pub fn spill_temps_at_ccall(&mut self) {
+        assert_eq!(self.ccall_spill_size, None, "previous lazy spill should have been executed");
+        self.ccall_spill_size = Some(self.ctx.get_stack_size());
+    }
+
+    /// Temporarily manipulate the stack_size to fulfill lazy spill requests.
+    fn with_ccall_spill_size<F: FnMut(&mut Assembler)>(&mut self, mut callback: F) {
+        if let Some(spill_size) = self.ccall_spill_size {
+            assert!(spill_size >= self.ctx.get_stack_size());
+            let old_sp_offset = self.ctx.get_sp_offset();
+            let old_stack_size = self.ctx.get_stack_size();
+
+            // Let asm.ccall() spill operands that were spilled after spill_temps_at_ccall().
+            self.ctx.set_sp_offset(self.ctx.get_sp_offset() + spill_size as i8 - self.ctx.get_stack_size() as i8);
+            self.ctx.set_stack_size(spill_size);
+            callback(self);
+            self.ctx.set_sp_offset(old_sp_offset);
+            self.ctx.set_stack_size(old_stack_size);
+
+            self.ccall_spill_size = None;
+        } else {
+            callback(self);
         }
     }
 
@@ -1697,10 +1729,12 @@ impl Assembler {
 
     pub fn ccall(&mut self, fptr: *const u8, opnds: Vec<Opnd>) -> Opnd {
         let old_temps = self.ctx.get_reg_temps(); // with registers
-        // Spill stack temp registers since they are caller-saved registers.
-        // Note that this doesn't spill stack temps that are already popped
-        // but may still be used in the C arguments.
-        self.spill_temps();
+        self.with_ccall_spill_size(|asm| {
+            // Spill stack temp registers since they are caller-saved registers.
+            // Note that this doesn't spill stack temps that are already popped
+            // but may still be used in the C arguments.
+            asm.spill_temps();
+        });
         let new_temps = self.ctx.get_reg_temps(); // all spilled
 
         // Temporarily manipulate RegTemps so that we can use registers

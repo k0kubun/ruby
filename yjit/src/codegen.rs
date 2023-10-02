@@ -311,8 +311,8 @@ fn jit_prepare_routine_call(
     jit_save_pc(jit, asm);
     gen_save_sp(asm);
     // After jit_prepare_routine_call(), we often pop operands before asm.ccall().
-    // They should be spilled here to let GC mark them.
-    asm.spill_temps();
+    // They should be spilled for GC. We lazily do so to use registers for passing them.
+    asm.spill_temps_at_ccall();
 
     // In case the routine calls Ruby methods, it can set local variables
     // through Kernel#binding and other means.
@@ -2464,7 +2464,6 @@ fn gen_setinstancevariable(
             Counter::setivar_megamorphic,
         );
 
-        asm.spill_temps(); // for ccall (must be done before write_val is popped)
         let write_val;
 
         match ivar_index {
@@ -2955,8 +2954,7 @@ fn gen_equality_specialized(
         let equal = asm.new_label("equal");
         let ret = asm.new_label("ret");
 
-        // Spill for ccall. For safety, unconditionally spill temps before branching.
-        asm.spill_temps();
+        asm.spill_temps(); // For ccall. Unconditionally spill temps for RegTemps consistency.
 
         // If they are equal by identity, return true
         asm.cmp(a_opnd, b_opnd);
@@ -4654,7 +4652,6 @@ fn jit_rb_str_uplus(
     asm.jz(ret_label);
 
     // Str is frozen - duplicate it
-    asm.spill_temps(); // for ccall
     let ret_opnd = asm.ccall(rb_str_dup as *const u8, vec![recv_opnd]);
     asm.mov(stack_ret, ret_opnd);
 
@@ -4803,6 +4800,7 @@ fn jit_rb_str_concat(
     // other Ractors may trigger global invalidation, so we need ctx.clear_local_types().
     // PC is used on errors like Encoding::CompatibilityError raised by rb_str_buf_append.
     jit_prepare_routine_call(jit, asm);
+    asm.spill_temps(); // For ccall. Unconditionally spill temps for RegTemps consistency.
 
     let concat_arg = asm.stack_pop(1);
     let recv = asm.stack_pop(1);
@@ -4826,7 +4824,6 @@ fn jit_rb_str_concat(
     asm.jnz(enc_mismatch);
 
     // If encodings match, call the simple append function and jump to return
-    asm.spill_temps(); // for ccall
     let ret_opnd = asm.ccall(rb_yjit_str_simple_append as *const u8, vec![recv, concat_arg]);
     let ret_label = asm.new_label("func_return");
     let stack_ret = asm.stack_push(Type::TString);
@@ -4836,7 +4833,6 @@ fn jit_rb_str_concat(
 
     // If encodings are different, use a slower encoding-aware concatenate
     asm.write_label(enc_mismatch);
-    asm.spill_temps(); // for ccall
     let ret_opnd = asm.ccall(rb_str_buf_append as *const u8, vec![recv, concat_arg]);
     let stack_ret = asm.stack_push(Type::TString);
     asm.mov(stack_ret, ret_opnd);
