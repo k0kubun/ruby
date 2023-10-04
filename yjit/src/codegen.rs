@@ -923,6 +923,15 @@ pub fn gen_single_block(
         asm_comment!(asm, "Block: {} {}", iseq_get_location(blockid.iseq, blockid_idx), chain_depth);
         asm_comment!(asm, "reg_temps: {:08b}", asm.ctx.get_reg_temps().as_u8());
     }
+    {
+        let comptime_recv_class = jit.peek_at_self().class_of();
+        let class_name = unsafe { cstr_to_rust_string(rb_class2name(comptime_recv_class)) }.unwrap();
+        let iseq_label = match unsafe { rb_iseq_label(iseq) } {
+            Qnil => "[unknown]".to_string(),
+            iseq_label => ruby_str_to_rust(iseq_label),
+        };
+        jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}#{}", class_name, iseq_label));
+    }
 
     if asm.ctx.is_return_landing() {
         // Continuation of the end of gen_leave().
@@ -998,9 +1007,9 @@ pub fn gen_single_block(
             }
 
             // Call the code generation function
-            jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}", insn_name(opcode)));
+            //jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}", insn_name(opcode)));
             status = gen_fn(&mut jit, &mut asm, ocb);
-            jit.perf_symbol_range_end(&mut asm);
+            //jit.perf_symbol_range_end(&mut asm);
         }
 
         // If we can't compile this instruction
@@ -1037,6 +1046,8 @@ pub fn gen_single_block(
         }
     }
     let end_insn_idx = insn_idx;
+
+    jit.perf_symbol_range_end(&mut asm);
 
     // We currently can't handle cases where the request is for a block that
     // doesn't go to the next instruction in the same iseq.
