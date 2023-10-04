@@ -237,31 +237,37 @@ impl JITState {
     }
 
     fn perf_symbol_range_start(&self, asm: &mut Assembler, symbol_name: &str) {
-        let symbol_name = symbol_name.to_string();
-        let syms = self.perf_syms.clone();
-        asm.pos_marker(move |start| syms.borrow_mut().push((start, None, symbol_name.clone())));
+        if get_option!(perf_map) {
+            let symbol_name = symbol_name.to_string();
+            let syms = self.perf_syms.clone();
+            asm.pos_marker(move |start| syms.borrow_mut().push((start, None, symbol_name.clone())));
+        }
     }
 
     fn perf_symbol_range_end(&self, asm: &mut Assembler) {
-        let syms = self.perf_syms.clone();
-        asm.pos_marker(move |end| {
-            if let Some((_, ref mut end_store, _)) = syms.borrow_mut().last_mut() {
-                assert_eq!(None, *end_store);
-                *end_store = Some(end);
-            }
-        });
+        if get_option!(perf_map) {
+            let syms = self.perf_syms.clone();
+            asm.pos_marker(move |end| {
+                if let Some((_, ref mut end_store, _)) = syms.borrow_mut().last_mut() {
+                    assert_eq!(None, *end_store);
+                    *end_store = Some(end);
+                }
+            });
+        }
     }
 
     fn flush_perf_symbols(&self, cb: &CodeBlock) {
-        use std::io::Write;
-        let path = format!("/tmp/perf-{}.map", std::process::id());
-        let mut f = std::fs::File::options().create(true).append(true).open(path).unwrap();
-        for sym in self.perf_syms.borrow().iter() {
-            if let (start, Some(end), name) = sym {
-                // In case the code straddles two pages, part of it belongs to the symbol.
-                for (inline_start, inline_end) in cb.writable_addrs(*start, *end) {
-                    let code_size = inline_end - inline_start;
-                    writeln!(f, "{inline_start:x} {code_size:x} {name}").unwrap();
+        if get_option!(perf_map) {
+            use std::io::Write;
+            let path = format!("/tmp/perf-{}.map", std::process::id());
+            let mut f = std::fs::File::options().create(true).append(true).open(path).unwrap();
+            for sym in self.perf_syms.borrow().iter() {
+                if let (start, Some(end), name) = sym {
+                    // In case the code straddles two pages, part of it belongs to the symbol.
+                    for (inline_start, inline_end) in cb.writable_addrs(*start, *end) {
+                        let code_size = inline_end - inline_start;
+                        writeln!(f, "{inline_start:x} {code_size:x} {name}").unwrap();
+                    }
                 }
             }
         }
@@ -992,7 +998,9 @@ pub fn gen_single_block(
             }
 
             // Call the code generation function
+            jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}", insn_name(opcode)));
             status = gen_fn(&mut jit, &mut asm, ocb);
+            jit.perf_symbol_range_end(&mut asm);
         }
 
         // If we can't compile this instruction
@@ -1048,9 +1056,7 @@ pub fn gen_single_block(
         return Err(());
     }
 
-    if get_option!(perf_map) {
-        jit.flush_perf_symbols(cb);
-    }
+    jit.flush_perf_symbols(cb);
 
     // Block compiled successfully
     Ok(jit.into_block(end_insn_idx, block_start_addr, end_addr, gc_offsets))
@@ -5500,10 +5506,6 @@ fn gen_send_cfunc(
     // Points to the receiver operand on the stack
     let recv = asm.stack_opnd(argc);
 
-    if get_option!(perf_map) {
-        jit.perf_symbol_range_start(asm, "c_method_frame_push");
-    }
-
     // Store incremented PC into current control frame in case callee raises.
     jit_save_pc(jit, asm);
 
@@ -5535,10 +5537,6 @@ fn gen_send_cfunc(
         },
         iseq: None,
     });
-
-    if get_option!(perf_map) {
-        jit.perf_symbol_range_end(asm);
-    }
 
     if !kw_arg.is_null() {
         // Build a hash from all kwargs passed
