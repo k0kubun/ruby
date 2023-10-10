@@ -36,6 +36,9 @@ pub struct Options {
     // compile anything)
     pub pause: bool,
 
+    /// Stop generating new code when exec_mem_size is reached. Don't run code GC
+    pub disable_code_gc: bool,
+
     /// Dump compiled and executed instructions for debugging
     pub dump_insns: bool,
 
@@ -66,6 +69,7 @@ pub static mut OPTIONS: Options = Options {
     gen_stats: false,
     gen_trace_exits: false,
     pause: false,
+    disable_code_gc: false,
     dump_insns: false,
     dump_disasm: None,
     verify_ctx: false,
@@ -86,7 +90,12 @@ macro_rules! get_option {
     // Unsafe is ok here because options are initialized
     // once before any Ruby code executes
     ($option_name:ident) => {
-        unsafe { OPTIONS.$option_name }
+        {
+            // make this a statement since attributes on expressions are experimental
+            #[allow(unused_unsafe)]
+            let ret = unsafe { OPTIONS.$option_name };
+            ret
+        }
     };
 }
 pub(crate) use get_option;
@@ -159,6 +168,10 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("pause", "") => unsafe {
             OPTIONS.pause = true;
         },
+
+        ("disable-code-gc", "") => unsafe {
+            OPTIONS.disable_code_gc = true;
+        }
 
         ("dump-disasm", _) => match opt_val.to_string().as_str() {
             "" => unsafe { OPTIONS.dump_disasm = Some(DumpDisasm::Stdout) },

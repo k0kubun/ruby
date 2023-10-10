@@ -1646,7 +1646,9 @@ pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> Option<
         // Compilation failed
         None => {
             // Trigger code GC. This entry point will be recompiled later.
-            cb.code_gc();
+            if !get_option!(disable_code_gc) {
+                cb.code_gc();
+            }
             return None;
         }
 
@@ -1760,7 +1762,9 @@ fn entry_stub_hit_body(entry_ptr: *const c_void, ec: EcPtr) -> Option<*const u8>
         get_or_create_iseq_payload(iseq).entries.push(pending_entry.into_entry());
     } else { // No space
         // Trigger code GC. This entry point will be recompiled later.
-        cb.code_gc();
+        if !get_option!(disable_code_gc) {
+            cb.code_gc();
+        }
     }
 
     cb.mark_all_executable();
@@ -1973,6 +1977,10 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
         // So we do it here instead.
         rb_set_cfp_sp(cfp, reconned_sp);
 
+        if get_option!(disable_code_gc) && (cb.has_dropped_bytes() || ocb.unwrap().has_dropped_bytes()) {
+            return CodegenGlobals::get_stub_exit_code().raw_ptr();
+        }
+
         (cfp, original_interp_sp)
     };
 
@@ -2053,7 +2061,9 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
             // because incomplete code could be used when cb.dropped_bytes is flipped
             // by code GC. So this place, after all compilation, is the safest place
             // to hook code GC on branch_stub_hit.
-            cb.code_gc();
+            if !get_option!(disable_code_gc) {
+                cb.code_gc();
+            }
             branch = branch_rc.borrow_mut();
 
             // Failed to service the stub by generating a new block so now we
