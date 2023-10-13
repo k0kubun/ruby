@@ -6949,6 +6949,8 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
         return None;
     }
 
+    jit.perf_symbol_range_start(asm, "[JIT] gen_send_dynamic");
+
     // Save PC and SP to prepare for dynamic dispatch
     jit_prepare_routine_call(jit, asm);
 
@@ -6964,6 +6966,8 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
 
     // Fix the interpreter SP deviated by vm_sendish
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), SP);
+
+    jit.perf_symbol_range_end(asm);
 
     gen_counter_incr(asm, Counter::num_send_dynamic);
     Some(KeepCompiling)
@@ -7038,6 +7042,7 @@ fn gen_send_general(
         return None;
     }
 
+    jit.perf_symbol_range_start(asm, "[JIT] jit_guard_known_class");
     jit_guard_known_klass(
         jit,
         asm,
@@ -7049,6 +7054,7 @@ fn gen_send_general(
         SEND_MAX_DEPTH,
         Counter::guard_send_klass_megamorphic,
     );
+    jit.perf_symbol_range_end(asm);
 
     // Do method lookup
     let mut cme = unsafe { rb_callable_method_entry(comptime_recv_klass, mid) };
