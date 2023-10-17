@@ -1732,7 +1732,7 @@ fn entry_stub_hit_body(entry_ptr: *const c_void, ec: EcPtr) -> Option<*const u8>
     // Compile a new entry guard as a next entry
     let next_entry = cb.get_write_ptr();
     let mut asm = Assembler::new();
-    let pending_entry = gen_entry_chain_guard(&mut asm, ocb, iseq, insn_idx)?;
+    let pending_entry = gen_entry_chain_guard(&mut asm, ocb, iseq, insn_idx);
     asm.compile(cb);
 
     // Find or compile a block version
@@ -1743,7 +1743,7 @@ fn entry_stub_hit_body(entry_ptr: *const c_void, ec: EcPtr) -> Option<*const u8>
         // If an existing block is found, generate a jump to the block.
         Some(blockref) => {
             let mut asm = Assembler::new();
-            asm.jmp(blockref.borrow().start_addr?.into());
+            asm.jmp(blockref.borrow().start_addr.unwrap().into());
             asm.compile(cb);
             Some(blockref)
         }
@@ -1756,13 +1756,13 @@ fn entry_stub_hit_body(entry_ptr: *const c_void, ec: EcPtr) -> Option<*const u8>
     }
 
     // Commit or retry the entry
-    if blockref.is_some() {
+    if blockref.is_some() && pending_entry.is_some() {
         // Regenerate the previous entry
         let entryref = NonNull::<Entry>::new(entry_ptr as *mut Entry).expect("Entry should not be null");
         regenerate_entry(cb, &entryref, next_entry);
 
         // Write an entry to the heap and push it to the ISEQ
-        let pending_entry = Rc::try_unwrap(pending_entry).ok().expect("PendingEntry should be unique");
+        let pending_entry = Rc::try_unwrap(pending_entry.unwrap()).ok().expect("PendingEntry should be unique");
         get_or_create_iseq_payload(iseq).entries.push(pending_entry.into_entry());
     } else { // No space
         // Trigger code GC. This entry point will be recompiled later.
