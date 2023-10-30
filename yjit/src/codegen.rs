@@ -8826,7 +8826,7 @@ impl CodegenGlobals {
         let me = unsafe { rb_method_entry_at(klass, mid) };
 
         if me.is_null() {
-            panic!("undefined optimized method!");
+            panic!("undefined optimized method!: {}", mid_str);
         }
 
         // For now, only cfuncs are supported
