@@ -2233,7 +2233,9 @@ pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> Option<
         // Compilation failed
         None => {
             // Trigger code GC. This entry point will be recompiled later.
-            cb.code_gc(ocb);
+            if !get_option!(disable_code_gc) {
+                cb.code_gc(ocb);
+            }
             return None;
         }
 
@@ -2299,7 +2301,9 @@ c_callable! {
                     .unwrap_or_else(|| {
                         // Trigger code GC (e.g. no space).
                         // This entry point will be recompiled later.
-                        cb.code_gc(ocb);
+                        if !get_option!(disable_code_gc) {
+                            cb.code_gc(ocb);
+                        }
                         CodegenGlobals::get_stub_exit_code().raw_ptr()
                     });
 
@@ -2556,6 +2560,10 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
     let cb = CodegenGlobals::get_inline_cb();
     let ocb = CodegenGlobals::get_outlined_cb();
 
+    if get_option!(disable_code_gc) && (cb.has_dropped_bytes() || ocb.unwrap().has_dropped_bytes()) {
+        return CodegenGlobals::get_stub_exit_code().raw_ptr();
+    }
+
     // Try to find an existing compiled version of this block
     let mut block = find_block_version(target_blockid, &target_ctx);
     let mut branch_modified = false;
@@ -2621,7 +2629,9 @@ fn branch_stub_hit_body(branch_ptr: *const c_void, target_idx: u32, ec: EcPtr) -
             // because incomplete code could be used when cb.dropped_bytes is flipped
             // by code GC. So this place, after all compilation, is the safest place
             // to hook code GC on branch_stub_hit.
-            cb.code_gc(ocb);
+            if !get_option!(disable_code_gc) {
+                cb.code_gc(ocb);
+            }
 
             // Failed to service the stub by generating a new block so now we
             // need to exit to the interpreter at the stubbed location. We are

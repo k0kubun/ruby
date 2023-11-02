@@ -72,6 +72,9 @@ pub struct Options {
     /// Enable generating frame pointers (for x86. arm64 always does this)
     pub frame_pointer: bool,
 
+    /// Stop generating new code when exec_mem_size is reached. Don't run code GC
+    pub disable_code_gc: bool,
+
     /// Enable writing /tmp/perf-{pid}.map for Linux perf
     pub perf_map: bool,
 }
@@ -92,11 +95,12 @@ pub static mut OPTIONS: Options = Options {
     verify_ctx: false,
     dump_iseq_disasm: None,
     frame_pointer: false,
+    disable_code_gc: false,
     perf_map: false,
 };
 
 /// YJIT option descriptions for `ruby --help`.
-static YJIT_OPTIONS: [(&str, &str); 8] = [
+static YJIT_OPTIONS: [(&str, &str); 9] = [
     ("--yjit-stats",                    "Enable collecting YJIT statistics"),
     ("--yjit-trace-exits",              "Record Ruby source location when exiting from generated code"),
     ("--yjit-trace-exits-sample-rate",  "Trace exit locations only every Nth occurrence"),
@@ -104,6 +108,7 @@ static YJIT_OPTIONS: [(&str, &str); 8] = [
     ("--yjit-call-threshold=num",       "Number of calls to trigger JIT"),
     ("--yjit-cold-threshold=num",       "Global call after which ISEQs not compiled (default: 200K)"),
     ("--yjit-max-versions=num",         "Maximum number of versions per basic block (default: 4)"),
+    ("--yjit-disable-code-gc",          "Don't run code GC after exhausting exec-mem-size"),
     ("--yjit-perf",                     "Enable frame pointers and perf profiling"),
 ];
 
@@ -202,6 +207,10 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => {
                 return None;
             }
+        },
+
+        ("disable-code-gc", _) => unsafe {
+            OPTIONS.disable_code_gc = true;
         },
 
         ("perf", _) => match opt_val {
