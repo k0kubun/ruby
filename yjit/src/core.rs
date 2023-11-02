@@ -2341,7 +2341,7 @@ fn entry_stub_hit_body(
     let blockid = BlockId { iseq, idx: insn_idx };
     let mut ctx = Context::default();
     ctx.stack_size = stack_size;
-    let blockref = match find_block_version(blockid, &ctx) {
+    let mut blockref = match find_block_version(blockid, &ctx) {
         // If an existing block is found, generate a jump to the block.
         Some(blockref) => {
             let mut asm = Assembler::new();
@@ -2352,6 +2352,10 @@ fn entry_stub_hit_body(
         // If this block hasn't yet been compiled, generate blocks after the entry guard.
         None => gen_block_series(blockid, &ctx, ec, cb, ocb),
     };
+
+    if cb.has_dropped_bytes() || ocb.unwrap().has_dropped_bytes() {
+        blockref = None;
+    }
 
     // Commit or retry the entry
     if blockref.is_some() {
