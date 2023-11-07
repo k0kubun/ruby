@@ -2525,6 +2525,7 @@ pub fn invalidate_block_version(blockref: &BlockRef) {
         // }
 
         // Create a stub for this branch target or rewire it to a valid block
+        branch.targets[target_idx] = None; // make sure the following is_none() check works on "No space"
         set_branch_target(target_idx as u32, block.blockid, &block.ctx, branchref, &mut branch, ocb);
 
         if branch.targets[target_idx].is_none() {
