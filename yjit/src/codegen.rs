@@ -8962,7 +8962,7 @@ impl CodegenGlobals {
 
     pub fn push_global_inval_patch(i_pos: CodePtr, o_pos: CodePtr) {
         let cb = CodegenGlobals::get_inline_cb();
-        if cb.get_ptr(get_option!(exec_mem_size) * 1024 * 1024 - 8 * 1024 - 6) == i_pos {
+        if i_pos.as_offset() - cb.get_ptr(get_option!(exec_mem_size) * 1024 * 1024 - 8 * 1024 - 6).as_offset() < 6 {
             panic!("patching the last byte");
         }
         let patch = CodepagePatch {
