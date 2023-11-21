@@ -516,6 +516,7 @@ pub extern "C" fn rb_yjit_tracing_invalidate_all() {
         });
 
         let cb = CodegenGlobals::get_inline_cb();
+        let ocb = CodegenGlobals::get_outlined_cb().unwrap();
 
         // Apply patches
         let old_pos = cb.get_write_pos();
@@ -531,8 +532,9 @@ pub extern "C" fn rb_yjit_tracing_invalidate_all() {
 
             cb.set_write_ptr(patch.inline_patch_pos);
             cb.set_dropped_bytes(false);
+            let ocb_had_dropped_bytes = ocb.has_dropped_bytes();
             if asm.compile(cb, None).is_none() {
-                panic!("Failed to apply patch at {:?}", patch.inline_patch_pos);
+                panic!("Failed to apply patch at {:?} (cb.has_dropped_bytes: {}, ocb.has_dropped_bytes: {}, ocb_had_dropped_bytes: {})", patch.inline_patch_pos, cb.has_dropped_bytes(), ocb.has_dropped_bytes(), ocb_had_dropped_bytes);
             }
             last_patch_end = cb.get_write_ptr().raw_ptr(cb);
         }
