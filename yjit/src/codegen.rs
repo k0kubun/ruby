@@ -12,6 +12,7 @@ use crate::utils::*;
 use CodegenStatus::*;
 use YARVOpnd::*;
 
+use core::panic;
 use std::cell::Cell;
 use std::cmp;
 use std::cmp::min;
@@ -8960,6 +8961,10 @@ impl CodegenGlobals {
     }
 
     pub fn push_global_inval_patch(i_pos: CodePtr, o_pos: CodePtr) {
+        let cb = CodegenGlobals::get_inline_cb();
+        if cb.get_ptr(get_option!(exec_mem_size) * 1024 * 1024 - 8 * 1024 - 6) == i_pos {
+            panic!("patching the last byte");
+        }
         let patch = CodepagePatch {
             inline_patch_pos: i_pos,
             outlined_target_pos: o_pos,
