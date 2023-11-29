@@ -341,6 +341,7 @@ struct parser_params {
     int node_id;
 
     int max_numparam;
+    ID it_id;
 
     struct lex_context ctxt;
 
@@ -768,7 +769,7 @@ static NODE *new_hash_pattern(struct parser_params *p, NODE *constant, NODE *hsh
 static NODE *new_hash_pattern_tail(struct parser_params *p, NODE *kw_args, ID kw_rest_arg, const YYLTYPE *loc);
 
 static NODE *new_kw_arg(struct parser_params *p, NODE *k, const YYLTYPE *loc);
-static NODE *args_with_numbered(struct parser_params*,NODE*,int);
+static NODE *args_with_numbered(struct parser_params*,NODE*,int,ID);
 
 static VALUE negate_lit(struct parser_params*, VALUE);
 static NODE *ret_args(struct parser_params*,NODE*);
@@ -1089,7 +1090,7 @@ new_args_tail(struct parser_params *p, VALUE kw_args, VALUE kw_rest_arg, VALUE b
 }
 
 static inline VALUE
-args_with_numbered(struct parser_params *p, VALUE args, int max_numparam)
+args_with_numbered(struct parser_params *p, VALUE args, int max_numparam, ID it_id)
 {
     return args;
 }
@@ -4089,6 +4090,10 @@ lambda		: tLAMBDA
                     {
                         $<node>$ = numparam_push(p);
                     }
+                    {
+                       $<id>$ = p->it_id;
+                       p->it_id = 0;
+                    }
                   f_larglist
                     {
                         CMDARG_PUSH(0);
@@ -4096,20 +4101,22 @@ lambda		: tLAMBDA
                   lambda_body
                     {
                         int max_numparam = p->max_numparam;
+                        ID it_id = p->it_id;
                         p->lex.lpar_beg = $<num>2;
                         p->max_numparam = $<num>3;
+                        p->it_id = $<id>4;
                         CMDARG_POP();
-                        $5 = args_with_numbered(p, $5, max_numparam);
+                        $6 = args_with_numbered(p, $6, max_numparam, it_id);
                     /*%%%*/
                         {
-                            YYLTYPE loc = code_loc_gen(&@5, &@7);
-                            $$ = NEW_LAMBDA($5, $7, &loc);
-                            nd_set_line($$->nd_body, @7.end_pos.lineno);
-                            nd_set_line($$, @5.end_pos.lineno);
+                            YYLTYPE loc = code_loc_gen(&@6, &@8);
+                            $$ = NEW_LAMBDA($6, $8, &loc);
+                            nd_set_line($$->nd_body, @8.end_pos.lineno);
+                            nd_set_line($$, @6.end_pos.lineno);
                             nd_set_first_loc($$, @1.beg_pos);
                         }
                     /*% %*/
-                    /*% ripper: lambda!($5, $7) %*/
+                    /*% ripper: lambda!($6, $8) %*/
                         numparam_pop(p, $<node>4);
                         dyna_pop(p, $<vars>1);
                     }
@@ -4300,15 +4307,21 @@ brace_body	: {$<vars>$ = dyna_push(p);}
                     {
                         $<node>$ = numparam_push(p);
                     }
+                    {
+                        $<id>$ = p->it_id;
+                        p->it_id = 0;
+                    }
                   opt_block_param compstmt
                     {
                         int max_numparam = p->max_numparam;
+                        ID it_id = p->it_id;
                         p->max_numparam = $<num>2;
-                        $4 = args_with_numbered(p, $4, max_numparam);
+                        p->it_id = $<id>4;
+                        $5 = args_with_numbered(p, $5, max_numparam, it_id);
                     /*%%%*/
-                        $$ = NEW_ITER($4, $5, &@$);
+                        $$ = NEW_ITER($5, $6, &@$);
                     /*% %*/
-                    /*% ripper: brace_block!(escape_Qundef($4), $5) %*/
+                    /*% ripper: brace_block!(escape_Qundef($5), $6) %*/
                         numparam_pop(p, $<node>3);
                         dyna_pop(p, $<vars>1);
                     }
@@ -4323,15 +4336,21 @@ do_body 	: {$<vars>$ = dyna_push(p);}
                         $<node>$ = numparam_push(p);
                         CMDARG_PUSH(0);
                     }
+                    {
+                        $<id>$ = p->it_id;
+                        p->it_id = 0;
+                    }
                   opt_block_param bodystmt
                     {
                         int max_numparam = p->max_numparam;
+                        ID it_id = p->it_id;
                         p->max_numparam = $<num>2;
-                        $4 = args_with_numbered(p, $4, max_numparam);
+                        p->it_id = $<id>4;
+                        $5 = args_with_numbered(p, $5, max_numparam, it_id);
                     /*%%%*/
-                        $$ = NEW_ITER($4, $5, &@$);
+                        $$ = NEW_ITER($5, $6, &@$);
                     /*% %*/
-                    /*% ripper: do_block!(escape_Qundef($4), $5) %*/
+                    /*% ripper: do_block!(escape_Qundef($5), $6) %*/
                         CMDARG_POP();
                         numparam_pop(p, $<node>3);
                         dyna_pop(p, $<vars>1);
@@ -11004,6 +11023,17 @@ gettable(struct parser_params *p, ID id, const YYLTYPE *loc)
         }
 # endif
         /* method call without arguments */
+        if (dyna_in_block(p) && id == rb_intern("it") && !(DVARS_TERMINAL_P(p->lvtbl->args) || DVARS_TERMINAL_P(p->lvtbl->args->prev))) {
+            if (p->max_numparam < 0) {
+                compile_error(p, "ordinary parameter is defined");
+                return 0;
+            }
+            if (!p->it_id) {
+                p->it_id = internal_id(p);
+                vtable_add(p->lvtbl->args, p->it_id);
+            }
+            return NEW_DVAR(p->it_id, loc);
+        }
         return NEW_VCALL(id, loc);
       case ID_GLOBAL:
         return NEW_GVAR(id, loc);
@@ -12654,15 +12684,15 @@ new_args_tail(struct parser_params *p, NODE *kw_args, ID kw_rest_arg, ID block, 
 }
 
 static NODE *
-args_with_numbered(struct parser_params *p, NODE *args, int max_numparam)
+args_with_numbered(struct parser_params *p, NODE *args, int max_numparam, ID it_id)
 {
-    if (max_numparam > NO_PARAM) {
+    if (max_numparam > NO_PARAM || it_id) {
         if (!args) {
             YYLTYPE loc = RUBY_INIT_YYLLOC();
             args = new_args_tail(p, 0, 0, 0, 0);
             nd_set_loc(args, &loc);
         }
-        args->nd_ainfo->pre_args_num = max_numparam;
+        args->nd_ainfo->pre_args_num = it_id ? 1 : max_numparam;
     }
     return args;
 }
