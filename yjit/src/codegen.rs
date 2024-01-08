@@ -101,6 +101,7 @@ pub struct JITState {
 
     /// Address range for Linux perf's [JIT interface](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/jit-interface.txt)
     perf_map: Rc::<RefCell::<Vec<(CodePtr, Option<CodePtr>, String)>>>,
+    perf_stack: Vec<String>,
 }
 
 impl JITState {
@@ -123,6 +124,7 @@ impl JITState {
             stable_constant_names_assumption: None,
             block_assumes_single_ractor: false,
             perf_map: Rc::default(),
+            perf_stack: vec![],
         }
     }
 
@@ -239,6 +241,22 @@ impl JITState {
 
     pub fn queue_outgoing_branch(&mut self, branch: PendingBranchRef) {
         self.pending_outgoing.push(branch)
+    }
+
+    fn perf_symbol_range_push(&mut self, asm: &mut Assembler, symbol_name: &str) {
+        if !self.perf_stack.is_empty() {
+            self.perf_symbol_range_end(asm);
+        }
+        self.perf_stack.push(symbol_name.to_string());
+        self.perf_symbol_range_start(asm, symbol_name);
+    }
+
+    fn perf_symbol_range_pop(&mut self, asm: &mut Assembler) {
+        self.perf_symbol_range_end(asm);
+        self.perf_stack.pop();
+        if let Some(symbol_name) = self.perf_stack.get(0) {
+            self.perf_symbol_range_start(asm, symbol_name);
+        }
     }
 
     /// Mark the start address of a symbol to be reported to perf
@@ -916,19 +934,6 @@ pub fn gen_single_block(
         asm_comment!(asm, "reg_temps: {:08b}", asm.ctx.get_reg_temps().as_u8());
     }
 
-    // Mark the start of a method name symbol for --yjit-perf
-    if get_option!(perf_map) {
-        let comptime_recv_class = jit.peek_at_self().class_of();
-        let class_name = unsafe { cstr_to_rust_string(rb_class2name(comptime_recv_class)) };
-        match (class_name, unsafe { rb_iseq_label(iseq) }) {
-            (Some(class_name), iseq_label) if iseq_label != Qnil => {
-                let iseq_label = ruby_str_to_rust(iseq_label);
-                jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}#{}", class_name, iseq_label));
-            }
-            _ => {},
-        }
-    }
-
     if asm.ctx.is_return_landing() {
         // Continuation of the end of gen_leave().
         // Reload REG_SP for the current frame and transfer the return value
@@ -1003,7 +1008,13 @@ pub fn gen_single_block(
             }
 
             // Call the code generation function
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_push(&mut asm, &format!("[JIT] {}", insn_name(opcode)));
+            }
             status = gen_fn(&mut jit, &mut asm, ocb);
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_pop(&mut asm);
+            }
         }
 
         // If we can't compile this instruction
@@ -1048,11 +1059,6 @@ pub fn gen_single_block(
     // Pad the block if it has the potential to be invalidated
     if jit.block_entry_exit.is_some() {
         asm.pad_inval_patch();
-    }
-
-    // Mark the end of a method name symbol for --yjit-perf
-    if get_option!(perf_map) {
-        jit.perf_symbol_range_end(&mut asm);
     }
 
     // Compile code into the code block
@@ -2311,7 +2317,7 @@ fn gen_set_ivar(
 
     // This is a .send call and we need to adjust the stack
     if flags & VM_CALL_OPT_SEND != 0 {
-        handle_opt_send_shift_stack(asm, argc);
+        handle_opt_send_shift_stack(jit, asm, argc);
     }
 
     // Save the PC and SP because the callee may allocate
@@ -4279,12 +4285,6 @@ fn gen_jump(
     Some(EndBlock)
 }
 
-/// Guard that self or a stack operand has the same class as `known_klass`, using
-/// `sample_instance` to speculate about the shape of the runtime value.
-/// FIXNUM and on-heap integers are treated as if they have distinct classes, and
-/// the guard generated for one will fail for the other.
-///
-/// Recompile as contingency if possible, or take side exit a last resort.
 fn jit_guard_known_klass(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -4296,6 +4296,38 @@ fn jit_guard_known_klass(
     max_chain_depth: i32,
     counter: Counter,
 ) {
+    jit_guard_known_klass_body(
+        jit,
+        asm,
+        ocb,
+        known_klass,
+        obj_opnd,
+        insn_opnd,
+        sample_instance,
+        max_chain_depth,
+        counter,
+        false,
+    );
+}
+
+/// Guard that self or a stack operand has the same class as `known_klass`, using
+/// `sample_instance` to speculate about the shape of the runtime value.
+/// FIXNUM and on-heap integers are treated as if they have distinct classes, and
+/// the guard generated for one will fail for the other.
+///
+/// Recompile as contingency if possible, or take side exit a last resort.
+fn jit_guard_known_klass_body(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    ocb: &mut OutlinedCb,
+    known_klass: VALUE,
+    obj_opnd: Opnd,
+    insn_opnd: YARVOpnd,
+    sample_instance: VALUE,
+    max_chain_depth: i32,
+    counter: Counter,
+    perf_map: bool,
+) {
     let val_type = asm.ctx.get_opnd_type(insn_opnd);
 
     if val_type.known_class() == Some(known_klass) {
@@ -4304,6 +4336,7 @@ fn jit_guard_known_klass(
     }
 
     if unsafe { known_klass == rb_cNilClass } {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: nil") }
         assert!(!val_type.is_heap());
         assert!(val_type.is_unknown());
 
@@ -4313,6 +4346,7 @@ fn jit_guard_known_klass(
 
         asm.ctx.upgrade_opnd_type(insn_opnd, Type::Nil);
     } else if unsafe { known_klass == rb_cTrueClass } {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: true") }
         assert!(!val_type.is_heap());
         assert!(val_type.is_unknown());
 
@@ -4322,6 +4356,7 @@ fn jit_guard_known_klass(
 
         asm.ctx.upgrade_opnd_type(insn_opnd, Type::True);
     } else if unsafe { known_klass == rb_cFalseClass } {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: false") }
         assert!(!val_type.is_heap());
         assert!(val_type.is_unknown());
 
@@ -4332,6 +4367,7 @@ fn jit_guard_known_klass(
 
         asm.ctx.upgrade_opnd_type(insn_opnd, Type::False);
     } else if unsafe { known_klass == rb_cInteger } && sample_instance.fixnum_p() {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: Fixnum") }
         // We will guard fixnum and bignum as though they were separate classes
         // BIGNUM can be handled by the general else case below
         assert!(val_type.is_unknown());
@@ -4341,6 +4377,7 @@ fn jit_guard_known_klass(
         jit_chain_guard(JCC_JZ, jit, asm, ocb, max_chain_depth, counter);
         asm.ctx.upgrade_opnd_type(insn_opnd, Type::Fixnum);
     } else if unsafe { known_klass == rb_cSymbol } && sample_instance.static_sym_p() {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: static Symbol") }
         assert!(!val_type.is_heap());
         // We will guard STATIC vs DYNAMIC as though they were separate classes
         // DYNAMIC symbols can be handled by the general else case below
@@ -4354,6 +4391,7 @@ fn jit_guard_known_klass(
             asm.ctx.upgrade_opnd_type(insn_opnd, Type::ImmSymbol);
         }
     } else if unsafe { known_klass == rb_cFloat } && sample_instance.flonum_p() {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: Flonum") }
         assert!(!val_type.is_heap());
         if val_type != Type::Flonum || !val_type.is_imm() {
             assert!(val_type.is_unknown());
@@ -4370,6 +4408,7 @@ fn jit_guard_known_klass(
             && sample_instance == rb_class_attached_object(known_klass)
             && !rb_obj_is_kind_of(sample_instance, rb_cIO).test()
     } {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: singleton class") }
         // Singleton classes are attached to one specific object, so we can
         // avoid one memory access (and potentially the is_heap check) by
         // looking for the expected object directly.
@@ -4386,6 +4425,7 @@ fn jit_guard_known_klass(
         asm.cmp(obj_opnd, sample_instance.into());
         jit_chain_guard(JCC_JNE, jit, asm, ocb, max_chain_depth, counter);
     } else if val_type == Type::CString && unsafe { known_klass == rb_cString } {
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: rb_cString") }
         // guard elided because the context says we've already checked
         unsafe {
             assert_eq!(sample_instance.class_of(), rb_cString, "context says class is exactly ::String")
@@ -4396,11 +4436,13 @@ fn jit_guard_known_klass(
         // Check that the receiver is a heap object
         // Note: if we get here, the class doesn't have immediate instances.
         if !val_type.is_heap() {
+            if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: guard not immediate") }
             asm_comment!(asm, "guard not immediate");
             asm.test(obj_opnd, (RUBY_IMMEDIATE_MASK as u64).into());
             jit_chain_guard(JCC_JNZ, jit, asm, ocb, max_chain_depth, counter);
             asm.cmp(obj_opnd, Qfalse.into());
             jit_chain_guard(JCC_JE, jit, asm, ocb, max_chain_depth, counter);
+            if perf_map { jit.perf_symbol_range_pop(asm) }
 
             asm.ctx.upgrade_opnd_type(insn_opnd, Type::UnknownHeap);
         }
@@ -4414,6 +4456,7 @@ fn jit_guard_known_klass(
 
         // Bail if receiver class is different from known_klass
         // TODO: jit_mov_gc_ptr keeps a strong reference, which leaks the class.
+        if perf_map { jit.perf_symbol_range_push(asm, "[JIT send] jit_guard_known_klass: guard known class") }
         asm_comment!(asm, "guard known class");
         asm.cmp(klass_opnd, known_klass.into());
         jit_chain_guard(JCC_JNE, jit, asm, ocb, max_chain_depth, counter);
@@ -4428,6 +4471,10 @@ fn jit_guard_known_klass(
         } else if known_klass == unsafe { rb_cArray } {
             asm.ctx.upgrade_opnd_type(insn_opnd, Type::TArray);
         }
+    }
+
+    if perf_map {
+        jit.perf_symbol_range_pop(asm);
     }
 }
 
@@ -5571,6 +5618,13 @@ fn gen_push_frame(
     asm: &mut Assembler,
     frame: ControlFrame,
 ) {
+    if get_option!(perf_map) {
+        if frame.iseq.is_some() {
+            jit.perf_symbol_range_push(asm, "[JIT send] gen_push_frame: iseq");
+        } else {
+            jit.perf_symbol_range_push(asm, "[JIT send] gen_push_frame: C");
+        }
+    }
     let sp = frame.sp;
 
     asm_comment!(asm, "push cme, specval, frame type");
@@ -5670,9 +5724,43 @@ fn gen_push_frame(
     }
     let ep = asm.sub(sp, SIZEOF_VALUE.into());
     asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
 }
 
 fn gen_send_cfunc(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    ocb: &mut OutlinedCb,
+    ci: *const rb_callinfo,
+    cme: *const rb_callable_method_entry_t,
+    block: Option<BlockHandler>,
+    recv_known_klass: *const VALUE,
+    flags: u32,
+    argc: i32,
+) -> Option<CodegenStatus> {
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_push(asm, "[JIT send] gen_send_cfunc");
+    }
+    let ret = gen_send_cfunc_body(
+        jit,
+        asm,
+        ocb,
+        ci,
+        cme,
+        block,
+        recv_known_klass,
+        flags,
+        argc,
+    );
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
+    ret
+}
+
+fn gen_send_cfunc_body(
     jit: &mut JITState,
     asm: &mut Assembler,
     ocb: &mut OutlinedCb,
@@ -5734,7 +5822,14 @@ fn gen_send_cfunc(
         let codegen_p = lookup_cfunc_codegen(unsafe { (*cme).def });
         let expected_stack_after = asm.ctx.get_stack_size() as i32 - argc;
         if let Some(known_cfunc_codegen) = codegen_p {
-            if known_cfunc_codegen(jit, asm, ocb, ci, cme, block, argc, recv_known_klass) {
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_push(asm, "[JIT send] gen_send_cfunc: known_cfunc_codegen");
+            }
+            let generated = known_cfunc_codegen(jit, asm, ocb, ci, cme, block, argc, recv_known_klass);
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_pop(asm);
+            }
+            if generated {
                 assert_eq!(expected_stack_after, asm.ctx.get_stack_size() as i32);
                 gen_counter_incr(asm, Counter::num_send_cfunc_inline);
                 // cfunc codegen generated code. Terminate the block so
@@ -5861,7 +5956,7 @@ fn gen_send_cfunc(
 
     // This is a .send call and we need to adjust the stack
     if flags & VM_CALL_OPT_SEND != 0 {
-        handle_opt_send_shift_stack(asm, argc);
+        handle_opt_send_shift_stack(jit, asm, argc);
     }
 
     // Points to the receiver operand on the stack
@@ -6179,6 +6274,43 @@ fn gen_send_iseq(
     argc: i32,
     captured_opnd: Option<Opnd>,
 ) -> Option<CodegenStatus> {
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_push(asm, "[JIT send] gen_send_iseq");
+    }
+    let ret = gen_send_iseq_body(
+        jit,
+        asm,
+        ocb,
+        iseq,
+        ci,
+        frame_type,
+        prev_ep,
+        cme,
+        block,
+        flags,
+        argc,
+        captured_opnd,
+    );
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
+    ret
+}
+
+fn gen_send_iseq_body(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    ocb: &mut OutlinedCb,
+    iseq: *const rb_iseq_t,
+    ci: *const rb_callinfo,
+    frame_type: u32,
+    prev_ep: Option<*const VALUE>,
+    cme: *const rb_callable_method_entry_t,
+    block: Option<BlockHandler>,
+    flags: u32,
+    argc: i32,
+    captured_opnd: Option<Opnd>,
+) -> Option<CodegenStatus> {
     // Argument count. We will change this as we gather values from
     // sources to satisfy the callee's parameters. To help make sense
     // of changes, note that:
@@ -6449,6 +6581,9 @@ fn gen_send_iseq(
                 }
                 asm.stack_pop(1);
             }
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_push(asm, "[JIT send] gen_send_iseq: leaf builtin");
+            }
 
             asm_comment!(asm, "inlined leaf builtin");
             gen_counter_incr(asm, Counter::num_send_leaf_builtin);
@@ -6478,6 +6613,9 @@ fn gen_send_iseq(
 
             // Let guard chains share the same successor
             jump_to_next_insn(jit, asm, ocb);
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_pop(asm);
+            }
             return Some(EndBlock);
         }
     }
@@ -6604,7 +6742,7 @@ fn gen_send_iseq(
     // TODO: This can be more efficient if we do it before
     //       extracting from the splat array above.
     if flags & VM_CALL_OPT_SEND != 0 {
-        handle_opt_send_shift_stack(asm, argc);
+        handle_opt_send_shift_stack(jit, asm, argc);
     }
 
     if iseq_has_rest {
@@ -7265,7 +7403,7 @@ fn gen_struct_aref(
 
     // This is a .send call and we need to adjust the stack
     if flags & VM_CALL_OPT_SEND != 0 {
-        handle_opt_send_shift_stack(asm, argc);
+        handle_opt_send_shift_stack(jit, asm, argc);
     }
 
     // All structs from the same Struct class should have the same
@@ -7309,7 +7447,7 @@ fn gen_struct_aset(
 
     // This is a .send call and we need to adjust the stack
     if flags & VM_CALL_OPT_SEND != 0 {
-        handle_opt_send_shift_stack(asm, argc);
+        handle_opt_send_shift_stack(jit, asm, argc);
     }
 
     let off: i32 = unsafe { get_cme_def_body_optimized_index(cme) }
@@ -7347,6 +7485,10 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
         return None;
     }
 
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_push(asm, "[JIT send] gen_send_dynamic");
+    }
+
     // Save PC and SP to prepare for dynamic dispatch
     jit_prepare_routine_call(jit, asm);
 
@@ -7364,10 +7506,37 @@ fn gen_send_dynamic<F: Fn(&mut Assembler) -> Opnd>(
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), SP);
 
     gen_counter_incr(asm, Counter::num_send_dynamic);
+
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
     Some(KeepCompiling)
 }
 
 fn gen_send_general(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    ocb: &mut OutlinedCb,
+    cd: *const rb_call_data,
+    block: Option<BlockHandler>,
+) -> Option<CodegenStatus> {
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_push(asm, "[JIT send] gen_send_general");
+    }
+    let ret = gen_send_general_body(
+        jit,
+        asm,
+        ocb,
+        cd,
+        block,
+    );
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
+    ret
+}
+
+fn gen_send_general_body(
     jit: &mut JITState,
     asm: &mut Assembler,
     ocb: &mut OutlinedCb,
@@ -7449,7 +7618,7 @@ fn gen_send_general(
         return None;
     }
 
-    jit_guard_known_klass(
+    jit_guard_known_klass_body(
         jit,
         asm,
         ocb,
@@ -7459,6 +7628,7 @@ fn gen_send_general(
         comptime_recv,
         SEND_MAX_DEPTH,
         Counter::guard_send_klass_megamorphic,
+        get_option!(perf_map),
     );
 
     // Do method lookup
@@ -7756,7 +7926,7 @@ fn gen_send_general(
 
                         // If this is a .send call we need to adjust the stack
                         if flags & VM_CALL_OPT_SEND != 0 {
-                            handle_opt_send_shift_stack(asm, argc);
+                            handle_opt_send_shift_stack(jit, asm, argc);
                         }
 
                         // About to reset the SP, need to load this here
@@ -7870,7 +8040,10 @@ fn gen_send_general(
 ///--+------+--------+------+------
 ///
 /// We do this for our compiletime context and the actual stack
-fn handle_opt_send_shift_stack(asm: &mut Assembler, argc: i32) {
+fn handle_opt_send_shift_stack(jit: &mut JITState, asm: &mut Assembler, argc: i32) {
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_push(asm, "[JIT send] handle_opt_send_shift_stack");
+    }
     asm_comment!(asm, "shift_stack");
     for j in (0..argc).rev() {
         let opnd = asm.stack_opnd(j);
@@ -7878,6 +8051,9 @@ fn handle_opt_send_shift_stack(asm: &mut Assembler, argc: i32) {
         asm.mov(opnd2, opnd);
     }
     asm.shift_stack(argc as usize);
+    if get_option!(perf_map) {
+        jit.perf_symbol_range_pop(asm);
+    }
 }
 
 fn gen_opt_send_without_block(
