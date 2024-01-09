@@ -916,19 +916,6 @@ pub fn gen_single_block(
         asm_comment!(asm, "reg_temps: {:08b}", asm.ctx.get_reg_temps().as_u8());
     }
 
-    // Mark the start of a method name symbol for --yjit-perf
-    if get_option!(perf_map) {
-        let comptime_recv_class = jit.peek_at_self().class_of();
-        let class_name = unsafe { cstr_to_rust_string(rb_class2name(comptime_recv_class)) };
-        match (class_name, unsafe { rb_iseq_label(iseq) }) {
-            (Some(class_name), iseq_label) if iseq_label != Qnil => {
-                let iseq_label = ruby_str_to_rust(iseq_label);
-                jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}#{}", class_name, iseq_label));
-            }
-            _ => {},
-        }
-    }
-
     if asm.ctx.is_return_landing() {
         // Continuation of the end of gen_leave().
         // Reload REG_SP for the current frame and transfer the return value
@@ -1003,7 +990,13 @@ pub fn gen_single_block(
             }
 
             // Call the code generation function
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_start(&mut asm, &format!("[JIT] {}", insn_name(opcode)));
+            }
             status = gen_fn(&mut jit, &mut asm, ocb);
+            if get_option!(perf_map) {
+                jit.perf_symbol_range_end(&mut asm);
+            }
         }
 
         // If we can't compile this instruction
@@ -1048,11 +1041,6 @@ pub fn gen_single_block(
     // Pad the block if it has the potential to be invalidated
     if jit.block_entry_exit.is_some() {
         asm.pad_inval_patch();
-    }
-
-    // Mark the end of a method name symbol for --yjit-perf
-    if get_option!(perf_map) {
-        jit.perf_symbol_range_end(&mut asm);
     }
 
     // Compile code into the code block
