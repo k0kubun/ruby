@@ -787,6 +787,18 @@ pub fn gen_entry_prologue(
         );
     }
 
+    let builtin_attrs = unsafe { rb_yjit_iseq_builtin_attrs(iseq) };
+    if builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0 {
+        let ep_opnd = gen_get_lep_with_iseq(iseq, &mut asm);
+        let block_handler_opnd = asm.load(
+            Opnd::mem(64, ep_opnd, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL)
+        );
+        let tag_opnd = asm.and(block_handler_opnd, 0x3.into()); // block_handler is a tagged pointer
+        asm.cmp(tag_opnd, 0x1.into()); // VM_BH_ISEQ_BLOCK_P
+        asm.set_side_exit_context(unsafe { rb_iseq_pc_at_idx(iseq, 0) }, asm.ctx.get_stack_size());
+        asm.je(Target::side_exit(Counter::guard_send_iseq_block_entry));
+    }
+
     // We're compiling iseqs that we *expect* to start at `insn_idx`.
     // But in the case of optional parameters or when handling exceptions,
     // the interpreter can set the pc to a different location. For
@@ -1810,7 +1822,11 @@ fn gen_get_ep(asm: &mut Assembler, level: u32) -> Opnd {
 
 // Gets the EP of the ISeq of the containing method, or "local level".
 // Equivalent of GET_LEP() macro.
-fn gen_get_lep(jit: &mut JITState, asm: &mut Assembler) -> Opnd {
+fn gen_get_lep(jit: &JITState, asm: &mut Assembler) -> Opnd {
+    gen_get_lep_with_iseq(jit.iseq, asm)
+}
+
+fn gen_get_lep_with_iseq(iseq: IseqPtr, asm: &mut Assembler) -> Opnd {
     // Equivalent of get_lvar_level() in compile.c
     fn get_lvar_level(iseq: IseqPtr) -> u32 {
         if iseq == unsafe { rb_get_iseq_body_local_iseq(iseq) } {
@@ -1820,7 +1836,7 @@ fn gen_get_lep(jit: &mut JITState, asm: &mut Assembler) -> Opnd {
         }
     }
 
-    let level = get_lvar_level(jit.get_iseq());
+    let level = get_lvar_level(iseq);
     gen_get_ep(asm, level)
 }
 
@@ -6851,6 +6867,12 @@ fn gen_send_iseq(
 
     // Create a context for the callee
     let mut callee_ctx = Context::default();
+
+    // If the callee has :inline_yield annotation and the callsite has a block ISEQ,
+    // duplicate a callee block for each block ISEQ to make its `yield` monomorphic.
+    if let (Some(BlockHandler::BlockISeq(iseq)), true) = (block, builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0) {
+        callee_ctx.set_block_iseq(iseq);
+    }
 
     // Set the argument types in the callee's context
     for arg_idx in 0..argc {

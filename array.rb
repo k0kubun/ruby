@@ -42,6 +42,7 @@ class Array
   #
   # Related: #each_index, #reverse_each.
   def each
+    Primitive.attr! :inline_yield
     unless block_given?
       return to_enum(:each) { self.length }
     end

@@ -412,6 +412,7 @@ make_counters! {
     guard_send_send_chain_not_sym,
     guard_send_iseq_has_rest_and_splat_too_few,
     guard_send_is_a_class_mismatch,
+    guard_send_iseq_block_entry,
     guard_send_instance_of_class_mismatch,
     guard_send_interrupted,
     guard_send_not_fixnums,
