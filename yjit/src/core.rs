@@ -475,6 +475,10 @@ pub struct Context {
     // Stack slot type/local_idx we track
     // 8 temp types * 4 bits, total 32 bits
     temp_payload: u32,
+
+    /// A pointer to a block ISEQ supplied by the caller
+    /// Not using IseqPtr to satisfy Default trait, and not using Option for #[repr(packed)]
+    block_iseq: u64,
 }
 
 /// Tuple of (iseq, idx) used to identify basic blocks
@@ -1395,14 +1399,19 @@ pub fn take_version_list(blockid: BlockId) -> VersionList {
 }
 
 /// Count the number of block versions matching a given blockid
-fn get_num_versions(blockid: BlockId) -> usize {
+/// `inlined: true` counts inlined versions, and `inlined: false` counts other versions.
+fn get_num_versions(blockid: BlockId, inlined: bool) -> usize {
     let insn_idx = blockid.idx.as_usize();
     match get_iseq_payload(blockid.iseq) {
         Some(payload) => {
             payload
                 .version_map
                 .get(insn_idx)
-                .map(|versions| versions.len())
+                .map(|versions| {
+                    versions.iter().filter(|&&version|
+                        unsafe { version.as_ref() }.ctx.inlined() == inlined
+                    ).count()
+                })
                 .unwrap_or(0)
         }
         None => 0,
@@ -1460,6 +1469,9 @@ fn find_block_version(blockid: BlockId, ctx: &Context) -> Option<BlockRef> {
     return best_version;
 }
 
+/// Allow inlining a Block up to MAX_INLINED_VERSIONS times.
+const MAX_INLINED_VERSIONS: usize = 1000;
+
 /// Produce a generic context when the block version limit is hit for a blockid
 pub fn limit_block_versions(blockid: BlockId, ctx: &Context) -> Context {
     // Guard chains implement limits separately, do nothing
@@ -1467,8 +1479,14 @@ pub fn limit_block_versions(blockid: BlockId, ctx: &Context) -> Context {
         return *ctx;
     }
 
+    let max_versions = if ctx.inlined() {
+        MAX_INLINED_VERSIONS
+    } else {
+        get_option!(max_versions)
+    };
+
     // If this block version we're about to add will hit the version limit
-    if get_num_versions(blockid) + 1 >= get_option!(max_versions) {
+    if get_num_versions(blockid, ctx.inlined()) + 1 >= max_versions {
         // Produce a generic context that stores no type information,
         // but still respects the stack_size and sp_offset constraints.
         // This new context will then match all future requests.
@@ -2003,6 +2021,16 @@ impl Context {
         self.local_types = 0;
     }
 
+    /// Return true if the block is duplicated for each caller
+    pub fn inlined(&self) -> bool {
+        self.block_iseq != 0
+    }
+
+    /// Set a block ISEQ given to the Block of this Context
+    pub fn set_block_iseq(&mut self, iseq: IseqPtr) {
+        self.block_iseq = iseq as u64
+    }
+
     /// Compute a difference score for two context objects
     pub fn diff(&self, dst: &Context) -> TypeDiff {
         // Self is the source context (at the end of the predecessor)
@@ -2043,6 +2071,15 @@ impl Context {
             TypeDiff::Compatible(diff) => diff,
             TypeDiff::Incompatible => return TypeDiff::Incompatible,
         };
+
+        // Check the inlining key
+        if src.block_iseq != dst.block_iseq {
+            if dst.inlined() {
+                return TypeDiff::Incompatible; // duplicate the dst block
+            } else {
+                diff += 1; // using a generic Context should be compatible
+            }
+        }
 
         // For each local type we track
         for i in 0.. MAX_LOCAL_TYPES {
@@ -3435,7 +3472,7 @@ mod tests {
 
     #[test]
     fn context_size() {
-        assert_eq!(mem::size_of::<Context>(), 15);
+        assert_eq!(mem::size_of::<Context>(), 23);
     }
 
     #[test]

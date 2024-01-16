@@ -8636,6 +8636,9 @@ compile_builtin_attr(rb_iseq_t *iseq, const NODE *node)
         if (strcmp(RSTRING_PTR(string), "leaf") == 0) {
             ISEQ_BODY(iseq)->builtin_attrs |= BUILTIN_ATTR_LEAF;
         }
+        else if (strcmp(RSTRING_PTR(string), "inline_yield") == 0) {
+            ISEQ_BODY(iseq)->builtin_attrs |= BUILTIN_ATTR_INLINE_YIELD;
+        }
         else {
             goto unknown_arg;
         }
