@@ -1035,6 +1035,7 @@ rb_backtrace_print_as_bugreport(FILE *fp)
 void
 rb_backtrace(void)
 {
+    fprintf(stderr, "---\n");
     vm_backtrace_print(stderr);
 }
 

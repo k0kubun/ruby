@@ -1470,7 +1470,7 @@ fn find_block_version(blockid: BlockId, ctx: &Context) -> Option<BlockRef> {
 }
 
 /// Allow inlining a Block up to MAX_INLINED_VERSIONS times.
-const MAX_INLINED_VERSIONS: usize = 1000;
+const MAX_INLINED_VERSIONS: usize = 100000;
 
 /// Produce a generic context when the block version limit is hit for a blockid
 pub fn limit_block_versions(blockid: BlockId, ctx: &Context) -> Context {

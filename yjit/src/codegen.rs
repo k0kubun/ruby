@@ -522,7 +522,7 @@ fn gen_exit(exit_pc: *mut VALUE, asm: &mut Assembler) {
 
         // If --yjit-trace-exits option is enabled, record the exit stack
         // while recording the side exits.
-        if get_option!(gen_trace_exits) {
+        if get_option!(gen_trace_exits) && false {
             asm.ccall(
                 rb_yjit_record_exit_stack as *const u8,
                 vec![Opnd::const_ptr(exit_pc as *const u8)]
@@ -908,11 +908,13 @@ pub fn gen_single_block(
     let mut asm = Assembler::new();
     asm.ctx = ctx;
 
-    #[cfg(feature = "disasm")]
-    if get_option_ref!(dump_disasm).is_some() {
+    let builtin_attrs = unsafe { rb_yjit_iseq_builtin_attrs(jit.iseq) };
+    if get_option_ref!(dump_disasm).is_some() || builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0 {
         let blockid_idx = blockid.idx;
         let chain_depth = if asm.ctx.get_chain_depth() > 0 { format!("(chain_depth: {})", asm.ctx.get_chain_depth()) } else { "".to_string() };
-        asm_comment!(asm, "Block: {} {}", iseq_get_location(blockid.iseq, blockid_idx), chain_depth);
+        let inline = if asm.ctx.inlined() { "INLINE" } else { ""};
+        println!("Block: {} {} {}", iseq_get_location(blockid.iseq, blockid_idx), chain_depth, inline);
+        asm_comment!(asm, "Block: {} {} {}", iseq_get_location(blockid.iseq, blockid_idx), chain_depth, inline);
         asm_comment!(asm, "reg_temps: {:08b}", asm.ctx.get_reg_temps().as_u8());
     }
 
@@ -6854,8 +6856,13 @@ fn gen_send_iseq(
 
     // If the callee has :inline_yield annotation and the callsite has a block ISEQ,
     // duplicate a callee block for each block ISEQ to make its `yield` monomorphic.
-    if let (Some(BlockHandler::BlockISeq(iseq)), true) = (block, builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0) {
-        callee_ctx.set_block_iseq(iseq);
+    if builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0 {
+        if let Some(BlockHandler::BlockISeq(iseq)) = block {
+            callee_ctx.set_block_iseq(iseq);
+            println!("success inlining: {}", iseq_get_location(jit.iseq, jit.get_insn_idx()));
+        } else {
+            println!("failure inlining: {}", iseq_get_location(jit.iseq, jit.get_insn_idx()));
+        }
     }
 
     // Set the argument types in the callee's context
@@ -7778,6 +7785,11 @@ fn gen_invokeblock(
         return Some(status);
     }
 
+    let builtin_attrs = unsafe { rb_yjit_iseq_builtin_attrs(jit.iseq) };
+    if builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0 {
+        println!("  invokeblock (chain_depth: {}): dynamic", asm.ctx.get_chain_depth());
+    }
+
     // Otherwise, fallback to dynamic dispatch using the interpreter's implementation of send
     gen_send_dynamic(jit, asm, cd, unsafe { rb_yjit_invokeblock_sp_pops((*cd).ci) }, |asm| {
         extern "C" {
@@ -7801,9 +7813,25 @@ fn gen_invokeblock_specialized(
         return Some(EndBlock);
     }
 
+    let builtin_attrs = unsafe { rb_yjit_iseq_builtin_attrs(jit.iseq) };
+    let inline_yield = builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0;
+
     // Fallback to dynamic dispatch if this callsite is megamorphic
     if asm.ctx.get_chain_depth() as i32 >= SEND_MAX_DEPTH {
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): megamorphic", asm.ctx.get_chain_depth());
+        }
         gen_counter_incr(asm, Counter::invokeblock_megamorphic);
+        if get_option!(gen_trace_exits) {
+            asm.ccall(
+                rb_yjit_record_exit_stack as *const u8,
+                vec![Opnd::const_ptr(jit.pc as *const u8)]
+            );
+            //asm.ccall(
+            //    rb_backtrace as *const u8,
+            //    vec![]
+            //);
+        }
         return None;
     }
 
@@ -7819,6 +7847,9 @@ fn gen_invokeblock_specialized(
 
     // Handle each block_handler type
     if comptime_handler.0 == VM_BLOCK_HANDLER_NONE as usize { // no block given
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): none", asm.ctx.get_chain_depth());
+        }
         gen_counter_incr(asm, Counter::invokeblock_none);
         None
     } else if comptime_handler.0 & 0x3 == 0x1 { // VM_BH_ISEQ_BLOCK_P
@@ -7842,6 +7873,9 @@ fn gen_invokeblock_specialized(
 
         let comptime_captured = unsafe { ((comptime_handler.0 & !0x3) as *const rb_captured_block).as_ref().unwrap() };
         let comptime_iseq = unsafe { *comptime_captured.code.iseq.as_ref() };
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): iseq {}", asm.ctx.get_chain_depth(), iseq_get_location(comptime_iseq, 0));
+        }
 
         asm_comment!(asm, "guard known ISEQ");
         let captured_opnd = asm.and(block_handler_opnd, Opnd::Imm(!0x3));
@@ -7871,6 +7905,9 @@ fn gen_invokeblock_specialized(
             Some(captured_opnd),
         )
     } else if comptime_handler.0 & 0x3 == 0x3 { // VM_BH_IFUNC_P
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): ifunc", asm.ctx.get_chain_depth());
+        }
         // We aren't handling CALLER_SETUP_ARG and CALLER_REMOVE_EMPTY_KW_SPLAT yet.
         if flags & VM_CALL_ARGS_SPLAT != 0 {
             gen_counter_incr(asm, Counter::invokeblock_ifunc_args_splat);
@@ -7924,9 +7961,15 @@ fn gen_invokeblock_specialized(
         jump_to_next_insn(jit, asm, ocb);
         Some(EndBlock)
     } else if comptime_handler.symbol_p() {
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): symbol", asm.ctx.get_chain_depth());
+        }
         gen_counter_incr(asm, Counter::invokeblock_symbol);
         None
     } else { // Proc
+        if inline_yield {
+            println!("  invokeblock (chain_depth: {}): proc", asm.ctx.get_chain_depth());
+        }
         gen_counter_incr(asm, Counter::invokeblock_proc);
         None
     }
