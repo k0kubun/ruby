@@ -2077,7 +2077,7 @@ impl Context {
             if dst.inlined() {
                 return TypeDiff::Incompatible; // duplicate the dst block
             } else {
-                diff += 1; // using a generic Context should be compatible
+                return TypeDiff::Incompatible; // duplicate the dst block
             }
         }
 
@@ -2374,6 +2374,11 @@ fn gen_block_series_body(
 /// If jit_exception is true, compile JIT code for handling exceptions.
 /// See [jit_compile_exception] for details.
 pub fn gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> Option<*const u8> {
+    let builtin_attrs = unsafe { rb_yjit_iseq_builtin_attrs(iseq) };
+    if builtin_attrs & BUILTIN_ATTR_INLINE_YIELD != 0 {
+        return None;
+    }
+
     // Compute the current instruction index based on the current PC
     let cfp = unsafe { get_ec_cfp(ec) };
     let insn_idx: u16 = unsafe {
