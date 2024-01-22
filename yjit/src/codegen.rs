@@ -5158,6 +5158,35 @@ fn jit_rb_ary_push(
     true
 }
 
+// Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+fn jit_rb_ary_each(jit: &mut JITState, asm: &mut Assembler) {
+    // Load the local variable `_i`
+    let ep_opnd = gen_get_ep(asm, 0);
+    let i_opnd = Opnd::mem(64, ep_opnd, iseq_local_offset(jit.iseq, "_i"));
+
+    // Check `_i < self.length`
+    let array_opnd = asm.load(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_SELF));
+    let length_opnd = get_array_len(asm, array_opnd);
+    let found = asm.new_label("found");
+    asm.cmp(i_opnd, length_opnd);
+    asm.jl(found);
+
+    // If `_i >= self.length`, return `false`
+    let stack_ret = asm.stack_push(Type::UnknownImm);
+    asm.mov(stack_ret, Qfalse.into());
+    let ret_label = asm.new_label("stack_ret");
+    asm.jmp(ret_label);
+
+    // If `_i < self.length`, write `value = self[_i]` and return `true`
+    asm.write_label(found);
+    let _array_ptr = get_array_ptr(asm, array_opnd);
+    // TODO: mul _i and Opnd::mem(64, ep_opnd, iseq_local_offset(jit.iseq, "value"))
+    // add it to array_ptr, and write Opnd::mem(64, array_ptr, 0) to value
+    asm.mov(stack_ret, Qtrue.into());
+
+    asm.write_label(ret_label);
+}
+
 fn jit_obj_respond_to(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -8978,11 +9007,19 @@ type MethodGenFn = fn(
 /// Methods for generating code for hardcoded (usually C) methods
 static mut METHOD_CODEGEN_TABLE: Option<HashMap<usize, MethodGenFn>> = None;
 
+// Codegen function for Primitive
+type BuiltinGenFn = fn(jit: &mut JITState, asm: &mut Assembler);
+
+/// Methods for generating code for Primitive in hardcoded methods
+static mut BUILTIN_CODEGEN_TABLE: Option<HashMap<usize, BuiltinGenFn>> = None;
+
 /// Register codegen functions for some Ruby core methods
 pub fn yjit_reg_method_codegen_fns() {
     unsafe {
         assert!(METHOD_CODEGEN_TABLE.is_none());
+        assert!(BUILTIN_CODEGEN_TABLE.is_none());
         METHOD_CODEGEN_TABLE = Some(HashMap::default());
+        BUILTIN_CODEGEN_TABLE = Some(HashMap::default());
 
         // Specialization for C methods. See yjit_reg_method() for details.
         yjit_reg_method(rb_cBasicObject, "!", jit_rb_obj_not);
@@ -9024,6 +9061,7 @@ pub fn yjit_reg_method_codegen_fns() {
         yjit_reg_method(rb_cArray, "length", jit_rb_ary_length);
         yjit_reg_method(rb_cArray, "size", jit_rb_ary_length);
         yjit_reg_method(rb_cArray, "<<", jit_rb_ary_push);
+        yjit_reg_builtin(rb_cArray, "each", jit_rb_ary_each);
 
         yjit_reg_method(rb_mKernel, "respond_to?", jit_obj_respond_to);
         yjit_reg_method(rb_mKernel, "block_given?", jit_rb_f_block_given_p);
@@ -9038,6 +9076,21 @@ pub fn yjit_reg_method_codegen_fns() {
 // behavior changes, the codegen function should only target simple code paths
 // that do not allocate and do not make method calls.
 fn yjit_reg_method(klass: VALUE, mid_str: &str, gen_fn: MethodGenFn) {
+    let def = get_method_def(klass, mid_str);
+    let method_serial = unsafe { get_def_method_serial(def) };
+    unsafe { METHOD_CODEGEN_TABLE.as_mut().unwrap().insert(method_serial, gen_fn); }
+}
+
+// Register a specialized codegen function for Primitive in a particular method.
+// We expect methods with Primitive specialization to have only one invokebuiltin insn.
+fn yjit_reg_builtin(klass: VALUE, mid_str: &str, gen_fn: BuiltinGenFn) {
+    let def = get_method_def(klass, mid_str);
+    // TODO: Assert that def.iseq has only one invokebuiltin
+    let method_serial = unsafe { get_def_method_serial(def) };
+    unsafe { BUILTIN_CODEGEN_TABLE.as_mut().unwrap().insert(method_serial, gen_fn); }
+}
+
+fn get_method_def(klass: VALUE, mid_str: &str) -> *const rb_method_definition_t {
     let id_string = std::ffi::CString::new(mid_str).expect("couldn't convert to CString!");
     let mid = unsafe { rb_intern(id_string.as_ptr()) };
     let me = unsafe { rb_method_entry_at(klass, mid) };
@@ -9050,12 +9103,7 @@ fn yjit_reg_method(klass: VALUE, mid_str: &str, gen_fn: MethodGenFn) {
     //RUBY_ASSERT(me && me->def);
     //RUBY_ASSERT(me->def->type == VM_METHOD_TYPE_CFUNC);
 
-    let method_serial = unsafe {
-        let def = (*me).def;
-        get_def_method_serial(def)
-    };
-
-    unsafe { METHOD_CODEGEN_TABLE.as_mut().unwrap().insert(method_serial, gen_fn); }
+    unsafe { (*me).def }
 }
 
 /// Global state needed for code generation

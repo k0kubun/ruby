@@ -1056,6 +1056,10 @@ extern "C" {
     pub fn rb_iseq_reset_jit_func(iseq: *const rb_iseq_t);
     pub fn rb_iseq_pc_at_idx(iseq: *const rb_iseq_t, insn_idx: u32) -> *mut VALUE;
     pub fn rb_iseq_opcode_at_pc(iseq: *const rb_iseq_t, pc: *const VALUE) -> ::std::os::raw::c_int;
+    pub fn rb_iseq_local_offset(
+        iseq: *const rb_iseq_t,
+        local_name: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
     pub fn rb_RSTRING_LEN(str_: VALUE) -> ::std::os::raw::c_ulong;
     pub fn rb_RSTRING_PTR(str_: VALUE) -> *mut ::std::os::raw::c_char;
     pub fn rb_yjit_get_proc_ptr(procv: VALUE) -> *mut rb_proc_t;

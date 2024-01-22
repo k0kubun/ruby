@@ -255,6 +255,12 @@ pub fn iseq_opcode_at_idx(iseq: IseqPtr, insn_idx: u32) -> u32 {
     unsafe { rb_iseq_opcode_at_pc(iseq, pc) as u32 }
 }
 
+/// Given an ISEQ pointer and a local variable name, return its offset to EP.
+pub fn iseq_local_offset(iseq: IseqPtr, local_name: &str) -> i32 {
+    let local_name = CString::new(local_name).unwrap();
+    unsafe { rb_iseq_local_offset(iseq, local_name.as_ptr()) }
+}
+
 /// Opaque execution-context type from vm_core.h
 #[repr(C)]
 pub struct rb_execution_context_struct {

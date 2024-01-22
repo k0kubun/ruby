@@ -452,6 +452,20 @@ rb_iseq_opcode_at_pc(const rb_iseq_t *iseq, const VALUE *pc)
     return rb_vm_insn_addr2opcode((const void *)at_pc);
 }
 
+// Get a local variable's offset from EP in an ISEQ.
+int
+rb_iseq_local_offset(const rb_iseq_t *iseq, const char *local_name)
+{
+    ID local_id = rb_intern(local_name);
+    for (unsigned int i = 0; i < iseq->body->local_table_size; i++) {
+        if (local_id == iseq->body->local_table[i]) {
+            return -VM_ENV_DATA_SIZE - i;
+        }
+    }
+    rb_bug("local variable '%s' was not found in '%s'",
+           local_name, RSTRING_PTR(iseq->body->location.label));
+}
+
 unsigned long
 rb_RSTRING_LEN(VALUE str)
 {
