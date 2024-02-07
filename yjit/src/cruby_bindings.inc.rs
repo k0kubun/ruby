@@ -906,6 +906,21 @@ pub type robject_offsets = u32;
 pub const RUBY_OFFSET_RSTRING_LEN: rstring_offsets = 16;
 pub type rstring_offsets = u32;
 pub type rb_seq_param_keyword_struct = rb_iseq_constant_body__bindgen_ty_1_rb_iseq_param_keyword;
+#[repr(C)]
+pub struct rb_id_item {
+    pub key: usize,
+    pub collision: ::std::os::raw::c_int,
+    pub val: VALUE,
+}
+pub type item_t = rb_id_item;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rb_class_table {
+    pub capa: ::std::os::raw::c_int,
+    pub num: ::std::os::raw::c_int,
+    pub used: ::std::os::raw::c_int,
+    pub items: *mut item_t,
+}
 extern "C" {
     pub fn rb_class_attached_object(klass: VALUE) -> VALUE;
     pub fn rb_singleton_class(obj: VALUE) -> VALUE;
@@ -1192,4 +1207,14 @@ extern "C" {
         leave_exit: *mut ::std::os::raw::c_void,
         leave_exception: *mut ::std::os::raw::c_void,
     );
+    pub fn rb_class_table_get(
+        table: *mut rb_class_table,
+        key: usize,
+    ) -> *mut ::std::os::raw::c_void;
+    pub fn rb_class_table_insert(
+        table: *mut rb_class_table,
+        key: usize,
+        val: *mut ::std::os::raw::c_void,
+    );
+    pub fn rb_class_table_new() -> *mut rb_class_table;
 }

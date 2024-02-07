@@ -455,6 +455,10 @@ fn main() {
         .allowlist_function("rb_ec_stack_check")
         .allowlist_function("rb_vm_top_self")
 
+        .allowlist_function("rb_class_table_new")
+        .allowlist_function("rb_class_table_get")
+        .allowlist_function("rb_class_table_insert")
+
         // We define VALUE manually, don't import it
         .blocklist_type("VALUE")
 

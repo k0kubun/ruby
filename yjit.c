@@ -1191,3 +1191,167 @@ rb_yjit_init_gc_hooks(void)
     VALUE yjit_root = TypedData_Make_Struct(0, struct yjit_root_struct, &yjit_root_type, root);
     rb_gc_register_mark_object(yjit_root);
 }
+
+typedef struct rb_id_item {
+    size_t key;
+#if SIZEOF_VALUE == 8
+    int      collision;
+#endif
+    VALUE    val;
+} item_t;
+
+struct rb_class_table {
+    int capa;
+    int num;
+    int used;
+    item_t *items;
+};
+
+#if SIZEOF_VALUE == 8
+#define ITEM_GET_KEY(tbl, i) ((tbl)->items[i].key)
+#define ITEM_KEY_ISSET(tbl, i) ((tbl)->items[i].key)
+#define ITEM_COLLIDED(tbl, i) ((tbl)->items[i].collision)
+#define ITEM_SET_COLLIDED(tbl, i) ((tbl)->items[i].collision = 1)
+static inline void
+ITEM_SET_KEY(struct rb_class_table *tbl, int i, size_t key)
+{
+    tbl->items[i].key = key;
+}
+#else
+#define ITEM_GET_KEY(tbl, i) ((tbl)->items[i].key >> 1)
+#define ITEM_KEY_ISSET(tbl, i) ((tbl)->items[i].key > 1)
+#define ITEM_COLLIDED(tbl, i) ((tbl)->items[i].key & 1)
+#define ITEM_SET_COLLIDED(tbl, i) ((tbl)->items[i].key |= 1)
+static inline void
+ITEM_SET_KEY(struct rb_id_table *tbl, int i, id_key_t key)
+{
+    tbl->items[i].key = (key << 1) | ITEM_COLLIDED(tbl, i);
+}
+#endif
+
+static int
+hash_table_index(struct rb_class_table* tbl, size_t key)
+{
+    if (tbl->capa > 0) {
+        int mask = tbl->capa - 1;
+        int ix = (key >> 3) & mask;
+        int d = 1;
+        while (key != ITEM_GET_KEY(tbl, ix)) {
+            if (!ITEM_COLLIDED(tbl, ix))
+                return -1;
+            ix = (ix + d) & mask;
+            d++;
+        }
+        return ix;
+    }
+    return -1;
+}
+
+static void
+hash_table_raw_insert(struct rb_class_table *tbl, size_t key, VALUE val)
+{
+    int mask = tbl->capa - 1;
+    int ix = (key >> 3) & mask;
+    int d = 1;
+    assert(key != 0);
+    while (ITEM_KEY_ISSET(tbl, ix)) {
+        ITEM_SET_COLLIDED(tbl, ix);
+        ix = (ix + d) & mask;
+        d++;
+    }
+    tbl->num++;
+    if (!ITEM_COLLIDED(tbl, ix)) {
+        tbl->used++;
+    }
+    ITEM_SET_KEY(tbl, ix, key);
+    tbl->items[ix].val = val;
+}
+
+static inline int
+round_capa(int capa)
+{
+    /* minsize is 4 */
+    capa >>= 2;
+    capa |= capa >> 1;
+    capa |= capa >> 2;
+    capa |= capa >> 4;
+    capa |= capa >> 8;
+    capa |= capa >> 16;
+    return (capa + 1) << 2;
+}
+
+static void
+hash_table_extend(struct rb_class_table* tbl)
+{
+    if (tbl->used + (tbl->used >> 1) >= tbl->capa) {
+        int new_cap = round_capa(tbl->num + (tbl->num >> 1));
+        int i;
+        item_t* old;
+        struct rb_class_table tmp_tbl = {0, 0, 0};
+        if (new_cap < tbl->capa) {
+            new_cap = round_capa(tbl->used + (tbl->used >> 1));
+        }
+        tmp_tbl.capa = new_cap;
+        tmp_tbl.items = ZALLOC_N(item_t, new_cap);
+        for (i = 0; i < tbl->capa; i++) {
+            size_t key = ITEM_GET_KEY(tbl, i);
+            if (key != 0) {
+                hash_table_raw_insert(&tmp_tbl, key, tbl->items[i].val);
+            }
+        }
+        old = tbl->items;
+        *tbl = tmp_tbl;
+        xfree(old);
+    }
+}
+
+static int
+rb_class_table_insert_key(struct rb_class_table *tbl, const size_t key, const VALUE val)
+{
+    const int index = hash_table_index(tbl, key);
+
+    if (index >= 0) {
+        tbl->items[index].val = val;
+    }
+    else {
+        hash_table_extend(tbl);
+        hash_table_raw_insert(tbl, key, val);
+    }
+    return TRUE;
+}
+
+static struct rb_class_table *
+rb_class_table_init(struct rb_class_table *tbl, int capa)
+{
+    MEMZERO(tbl, struct rb_class_table, 1);
+    if (capa > 0) {
+        capa = round_capa(capa);
+        tbl->capa = (int)capa;
+        tbl->items = ZALLOC_N(item_t, capa);
+    }
+    return tbl;
+}
+
+void *
+rb_class_table_get(struct rb_class_table *table, size_t key)
+{
+    int index = hash_table_index(table, key);
+    if (index >= 0) {
+        return (void *)table->items[index].val;
+    } else {
+        return 0;
+    }
+}
+
+void
+rb_class_table_insert(struct rb_class_table *table, size_t key, void *val)
+{
+    rb_class_table_insert_key(table, key, (VALUE)val);
+}
+
+struct rb_class_table *
+rb_class_table_new(void)
+{
+    struct rb_class_table *tbl = malloc(sizeof(struct rb_class_table));
+    return rb_class_table_init(tbl, 4);
+}

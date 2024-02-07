@@ -15,7 +15,6 @@ use crate::utils::*;
 use crate::disasm::*;
 use core::ffi::c_void;
 use std::cell::*;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::mem;
@@ -530,7 +529,7 @@ pub enum BranchGenFn {
     JBToTarget0,
     JOMulToTarget0,
     JITReturn,
-    SendDispatch(HashMap<usize, *const u8>),
+    SendDispatch(*mut rb_class_table),
 }
 
 impl BranchGenFn {
@@ -3022,8 +3021,9 @@ c_callable! {
 
         // Look up the dispatch table
         if let BranchGenFn::SendDispatch(dispatch_table) = &branch.gen_fn {
-            if let Some(&jump_addr) = dispatch_table.get(&klass) {
-                return jump_addr; // cache hit
+            let result: *const c_void = unsafe { rb_class_table_get(*dispatch_table, klass) };
+            if result != 0 as _ {
+                return result as _; // cache hit
             }
         } else {
             unreachable!("send_dispatch_hit may be used only with MegamorphicSend")
@@ -3098,7 +3098,8 @@ fn send_dispatch_hit_body(branch_ptr: *const c_void, klass: usize, ec: EcPtr) ->
 
             // Insert the new block to the dispatch table
             if let BranchGenFn::SendDispatch(dispatch_table) = &mut branch.gen_fn {
-                dispatch_table.insert(klass, new_block.start_addr.raw_ptr(cb));
+                let addr = new_block.start_addr.raw_ptr(cb);
+                unsafe { rb_class_table_insert(*dispatch_table, klass, addr as _) }
             } else {
                 unreachable!("send_dispatch_hit may be used only with MegamorphicSend")
             }
@@ -3132,7 +3133,8 @@ pub fn gen_send_dispatch(
     target: BlockId,
 ) {
     // Create a Branch with a HashMap to dispatch send
-    let branch = new_pending_branch(jit, BranchGenFn::SendDispatch(HashMap::new()));
+    let table = unsafe { rb_class_table_new() };
+    let branch = new_pending_branch(jit, BranchGenFn::SendDispatch(table));
 
     // Dispatch a jump destination using the HashMap
     let jump_addr = asm.ccall(
