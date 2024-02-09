@@ -453,6 +453,7 @@ make_counters! {
     guard_send_not_fixnum_or_flonum,
     guard_send_not_string,
     guard_send_respond_to_mid_mismatch,
+    guard_send_str_match_not_regexp,
 
     guard_invokesuper_me_changed,
 

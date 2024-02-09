@@ -1726,6 +1726,29 @@ fn guard_object_is_string(
     }
 }
 
+fn guard_object_is_regexp(
+    asm: &mut Assembler,
+    object: Opnd,
+    object_opnd: YARVOpnd,
+    counter: Counter,
+) {
+    let object_reg = match object {
+        Opnd::InsnOut { .. } => object,
+        _ => asm.load(object),
+    };
+    guard_object_is_heap(asm, object_reg, object_opnd, counter);
+
+    asm_comment!(asm, "guard object is regexp");
+
+    // Pull out the type mask
+    let flags_reg = asm.load(Opnd::mem(VALUE_BITS, object_reg, RUBY_OFFSET_RBASIC_FLAGS));
+    let flags_reg = asm.and(flags_reg, Opnd::UImm(RUBY_T_MASK as u64));
+
+    // Compare the result with T_REGEXP
+    asm.cmp(flags_reg, Opnd::UImm(RUBY_T_REGEXP as u64));
+    asm.jne(Target::side_exit(counter));
+}
+
 /// This guards that a special flag is not set on a hash.
 /// By passing a hash with this flag set as the last argument
 /// in a splat call, you can change the way keywords are handled
@@ -5438,6 +5461,38 @@ fn jit_rb_str_concat(
 
     asm.write_label(ret_label);
 
+    true
+}
+
+fn jit_rb_str_match(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    _ocb: &mut OutlinedCb,
+    _ci: *const rb_callinfo,
+    _cme: *const rb_callable_method_entry_t,
+    _block: Option<BlockHandler>,
+    _argc: i32,
+    _known_recv_class: Option<VALUE>,
+) -> bool {
+    // Handle only T_REGEXP, which makes this method leaf
+    let comptime_re = jit.peek_at_stack(&asm.ctx, 0);
+    if unsafe { !RB_TYPE_P(comptime_re, RUBY_T_REGEXP) } {
+        return false;
+    }
+
+    // Guard that the argument is a regexp
+    guard_object_is_regexp(asm, asm.stack_opnd(0), StackOpnd(0), Counter::guard_send_str_match_not_regexp);
+
+    // =~ allocates MatchData for $~
+    jit_prepare_call_with_gc(jit, asm);
+
+    let str_opnd = asm.stack_opnd(1);
+    let re_opnd = asm.stack_opnd(0);
+    let ret = asm.ccall(rb_reg_match as *const u8, vec![re_opnd, str_opnd]);
+    asm.stack_pop(2); // Keep them on stack during ccall for GC
+
+    let ret_opnd = asm.stack_push(Type::UnknownImm); // Integer or nil
+    asm.mov(ret_opnd, ret);
     true
 }
 
@@ -9390,6 +9445,7 @@ pub fn yjit_reg_method_codegen_fns() {
         yjit_reg_method(rb_cString, "getbyte", jit_rb_str_getbyte);
         yjit_reg_method(rb_cString, "<<", jit_rb_str_concat);
         yjit_reg_method(rb_cString, "+@", jit_rb_str_uplus);
+        yjit_reg_method(rb_cString, "=~", jit_rb_str_match);
 
         yjit_reg_method(rb_cArray, "empty?", jit_rb_ary_empty_p);
         yjit_reg_method(rb_cArray, "length", jit_rb_ary_length);

@@ -232,6 +232,7 @@ fn main() {
 
         // From include/ruby/internal/intern/re.h
         .allowlist_function("rb_reg_last_match")
+        .allowlist_function("rb_reg_match")
         .allowlist_function("rb_reg_match_pre")
         .allowlist_function("rb_reg_match_post")
         .allowlist_function("rb_reg_match_last")
