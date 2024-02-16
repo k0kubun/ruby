@@ -2451,6 +2451,7 @@ fn gen_get_ivar(
     ivar_name: ID,
     recv: Opnd,
     recv_opnd: YARVOpnd,
+    ic: Option<*const iseq_inline_iv_cache_entry>,
 ) -> Option<CodegenStatus> {
     let comptime_val_klass = comptime_receiver.class_of();
 
@@ -2484,14 +2485,25 @@ fn gen_get_ivar(
     //       inside object shapes.
     // too-complex shapes can't use index access, so we use rb_ivar_get for them too.
     if !receiver_t_object || uses_custom_allocator || comptime_receiver.shape_too_complex() || megamorphic {
-        // General case. Call rb_ivar_get().
-        // VALUE rb_ivar_get(VALUE obj, ID id)
-        asm_comment!(asm, "call rb_ivar_get()");
-
+        // General case. Fallback to a C function call.
         // The function could raise RactorIsolationError.
         jit_prepare_non_leaf_call(jit, asm);
 
-        let ivar_val = asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name)]);
+        let ivar_val = if let Some(ic) = ic {
+            asm_comment!(asm, "call rb_vm_getinstancevariable()");
+            asm.ccall(
+                rb_vm_getinstancevariable as *const u8,
+                vec![
+                    Opnd::const_ptr(jit.iseq as *const u8),
+                    recv,
+                    Opnd::UImm(ivar_name),
+                    Opnd::const_ptr(ic as *const u8),
+                ],
+            )
+        } else {
+            asm_comment!(asm, "call rb_ivar_get()");
+            asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name)])
+        };
 
         if recv_opnd != SelfOpnd {
             asm.stack_pop(1);
@@ -2594,6 +2606,7 @@ fn gen_getinstancevariable(
     }
 
     let ivar_name = jit.get_arg(0).as_u64();
+    let ic = jit.get_arg(1).as_ptr();
 
     let comptime_val = jit.peek_at_self();
 
@@ -2609,6 +2622,7 @@ fn gen_getinstancevariable(
         ivar_name,
         self_asm_opnd,
         SelfOpnd,
+        Some(ic),
     )
 }
 
@@ -8022,6 +8036,7 @@ fn gen_send_general(
                     ivar_name,
                     recv,
                     recv.into(),
+                    None,
                 );
             }
             VM_METHOD_TYPE_ATTRSET => {
