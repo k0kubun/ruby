@@ -5719,6 +5719,41 @@ fn jit_rb_ary_length(
     return true;
 }
 
+fn jit_rb_ary_rotate_bang(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    _ocb: &mut OutlinedCb,
+    _ci: *const rb_callinfo,
+    cme: *const rb_callable_method_entry_t,
+    _block: Option<BlockHandler>,
+    argc: i32,
+    _known_recv_class: Option<VALUE>,
+) -> bool {
+    if argc != 1 {
+        return false;
+    }
+
+    // Raises when the array is frozen. Lazily push a frame in that case.
+    if !jit_prepare_lazy_frame_call(jit, asm, cme, StackOpnd(1)) {
+        return false;
+    }
+    asm_comment!(asm, "Array#rotate!");
+
+    let ary_opnd = asm.stack_opnd(1);
+    let argv_opnd = asm.lea(asm.ctx.sp_opnd(-SIZEOF_VALUE_I32));
+
+    let ret_opnd = asm.ccall(
+        rb_ary_rotate_bang as *const u8,
+        vec![1.into(), argv_opnd, ary_opnd],
+    );
+    asm.stack_pop(2); // Keep the receiver on stack during ccall for lazy frame
+
+    let out_opnd = asm.stack_push(Type::TArray);
+    asm.store(out_opnd, ret_opnd);
+
+    true
+}
+
 fn jit_rb_ary_push(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -9782,6 +9817,7 @@ pub fn yjit_reg_method_codegen_fns() {
         yjit_reg_method(rb_cArray, "empty?", jit_rb_ary_empty_p);
         yjit_reg_method(rb_cArray, "length", jit_rb_ary_length);
         yjit_reg_method(rb_cArray, "size", jit_rb_ary_length);
+        yjit_reg_method(rb_cArray, "rotate!", jit_rb_ary_rotate_bang);
         yjit_reg_method(rb_cArray, "<<", jit_rb_ary_push);
 
         yjit_reg_method(rb_cHash, "empty?", jit_rb_hash_empty_p);

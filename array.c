@@ -3150,7 +3150,7 @@ rb_ary_rotate(VALUE ary, long cnt)
  *
  */
 
-static VALUE
+VALUE
 rb_ary_rotate_bang(int argc, VALUE *argv, VALUE ary)
 {
     long n = (rb_check_arity(argc, 0, 1) ? NUM2LONG(argv[0]) : 1);
