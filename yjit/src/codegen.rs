@@ -6883,6 +6883,14 @@ fn gen_send_iseq(
     let builtin_func_raw = unsafe { rb_yjit_builtin_function(iseq) };
     let builtin_func = if builtin_func_raw.is_null() { None } else { Some(builtin_func_raw) };
     let opt_send_call = flags & VM_CALL_OPT_SEND != 0; // .send call is not currently supported for builtins
+    let method_name_cstr = unsafe { rb_id2name(vm_ci_mid(ci)) };
+    if !method_name_cstr.is_null() {
+        if let Some(method_name) = cstr_to_rust_string(method_name_cstr) {
+            if method_name == "class" {
+                eprintln!("[SFR_YJIT_DEBUG] block:{:?}, builtin_func:{:?}, builtin_attrs:{}, opt_send_call:{:?}, splat_array_length:{:?}", block.is_some(), builtin_func, builtin_attrs, opt_send_call, splat_array_length);
+            }
+        }
+    }
     if let (None, Some(builtin_info), true, false, None | Some(0)) =
            (block, builtin_func, builtin_attrs & BUILTIN_ATTR_LEAF != 0, opt_send_call, splat_array_length) {
         let builtin_argc = unsafe { (*builtin_info).argc };
