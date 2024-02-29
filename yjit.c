@@ -741,20 +741,28 @@ rb_yjit_iseq_builtin_attrs(const rb_iseq_t *iseq)
 
 // If true, the iseq has only opt_invokebuiltin_delegate_leave and leave insns.
 static bool
-invokebuiltin_delegate_leave_p(const rb_iseq_t *iseq)
+invokebuiltin_delegate_leave_p(const rb_iseq_t *iseq, bool debug_p)
 {
     unsigned int invokebuiltin_len = insn_len(BIN(opt_invokebuiltin_delegate_leave));
     unsigned int leave_len = insn_len(BIN(leave));
-    return iseq->body->iseq_size == (invokebuiltin_len + leave_len) &&
-        rb_vm_insn_addr2opcode((void *)iseq->body->iseq_encoded[0]) == BIN(opt_invokebuiltin_delegate_leave) &&
-        rb_vm_insn_addr2opcode((void *)iseq->body->iseq_encoded[invokebuiltin_len]) == BIN(leave);
+    if (iseq->body->iseq_size == (invokebuiltin_len + leave_len)) {
+        int insn1 = rb_vm_insn_addr2opcode((void *)iseq->body->iseq_encoded[0]);
+        int insn2 = rb_vm_insn_addr2opcode((void *)iseq->body->iseq_encoded[invokebuiltin_len]);
+        if (debug_p) fprintf(stderr, "[SFR_YJIT_DEBUG2] iseq[0]=%d, iseq[1]=%ld, iseq[2]=%d\n", insn1, iseq->body->iseq_encoded[1], insn2);
+        return insn1 == BIN(opt_invokebuiltin_delegate_leave) &&
+               insn2 == BIN(leave);
+    }
+    else {
+        if (debug_p) fprintf(stderr, "[SFR_YJIT_DEBUG2] iseq_size=%d\n", iseq->body->iseq_size);
+        return false;
+    }
 }
 
 // Return an rb_builtin_function if the iseq contains only that builtin function.
 const struct rb_builtin_function *
-rb_yjit_builtin_function(const rb_iseq_t *iseq)
+rb_yjit_builtin_function(const rb_iseq_t *iseq, bool debug_p)
 {
-    if (invokebuiltin_delegate_leave_p(iseq)) {
+    if (invokebuiltin_delegate_leave_p(iseq, debug_p)) {
         return (const struct rb_builtin_function *)iseq->body->iseq_encoded[1];
     }
     else {

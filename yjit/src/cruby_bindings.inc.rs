@@ -1173,7 +1173,10 @@ extern "C" {
         block_handler: VALUE,
     ) -> VALUE;
     pub fn rb_yjit_iseq_builtin_attrs(iseq: *const rb_iseq_t) -> ::std::os::raw::c_uint;
-    pub fn rb_yjit_builtin_function(iseq: *const rb_iseq_t) -> *const rb_builtin_function;
+    pub fn rb_yjit_builtin_function(
+        iseq: *const rb_iseq_t,
+        debug_p: bool,
+    ) -> *const rb_builtin_function;
     pub fn rb_yjit_str_simple_append(str1: VALUE, str2: VALUE) -> VALUE;
     pub fn rb_get_ec_cfp(ec: *const rb_execution_context_t) -> *mut rb_control_frame_struct;
     pub fn rb_get_cfp_iseq(cfp: *mut rb_control_frame_struct) -> *const rb_iseq_t;
