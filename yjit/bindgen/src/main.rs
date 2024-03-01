@@ -117,9 +117,11 @@ fn main() {
         .allowlist_function("rb_hash_new")
 
         // From internal/hash.h
+        .allowlist_function("rb_hash_has_key")
         .allowlist_function("rb_hash_new_with_size")
         .allowlist_function("rb_hash_resurrect")
         .allowlist_function("rb_hash_stlike_foreach")
+        .allowlist_function("rb_hash_stlike_lookup")
         .allowlist_function("rb_to_hash_type")
 
         // From include/ruby/st.h
