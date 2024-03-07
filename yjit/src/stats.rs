@@ -567,6 +567,9 @@ make_counters! {
 
     num_gc_obj_refs,
 
+num_chain_attempt,
+num_chain_land,
+
     num_send,
     num_send_known_class,
     num_send_polymorphic,
