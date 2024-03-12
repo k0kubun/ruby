@@ -1,4 +1,4 @@
-// We use the YARV bytecode constants which have a CRuby-style name
+﻿// We use the YARV bytecode constants which have a CRuby-style name
 #![allow(non_upper_case_globals)]
 
 use crate::asm::*;
@@ -375,13 +375,13 @@ fn gen_counter_incr(jit: Option<&mut JITState>, asm: &mut Assembler, counter: Co
         let ptr_reg = asm.load(Opnd::const_ptr(ptr as *const u8));
         let counter_opnd = Opnd::mem(64, ptr_reg, 0);
 
-        if counter.get_name().starts_with("send") && jit.is_some() {
-            jit.unwrap().perf_symbol_push(asm, &format!("poppop{}", counter.get_name()));
-        }
-
         // Increment and store the updated value
         asm.incr_counter(counter_opnd, Opnd::UImm(1));
     }
+
+        if counter.get_name().starts_with("send") && jit.is_some() {
+            jit.unwrap().perf_symbol_push(asm, &format!("poppop{}", counter.get_name()));
+        }
 }
 
 // Save the incremented PC on the CFP
