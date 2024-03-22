@@ -89,7 +89,7 @@ RUST_VERSION = +1.58.0
 .PHONY: yjit-smoke-test
 yjit-smoke-test:
 ifneq ($(strip $(CARGO)),)
-	$(CARGO) $(RUST_VERSION) test --all-features -q --manifest-path='$(top_srcdir)/yjit/Cargo.toml'
+	$(CARGO) $(RUST_VERSION) test --all-features --manifest-path='$(top_srcdir)/yjit/Cargo.toml'
 endif
 	$(MAKE) btest RUN_OPTS='--yjit-call-threshold=1' BTESTS=-j
 	$(MAKE) test-all TESTS='$(top_srcdir)/test/ruby/test_yjit.rb'
