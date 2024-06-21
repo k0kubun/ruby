@@ -1,5 +1,5 @@
 use std::{ffi::{CStr, CString}, ptr::null, fs::File};
-use crate::{backend::current::TEMP_REGS, stats::Counter};
+use crate::{core::MAX_TEMP_REGS, stats::Counter};
 use std::os::raw::{c_char, c_int, c_uint};
 
 // Call threshold for small deployments and command-line apps
@@ -84,7 +84,7 @@ pub static mut OPTIONS: Options = Options {
     exec_mem_size: 48 * 1024 * 1024,
     no_type_prop: false,
     max_versions: 4,
-    num_temp_regs: 5,
+    num_temp_regs: MAX_TEMP_REGS,
     gen_stats: false,
     trace_exits: None,
     print_stats: true,
@@ -224,7 +224,7 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("temp-regs", _) => match opt_val.parse() {
             Ok(n) => {
-                assert!(n <= TEMP_REGS.len(), "--yjit-temp-regs must be <= {}", TEMP_REGS.len());
+                assert!(n <= MAX_TEMP_REGS, "--yjit-temp-regs must be <= {}", MAX_TEMP_REGS);
                 unsafe { OPTIONS.num_temp_regs = n }
             }
             Err(_) => {

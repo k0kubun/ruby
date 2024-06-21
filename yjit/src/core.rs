@@ -411,6 +411,9 @@ impl From<Opnd> for YARVOpnd {
     }
 }
 
+/// Number of registers that can be used for stack temps
+pub const MAX_TEMP_REGS: usize = 5;
+
 /// Maximum index of stack temps that could be in a register
 pub const MAX_REG_TEMPS: u8 = 8;
 
@@ -450,6 +453,84 @@ impl RegTemps {
     }
 }
 
+/// A stack slot or a local variable. u8 represents the index of it (<= 8).
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+pub enum RegTemp {
+    Stack(u8),
+    Local(u8),
+}
+
+/// RegTemps manages a set of registers used for temporary values on the stack.
+/// Each element of the array represents each of the registers.
+/// If an element is Some, the temporary value uses a register.
+#[derive(Copy, Clone, Default, Eq, Hash, PartialEq)]
+pub struct RegTemps2(pub [Option<RegTemp>; MAX_TEMP_REGS]);
+
+impl RegTemps2 {
+    /// Allocate a register for a given stack value if available.
+    /// Return true if self is updated.
+    pub fn alloc_reg(&mut self, new_temp: RegTemp) -> bool {
+        // If a given value is already set, skip allocation.
+        for &temp in self.0.iter() {
+            if temp == Some(new_temp) {
+                return false;
+            }
+        }
+
+        // Allocate a register if available.
+        if let Some(reg_index) = self.find_unused_reg(new_temp) {
+            self.0[reg_index] = Some(new_temp);
+            return true;
+        }
+        false
+    }
+
+    /// Deallocate a register for a given stack value if in use.
+    /// Return true if self is updated.
+    pub fn dealloc_reg(&mut self, old_temp: RegTemp) -> bool {
+        for temp in self.0.iter_mut() {
+            if *temp == Some(old_temp) {
+                *temp = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return the index of the register for a given stack value if allocated.
+    pub fn get_reg(&self, temp: RegTemp) -> Option<usize> {
+        self.0.iter().enumerate().find(|(_, &reg_temp)| reg_temp == Some(temp)).map(|(index, _)| index)
+    }
+
+    /// Find an available register and return the index of it.
+    fn find_unused_reg(&self, new_temp: RegTemp) -> Option<usize> {
+        // If the default index for the stack value is available, use that to minimize
+        // discrepancies among Contexts.
+        let default_index = match new_temp {
+            RegTemp::Stack(index) => index.as_usize() % MAX_TEMP_REGS,
+            RegTemp::Local(index) => MAX_TEMP_REGS - (index.as_usize() % MAX_TEMP_REGS) - 1,
+        };
+        if self.0[default_index].is_none() {
+            return Some(default_index);
+        }
+
+        // If not, pick any other available register. Like default indexes, prefer
+        // lower indexes for Stack, and higher indexes for Local.
+        let temps = self.0.iter();
+        match new_temp {
+            RegTemp::Stack(_) => temps.enumerate().find(|(_, temp)| temp.is_none()),
+            RegTemp::Local(_) => temps.rev().enumerate().find(|(_, temp)| temp.is_none()),
+        }.map(|(index, _)| index)
+    }
+}
+
+impl fmt::Debug for RegTemps2 {
+    /// Print `[None, ...]` instead of the default `RegTemps([None, ...])`
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "{:?}", self.0)
+    }
+}
+
 /// Bits for chain_depth_return_landing_defer
 const RETURN_LANDING_BIT: u8 = 0b10000000;
 const DEFER_BIT: u8          = 0b01000000;
@@ -475,6 +556,7 @@ pub struct Context {
 
     /// Bitmap of which stack temps are in a register
     reg_temps: RegTemps,
+    reg_temps2: RegTemps2,
 
     /// Fields packed into u8
     /// - 1st bit from the left: Whether this code is the target of a JIT-to-JIT Ruby return ([Self::is_return_landing])
@@ -965,6 +1047,25 @@ impl Context {
         let RegTemps(reg_temps) = self.reg_temps;
         bits.push_u8(reg_temps);
 
+        // Which stack temps are in a register
+        for &temp in self.reg_temps2.0.iter() {
+            if let Some(temp) = temp {
+                bits.push_u1(1); // Some
+                match temp {
+                    RegTemp::Stack(index) => {
+                        bits.push_u1(0); // Stack
+                        bits.push_u3(index);
+                    }
+                    RegTemp::Local(index) => {
+                        bits.push_u1(1); // Local
+                        bits.push_u3(index);
+                    }
+                }
+            } else {
+                bits.push_u1(0); // None
+            }
+        }
+
         // chain_depth_and_flags: u8,
         bits.push_u8(self.chain_depth_and_flags);
 
@@ -984,7 +1085,7 @@ impl Context {
             }
         }
 
-        // Encode stack temps
+        // Encode stack temps (old)
         for stack_idx in 0..MAX_TEMP_TYPES {
             let mapping = self.get_temp_mapping(stack_idx);
 
@@ -1045,6 +1146,18 @@ impl Context {
 
         // Bitmap of which stack temps are in a register
         ctx.reg_temps = RegTemps(bits.read_u8(&mut idx));
+
+        // Which stack temps are in a register
+        for index in 0..MAX_TEMP_REGS {
+            if bits.read_u1(&mut idx) == 1 {
+                let temp = if bits.read_u1(&mut idx) == 0 {
+                    RegTemp::Stack(bits.read_u3(&mut idx))
+                } else {
+                    RegTemp::Local(bits.read_u3(&mut idx))
+                };
+                ctx.reg_temps2.0[index] = Some(temp);
+            }
+        }
 
         // chain_depth_and_flags: u8
         ctx.chain_depth_and_flags = bits.read_u8(&mut idx);
@@ -2382,6 +2495,14 @@ impl Context {
         self.reg_temps = reg_temps;
     }
 
+    pub fn get_reg_temps2(&self) -> RegTemps2 {
+        self.reg_temps2
+    }
+
+    pub fn set_reg_temps2(&mut self, temp_regs: RegTemps2) {
+        self.reg_temps2 = temp_regs;
+    }
+
     pub fn get_chain_depth(&self) -> u8 {
         self.chain_depth_and_flags & CHAIN_DEPTH_MASK
     }
@@ -2918,6 +3039,9 @@ impl Assembler {
             stack_size: self.ctx.stack_size,
             sp_offset: self.ctx.sp_offset,
             reg_temps: None, // push_insn will set this
+            // push_insn() will set this later.
+            // self.ctx.reg_temps can be different when this operand gets used.
+            reg_temps2: None,
         }
     }
 }

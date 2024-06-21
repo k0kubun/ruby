@@ -2,6 +2,7 @@ use std::mem::take;
 
 use crate::asm::{CodeBlock, OutlinedCb};
 use crate::asm::arm64::*;
+use crate::core::MAX_TEMP_REGS;
 use crate::cruby::*;
 use crate::backend::ir::*;
 use crate::virtualmem::CodePtr;
@@ -178,7 +179,7 @@ fn emit_load_value(cb: &mut CodeBlock, rd: A64Opnd, value: u64) -> usize {
 
 /// List of registers that can be used for stack temps.
 /// These are caller-saved registers.
-pub static TEMP_REGS: [Reg; 5] = [X1_REG, X9_REG, X10_REG, X14_REG, X15_REG];
+pub static TEMP_REGS: [Reg; MAX_TEMP_REGS] = [X1_REG, X9_REG, X10_REG, X14_REG, X15_REG];
 
 #[derive(Debug, PartialEq)]
 enum EmitError {

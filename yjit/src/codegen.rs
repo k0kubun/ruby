@@ -1,4 +1,4 @@
-// We use the YARV bytecode constants which have a CRuby-style name
+﻿// We use the YARV bytecode constants which have a CRuby-style name
 #![allow(non_upper_case_globals)]
 
 use crate::asm::*;
@@ -1188,7 +1188,7 @@ pub fn gen_single_block(
         let blockid_idx = blockid.idx;
         let chain_depth = if asm.ctx.get_chain_depth() > 0 { format!("(chain_depth: {})", asm.ctx.get_chain_depth()) } else { "".to_string() };
         asm_comment!(asm, "Block: {} {}", iseq_get_location(blockid.iseq, blockid_idx), chain_depth);
-        asm_comment!(asm, "reg_temps: {:08b}", asm.ctx.get_reg_temps().as_u8());
+        asm_comment!(asm, "reg_temps: {:?}", asm.ctx.get_reg_temps2().0);
     }
 
     // Mark the start of an ISEQ for --yjit-perf
