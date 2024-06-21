@@ -3,6 +3,7 @@ use std::mem::take;
 use crate::asm::*;
 use crate::asm::x86_64::*;
 use crate::codegen::CodePtr;
+use crate::core::MAX_TEMP_REGS;
 use crate::cruby::*;
 use crate::backend::ir::*;
 use crate::options::*;
@@ -80,7 +81,7 @@ impl From<&Opnd> for X86Opnd {
 }
 
 /// List of registers that can be used for stack temps.
-pub static TEMP_REGS: [Reg; 5] = [RSI_REG, RDI_REG, R8_REG, R9_REG, R10_REG];
+pub static TEMP_REGS: [Reg; MAX_TEMP_REGS] = [RSI_REG, RDI_REG, R8_REG, R9_REG, R10_REG];
 
 impl Assembler
 {

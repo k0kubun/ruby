@@ -6,7 +6,7 @@ use crate::codegen::{gen_outlined_exit, gen_counted_exit};
 use crate::cruby::{vm_stack_canary, SIZEOF_VALUE_I32, VALUE};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, OutlinedCb};
-use crate::core::{Context, RegTemps, MAX_REG_TEMPS};
+use crate::core::{Context, RegTemps, RegTemp, RegTemps2, MAX_REG_TEMPS};
 use crate::options::*;
 use crate::stats::*;
 
@@ -80,7 +80,8 @@ pub enum Opnd
         /// ctx.sp_offset when this operand is made. Used with idx for Opnd::Mem.
         sp_offset: i8,
         /// ctx.reg_temps when this operand is read. Used for register allocation.
-        reg_temps: Option<RegTemps>
+        reg_temps: Option<RegTemps>,
+        reg_temps2: Option<RegTemps2>,
     },
 
     // Low-level operands, for lowering
@@ -172,7 +173,7 @@ impl Opnd
             Opnd::Reg(reg) => Some(Opnd::Reg(reg.with_num_bits(num_bits))),
             Opnd::Mem(Mem { base, disp, .. }) => Some(Opnd::Mem(Mem { base, disp, num_bits })),
             Opnd::InsnOut { idx, .. } => Some(Opnd::InsnOut { idx, num_bits }),
-            Opnd::Stack { idx, stack_size, sp_offset, reg_temps, .. } => Some(Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps }),
+            Opnd::Stack { idx, stack_size, sp_offset, reg_temps, reg_temps2, .. } => Some(Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps, reg_temps2 }),
             _ => None,
         }
     }
@@ -1102,7 +1103,7 @@ impl Assembler
                     self.live_ranges[*idx] = insn_idx;
                 }
                 // Set current ctx.reg_temps to Opnd::Stack.
-                Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: None } => {
+                Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: None, reg_temps2: None } => {
                     assert_eq!(
                         self.ctx.get_stack_size() as i16 - self.ctx.get_sp_offset() as i16,
                         *stack_size as i16 - *sp_offset as i16,
@@ -1115,6 +1116,7 @@ impl Assembler
                         stack_size: *stack_size,
                         sp_offset: *sp_offset,
                         reg_temps: Some(self.ctx.get_reg_temps()),
+                        reg_temps2: Some(self.ctx.get_reg_temps2()),
                     };
                 }
                 _ => {}
@@ -1203,13 +1205,19 @@ impl Assembler
             return;
         }
 
-        // Allocate a register if there's no conflict.
+        // Allocate a register if there's no conflict. (old)
         let mut reg_temps = self.ctx.get_reg_temps();
         if reg_temps.conflicts_with(stack_idx) {
             assert!(!reg_temps.get(stack_idx));
         } else {
             reg_temps.set(stack_idx, true);
             self.set_reg_temps(reg_temps);
+        }
+
+        // Allocate a register if there's an unused register.
+        let mut reg_temps2 = self.ctx.get_reg_temps2();
+        if reg_temps2.alloc_reg(RegTemp::Stack(stack_idx)) {
+            self.set_reg_temps2(reg_temps2);
         }
     }
 
@@ -1222,45 +1230,64 @@ impl Assembler
 
     /// Spill all live stack temps from registers to the stack
     pub fn spill_temps(&mut self) {
-        // Forget registers above the stack top
+        // Forget registers above the stack top (old)
         let mut reg_temps = self.ctx.get_reg_temps();
         for stack_idx in self.ctx.get_stack_size()..MAX_REG_TEMPS {
             reg_temps.set(stack_idx, false);
         }
         self.set_reg_temps(reg_temps);
 
+        // Forget registers above the stack top
+        let mut reg_temps2 = self.ctx.get_reg_temps2();
+        for stack_idx in self.ctx.get_stack_size()..MAX_REG_TEMPS {
+            reg_temps2.dealloc_reg(RegTemp::Stack(stack_idx));
+        }
+        self.set_reg_temps2(reg_temps2);
+
         // Spill live stack temps
-        if self.ctx.get_reg_temps() != RegTemps::default() {
-            asm_comment!(self, "spill_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), RegTemps::default().as_u8());
+        //if self.ctx.get_reg_temps() != RegTemps::default() {
+        if reg_temps2 != RegTemps2::default() {
+            asm_comment!(self, "spill_temps: {:08b} -> {:08b} (old)", self.ctx.get_reg_temps().as_u8(), RegTemps::default().as_u8());
+            asm_comment!(self, "spill_temps: {:?} -> {:?}", self.ctx.get_reg_temps2(), RegTemps2::default());
             for stack_idx in 0..u8::min(MAX_REG_TEMPS, self.ctx.get_stack_size()) {
-                if self.ctx.get_reg_temps().get(stack_idx) {
-                    let idx = self.ctx.get_stack_size() - 1 - stack_idx;
-                    self.spill_temp(self.stack_opnd(idx.into()));
-                    reg_temps.set(stack_idx, false);
+                //if self.ctx.get_reg_temps().get(stack_idx) {
+                //    let idx = self.ctx.get_stack_size() - 1 - stack_idx;
+                //    self.spill_temp(self.stack_opnd(idx.into()));
+                //    reg_temps.set(stack_idx, false);
+                //}
+                if reg_temps2.dealloc_reg(RegTemp::Stack(stack_idx)) {
+                    let opnd_idx = self.ctx.get_stack_size() - 1 - stack_idx;
+                    self.spill_temp(self.stack_opnd(opnd_idx.into()));
                 }
             }
             self.ctx.set_reg_temps(reg_temps);
+            self.ctx.set_reg_temps2(reg_temps2);
         }
 
         // Every stack temp should have been spilled
-        assert_eq!(self.ctx.get_reg_temps(), RegTemps::default());
+        assert_eq!(self.ctx.get_reg_temps2(), RegTemps2::default());
     }
 
     /// Spill a stack temp from a register to the stack
     fn spill_temp(&mut self, opnd: Opnd) {
         assert!(self.ctx.get_reg_temps().get(opnd.stack_idx()));
 
-        // Use different RegTemps for dest and src operands
+        // Use different RegTemps for dest and src operands (old)
         let reg_temps = self.ctx.get_reg_temps();
         let mut mem_temps = reg_temps;
         mem_temps.set(opnd.stack_idx(), false);
+
+        // Use different RegTemps for dest and src operands
+        let reg_temps2 = self.ctx.get_reg_temps2();
+        let mut mem_temps2 = reg_temps2;
+        mem_temps2.dealloc_reg(RegTemp::Stack(opnd.stack_idx())); // TODO: support locals?
 
         // Move the stack operand from a register to memory
         match opnd {
             Opnd::Stack { idx, num_bits, stack_size, sp_offset, .. } => {
                 self.mov(
-                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps) },
-                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps) },
+                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(mem_temps), reg_temps2: Some(mem_temps2) },
+                    Opnd::Stack { idx, num_bits, stack_size, sp_offset, reg_temps: Some(reg_temps), reg_temps2: Some(reg_temps2) },
                 );
             }
             _ => unreachable!(),
@@ -1268,10 +1295,10 @@ impl Assembler
         incr_counter!(temp_spill);
     }
 
-    /// Update which stack temps are in a register
+    /// Update which stack temps are in a register (old)
     pub fn set_reg_temps(&mut self, reg_temps: RegTemps) {
         if self.ctx.get_reg_temps() != reg_temps {
-            asm_comment!(self, "reg_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), reg_temps.as_u8());
+            asm_comment!(self, "reg_temps (old): {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), reg_temps.as_u8());
             self.ctx.set_reg_temps(reg_temps);
             self.verify_reg_temps();
         }
@@ -1283,6 +1310,17 @@ impl Assembler
             if self.ctx.get_reg_temps().get(stack_idx) {
                 assert!(!self.ctx.get_reg_temps().conflicts_with(stack_idx));
             }
+        }
+    }
+
+    /// Update which stack values are in a register
+    pub fn set_reg_temps2(&mut self, reg_temps: RegTemps2) {
+        if self.ctx.get_reg_temps2() != reg_temps {
+            // TODO: implement this
+            asm_comment!(self, "reg_temps: {:?} -> {:?}", self.ctx.get_reg_temps2(), reg_temps);
+            self.ctx.set_reg_temps2(reg_temps);
+            // TODO: implement this
+            // self.verify_reg_temps();
         }
     }
 
