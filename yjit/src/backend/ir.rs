@@ -1231,7 +1231,7 @@ impl Assembler
 
         // Spill live stack temps
         if self.ctx.get_reg_temps() != RegTemps::default() {
-            asm_comment!(self, "spill_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), RegTemps::default().as_u8());
+            asm_comment!(self, "spill_temps: {:?} -> {:?}", self.ctx.get_reg_temps(), RegTemps::default());
             for stack_idx in 0..u8::min(MAX_REG_TEMPS, self.ctx.get_stack_size()) {
                 if self.ctx.get_reg_temps().get(stack_idx) {
                     let idx = self.ctx.get_stack_size() - 1 - stack_idx;
@@ -1271,7 +1271,7 @@ impl Assembler
     /// Update which stack temps are in a register
     pub fn set_reg_temps(&mut self, reg_temps: RegTemps) {
         if self.ctx.get_reg_temps() != reg_temps {
-            asm_comment!(self, "reg_temps: {:08b} -> {:08b}", self.ctx.get_reg_temps().as_u8(), reg_temps.as_u8());
+            asm_comment!(self, "reg_temps: {:?} -> {:?}", self.ctx.get_reg_temps(), reg_temps);
             self.ctx.set_reg_temps(reg_temps);
             self.verify_reg_temps();
         }
