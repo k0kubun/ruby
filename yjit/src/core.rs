@@ -411,42 +411,62 @@ impl From<Opnd> for YARVOpnd {
     }
 }
 
+/// Number of registers that can be used for stack temps
+pub const MAX_TEMP_REGS: usize = 5;
+
 /// Maximum index of stack temps that could be in a register
 pub const MAX_REG_TEMPS: u8 = 8;
 
-/// Bitmap of which stack temps are in a register
-#[derive(Copy, Clone, Default, Eq, Hash, PartialEq, Debug)]
-pub struct RegTemps(u8);
+/// A stack slot or a local variable. u8 represents the index of it (<= 8).
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+pub enum RegTemp {
+    Stack(u8),
+    //Local(u8),
+}
+
+/// RegTemps manages a set of registers used for temporary values on the stack.
+/// Each element of the array represents each of the registers.
+/// If an element is Some, the temporary value uses a register.
+#[derive(Copy, Clone, Default, Eq, Hash, PartialEq)]
+pub struct RegTemps([Option<RegTemp>; MAX_TEMP_REGS]);
 
 impl RegTemps {
-    pub fn get(&self, index: u8) -> bool {
-        assert!(index < MAX_REG_TEMPS);
-        (self.0 >> index) & 1 == 1
+    // TODO: Return RegTemp
+    pub fn get(&self, stack_idx: u8) -> bool {
+        self.get_reg(RegTemp::Stack(stack_idx)).is_some() // TODO: Support Local
     }
 
-    pub fn set(&mut self, index: u8, value: bool) {
-        assert!(index < MAX_REG_TEMPS);
-        if value {
-            self.0 = self.0 | (1 << index);
-        } else {
-            self.0 = self.0 & !(1 << index);
+    pub fn set(&mut self, stack_idx: u8, value: bool) {
+        let reg_index = stack_idx as usize % MAX_TEMP_REGS;
+        // TODO: Support Local
+        if value && self.0[reg_index].is_none() {
+            self.0[reg_index] = Some(RegTemp::Stack(stack_idx))
+        } else if !value && self.0[reg_index] == Some(RegTemp::Stack(stack_idx)) {
+            self.0[reg_index] = None;
         }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.0
     }
 
     /// Return true if there's a register that conflicts with a given stack_idx.
     pub fn conflicts_with(&self, stack_idx: u8) -> bool {
-        let mut other_idx = stack_idx as usize % get_option!(num_temp_regs);
-        while other_idx < MAX_REG_TEMPS as usize {
-            if stack_idx as usize != other_idx && self.get(other_idx as u8) {
-                return true;
-            }
-            other_idx += get_option!(num_temp_regs);
+        let reg_index = stack_idx as usize % MAX_TEMP_REGS;
+        match self.0[reg_index] {
+            Some(temp) => temp != RegTemp::Stack(stack_idx), // TODO: Support Local
+            None => false,
         }
-        false
+    }
+
+    /// Return the index of the register for a given stack value if allocated.
+    fn get_reg(&self, temp: RegTemp) -> Option<usize> {
+        self.0.iter().enumerate()
+            .find(|(_, &reg_temp)| reg_temp == Some(temp))
+            .map(|(reg_index, _)| reg_index)
+    }
+}
+
+impl fmt::Debug for RegTemps {
+    /// Print `[None, ...]` instead of the default `RegTemps([None, ...])`
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "{:?}", self.0)
     }
 }
 
@@ -786,7 +806,7 @@ mod bitvector_tests {
         let idx0 = ctx0.encode_into(&mut bits);
 
         let mut ctx1 = Context::default();
-        ctx1.reg_temps = RegTemps(1);
+        ctx1.reg_temps = RegTemps([Some(RegTemp::Stack(0)), None, None, None, None]);
         let idx1 = ctx1.encode_into(&mut bits);
 
         // Make sure that we can encode two contexts successively
@@ -800,7 +820,7 @@ mod bitvector_tests {
     fn regress_reg_temps() {
         let mut bits = BitVector::new();
         let mut ctx = Context::default();
-        ctx.reg_temps = RegTemps(1);
+        ctx.reg_temps = RegTemps([Some(RegTemp::Stack(0)), None, None, None, None]);
         ctx.encode_into(&mut bits);
 
         let b0 = bits.read_u1(&mut 0);
@@ -961,9 +981,24 @@ impl Context {
             bits.push_u8(self.sp_offset as u8);
         }
 
-        // Bitmap of which stack temps are in a register
-        let RegTemps(reg_temps) = self.reg_temps;
-        bits.push_u8(reg_temps);
+        // Which stack temps are in a register
+        for &temp in self.reg_temps.0.iter() {
+            if let Some(temp) = temp {
+                bits.push_u1(1); // Some
+                match temp {
+                    RegTemp::Stack(index) => {
+                        bits.push_u1(0); // Stack
+                        bits.push_u3(index);
+                    }
+                    //RegTemp::Local(index) => {
+                    //    bits.push_u1(1); // Local
+                    //    bits.push_u3(index);
+                    //}
+                }
+            } else {
+                bits.push_u1(0); // None
+            }
+        }
 
         // chain_depth_and_flags: u8,
         bits.push_u8(self.chain_depth_and_flags);
@@ -1043,8 +1078,18 @@ impl Context {
             ctx.sp_offset = bits.read_u8(&mut idx) as i8;
         }
 
-        // Bitmap of which stack temps are in a register
-        ctx.reg_temps = RegTemps(bits.read_u8(&mut idx));
+        // Which stack temps are in a register
+        for index in 0..MAX_TEMP_REGS {
+            if bits.read_u1(&mut idx) == 1 { // Some
+                let temp = if bits.read_u1(&mut idx) == 0 { // RegTemp::Stack
+                    RegTemp::Stack(bits.read_u3(&mut idx))
+                } else {
+                    unimplemented!();
+                    //RegTemp::Local(bits.read_u3(&mut idx))
+                };
+                ctx.reg_temps.0[index] = Some(temp);
+            }
+        }
 
         // chain_depth_and_flags: u8
         ctx.chain_depth_and_flags = bits.read_u8(&mut idx);
@@ -4236,19 +4281,19 @@ mod tests {
 
     #[test]
     fn reg_temps() {
-        let mut reg_temps = RegTemps(0);
+        let mut reg_temps = RegTemps([None, None, None, None, None]);
 
         // 0 means every slot is not spilled
         for stack_idx in 0..MAX_REG_TEMPS {
             assert_eq!(reg_temps.get(stack_idx), false);
         }
 
-        // Set 0, 2, 7 (RegTemps: 10100001)
+        // Set 0, 2, 6 (RegTemps: 10100010)
         reg_temps.set(0, true);
         reg_temps.set(2, true);
         reg_temps.set(3, true);
         reg_temps.set(3, false);
-        reg_temps.set(7, true);
+        reg_temps.set(6, true);
 
         // Get 0..8
         assert_eq!(reg_temps.get(0), true);
@@ -4257,19 +4302,19 @@ mod tests {
         assert_eq!(reg_temps.get(3), false);
         assert_eq!(reg_temps.get(4), false);
         assert_eq!(reg_temps.get(5), false);
-        assert_eq!(reg_temps.get(6), false);
-        assert_eq!(reg_temps.get(7), true);
+        assert_eq!(reg_temps.get(6), true);
+        assert_eq!(reg_temps.get(7), false);
 
         // Test conflicts
         assert_eq!(5, get_option!(num_temp_regs));
         assert_eq!(reg_temps.conflicts_with(0), false); // already set, but no conflict
-        assert_eq!(reg_temps.conflicts_with(1), false);
-        assert_eq!(reg_temps.conflicts_with(2), true); // already set, and conflicts with 7
+        assert_eq!(reg_temps.conflicts_with(1), true);  // not set, and will conflict with 6
+        assert_eq!(reg_temps.conflicts_with(2), false); // already set, but no conflict
         assert_eq!(reg_temps.conflicts_with(3), false);
         assert_eq!(reg_temps.conflicts_with(4), false);
-        assert_eq!(reg_temps.conflicts_with(5), true); // not set, and will conflict with 0
-        assert_eq!(reg_temps.conflicts_with(6), false);
-        assert_eq!(reg_temps.conflicts_with(7), true); // already set, and conflicts with 2
+        assert_eq!(reg_temps.conflicts_with(5), true);  // not set, and will conflict with 0
+        assert_eq!(reg_temps.conflicts_with(6), false); // already set, but no conflict
+        assert_eq!(reg_temps.conflicts_with(7), true);  // not set, but will conflict with 2
     }
 
     #[test]
