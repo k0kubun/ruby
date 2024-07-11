@@ -241,16 +241,6 @@ impl Opnd
             _ => None
         }
     }
-
-    /// Get the index for stack temp registers.
-    pub fn reg_idx(&self) -> usize {
-        match self {
-            Opnd::Stack { .. } => {
-                self.stack_idx() as usize % get_option!(num_temp_regs)
-            },
-            _ => unreachable!(),
-        }
-    }
 }
 
 impl From<usize> for Opnd {

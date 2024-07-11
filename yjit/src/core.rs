@@ -441,15 +441,13 @@ impl RegTemps {
     /// Allocate a register for a given stack value if available.
     /// Return true if self is updated.
     pub fn alloc_reg(&mut self, temp: RegTemp) -> bool {
-        let stack_idx = match temp {
-            RegTemp::Stack(stack_idx) => stack_idx,
-        };
-        if self.conflicts_with(stack_idx) {
+        // If a given value is already set, skip allocation.
+        if self.get_reg(temp).is_some() {
             return false;
         }
 
-        let reg_idx = stack_idx as usize % MAX_TEMP_REGS;
-        if self.0[reg_idx].is_none() {
+        // Allocate a register if available.
+        if let Some(reg_idx) = self.find_unused_reg(temp) {
             self.0[reg_idx] = Some(temp);
             return true;
         }
@@ -468,13 +466,25 @@ impl RegTemps {
         false
     }
 
-    /// Return true if there's a register that conflicts with a given stack_idx.
-    fn conflicts_with(&self, stack_idx: u8) -> bool {
-        let reg_idx = stack_idx as usize % MAX_TEMP_REGS;
-        match self.0[reg_idx] {
-            Some(temp) => temp != RegTemp::Stack(stack_idx), // TODO: Support Local
-            None => false,
+    /// Find an available register and return the index of it.
+    fn find_unused_reg(&self, new_temp: RegTemp) -> Option<usize> {
+        // If the default index for the stack value is available, use that to minimize
+        // discrepancies among Contexts.
+        let default_idx = match new_temp {
+            RegTemp::Stack(stack_idx) => stack_idx.as_usize() % MAX_TEMP_REGS,
+            //RegTemp::Local(index) => MAX_TEMP_REGS - (index.as_usize() % MAX_TEMP_REGS) - 1,
+        };
+        if self.0[default_idx].is_none() {
+            return Some(default_idx);
         }
+
+        // If not, pick any other available register. Like default indexes, prefer
+        // lower indexes for Stack, and higher indexes for Local.
+        let temps = self.0.iter();
+        match new_temp {
+            RegTemp::Stack(_) => temps.enumerate().find(|(_, temp)| temp.is_none()),
+            //RegTemp::Local(_) => temps.rev().enumerate().find(|(_, temp)| temp.is_none()),
+        }.map(|(index, _)| index)
     }
 }
 
