@@ -239,8 +239,9 @@ impl Opnd
         match *self {
             Opnd::Stack { idx, stack_size, local_size, .. } => Some(
                 if let Some(local_size) = local_size {
-                    let last_idx = stack_size as i32 + VM_ENV_DATA_SIZE as i32;
-                    assert!(last_idx <= idx && idx < last_idx + local_size as i32);
+                    let last_idx = stack_size as i32 + VM_ENV_DATA_SIZE as i32 - 1;
+                    assert!(last_idx <= idx, "Local index {} must be >= last local index {}", idx, last_idx);
+                    assert!(idx <= last_idx + local_size as i32, "Local index {} must be < last local index {} + local size {}", idx, last_idx, local_size);
                     RegTemp::Local((last_idx + local_size as i32 - idx) as u8)
                 } else {
                     assert!(idx < stack_size as i32);
@@ -1050,16 +1051,20 @@ pub struct Assembler {
 impl Assembler
 {
     pub fn new() -> Self {
-        Self::new_with_label_names(Vec::default(), HashMap::default())
+        Self::new_with_label_names(Vec::default(), HashMap::default(), None)
     }
 
-    pub fn new_with_label_names(label_names: Vec<String>, side_exits: HashMap<SideExitContext, CodePtr>) -> Self {
+    pub fn new_with_label_names(
+        label_names: Vec<String>,
+        side_exits: HashMap<SideExitContext, CodePtr>,
+        local_size: Option<u32>
+    ) -> Self {
         Self {
             insns: Vec::with_capacity(ASSEMBLER_INSNS_CAPACITY),
             live_ranges: Vec::with_capacity(ASSEMBLER_INSNS_CAPACITY),
             label_names,
             ctx: Context::default(),
-            local_size: None,
+            local_size,
             side_exits,
             side_exit_pc: None,
             side_exit_stack_size: None,
@@ -1146,7 +1151,7 @@ impl Assembler
         // Get a cached side exit
         let side_exit = match self.side_exits.get(&side_exit_context) {
             None => {
-                let exit_code = gen_outlined_exit(side_exit_context.pc, &side_exit_context.get_ctx(), ocb)?;
+                let exit_code = gen_outlined_exit(side_exit_context.pc, self.local_size.unwrap(), &side_exit_context.get_ctx(), ocb)?;
                 self.side_exits.insert(*side_exit_context, exit_code);
                 exit_code
             }
@@ -1410,7 +1415,7 @@ impl Assembler
         let live_ranges: Vec<usize> = take(&mut self.live_ranges);
         // shifted_live_ranges is indexed by mapped indexes in insn operands.
         let mut shifted_live_ranges: Vec<usize> = live_ranges.clone();
-        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), take(&mut self.side_exits));
+        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), take(&mut self.side_exits), self.local_size);
         let mut iterator = self.into_draining_iter();
 
         while let Some((index, mut insn)) = iterator.next_mapped() {

@@ -1478,7 +1478,7 @@ impl PendingBranch {
         target_idx: u32,
         target: BlockId,
         ctx: &Context,
-        ocb: &mut OutlinedCb,
+        jit: &mut JITState,
     ) -> Option<CodePtr> {
         // If the block already exists
         if let Some(blockref) = find_block_version(target, ctx) {
@@ -1496,7 +1496,7 @@ impl PendingBranch {
         // The branch struct is uninitialized right now but as a stable address.
         // We make sure the stub runs after the branch is initialized.
         let branch_struct_addr = self.uninit_branch.as_ptr() as usize;
-        let stub_addr = gen_branch_stub(ctx, ocb, branch_struct_addr, target_idx);
+        let stub_addr = gen_branch_stub(ctx, jit.iseq, jit.get_ocb(), branch_struct_addr, target_idx);
 
         if let Some(stub_addr) = stub_addr {
             // Fill the branch target with a stub
@@ -3675,6 +3675,7 @@ fn delete_empty_defer_block(branch: &Branch, new_block: &Block, target_ctx: Cont
 /// A piece of code that redeems for more code; a thunk for code.
 fn gen_branch_stub(
     ctx: u32,
+    iseq: IseqPtr,
     ocb: &mut OutlinedCb,
     branch_struct_address: usize,
     target_idx: u32,
@@ -3683,6 +3684,7 @@ fn gen_branch_stub(
 
     let mut asm = Assembler::new();
     asm.ctx = Context::decode(ctx);
+    asm.local_size = Some(unsafe { get_iseq_body_local_table_size(iseq) });
     asm.set_reg_temps(asm.ctx.reg_temps);
     asm_comment!(asm, "branch stub hit");
 
@@ -3830,12 +3832,11 @@ pub fn gen_branch(
     gen_fn: BranchGenFn,
 ) {
     let branch = new_pending_branch(jit, gen_fn);
-    let ocb = jit.get_ocb();
 
     // Get the branch targets or stubs
-    let target0_addr = branch.set_target(0, target0, ctx0, ocb);
+    let target0_addr = branch.set_target(0, target0, ctx0, jit);
     let target1_addr = if let Some(ctx) = ctx1 {
-        let addr = branch.set_target(1, target1.unwrap(), ctx, ocb);
+        let addr = branch.set_target(1, target1.unwrap(), ctx, jit);
         if addr.is_none() {
             // target1 requested but we're out of memory.
             // Avoid unwrap() in gen_fn()
@@ -3910,7 +3911,7 @@ pub fn defer_compilation(
     };
 
     // Likely a stub since the context is marked as deferred().
-    let target0_address = branch.set_target(0, blockid, &next_ctx, jit.get_ocb());
+    let target0_address = branch.set_target(0, blockid, &next_ctx, jit);
 
     // Pad the block if it has the potential to be invalidated. This must be
     // done before gen_fn() in case the jump is overwritten by a fallthrough.
@@ -4131,7 +4132,7 @@ pub fn invalidate_block_version(blockref: &BlockRef) {
         }
 
         // Create a stub for this branch target
-        let stub_addr = gen_branch_stub(block.ctx, ocb, branchref.as_ptr() as usize, target_idx as u32);
+        let stub_addr = gen_branch_stub(block.ctx, block.iseq.get(), ocb, branchref.as_ptr() as usize, target_idx as u32);
 
         // In case we were unable to generate a stub (e.g. OOM). Use the block's
         // exit instead of a stub for the block. It's important that we
