@@ -2504,10 +2504,9 @@ impl Context {
     /// Stop using a register for a given stack temp.
     /// This allows us to reuse the register for a value that we know is dead
     /// and will no longer be used (e.g. popped stack temp).
-    pub fn dealloc_temp_reg(&mut self, stack_idx: u8) {
-        if stack_idx < MAX_REG_TEMPS {
-            let mut reg_temps = self.get_reg_temps();
-            reg_temps.dealloc_reg(RegTemp::Stack(stack_idx)); // TODO: Support Local
+    pub fn dealloc_temp_reg(&mut self, temp: RegTemp) {
+        let mut reg_temps = self.get_reg_temps();
+        if reg_temps.dealloc_reg(temp) {
             self.set_reg_temps(reg_temps);
         }
     }

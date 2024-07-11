@@ -1234,7 +1234,7 @@ pub fn gen_single_block(
         // stack_pop doesn't immediately deallocate a register for stack temps,
         // but it's safe to do so at this instruction boundary.
         for stack_idx in asm.ctx.get_stack_size()..MAX_REG_TEMPS {
-            asm.ctx.dealloc_temp_reg(stack_idx);
+            asm.ctx.dealloc_temp_reg(RegTemp::Stack(stack_idx));
         }
 
         // If previous instruction requested to record the boundary
@@ -1803,7 +1803,7 @@ fn gen_splatkw(
         asm.mov(stack_ret, hash);
         asm.stack_push(block_type);
         // Leave block_opnd spilled by ccall as is
-        asm.ctx.dealloc_temp_reg(asm.ctx.get_stack_size() - 1);
+        asm.ctx.dealloc_temp_reg(RegTemp::Stack(asm.ctx.get_stack_size() - 1));
     }
 
     Some(KeepCompiling)
@@ -7502,7 +7502,7 @@ fn gen_send_iseq(
         };
         // Store rest param to memory to avoid register shuffle as
         // we won't be reading it for the remainder of the block.
-        asm.ctx.dealloc_temp_reg(rest_param.stack_idx());
+        asm.ctx.dealloc_temp_reg(rest_param.reg_temp());
         asm.store(rest_param, rest_param_array);
     }
 
@@ -7601,7 +7601,7 @@ fn gen_send_iseq(
         // Write the CI in to the stack and ensure that it actually gets
         // flushed to memory
         let ci_opnd = asm.stack_opnd(-1);
-        asm.ctx.dealloc_temp_reg(ci_opnd.stack_idx());
+        asm.ctx.dealloc_temp_reg(ci_opnd.reg_temp());
         asm.mov(ci_opnd, VALUE(ci as usize).into());
     }
 
@@ -7967,7 +7967,7 @@ fn gen_iseq_kw_call(
             kwargs_order[kwrest_idx] = 0;
         }
         // Put kwrest straight into memory, since we might pop it later
-        asm.ctx.dealloc_temp_reg(stack_kwrest.stack_idx());
+        asm.ctx.dealloc_temp_reg(stack_kwrest.reg_temp());
         asm.mov(stack_kwrest, kwrest);
         if stack_kwrest_idx >= 0 {
             asm.ctx.set_opnd_mapping(stack_kwrest.into(), TempMapping::map_to_stack(kwrest_type));
@@ -8065,7 +8065,7 @@ fn gen_iseq_kw_call(
     if let Some(kwrest_type) = kwrest_type {
         let kwrest = asm.stack_push(kwrest_type);
         // We put the kwrest parameter in memory earlier
-        asm.ctx.dealloc_temp_reg(kwrest.stack_idx());
+        asm.ctx.dealloc_temp_reg(kwrest.reg_temp());
         argc += 1;
     }
 

@@ -227,18 +227,18 @@ impl Opnd
         Self::match_num_bits_iter(opnds.iter())
     }
 
-    /// Calculate Opnd::Stack's index from the stack bottom.
-    pub fn stack_idx(&self) -> u8 {
-        self.get_stack_idx().unwrap()
+    /// Convert Opnd::Stack into RegTemp
+    pub fn reg_temp(&self) -> RegTemp {
+        self.get_reg_temp().unwrap()
     }
 
-    /// Calculate Opnd::Stack's index from the stack bottom if it's Opnd::Stack.
-    pub fn get_stack_idx(&self) -> Option<u8> {
-        match self {
-            Opnd::Stack { idx, stack_size, .. } => {
-                Some((*stack_size as isize - *idx as isize - 1) as u8)
-            },
-            _ => None
+    /// Convert an operand into RegTemp if it's Opnd::Stack
+    pub fn get_reg_temp(&self) -> Option<RegTemp> {
+        match *self {
+            Opnd::Stack { idx, stack_size, .. } => Some(
+                RegTemp::Stack((stack_size as isize - idx as isize - 1) as u8)
+            ),
+            _ => None,
         }
     }
 }
@@ -1177,7 +1177,7 @@ impl Assembler
 
         match opnd {
             Opnd::Stack { reg_temps, .. } => {
-                if let Some(reg_idx) = reg_temps.unwrap().get_reg(RegTemp::Stack(opnd.stack_idx())) {
+                if let Some(reg_idx) = reg_temps.unwrap().get_reg(opnd.reg_temp()) {
                     reg_opnd(opnd, reg_idx)
                 } else {
                     mem_opnd(opnd)
@@ -1195,7 +1195,7 @@ impl Assembler
 
         // Allocate a register if there's no conflict.
         let mut reg_temps = self.ctx.get_reg_temps();
-        if reg_temps.alloc_reg(RegTemp::Stack(stack_idx)) { // TODO: Support Local
+        if reg_temps.alloc_reg(RegTemp::Stack(stack_idx)) {
             self.set_reg_temps(reg_temps);
         }
     }
@@ -1234,12 +1234,12 @@ impl Assembler
 
     /// Spill a stack temp from a register to the stack
     fn spill_temp(&mut self, opnd: Opnd) {
-        assert!(self.ctx.get_reg_temps().get_reg(RegTemp::Stack(opnd.stack_idx())).is_some()); // TODO: Support Local
+        assert_ne!(self.ctx.get_reg_temps().get_reg(opnd.reg_temp()), None);
 
         // Use different RegTemps for dest and src operands
         let reg_temps = self.ctx.get_reg_temps();
         let mut mem_temps = reg_temps;
-        mem_temps.dealloc_reg(RegTemp::Stack(opnd.stack_idx())); // TODO: Support Local
+        mem_temps.dealloc_reg(opnd.reg_temp());
 
         // Move the stack operand from a register to memory
         match opnd {
@@ -1714,7 +1714,7 @@ impl Assembler {
         // If the slot is already used, which is a valid optimization to avoid spills,
         // give up the verification.
         let canary_opnd = if cfg!(debug_assertions) && self.leaf_ccall && opnds.iter().all(|opnd|
-            opnd.get_stack_idx() != canary_opnd.get_stack_idx()
+            opnd.get_reg_temp() != canary_opnd.get_reg_temp()
         ) {
             asm_comment!(self, "set stack canary");
             self.mov(canary_opnd, vm_stack_canary().into());
