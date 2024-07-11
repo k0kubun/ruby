@@ -431,35 +431,50 @@ pub enum RegTemp {
 pub struct RegTemps([Option<RegTemp>; MAX_TEMP_REGS]);
 
 impl RegTemps {
-    // TODO: Return RegTemp
-    pub fn get(&self, stack_idx: u8) -> bool {
-        self.get_reg(RegTemp::Stack(stack_idx)).is_some() // TODO: Support Local
+    /// Return the index of the register for a given stack value if allocated.
+    pub fn get_reg(&self, temp: RegTemp) -> Option<usize> {
+        self.0.iter().enumerate()
+            .find(|(_, &reg_temp)| reg_temp == Some(temp))
+            .map(|(reg_idx, _)| reg_idx)
     }
 
-    pub fn set(&mut self, stack_idx: u8, value: bool) {
-        let reg_index = stack_idx as usize % MAX_TEMP_REGS;
-        // TODO: Support Local
-        if value && self.0[reg_index].is_none() {
-            self.0[reg_index] = Some(RegTemp::Stack(stack_idx))
-        } else if !value && self.0[reg_index] == Some(RegTemp::Stack(stack_idx)) {
-            self.0[reg_index] = None;
+    /// Allocate a register for a given stack value if available.
+    /// Return true if self is updated.
+    pub fn alloc_reg(&mut self, temp: RegTemp) -> bool {
+        let stack_idx = match temp {
+            RegTemp::Stack(stack_idx) => stack_idx,
+        };
+        if self.conflicts_with(stack_idx) {
+            return false;
         }
+
+        let reg_idx = stack_idx as usize % MAX_TEMP_REGS;
+        if self.0[reg_idx].is_none() {
+            self.0[reg_idx] = Some(temp);
+            return true;
+        }
+        false
+    }
+
+    /// Deallocate a register for a given stack value if in use.
+    /// Return true if self is updated.
+    pub fn dealloc_reg(&mut self, temp: RegTemp) -> bool {
+        for reg_temp in self.0.iter_mut() {
+            if *reg_temp == Some(temp) {
+                *reg_temp = None;
+                return true;
+            }
+        }
+        false
     }
 
     /// Return true if there's a register that conflicts with a given stack_idx.
-    pub fn conflicts_with(&self, stack_idx: u8) -> bool {
-        let reg_index = stack_idx as usize % MAX_TEMP_REGS;
-        match self.0[reg_index] {
+    fn conflicts_with(&self, stack_idx: u8) -> bool {
+        let reg_idx = stack_idx as usize % MAX_TEMP_REGS;
+        match self.0[reg_idx] {
             Some(temp) => temp != RegTemp::Stack(stack_idx), // TODO: Support Local
             None => false,
         }
-    }
-
-    /// Return the index of the register for a given stack value if allocated.
-    fn get_reg(&self, temp: RegTemp) -> Option<usize> {
-        self.0.iter().enumerate()
-            .find(|(_, &reg_temp)| reg_temp == Some(temp))
-            .map(|(reg_index, _)| reg_index)
     }
 }
 
@@ -2482,7 +2497,7 @@ impl Context {
     pub fn dealloc_temp_reg(&mut self, stack_idx: u8) {
         if stack_idx < MAX_REG_TEMPS {
             let mut reg_temps = self.get_reg_temps();
-            reg_temps.set(stack_idx, false);
+            reg_temps.dealloc_reg(RegTemp::Stack(stack_idx)); // TODO: Support Local
             self.set_reg_temps(reg_temps);
         }
     }
@@ -4285,36 +4300,25 @@ mod tests {
 
         // 0 means every slot is not spilled
         for stack_idx in 0..MAX_REG_TEMPS {
-            assert_eq!(reg_temps.get(stack_idx), false);
+            assert_eq!(reg_temps.get_reg(RegTemp::Stack(stack_idx)), None);
         }
 
-        // Set 0, 2, 6 (RegTemps: 10100010)
-        reg_temps.set(0, true);
-        reg_temps.set(2, true);
-        reg_temps.set(3, true);
-        reg_temps.set(3, false);
-        reg_temps.set(6, true);
+        // Set 0, 2, 6 (RegTemps: [Some(0), Some(6), Some(2), None, None])
+        reg_temps.alloc_reg(RegTemp::Stack(0));
+        reg_temps.alloc_reg(RegTemp::Stack(2));
+        reg_temps.alloc_reg(RegTemp::Stack(3));
+        reg_temps.dealloc_reg(RegTemp::Stack(3));
+        reg_temps.alloc_reg(RegTemp::Stack(6));
 
         // Get 0..8
-        assert_eq!(reg_temps.get(0), true);
-        assert_eq!(reg_temps.get(1), false);
-        assert_eq!(reg_temps.get(2), true);
-        assert_eq!(reg_temps.get(3), false);
-        assert_eq!(reg_temps.get(4), false);
-        assert_eq!(reg_temps.get(5), false);
-        assert_eq!(reg_temps.get(6), true);
-        assert_eq!(reg_temps.get(7), false);
-
-        // Test conflicts
-        assert_eq!(5, get_option!(num_temp_regs));
-        assert_eq!(reg_temps.conflicts_with(0), false); // already set, but no conflict
-        assert_eq!(reg_temps.conflicts_with(1), true);  // not set, and will conflict with 6
-        assert_eq!(reg_temps.conflicts_with(2), false); // already set, but no conflict
-        assert_eq!(reg_temps.conflicts_with(3), false);
-        assert_eq!(reg_temps.conflicts_with(4), false);
-        assert_eq!(reg_temps.conflicts_with(5), true);  // not set, and will conflict with 0
-        assert_eq!(reg_temps.conflicts_with(6), false); // already set, but no conflict
-        assert_eq!(reg_temps.conflicts_with(7), true);  // not set, but will conflict with 2
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(0)), Some(0));
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(1)), None);
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(2)), Some(2));
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(3)), None);
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(4)), None);
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(5)), None);
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(6)), Some(1));
+        assert_eq!(reg_temps.get_reg(RegTemp::Stack(7)), None);
     }
 
     #[test]

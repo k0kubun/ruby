@@ -6,7 +6,7 @@ use crate::codegen::{gen_outlined_exit, gen_counted_exit};
 use crate::cruby::{vm_stack_canary, SIZEOF_VALUE_I32, VALUE};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, OutlinedCb};
-use crate::core::{Context, RegTemps, MAX_REG_TEMPS};
+use crate::core::{Context, RegTemp, RegTemps, MAX_REG_TEMPS};
 use crate::options::*;
 use crate::stats::*;
 
@@ -1175,11 +1175,11 @@ impl Assembler
         }
 
         // Convert Opnd::Stack to Opnd::Reg
-        fn reg_opnd(opnd: &Opnd) -> Opnd {
+        fn reg_opnd(opnd: &Opnd, reg_idx: usize) -> Opnd {
             let regs = Assembler::get_temp_regs();
             if let Opnd::Stack { num_bits, .. } = *opnd {
                 incr_counter!(temp_reg_opnd);
-                Opnd::Reg(regs[opnd.reg_idx()]).with_num_bits(num_bits).unwrap()
+                Opnd::Reg(regs[reg_idx]).with_num_bits(num_bits).unwrap()
             } else {
                 unreachable!()
             }
@@ -1187,8 +1187,8 @@ impl Assembler
 
         match opnd {
             Opnd::Stack { reg_temps, .. } => {
-                if opnd.stack_idx() < MAX_REG_TEMPS && reg_temps.unwrap().get(opnd.stack_idx()) {
-                    reg_opnd(opnd)
+                if let Some(reg_idx) = reg_temps.unwrap().get_reg(RegTemp::Stack(opnd.stack_idx())) {
+                    reg_opnd(opnd, reg_idx)
                 } else {
                     mem_opnd(opnd)
                 }
@@ -1205,10 +1205,7 @@ impl Assembler
 
         // Allocate a register if there's no conflict.
         let mut reg_temps = self.ctx.get_reg_temps();
-        if reg_temps.conflicts_with(stack_idx) {
-            assert!(!reg_temps.get(stack_idx));
-        } else {
-            reg_temps.set(stack_idx, true);
+        if reg_temps.alloc_reg(RegTemp::Stack(stack_idx)) { // TODO: Support Local
             self.set_reg_temps(reg_temps);
         }
     }
@@ -1225,7 +1222,7 @@ impl Assembler
         // Forget registers above the stack top
         let mut reg_temps = self.ctx.get_reg_temps();
         for stack_idx in self.ctx.get_stack_size()..MAX_REG_TEMPS {
-            reg_temps.set(stack_idx, false);
+            reg_temps.dealloc_reg(RegTemp::Stack(stack_idx)); // TODO: Support Local
         }
         self.set_reg_temps(reg_temps);
 
@@ -1233,10 +1230,9 @@ impl Assembler
         if self.ctx.get_reg_temps() != RegTemps::default() {
             asm_comment!(self, "spill_temps: {:?} -> {:?}", self.ctx.get_reg_temps(), RegTemps::default());
             for stack_idx in 0..u8::min(MAX_REG_TEMPS, self.ctx.get_stack_size()) {
-                if self.ctx.get_reg_temps().get(stack_idx) {
+                if reg_temps.dealloc_reg(RegTemp::Stack(stack_idx)) { // TODO: Support Local
                     let idx = self.ctx.get_stack_size() - 1 - stack_idx;
                     self.spill_temp(self.stack_opnd(idx.into()));
-                    reg_temps.set(stack_idx, false);
                 }
             }
             self.ctx.set_reg_temps(reg_temps);
@@ -1248,12 +1244,12 @@ impl Assembler
 
     /// Spill a stack temp from a register to the stack
     fn spill_temp(&mut self, opnd: Opnd) {
-        assert!(self.ctx.get_reg_temps().get(opnd.stack_idx()));
+        assert!(self.ctx.get_reg_temps().get_reg(RegTemp::Stack(opnd.stack_idx())).is_some()); // TODO: Support Local
 
         // Use different RegTemps for dest and src operands
         let reg_temps = self.ctx.get_reg_temps();
         let mut mem_temps = reg_temps;
-        mem_temps.set(opnd.stack_idx(), false);
+        mem_temps.dealloc_reg(RegTemp::Stack(opnd.stack_idx())); // TODO: Support Local
 
         // Move the stack operand from a register to memory
         match opnd {
@@ -1273,16 +1269,6 @@ impl Assembler
         if self.ctx.get_reg_temps() != reg_temps {
             asm_comment!(self, "reg_temps: {:?} -> {:?}", self.ctx.get_reg_temps(), reg_temps);
             self.ctx.set_reg_temps(reg_temps);
-            self.verify_reg_temps();
-        }
-    }
-
-    /// Assert there's no conflict in stack temp register allocation
-    fn verify_reg_temps(&self) {
-        for stack_idx in 0..MAX_REG_TEMPS {
-            if self.ctx.get_reg_temps().get(stack_idx) {
-                assert!(!self.ctx.get_reg_temps().conflicts_with(stack_idx));
-            }
         }
     }
 
