@@ -1182,6 +1182,7 @@ pub fn gen_single_block(
     // Create a backend assembler instance
     let mut asm = Assembler::new();
     asm.ctx = ctx;
+    asm.local_size = Some(unsafe { get_iseq_body_local_table_size(iseq) });
 
     #[cfg(feature = "disasm")]
     if get_option_ref!(dump_disasm).is_some() {
@@ -2278,7 +2279,7 @@ fn gen_getlocal_generic(
 ) -> Option<CodegenStatus> {
     let local_opnd = if level == 0 && jit.assume_no_ep_escape(asm) {
         // Load the local using SP register
-        asm.ctx.ep_opnd(-(ep_offset as i32))
+        asm.local_opnd(ep_offset)
     } else {
         // Load environment pointer EP (level 0) from CFP
         let ep_opnd = gen_get_ep(asm, level);
@@ -2359,8 +2360,11 @@ fn gen_setlocal_generic(
 
     let (flags_opnd, local_opnd) = if level == 0 && jit.assume_no_ep_escape(asm) {
         // Load flags and the local using SP register
-        let local_opnd = asm.ctx.ep_opnd(-(ep_offset as i32));
         let flags_opnd = asm.ctx.ep_opnd(VM_ENV_DATA_INDEX_FLAGS as i32);
+        let local_opnd = asm.local_opnd(ep_offset);
+
+        // Allocate a register to the new local operand
+        asm.alloc_temp_reg(local_opnd.reg_temp());
         (flags_opnd, local_opnd)
     } else {
         // Load flags and the local for the level

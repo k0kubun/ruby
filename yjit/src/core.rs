@@ -421,7 +421,7 @@ pub const MAX_REG_TEMPS: u8 = 8;
 #[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
 pub enum RegTemp {
     Stack(u8),
-    //Local(u8),
+    Local(u8),
 }
 
 /// RegTemps manages a set of registers used for temporary values on the stack.
@@ -441,8 +441,17 @@ impl RegTemps {
     /// Allocate a register for a given stack value if available.
     /// Return true if self is updated.
     pub fn alloc_reg(&mut self, temp: RegTemp) -> bool {
-        // If a given value is already set, skip allocation.
+        // If a given temp already has a register, skip allocation.
         if self.get_reg(temp).is_some() {
+            return false;
+        }
+
+        // If the index is too large to encode with with 3 bits, give up.
+        let temp_idx = match temp {
+            RegTemp::Stack(stack_idx) => stack_idx,
+            RegTemp::Local(local_idx) => local_idx,
+        };
+        if temp_idx >= MAX_REG_TEMPS {
             return false;
         }
 
@@ -467,12 +476,16 @@ impl RegTemps {
     }
 
     /// Find an available register and return the index of it.
-    fn find_unused_reg(&self, new_temp: RegTemp) -> Option<usize> {
+    fn find_unused_reg(&self, temp: RegTemp) -> Option<usize> {
+        if get_option!(num_temp_regs) == 0 {
+            return None;
+        }
+
         // If the default index for the stack value is available, use that to minimize
         // discrepancies among Contexts.
-        let default_idx = match new_temp {
+        let default_idx = match temp {
             RegTemp::Stack(stack_idx) => stack_idx.as_usize() % MAX_TEMP_REGS,
-            //RegTemp::Local(index) => MAX_TEMP_REGS - (index.as_usize() % MAX_TEMP_REGS) - 1,
+            RegTemp::Local(local_idx) => MAX_TEMP_REGS - (local_idx.as_usize() % MAX_TEMP_REGS) - 1,
         };
         if self.0[default_idx].is_none() {
             return Some(default_idx);
@@ -481,9 +494,9 @@ impl RegTemps {
         // If not, pick any other available register. Like default indexes, prefer
         // lower indexes for Stack, and higher indexes for Local.
         let temps = self.0.iter();
-        match new_temp {
+        match temp {
             RegTemp::Stack(_) => temps.enumerate().find(|(_, temp)| temp.is_none()),
-            //RegTemp::Local(_) => temps.rev().enumerate().find(|(_, temp)| temp.is_none()),
+            RegTemp::Local(_) => temps.rev().enumerate().find(|(_, temp)| temp.is_none()),
         }.map(|(index, _)| index)
     }
 }
@@ -1011,14 +1024,14 @@ impl Context {
             if let Some(temp) = temp {
                 bits.push_u1(1); // Some
                 match temp {
-                    RegTemp::Stack(index) => {
+                    RegTemp::Stack(stack_idx) => {
                         bits.push_u1(0); // Stack
-                        bits.push_u3(index);
+                        bits.push_u3(stack_idx);
                     }
-                    //RegTemp::Local(index) => {
-                    //    bits.push_u1(1); // Local
-                    //    bits.push_u3(index);
-                    //}
+                    RegTemp::Local(local_idx) => {
+                        bits.push_u1(1); // Local
+                        bits.push_u3(local_idx);
+                    }
                 }
             } else {
                 bits.push_u1(0); // None
@@ -1109,8 +1122,7 @@ impl Context {
                 let temp = if bits.read_u1(&mut idx) == 0 { // RegTemp::Stack
                     RegTemp::Stack(bits.read_u3(&mut idx))
                 } else {
-                    unimplemented!();
-                    //RegTemp::Local(bits.read_u3(&mut idx))
+                    RegTemp::Local(bits.read_u3(&mut idx))
                 };
                 ctx.reg_temps.0[index] = Some(temp);
             }
@@ -2907,15 +2919,14 @@ impl Assembler {
             }
         }
 
-        // Allocate a register to the stack operand
-        if self.ctx.stack_size < MAX_REG_TEMPS {
-            self.alloc_temp_reg(self.ctx.stack_size);
-        }
-
         self.ctx.stack_size += 1;
         self.ctx.sp_offset += 1;
 
-        return self.stack_opnd(0);
+        // Allocate a register to the new stack operand
+        let stack_opnd = self.stack_opnd(0);
+        self.alloc_temp_reg(stack_opnd.reg_temp());
+
+        stack_opnd
     }
 
     /// Push one new value on the temp stack
@@ -2985,6 +2996,20 @@ impl Assembler {
             idx,
             num_bits: 64,
             stack_size: self.ctx.stack_size,
+            local_size: None, // not needed for stack temps
+            sp_offset: self.ctx.sp_offset,
+            reg_temps: None, // push_insn will set this
+        }
+    }
+
+    /// Get an operand pointing to a local variable
+    pub fn local_opnd(&self, ep_offset: u32) -> Opnd {
+        let idx = self.ctx.stack_size as i32 + ep_offset as i32;
+        Opnd::Stack {
+            idx,
+            num_bits: 64,
+            stack_size: self.ctx.stack_size,
+            local_size: Some(self.local_size.unwrap()), // this must exist for locals
             sp_offset: self.ctx.sp_offset,
             reg_temps: None, // push_insn will set this
         }
