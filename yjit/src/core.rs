@@ -493,10 +493,10 @@ impl RegTemps {
 
         // If not, pick any other available register. Like default indexes, prefer
         // lower indexes for Stack, and higher indexes for Local.
-        let temps = self.0.iter();
+        let mut index_temps = self.0.iter().enumerate();
         match temp {
-            RegTemp::Stack(_) => temps.enumerate().find(|(_, temp)| temp.is_none()),
-            RegTemp::Local(_) => temps.rev().enumerate().find(|(_, temp)| temp.is_none()),
+            RegTemp::Stack(_) => index_temps.find(|(_, temp)| temp.is_none()),
+            RegTemp::Local(_) => index_temps.rev().find(|(_, temp)| temp.is_none()),
         }.map(|(index, _)| index)
     }
 }
