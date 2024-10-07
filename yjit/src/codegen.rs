@@ -7855,18 +7855,19 @@ fn gen_send_iseq(
     // Create a context for the callee
     let mut callee_ctx = Context::default();
 
-    // Transfer some stack temp registers to the callee's locals for arguments.
-    let mapped_temps = if !forwarding {
-        asm.map_temp_regs_to_args(&mut callee_ctx, argc)
-    } else {
-        // When forwarding, the callee's local table has only a callinfo,
-        // so we can't map the actual arguments to the callee's locals.
-        vec![]
-    };
-
-    // Spill stack temps and locals that are not used by the callee.
+    // Spill locals and stack temps that will not be used by the callee.
     // This must be done before changing the SP register.
-    asm.spill_regs_except(&mapped_temps);
+    let arg_opnds = (0..argc).map(|arg_idx| {
+        RegOpnd::Stack((asm.ctx.get_stack_size() as i32 - argc + arg_idx).try_into().unwrap())
+    }).collect();
+    asm.spill_regs_except(&arg_opnds);
+
+    // Populate as many registers as possible with arguments to minimize the number of
+    // RegMapping variations in the callee blocks. When forwarding, the callee has only
+    // a callinfo in locals, so we can't map the actual arguments to the callee's locals.
+    if argc > 0 && !forwarding {
+        asm.map_args_to_regs(&mut callee_ctx, argc);
+    }
 
     // Saving SP before calculating ep avoids a dependency on a register
     // However this must be done after referencing frame.recv, which may be SP-relative
@@ -7930,21 +7931,21 @@ fn gen_send_iseq(
     // Now that callee_ctx is prepared, discover a block that can be reused if we move some registers.
     // If there's such a block, move registers accordingly to avoid creating a new block.
     let blockid = BlockId { iseq, idx: start_pc_offset };
-    if !mapped_temps.is_empty() {
-        // Discover a block that have the same things in different (or same) registers
-        if let Some(block_ctx) = find_block_ctx_with_same_regs(blockid, &callee_ctx) {
-            // List pairs of moves for making the register mappings compatible
-            let mut moves = vec![];
-            for &reg_opnd in callee_ctx.get_reg_mapping().get_reg_opnds().iter() {
-                let old_reg = TEMP_REGS[callee_ctx.get_reg_mapping().get_reg(reg_opnd).unwrap()];
-                let new_reg = TEMP_REGS[block_ctx.get_reg_mapping().get_reg(reg_opnd).unwrap()];
-                moves.push((new_reg, Opnd::Reg(old_reg)));
-            }
+    if let Some(block_ctx) = find_block_ctx_with_same_regs(blockid, &callee_ctx) {
+        // List pairs of moves for making the register mappings compatible
+        let mut moves = vec![];
+        for &reg_opnd in callee_ctx.get_reg_mapping().get_reg_opnds().iter() {
+            let old_reg = TEMP_REGS[callee_ctx.get_reg_mapping().get_reg(reg_opnd).unwrap()];
+            let new_reg = TEMP_REGS[block_ctx.get_reg_mapping().get_reg(reg_opnd).unwrap()];
+            moves.push((new_reg, Opnd::Reg(old_reg)));
+        }
 
-            // Shuffle them to break cycles and generate the moves
-            let moves = Assembler::reorder_reg_moves(&moves);
-            for (reg, opnd) in moves {
-                asm.load_into(Opnd::Reg(reg), opnd);
+        // Shuffle them to break cycles and generate the moves
+        let moves = Assembler::reorder_reg_moves(&moves);
+        if !moves.is_empty() {
+            asm_comment!(asm, "shuffle registers: {:?}", block_ctx.get_reg_mapping());
+            for (new_reg, old_reg_opnd) in moves {
+                asm.load_into(Opnd::Reg(new_reg), old_reg_opnd);
             }
             callee_ctx.set_reg_mapping(block_ctx.get_reg_mapping());
         }

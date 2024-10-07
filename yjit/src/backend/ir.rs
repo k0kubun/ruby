@@ -1229,7 +1229,7 @@ impl Assembler
     pub fn alloc_reg(&mut self, mapping: RegOpnd) {
         // Allocate a register if there's no conflict.
         let mut reg_mapping = self.ctx.get_reg_mapping();
-        if reg_mapping.alloc_reg(mapping) {
+        if reg_mapping.alloc_reg(mapping).is_some() {
             self.set_reg_mapping(reg_mapping);
         }
     }
@@ -1241,27 +1241,28 @@ impl Assembler
         self.ctx.clear_local_types();
     }
 
-    /// Repurpose stack temp registers to the corresponding locals for arguments
-    pub fn map_temp_regs_to_args(&mut self, callee_ctx: &mut Context, argc: i32) -> Vec<RegOpnd> {
+    /// Move as many arguments to registers as possible
+    pub fn map_args_to_regs(&mut self, callee_ctx: &mut Context, argc: i32) {
+        let mut caller_reg_mapping = self.ctx.get_reg_mapping();
         let mut callee_reg_mapping = callee_ctx.get_reg_mapping();
-        let mut mapped_temps = vec![];
 
         for arg_idx in 0..argc {
             let stack_idx: u8 = (self.ctx.get_stack_size() as i32 - argc + arg_idx).try_into().unwrap();
             let temp_opnd = RegOpnd::Stack(stack_idx);
+            let local_opnd = RegOpnd::Local(arg_idx.try_into().unwrap());
 
-            // For each argument, if the stack temp for it has a register,
-            // let the callee use the register for the local variable.
-            if let Some(reg_idx) = self.ctx.get_reg_mapping().get_reg(temp_opnd) {
-                let local_opnd = RegOpnd::Local(arg_idx.try_into().unwrap());
+            if let Some(reg_idx) = caller_reg_mapping.get_reg(temp_opnd) {
+                // If an argument is already in a register, just let the callee use it.
                 callee_reg_mapping.set_reg(local_opnd, reg_idx);
-                mapped_temps.push(temp_opnd);
+            } else if let Some(reg_idx) = caller_reg_mapping.alloc_reg(temp_opnd) {
+                // If an argument is currently not in a register, move it to a register if available.
+                self.mov(Opnd::Reg(TEMP_REGS[reg_idx]), self.stack_opnd(argc - arg_idx));
+                callee_reg_mapping.set_reg(local_opnd, reg_idx);
             }
         }
 
-        asm_comment!(self, "local maps: {:?}", callee_reg_mapping);
+        asm_comment!(self, "local maps: {:?} -> {:?}", caller_reg_mapping, callee_reg_mapping);
         callee_ctx.set_reg_mapping(callee_reg_mapping);
-        mapped_temps
     }
 
     /// Spill all live registers to the stack
@@ -1269,8 +1270,8 @@ impl Assembler
         self.spill_regs_except(&vec![]);
     }
 
-    /// Spill all live registers except `ignored_temps` to the stack
-    pub fn spill_regs_except(&mut self, ignored_temps: &Vec<RegOpnd>) {
+    /// Spill all live registers except `ignored_opnds` to the stack
+    pub fn spill_regs_except(&mut self, ignored_opnds: &Vec<RegOpnd>) {
         // Forget registers above the stack top
         let mut reg_mapping = self.ctx.get_reg_mapping();
         for stack_idx in self.ctx.get_stack_size()..MAX_CTX_TEMPS as u8 {
@@ -1287,7 +1288,7 @@ impl Assembler
         let mut spilled_opnds = vec![];
         for stack_idx in 0..u8::min(MAX_CTX_TEMPS as u8, self.ctx.get_stack_size()) {
             let reg_opnd = RegOpnd::Stack(stack_idx);
-            if !ignored_temps.contains(&reg_opnd) && reg_mapping.dealloc_reg(reg_opnd) {
+            if !ignored_opnds.contains(&reg_opnd) && reg_mapping.dealloc_reg(reg_opnd) {
                 let idx = self.ctx.get_stack_size() - 1 - stack_idx;
                 let spilled_opnd = self.stack_opnd(idx.into());
                 spilled_opnds.push(spilled_opnd);

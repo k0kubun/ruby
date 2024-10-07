@@ -378,29 +378,29 @@ impl RegMapping {
     }
 
     /// Allocate a register for a given operand if available.
-    /// Return true if self is updated.
-    pub fn alloc_reg(&mut self, opnd: RegOpnd) -> bool {
+    /// Return the index of the register if allocated.
+    pub fn alloc_reg(&mut self, opnd: RegOpnd) -> Option<usize> {
         // If a given opnd already has a register, skip allocation.
         if self.get_reg(opnd).is_some() {
-            return false;
+            return None;
         }
 
         // If the index is too large to encode with with 3 bits, give up.
         match opnd {
             RegOpnd::Stack(stack_idx) => if stack_idx >= MAX_CTX_TEMPS as u8 {
-                return false;
+                return None;
             }
             RegOpnd::Local(local_idx) => if local_idx >= MAX_CTX_LOCALS as u8 {
-                return false;
+                return None;
             }
         };
 
         // Allocate a register if available.
         if let Some(reg_idx) = self.find_unused_reg(opnd) {
             self.0[reg_idx] = Some(opnd);
-            return true;
+            return Some(reg_idx);
         }
-        false
+        None
     }
 
     /// Deallocate a register for a given operand if in use.
