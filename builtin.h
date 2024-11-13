@@ -112,6 +112,13 @@ rb_builtin_basic_definition_p(rb_execution_context_t *ec, VALUE klass, VALUE id_
     return rb_method_basic_definition_p(klass, rb_sym2id(id_sym)) ? Qtrue : Qfalse;
 }
 
+static inline VALUE
+rb_builtin_warn(rb_execution_context_t *ec, VALUE klass, VALUE message)
+{
+    rb_warn("%s", RSTRING_PTR(message));
+    return Qnil;
+}
+
 #define LOCAL_PTR(local) local ## __ptr
 
 // dump/load

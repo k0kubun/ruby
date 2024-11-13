@@ -215,6 +215,58 @@ class Array
   end
 
   with_yjit do
+    if Primitive.rb_builtin_basic_definition_p(:all?)
+      undef :all?
+
+      def all?(pattern = unspecified = true) # :nodoc:
+        Primitive.attr! :inline_block, :c_trace
+
+        _i = 0
+        value = nil
+        if !unspecified
+          Primitive.rb_builtin_warn("given block not used") if defined?(yield)
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return false unless pattern === value
+          end
+        elsif defined?(yield)
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return false unless yield(value)
+          end
+        else
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return false unless value
+          end
+        end
+        true
+      end
+    end
+
+    if Primitive.rb_builtin_basic_definition_p(:any?)
+      undef :any?
+
+      def any?(pattern = unspecified = true) # :nodoc:
+        Primitive.attr! :inline_block, :c_trace
+
+        _i = 0
+        value = nil
+        if !unspecified
+          Primitive.rb_builtin_warn("given block not used") if defined?(yield)
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return true if pattern === value
+          end
+        elsif defined?(yield)
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return true if yield(value)
+          end
+        else
+          while Primitive.cexpr!(%q{ ary_fetch_next(self, LOCAL_PTR(_i), LOCAL_PTR(value)) })
+            return true if value
+          end
+        end
+        false
+      end
+    end
+
     if Primitive.rb_builtin_basic_definition_p(:each)
       undef :each
 
