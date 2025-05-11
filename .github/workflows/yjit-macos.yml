@@ -1,8 +1,6 @@
 name: YJIT macOS Arm64
 on:
   push:
-    branches:
-      - master
     paths-ignore:
       - 'doc/**'
       - '**/man/*'
