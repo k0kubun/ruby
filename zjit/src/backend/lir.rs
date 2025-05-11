@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::mem::take;
-use crate::{cruby::VALUE, hir::FrameState};
+use crate::cruby::{Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VM_ENV_DATA_SIZE};
+use crate::{cruby::VALUE};
 use crate::backend::current::*;
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
@@ -273,9 +275,9 @@ pub enum Target
     /// Pointer to a piece of ZJIT-generated code
     CodePtr(CodePtr),
     // Side exit with a counter
-    SideExit(FrameState),
+    SideExit { pc: *const VALUE, stack: Vec<Opnd>, locals: Vec<Opnd> },
     /// Pointer to a side exit code
-    SideExitPtr(CodePtr),
+    SideExitPtr(CodePtr), // TODO: Use Label instead
     /// A label within the generated code
     Label(Label),
 }
@@ -1203,6 +1205,8 @@ impl Assembler
             }
         }
 
+        // TODO: update live_range for VReg in Target::SideExit
+
         self.insns.push(insn);
     }
 
@@ -1605,6 +1609,36 @@ impl Assembler
                 }
             }
 
+            if let Some(target) = insn.target_mut() {
+                if let Target::SideExit { stack, locals, ..} = target {
+                    for opnd in stack.iter_mut() {
+                        match *opnd {
+                            Opnd::VReg { idx, num_bits } => {
+                                *opnd = Opnd::Reg(reg_mapping[idx].unwrap()).with_num_bits(num_bits).unwrap();
+                            },
+                            Opnd::Mem(Mem { base: MemBase::VReg(idx), disp, num_bits }) => {
+                                let base = MemBase::Reg(reg_mapping[idx].unwrap().reg_no);
+                                *opnd = Opnd::Mem(Mem { base, disp, num_bits });
+                            }
+                            _ => {},
+                        }
+                    }
+
+                    for opnd in locals.iter_mut() {
+                        match *opnd {
+                            Opnd::VReg { idx, num_bits } => {
+                                *opnd = Opnd::Reg(reg_mapping[idx].unwrap()).with_num_bits(num_bits).unwrap();
+                            },
+                            Opnd::Mem(Mem { base: MemBase::VReg(idx), disp, num_bits }) => {
+                                let base = MemBase::Reg(reg_mapping[idx].unwrap().reg_no);
+                                *opnd = Opnd::Mem(Mem { base, disp, num_bits });
+                            }
+                            _ => {},
+                        }
+                    }
+                }
+            }
+
             // Push instruction(s)
             let is_ccall = matches!(insn, Insn::CCall { .. });
             match insn {
@@ -1651,7 +1685,7 @@ impl Assembler
     #[must_use]
     pub fn compile(mut self, cb: &mut CodeBlock) -> Option<(CodePtr, Vec<u32>)>
     {
-        self.compile_side_exits(cb)?;
+        //self.compile_side_exits(cb)?;
 
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
@@ -1670,46 +1704,46 @@ impl Assembler
     /// Compile Target::SideExit and convert it into Target::CodePtr for all instructions
     #[must_use]
     pub fn compile_side_exits(&mut self, cb: &mut CodeBlock) -> Option<()> {
-        for insn in self.insns.iter_mut() {
-            if let Some(target) = insn.target_mut() {
-                if let Target::SideExit(state) = target {
-                    let side_exit_ptr = cb.get_write_ptr();
-                    let mut asm = Assembler::new();
-                    asm_comment!(asm, "side exit: {state}");
-                    asm.ccall(Self::rb_zjit_side_exit as *const u8, vec![]);
-                    asm.compile(cb)?;
-                    *target = Target::SideExitPtr(side_exit_ptr);
+        let mut targets = HashMap::new();
+        for (idx, insn) in self.insns.iter().enumerate() {
+            if let Some(target @ Target::SideExit { .. }) = insn.target() {
+                targets.insert(idx, target.clone());
+            }
+        }
+
+        for (idx, target) in targets {
+            if let Target::SideExit { pc, stack, locals } = target {
+                let side_exit_label = self.new_label("side_exit".into());
+                self.write_label(side_exit_label.clone());
+
+                asm_comment!(self, "write stack slots: {stack:?}");
+                for (idx, &opnd) in stack.iter().enumerate() {
+                    self.mov(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
                 }
+
+                asm_comment!(self, "write locals: {locals:?}");
+                for (idx, &opnd) in locals.iter().enumerate() {
+                    self.mov(Opnd::mem(64, SP, (-(VM_ENV_DATA_SIZE as i32) - locals.len() as i32 + idx as i32) * SIZEOF_VALUE_I32), opnd);
+                }
+
+                asm_comment!(self, "save cfp->pc");
+                //self.mov(, Opnd::const_ptr(pc as *const u8));
+                self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::const_ptr(pc as *const u8));
+                self.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::Reg(Assembler::SCRATCH_REG));
+
+                asm_comment!(self, "save cfp->sp");
+                self.lea_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
+                let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
+                self.mov(cfp_sp, Opnd::Reg(Assembler::SCRATCH_REG));
+
+                asm_comment!(self, "exit to the interpreter2");
+                self.cret(Qundef.into());
+
+                *self.insns[idx].target_mut().unwrap() = side_exit_label;
             }
         }
         Some(())
     }
-
-    #[unsafe(no_mangle)]
-    extern "C" fn rb_zjit_side_exit() {
-        unimplemented!("side exits are not implemented yet");
-    }
-
-    /*
-    /// Compile with a limited number of registers. Used only for unit tests.
-    #[cfg(test)]
-    pub fn compile_with_num_regs(self, cb: &mut CodeBlock, num_regs: usize) -> (CodePtr, Vec<u32>)
-    {
-        let mut alloc_regs = Self::get_alloc_regs();
-        let alloc_regs = alloc_regs.drain(0..num_regs).collect();
-        self.compile_with_regs(cb, None, alloc_regs).unwrap()
-    }
-
-    /// Return true if the next ccall() is expected to be leaf.
-    pub fn get_leaf_ccall(&mut self) -> bool {
-        self.leaf_ccall
-    }
-
-    /// Assert that the next ccall() is going to be leaf.
-    pub fn expect_leaf_ccall(&mut self) {
-        self.leaf_ccall = true;
-    }
-    */
 }
 
 impl fmt::Debug for Assembler {
@@ -1968,6 +2002,10 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&[opnd]));
         self.push_insn(Insn::Lea { opnd, out });
         out
+    }
+
+    pub fn lea_into(&mut self, out: Opnd, opnd: Opnd) {
+        self.push_insn(Insn::Lea { opnd, out });
     }
 
     #[must_use]

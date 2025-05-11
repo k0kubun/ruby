@@ -1690,6 +1690,10 @@ impl FrameState {
         self.stack.iter()
     }
 
+    pub fn locals(&self) -> Iter<InsnId> {
+        self.locals.iter()
+    }
+
     /// Push a stack operand
     fn stack_push(&mut self, opnd: InsnId) {
         self.stack.push(opnd);

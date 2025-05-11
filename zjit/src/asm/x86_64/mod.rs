@@ -1039,7 +1039,7 @@ pub fn mov(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
             }
 
             let output_num_bits = if mem.num_bits > 32 { 32 } else { mem.num_bits.into() };
-            assert!(imm_num_bits(uimm.value as i64) <= (output_num_bits as u8));
+            assert!(imm_num_bits(uimm.value as i64) <= (output_num_bits as u8), "uimm: {}, output: {}", uimm.value as i64, output_num_bits);
             cb.write_int(uimm.value, output_num_bits);
         },
         // * + Imm/UImm
