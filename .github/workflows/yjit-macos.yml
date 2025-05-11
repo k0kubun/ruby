@@ -62,10 +62,12 @@ jobs:
           #- test_task: 'check'
           #  configure: '--enable-yjit'
           #  yjit_opts: '--yjit'
-          - test_task: 'check'
+          - test_task: 'test-all'
             configure: '--enable-yjit=dev'
             yjit_opts: '--yjit-call-threshold=1 --yjit-verify-ctx --yjit-code-gc'
-            specopts: '-T --yjit-call-threshold=1 -T --yjit-verify-ctx -T --yjit-code-gc'
+          - test_task: 'test-all'
+            configure: '--enable-yjit=dev'
+            yjit_opts: '--yjit-call-threshold=1'
       fail-fast: false
 
     env:
