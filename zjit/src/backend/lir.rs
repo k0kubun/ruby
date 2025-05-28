@@ -1718,25 +1718,46 @@ impl Assembler
 
                 asm_comment!(self, "write stack slots: {stack:?}");
                 for (idx, &opnd) in stack.iter().enumerate() {
-                    self.mov(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
+                    let opnd = match opnd {
+                        Opnd::Mem(_) => {
+                            self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), opnd);
+                            Opnd::Reg(Assembler::SCRATCH_REG)
+                        }
+                        Opnd::Value(value) => {
+                            self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::UImm(value.as_u64())); // TODO: gc offset
+                            Opnd::Reg(Assembler::SCRATCH_REG)
+                        },
+                        _ => opnd,
+                    };
+                    self.store(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
                 }
 
                 asm_comment!(self, "write locals: {locals:?}");
                 for (idx, &opnd) in locals.iter().enumerate() {
-                    self.mov(Opnd::mem(64, SP, (-(VM_ENV_DATA_SIZE as i32) - locals.len() as i32 + idx as i32) * SIZEOF_VALUE_I32), opnd);
+                    let opnd = match opnd {
+                        Opnd::Mem(_) => {
+                            self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), opnd);
+                            Opnd::Reg(Assembler::SCRATCH_REG)
+                        }
+                        Opnd::Value(value) => {
+                            self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::UImm(value.as_u64())); // TODO: gc offset
+                            Opnd::Reg(Assembler::SCRATCH_REG)
+                        },
+                        _ => opnd,
+                    };
+                    self.store(Opnd::mem(64, SP, (-(VM_ENV_DATA_SIZE as i32) - locals.len() as i32 + idx as i32) * SIZEOF_VALUE_I32), opnd);
                 }
 
                 asm_comment!(self, "save cfp->pc");
-                //self.mov(, Opnd::const_ptr(pc as *const u8));
                 self.load_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::const_ptr(pc as *const u8));
-                self.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::Reg(Assembler::SCRATCH_REG));
+                self.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::Reg(Assembler::SCRATCH_REG));
 
                 asm_comment!(self, "save cfp->sp");
                 self.lea_into(Opnd::Reg(Assembler::SCRATCH_REG), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
                 let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
-                self.mov(cfp_sp, Opnd::Reg(Assembler::SCRATCH_REG));
+                self.store(cfp_sp, Opnd::Reg(Assembler::SCRATCH_REG));
 
-                asm_comment!(self, "exit to the interpreter2");
+                asm_comment!(self, "exit to the interpreter");
                 self.cret(Qundef.into());
 
                 *self.insns[idx].target_mut().unwrap() = side_exit_label;
