@@ -1104,7 +1104,7 @@ pub struct Function {
     union_find: std::cell::RefCell<UnionFind<InsnId>>,
     insn_types: Vec<Type>,
     blocks: Vec<Block>,
-    entry_block: BlockId,
+    entry_blocks: Vec<BlockId>,
     profiles: Option<ProfileOracle>,
 }
 
@@ -1116,7 +1116,7 @@ impl Function {
             insn_types: vec![],
             union_find: UnionFind::new().into(),
             blocks: vec![Block::default()],
-            entry_block: BlockId(0),
+            entry_blocks: vec![BlockId(0)],
             param_types: vec![],
             profiles: None,
         }
@@ -1442,7 +1442,7 @@ impl Function {
         self.insn_types.fill(types::Empty);
 
         // Fill parameter types
-        let entry_params = self.blocks[self.entry_block.0].params.iter();
+        let entry_params = self.blocks[self.entry_blocks[0].0].params.iter(); // TODO: should we handle other entry_blocks?
         let param_types = self.param_types.iter();
         assert_eq!(
             entry_params.len(),
@@ -1456,7 +1456,7 @@ impl Function {
         let rpo = self.rpo();
         // Walk the graph, computing types until fixpoint
         let mut reachable = BlockSet::with_capacity(self.blocks.len());
-        reachable.insert(self.entry_block);
+        reachable.insert(self.entry_blocks[0]); // TODO: should we handle other entry_blocks?
         loop {
             let mut changed = false;
             for &block in &rpo {
@@ -2338,7 +2338,7 @@ impl Function {
 
     /// Return a traversal of the `Function`'s `BlockId`s in reverse post-order.
     pub fn rpo(&self) -> Vec<BlockId> {
-        let mut result = self.po_from(self.entry_block);
+        let mut result = self.po_from(self.entry_blocks[0]);
         result.reverse();
         result
     }
@@ -2463,16 +2463,16 @@ impl Function {
         let rpo = self.rpo();
         // Begin with every block having every variable defined, except for the entry block, which
         // starts with nothing defined.
-        assigned_in[self.entry_block.0] = Some(InsnSet::with_capacity(self.insns.len()));
+        assigned_in[self.entry_blocks[0].0] = Some(InsnSet::with_capacity(self.insns.len())); // TODO: should we handle other entry_blocks?
         for &block in &rpo {
-            if block != self.entry_block {
+            if block != self.entry_blocks[0] { // TODO: should we handle other entry_blocks?
                 let mut all_ones = InsnSet::with_capacity(self.insns.len());
                 all_ones.insert_all();
                 assigned_in[block.0] = Some(all_ones);
             }
         }
         let mut worklist = VecDeque::with_capacity(self.num_blocks());
-        worklist.push_back(self.entry_block);
+        worklist.push_back(self.entry_blocks[0]); // TODO: should we handle other entry_blocks?
         while let Some(block) = worklist.pop_front() {
             let mut assigned = assigned_in[block.0].clone().unwrap();
             for &param in &self.blocks[block.0].params {
@@ -2830,9 +2830,19 @@ struct BytecodeInfo {
 }
 
 fn compute_bytecode_info(iseq: *const rb_iseq_t) -> BytecodeInfo {
+    // Process optional arguments as jump targets
+    let mut jump_targets = HashSet::new();
+    let opt_num = unsafe { get_iseq_body_param_opt_num(iseq) };
+    let opt_table = unsafe { get_iseq_body_param_opt_table(iseq) }; // `opt_num + 1` entries
+    for opt_idx in 0..=opt_num as isize{
+        let insn_idx = unsafe { opt_table.offset(opt_idx).read().as_u32() };
+        if insn_idx != 0 { // Function::new() creates the first block
+            jump_targets.insert(insn_idx);
+        }
+    }
+
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     let mut insn_idx = 0;
-    let mut jump_targets = HashSet::new();
     let mut has_send = false;
     while insn_idx < iseq_size {
         // Get the current pc and opcode
@@ -2983,9 +2993,6 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     let BytecodeInfo { jump_targets, has_send } = compute_bytecode_info(iseq);
     let mut insn_idx_to_block = HashMap::new();
     for insn_idx in jump_targets {
-        if insn_idx == 0 {
-            todo!("Separate entry block for param/self/...");
-        }
         insn_idx_to_block.insert(insn_idx, fun.new_block(insn_idx));
     }
 
@@ -3005,13 +3012,13 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     // item between commas in the source increase the parameter count by one,
     // regardless of parameter kind.
     let mut entry_state = FrameState::new(iseq);
-    fun.push_insn(fun.entry_block, Insn::Param { idx: SELF_PARAM_IDX });
+    fun.push_insn(fun.entry_blocks[0], Insn::Param { idx: SELF_PARAM_IDX });
     fun.param_types.push(types::BasicObject); // self
     for local_idx in 0..num_locals(iseq) {
         if local_idx < unsafe { get_iseq_body_param_size(iseq) }.as_usize() {
-            entry_state.locals.push(fun.push_insn(fun.entry_block, Insn::Param { idx: local_idx + 1 })); // +1 for self
+            entry_state.locals.push(fun.push_insn(fun.entry_blocks[00], Insn::Param { idx: local_idx + 1 })); // +1 for self // TODO: should we handle other entry blocks?
         } else {
-            entry_state.locals.push(fun.push_insn(fun.entry_block, Insn::Const { val: Const::Value(Qnil) }));
+            entry_state.locals.push(fun.push_insn(fun.entry_blocks[0], Insn::Const { val: Const::Value(Qnil) })); // TODO: should we handle other entry blocks?
         }
 
         let mut param_type = types::BasicObject;
@@ -3021,7 +3028,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
         }
         fun.param_types.push(param_type);
     }
-    queue.push_back((entry_state, fun.entry_block, /*insn_idx=*/0_u32));
+    queue.push_back((entry_state, fun.entry_blocks[0], /*insn_idx=*/0_u32)); // TODO: should we handle other entry blocks?
 
     let mut visited = HashSet::new();
 
@@ -3031,7 +3038,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
         if visited.contains(&block) { continue; }
         visited.insert(block);
         let (self_param, mut state) = if insn_idx == 0 {
-            (fun.blocks[fun.entry_block.0].params[SELF_PARAM_IDX], incoming_state.clone())
+            (fun.blocks[fun.entry_blocks[0].0].params[SELF_PARAM_IDX], incoming_state.clone()) // TODO: should we handle other entry blocks?
         } else {
             let self_param = fun.push_insn(block, Insn::Param { idx: SELF_PARAM_IDX });
             let mut result = FrameState::new(iseq);
@@ -3730,7 +3737,7 @@ mod rpo_tests {
     #[test]
     fn one_block() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Return { val });
         assert_eq!(function.rpo(), vec![entry]);
@@ -3739,7 +3746,7 @@ mod rpo_tests {
     #[test]
     fn jump() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
@@ -3750,7 +3757,7 @@ mod rpo_tests {
     #[test]
     fn diamond_iftrue() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
@@ -3765,7 +3772,7 @@ mod rpo_tests {
     #[test]
     fn diamond_iffalse() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
@@ -3780,7 +3787,7 @@ mod rpo_tests {
     #[test]
     fn a_loop() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         function.push_insn(entry, Insn::Jump(BranchEdge { target: entry, args: vec![] }));
         assert_eq!(function.rpo(), vec![entry]);
     }
@@ -3803,7 +3810,7 @@ mod validation_tests {
     #[test]
     fn one_block_no_terminator() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         assert_matches_err(function.validate(), ValidationError::BlockHasNoTerminator(entry));
     }
@@ -3811,7 +3818,7 @@ mod validation_tests {
     #[test]
     fn one_block_terminator_not_at_end() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         let insn_id = function.push_insn(entry, Insn::Return { val });
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
@@ -3821,7 +3828,7 @@ mod validation_tests {
     #[test]
     fn iftrue_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfTrue { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
@@ -3831,7 +3838,7 @@ mod validation_tests {
     #[test]
     fn iffalse_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfFalse { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
@@ -3841,7 +3848,7 @@ mod validation_tests {
     #[test]
     fn jump_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Jump ( BranchEdge { target: side, args: vec![val, val, val] } ));
@@ -3851,21 +3858,21 @@ mod validation_tests {
     #[test]
     fn not_defined_within_bb() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         // Create an instruction without making it belong to anything.
         let dangling = function.new_insn(Insn::Const{val: Const::CBool(true)});
-        let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: dangling, state: InsnId(0usize) });
+        let val = function.push_insn(function.entry_blocks[0], Insn::ArrayDup { val: dangling, state: InsnId(0usize) });
         assert_matches_err(function.validate_definite_assignment(), ValidationError::OperandNotDefined(entry, val, dangling));
     }
 
     #[test]
     fn using_non_output_insn() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
-        let const_ = function.push_insn(function.entry_block, Insn::Const{val: Const::CBool(true)});
+        let entry = function.entry_blocks[0];
+        let const_ = function.push_insn(function.entry_blocks[0], Insn::Const{val: Const::CBool(true)});
         // Ret is a non-output instruction.
-        let ret = function.push_insn(function.entry_block, Insn::Return { val: const_ });
-        let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: ret, state: InsnId(0usize) });
+        let ret = function.push_insn(function.entry_blocks[0], Insn::Return { val: const_ });
+        let val = function.push_insn(function.entry_blocks[0], Insn::ArrayDup { val: ret, state: InsnId(0usize) });
         assert_matches_err(function.validate_definite_assignment(), ValidationError::OperandNotDefined(entry, val, ret));
     }
 
@@ -3873,7 +3880,7 @@ mod validation_tests {
     fn not_dominated_by_diamond() {
         // This tests that one branch is missing a definition which fails.
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
@@ -3892,7 +3899,7 @@ mod validation_tests {
     fn dominated_by_diamond() {
         // This tests that both branches with a definition succeeds.
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         let v0 = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
@@ -3911,7 +3918,7 @@ mod validation_tests {
     #[test]
     fn instruction_appears_twice_in_same_block() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn_id(entry, val);
         function.push_insn(entry, Insn::Return { val });
@@ -3921,7 +3928,7 @@ mod validation_tests {
     #[test]
     fn instruction_appears_twice_with_different_ids() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let val0 = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         let val1 = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.make_equal_to(val1, val0);
@@ -3932,7 +3939,7 @@ mod validation_tests {
     #[test]
     fn instruction_appears_twice_in_different_blocks() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
@@ -3959,7 +3966,7 @@ mod infer_tests {
     #[test]
     fn test_const() {
         let mut function = Function::new(std::ptr::null());
-        let val = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qnil) });
+        let val = function.push_insn(function.entry_blocks[0], Insn::Const { val: Const::Value(Qnil) });
         assert_bit_equal(function.infer_type(val), types::NilClass);
     }
 
@@ -3967,8 +3974,8 @@ mod infer_tests {
     fn test_nil() {
         crate::cruby::with_rubyvm(|| {
             let mut function = Function::new(std::ptr::null());
-            let nil = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qnil) });
-            let val = function.push_insn(function.entry_block, Insn::Test { val: nil });
+            let nil = function.push_insn(function.entry_blocks[0], Insn::Const { val: Const::Value(Qnil) });
+            let val = function.push_insn(function.entry_blocks[0], Insn::Test { val: nil });
             function.infer_types();
             assert_bit_equal(function.type_of(val), Type::from_cbool(false));
         });
@@ -3978,8 +3985,8 @@ mod infer_tests {
     fn test_false() {
         crate::cruby::with_rubyvm(|| {
             let mut function = Function::new(std::ptr::null());
-            let false_ = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qfalse) });
-            let val = function.push_insn(function.entry_block, Insn::Test { val: false_ });
+            let false_ = function.push_insn(function.entry_blocks[0], Insn::Const { val: Const::Value(Qfalse) });
+            let val = function.push_insn(function.entry_blocks[0], Insn::Test { val: false_ });
             function.infer_types();
             assert_bit_equal(function.type_of(val), Type::from_cbool(false));
         });
@@ -3989,8 +3996,8 @@ mod infer_tests {
     fn test_truthy() {
         crate::cruby::with_rubyvm(|| {
             let mut function = Function::new(std::ptr::null());
-            let true_ = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qtrue) });
-            let val = function.push_insn(function.entry_block, Insn::Test { val: true_ });
+            let true_ = function.push_insn(function.entry_blocks[0], Insn::Const { val: Const::Value(Qtrue) });
+            let val = function.push_insn(function.entry_blocks[0], Insn::Test { val: true_ });
             function.infer_types();
             assert_bit_equal(function.type_of(val), Type::from_cbool(true));
         });
@@ -4000,9 +4007,9 @@ mod infer_tests {
     fn test_unknown() {
         crate::cruby::with_rubyvm(|| {
             let mut function = Function::new(std::ptr::null());
-            let param = function.push_insn(function.entry_block, Insn::Param { idx: SELF_PARAM_IDX });
+            let param = function.push_insn(function.entry_blocks[0], Insn::Param { idx: SELF_PARAM_IDX });
             function.param_types.push(types::BasicObject); // self
-            let val = function.push_insn(function.entry_block, Insn::Test { val: param });
+            let val = function.push_insn(function.entry_blocks[0], Insn::Test { val: param });
             function.infer_types();
             assert_bit_equal(function.type_of(val), types::CBool);
         });
@@ -4012,7 +4019,7 @@ mod infer_tests {
     fn newarray() {
         let mut function = Function::new(std::ptr::null());
         // Fake FrameState index of 0usize
-        let val = function.push_insn(function.entry_block, Insn::NewArray { elements: vec![], state: InsnId(0usize) });
+        let val = function.push_insn(function.entry_blocks[0], Insn::NewArray { elements: vec![], state: InsnId(0usize) });
         assert_bit_equal(function.infer_type(val), types::ArrayExact);
     }
 
@@ -4020,15 +4027,15 @@ mod infer_tests {
     fn arraydup() {
         let mut function = Function::new(std::ptr::null());
         // Fake FrameState index of 0usize
-        let arr = function.push_insn(function.entry_block, Insn::NewArray { elements: vec![], state: InsnId(0usize) });
-        let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: arr, state: InsnId(0usize) });
+        let arr = function.push_insn(function.entry_blocks[0], Insn::NewArray { elements: vec![], state: InsnId(0usize) });
+        let val = function.push_insn(function.entry_blocks[0], Insn::ArrayDup { val: arr, state: InsnId(0usize) });
         assert_bit_equal(function.infer_type(val), types::ArrayExact);
     }
 
     #[test]
     fn diamond_iffalse_merge_fixnum() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
@@ -4047,7 +4054,7 @@ mod infer_tests {
     #[test]
     fn diamond_iffalse_merge_bool() {
         let mut function = Function::new(std::ptr::null());
-        let entry = function.entry_block;
+        let entry = function.entry_blocks[0];
         let side = function.new_block(0);
         let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(Qtrue) });
