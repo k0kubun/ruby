@@ -36,7 +36,7 @@ pub const C_ARG_OPNDS: [Opnd; 6] = [
 pub const C_RET_REG: Reg = X0_REG;
 pub const C_RET_OPND: Opnd = Opnd::Reg(X0_REG);
 pub const NATIVE_STACK_PTR: Opnd = Opnd::Reg(XZR_REG);
-pub const NATIVE_BASE_PTR: Opnd = Opnd::Reg(X29_REG);
+pub const NATIVE_BASE_PTR_REG: Reg = X29_REG;
 
 // These constants define the way we work with Arm64's stack pointer. The stack
 // pointer always needs to be aligned to a 16-byte boundary.
@@ -78,6 +78,9 @@ impl From<Opnd> for A64Opnd {
             },
             Opnd::Mem(Mem { base: MemBase::VReg(_), .. }) => {
                 panic!("attempted to lower an Opnd::Mem with a MemBase::VReg base")
+            },
+            Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. }) => {
+                panic!("attempted to lower an Opnd::Mem with a MemBase::Stack base")
             },
             Opnd::VReg { .. } => panic!("attempted to lower an Opnd::VReg"),
             Opnd::Value(_) => panic!("attempted to lower an Opnd::Value"),
@@ -690,6 +693,9 @@ impl Assembler {
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so this
     /// splits them and uses scratch registers for it.
     fn arm64_scratch_split(self) -> Assembler {
+        // Prepare StackState to calculate stack_idx_to_disp
+        let stack_state = StackState::new(self.stack_base_idx);
+
         let mut asm = Assembler::new_with_asm(&self);
         asm.accept_scratch_reg = true;
         let mut iterator = self.insns.into_iter().enumerate().peekable();
@@ -726,6 +732,30 @@ impl Assembler {
                         }
                     }
                 }
+                &mut Insn::Load { opnd, out } |
+                &mut Insn::LoadInto { opnd, dest: out } => {
+                    // Lower MemBase::Stack into MemBase::Reg using a scratch register
+                    let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
+                        // Convert MemBase::Stack to the original Opnd::Mem
+                        let stack_disp = stack_state.stack_idx_to_disp(stack_idx);
+                        let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
+                        println!("stack_disp: {stack_disp}, disp: {disp}");
+
+                        // Lower MemBase::Stack to MemBase::Reg using a scratch register
+                        asm.load_into(SCRATCH0_OPND, base_mem);
+                        Opnd::Mem(Mem { base: MemBase::Reg(SCRATCH0_OPND.unwrap_reg().reg_no), disp, num_bits })
+                    } else {
+                        opnd
+                    };
+
+                    if matches!(out, Opnd::Mem(_)) {
+                        asm.load_into(SCRATCH0_OPND, opnd);
+                        asm.store(out, SCRATCH0_OPND);
+                    } else {
+                        asm.push_insn(insn);
+                    }
+                }
+                // Convert Opnd::const_ptr into Opnd::Mem. It's split here compile_side_exits.
                 &mut Insn::IncrCounter { mem, value } => {
                     // Convert Opnd::const_ptr into Opnd::Mem.
                     // It's split here to support IncrCounter in compile_exits.
@@ -1181,6 +1211,7 @@ impl Assembler {
                 },
                 Insn::Load { opnd, out } |
                 Insn::LoadInto { opnd, dest: out } => {
+                    assert!(matches!(out, Opnd::Reg(_)), "load destination must be a register: {insn:?}");
                     match *opnd {
                         Opnd::Reg(_) | Opnd::VReg { .. } => {
                             mov(cb, out.into(), opnd.into());
