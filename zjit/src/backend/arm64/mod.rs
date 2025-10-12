@@ -73,6 +73,9 @@ impl From<Opnd> for A64Opnd {
             Opnd::Mem(Mem { base: MemBase::VReg(_), .. }) => {
                 panic!("attempted to lower an Opnd::Mem with a MemBase::VReg base")
             },
+            Opnd::Mem(Mem { base: MemBase::Stack(_), .. }) => {
+                panic!("attempted to lower an Opnd::Mem with a MemBase::Stack base")
+            },
             Opnd::VReg { .. } => panic!("attempted to lower an Opnd::VReg"),
             Opnd::Value(_) => panic!("attempted to lower an Opnd::Value"),
             Opnd::None => panic!(
@@ -492,7 +495,7 @@ impl Assembler {
                     // Note: the iteration order is reversed to avoid corrupting x0,
                     // which is both the return value and first argument register
                     if !opnds.is_empty() {
-                        let mut args: Vec<(Reg, Opnd)> = vec![];
+                        let mut args: Vec<(Opnd, Opnd)> = vec![];
                         for (idx, opnd) in opnds.iter_mut().enumerate().rev() {
                             // If the value that we're sending is 0, then we can use
                             // the zero register, so in this case we'll just send
@@ -502,7 +505,7 @@ impl Assembler {
                                 Opnd::Mem(_) => split_memory_address(asm, *opnd),
                                 _ => *opnd
                             };
-                            args.push((C_ARG_OPNDS[idx].unwrap_reg(), value));
+                            args.push((C_ARG_OPNDS[idx], value));
                         }
                         asm.parallel_mov(args);
                     }
@@ -717,6 +720,15 @@ impl Assembler {
                         }
                     }
                 }
+                &mut Insn::Load { opnd, out } |
+                &mut Insn::LoadInto { opnd, dest: out } => {
+                    if matches!(out, Opnd::Mem(_)) {
+                        asm.load_into(SCRATCH_OPND, opnd);
+                        asm.store(out, SCRATCH_OPND);
+                    } else {
+                        asm.push_insn(insn);
+                    }
+                }
                 // Convert Opnd::const_ptr into Opnd::Mem. It's split here compile_side_exits.
                 &mut Insn::IncrCounter { mem, value } => {
                     assert!(matches!(mem, Opnd::UImm(_)));
@@ -727,7 +739,7 @@ impl Assembler {
                 // Resolve ParallelMov that couldn't be handled without a scratch register.
                 Insn::ParallelMov { moves } => {
                     for (reg, opnd) in Self::resolve_parallel_moves(moves, Some(SCRATCH_OPND)).unwrap() {
-                        asm.load_into(Opnd::Reg(reg), opnd);
+                        asm.load_into(reg, opnd);
                     }
                 }
                 _ => {
@@ -1145,6 +1157,7 @@ impl Assembler {
                 },
                 Insn::Load { opnd, out } |
                 Insn::LoadInto { opnd, dest: out } => {
+                    assert!(matches!(out, Opnd::Reg(_)), "load destination must be a register: {insn:?}");
                     match *opnd {
                         Opnd::Reg(_) | Opnd::VReg { .. } => {
                             mov(cb, out.into(), opnd.into());
@@ -1664,7 +1677,7 @@ mod tests {
     fn test_emit_frame() {
         let (mut asm, mut cb) = setup_asm();
 
-        asm.frame_setup(&[], 0);
+        asm.frame_setup(&[]);
         asm.frame_teardown(&[]);
         asm.compile_with_num_regs(&mut cb, 0);
 
@@ -1683,7 +1696,8 @@ mod tests {
         // Test 3 preserved regs (odd), odd slot_count
         let cb1 = {
             let (mut asm, mut cb) = setup_asm();
-            asm.frame_setup(THREE_REGS, 3);
+            asm.stack_base_idx = 3;
+            asm.frame_setup(THREE_REGS);
             asm.frame_teardown(THREE_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
             cb
@@ -1692,7 +1706,8 @@ mod tests {
         // Test 3 preserved regs (odd), even slot_count
         let cb2 = {
             let (mut asm, mut cb) = setup_asm();
-            asm.frame_setup(THREE_REGS, 4);
+            asm.stack_base_idx = 4;
+            asm.frame_setup(THREE_REGS);
             asm.frame_teardown(THREE_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
             cb
@@ -1702,7 +1717,8 @@ mod tests {
         let cb3 = {
             static FOUR_REGS: &[Opnd] = &[Opnd::Reg(X19_REG), Opnd::Reg(X20_REG), Opnd::Reg(X21_REG), Opnd::Reg(X22_REG)];
             let (mut asm, mut cb) = setup_asm();
-            asm.frame_setup(FOUR_REGS, 3);
+            asm.stack_base_idx = 3;
+            asm.frame_setup(FOUR_REGS);
             asm.frame_teardown(FOUR_REGS);
             asm.compile_with_num_regs(&mut cb, 0);
             cb
