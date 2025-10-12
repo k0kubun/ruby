@@ -30,7 +30,7 @@ pub const C_ARG_OPNDS: [Opnd; 6] = [
 pub const C_RET_REG: Reg = X0_REG;
 pub const C_RET_OPND: Opnd = Opnd::Reg(X0_REG);
 pub const NATIVE_STACK_PTR: Opnd = Opnd::Reg(XZR_REG);
-pub const NATIVE_BASE_PTR: Opnd = Opnd::Reg(X29_REG);
+pub const NATIVE_BASE_PTR_REG: Reg = X29_REG;
 
 // These constants define the way we work with Arm64's stack pointer. The stack
 // pointer always needs to be aligned to a 16-byte boundary.
@@ -73,7 +73,7 @@ impl From<Opnd> for A64Opnd {
             Opnd::Mem(Mem { base: MemBase::VReg(_), .. }) => {
                 panic!("attempted to lower an Opnd::Mem with a MemBase::VReg base")
             },
-            Opnd::Mem(Mem { base: MemBase::Stack(_), .. }) => {
+            Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. }) => {
                 panic!("attempted to lower an Opnd::Mem with a MemBase::Stack base")
             },
             Opnd::VReg { .. } => panic!("attempted to lower an Opnd::VReg"),
@@ -210,7 +210,7 @@ impl Assembler {
 
     /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
     pub fn new_with_scratch_reg() -> (Self, Opnd) {
-        (Self::new_with_label_names(Vec::default(), 0, true), SCRATCH_OPND)
+        (Self::new_with_label_names(Vec::default(), 0, true, 0), SCRATCH_OPND)
     }
 
     /// Return true if opnd contains a scratch reg
@@ -391,7 +391,7 @@ impl Assembler {
 
         let live_ranges: Vec<LiveRange> = take(&mut self.live_ranges);
         let mut iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm_local = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len(), self.accept_scratch_reg);
+        let mut asm_local = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len(), self.accept_scratch_reg, self.stack_base_idx);
         let asm = &mut asm_local;
 
         while let Some((index, mut insn)) = iterator.next() {
@@ -696,7 +696,7 @@ impl Assembler {
     /// splits them and uses scratch registers for it.
     fn arm64_split_with_scratch_reg(mut self) -> Assembler {
         let iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true);
+        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true, self.stack_base_idx);
 
         for (_, mut insn) in iterator {
             match &mut insn {
