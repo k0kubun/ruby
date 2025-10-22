@@ -91,26 +91,26 @@ pub const ALLOC_REGS: &[Reg] = &[
     RCX_REG,
     R8_REG,
     R9_REG,
-    R10_REG,
     RAX_REG,
 ];
 
 /// Special scratch register for intermediate processing. It should be used only by
 /// [`Assembler::x86_split_with_scratch_reg`] or [`Assembler::new_with_scratch_reg`].
-const SCRATCH_OPND: Opnd = Opnd::Reg(R11_REG);
+const SCRATCH0_OPND: Opnd = Opnd::Reg(R11_REG);
+const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 
 impl Assembler {
     /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
     pub fn new_with_scratch_reg() -> (Self, Opnd) {
-        (Self::new_with_label_names(Vec::default(), 0, true, 0), SCRATCH_OPND)
+        (Self::new_with_label_names(Vec::default(), 0, true, 0), SCRATCH0_OPND)
     }
 
     /// Return true if opnd contains a scratch reg
     pub fn has_scratch_reg(opnd: Opnd) -> bool {
         match opnd {
-            Opnd::Reg(_) => opnd == SCRATCH_OPND,
+            Opnd::Reg(_) => opnd == SCRATCH0_OPND,
             Opnd::Mem(Mem { base: MemBase::Reg(reg_no), .. }) => {
-                reg_no == SCRATCH_OPND.unwrap_reg().reg_no
+                reg_no == SCRATCH0_OPND.unwrap_reg().reg_no
             }
             _ => false,
         }
@@ -400,8 +400,8 @@ impl Assembler {
                 Opnd::Imm(value) => {
                     // 32-bit values will be sign-extended
                     if imm_num_bits(value) > 32 {
-                        asm.mov(SCRATCH_OPND, opnd);
-                        SCRATCH_OPND
+                        asm.mov(SCRATCH0_OPND, opnd);
+                        SCRATCH0_OPND
                     } else {
                         opnd
                     }
@@ -409,13 +409,29 @@ impl Assembler {
                 Opnd::UImm(value) => {
                     // 32-bit values will be sign-extended
                     if imm_num_bits(value as i64) > 32 {
-                        asm.mov(SCRATCH_OPND, opnd);
-                        SCRATCH_OPND
+                        asm.mov(SCRATCH0_OPND, opnd);
+                        SCRATCH0_OPND
                     } else {
                         Opnd::Imm(value as i64)
                     }
                 },
                 _ => opnd
+            }
+        }
+
+        /// If a given operand is Opnd::Mem and it uses MemBase::Stack,
+        /// lower it to MemBase::Reg using a scratch regsiter.
+        fn split_stack_base(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd, stack_allocator: &StackAllocator) -> Opnd {
+            if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
+                // Convert MemBase::Stack to the original Opnd::Mem
+                let stack_disp = stack_allocator.stack_idx_to_disp(stack_idx);
+                let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
+
+                // Lower MemBase::Stack to MemBase::Reg using a scratch register
+                asm.load_into(scratch_opnd, base_mem);
+                Opnd::Mem(Mem { base: MemBase::Reg(scratch_opnd.unwrap_reg().reg_no), disp, num_bits })
+            } else {
+                opnd
             }
         }
 
@@ -427,33 +443,142 @@ impl Assembler {
 
         while let Some((_, mut insn)) = iterator.next() {
             match &mut insn {
-                Insn::Add { right, .. } |
-                Insn::Sub { right, .. } |
-                Insn::Mul { right, .. } |
-                Insn::And { right, .. } |
-                Insn::Or { right, .. } |
-                Insn::Xor { right, .. } |
-                Insn::Test { right, .. } => {
-                    *right = split_64bit_immediate(&mut asm, *right);
+                Insn::Add { left, right, out } |
+                Insn::Sub { left, right, out } |
+                Insn::And { left, right, out } |
+                Insn::Or  { left, right, out } |
+                Insn::Xor { left, right, out } => {
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
+                    let left = *left;
+                    let out = *out;
+
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            *right = split_64bit_immediate(&mut asm, *right);
+                        }
+                        _ => {}
+                    }
+
+                    asm.push_insn(insn);
+
+                    if out != left {
+                        if matches!((out, left), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, left);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            //
+                            asm.mov(out, left);
+                        }
+                    }
+                }
+                Insn::Mul { left, right, out } => {
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
+
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            *right = split_64bit_immediate(&mut asm, *right);
+                        }
+                        _ => {}
+                    }
+
+                    let opnd = if matches!((&left, &right), (&Opnd::Mem(_), &Opnd::Reg(_))) {
+                        *right // imul flips the left and the right for this case
+                    } else {
+                        *left
+                    };
+                    let out = *out;
+
+                    asm.push_insn(insn);
+
+                    if out != opnd {
+                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, opnd);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            asm.mov(out, opnd);
+                        }
+                    }
+                }
+                &mut Insn::Not { opnd, out } |
+                &mut Insn::LShift { opnd, out, .. } |
+                &mut Insn::RShift { opnd, out, .. } |
+                &mut Insn::URShift { opnd, out, .. } => {
+                    asm.push_insn(insn);
+
+                    if out != opnd {
+                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, opnd);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            asm.mov(out, opnd);
+                        }
+                    }
+                }
+                Insn::Test { left, right } => {
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
+
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            *right = split_64bit_immediate(&mut asm, *right);
+                        }
+                        _ => {}
+                    }
+
                     asm.push_insn(insn);
                 }
                 Insn::Cmp { left, right } => {
-                    let num_bits = match right {
-                        Opnd::Imm(value) => Some(imm_num_bits(*value)),
-                        Opnd::UImm(value) => Some(uimm_num_bits(*value)),
-                        _ => None
-                    };
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
 
-                    // If the immediate is less than 64 bits (like 32, 16, 8), and the operand
-                    // sizes match, then we can represent it as an immediate in the instruction
-                    // without moving it to a register first.
-                    // IOW, 64 bit immediates must always be moved to a register
-                    // before comparisons, where other sizes may be encoded
-                    // directly in the instruction.
-                    let use_imm = num_bits.is_some() && left.num_bits() == num_bits && num_bits.unwrap() < 64;
-                    if !use_imm {
-                        *right = split_64bit_immediate(&mut asm, *right);
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND, *right);
+                                *right = SCRATCH1_OPND;
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            let num_bits = match right {
+                                Opnd::Imm(value) => imm_num_bits(*value),
+                                Opnd::UImm(value) => uimm_num_bits(*value),
+                                _ => unreachable!(),
+                            };
+
+                            // If the immediate is less than 64 bits (like 32, 16, 8), and the operand
+                            // sizes match, then we can represent it as an immediate in the instruction
+                            // without moving it to a register first.
+                            // IOW, 64 bit immediates must always be moved to a register
+                            // before comparisons, where other sizes may be encoded
+                            // directly in the instruction.
+                            let use_imm = left.num_bits() == Some(num_bits) && num_bits < 64;
+                            if !use_imm {
+                                *right = split_64bit_immediate(&mut asm, *right);
+                            }
+                        }
+                        _ => {}
                     }
+
                     asm.push_insn(insn);
                 }
                 // For compile_side_exits, support splitting simple C arguments here
@@ -468,8 +593,8 @@ impl Assembler {
                     match (opnd, out) {
                         // Split here for compile_side_exits
                         (Opnd::Mem(_), Opnd::Mem(_)) => {
-                            asm.lea_into(SCRATCH_OPND, opnd);
-                            asm.store(out, SCRATCH_OPND);
+                            asm.lea_into(SCRATCH0_OPND, opnd);
+                            asm.store(out, SCRATCH0_OPND);
                         }
                         _ => {
                             asm.push_insn(insn);
@@ -478,29 +603,19 @@ impl Assembler {
                 }
                 Insn::LeaJumpTarget { target, out } => {
                     if let Target::Label(_) = target {
-                        asm.push_insn(Insn::LeaJumpTarget { out: SCRATCH_OPND, target: target.clone() });
-                        asm.mov(*out, SCRATCH_OPND);
+                        asm.push_insn(Insn::LeaJumpTarget { out: SCRATCH0_OPND, target: target.clone() });
+                        asm.mov(*out, SCRATCH0_OPND);
                     }
                 }
-                &mut Insn::Load { out, opnd } |
-                &mut Insn::LoadInto { dest: out, opnd } => {
+                Insn::Load { out, opnd } |
+                Insn::LoadInto { dest: out, opnd } => {
                     // If the load target has MemBase::Stack, lower it to Stack::Reg.
-                    let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
-                        // Convert MemBase::Stack to the original Opnd::Mem
-                        let stack_disp = stack_allocator.stack_idx_to_disp(stack_idx);
-                        let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
-
-                        // Lower MemBase::Stack to MemBase::Reg using a scratch register
-                        asm.load_into(SCRATCH_OPND, base_mem);
-                        Opnd::Mem(Mem { base: MemBase::Reg(SCRATCH_OPND.unwrap_reg().reg_no), disp, num_bits })
-                    } else {
-                        opnd
-                    };
+                    *opnd = split_stack_base(&mut asm, *opnd, SCRATCH0_OPND, &stack_allocator);
 
                     // If a load attempt fails due to register spill, load into a scratch register first.
-                    if let Opnd::Mem(Mem { num_bits, .. }) = out {
-                        asm.load_into(SCRATCH_OPND.with_num_bits(num_bits), opnd);
-                        asm.store(out, SCRATCH_OPND.with_num_bits(num_bits));
+                    if let Opnd::Mem(Mem { num_bits, .. }) = *out {
+                        asm.load_into(SCRATCH0_OPND.with_num_bits(num_bits), *opnd);
+                        asm.store(*out, SCRATCH0_OPND.with_num_bits(num_bits));
                     } else {
                         asm.push_insn(insn);
                     }
@@ -509,32 +624,40 @@ impl Assembler {
                 // a register for compile_side_exits.
                 &mut Insn::IncrCounter { mem, value } => {
                     assert!(matches!(mem, Opnd::UImm(_)));
-                    asm.load_into(SCRATCH_OPND, mem);
-                    asm.incr_counter(Opnd::mem(64, SCRATCH_OPND, 0), value);
+                    asm.load_into(SCRATCH0_OPND, mem);
+                    asm.incr_counter(Opnd::mem(64, SCRATCH0_OPND, 0), value);
                 }
                 // Resolve ParallelMov that couldn't be handled without a scratch register.
                 Insn::ParallelMov { moves } => {
-                    for (dst, src) in Self::resolve_parallel_moves(&moves, Some(SCRATCH_OPND)).unwrap() {
-                        asm.load_into(dst, src);
+                    for (dst, src) in Self::resolve_parallel_moves(&moves, Some(SCRATCH0_OPND)).unwrap() {
+                        if matches!(dst, Opnd::Mem(_)) {
+                            if matches!(src, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH0_OPND, src);
+                                asm.store(dst, SCRATCH0_OPND);
+                            } else {
+                                asm.store(dst, src);
+                            }
+                        } else {
+                            asm.load_into(dst, src);
+                        }
                     }
                 }
                 // Handle various operand combinations for spills on compile_side_exits.
                 &mut Insn::Store { dest, src } => {
-                    let Opnd::Mem(Mem { num_bits, .. }) = dest else {
-                        panic!("Unexpected Insn::Store destination in x86_split_with_scratch_reg: {dest:?}");
-                    };
+                    let num_bits = dest.rm_num_bits();
+                    let dest = split_stack_base(&mut asm, dest, SCRATCH1_OPND, &stack_allocator);
 
                     let src = match src {
                         Opnd::Reg(_) => src,
                         Opnd::Mem(_) => {
-                            asm.mov(SCRATCH_OPND, src);
-                            SCRATCH_OPND
+                            asm.mov(SCRATCH0_OPND, src);
+                            SCRATCH0_OPND
                         }
                         Opnd::Imm(imm) => {
                             // For 64 bit destinations, 32-bit values will be sign-extended
                             if num_bits == 64 && imm_num_bits(imm) > 32 {
-                                asm.mov(SCRATCH_OPND, src);
-                                SCRATCH_OPND
+                                asm.mov(SCRATCH0_OPND, src);
+                                SCRATCH0_OPND
                             } else if uimm_num_bits(imm as u64) <= num_bits {
                                 // If the bit string is short enough for the destination, use the unsigned representation.
                                 // Note that 64-bit and negative values are ruled out.
@@ -546,19 +669,36 @@ impl Assembler {
                         Opnd::UImm(imm) => {
                             // For 64 bit destinations, 32-bit values will be sign-extended
                             if num_bits == 64 && imm_num_bits(imm as i64) > 32 {
-                                asm.mov(SCRATCH_OPND, src);
-                                SCRATCH_OPND
+                                asm.mov(SCRATCH0_OPND, src);
+                                SCRATCH0_OPND
                             } else {
                                 src.into()
                             }
                         }
                         Opnd::Value(_) => {
-                            asm.load_into(SCRATCH_OPND, src);
-                            SCRATCH_OPND
+                            asm.load_into(SCRATCH0_OPND, src);
+                            SCRATCH0_OPND
                         }
                         src @ (Opnd::None | Opnd::VReg { .. }) => panic!("Unexpected source operand during x86_split_with_scratch_reg: {src:?}"),
                     };
                     asm.store(dest, src);
+                }
+                Insn::CSelZ { out, .. } |
+                Insn::CSelNZ { out, .. } |
+                Insn::CSelE { out, .. } |
+                Insn::CSelNE { out, .. } |
+                Insn::CSelL { out, .. } |
+                Insn::CSelLE { out, .. } |
+                Insn::CSelG { out, .. } |
+                Insn::CSelGE { out, .. } => {
+                    if let Opnd::Mem(_) = out {
+                        let mem_out = out.clone();
+                        *out = SCRATCH0_OPND.with_num_bits(out.rm_num_bits());
+                        asm.push_insn(insn);
+                        asm.store(mem_out, SCRATCH0_OPND.with_num_bits(mem_out.rm_num_bits()))
+                    } else {
+                        asm.push_insn(insn);
+                    }
                 }
                 _ => {
                     asm.push_insn(insn);
