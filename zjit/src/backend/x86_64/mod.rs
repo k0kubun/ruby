@@ -446,7 +446,6 @@ impl Assembler {
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
-                Insn::Mul { left, right, out } |
                 Insn::And { left, right, out } |
                 Insn::Or  { left, right, out } |
                 Insn::Xor { left, right, out } => {
@@ -477,6 +476,41 @@ impl Assembler {
                         } else {
                             //
                             asm.mov(out, left);
+                        }
+                    }
+                }
+                Insn::Mul { left, right, out } => {
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
+
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            *right = split_64bit_immediate(&mut asm, *right);
+                        }
+                        _ => {}
+                    }
+
+                    let opnd = if matches!((&left, &right), (&Opnd::Mem(_), &Opnd::Reg(_))) {
+                        *right // imul flips the left and the right for this case
+                    } else {
+                        *left
+                    };
+                    let out = *out;
+
+                    asm.push_insn(insn);
+
+                    if out != opnd {
+                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, opnd);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            asm.mov(out, opnd);
                         }
                     }
                 }
