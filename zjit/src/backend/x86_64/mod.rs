@@ -444,12 +444,57 @@ impl Assembler {
 
         while let Some((_, mut insn)) = iterator.next() {
             match &mut insn {
-                Insn::Add { left, right, .. } |
-                Insn::Sub { left, right, .. } |
-                Insn::Mul { left, right, .. } |
-                Insn::And { left, right, .. } |
-                Insn::Or { left, right, .. } |
-                Insn::Xor { left, right, .. } |
+                Insn::Add { left, right, out } |
+                Insn::Sub { left, right, out } |
+                Insn::Mul { left, right, out } |
+                Insn::And { left, right, out } |
+                Insn::Or  { left, right, out } |
+                Insn::Xor { left, right, out } => {
+                    *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
+                    let left = *left;
+                    let out = *out;
+
+                    match &right {
+                        Opnd::Mem(_) => {
+                            *right = split_stack_base(&mut asm, *right, SCRATCH1_OPND, &stack_allocator);
+                            if matches!(left, Opnd::Mem(_)) {
+                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
+                            }
+                        }
+                        Opnd::UImm(_) | Opnd::Imm(_) => {
+                            *right = split_64bit_immediate(&mut asm, *right);
+                        }
+                        _ => {}
+                    }
+
+                    asm.push_insn(insn);
+
+                    if out != left {
+                        if matches!((out, left), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, left);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            //
+                            asm.mov(out, left);
+                        }
+                    }
+                }
+                &mut Insn::Not { opnd, out } |
+                &mut Insn::LShift { opnd, out, .. } |
+                &mut Insn::RShift { opnd, out, .. } |
+                &mut Insn::URShift { opnd, out, .. } => {
+                    asm.push_insn(insn);
+
+                    if out != opnd {
+                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
+                            asm.mov(SCRATCH0_OPND, opnd);
+                            asm.mov(out, SCRATCH0_OPND);
+                        } else {
+                            asm.mov(out, opnd);
+                        }
+                    }
+                }
                 Insn::Test { left, right } => {
                     *left = split_stack_base(&mut asm, *left, SCRATCH0_OPND, &stack_allocator);
 
