@@ -102,7 +102,7 @@ const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 impl Assembler {
     /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
     pub fn new_with_scratch_reg() -> (Self, Opnd) {
-        (Self::new_with_label_names(Vec::default(), 0, true, 0), SCRATCH0_OPND)
+        (Self::new_with_accept_scratch_reg(true), SCRATCH0_OPND)
     }
 
     /// Return true if opnd contains a scratch reg
@@ -137,9 +137,9 @@ impl Assembler {
     /// Split IR instructions for the x86 platform
     fn x86_split(mut self) -> Assembler
     {
+        let mut asm = Assembler::new_with_asm(&self);
         let live_ranges: Vec<LiveRange> = take(&mut self.live_ranges);
         let mut iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len(), self.accept_scratch_reg, self.stack_base_idx);
 
         while let Some((index, mut insn)) = iterator.next() {
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
@@ -390,7 +390,7 @@ impl Assembler {
     /// for VRegs, most splits should happen in [`Self::x86_split`]. However, some instructions
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_side_exits`, so
     /// this splits them and uses scratch registers for it.
-    pub fn x86_split_with_scratch_reg(mut self) -> Assembler {
+    pub fn x86_split_with_scratch_reg(self) -> Assembler {
         /// For some instructions, we want to be able to lower a 64-bit operand
         /// without requiring more registers to be available in the register
         /// allocator. So we just use the SCRATCH_OPND register temporarily to hold
@@ -438,8 +438,9 @@ impl Assembler {
         // Prepare StackAllocator to calculate stack_idx_to_disp
         let stack_allocator = StackAllocator::new(self.stack_base_idx);
 
+        let mut asm = Assembler::new_with_asm(&self);
+        asm.accept_scratch_reg = true;
         let mut iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true, self.stack_base_idx);
 
         while let Some((_, mut insn)) = iterator.next() {
             match &mut insn {

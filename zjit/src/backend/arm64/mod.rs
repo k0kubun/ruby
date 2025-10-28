@@ -210,7 +210,7 @@ impl Assembler {
 
     /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
     pub fn new_with_scratch_reg() -> (Self, Opnd) {
-        (Self::new_with_label_names(Vec::default(), 0, true, 0), SCRATCH_OPND)
+        (Self::new_with_accept_scratch_reg(true), SCRATCH_OPND)
     }
 
     /// Return true if opnd contains a scratch reg
@@ -389,9 +389,9 @@ impl Assembler {
             }
         }
 
+        let mut asm_local = Assembler::new_with_asm(&self);
         let live_ranges: Vec<LiveRange> = take(&mut self.live_ranges);
         let mut iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm_local = Assembler::new_with_label_names(take(&mut self.label_names), live_ranges.len(), self.accept_scratch_reg, self.stack_base_idx);
         let asm = &mut asm_local;
 
         while let Some((index, mut insn)) = iterator.next() {
@@ -694,12 +694,13 @@ impl Assembler {
     /// VRegs, most splits should happen in [`Self::arm64_split`]. However, some instructions
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_side_exits`, so this
     /// splits them and uses scratch registers for it.
-    fn arm64_split_with_scratch_reg(mut self) -> Assembler {
+    fn arm64_split_with_scratch_reg(self) -> Assembler {
         // Prepare StackAllocator to calculate stack_idx_to_disp
         let stack_allocator = StackAllocator::new(self.stack_base_idx);
 
+        let mut asm = Assembler::new_with_asm(&self);
+        asm.accept_scratch_reg = true;
         let iterator = self.insns.into_iter().enumerate().peekable();
-        let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true, self.stack_base_idx);
 
         for (_, mut insn) in iterator {
             match &mut insn {
