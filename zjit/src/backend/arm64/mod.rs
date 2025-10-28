@@ -695,6 +695,9 @@ impl Assembler {
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_side_exits`, so this
     /// splits them and uses scratch registers for it.
     fn arm64_split_with_scratch_reg(mut self) -> Assembler {
+        // Prepare StackAllocator to calculate stack_idx_to_disp
+        let stack_allocator = StackAllocator::new(self.stack_base_idx);
+
         let iterator = self.insns.into_iter().enumerate().peekable();
         let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), self.live_ranges.len(), true, self.stack_base_idx);
 
@@ -722,6 +725,20 @@ impl Assembler {
                 }
                 &mut Insn::Load { opnd, out } |
                 &mut Insn::LoadInto { opnd, dest: out } => {
+                    // Lower MemBase::Stack into MemBase::Reg using a scratch register
+                    let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
+                        // Convert MemBase::Stack to the original Opnd::Mem
+                        let stack_disp = stack_allocator.stack_idx_to_disp(stack_idx);
+                        let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
+                        println!("stack_disp: {stack_disp}, disp: {disp}");
+
+                        // Lower MemBase::Stack to MemBase::Reg using a scratch register
+                        asm.load_into(SCRATCH_OPND, base_mem);
+                        Opnd::Mem(Mem { base: MemBase::Reg(SCRATCH_OPND.unwrap_reg().reg_no), disp, num_bits })
+                    } else {
+                        opnd
+                    };
+
                     if matches!(out, Opnd::Mem(_)) {
                         asm.load_into(SCRATCH_OPND, opnd);
                         asm.store(out, SCRATCH_OPND);
