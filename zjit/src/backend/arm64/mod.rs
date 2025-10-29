@@ -791,7 +791,7 @@ impl Assembler {
                         let out = if mem_disp_fits_bits(disp) {
                             out
                         } else {
-                            asm.lea_into(SCRATCH1_OPND.with_num_bits(num_bits), out);
+                            asm.lea_into(SCRATCH1_OPND, out);
                             Opnd::mem(num_bits, SCRATCH1_OPND, 0)
                         };
                         asm.store(out, opnd);
@@ -833,7 +833,15 @@ impl Assembler {
                 &mut Insn::Mov { dest, src } => {
                     match dest {
                         Opnd::Reg(_) => asm.load_into(dest, src),
-                        Opnd::Mem(_) => asm.store(dest, src),
+                        Opnd::Mem(Mem { num_bits, disp, .. }) => {
+                            let dest = if mem_disp_fits_bits(disp) {
+                                dest
+                            } else {
+                                asm.lea_into(SCRATCH0_OPND, dest);
+                                Opnd::mem(num_bits, SCRATCH0_OPND, 0)
+                            };
+                            asm.store(dest, src);
+                        }
                         _ => asm.push_insn(insn),
                     }
                 }
