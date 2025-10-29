@@ -693,6 +693,20 @@ impl Assembler {
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so this
     /// splits them and uses scratch registers for it.
     fn arm64_scratch_split(self) -> Assembler {
+        fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
+            if let Opnd::Mem(_) = opnd {
+                let scratch_opnd = if let Some(num_bits) = opnd.num_bits() {
+                    scratch_opnd.with_num_bits(num_bits)
+                } else {
+                    scratch_opnd
+                };
+                asm.load_into(scratch_opnd, opnd);
+                scratch_opnd
+            } else {
+                opnd
+            }
+        }
+
         // Prepare StackState to calculate stack_idx_to_disp
         let _stack_state = StackState::new(self.stack_base_idx);
 
@@ -711,6 +725,15 @@ impl Assembler {
                         // Based on the sign bit of the 64-bit mul result
                         asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: out, shift: Opnd::UImm(63) });
                     }
+                }
+                Insn::Cmp { right, .. } => {
+                    *right = split_memory_operand(&mut asm, *right, SCRATCH0_OPND);
+                    asm.push_insn(insn);
+                }
+                Insn::Test { left, right } => {
+                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
+                    asm.push_insn(insn);
                 }
                 // For compile_exits, support splitting simple C arguments here
                 Insn::CCall { opnds, .. } if !opnds.is_empty() => {
