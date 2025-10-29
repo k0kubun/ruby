@@ -746,8 +746,17 @@ impl Assembler {
                 &mut Insn::Lea { opnd, out } => {
                     match (opnd, out) {
                         // Split here for compile_exits
-                        (Opnd::Mem(_), Opnd::Mem(_)) => {
+                        (Opnd::Mem(_), Opnd::Mem(Mem { num_bits: out_num_bits, disp: out_disp, .. })) => {
                             asm.lea_into(SCRATCH0_OPND, opnd);
+
+                            // Split out using a scratch register if necessary.
+                            let out = if mem_disp_fits_bits(out_disp) {
+                                out
+                            } else {
+                                asm.lea_into(SCRATCH1_OPND, out);
+                                Opnd::mem(out_num_bits, SCRATCH1_OPND, 0)
+                            };
+
                             asm.store(out, SCRATCH0_OPND);
                         }
                         _ => {
