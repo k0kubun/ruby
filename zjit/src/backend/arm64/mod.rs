@@ -708,7 +708,7 @@ impl Assembler {
         }
 
         // Prepare StackState to calculate stack_idx_to_disp
-        let _stack_state = StackState::new(self.stack_base_idx);
+        let stack_state = StackState::new(self.stack_base_idx);
 
         let mut asm = Assembler::new_with_asm(&self);
         asm.accept_scratch_reg = true;
@@ -766,30 +766,35 @@ impl Assembler {
                 }
                 &mut Insn::Load { opnd, out } |
                 &mut Insn::LoadInto { opnd, dest: out } => {
-                    /*
                     // Lower MemBase::Stack into MemBase::Reg using a scratch register
                     let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
                         // Convert MemBase::Stack to the original Opnd::Mem
                         let stack_disp = stack_state.stack_idx_to_disp(stack_idx);
                         let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
-                        println!("stack_disp: {stack_disp}, disp: {disp}");
+
+                        let base_mem = if mem_disp_fits_bits(stack_disp) {
+                            base_mem
+                        } else {
+                            asm.lea_into(SCRATCH0_OPND, base_mem);
+                            Opnd::mem(stack_num_bits, SCRATCH0_OPND, 0)
+                        };
 
                         // Lower MemBase::Stack to MemBase::Reg using a scratch register
                         asm.load_into(SCRATCH0_OPND, base_mem);
+
                         Opnd::Mem(Mem { base: MemBase::Reg(SCRATCH0_OPND.unwrap_reg().reg_no), disp, num_bits })
                     } else {
                         opnd
                     };
-                    */
 
-                    if matches!(out, Opnd::Mem(_)) {
-                        let scratch_opnd = if let Some(num_bits) = opnd.num_bits() {
-                            SCRATCH0_OPND.with_num_bits(num_bits)
+                    if let Opnd::Mem(Mem { num_bits, disp, .. }) = out {
+                        let out = if mem_disp_fits_bits(disp) {
+                            out
                         } else {
-                            SCRATCH0_OPND
+                            asm.lea_into(SCRATCH1_OPND.with_num_bits(num_bits), out);
+                            Opnd::mem(num_bits, SCRATCH1_OPND, 0)
                         };
-                        asm.load_into(scratch_opnd, opnd);
-                        asm.store(out, scratch_opnd);
+                        asm.store(out, opnd);
                     } else {
                         asm.push_insn(insn);
                     }
