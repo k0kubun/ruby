@@ -694,7 +694,7 @@ impl Assembler {
     /// splits them and uses scratch registers for it.
     fn arm64_scratch_split(self) -> Assembler {
         // Prepare StackState to calculate stack_idx_to_disp
-        let stack_state = StackState::new(self.stack_base_idx);
+        let _stack_state = StackState::new(self.stack_base_idx);
 
         let mut asm = Assembler::new_with_asm(&self);
         asm.accept_scratch_reg = true;
@@ -734,6 +734,7 @@ impl Assembler {
                 }
                 &mut Insn::Load { opnd, out } |
                 &mut Insn::LoadInto { opnd, dest: out } => {
+                    /*
                     // Lower MemBase::Stack into MemBase::Reg using a scratch register
                     let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
                         // Convert MemBase::Stack to the original Opnd::Mem
@@ -747,10 +748,16 @@ impl Assembler {
                     } else {
                         opnd
                     };
+                    */
 
                     if matches!(out, Opnd::Mem(_)) {
-                        asm.load_into(SCRATCH0_OPND, opnd);
-                        asm.store(out, SCRATCH0_OPND);
+                        let scratch_opnd = if let Some(num_bits) = opnd.num_bits() {
+                            SCRATCH0_OPND.with_num_bits(num_bits)
+                        } else {
+                            SCRATCH0_OPND
+                        };
+                        asm.load_into(scratch_opnd, opnd);
+                        asm.store(out, scratch_opnd);
                     } else {
                         asm.push_insn(insn);
                     }

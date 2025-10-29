@@ -216,7 +216,9 @@ impl Opnd
 
     /// Get the size in bits for register/memory operands.
     pub fn rm_num_bits(&self) -> u8 {
-        self.num_bits().unwrap()
+        self.num_bits().unwrap_or_else(|| {
+            panic!("invalid Opnd for rm_num_bits: {self:?}")
+        })
     }
 
     /// Maps the indices from a previous list of instructions to a new list of
