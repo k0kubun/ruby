@@ -1239,10 +1239,11 @@ impl Assembler {
                                 load_effective_address(cb, Self::EMIT_OPND, src_base_reg_no, src_disp);
                                 A64Opnd::new_mem(dest.rm_num_bits(), Self::EMIT_OPND, 0)
                             };
+                            let dst = A64Opnd::Reg(Self::EMIT_REG.with_num_bits(src_num_bits));
                             match src_num_bits {
-                                64 | 32 => ldur(cb, Self::EMIT_OPND, src_mem),
-                                16 => ldurh(cb, Self::EMIT_OPND, src_mem),
-                                8 => ldurb(cb, Self::EMIT_OPND, src_mem),
+                                64 | 32 => ldur(cb, dst, src_mem),
+                                16 => ldurh(cb, dst, src_mem),
+                                8 => ldurb(cb, dst, src_mem),
                                 num_bits => panic!("unexpected num_bits: {num_bits}")
                             };
                             Self::EMIT_REG

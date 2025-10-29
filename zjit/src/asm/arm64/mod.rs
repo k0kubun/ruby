@@ -584,7 +584,7 @@ pub fn ldur(cb: &mut CodeBlock, rt: A64Opnd, rn: A64Opnd) {
             LoadStore::ldur(rt.reg_no, rn.reg_no, 0, rt.num_bits).into()
         },
         (A64Opnd::Reg(rt), A64Opnd::Mem(rn)) => {
-            assert!(rt.num_bits == rn.num_bits, "Expected registers to be the same size");
+            assert!(rt.num_bits == rn.num_bits, "Expected registers to be the same size: {rt:?}, {rn:?}");
             assert!(mem_disp_fits_bits(rn.disp), "Expected displacement to be 9 bits or less");
 
             LoadStore::ldur(rt.reg_no, rn.base_reg_no, rn.disp as i16, rt.num_bits).into()
