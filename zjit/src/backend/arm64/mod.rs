@@ -206,6 +206,7 @@ pub const ALLOC_REGS: &[Reg] = &[
 /// [`Assembler::arm64_scratch_split`] or [`Assembler::new_with_scratch_reg`].
 const SCRATCH0_OPND: Opnd = Opnd::Reg(X15_REG);
 const SCRATCH1_OPND: Opnd = Opnd::Reg(X17_REG);
+const SCRATCH2_OPND: Opnd = Opnd::Reg(X14_REG);
 
 impl Assembler {
     /// Special register for intermediate processing in arm64_emit. It should be used only by arm64_emit.
@@ -734,6 +735,26 @@ impl Assembler {
                     *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
                     *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
                     asm.push_insn(insn);
+                }
+                Insn::CSelZ  { truthy, falsy, out } |
+                Insn::CSelNZ { truthy, falsy, out } |
+                Insn::CSelE  { truthy, falsy, out } |
+                Insn::CSelNE { truthy, falsy, out } |
+                Insn::CSelL  { truthy, falsy, out } |
+                Insn::CSelLE { truthy, falsy, out } |
+                Insn::CSelG  { truthy, falsy, out } |
+                Insn::CSelGE { truthy, falsy, out } => {
+                    *truthy = split_memory_operand(&mut asm, *truthy, SCRATCH0_OPND);
+                    *falsy = split_memory_operand(&mut asm, *falsy, SCRATCH1_OPND);
+
+                    if let Opnd::Mem(_) = out {
+                        let mem_out = out.clone();
+                        *out = SCRATCH2_OPND;
+                        asm.push_insn(insn);
+                        asm.store(mem_out, SCRATCH2_OPND);
+                    } else {
+                        asm.push_insn(insn);
+                    }
                 }
                 // For compile_exits, support splitting simple C arguments here
                 Insn::CCall { opnds, .. } if !opnds.is_empty() => {

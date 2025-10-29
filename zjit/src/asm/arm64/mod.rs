@@ -355,7 +355,7 @@ pub fn csel(cb: &mut CodeBlock, rd: A64Opnd, rn: A64Opnd, rm: A64Opnd, cond: u8)
 
             Conditional::csel(rd.reg_no, rn.reg_no, rm.reg_no, cond, rd.num_bits).into()
         },
-        _ => panic!("Invalid operand combination to csel instruction."),
+        _ => panic!("Invalid operand combination to csel instruction: {rd:?}, {rn:?}, {rm:?}"),
     };
 
     cb.write_bytes(&bytes);
