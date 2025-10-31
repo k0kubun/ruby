@@ -764,8 +764,9 @@ impl Assembler {
                         asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: out, shift: Opnd::UImm(63) });
                     }
                 }
-                Insn::Cmp { right, .. } => {
-                    *right = split_memory_operand(&mut asm, *right, SCRATCH0_OPND);
+                Insn::Cmp { left, right } => {
+                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
                     asm.push_insn(insn);
                 }
                 Insn::Test { left, right } => {
