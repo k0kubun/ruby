@@ -748,7 +748,8 @@ impl Assembler {
         // Prepare StackState to calculate stack_idx_to_disp
         let stack_state = StackState::new(self.stack_base_idx);
 
-        let mut asm = Assembler::new_with_asm(&self);
+        let mut asm_local = Assembler::new_with_asm(&self);
+        let asm = &mut asm_local;
         asm.accept_scratch_reg = true;
         let mut iterator = self.insns.into_iter().enumerate().peekable();
 
@@ -756,9 +757,17 @@ impl Assembler {
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
-                Insn::And { left, right, out } => {
-                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
+                Insn::And { left, right, out } |
+                Insn::CSelZ  { truthy: left, falsy: right, out } |
+                Insn::CSelNZ { truthy: left, falsy: right, out } |
+                Insn::CSelE  { truthy: left, falsy: right, out } |
+                Insn::CSelNE { truthy: left, falsy: right, out } |
+                Insn::CSelL  { truthy: left, falsy: right, out } |
+                Insn::CSelLE { truthy: left, falsy: right, out } |
+                Insn::CSelG  { truthy: left, falsy: right, out } |
+                Insn::CSelGE { truthy: left, falsy: right, out } => {
+                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
 
                     if let Opnd::Mem(_) = out {
                         let mem_out = out.clone();
@@ -780,35 +789,15 @@ impl Assembler {
                     }
                 }
                 Insn::RShift { opnd, out, .. } => {
-                    *opnd = split_memory_operand(&mut asm, *opnd, SCRATCH0_OPND);
-                    *out = split_memory_operand(&mut asm, *out, SCRATCH1_OPND);
+                    *opnd = split_memory_operand(asm, *opnd, SCRATCH0_OPND);
+                    *out = split_memory_operand(asm, *out, SCRATCH1_OPND);
                     asm.push_insn(insn);
                 }
                 Insn::Cmp { left, right } |
                 Insn::Test { left, right } => {
-                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
+                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
                     asm.push_insn(insn);
-                }
-                Insn::CSelZ  { truthy, falsy, out } |
-                Insn::CSelNZ { truthy, falsy, out } |
-                Insn::CSelE  { truthy, falsy, out } |
-                Insn::CSelNE { truthy, falsy, out } |
-                Insn::CSelL  { truthy, falsy, out } |
-                Insn::CSelLE { truthy, falsy, out } |
-                Insn::CSelG  { truthy, falsy, out } |
-                Insn::CSelGE { truthy, falsy, out } => {
-                    *truthy = split_memory_operand(&mut asm, *truthy, SCRATCH0_OPND);
-                    *falsy = split_memory_operand(&mut asm, *falsy, SCRATCH1_OPND);
-
-                    if let Opnd::Mem(_) = out {
-                        let mem_out = out.clone();
-                        *out = SCRATCH2_OPND;
-                        asm.push_insn(insn);
-                        asm.store(mem_out, SCRATCH2_OPND);
-                    } else {
-                        asm.push_insn(insn);
-                    }
                 }
                 // For compile_exits, support splitting simple C arguments here
                 Insn::CCall { opnds, .. } if !opnds.is_empty() => {
@@ -820,17 +809,11 @@ impl Assembler {
                 }
                 &mut Insn::Lea { opnd, out } => {
                     match (opnd, out) {
-                        // Split here for compile_exits
-                        (Opnd::Mem(_), Opnd::Mem(Mem { num_bits: out_num_bits, disp: out_disp, .. })) => {
+                        (Opnd::Mem(_), Opnd::Mem(_)) => {
                             asm.lea_into(SCRATCH0_OPND, opnd);
 
                             // Split out using a scratch register if necessary.
-                            let out = if mem_disp_fits_bits(out_disp) {
-                                out
-                            } else {
-                                asm.lea_into(SCRATCH1_OPND, out);
-                                Opnd::mem(out_num_bits, SCRATCH1_OPND, 0)
-                            };
+                            let out = split_large_disp(asm, out, SCRATCH1_OPND);
 
                             asm.store(out, SCRATCH0_OPND);
                         }
@@ -849,11 +832,11 @@ impl Assembler {
                             SCRATCH0_OPND
                         }
                         // Lower MemBase::Stack into MemBase::Reg using a scratch register
-                        _ => split_stack_membase(&mut asm, *opnd, SCRATCH0_OPND, &stack_state),
+                        _ => split_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state),
                     };
 
                     // Lower too-large disp using `lea_into`
-                    *out = split_stack_membase(&mut asm, *out, SCRATCH1_OPND, &stack_state);
+                    *out = split_stack_membase(asm, *out, SCRATCH1_OPND, &stack_state);
 
                     if let Opnd::Mem(_) = out {
                         asm.store(*out, *opnd);
@@ -878,14 +861,14 @@ impl Assembler {
                     asm.jne(label);
                 }
                 Insn::Store { dest, .. } => {
-                    *dest = split_stack_membase(&mut asm, *dest, SCRATCH0_OPND, &stack_state);
+                    *dest = split_stack_membase(asm, *dest, SCRATCH0_OPND, &stack_state);
                     asm.push_insn(insn);
                 }
                 &mut Insn::Mov { dest, src } => {
                     match dest {
                         Opnd::Reg(_) => asm.load_into(dest, src),
                         Opnd::Mem(_) => {
-                            let dest = split_large_disp(&mut asm, dest, SCRATCH0_OPND);
+                            let dest = split_large_disp(asm, dest, SCRATCH0_OPND);
                             asm.store(dest, src);
                         }
                         _ => asm.push_insn(insn),
@@ -907,7 +890,7 @@ impl Assembler {
             }
         }
 
-        asm
+        asm_local
     }
 
     /// Emit platform-specific machine code
