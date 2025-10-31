@@ -709,8 +709,16 @@ impl Assembler {
         }
 
         /// If opnd is Opnd::Mem with MemBase::Stack, lower it to Opnd::Mem with MemBase::Reg.
+        /// Then it also splits large disp.
         fn split_stack_membase(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd, stack_state: &StackState) -> Opnd {
-            let opnd = if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: base_num_bits }, disp: opnd_disp, num_bits: opnd_num_bits }) = opnd {
+            let opnd = split_stack_membase_without_disp(asm, opnd, scratch_opnd, stack_state);
+            split_large_disp(asm, opnd, scratch_opnd)
+        }
+
+        /// You probably want to use split_stack_membase in most cases, but this is separate
+        /// from split_stack_membase for lea to avoid unnecessary splits.
+        fn split_stack_membase_without_disp(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd, stack_state: &StackState) -> Opnd {
+            if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: base_num_bits }, disp: opnd_disp, num_bits: opnd_num_bits }) = opnd {
                 // Convert MemBase::Stack to the original Opnd::Mem
                 let base_disp = stack_state.stack_idx_to_disp(stack_idx);
                 let base = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: base_disp, num_bits: base_num_bits });
@@ -725,10 +733,7 @@ impl Assembler {
                 Opnd::Mem(Mem { base: MemBase::Reg(scratch_opnd.unwrap_reg().reg_no), disp: opnd_disp, num_bits: opnd_num_bits })
             } else {
                 opnd
-            };
-
-            // If opnd's disp is too large, make it smaller using `lea_into`
-            split_large_disp(asm, opnd, scratch_opnd)
+            }
         }
 
         fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
@@ -807,19 +812,14 @@ impl Assembler {
                     *opnds = vec![];
                     asm.push_insn(insn);
                 }
-                &mut Insn::Lea { opnd, out } => {
-                    match (opnd, out) {
-                        (Opnd::Mem(_), Opnd::Mem(_)) => {
-                            asm.lea_into(SCRATCH0_OPND, opnd);
-
-                            // Split out using a scratch register if necessary.
-                            let out = split_large_disp(asm, out, SCRATCH1_OPND);
-
-                            asm.store(out, SCRATCH0_OPND);
-                        }
-                        _ => {
-                            asm.push_insn(insn);
-                        }
+                Insn::Lea { opnd, out } => {
+                    *opnd = split_stack_membase_without_disp(asm, *opnd, SCRATCH0_OPND, &stack_state);
+                    if let Opnd::Mem(_) = out {
+                        asm.lea_into(SCRATCH0_OPND, *opnd);
+                        let out = split_large_disp(asm, *out, SCRATCH1_OPND);
+                        asm.store(out, SCRATCH0_OPND);
+                    } else {
+                        asm.push_insn(insn);
                     }
                 }
                 Insn::Load { opnd, out } |
