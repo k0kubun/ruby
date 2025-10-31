@@ -779,7 +779,8 @@ impl Assembler {
                         let mem_out = out.clone();
                         *out = SCRATCH2_OPND;
                         asm.push_insn(insn);
-                        asm.store(mem_out, SCRATCH2_OPND);
+                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
+                        asm.store(out, SCRATCH2_OPND);
                     } else {
                         asm.push_insn(insn);
                     }
