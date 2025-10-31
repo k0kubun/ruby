@@ -754,6 +754,18 @@ impl Assembler {
 
         while let Some((_, mut insn)) = iterator.next() {
             match &mut insn {
+                Insn::And { left, right, out } => {
+                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
+                    *out = split_memory_operand(&mut asm, *out, SCRATCH2_OPND);
+                    asm.push_insn(insn);
+                }
+                Insn::Cmp { left, right } |
+                Insn::Test { left, right } => {
+                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
+                    asm.push_insn(insn);
+                }
                 &mut Insn::Mul { out, .. } => {
                     asm.push_insn(insn);
 
@@ -763,16 +775,6 @@ impl Assembler {
                         // Based on the sign bit of the 64-bit mul result
                         asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: out, shift: Opnd::UImm(63) });
                     }
-                }
-                Insn::Cmp { left, right } => {
-                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
-                    asm.push_insn(insn);
-                }
-                Insn::Test { left, right } => {
-                    *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
-                    asm.push_insn(insn);
                 }
                 Insn::CSelZ  { truthy, falsy, out } |
                 Insn::CSelNZ { truthy, falsy, out } |
