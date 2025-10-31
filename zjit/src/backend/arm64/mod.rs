@@ -736,6 +736,7 @@ impl Assembler {
             }
         }
 
+        /// If opnd is Opnd::Mem, lower it to Opnd::Reg. You should use this when `opnd` is read by the instruction, not written.
         fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             if let Opnd::Mem(_) = opnd {
                 let opnd = split_large_disp(asm, opnd, scratch_opnd);
@@ -877,6 +878,8 @@ impl Assembler {
                 // Resolve ParallelMov that couldn't be handled without a scratch register.
                 Insn::ParallelMov { moves } => {
                     for (dst, src) in Self::resolve_parallel_moves(moves, Some(SCRATCH0_OPND)).unwrap() {
+                        let src = split_stack_membase(asm, src, SCRATCH1_OPND, &stack_state);
+                        let dst = split_large_disp(asm, dst, SCRATCH2_OPND);
                         match dst {
                             Opnd::Reg(_) => asm.load_into(dst, src),
                             Opnd::Mem(_) => asm.store(dst, src),
