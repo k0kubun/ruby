@@ -818,25 +818,18 @@ impl Assembler {
                     *opnds = vec![];
                     asm.push_insn(insn);
                 }
-                &mut Insn::Lea { opnd, out } => {
-                    match (opnd, out) {
-                        // Split here for compile_exits
-                        (Opnd::Mem(_), Opnd::Mem(Mem { num_bits: out_num_bits, disp: out_disp, .. })) => {
-                            asm.lea_into(SCRATCH0_OPND, opnd);
+                Insn::Lea { opnd, out } => {
+                    *opnd = split_stack_membase(&mut asm, *opnd, SCRATCH0_OPND, &stack_state);
 
-                            // Split out using a scratch register if necessary.
-                            let out = if mem_disp_fits_bits(out_disp) {
-                                out
-                            } else {
-                                asm.lea_into(SCRATCH1_OPND, out);
-                                Opnd::mem(out_num_bits, SCRATCH1_OPND, 0)
-                            };
+                    if let Opnd::Mem(_) = out {
+                        asm.lea_into(SCRATCH0_OPND, *opnd);
 
-                            asm.store(out, SCRATCH0_OPND);
-                        }
-                        _ => {
-                            asm.push_insn(insn);
-                        }
+                        // Split out using a scratch register if necessary.
+                        let out = split_large_disp(&mut asm, *out, SCRATCH1_OPND);
+
+                        asm.store(out, SCRATCH0_OPND);
+                    } else {
+                        asm.push_insn(insn);
                     }
                 }
                 Insn::Load { opnd, out } |
