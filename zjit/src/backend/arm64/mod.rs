@@ -861,7 +861,10 @@ impl Assembler {
                 }
                 &mut Insn::Mov { dest, src } => {
                     match dest {
-                        Opnd::Reg(_) => asm.load_into(dest, src),
+                        Opnd::Reg(_) => {
+                            let src = split_large_disp(asm, src, SCRATCH0_OPND);
+                            asm.load_into(dest, src);
+                        }
                         Opnd::Mem(_) => {
                             let dest = split_large_disp(asm, dest, SCRATCH0_OPND);
                             asm.store(dest, src);
