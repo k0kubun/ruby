@@ -861,15 +861,15 @@ impl Assembler {
                     *dest = split_stack_membase(asm, *dest, SCRATCH0_OPND, &stack_state);
                     asm.push_insn(insn);
                 }
-                &mut Insn::Mov { dest, src } => {
+                Insn::Mov { dest, src } => {
+                    *src = split_stack_membase(asm, *src, SCRATCH0_OPND, &stack_state);
+                    *dest = split_large_disp(asm, *dest, SCRATCH1_OPND);
                     match dest {
                         Opnd::Reg(_) => {
-                            let src = split_large_disp(asm, src, SCRATCH0_OPND);
-                            asm.load_into(dest, src);
+                            asm.load_into(*dest, *src);
                         }
                         Opnd::Mem(_) => {
-                            let dest = split_large_disp(asm, dest, SCRATCH0_OPND);
-                            asm.store(dest, src);
+                            asm.store(*dest, *src);
                         }
                         _ => asm.push_insn(insn),
                     }
