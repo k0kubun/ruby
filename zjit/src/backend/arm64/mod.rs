@@ -738,6 +738,7 @@ impl Assembler {
 
         fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             if let Opnd::Mem(_) = opnd {
+                let opnd = split_large_disp(asm, opnd, scratch_opnd);
                 let scratch_opnd = if let Some(num_bits) = opnd.num_bits() {
                     scratch_opnd.with_num_bits(num_bits)
                 } else {
