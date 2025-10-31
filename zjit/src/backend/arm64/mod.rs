@@ -824,21 +824,16 @@ impl Assembler {
                 }
                 Insn::Load { opnd, out } |
                 Insn::LoadInto { opnd, dest: out } => {
-                    *opnd = match (&out, &opnd) {
-                        // If NATIVE_STACK_PTR is used as a source for Store, it's handled as xzr, storeing zero.
-                        // To save the content of NATIVE_STACK_PTR, we need to load it into another register first.
-                        (Opnd::Mem(_), Opnd::Reg(_)) if *opnd == NATIVE_STACK_PTR => {
-                            asm.load_into(SCRATCH0_OPND, NATIVE_STACK_PTR);
-                            SCRATCH0_OPND
-                        }
-                        // Lower MemBase::Stack into MemBase::Reg using a scratch register
-                        _ => split_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state),
-                    };
-
-                    // Lower too-large disp using `lea_into`
+                    *opnd = split_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state);
                     *out = split_stack_membase(asm, *out, SCRATCH1_OPND, &stack_state);
 
                     if let Opnd::Mem(_) = out {
+                        // If NATIVE_STACK_PTR is used as a source for Store, it's handled as xzr, storeing zero.
+                        // To save the content of NATIVE_STACK_PTR, we need to load it into another register first.
+                        if *opnd == NATIVE_STACK_PTR {
+                            asm.load_into(SCRATCH0_OPND, NATIVE_STACK_PTR);
+                            *opnd = SCRATCH0_OPND;
+                        }
                         asm.store(*out, *opnd);
                     } else {
                         asm.push_insn(insn);
