@@ -759,8 +759,15 @@ impl Assembler {
                 Insn::And { left, right, out } => {
                     *left = split_memory_operand(&mut asm, *left, SCRATCH0_OPND);
                     *right = split_memory_operand(&mut asm, *right, SCRATCH1_OPND);
-                    *out = split_memory_operand(&mut asm, *out, SCRATCH2_OPND);
-                    asm.push_insn(insn);
+
+                    if let Opnd::Mem(_) = out {
+                        let mem_out = out.clone();
+                        *out = SCRATCH2_OPND;
+                        asm.push_insn(insn);
+                        asm.store(mem_out, SCRATCH2_OPND);
+                    } else {
+                        asm.push_insn(insn);
+                    }
                 }
                 &mut Insn::Mul { out, .. } => {
                     asm.push_insn(insn);
@@ -795,7 +802,6 @@ impl Assembler {
                     *falsy = split_memory_operand(&mut asm, *falsy, SCRATCH1_OPND);
 
                     if let Opnd::Mem(_) = out {
-                        // If out is memory, write into a register first, and then copy it into memory.
                         let mem_out = out.clone();
                         *out = SCRATCH2_OPND;
                         asm.push_insn(insn);
