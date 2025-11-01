@@ -814,8 +814,15 @@ impl Assembler {
                 }
                 Insn::RShift { opnd, out, .. } => {
                     *opnd = split_memory_operand(asm, *opnd, SCRATCH0_OPND);
-                    *out = split_memory_operand(asm, *out, SCRATCH1_OPND);
-                    asm.push_insn(insn);
+                    if let Opnd::Mem(_) = out {
+                        let mem_out = out.clone();
+                        *out = SCRATCH1_OPND;
+                        asm.push_insn(insn);
+                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
+                        asm.store(out, SCRATCH1_OPND);
+                    } else {
+                        asm.push_insn(insn);
+                    }
                 }
                 Insn::Cmp { left, right } |
                 Insn::Test { left, right } => {
