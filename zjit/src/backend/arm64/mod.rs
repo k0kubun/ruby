@@ -722,13 +722,11 @@ impl Assembler {
                 let base_disp = stack_state.stack_idx_to_disp(base_stack_idx);
                 let base = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: base_disp, num_bits: base_num_bits });
 
-                // If base's disp is too large, make it smaller using `lea_into`
+                // Load the base Opnd::Mem into Opnd::Reg
                 let base = split_large_disp(asm, base, scratch_opnd);
-
-                // Convert the base Opnd::Mem into Opnd::Reg
                 asm.load_into(scratch_opnd, base);
 
-                // Finally, reconstruct the original `opnd` using MemBase::Reg lowered from MemBase::Stack
+                // Finally, reconstruct the original `opnd` using MemBase::Reg
                 Opnd::Mem(Mem { base: MemBase::Reg(scratch_opnd.unwrap_reg().reg_no), disp: opnd_disp, num_bits: opnd_num_bits })
             } else {
                 opnd
@@ -739,11 +737,7 @@ impl Assembler {
         fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             if let Opnd::Mem(_) = opnd {
                 let opnd = split_large_disp(asm, opnd, scratch_opnd);
-                let scratch_opnd = if let Some(num_bits) = opnd.num_bits() {
-                    scratch_opnd.with_num_bits(num_bits)
-                } else {
-                    scratch_opnd
-                };
+                let scratch_opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
                 asm.load_into(scratch_opnd, opnd);
                 scratch_opnd
             } else {
