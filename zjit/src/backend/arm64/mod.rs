@@ -765,6 +765,8 @@ impl Assembler {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
                 Insn::And { left, right, out } |
+                Insn::Or { left, right, out } |
+                Insn::Xor { left, right, out } |
                 Insn::CSelZ  { truthy: left, falsy: right, out } |
                 Insn::CSelNZ { truthy: left, falsy: right, out } |
                 Insn::CSelE  { truthy: left, falsy: right, out } |
