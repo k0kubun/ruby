@@ -788,8 +788,22 @@ impl Assembler {
                         asm.push_insn(insn);
                     }
                 }
-                &mut Insn::Mul { out, .. } => {
-                    asm.push_insn(insn);
+                Insn::Mul { left, right, out } => {
+                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
+
+                    let out = if let Opnd::Mem(_) = out {
+                        let mem_out = out.clone();
+                        *out = SCRATCH2_OPND;
+                        asm.push_insn(insn);
+                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
+                        asm.store(out, SCRATCH2_OPND);
+                        SCRATCH2_OPND
+                    } else {
+                        let out = out.clone();
+                        asm.push_insn(insn);
+                        out
+                    };
 
                     // If the next instruction is JoMul
                     if matches!(iterator.peek(), Some((_, Insn::JoMul(_)))) {
