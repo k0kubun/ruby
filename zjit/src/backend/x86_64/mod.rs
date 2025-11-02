@@ -435,10 +435,23 @@ impl Assembler {
             }
         }
 
+        /// If out is different from opnd, move opnd to out, splitting it with scratch_opnd if it's a Mem-to-Mem move.
+        fn mov_out_opnd(asm: &mut Assembler, out: Opnd, opnd: Opnd, scratch_opnd: Opnd) {
+            if out != opnd {
+                if let (Opnd::Mem(_), Opnd::Mem(_)) = (out, opnd) {
+                    asm.mov(scratch_opnd, opnd);
+                    asm.mov(out, scratch_opnd);
+                } else {
+                    asm.mov(out, opnd);
+                }
+            }
+        }
+
         // Prepare StackState to calculate stack_idx_to_disp
         let stack_state = StackState::new(self.stack_base_idx);
 
-        let mut asm = Assembler::new_with_asm(&self);
+        let mut asm_local = Assembler::new_with_asm(&self);
+        let asm = &mut asm_local;
         asm.accept_scratch_reg = true;
         let mut iterator = self.insns.into_iter().enumerate().peekable();
 
@@ -449,49 +462,41 @@ impl Assembler {
                 Insn::And { left, right, out } |
                 Insn::Or  { left, right, out } |
                 Insn::Xor { left, right, out } => {
-                    *left = split_stack_membase(&mut asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
                     let left = *left;
                     let out = *out;
 
                     match &right {
                         Opnd::Mem(_) => {
-                            *right = split_stack_membase(&mut asm, *right, SCRATCH1_OPND, &stack_state);
+                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                             if matches!(left, Opnd::Mem(_)) {
                                 asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
                                 *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(&mut asm, *right);
+                            *right = split_64bit_immediate(asm, *right);
                         }
                         _ => {}
                     }
 
                     asm.push_insn(insn);
 
-                    if out != left {
-                        if matches!((out, left), (Opnd::Mem(_), Opnd::Mem(_))) {
-                            asm.mov(SCRATCH0_OPND, left);
-                            asm.mov(out, SCRATCH0_OPND);
-                        } else {
-                            //
-                            asm.mov(out, left);
-                        }
-                    }
+                    mov_out_opnd(asm, out, left, SCRATCH0_OPND);
                 }
                 Insn::Mul { left, right, out } => {
-                    *left = split_stack_membase(&mut asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
 
                     match &right {
                         Opnd::Mem(_) => {
-                            *right = split_stack_membase(&mut asm, *right, SCRATCH1_OPND, &stack_state);
+                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                             if matches!(left, Opnd::Mem(_)) {
                                 asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
                                 *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(&mut asm, *right);
+                            *right = split_64bit_immediate(asm, *right);
                         }
                         _ => {}
                     }
@@ -505,43 +510,28 @@ impl Assembler {
 
                     asm.push_insn(insn);
 
-                    if out != opnd {
-                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
-                            asm.mov(SCRATCH0_OPND, opnd);
-                            asm.mov(out, SCRATCH0_OPND);
-                        } else {
-                            asm.mov(out, opnd);
-                        }
-                    }
+                    mov_out_opnd(asm, out, opnd, SCRATCH0_OPND);
                 }
                 &mut Insn::Not { opnd, out } |
                 &mut Insn::LShift { opnd, out, .. } |
                 &mut Insn::RShift { opnd, out, .. } |
                 &mut Insn::URShift { opnd, out, .. } => {
                     asm.push_insn(insn);
-
-                    if out != opnd {
-                        if matches!((out, opnd), (Opnd::Mem(_), Opnd::Mem(_))) {
-                            asm.mov(SCRATCH0_OPND, opnd);
-                            asm.mov(out, SCRATCH0_OPND);
-                        } else {
-                            asm.mov(out, opnd);
-                        }
-                    }
+                    mov_out_opnd(asm, out, opnd, SCRATCH0_OPND);
                 }
                 Insn::Test { left, right } => {
-                    *left = split_stack_membase(&mut asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
 
                     match &right {
                         Opnd::Mem(_) => {
-                            *right = split_stack_membase(&mut asm, *right, SCRATCH1_OPND, &stack_state);
+                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                             if matches!(left, Opnd::Mem(_)) {
                                 asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
                                 *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(&mut asm, *right);
+                            *right = split_64bit_immediate(asm, *right);
                         }
                         _ => {}
                     }
@@ -549,11 +539,11 @@ impl Assembler {
                     asm.push_insn(insn);
                 }
                 Insn::Cmp { left, right } => {
-                    *left = split_stack_membase(&mut asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
 
                     match &right {
                         Opnd::Mem(_) => {
-                            *right = split_stack_membase(&mut asm, *right, SCRATCH1_OPND, &stack_state);
+                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                             if matches!(left, Opnd::Mem(_)) {
                                 asm.load_into(SCRATCH1_OPND, *right);
                                 *right = SCRATCH1_OPND;
@@ -574,7 +564,7 @@ impl Assembler {
                             // directly in the instruction.
                             let use_imm = left.num_bits() == Some(num_bits) && num_bits < 64;
                             if !use_imm {
-                                *right = split_64bit_immediate(&mut asm, *right);
+                                *right = split_64bit_immediate(asm, *right);
                             }
                         }
                         _ => {}
@@ -611,7 +601,7 @@ impl Assembler {
                 Insn::Load { out, opnd } |
                 Insn::LoadInto { dest: out, opnd } => {
                     // If the load target has MemBase::Stack, lower it to Stack::Reg.
-                    *opnd = split_stack_membase(&mut asm, *opnd, SCRATCH0_OPND, &stack_state);
+                    *opnd = split_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state);
 
                     // If a load attempt fails due to register spill, load into a scratch register first.
                     if let Opnd::Mem(Mem { num_bits, .. }) = *out {
@@ -658,7 +648,7 @@ impl Assembler {
                 // Handle various operand combinations for spills on compile_exits.
                 &mut Insn::Store { dest, src } => {
                     let num_bits = dest.rm_num_bits();
-                    let dest = split_stack_membase(&mut asm, dest, SCRATCH1_OPND, &stack_state);
+                    let dest = split_stack_membase(asm, dest, SCRATCH1_OPND, &stack_state);
 
                     let src = match src {
                         Opnd::Reg(_) => src,
@@ -719,7 +709,7 @@ impl Assembler {
             }
         }
 
-        asm
+        asm_local
     }
 
     /// Emit platform-specific machine code
