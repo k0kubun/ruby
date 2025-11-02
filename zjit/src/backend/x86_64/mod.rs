@@ -395,13 +395,13 @@ impl Assembler {
         /// without requiring more registers to be available in the register
         /// allocator. So we just use the SCRATCH0_OPND register temporarily to hold
         /// the value before we immediately use it.
-        fn split_64bit_immediate(asm: &mut Assembler, opnd: Opnd) -> Opnd {
+        fn split_64bit_immediate(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             match opnd {
                 Opnd::Imm(value) => {
                     // 32-bit values will be sign-extended
                     if imm_num_bits(value) > 32 {
-                        asm.mov(SCRATCH0_OPND, opnd);
-                        SCRATCH0_OPND
+                        asm.mov(scratch_opnd, opnd);
+                        scratch_opnd
                     } else {
                         opnd
                     }
@@ -409,8 +409,8 @@ impl Assembler {
                 Opnd::UImm(value) => {
                     // 32-bit values will be sign-extended
                     if imm_num_bits(value as i64) > 32 {
-                        asm.mov(SCRATCH0_OPND, opnd);
-                        SCRATCH0_OPND
+                        asm.mov(scratch_opnd, opnd);
+                        scratch_opnd
                     } else {
                         Opnd::Imm(value as i64)
                     }
@@ -486,7 +486,7 @@ impl Assembler {
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(asm, *right);
+                            *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
                         }
                         _ => {}
                     }
@@ -507,7 +507,7 @@ impl Assembler {
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(asm, *right);
+                            *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
                         }
                         _ => {}
                     }
@@ -542,7 +542,7 @@ impl Assembler {
                             }
                         }
                         Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(asm, *right);
+                            *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
                         }
                         _ => {}
                     }
@@ -550,37 +550,30 @@ impl Assembler {
                     asm.push_insn(insn);
                 }
                 Insn::Cmp { left, right } => {
-                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_stack_membase(asm, *left, SCRATCH1_OPND, &stack_state);
+                    *right = split_stack_membase(asm, *right, SCRATCH0_OPND, &stack_state);
 
-                    match &right {
-                        Opnd::Mem(_) => {
-                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
-                            if matches!(left, Opnd::Mem(_)) {
-                                asm.load_into(SCRATCH1_OPND, *right);
-                                *right = SCRATCH1_OPND;
-                            }
-                        }
-                        Opnd::UImm(_) | Opnd::Imm(_) => {
-                            let num_bits = match right {
-                                Opnd::Imm(value) => imm_num_bits(*value),
-                                Opnd::UImm(value) => uimm_num_bits(*value),
-                                _ => unreachable!(),
-                            };
+                    let num_bits = match right {
+                        Opnd::Imm(value) => Some(imm_num_bits(*value)),
+                        Opnd::UImm(value) => Some(uimm_num_bits(*value)),
+                        _ => None
+                    };
 
-                            // If the immediate is less than 64 bits (like 32, 16, 8), and the operand
-                            // sizes match, then we can represent it as an immediate in the instruction
-                            // without moving it to a register first.
-                            // IOW, 64 bit immediates must always be moved to a register
-                            // before comparisons, where other sizes may be encoded
-                            // directly in the instruction.
-                            let use_imm = left.num_bits() == Some(num_bits) && num_bits < 64;
-                            if !use_imm {
-                                *right = split_64bit_immediate(asm, *right);
-                            }
-                        }
-                        _ => {}
+                    // If the immediate is less than 64 bits (like 32, 16, 8), and the operand
+                    // sizes match, then we can represent it as an immediate in the instruction
+                    // without moving it to a register first.
+                    // IOW, 64 bit immediates must always be moved to a register
+                    // before comparisons, where other sizes may be encoded
+                    // directly in the instruction.
+                    let use_imm = num_bits.is_some() && left.num_bits() == num_bits && num_bits.unwrap() < 64;
+                    if !use_imm {
+                        *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
                     }
 
+                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
+                        asm.load_into(SCRATCH0_OPND, *right);
+                        *right = SCRATCH0_OPND;
+                    }
                     asm.push_insn(insn);
                 }
                 // For compile_exits, support splitting simple C arguments here
