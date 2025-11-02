@@ -435,6 +435,17 @@ impl Assembler {
             }
         }
 
+        /// If opnd is Opnd::Mem, set scratch_reg to *opnd. Return Some(Opnd::Mem) if it needs to be written back from scratch_reg.
+        fn split_memory_write(opnd: &mut Opnd, scratch_opnd: Opnd) -> Option<Opnd> {
+            if let Opnd::Mem(_) = opnd {
+                let mem_opnd = opnd.clone();
+                *opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
+                Some(mem_opnd)
+            } else {
+                None
+            }
+        }
+
         /// If out is different from opnd, move opnd to out, splitting it with scratch_opnd if it's a Mem-to-Mem move.
         fn mov_out_opnd(asm: &mut Assembler, out: Opnd, opnd: Opnd, scratch_opnd: Opnd) {
             if out != opnd {
@@ -580,16 +591,19 @@ impl Assembler {
                     *opnds = vec![];
                     asm.push_insn(insn);
                 }
-                &mut Insn::Lea { opnd, out } => {
-                    match (opnd, out) {
-                        // Split here for compile_exits
-                        (Opnd::Mem(_), Opnd::Mem(_)) => {
-                            asm.lea_into(SCRATCH0_OPND, opnd);
-                            asm.store(out, SCRATCH0_OPND);
-                        }
-                        _ => {
-                            asm.push_insn(insn);
-                        }
+                Insn::CSelZ { out, .. } |
+                Insn::CSelNZ { out, .. } |
+                Insn::CSelE { out, .. } |
+                Insn::CSelNE { out, .. } |
+                Insn::CSelL { out, .. } |
+                Insn::CSelLE { out, .. } |
+                Insn::CSelG { out, .. } |
+                Insn::CSelGE { out, .. } |
+                Insn::Lea { out, .. } => {
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+                    asm.push_insn(insn);
+                    if let Some(mem_out) = mem_out {
+                        asm.store(mem_out, SCRATCH0_OPND);
                     }
                 }
                 Insn::LeaJumpTarget { target, out } => {
@@ -600,15 +614,11 @@ impl Assembler {
                 }
                 Insn::Load { out, opnd } |
                 Insn::LoadInto { dest: out, opnd } => {
-                    // If the load target has MemBase::Stack, lower it to Stack::Reg.
                     *opnd = split_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state);
-
-                    // If a load attempt fails due to register spill, load into a scratch register first.
-                    if let Opnd::Mem(Mem { num_bits, .. }) = *out {
-                        asm.load_into(SCRATCH0_OPND.with_num_bits(num_bits), *opnd);
-                        asm.store(*out, SCRATCH0_OPND.with_num_bits(num_bits));
-                    } else {
-                        asm.push_insn(insn);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+                    asm.push_insn(insn);
+                    if let Some(mem_out) = mem_out {
+                        asm.store(mem_out, SCRATCH0_OPND.with_num_bits(mem_out.rm_num_bits()));
                     }
                 }
                 // Convert Opnd::const_ptr into Opnd::Mem. This split is done here to give
@@ -685,23 +695,6 @@ impl Assembler {
                         src @ (Opnd::None | Opnd::VReg { .. }) => panic!("Unexpected source operand during x86_scratch_split: {src:?}"),
                     };
                     asm.store(dest, src);
-                }
-                Insn::CSelZ { out, .. } |
-                Insn::CSelNZ { out, .. } |
-                Insn::CSelE { out, .. } |
-                Insn::CSelNE { out, .. } |
-                Insn::CSelL { out, .. } |
-                Insn::CSelLE { out, .. } |
-                Insn::CSelG { out, .. } |
-                Insn::CSelGE { out, .. } => {
-                    if let Opnd::Mem(_) = out {
-                        let mem_out = out.clone();
-                        *out = SCRATCH0_OPND.with_num_bits(out.rm_num_bits());
-                        asm.push_insn(insn);
-                        asm.store(mem_out, SCRATCH0_OPND.with_num_bits(mem_out.rm_num_bits()))
-                    } else {
-                        asm.push_insn(insn);
-                    }
                 }
                 _ => {
                     asm.push_insn(insn);

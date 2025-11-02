@@ -749,8 +749,7 @@ impl Assembler {
         fn split_memory_write(opnd: &mut Opnd, scratch_opnd: Opnd) -> Option<Opnd> {
             if let Opnd::Mem(_) = opnd {
                 let mem_opnd = opnd.clone();
-                let scratch_opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
-                *opnd = scratch_opnd;
+                *opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
                 Some(mem_opnd)
             } else {
                 None
