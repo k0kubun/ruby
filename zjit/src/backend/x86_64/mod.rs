@@ -446,14 +446,14 @@ impl Assembler {
             }
         }
 
-        /// If out is different from opnd, move opnd to out, splitting it with scratch_opnd if it's a Mem-to-Mem move.
-        fn mov_out_opnd(asm: &mut Assembler, out: Opnd, opnd: Opnd, scratch_opnd: Opnd) {
-            if out != opnd {
-                if let (Opnd::Mem(_), Opnd::Mem(_)) = (out, opnd) {
-                    asm.mov(scratch_opnd, opnd);
-                    asm.mov(out, scratch_opnd);
+        /// Move src to dst, splitting it with scratch_opnd if it's a Mem-to-Mem move. Skip it if dst == src.
+        fn asm_mov(asm: &mut Assembler, dst: Opnd, src: Opnd, scratch_opnd: Opnd) {
+            if dst != src {
+                if let (Opnd::Mem(_), Opnd::Mem(_)) = (dst, src) {
+                    asm.mov(scratch_opnd, src);
+                    asm.mov(dst, scratch_opnd);
                 } else {
-                    asm.mov(out, opnd);
+                    asm.mov(dst, src);
                 }
             }
         }
@@ -492,8 +492,7 @@ impl Assembler {
                     }
 
                     asm.push_insn(insn);
-
-                    mov_out_opnd(asm, out, left, SCRATCH0_OPND);
+                    asm_mov(asm, out, left, SCRATCH0_OPND);
                 }
                 Insn::Mul { left, right, out } => {
                     *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
@@ -512,7 +511,7 @@ impl Assembler {
                         _ => {}
                     }
 
-                    let opnd = if matches!((&left, &right), (&Opnd::Mem(_), &Opnd::Reg(_))) {
+                    let opnd = if let (&Opnd::Mem(_), &Opnd::Reg(_)) = (&left, &right) {
                         *right // imul flips the left and the right for this case
                     } else {
                         *left
@@ -520,15 +519,14 @@ impl Assembler {
                     let out = *out;
 
                     asm.push_insn(insn);
-
-                    mov_out_opnd(asm, out, opnd, SCRATCH0_OPND);
+                    asm_mov(asm, out, opnd, SCRATCH0_OPND);
                 }
                 &mut Insn::Not { opnd, out } |
                 &mut Insn::LShift { opnd, out, .. } |
                 &mut Insn::RShift { opnd, out, .. } |
                 &mut Insn::URShift { opnd, out, .. } => {
                     asm.push_insn(insn);
-                    mov_out_opnd(asm, out, opnd, SCRATCH0_OPND);
+                    asm_mov(asm, out, opnd, SCRATCH0_OPND);
                 }
                 Insn::Test { left, right } |
                 Insn::Cmp { left, right } => {
@@ -604,30 +602,12 @@ impl Assembler {
                     asm.incr_counter(Opnd::mem(64, SCRATCH0_OPND, 0), value);
                 }
                 &mut Insn::Mov { dest, src } => {
-                    if matches!(dest, Opnd::Mem(_)) {
-                        if matches!(src, Opnd::Mem(_)) {
-                            asm.load_into(SCRATCH0_OPND, src);
-                            asm.store(dest, SCRATCH0_OPND);
-                        } else {
-                            asm.store(dest, src);
-                        }
-                    } else {
-                        asm.push_insn(insn);
-                    }
+                    asm_mov(asm, dest, src, SCRATCH0_OPND);
                 }
                 // Resolve ParallelMov that couldn't be handled without a scratch register.
                 Insn::ParallelMov { moves } => {
                     for (dst, src) in Self::resolve_parallel_moves(&moves, Some(SCRATCH0_OPND)).unwrap() {
-                        if matches!(dst, Opnd::Mem(_)) {
-                            if matches!(src, Opnd::Mem(_)) {
-                                asm.load_into(SCRATCH0_OPND, src);
-                                asm.store(dst, SCRATCH0_OPND);
-                            } else {
-                                asm.store(dst, src);
-                            }
-                        } else {
-                            asm.mov(dst, src);
-                        }
+                        asm_mov(asm, dst, src, SCRATCH0_OPND);
                     }
                 }
                 // Handle various operand combinations for spills on compile_exits.
