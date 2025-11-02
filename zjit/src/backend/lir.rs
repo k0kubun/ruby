@@ -1204,7 +1204,18 @@ impl StackState {
         (self.stack_base_idx + stack_idx + 1) as i32 * -SIZEOF_VALUE_I32
     }
 
-    /// Convert MemBase::Stack to the original Opnd::Mem.
+    /// Convert Mem to MemBase::Stack
+    fn mem_to_stack_membase(&self, mem: Mem) -> MemBase {
+        match mem {
+            Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG_NO), disp, num_bits } => {
+                let stack_idx = self.disp_to_stack_idx(disp);
+                MemBase::Stack { stack_idx, num_bits }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Convert MemBase::Stack to Mem
     pub(super) fn stack_membase_to_mem(&self, membase: MemBase) -> Mem {
         match membase {
             MemBase::Stack { stack_idx, num_bits } => {
@@ -1656,10 +1667,9 @@ impl Assembler
                             Opnd::Reg(reg) => {
                                 *opnd = Opnd::Mem(Mem { base: MemBase::Reg(reg.reg_no), disp, num_bits });
                             }
-                            // If the MemBase is a spilled VReg, lower it to MemBase::Stack, letting scratch_split lower it to MemBase::Reg.
-                            Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG_NO), disp: stack_disp, num_bits: stack_num_bits }) => {
-                                let stack_idx = pool.stack_state.disp_to_stack_idx(stack_disp);
-                                *opnd = Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits });
+                            Opnd::Mem(mem) => {
+                                // If the base is spilled, lower it to MemBase::Stack, which scratch_split will lower to MemBase::Reg.
+                                *opnd = Opnd::Mem(Mem { base: pool.stack_state.mem_to_stack_membase(mem), disp, num_bits });
                             }
                             _ => unreachable!(),
                         }
