@@ -1260,19 +1260,16 @@ impl RegisterPool {
     // Mutate the pool to indicate that the given register is being returned
     // as it is no longer used by the instruction that previously held it.
     fn dealloc_opnd(&mut self, opnd: &Opnd) {
-        match *opnd {
-            Opnd::Reg(reg) => {
-                let reg_idx = self.regs.iter().position(|elem| elem.reg_no == reg.reg_no)
-                    .unwrap_or_else(|| panic!("Unable to find register: {}", reg.reg_no));
-                if self.pool[reg_idx].is_some() {
-                    self.pool[reg_idx] = None;
-                    self.live_regs -= 1;
-                }
-            }
-            Opnd::Mem(Mem { disp, .. }) => {
-                self.stack_state.dealloc_stack(disp);
-            }
-            _ => unreachable!(),
+        if let Opnd::Mem(Mem { disp, .. }) = *opnd {
+            return self.stack_state.dealloc_stack(disp);
+        }
+
+        let reg = opnd.unwrap_reg();
+        let reg_idx = self.regs.iter().position(|elem| elem.reg_no == reg.reg_no)
+            .unwrap_or_else(|| panic!("Unable to find register: {}", reg.reg_no));
+        if self.pool[reg_idx].is_some() {
+            self.pool[reg_idx] = None;
+            self.live_regs -= 1;
         }
     }
 
