@@ -446,6 +446,16 @@ impl Assembler {
             }
         }
 
+        /// If both opnd and other are Opnd::Mem, split opnd with scratch_opnd.
+        fn split_if_both_memory(asm: &mut Assembler, opnd: Opnd, other: Opnd, scratch_opnd: Opnd) -> Opnd {
+            if let (Opnd::Mem(_), Opnd::Mem(_)) = (opnd, other) {
+                asm.load_into(scratch_opnd.with_num_bits(opnd.rm_num_bits()), opnd);
+                scratch_opnd.with_num_bits(opnd.rm_num_bits())
+            } else {
+                opnd
+            }
+        }
+
         /// Move src to dst, splitting it with scratch_opnd if it's a Mem-to-Mem move. Skip it if dst == src.
         fn asm_mov(asm: &mut Assembler, dst: Opnd, src: Opnd, scratch_opnd: Opnd) {
             if dst != src {
@@ -474,13 +484,9 @@ impl Assembler {
                 Insn::Or  { left, right, out } |
                 Insn::Xor { left, right, out } => {
                     *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_if_both_memory(asm, *left, *right, SCRATCH0_OPND);
                     *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                     *right = split_64bit_immediate(asm, *right, SCRATCH1_OPND);
-
-                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
-                        asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
-                        *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
-                    }
 
                     let (out, left) = (*out, *left);
                     asm.push_insn(insn);
@@ -488,13 +494,9 @@ impl Assembler {
                 }
                 Insn::Mul { left, right, out } => {
                     *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
+                    *left = split_if_both_memory(asm, *left, *right, SCRATCH0_OPND);
                     *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
                     *right = split_64bit_immediate(asm, *right, SCRATCH1_OPND);
-
-                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
-                        asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
-                        *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
-                    }
 
                     // imul doesn't have (Mem, Reg) encoding. Swap left and right in that case.
                     if let (Opnd::Mem(_), Opnd::Reg(_)) = (&left, &right) {
@@ -516,6 +518,7 @@ impl Assembler {
                 Insn::Cmp { left, right } => {
                     *left = split_stack_membase(asm, *left, SCRATCH1_OPND, &stack_state);
                     *right = split_stack_membase(asm, *right, SCRATCH0_OPND, &stack_state);
+                    *right = split_if_both_memory(asm, *right, *left, SCRATCH0_OPND);
 
                     let num_bits = match right {
                         Opnd::Imm(value) => Some(imm_num_bits(*value)),
@@ -532,11 +535,6 @@ impl Assembler {
                     let use_imm = num_bits.is_some() && left.num_bits() == num_bits && num_bits.unwrap() < 64;
                     if !use_imm {
                         *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
-                    }
-
-                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
-                        asm.load_into(SCRATCH0_OPND.with_num_bits(right.rm_num_bits()), *right);
-                        *right = SCRATCH0_OPND.with_num_bits(right.rm_num_bits());
                     }
                     asm.push_insn(insn);
                 }
