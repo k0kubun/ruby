@@ -1,4 +1,4 @@
-use std::mem::take;
+use std::mem::{self, take};
 
 use crate::asm::*;
 use crate::asm::x86_64::*;
@@ -474,52 +474,36 @@ impl Assembler {
                 Insn::Or  { left, right, out } |
                 Insn::Xor { left, right, out } => {
                     *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
-                    let left = *left;
-                    let out = *out;
+                    *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
+                    *right = split_64bit_immediate(asm, *right, SCRATCH1_OPND);
 
-                    match &right {
-                        Opnd::Mem(_) => {
-                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
-                            if matches!(left, Opnd::Mem(_)) {
-                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
-                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
-                            }
-                        }
-                        Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
-                        }
-                        _ => {}
+                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
+                        asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                        *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
                     }
 
+                    let (out, left) = (*out, *left);
                     asm.push_insn(insn);
                     asm_mov(asm, out, left, SCRATCH0_OPND);
                 }
                 Insn::Mul { left, right, out } => {
                     *left = split_stack_membase(asm, *left, SCRATCH0_OPND, &stack_state);
+                    *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
+                    *right = split_64bit_immediate(asm, *right, SCRATCH1_OPND);
 
-                    match &right {
-                        Opnd::Mem(_) => {
-                            *right = split_stack_membase(asm, *right, SCRATCH1_OPND, &stack_state);
-                            if matches!(left, Opnd::Mem(_)) {
-                                asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
-                                *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
-                            }
-                        }
-                        Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *right = split_64bit_immediate(asm, *right, SCRATCH0_OPND);
-                        }
-                        _ => {}
+                    if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
+                        asm.load_into(SCRATCH1_OPND.with_num_bits(right.rm_num_bits()), *right);
+                        *right = SCRATCH1_OPND.with_num_bits(right.rm_num_bits());
                     }
 
-                    let opnd = if let (&Opnd::Mem(_), &Opnd::Reg(_)) = (&left, &right) {
-                        *right // imul flips the left and the right for this case
-                    } else {
-                        *left
-                    };
-                    let out = *out;
+                    // imul doesn't have (Mem, Reg) encoding. Swap left and right in that case.
+                    if let (Opnd::Mem(_), Opnd::Reg(_)) = (&left, &right) {
+                        mem::swap(left, right);
+                    }
 
+                    let (out, left) = (*out, *left);
                     asm.push_insn(insn);
-                    asm_mov(asm, out, opnd, SCRATCH0_OPND);
+                    asm_mov(asm, out, left, SCRATCH0_OPND);
                 }
                 &mut Insn::Not { opnd, out } |
                 &mut Insn::LShift { opnd, out, .. } |
