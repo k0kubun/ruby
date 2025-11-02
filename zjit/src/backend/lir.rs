@@ -31,12 +31,12 @@ pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemBase
 {
+    /// Register: Every Opnd::Mem should have this MemBase as of emit.
+    Reg(u8),
     /// Virtual register: Lowered to MemBase::Reg or MemBase::Stack in alloc_regs.
     VReg(usize),
     /// Stack slot: Lowered to MemBase::Reg in scratch_split.
     Stack { stack_idx: usize, num_bits: u8 },
-    /// Register: Every Opnd::Mem should have this MemBase as of emit.
-    Reg(u8),
 }
 
 // Memory location
@@ -1531,7 +1531,7 @@ impl Assembler
 
         // Mapping from VReg to register or stack slot; allocated Opnd for each vreg_idx.
         // None if a register or a stack slot has not been allocated for the VReg.
-        let mut vreg_mapping: Vec<Option<Opnd>> = vec![None; self.live_ranges.len()];
+        let mut vreg_opnd: Vec<Option<Opnd>> = vec![None; self.live_ranges.len()];
 
         // List of registers saved before a C call, paired with the VReg index.
         let mut saved_regs: Vec<(Reg, usize)> = vec![];
@@ -1559,7 +1559,7 @@ impl Assembler
                         let new_reg = pool.alloc_opnd(vreg_idx);
                         asm.mov(new_reg, C_RET_OPND);
                         pool.dealloc_opnd(&Opnd::Reg(C_RET_REG));
-                        vreg_mapping[vreg_idx] = Some(new_reg);
+                        vreg_opnd[vreg_idx] = Some(new_reg);
                     }
 
                     true
@@ -1578,8 +1578,8 @@ impl Assembler
                         // uses this operand. If it is, we can return the allocated
                         // register to the pool.
                         if live_ranges[idx].end() == index {
-                            if let Some(reg) = vreg_mapping[idx] {
-                                pool.dealloc_opnd(&reg);
+                            if let Some(opnd) = vreg_opnd[idx] {
+                                pool.dealloc_opnd(&opnd);
                             } else {
                                 unreachable!("no register allocated for insn {:?}", insn);
                             }
@@ -1637,7 +1637,7 @@ impl Assembler
 
                     if let Some(Opnd::VReg{ idx, .. }) = opnd_iter.next() {
                         if live_ranges[*idx].end() == index {
-                            if let Some(Opnd::Reg(reg)) = vreg_mapping[*idx] {
+                            if let Some(Opnd::Reg(reg)) = vreg_opnd[*idx] {
                                 out_reg = Some(pool.take_reg(&reg, vreg_idx));
                             }
                         }
@@ -1646,7 +1646,7 @@ impl Assembler
 
                 // Allocate a new register for this instruction if one is not
                 // already allocated.
-                let out_reg = out_reg.unwrap_or_else(|| pool.alloc_opnd(vreg_idx));
+                let out_opnd = out_reg.unwrap_or_else(|| pool.alloc_opnd(vreg_idx));
 
                 // Set the output operand on the instruction
                 let out_num_bits = Opnd::match_num_bits_iter(insn.opnd_iter());
@@ -1655,9 +1655,9 @@ impl Assembler
                 // output operand on this instruction because the live range
                 // extends beyond the index of the instruction.
                 let out = insn.out_opnd_mut().unwrap();
-                let reg = out_reg.with_num_bits(out_num_bits);
-                vreg_mapping[out.vreg_idx()] = Some(reg);
-                *out = reg;
+                let out_opnd = out_opnd.with_num_bits(out_num_bits);
+                vreg_opnd[out.vreg_idx()] = Some(out_opnd);
+                *out = out_opnd;
             }
 
             // Replace VReg and Param operands by their corresponding register
@@ -1665,14 +1665,14 @@ impl Assembler
             while let Some(opnd) = opnd_iter.next() {
                 match *opnd {
                     Opnd::VReg { idx, num_bits } => {
-                        *opnd = vreg_mapping[idx].unwrap().with_num_bits(num_bits);
+                        *opnd = vreg_opnd[idx].unwrap().with_num_bits(num_bits);
                     },
                     Opnd::Mem(Mem { base: MemBase::VReg(idx), disp, num_bits }) => {
-                        match vreg_mapping[idx].unwrap() {
+                        match vreg_opnd[idx].unwrap() {
                             Opnd::Reg(reg) => {
                                 *opnd = Opnd::Mem(Mem { base: MemBase::Reg(reg.reg_no), disp, num_bits });
                             }
-                            // If the MemBase is a spilled VReg, let scratch_split lower it to MemBase::Reg.
+                            // If the MemBase is a spilled VReg, lower it to MemBase::Stack, letting scratch_split lower it to MemBase::Reg.
                             Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG_NO), disp: stack_disp, num_bits: stack_num_bits }) => {
                                 let stack_idx = pool.stack_state.disp_to_stack_idx(stack_disp);
                                 *opnd = Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits });
@@ -1688,8 +1688,8 @@ impl Assembler
             // register
             if let Some(idx) = vreg_idx {
                 if live_ranges[idx].end() == index {
-                    if let Some(reg) = vreg_mapping[idx] {
-                        pool.dealloc_opnd(&reg);
+                    if let Some(opnd) = vreg_opnd[idx] {
+                        pool.dealloc_opnd(&opnd);
                     } else {
                         unreachable!("no register allocated for insn {:?}", insn);
                     }
