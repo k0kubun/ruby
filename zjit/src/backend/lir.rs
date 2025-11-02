@@ -1556,10 +1556,10 @@ impl Assembler
                     // If C_RET_REG is in use, move it to another register.
                     // This must happen before last-use registers are deallocated.
                     if let Some(vreg_idx) = pool.vreg_for(&C_RET_REG) {
-                        let new_reg = pool.alloc_opnd(vreg_idx);
-                        asm.mov(new_reg, C_RET_OPND);
+                        let new_opnd = pool.alloc_opnd(vreg_idx);
+                        asm.mov(new_opnd, C_RET_OPND);
                         pool.dealloc_opnd(&Opnd::Reg(C_RET_REG));
-                        vreg_opnd[vreg_idx] = Some(new_reg);
+                        vreg_opnd[vreg_idx] = Some(new_opnd);
                     }
 
                     true
