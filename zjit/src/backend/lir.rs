@@ -1164,7 +1164,7 @@ pub struct StackState {
 
 impl StackState {
     /// Initialize a stack allocator
-    pub fn new(stack_base_idx: usize) -> Self {
+    pub(super) fn new(stack_base_idx: usize) -> Self {
         StackState {
             stack_size: 0,
             stack_slots: vec![],
@@ -1200,8 +1200,19 @@ impl StackState {
     }
 
     /// Convert a stack index to the `disp` of the stack slot
-    pub fn stack_idx_to_disp(&self, stack_idx: usize) -> i32 {
+    fn stack_idx_to_disp(&self, stack_idx: usize) -> i32 {
         (self.stack_base_idx + stack_idx + 1) as i32 * -SIZEOF_VALUE_I32
+    }
+
+    /// Convert MemBase::Stack to the original Opnd::Mem.
+    pub(super) fn stack_membase_to_mem(&self, membase: MemBase) -> Mem {
+        match membase {
+            MemBase::Stack { stack_idx, num_bits } => {
+                let disp = self.stack_idx_to_disp(stack_idx);
+                Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp, num_bits }
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

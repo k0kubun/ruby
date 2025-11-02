@@ -713,20 +713,10 @@ impl Assembler {
 
         /// split_stack_membase but without split_large_disp. This should be used only by lea.
         fn split_only_stack_membase(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd, stack_state: &StackState) -> Opnd {
-            if let Opnd::Mem(Mem {
-                base: MemBase::Stack { stack_idx: base_stack_idx, num_bits: base_num_bits },
-                disp: opnd_disp,
-                num_bits: opnd_num_bits,
-            }) = opnd {
-                // Convert MemBase::Stack to the original Opnd::Mem
-                let base_disp = stack_state.stack_idx_to_disp(base_stack_idx);
-                let base = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: base_disp, num_bits: base_num_bits });
-
-                // Load the base Opnd::Mem into Opnd::Reg
+            if let Opnd::Mem(Mem { base: stack_membase @ MemBase::Stack { .. }, disp: opnd_disp, num_bits: opnd_num_bits }) = opnd {
+                let base = Opnd::Mem(stack_state.stack_membase_to_mem(stack_membase));
                 let base = split_large_disp(asm, base, scratch_opnd);
                 asm.load_into(scratch_opnd, base);
-
-                // Finally, reconstruct the original `opnd` using MemBase::Reg
                 Opnd::Mem(Mem { base: MemBase::Reg(scratch_opnd.unwrap_reg().reg_no), disp: opnd_disp, num_bits: opnd_num_bits })
             } else {
                 opnd
@@ -756,7 +746,7 @@ impl Assembler {
             }
         }
 
-        // Prepare StackState to calculate stack_idx_to_disp
+        // Prepare StackState to lower MemBase::Stack
         let stack_state = StackState::new(self.stack_base_idx);
 
         let mut asm_local = Assembler::new_with_asm(&self);

@@ -419,16 +419,11 @@ impl Assembler {
             }
         }
 
-        /// If a given operand is Opnd::Mem and it uses MemBase::Stack,
-        /// lower it to MemBase::Reg using a scratch regsiter.
+        /// If a given operand is Opnd::Mem and it uses MemBase::Stack, lower it to MemBase::Reg using a scratch regsiter.
         fn split_stack_membase(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd, stack_state: &StackState) -> Opnd {
-            if let Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: stack_num_bits }, disp, num_bits }) = opnd {
-                // Convert MemBase::Stack to the original Opnd::Mem
-                let stack_disp = stack_state.stack_idx_to_disp(stack_idx);
-                let base_mem = Opnd::Mem(Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp: stack_disp, num_bits: stack_num_bits });
-
-                // Lower MemBase::Stack to MemBase::Reg using a scratch register
-                asm.load_into(scratch_opnd, base_mem);
+            if let Opnd::Mem(Mem { base: stack_membase @ MemBase::Stack { .. }, disp, num_bits }) = opnd {
+                let base = Opnd::Mem(stack_state.stack_membase_to_mem(stack_membase));
+                asm.load_into(scratch_opnd, base);
                 Opnd::Mem(Mem { base: MemBase::Reg(scratch_opnd.unwrap_reg().reg_no), disp, num_bits })
             } else {
                 opnd
@@ -468,7 +463,7 @@ impl Assembler {
             }
         }
 
-        // Prepare StackState to calculate stack_idx_to_disp
+        // Prepare StackState to lower MemBase::Stack
         let stack_state = StackState::new(self.stack_base_idx);
 
         let mut asm_local = Assembler::new_with_asm(&self);
