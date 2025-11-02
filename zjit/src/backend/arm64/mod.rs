@@ -733,8 +733,8 @@ impl Assembler {
             }
         }
 
-        /// If opnd is Opnd::Mem, lower it to Opnd::Reg. You should use this when `opnd` is read by the instruction, not written.
-        fn split_memory_operand(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
+        /// If opnd is Opnd::Mem, lower it to scratch_opnd. You should use this when `opnd` is read by the instruction, not written.
+        fn split_memory_read(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             if let Opnd::Mem(_) = opnd {
                 let opnd = split_large_disp(asm, opnd, scratch_opnd);
                 let scratch_opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
@@ -742,6 +742,18 @@ impl Assembler {
                 scratch_opnd
             } else {
                 opnd
+            }
+        }
+
+        /// If opnd is Opnd::Mem, set scratch_reg to *opnd. Return Some(Opnd::Mem) if it needs to be written back from scratch_reg.
+        fn split_memory_write(opnd: &mut Opnd, scratch_opnd: Opnd) -> Option<Opnd> {
+            if let Opnd::Mem(_) = opnd {
+                let mem_opnd = opnd.clone();
+                let scratch_opnd = opnd.num_bits().map(|num_bits| scratch_opnd.with_num_bits(num_bits)).unwrap_or(scratch_opnd);
+                *opnd = scratch_opnd;
+                Some(mem_opnd)
+            } else {
+                None
             }
         }
 
@@ -768,59 +780,52 @@ impl Assembler {
                 Insn::CSelLE { truthy: left, falsy: right, out } |
                 Insn::CSelG  { truthy: left, falsy: right, out } |
                 Insn::CSelGE { truthy: left, falsy: right, out } => {
-                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
+                    *left = split_memory_read(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_read(asm, *right, SCRATCH1_OPND);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
 
-                    if let Opnd::Mem(_) = out {
-                        let mem_out = out.clone();
-                        *out = SCRATCH2_OPND;
-                        asm.push_insn(insn);
-                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
-                        asm.store(out, SCRATCH2_OPND);
-                    } else {
-                        asm.push_insn(insn);
+                    asm.push_insn(insn);
+
+                    if let Some(mem_out) = mem_out {
+                        let mem_out = split_large_disp(asm, mem_out, SCRATCH1_OPND);
+                        asm.store(mem_out, SCRATCH0_OPND);
                     }
                 }
                 Insn::Mul { left, right, out } => {
-                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
+                    *left = split_memory_read(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_read(asm, *right, SCRATCH1_OPND);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+                    let reg_out = out.clone();
 
-                    let out = if let Opnd::Mem(_) = out {
-                        let mem_out = out.clone();
-                        *out = SCRATCH2_OPND;
-                        asm.push_insn(insn);
-                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
-                        asm.store(out, SCRATCH2_OPND);
-                        SCRATCH2_OPND
-                    } else {
-                        let out = out.clone();
-                        asm.push_insn(insn);
-                        out
+                    asm.push_insn(insn);
+
+                    if let Some(mem_out) = mem_out {
+                        let mem_out = split_large_disp(asm, mem_out, SCRATCH1_OPND);
+                        asm.store(mem_out, SCRATCH0_OPND);
                     };
 
                     // If the next instruction is JoMul
                     if matches!(iterator.peek(), Some((_, Insn::JoMul(_)))) {
                         // Produce a register that is all zeros or all ones
                         // Based on the sign bit of the 64-bit mul result
-                        asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: out, shift: Opnd::UImm(63) });
+                        asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: reg_out, shift: Opnd::UImm(63) });
                     }
                 }
                 Insn::RShift { opnd, out, .. } => {
-                    *opnd = split_memory_operand(asm, *opnd, SCRATCH0_OPND);
-                    if let Opnd::Mem(_) = out {
-                        let mem_out = out.clone();
-                        *out = SCRATCH1_OPND;
-                        asm.push_insn(insn);
-                        let out = split_large_disp(asm, mem_out, SCRATCH0_OPND);
-                        asm.store(out, SCRATCH1_OPND);
-                    } else {
-                        asm.push_insn(insn);
+                    *opnd = split_memory_read(asm, *opnd, SCRATCH0_OPND);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+
+                    asm.push_insn(insn);
+
+                    if let Some(mem_out) = mem_out {
+                        let mem_out = split_large_disp(asm, mem_out, SCRATCH1_OPND);
+                        asm.store(mem_out, SCRATCH0_OPND);
                     }
                 }
                 Insn::Cmp { left, right } |
                 Insn::Test { left, right } => {
-                    *left = split_memory_operand(asm, *left, SCRATCH0_OPND);
-                    *right = split_memory_operand(asm, *right, SCRATCH1_OPND);
+                    *left = split_memory_read(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_read(asm, *right, SCRATCH1_OPND);
                     asm.push_insn(insn);
                 }
                 // For compile_exits, support splitting simple C arguments here
@@ -833,12 +838,13 @@ impl Assembler {
                 }
                 Insn::Lea { opnd, out } => {
                     *opnd = split_only_stack_membase(asm, *opnd, SCRATCH0_OPND, &stack_state);
-                    if let Opnd::Mem(_) = out {
-                        asm.lea_into(SCRATCH0_OPND, *opnd);
-                        let out = split_large_disp(asm, *out, SCRATCH1_OPND);
-                        asm.store(out, SCRATCH0_OPND);
-                    } else {
-                        asm.push_insn(insn);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+
+                    asm.push_insn(insn);
+
+                    if let Some(mem_out) = mem_out {
+                        let mem_out = split_large_disp(asm, mem_out, SCRATCH1_OPND);
+                        asm.store(mem_out, SCRATCH0_OPND);
                     }
                 }
                 Insn::Load { opnd, out } |
