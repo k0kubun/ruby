@@ -36,7 +36,7 @@ pub const C_ARG_OPNDS: [Opnd; 6] = [
 pub const C_RET_REG: Reg = X0_REG;
 pub const C_RET_OPND: Opnd = Opnd::Reg(X0_REG);
 pub const NATIVE_STACK_PTR: Opnd = Opnd::Reg(XZR_REG);
-pub const NATIVE_BASE_PTR_REG: Reg = X29_REG;
+pub const NATIVE_BASE_PTR: Opnd = Opnd::Reg(X29_REG);
 
 // These constants define the way we work with Arm64's stack pointer. The stack
 // pointer always needs to be aligned to a 16-byte boundary.

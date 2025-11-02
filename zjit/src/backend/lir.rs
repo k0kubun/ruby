@@ -18,12 +18,9 @@ pub use crate::backend::current::{
     mem_base_reg,
     Reg,
     EC, CFP, SP,
-    NATIVE_STACK_PTR, NATIVE_BASE_PTR_REG,
+    NATIVE_STACK_PTR, NATIVE_BASE_PTR,
     C_ARG_OPNDS, C_RET_REG, C_RET_OPND,
 };
-
-pub const NATIVE_BASE_PTR: Opnd = Opnd::Reg(NATIVE_BASE_PTR_REG);
-const NATIVE_BASE_PTR_REG_NO: u8 = NATIVE_BASE_PTR_REG.reg_no;
 
 pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC];
 
@@ -1207,7 +1204,7 @@ impl StackState {
     /// Convert Mem to MemBase::Stack
     fn mem_to_stack_membase(&self, mem: Mem) -> MemBase {
         match mem {
-            Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG_NO), disp, num_bits } => {
+            Mem { base: MemBase::Reg(reg_no), disp, num_bits } if NATIVE_BASE_PTR.unwrap_reg().reg_no == reg_no => {
                 let stack_idx = self.disp_to_stack_idx(disp);
                 MemBase::Stack { stack_idx, num_bits }
             }
@@ -1220,7 +1217,7 @@ impl StackState {
         match membase {
             MemBase::Stack { stack_idx, num_bits } => {
                 let disp = self.stack_idx_to_disp(stack_idx);
-                Mem { base: MemBase::Reg(NATIVE_BASE_PTR_REG.reg_no), disp, num_bits }
+                Mem { base: MemBase::Reg(NATIVE_BASE_PTR.unwrap_reg().reg_no), disp, num_bits }
             }
             _ => unreachable!(),
         }
@@ -1663,14 +1660,10 @@ impl Assembler
                         *opnd = vreg_opnd[idx].unwrap().with_num_bits(num_bits);
                     },
                     Opnd::Mem(Mem { base: MemBase::VReg(idx), disp, num_bits }) => {
-                        match vreg_opnd[idx].unwrap() {
-                            Opnd::Reg(reg) => {
-                                *opnd = Opnd::Mem(Mem { base: MemBase::Reg(reg.reg_no), disp, num_bits });
-                            }
-                            Opnd::Mem(mem) => {
-                                // If the base is spilled, lower it to MemBase::Stack, which scratch_split will lower to MemBase::Reg.
-                                *opnd = Opnd::Mem(Mem { base: pool.stack_state.mem_to_stack_membase(mem), disp, num_bits });
-                            }
+                        *opnd = match vreg_opnd[idx].unwrap() {
+                            Opnd::Reg(reg) => Opnd::Mem(Mem { base: MemBase::Reg(reg.reg_no), disp, num_bits }),
+                            // If the base is spilled, lower it to MemBase::Stack, which scratch_split will lower to MemBase::Reg.
+                            Opnd::Mem(mem) => Opnd::Mem(Mem { base: pool.stack_state.mem_to_stack_membase(mem), disp, num_bits }),
                             _ => unreachable!(),
                         }
                     }
