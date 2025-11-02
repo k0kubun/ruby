@@ -1502,35 +1502,11 @@ impl Assembler
     /// registers because their output is used as the operand on a subsequent
     /// instruction. This is our implementation of the linear scan algorithm.
     pub(super) fn alloc_regs(mut self, regs: Vec<Reg>) -> Result<Assembler, CompileError> {
-        // Dump live registers for register spill debugging.
-        fn dump_live_regs(insns: Vec<Insn>, live_ranges: Vec<LiveRange>, num_regs: usize, spill_index: usize) {
-            // Convert live_ranges to live_regs: the number of live registers at each index
-            let mut live_regs: Vec<usize> = vec![];
-            for insn_idx in 0..insns.len() {
-                let live_count = live_ranges.iter().filter(|range|
-                    match (range.start, range.end) {
-                        (Some(start), Some(end)) => start <= insn_idx && insn_idx <= end,
-                        _ => false,
-                    }
-                ).count();
-                live_regs.push(live_count);
-            }
-
-            // Dump insns along with live registers
-            for (insn_idx, insn) in insns.iter().enumerate() {
-                eprint!("{:3} ", if spill_index == insn_idx { "==>" } else { "" });
-                for reg in 0..=num_regs {
-                    eprint!("{:1}", if reg < live_regs[insn_idx] { "|" } else { "" });
-                }
-                eprintln!(" [{:3}] {:?}", insn_idx, insn);
-            }
-        }
-
         // First, create the pool of registers.
         let mut pool = RegisterPool::new(regs.clone(), self.stack_base_idx);
 
-        // Mapping from VReg to register or stack slot; allocated Opnd for each vreg_idx.
-        // None if a register or a stack slot has not been allocated for the VReg.
+        // Mapping between VReg and register or stack slot for each VReg index.
+        // None if no register or stack slot has been allocated for the VReg.
         let mut vreg_opnd: Vec<Option<Opnd>> = vec![None; self.live_ranges.len()];
 
         // List of registers saved before a C call, paired with the VReg index.
