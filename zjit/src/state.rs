@@ -66,9 +66,26 @@ pub struct ZJITState {
 /// Private singleton instance of the codegen globals
 static mut ZJIT_STATE: Option<ZJITState> = None;
 
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+static mut PROFILER: Option<*mut dhat::Profiler> = None;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_end_profiler() {
+    unsafe {
+        if let Some(profiler) = PROFILER {
+            let profiler = Box::from_raw(profiler);
+            drop(profiler);
+        }
+    }
+}
+
 impl ZJITState {
     /// Initialize the ZJIT globals. Return the address of the JIT entry trampoline.
     pub fn init() -> *const u8 {
+        unsafe { PROFILER = Some(Box::into_raw(Box::new(dhat::Profiler::new_heap()))) };
+
         let mut cb = {
             use crate::options::*;
             use crate::virtualmem::*;

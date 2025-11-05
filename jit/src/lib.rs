@@ -1,5 +1,6 @@
 //! Shared code between YJIT and ZJIT.
 
+/*
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};
 
@@ -35,3 +36,4 @@ unsafe impl GlobalAlloc for StatsAlloc {
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
+*/
