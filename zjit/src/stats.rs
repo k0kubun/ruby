@@ -1,7 +1,7 @@
 //! Counters and associated methods for events when ZJIT is run.
 
 use std::time::Instant;
-//use std::sync::atomic::Ordering;
+use std::sync::atomic::Ordering;
 use crate::options::OPTIONS;
 
 #[cfg(feature = "stats_allocator")]
@@ -648,7 +648,7 @@ pub fn with_time_stat<F, R>(counter: Counter, func: F) -> R where F: FnOnce() ->
 
 /// The number of bytes ZJIT has allocated on the Rust heap.
 pub fn zjit_alloc_bytes() -> usize {
-    0 //jit::GLOBAL_ALLOCATOR.alloc_size.load(Ordering::SeqCst)
+    crate::state::GLOBAL_ALLOCATOR.alloc_size.load(Ordering::SeqCst)
 }
 
 /// Struct of arrays for --zjit-trace-exits.

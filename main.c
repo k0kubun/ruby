@@ -60,7 +60,7 @@ main(int argc, char **argv)
 
     ruby_sysinit(&argc, &argv);
     int result = ruby_start_main(rb_main, argc, argv);
-    extern void rb_zjit_end_profiler();
-    rb_zjit_end_profiler();
+    //extern void rb_zjit_end_profiler();
+    //rb_zjit_end_profiler();
     return result;
 }

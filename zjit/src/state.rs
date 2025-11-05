@@ -66,8 +66,42 @@ pub struct ZJITState {
 /// Private singleton instance of the codegen globals
 static mut ZJIT_STATE: Option<ZJITState> = None;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::alloc::{GlobalAlloc, Layout};
+
 #[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
+pub static GLOBAL_ALLOCATOR: StatsAlloc = StatsAlloc { alloc_size: AtomicUsize::new(0), alloc: dhat::Alloc };
+
+pub struct StatsAlloc {
+    pub alloc_size: AtomicUsize,
+    alloc: dhat::Alloc,
+}
+
+unsafe impl GlobalAlloc for StatsAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.alloc_size.fetch_add(layout.size(), Ordering::SeqCst);
+        unsafe { self.alloc.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.alloc_size.fetch_sub(layout.size(), Ordering::SeqCst);
+        unsafe { self.alloc.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.alloc_size.fetch_add(layout.size(), Ordering::SeqCst);
+        unsafe { self.alloc.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if new_size > layout.size() {
+            self.alloc_size.fetch_add(new_size - layout.size(), Ordering::SeqCst);
+        } else if new_size < layout.size() {
+            self.alloc_size.fetch_sub(layout.size() - new_size, Ordering::SeqCst);
+        }
+        unsafe { self.alloc.realloc(ptr, layout, new_size) }
+    }
+}
 
 static mut PROFILER: Option<*mut dhat::Profiler> = None;
 

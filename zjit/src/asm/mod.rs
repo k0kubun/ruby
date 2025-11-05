@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::mem;
+use crate::state::rb_zjit_end_profiler;
 use crate::virtualmem::*;
 
 // Lots of manual vertical alignment in there that rustfmt doesn't handle well.
@@ -165,6 +166,7 @@ impl CodeBlock {
         if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
             self.write_pos += 1;
         } else {
+            rb_zjit_end_profiler();
             self.dropped_bytes = true;
         }
     }
