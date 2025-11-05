@@ -14,6 +14,8 @@ use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
 use crate::state::rb_zjit_record_exit_stack;
 
+const ENABLE_STACK_ALLOC: bool = false;
+
 pub use crate::backend::current::{
     mem_base_reg,
     Reg,
@@ -1257,15 +1259,19 @@ impl RegisterPool {
 
     /// Mutate the pool to indicate that the register at the index
     /// has been allocated and is live.
-    fn alloc_opnd(&mut self, vreg_idx: usize) -> Opnd {
+    fn alloc_opnd(&mut self, vreg_idx: usize) -> Option<Opnd> {
         for (reg_idx, reg) in self.regs.iter().enumerate() {
             if self.pool[reg_idx].is_none() {
                 self.pool[reg_idx] = Some(vreg_idx);
                 self.live_regs += 1;
-                return Opnd::Reg(*reg);
+                return Some(Opnd::Reg(*reg));
             }
         }
-        self.stack_state.alloc_stack(vreg_idx)
+        if ENABLE_STACK_ALLOC {
+            Some(self.stack_state.alloc_stack(vreg_idx))
+        } else {
+            None
+        }
     }
 
     /// Allocate a specific register
@@ -1550,7 +1556,9 @@ impl Assembler
                     // If C_RET_REG is in use, move it to another register.
                     // This must happen before last-use registers are deallocated.
                     if let Some(vreg_idx) = pool.vreg_for(&C_RET_REG) {
-                        let new_opnd = pool.alloc_opnd(vreg_idx);
+                        let Some(new_opnd) = pool.alloc_opnd(vreg_idx) else {
+                            return Err(CompileError::RegisterSpillOnCCall);
+                        };
                         asm.mov(new_opnd, C_RET_OPND);
                         pool.dealloc_opnd(&Opnd::Reg(C_RET_REG));
                         vreg_opnd[vreg_idx] = Some(new_opnd);
@@ -1640,7 +1648,14 @@ impl Assembler
 
                 // Allocate a new register for this instruction if one is not
                 // already allocated.
-                let out_opnd = out_reg.unwrap_or_else(|| pool.alloc_opnd(vreg_idx));
+                let out_opnd = if let Some(out_reg) = out_reg {
+                    out_reg
+                } else {
+                    let Some(out_reg) = pool.alloc_opnd(vreg_idx) else {
+                        return Err(CompileError::RegisterSpillOnAlloc);
+                    };
+                    out_reg
+                };
 
                 // Set the output operand on the instruction
                 let out_num_bits = Opnd::match_num_bits_iter(insn.opnd_iter());
