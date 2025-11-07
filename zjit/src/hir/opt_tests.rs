@@ -685,6 +685,31 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_dont_optimize_send_without_block_skewed_polymorphic() {
+        set_call_threshold(5);
+        eval("
+            def test(obj) = obj.to_s
+            # Profile 75% Fixnum
+            test(1); test(2); test(3); test(:s)
+        ");
+        assert_snapshot!(hir_string("test"), @r"
+        fn test@<compiled>:2:
+        bb0():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:BasicObject = GetLocal l0, SP@4
+          Jump bb2(v1, v2)
+        bb1(v5:BasicObject, v6:BasicObject):
+          EntryPoint JIT(0)
+          Jump bb2(v5, v6)
+        bb2(v8:BasicObject, v9:BasicObject):
+          v14:BasicObject = SendWithoutBlock v9, :to_s
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
     fn test_optimize_send_without_block_to_aliased_iseq() {
         eval("
             def foo = 1
@@ -4705,6 +4730,44 @@ mod hir_opt_tests {
           v27:BasicObject = LoadField v26, :@foo@0x103a
           CheckInterrupts
           Return v27
+        ");
+    }
+
+    #[test]
+    fn test_dont_optimize_getivar_skewed_polymorphic() {
+        set_call_threshold(5);
+        eval("
+            class Foo
+              def initialize(set_ivar)
+                if set_ivar
+                  @foo = 1
+                end
+              end
+
+              def test
+                @foo
+              end
+            end
+
+            shape1 = Foo.new(true)
+            shape2 = Foo.new(false)
+            # Profile 75% shape1
+            shape1.test; shape1.test; shape1.test; shape2.test
+        ");
+        assert_snapshot!(hir_string_proc("Foo.instance_method(:test)"), @r"
+        fn test@<compiled>:10:
+        bb0():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb2(v1)
+        bb1(v4:BasicObject):
+          EntryPoint JIT(0)
+          Jump bb2(v4)
+        bb2(v6:BasicObject):
+          PatchPoint SingleRactorMode
+          v12:BasicObject = GetIvar v6, :@foo
+          CheckInterrupts
+          Return v12
         ");
     }
 

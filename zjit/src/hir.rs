@@ -2094,7 +2094,7 @@ impl Function {
         let insn = self.chase_insn(insn);
         for (entry_insn, entry_type_summary) in entries {
             if self.union_find.borrow().find_const(*entry_insn) == insn {
-                if entry_type_summary.is_monomorphic() || entry_type_summary.is_skewed_polymorphic() {
+                if entry_type_summary.is_monomorphic() {
                     return Some(entry_type_summary.bucket(0));
                 } else {
                     return None;
@@ -2116,10 +2116,10 @@ impl Function {
         let insn = self.chase_insn(insn);
         for (entry_insn, entry_type_summary) in entries {
             if self.union_find.borrow().find_const(*entry_insn) == insn {
-                if !entry_type_summary.is_monomorphic() && !entry_type_summary.is_skewed_polymorphic() {
-                    return Some(true);
-                } else {
+                if entry_type_summary.is_monomorphic() {
                     return Some(false);
+                } else {
+                    return Some(true);
                 }
             }
         }
