@@ -12,8 +12,7 @@ use crate::invariants::{
     track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_no_trace_point_assumption,
     track_single_ractor_assumption, track_stable_constant_names_assumption, track_no_singleton_class_assumption
 };
-use crate::gc::append_gc_offsets;
-use crate::payload::{get_or_create_iseq_payload, get_or_create_iseq_payload_ptr, IseqCodePtrs, IseqPayload, IseqStatus};
+use crate::payload::{IseqCodePtrs, IseqPayload, IseqStatus, IseqVersion, get_or_create_iseq_payload, get_or_create_iseq_payload_ptr};
 use crate::state::ZJITState;
 use crate::stats::{send_fallback_counter, exit_counter_for_compile_error, incr_counter, incr_counter_by, send_fallback_counter_for_method_type, send_without_block_fallback_counter_for_method_type, send_without_block_fallback_counter_for_optimized_method_type, send_fallback_counter_ptr_for_opcode, CompileError};
 use crate::stats::{counter_ptr, with_time_stat, Counter, Counter::{compile_time_ns, exit_compile_error}};
@@ -24,6 +23,10 @@ use crate::hir::{Const, FrameState, Function, Insn, InsnId, SendFallbackReason};
 use crate::hir_type::{types, Type};
 use crate::options::get_option;
 use crate::cast::IntoUsize;
+
+/// Compile up to MAX_ISEQ_VERSIONS versions per ISEQ.
+/// At the moment, we support recompiling each ISEQ only once.
+const MAX_ISEQ_VERSIONS: usize = 2;
 
 /// Sentinel program counter stored in C frames when runtime checks are enabled.
 const PC_POISON: Option<*const VALUE> = if cfg!(feature = "runtime_checks") {
@@ -195,31 +198,47 @@ pub fn gen_entry_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError>
 
 /// Compile an ISEQ into machine code if not compiled yet
 fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
+    use IseqStatus::*;
+
     // Return an existing pointer if it's already compiled
     let payload = get_or_create_iseq_payload(iseq);
-    match &payload.status {
-        IseqStatus::Compiled(code_ptrs) => return Ok(code_ptrs.clone()),
-        IseqStatus::CantCompile(err) => return Err(err.clone()),
-        IseqStatus::NotCompiled => {},
+    if let Some(version) = payload.versions.last() {
+        match &*version.status.borrow() {
+            Compiled(code_ptrs) => return Ok(code_ptrs.clone()),
+            CantCompile(err) => return Err(err.clone()),
+            Invalidated => {},
+        }
+    }
+
+    // If the ISEQ already hax MAX_ISEQ_VERSIONS, do not compile a new version.
+    // Note that the last version is usually not invalidated, but it is by TracePoint.
+    if payload.versions.len() == MAX_ISEQ_VERSIONS {
+        return Err(CompileError::IseqHasMaxVersions);
     }
 
     // Compile the ISEQ
-    let code_ptrs = gen_iseq_body(cb, iseq, function, payload);
-    match &code_ptrs {
-        Ok(code_ptrs) => {
-            payload.status = IseqStatus::Compiled(code_ptrs.clone());
+    let result = gen_iseq_body(cb, iseq, function);
+
+    // Save the compilation result as a new version
+    let (result, version) = match result {
+        Ok((code_ptrs, gc_offsets, iseq_calls)) => {
             incr_counter!(compiled_iseq_count);
+            let version = IseqVersion::new(iseq, Compiled(code_ptrs.clone()), gc_offsets, iseq_calls);
+            (Ok(code_ptrs), version)
         }
         Err(err) => {
-            payload.status = IseqStatus::CantCompile(err.clone());
             incr_counter!(failed_iseq_count);
+            let version = IseqVersion::new(iseq, CantCompile(err.clone()), vec![], vec![]);
+            (Err(err), version)
         }
-    }
-    code_ptrs
+    };
+    payload.versions.push(version);
+
+    result
 }
 
 /// Compile an ISEQ into machine code
-fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>, payload: &mut IseqPayload) -> Result<IseqCodePtrs, CompileError> {
+fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     // If we ran out of code region, we shouldn't attempt to generate new code.
     if cb.has_dropped_bytes() {
         return Err(CompileError::OutOfMemory);
@@ -232,17 +251,15 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>,
     };
 
     // Compile the High-level IR
-    let (iseq_code_ptrs, gc_offsets, iseq_calls) = gen_function(cb, iseq, function)?;
+    let result = gen_function(cb, iseq, function)?;
 
     // Stub callee ISEQs for JIT-to-JIT calls
+    let (_, _, iseq_calls) = &result;
     for iseq_call in iseq_calls.iter() {
         gen_iseq_call(cb, iseq, iseq_call)?;
     }
 
-    // Prepare for GC
-    payload.iseq_calls.extend(iseq_calls);
-    append_gc_offsets(iseq, &gc_offsets);
-    Ok(iseq_code_ptrs)
+    Ok(result)
 }
 
 /// Compile a function
@@ -2135,22 +2152,29 @@ c_callable! {
                 }
             }
 
-            // If we already know we can't compile the ISEQ, fail early without cb.mark_all_executable().
-            // TODO: Alan thinks the payload status part of this check can happen without the VM lock, since the whole
-            // code path can be made read-only. But you still need the check as is while holding the VM lock in any case.
+            // After OOM, leave function_stub_hit as soon as possible.
             let cb = ZJITState::get_code_block();
-            let payload = get_or_create_iseq_payload(iseq);
-            let compile_error = match &payload.status {
-                IseqStatus::CantCompile(err) => Some(err),
-                _ if cb.has_dropped_bytes() => Some(&CompileError::OutOfMemory),
-                _ => None,
-            };
-            if let Some(compile_error) = compile_error {
+            if cb.has_dropped_bytes() {
                 // We'll use this Rc again, so increment the ref count decremented by from_raw.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
 
-                prepare_for_exit(iseq, cfp, sp, compile_error);
+                prepare_for_exit(iseq, cfp, sp, &CompileError::OutOfMemory);
                 return ZJITState::get_exit_trampoline_with_counter().raw_ptr(cb);
+            }
+
+            // If we already know we can't compile the ISEQ, fail early without cb.mark_all_executable().
+            // TODO: Alan thinks the payload status part of this check can happen without the VM lock, since the whole
+            // code path can be made read-only. But you still need the check as is while holding the VM lock in any case.
+            let payload = get_or_create_iseq_payload(iseq);
+            if let Some(version) = payload.versions.last() {
+                let status = version.status.borrow();
+                if let IseqStatus::CantCompile(err) = &*status {
+                    // We'll use this Rc again, so increment the ref count decremented by from_raw.
+                    unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
+
+                    prepare_for_exit(iseq, cfp, sp, &err);
+                    return ZJITState::get_exit_trampoline_with_counter().raw_ptr(cb);
+                }
             }
 
             // Otherwise, attempt to compile the ISEQ. We have to mark_all_executable() beyond this point.

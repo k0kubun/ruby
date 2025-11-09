@@ -381,8 +381,9 @@ pub extern "C" fn rb_zjit_tracing_invalidate_all() {
 
         for_each_iseq(|iseq| {
             let payload = get_or_create_iseq_payload(iseq);
-
-            payload.status = IseqStatus::NotCompiled;
+            if let Some(version) = payload.versions.last_mut() {
+                *version.status.borrow_mut() = IseqStatus::Invalidated;
+            }
             unsafe { rb_iseq_reset_jit_func(iseq) };
         });
 
