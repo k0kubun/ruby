@@ -1,4 +1,6 @@
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::rc::Rc;
 use crate::codegen::IseqCallRef;
 use crate::stats::CompileError;
 use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
@@ -6,27 +8,50 @@ use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
 /// This is all the data ZJIT stores on an ISEQ. We mark objects in this struct on GC.
 #[derive(Debug)]
 pub struct IseqPayload {
-    /// Compilation status of the ISEQ. It has the JIT code address of the first block if Compiled.
-    pub status: IseqStatus,
-
     /// Type information of YARV instruction operands
     pub profile: IseqProfile,
 
-    /// GC offsets of the JIT code. These are the addresses of objects that need to be marked.
-    pub gc_offsets: Vec<CodePtr>,
-
-    /// JIT-to-JIT calls in the ISEQ. The IseqPayload's ISEQ is the caller of it.
-    pub iseq_calls: Vec<IseqCallRef>,
+    /// JIT code versions. Different versions should have different assumptions.
+    pub versions: Vec<IseqVersionRef>,
 }
 
 impl IseqPayload {
     fn new(iseq_size: u32) -> Self {
         Self {
-            status: IseqStatus::NotCompiled,
             profile: IseqProfile::new(iseq_size),
-            gc_offsets: vec![],
-            iseq_calls: vec![],
+            versions: vec![],
         }
+    }
+}
+
+/// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.
+#[derive(Debug)]
+pub struct IseqVersion {
+    /// ISEQ to be compiled. This is used by PatchPoint to recompile this version.
+    pub iseq: Cell<IseqPtr>,
+
+    /// Compilation status of the ISEQ. It has the JIT code address of the first block if Compiled.
+    pub status: RefCell<IseqStatus>,
+
+    /// GC offsets of the JIT code. These are the addresses of objects that need to be marked.
+    pub gc_offsets: RefCell<Vec<CodePtr>>,
+
+    /// JIT-to-JIT calls in the ISEQ. The IseqPayload's ISEQ is the caller of it.
+    pub iseq_calls: RefCell<Vec<IseqCallRef>>,
+}
+
+pub type IseqVersionRef = Rc<IseqVersion>;
+
+impl IseqVersion {
+    /// Allocate a new IseqVersion to be compiled
+    pub fn new(iseq: IseqPtr) -> IseqVersionRef {
+        let version = Self {
+            iseq: Cell::new(iseq),
+            status: RefCell::new(IseqStatus::NotCompiled),
+            gc_offsets: RefCell::new(vec![]),
+            iseq_calls: RefCell::new(vec![]),
+        };
+        Rc::new(version)
     }
 }
 
@@ -44,6 +69,7 @@ pub enum IseqStatus {
     Compiled(IseqCodePtrs),
     CantCompile(CompileError),
     NotCompiled,
+    Invalidated,
 }
 
 /// Get a pointer to the payload object associated with an ISEQ. Create one if none exists.

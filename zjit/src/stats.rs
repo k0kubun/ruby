@@ -197,6 +197,7 @@ make_counters! {
 
     // compile_error_: Compile error reasons
     compile_error_iseq_stack_too_large,
+    compile_error_iseq_has_max_versions,
     compile_error_exception_handler,
     compile_error_out_of_memory,
     compile_error_jit_to_jit_optional,
@@ -332,6 +333,7 @@ pub fn send_fallback_counter_ptr_for_opcode(opcode: u32) -> *mut u64 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompileError {
     IseqStackTooLarge,
+    IseqHasMaxVersions,
     ExceptionHandler,
     OutOfMemory,
     ParseError(ParseError),
@@ -346,6 +348,7 @@ pub fn exit_counter_for_compile_error(compile_error: &CompileError) -> Counter {
     use crate::stats::Counter::*;
     match compile_error {
         IseqStackTooLarge     => compile_error_iseq_stack_too_large,
+        IseqHasMaxVersions    => compile_error_iseq_has_max_versions,
         ExceptionHandler      => compile_error_exception_handler,
         OutOfMemory           => compile_error_out_of_memory,
         JitToJitOptional      => compile_error_jit_to_jit_optional,

@@ -2,8 +2,7 @@
 
 use std::{collections::{HashMap, HashSet}, mem};
 
-use crate::{backend::lir::{asm_comment, Assembler}, cruby::{iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock, IseqPtr, RedefinitionFlag, ID, VALUE}, hir::Invariant, options::debug, state::{zjit_enabled_p, ZJITState}, virtualmem::CodePtr};
-use crate::payload::IseqPayload;
+use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, payload::IseqVersionRef, state::{ZJITState, zjit_enabled_p}, virtualmem::CodePtr};
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
 use crate::gc::remove_gc_offsets;
@@ -19,21 +18,21 @@ macro_rules! compile_patch_points {
                     asm.compile(cb).expect("can write existing code");
                 });
                 // Stop marking GC offsets corrupted by the jump instruction
-                remove_gc_offsets(patch_point.payload_ptr, &written_range);
+                remove_gc_offsets(&patch_point.version, &written_range);
             }
         });
     };
 }
 
 /// When a PatchPoint is invalidated, it generates a jump instruction from `from` to `to`.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Debug)]
 struct PatchPoint {
     /// Code pointer to be invalidated
     patch_point_ptr: CodePtr,
     /// Code pointer to a side exit
     side_exit_ptr: CodePtr,
-    /// Raw pointer to the ISEQ payload
-    payload_ptr: *mut IseqPayload,
+    /// ISEQ version to be invalidated
+    version: IseqVersionRef,
 }
 
 /// Used to track all of the various block references that contain assumptions
@@ -44,26 +43,26 @@ pub struct Invariants {
     ep_escape_iseqs: HashSet<IseqPtr>,
 
     /// Map from ISEQ that's assumed to not escape EP to a set of patch points
-    no_ep_escape_iseq_patch_points: HashMap<IseqPtr, HashSet<PatchPoint>>,
+    no_ep_escape_iseq_patch_points: HashMap<IseqPtr, Vec<PatchPoint>>,
 
     /// Map from a class and its associated basic operator to a set of patch points
-    bop_patch_points: HashMap<(RedefinitionFlag, ruby_basic_operators), HashSet<PatchPoint>>,
+    bop_patch_points: HashMap<(RedefinitionFlag, ruby_basic_operators), Vec<PatchPoint>>,
 
     /// Map from CME to patch points that assume the method hasn't been redefined
-    cme_patch_points: HashMap<*const rb_callable_method_entry_t, HashSet<PatchPoint>>,
+    cme_patch_points: HashMap<*const rb_callable_method_entry_t, Vec<PatchPoint>>,
 
     /// Map from constant ID to patch points that assume the constant hasn't been redefined
-    constant_state_patch_points: HashMap<ID, HashSet<PatchPoint>>,
+    constant_state_patch_points: HashMap<ID, Vec<PatchPoint>>,
 
     /// Set of patch points that assume that the TracePoint is not enabled
-    no_trace_point_patch_points: HashSet<PatchPoint>,
+    no_trace_point_patch_points: Vec<PatchPoint>,
 
     /// Set of patch points that assume that the interpreter is running with only one ractor
-    single_ractor_patch_points: HashSet<PatchPoint>,
+    single_ractor_patch_points: Vec<PatchPoint>,
 
     /// Map from a class to a set of patch points that assume objects of the class
     /// will have no singleton class.
-    no_singleton_class_patch_points: HashMap<VALUE, HashSet<PatchPoint>>,
+    no_singleton_class_patch_points: HashMap<VALUE, Vec<PatchPoint>>,
 }
 
 impl Invariants {
@@ -195,13 +194,13 @@ pub fn track_no_ep_escape_assumption(
     iseq: IseqPtr,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    payload_ptr: *mut IseqPayload,
+    version: &IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
-    invariants.no_ep_escape_iseq_patch_points.entry(iseq).or_default().insert(PatchPoint {
+    invariants.no_ep_escape_iseq_patch_points.entry(iseq).or_default().push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -216,13 +215,13 @@ pub fn track_bop_assumption(
     bop: ruby_basic_operators,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    payload_ptr: *mut IseqPayload,
+    version: &IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
-    invariants.bop_patch_points.entry((klass, bop)).or_default().insert(PatchPoint {
+    invariants.bop_patch_points.entry((klass, bop)).or_default().push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -231,13 +230,13 @@ pub fn track_cme_assumption(
     cme: *const rb_callable_method_entry_t,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    payload_ptr: *mut IseqPayload,
+    version: &IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
-    invariants.cme_patch_points.entry(cme).or_default().insert(PatchPoint {
+    invariants.cme_patch_points.entry(cme).or_default().push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -246,7 +245,7 @@ pub fn track_stable_constant_names_assumption(
     idlist: *const ID,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    payload_ptr: *mut IseqPayload,
+    version: &IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
 
@@ -257,10 +256,10 @@ pub fn track_stable_constant_names_assumption(
             break;
         }
 
-        invariants.constant_state_patch_points.entry(id).or_default().insert(PatchPoint {
+        invariants.constant_state_patch_points.entry(id).or_default().push(PatchPoint {
             patch_point_ptr,
             side_exit_ptr,
-            payload_ptr,
+            version: version.clone(),
         });
 
         idx += 1;
@@ -272,13 +271,13 @@ pub fn track_no_singleton_class_assumption(
     klass: VALUE,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    payload_ptr: *mut IseqPayload,
+    version: &IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
-    invariants.no_singleton_class_patch_points.entry(klass).or_default().insert(PatchPoint {
+    invariants.no_singleton_class_patch_points.entry(klass).or_default().push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -328,12 +327,12 @@ pub extern "C" fn rb_zjit_constant_state_changed(id: ID) {
 }
 
 /// Track the JIT code that assumes that the interpreter is running with only one ractor
-pub fn track_single_ractor_assumption(patch_point_ptr: CodePtr, side_exit_ptr: CodePtr, payload_ptr: *mut IseqPayload) {
+pub fn track_single_ractor_assumption(patch_point_ptr: CodePtr, side_exit_ptr: CodePtr, version: &IseqVersionRef) {
     let invariants = ZJITState::get_invariants();
-    invariants.single_ractor_patch_points.insert(PatchPoint {
+    invariants.single_ractor_patch_points.push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -357,12 +356,12 @@ pub extern "C" fn rb_zjit_before_ractor_spawn() {
     });
 }
 
-pub fn track_no_trace_point_assumption(patch_point_ptr: CodePtr, side_exit_ptr: CodePtr, payload_ptr: *mut IseqPayload) {
+pub fn track_no_trace_point_assumption(patch_point_ptr: CodePtr, side_exit_ptr: CodePtr, version: &IseqVersionRef) {
     let invariants = ZJITState::get_invariants();
-    invariants.no_trace_point_patch_points.insert(PatchPoint {
+    invariants.no_trace_point_patch_points.push(PatchPoint {
         patch_point_ptr,
         side_exit_ptr,
-        payload_ptr,
+        version: version.clone(),
     });
 }
 
@@ -382,7 +381,9 @@ pub extern "C" fn rb_zjit_tracing_invalidate_all() {
         for_each_iseq(|iseq| {
             let payload = get_or_create_iseq_payload(iseq);
 
-            payload.status = IseqStatus::NotCompiled;
+            if let Some(version) = payload.versions.last_mut() {
+                *version.status.borrow_mut() = IseqStatus::Invalidated;
+            }
             unsafe { rb_iseq_reset_jit_func(iseq) };
         });
 

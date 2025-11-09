@@ -629,8 +629,8 @@ impl Assembler {
                     };
                     asm.store(dest, src);
                 }
-                &mut Insn::PatchPoint { ref target, invariant, payload } => {
-                    split_patch_point(asm, target, invariant, payload);
+                &mut Insn::PatchPoint { ref target, invariant, ref version } => {
+                    split_patch_point(asm, target, invariant, version);
                 }
                 _ => {
                     asm.push_insn(insn);
