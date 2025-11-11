@@ -203,6 +203,7 @@ make_counters! {
     }
 
     // compile_error_: Compile error reasons
+    compile_error_iseq_has_max_versions,
     compile_error_iseq_stack_too_large,
     compile_error_exception_handler,
     compile_error_out_of_memory,
@@ -351,6 +352,7 @@ pub fn send_fallback_counter_ptr_for_opcode(opcode: u32) -> *mut u64 {
 /// Reason why ZJIT failed to produce any JIT code
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompileError {
+    IseqHasMaxVersions,
     IseqStackTooLarge,
     ExceptionHandler,
     OutOfMemory,
@@ -365,6 +367,7 @@ pub fn exit_counter_for_compile_error(compile_error: &CompileError) -> Counter {
     use crate::stats::CompileError::*;
     use crate::stats::Counter::*;
     match compile_error {
+        IseqHasMaxVersions    => compile_error_iseq_has_max_versions,
         IseqStackTooLarge     => compile_error_iseq_stack_too_large,
         ExceptionHandler      => compile_error_exception_handler,
         OutOfMemory           => compile_error_out_of_memory,
