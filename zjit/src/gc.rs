@@ -2,7 +2,7 @@
 
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
-use crate::payload::{IseqPayload, get_or_create_iseq_payload, payload_ptr_as_mut};
+use crate::payload::{IseqPayload, IseqVersionRef};
 use crate::stats::Counter::gc_time_ns;
 use crate::state::gc_mark_raw_samples;
 
@@ -93,14 +93,16 @@ fn iseq_mark(payload: &IseqPayload) {
 
     // Mark objects baked in JIT code
     let cb = ZJITState::get_code_block();
-    for &offset in payload.gc_offsets.iter() {
-        let value_ptr: *const u8 = offset.raw_ptr(cb);
-        // Creating an unaligned pointer is well defined unlike in C.
-        let value_ptr = value_ptr as *const VALUE;
+    for version in payload.versions.iter() {
+        for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
+            let value_ptr: *const u8 = offset.raw_ptr(cb);
+            // Creating an unaligned pointer is well defined unlike in C.
+            let value_ptr = value_ptr as *const VALUE;
 
-        unsafe {
-            let object = value_ptr.read_unaligned();
-            rb_gc_mark_movable(object);
+            unsafe {
+                let object = value_ptr.read_unaligned();
+                rb_gc_mark_movable(object);
+            }
         }
     }
 }
@@ -116,29 +118,33 @@ fn iseq_update_references(payload: &mut IseqPayload) {
     });
 
     // Move ISEQ references in IseqCall
-    for iseq_call in payload.iseq_calls.iter_mut() {
-        let old_iseq = iseq_call.iseq.get();
-        let new_iseq = unsafe { rb_gc_location(VALUE(old_iseq as usize)) }.0 as IseqPtr;
-        if old_iseq != new_iseq {
-            iseq_call.iseq.set(new_iseq);
+    for version in payload.versions.iter_mut() {
+        for iseq_call in unsafe { version.as_mut() }.iseq_calls.iter_mut() {
+            let old_iseq = iseq_call.iseq.get();
+            let new_iseq = unsafe { rb_gc_location(VALUE(old_iseq as usize)) }.0 as IseqPtr;
+            if old_iseq != new_iseq {
+                iseq_call.iseq.set(new_iseq);
+            }
         }
     }
 
     // Move objects baked in JIT code
     let cb = ZJITState::get_code_block();
-    for &offset in payload.gc_offsets.iter() {
-        let value_ptr: *const u8 = offset.raw_ptr(cb);
-        // Creating an unaligned pointer is well defined unlike in C.
-        let value_ptr = value_ptr as *const VALUE;
+    for version in payload.versions.iter() {
+        for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
+            let value_ptr: *const u8 = offset.raw_ptr(cb);
+            // Creating an unaligned pointer is well defined unlike in C.
+            let value_ptr = value_ptr as *const VALUE;
 
-        let object = unsafe { value_ptr.read_unaligned() };
-        let new_addr = unsafe { rb_gc_location(object) };
+            let object = unsafe { value_ptr.read_unaligned() };
+            let new_addr = unsafe { rb_gc_location(object) };
 
-        // Only write when the VALUE moves, to be copy-on-write friendly.
-        if new_addr != object {
-            for (byte_idx, &byte) in new_addr.as_u64().to_le_bytes().iter().enumerate() {
-                let byte_code_ptr = offset.add_bytes(byte_idx);
-                cb.write_mem(byte_code_ptr, byte).expect("patching existing code should be within bounds");
+            // Only write when the VALUE moves, to be copy-on-write friendly.
+            if new_addr != object {
+                for (byte_idx, &byte) in new_addr.as_u64().to_le_bytes().iter().enumerate() {
+                    let byte_code_ptr = offset.add_bytes(byte_idx);
+                    cb.write_mem(byte_code_ptr, byte).expect("patching existing code should be within bounds");
+                }
             }
         }
     }
@@ -146,9 +152,8 @@ fn iseq_update_references(payload: &mut IseqPayload) {
 }
 
 /// Append a set of gc_offsets to the iseq's payload
-pub fn append_gc_offsets(iseq: IseqPtr, offsets: &Vec<CodePtr>) {
-    let payload = get_or_create_iseq_payload(iseq);
-    payload.gc_offsets.extend(offsets);
+pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
+    unsafe { version.as_mut() }.gc_offsets.extend(offsets);
 
     // Call writebarrier on each newly added value
     let cb = ZJITState::get_code_block();
@@ -166,9 +171,8 @@ pub fn append_gc_offsets(iseq: IseqPtr, offsets: &Vec<CodePtr>) {
 /// We do this when invalidation rewrites some code with a jump instruction
 /// and GC offsets are corrupted by the rewrite, assuming no on-stack code
 /// will step into the instruction with the GC offsets after invalidation.
-pub fn remove_gc_offsets(payload_ptr: *mut IseqPayload, removed_range: &Range<CodePtr>) {
-    let payload = payload_ptr_as_mut(payload_ptr);
-    payload.gc_offsets.retain(|&gc_offset| {
+pub fn remove_gc_offsets(mut version: IseqVersionRef, removed_range: &Range<CodePtr>) {
+    unsafe { version.as_mut() }.gc_offsets.retain(|&gc_offset| {
         let offset_range = gc_offset..(gc_offset.add_bytes(SIZEOF_VALUE));
         !ranges_overlap(&offset_range, removed_range)
     });
