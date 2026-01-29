@@ -73,7 +73,7 @@
  * Teeny version.  This digit  is kind of reserved these days.   Kept 0 for the
  * entire 2.x era.  Waiting for future uses.
  */
-#define RUBY_API_VERSION_TEENY 0
+#define RUBY_API_VERSION_TEENY 7
 
 /**
  * This macro is API versions encoded into a C integer.
