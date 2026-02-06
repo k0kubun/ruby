@@ -3021,6 +3021,10 @@ impl Function {
         for block in self.rpo() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
             assert!(self.blocks[block.0].insns.is_empty());
+            // Track guard type mappings within this block: original value → guarded value.
+            // This allows subsequent sends using the same receiver to reuse the guard
+            // instead of falling back to profile data or dynamic dispatch.
+            let mut guard_map: HashMap<InsnId, InsnId> = HashMap::new();
             for insn_id in old_insns {
                 match self.find(insn_id) {
                     Insn::SendWithoutBlock { recv, args, state, cd, .. } if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty() =>
@@ -3028,6 +3032,10 @@ impl Function {
                     Insn::SendWithoutBlock { recv, args, state, cd, .. } if ruby_call_method_id(cd) == ID!(minusat) && args.is_empty() =>
                         self.try_rewrite_uminus(block, insn_id, recv, state),
                     Insn::SendWithoutBlock { mut recv, cd, args, state, .. } => {
+                        // Reuse an existing guard for the receiver if one was created earlier in this block
+                        if let Some(&guarded) = guard_map.get(&recv) {
+                            recv = guarded;
+                        }
                         let frame_state = self.frame_state(state);
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), frame_state.insn_idx) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
@@ -3114,7 +3122,10 @@ impl Function {
 
                             // Add GuardType for profiled receiver
                             if let Some(profiled_type) = profiled_type {
+                                let original = recv;
                                 recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                self.insn_types[recv.0] = self.infer_type(recv);
+                                guard_map.insert(original, recv);
                             }
 
                             let Ok((send_state, processed_args, kw_bits)) = self.prepare_direct_send_args(block, &args, ci, iseq, state)
@@ -3155,7 +3166,10 @@ impl Function {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
 
                             if let Some(profiled_type) = profiled_type {
+                                let original = recv;
                                 recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                self.insn_types[recv.0] = self.infer_type(recv);
+                                guard_map.insert(original, recv);
                             }
 
                             let Ok((send_state, processed_args, kw_bits)) = self.prepare_direct_send_args(block, &args, ci, iseq, state)
@@ -3179,7 +3193,10 @@ impl Function {
 
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                             if let Some(profiled_type) = profiled_type {
+                                let original = recv;
                                 recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                self.insn_types[recv.0] = self.infer_type(recv);
+                                guard_map.insert(original, recv);
                             }
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
 
@@ -3194,7 +3211,10 @@ impl Function {
 
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                             if let Some(profiled_type) = profiled_type {
+                                let original = recv;
                                 recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                self.insn_types[recv.0] = self.infer_type(recv);
+                                guard_map.insert(original, recv);
                             }
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
 
@@ -3216,7 +3236,10 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
+                                        let original = recv;
                                         recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                        self.insn_types[recv.0] = self.infer_type(recv);
+                                        guard_map.insert(original, recv);
                                     }
                                     let kw_splat = flags & VM_CALL_KW_SPLAT != 0;
                                     let invoke_proc = self.push_insn(block, Insn::InvokeProc { recv, args: args.clone(), state, kw_splat });
@@ -3251,7 +3274,10 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
+                                        let original = recv;
                                         recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                        self.insn_types[recv.0] = self.infer_type(recv);
+                                        guard_map.insert(original, recv);
                                     }
                                     // All structs from the same Struct class should have the same
                                     // length. So if our recv is embedded all runtime
@@ -3292,6 +3318,10 @@ impl Function {
                         }
                     }
                     Insn::Send { mut recv, cd, state, blockiseq, args, .. } => {
+                        // Reuse an existing guard for the receiver if one was created earlier in this block
+                        if let Some(&guarded) = guard_map.get(&recv) {
+                            recv = guarded;
+                        }
                         let frame_state = self.frame_state(state);
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), frame_state.insn_idx) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
@@ -3375,7 +3405,10 @@ impl Function {
 
                             // Add GuardType for profiled receiver
                             if let Some(profiled_type) = profiled_type {
+                                let original = recv;
                                 recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
+                                self.insn_types[recv.0] = self.infer_type(recv);
+                                guard_map.insert(original, recv);
                             }
 
                             let Ok((send_state, processed_args, kw_bits)) = self.prepare_direct_send_args(block, &args, ci, iseq, state)
@@ -4055,19 +4088,26 @@ impl Function {
         fn reduce_send_to_ccall(
             fun: &mut Function,
             block: BlockId,
-            self_type: Type,
+            _self_type: Type,
             send: Insn,
             send_insn_id: InsnId,
+            guard_map: &mut HashMap<InsnId, InsnId>,
         ) -> Result<(), ()> {
             let Insn::Send { mut recv, cd, blockiseq, args, state, .. } = send else {
                 return Err(());
             };
+
+            // Reuse an existing guard for the receiver if one was created earlier in this block
+            if let Some(&guarded) = guard_map.get(&recv) {
+                recv = guarded;
+            }
 
             let call_info = unsafe { (*cd).ci };
             let argc = unsafe { vm_ci_argc(call_info) };
             let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
             // If we have info about the class of the receiver
+            let self_type = fun.type_of(recv);
             let iseq_insn_idx = fun.frame_state(state).insn_idx;
             let (recv_class, profiled_type) = match fun.resolve_receiver_type(recv, self_type, iseq_insn_idx) {
                 ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
@@ -4144,8 +4184,10 @@ impl Function {
 
                     if let Some(profiled_type) = profiled_type {
                         // Guard receiver class
+                        let original = recv;
                         recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
                         fun.insn_types[recv.0] = fun.infer_type(recv);
+                        guard_map.insert(original, recv);
                     }
 
                     // Emit a call
@@ -4182,8 +4224,10 @@ impl Function {
 
                     if let Some(profiled_type) = profiled_type {
                         // Guard receiver class
+                        let original = recv;
                         recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
                         fun.insn_types[recv.0] = fun.infer_type(recv);
+                        guard_map.insert(original, recv);
                     }
 
                     if get_option!(stats) {
@@ -4218,19 +4262,26 @@ impl Function {
         fn reduce_send_without_block_to_ccall(
             fun: &mut Function,
             block: BlockId,
-            self_type: Type,
+            _self_type: Type,
             send: Insn,
             send_insn_id: InsnId,
+            guard_map: &mut HashMap<InsnId, InsnId>,
         ) -> Result<(), ()> {
             let Insn::SendWithoutBlock { mut recv, cd, args, state, .. } = send else {
                 return Err(());
             };
+
+            // Reuse an existing guard for the receiver if one was created earlier in this block
+            if let Some(&guarded) = guard_map.get(&recv) {
+                recv = guarded;
+            }
 
             let call_info = unsafe { (*cd).ci };
             let argc = unsafe { vm_ci_argc(call_info) };
             let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
             // If we have info about the class of the receiver
+            let self_type = fun.type_of(recv);
             let iseq_insn_idx = fun.frame_state(state).insn_idx;
             let (recv_class, profiled_type) = match fun.resolve_receiver_type(recv, self_type, iseq_insn_idx) {
                 ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
@@ -4307,8 +4358,10 @@ impl Function {
 
                     if let Some(profiled_type) = profiled_type {
                         // Guard receiver class
+                        let original = recv;
                         recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
                         fun.insn_types[recv.0] = fun.infer_type(recv);
+                        guard_map.insert(original, recv);
                     }
 
                     // Try inlining the cfunc into HIR
@@ -4382,8 +4435,10 @@ impl Function {
 
                         if let Some(profiled_type) = profiled_type {
                             // Guard receiver class
+                            let original = recv;
                             recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state });
                             fun.insn_types[recv.0] = fun.infer_type(recv);
+                            guard_map.insert(original, recv);
                         }
 
                         let cfunc = unsafe { get_mct_func(cfunc) }.cast();
@@ -4449,18 +4504,19 @@ impl Function {
         for block in self.rpo() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
             assert!(self.blocks[block.0].insns.is_empty());
+            let mut guard_map: HashMap<InsnId, InsnId> = HashMap::new();
             for insn_id in old_insns {
                 let send = self.find(insn_id);
                 match send {
                     send @ Insn::SendWithoutBlock { recv, .. } => {
                         let recv_type = self.type_of(recv);
-                        if reduce_send_without_block_to_ccall(self, block, recv_type, send, insn_id).is_ok() {
+                        if reduce_send_without_block_to_ccall(self, block, recv_type, send, insn_id, &mut guard_map).is_ok() {
                             continue;
                         }
                     }
                     send @ Insn::Send { recv, .. } => {
                         let recv_type = self.type_of(recv);
-                        if reduce_send_to_ccall(self, block, recv_type, send, insn_id).is_ok() {
+                        if reduce_send_to_ccall(self, block, recv_type, send, insn_id, &mut guard_map).is_ok() {
                             continue;
                         }
                     }
