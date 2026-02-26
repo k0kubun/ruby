@@ -6,6 +6,7 @@ use crate::cruby_methods;
 use crate::invariants::Invariants;
 use crate::asm::CodeBlock;
 use crate::options::{get_option, rb_zjit_prepare_options};
+use crate::payload::JITFrame;
 use crate::stats::{Counters, InsnCounters, SideExitLocations};
 use crate::virtualmem::CodePtr;
 use std::collections::HashMap;
@@ -64,6 +65,21 @@ pub struct ZJITState {
 
     /// Locations of side exists within generated code
     exit_locations: Option<SideExitLocations>,
+
+    // TODO: consider using raw pointer of JITFrame?
+    jit_frames: Vec<Box<JITFrame>>,
+}
+
+impl JITFrame {
+    pub fn new(pc: *const VALUE) -> *const Self {
+        let jit_frame = Box::new(JITFrame { pc });
+        let instance = ZJITState::get_instance();
+        // FIXME(alan): really, everyone should work with &JITFrame in safe code because &mut exclusivity may not hold
+        // think about this more
+        let raw_ptr = jit_frame.as_ref() as *const _;
+        instance.jit_frames.push(jit_frame);
+        raw_ptr
+    }
 }
 
 /// Tracks the initialization progress
@@ -140,6 +156,7 @@ impl ZJITState {
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
             ccall_counter_pointers: HashMap::new(),
             exit_locations,
+            jit_frames: vec![],
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
