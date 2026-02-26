@@ -18,6 +18,7 @@
 #include "ruby/debug.h"
 #include "ruby/encoding.h"
 #include "vm_core.h"
+#include "zjit.h"
 
 static VALUE rb_cBacktrace;
 static VALUE rb_cBacktraceLocation;
@@ -688,7 +689,7 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, long start_fram
 
     for (; cfp != end_cfp && (bt->backtrace_size < num_frames); cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
         if (cfp->iseq) {
-            if (cfp->pc) {
+            if (cfp->pc || cfp->jit_return) {
                 if (start_frame > 0) {
                     start_frame--;
                 }
@@ -697,7 +698,13 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, long start_fram
                     if (skip_internal && internal) continue;
                     if (!skip_next_frame) {
                         const rb_iseq_t *iseq = cfp->iseq;
-                        const VALUE *pc = cfp->pc;
+                        const VALUE *pc;
+                        if (rb_zjit_enabled_p && cfp->jit_return) {
+                            pc = rb_zjit_jit_return_pc(cfp->jit_return);
+                        }
+                        else {
+                            pc = cfp->pc;
+                        }
                         if (internal && backpatch_counter > 0) {
                             // To keep only one internal frame, discard the previous backpatch frames
                             bt->backtrace_size -= backpatch_counter;
