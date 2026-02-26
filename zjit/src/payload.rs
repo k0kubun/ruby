@@ -4,15 +4,7 @@ use crate::codegen::IseqCallRef;
 use crate::stats::CompileError;
 use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
 
-#[derive(Debug)]
-pub struct JITFrame {
-    pub pc: *const VALUE,
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_jit_return_pc(jit_return: *const JITFrame) -> *const VALUE {
-    unsafe { (*jit_return).pc }
-}
+pub use crate::jit_frame::JITFrame;
 
 /// This is all the data ZJIT stores on an ISEQ. We mark objects in this struct on GC.
 #[derive(Debug)]
