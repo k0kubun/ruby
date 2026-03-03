@@ -46,4 +46,15 @@ static inline VALUE *rb_zjit_jit_return_pc(void *jit_return) { UNREACHABLE_RETUR
 
 #define rb_zjit_enabled_p (rb_zjit_entry != 0)
 
+static inline const VALUE*
+rb_zjit_cfp_pc(const rb_control_frame_t *cfp)
+{
+    if (rb_zjit_enabled_p && cfp->jit_return) {
+        return rb_zjit_jit_return_pc(cfp->jit_return);
+    }
+    else {
+        return cfp->pc;
+    }
+}
+
 #endif // #ifndef ZJIT_H

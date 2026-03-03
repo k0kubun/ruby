@@ -2851,7 +2851,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
         cont_pc = cont_sp = 0;
         catch_iseq = NULL;
 
-        while (ec->cfp->pc == 0 || ec->cfp->iseq == 0) {
+        while (rb_zjit_cfp_pc(ec->cfp) == 0 || ec->cfp->iseq == 0) {
             if (UNLIKELY(VM_FRAME_TYPE(ec->cfp) == VM_FRAME_MAGIC_CFUNC)) {
                 EXEC_EVENT_HOOK_AND_POP_FRAME(ec, RUBY_EVENT_C_RETURN, ec->cfp->self,
                                               rb_vm_frame_method_entry(ec->cfp)->def->original_id,
@@ -2865,7 +2865,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
         }
 
         rb_control_frame_t *const cfp = ec->cfp;
-        epc = cfp->pc - ISEQ_BODY(cfp->iseq)->iseq_encoded;
+        epc = rb_zjit_cfp_pc(cfp) - ISEQ_BODY(cfp->iseq)->iseq_encoded;
 
         escape_cfp = NULL;
         if (state == TAG_BREAK || state == TAG_RETURN) {
@@ -2943,6 +2943,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         escape_cfp = THROW_DATA_CATCH_FRAME(err);
                         if (cfp == escape_cfp) {
                             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
+                            cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
                             ec->errinfo = Qnil;
                             return Qundef;
                         }
@@ -2973,6 +2974,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                     }
                     else if (entry->type == type) {
                         cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
+                        cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
                         cfp->sp = vm_base_ptr(cfp) + entry->sp;
 
                         if (state != TAG_REDO) {
@@ -3008,6 +3010,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
             rb_iseq_check(catch_iseq);
             cfp->sp = vm_base_ptr(cfp) + cont_sp;
             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + cont_pc;
+            cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
 
             /* push block frame */
             cfp->sp[0] = (VALUE)err;

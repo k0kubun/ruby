@@ -104,7 +104,7 @@ rb_vm_get_sourceline(const rb_control_frame_t *cfp)
 {
     if (VM_FRAME_RUBYFRAME_P(cfp) && cfp->iseq) {
         const rb_iseq_t *iseq = cfp->iseq;
-        int line = calc_lineno(iseq, cfp->pc);
+        int line = calc_lineno(iseq, rb_zjit_cfp_pc(cfp));
         if (line != 0) {
             return line;
         }
@@ -698,13 +698,7 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, long start_fram
                     if (skip_internal && internal) continue;
                     if (!skip_next_frame) {
                         const rb_iseq_t *iseq = cfp->iseq;
-                        const VALUE *pc;
-                        if (rb_zjit_enabled_p && cfp->jit_return) {
-                            pc = rb_zjit_jit_return_pc(cfp->jit_return);
-                        }
-                        else {
-                            pc = cfp->pc;
-                        }
+                        const VALUE *pc = rb_zjit_cfp_pc(cfp);
                         if (internal && backpatch_counter > 0) {
                             // To keep only one internal frame, discard the previous backpatch frames
                             bt->backtrace_size -= backpatch_counter;
