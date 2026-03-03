@@ -2834,6 +2834,23 @@ vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,
     return result;
 }
 
+static inline void
+rb_zjit_materialize_frames(rb_execution_context_t *ec)
+{
+    if (!rb_zjit_enabled_p) return;
+
+    rb_control_frame_t *cfp = ec->cfp;
+    const rb_control_frame_t *end_cfp = RUBY_VM_END_CONTROL_FRAME(ec);
+    while (cfp != end_cfp) {
+        if (cfp->jit_return) {
+            cfp->pc = rb_zjit_cfp_pc(cfp);
+            cfp->jit_return = 0;
+        }
+        if (VM_FRAME_FINISHED_P(cfp)) break;
+        cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+    }
+}
+
 static inline VALUE
 vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, VALUE errinfo)
 {
@@ -2905,6 +2922,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                     /* TAG_BREAK */
                     *cfp->sp++ = THROW_DATA_VAL(err);
                     ec->errinfo = Qnil;
+                    rb_zjit_materialize_frames(ec);
                     return Qundef;
                 }
             }
@@ -2942,8 +2960,8 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         const rb_control_frame_t *escape_cfp;
                         escape_cfp = THROW_DATA_CATCH_FRAME(err);
                         if (cfp == escape_cfp) {
+                            rb_zjit_materialize_frames(ec);
                             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
-                            cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
                             ec->errinfo = Qnil;
                             return Qundef;
                         }
@@ -2973,8 +2991,8 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         break;
                     }
                     else if (entry->type == type) {
+                        rb_zjit_materialize_frames(ec);
                         cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
-                        cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
                         cfp->sp = vm_base_ptr(cfp) + entry->sp;
 
                         if (state != TAG_REDO) {
@@ -3009,8 +3027,8 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
 
             rb_iseq_check(catch_iseq);
             cfp->sp = vm_base_ptr(cfp) + cont_sp;
+            rb_zjit_materialize_frames(ec);
             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + cont_pc;
-            cfp->jit_return = 0; // stop reading outdated cfp->pc in JITFrame
 
             /* push block frame */
             cfp->sp[0] = (VALUE)err;

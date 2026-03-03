@@ -31,4 +31,29 @@ mod tests {
         "#);
         assert_snapshot!(inspect("test.first"), @r#""<compiled>:4:in 'Object#test'""#);
     }
+
+    #[test]
+    fn test_materialize_one_frame() {
+        assert_snapshot!(inspect("
+            def jit_entry
+              raise rescue 1
+            end
+            jit_entry
+            jit_entry
+        "), @"1");
+    }
+
+    #[test]
+    fn test_materialize_two_frames() {
+        // At the point of `resuce`, there are two lightweight frames on stack and both need to be
+        // materialized before passing control to interpreter.
+        assert_snapshot!(inspect("
+            def jit_entry = raise_and_rescue
+            def raise_and_rescue
+              raise rescue 1
+            end
+            jit_entry
+            jit_entry
+        "), @"1");
+    }
 }
