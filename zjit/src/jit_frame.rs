@@ -56,4 +56,16 @@ mod tests {
             jit_entry
         "), @"1");
     }
+
+    // TODO: minimize
+    #[test]
+    fn test_opt_plus_type_guard_nested_exit() {
+        assert_snapshot!(inspect("
+            def side_exit(n) = 1 + n
+            def jit_frame(n) = 1 + side_exit(n)
+            def entry(n) = jit_frame(n)
+            entry(2) # profile send
+            [entry(2), entry(2.0)]
+        "), @"[4, 4.0]");
+    }
 }

@@ -2835,7 +2835,7 @@ vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,
 }
 
 static inline void
-rb_zjit_materialize_frames(rb_execution_context_t *ec)
+zjit_materialize_frames(rb_execution_context_t *ec)
 {
     if (!rb_zjit_enabled_p) return;
 
@@ -2849,6 +2849,12 @@ rb_zjit_materialize_frames(rb_execution_context_t *ec)
         if (VM_FRAME_FINISHED_P(cfp)) break;
         cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
     }
+}
+
+void
+rb_zjit_materialize_frames(rb_execution_context_t *ec)
+{
+    zjit_materialize_frames(ec);
 }
 
 static inline VALUE
@@ -2922,7 +2928,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                     /* TAG_BREAK */
                     *cfp->sp++ = THROW_DATA_VAL(err);
                     ec->errinfo = Qnil;
-                    rb_zjit_materialize_frames(ec);
+                    zjit_materialize_frames(ec);
                     return Qundef;
                 }
             }
@@ -2960,7 +2966,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         const rb_control_frame_t *escape_cfp;
                         escape_cfp = THROW_DATA_CATCH_FRAME(err);
                         if (cfp == escape_cfp) {
-                            rb_zjit_materialize_frames(ec);
+                            zjit_materialize_frames(ec);
                             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
                             ec->errinfo = Qnil;
                             return Qundef;
@@ -2991,7 +2997,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         break;
                     }
                     else if (entry->type == type) {
-                        rb_zjit_materialize_frames(ec);
+                        zjit_materialize_frames(ec);
                         cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + entry->cont;
                         cfp->sp = vm_base_ptr(cfp) + entry->sp;
 
@@ -3027,7 +3033,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
 
             rb_iseq_check(catch_iseq);
             cfp->sp = vm_base_ptr(cfp) + cont_sp;
-            rb_zjit_materialize_frames(ec);
+            zjit_materialize_frames(ec);
             cfp->pc = ISEQ_BODY(cfp->iseq)->iseq_encoded + cont_pc;
 
             /* push block frame */

@@ -1054,7 +1054,7 @@ static void
 oldbt_iter_iseq(void *ptr, const rb_control_frame_t *cfp)
 {
     const rb_iseq_t *iseq = cfp->iseq;
-    const VALUE *pc = cfp->pc;
+    const VALUE *pc = rb_zjit_cfp_pc(cfp);
     struct oldbt_arg *arg = (struct oldbt_arg *)ptr;
     VALUE file = arg->filename = rb_iseq_path(iseq);
     VALUE name = ISEQ_BODY(iseq)->location.label;

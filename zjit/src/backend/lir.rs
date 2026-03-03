@@ -5,7 +5,7 @@ use std::panic;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use crate::codegen::local_size_and_idx_to_ep_offset;
-use crate::cruby::{Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary};
+use crate::cruby::{vm_stack_canary, EcPtr, Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, debug, get_option};
@@ -2252,6 +2252,12 @@ impl Assembler
 
         /// Tear down the JIT frame and return to the interpreter.
         fn compile_exit_return(asm: &mut Assembler) {
+            asm_comment!(asm, "materialize caller frames");
+            unsafe extern "C" {
+                fn rb_zjit_materialize_frames(ec: EcPtr);
+            }
+            asm_ccall!(asm, rb_zjit_materialize_frames, EC);
+
             asm_comment!(asm, "exit to the interpreter");
             asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
             asm.cret(Opnd::UImm(Qundef.as_u64()));
