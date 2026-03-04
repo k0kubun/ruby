@@ -755,7 +755,7 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, long start_fram
         for (; cfp != end_cfp; cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
             if (cfp->iseq && cfp->pc && !(skip_internal && is_internal_location(cfp->iseq))) {
                 VM_ASSERT(!skip_next_frame); // ISEQ_TYPE_RESCUE/ISEQ_TYPE_ENSURE should have a caller Ruby ISEQ, not a cfunc
-                bt_backpatch_loc(backpatch_counter, loc, cfp->iseq, cfp->pc);
+                bt_backpatch_loc(backpatch_counter, loc, cfp->iseq, rb_zjit_cfp_pc(cfp));
                 RB_OBJ_WRITTEN(btobj, Qundef, cfp->iseq);
                 if (do_yield) {
                     bt_yield_loc(loc - backpatch_counter, backpatch_counter, btobj);
