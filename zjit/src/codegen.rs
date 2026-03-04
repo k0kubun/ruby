@@ -2455,7 +2455,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     if let Some(pc) = PC_POISON {
         asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
     }
-    let jit_frame = JITFrame::new(next_pc);
+    let jit_frame = JITFrame::new(next_pc, state.iseq);
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
 }
 

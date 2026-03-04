@@ -1,13 +1,19 @@
-use crate::cruby::VALUE;
+use crate::cruby::{IseqPtr, VALUE};
 
 #[derive(Debug)]
 pub struct JITFrame {
     pub pc: *const VALUE,
+    pub iseq: IseqPtr,
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_jit_return_pc(jit_return: *const JITFrame) -> *const VALUE {
     unsafe { (*jit_return).pc }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_jit_return_iseq(jit_return: *const JITFrame) -> IseqPtr {
+    unsafe { (*jit_return).iseq }
 }
 
 #[cfg(test)]

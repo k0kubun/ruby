@@ -1762,7 +1762,7 @@ thread_profile_frames(rb_execution_context_t *ec, int start, int limit, VALUE *b
             }
 
             if (lines) {
-                const VALUE *pc = cfp->pc;
+                const VALUE *pc = cfp->pc; // TODO: fix this
                 VALUE *iseq_encoded = ISEQ_BODY(cfp->iseq)->iseq_encoded;
                 VALUE *pc_end = iseq_encoded + ISEQ_BODY(cfp->iseq)->iseq_size;
 

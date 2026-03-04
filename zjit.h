@@ -29,6 +29,7 @@ void rb_zjit_before_ractor_spawn(void);
 void rb_zjit_tracing_invalidate_all(void);
 void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 VALUE *rb_zjit_jit_return_pc(void *jit_return);
+rb_iseq_t *rb_zjit_jit_return_iseq(void *jit_return);
 #else
 #define rb_zjit_entry 0
 static inline void rb_zjit_compile_iseq(const rb_iseq_t *iseq, bool jit_exception) {}

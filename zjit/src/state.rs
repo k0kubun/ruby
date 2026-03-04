@@ -1,7 +1,7 @@
 //! Runtime state of ZJIT.
 
 use crate::codegen::{gen_entry_trampoline, gen_exit_trampoline, gen_exit_trampoline_with_counter, gen_function_stub_hit_trampoline};
-use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_vm_insn_addr2opcode, rb_profile_frames, VALUE, VM_INSTRUCTION_SIZE, size_t, rb_gc_mark, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
+use crate::cruby::{self, EcPtr, IseqPtr, Qnil, Qtrue, VALUE, VM_INSTRUCTION_SIZE, rb_bug_panic_hook, rb_cRubyVM, rb_const_get, rb_funcallv, rb_gc_mark, rb_profile_frames, rb_vm_insn_addr2opcode, rb_vm_insn_count, rust_str_to_id, size_t, src_loc, with_vm_lock};
 use crate::cruby_methods;
 use crate::invariants::Invariants;
 use crate::asm::CodeBlock;
@@ -71,8 +71,8 @@ pub struct ZJITState {
 }
 
 impl JITFrame {
-    pub fn new(pc: *const VALUE) -> *const Self {
-        let jit_frame = Box::new(JITFrame { pc });
+    pub fn new(pc: *const VALUE, iseq: IseqPtr) -> *const Self { // TODO: move this to jit_frame.rs?
+        let jit_frame = Box::new(JITFrame { pc, iseq });
         let instance = ZJITState::get_instance();
         // FIXME(alan): really, everyone should work with &JITFrame in safe code because &mut exclusivity may not hold
         // think about this more

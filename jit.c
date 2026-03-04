@@ -16,6 +16,7 @@
 #include "vm_sync.h"
 #include "internal/fixnum.h"
 #include "internal/string.h"
+#include "zjit.h"
 
 enum jit_bindgen_constants {
     // Field offsets for the RObject struct
@@ -509,6 +510,7 @@ void
 rb_set_cfp_pc(struct rb_control_frame_struct *cfp, const VALUE *pc)
 {
     cfp->pc = pc;
+    if (rb_zjit_enabled_p) cfp->jit_return = 0; // TODO: do it in Rust (function_stub_hit)
 }
 
 void
