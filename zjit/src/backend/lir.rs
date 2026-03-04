@@ -2229,9 +2229,6 @@ impl Assembler
             // so that nobody stomps on us
             asm.pad_patch_point();
 
-            asm_comment!(asm, "save cfp->pc");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
-
             asm_comment!(asm, "save cfp->sp");
             asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
 
@@ -2248,16 +2245,19 @@ impl Assembler
                     asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(locals.len(), idx) - 1) * SIZEOF_VALUE_I32), opnd);
                 }
             }
-        }
 
-        /// Tear down the JIT frame and return to the interpreter.
-        fn compile_exit_return(asm: &mut Assembler) {
             asm_comment!(asm, "materialize caller frames");
             unsafe extern "C" {
                 fn rb_zjit_materialize_frames(ec: EcPtr);
             }
             asm_ccall!(asm, rb_zjit_materialize_frames, EC);
 
+            asm_comment!(asm, "save cfp->pc");
+            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
+        }
+
+        /// Tear down the JIT frame and return to the interpreter.
+        fn compile_exit_return(asm: &mut Assembler) {
             asm_comment!(asm, "exit to the interpreter");
             asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
             asm.cret(Opnd::UImm(Qundef.as_u64()));

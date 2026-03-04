@@ -44,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_two_frames() {
+    fn test_materialize_two_frames() { // materialize caller frames on raise
         // At the point of `resuce`, there are two lightweight frames on stack and both need to be
         // materialized before passing control to interpreter.
         assert_snapshot!(inspect("
@@ -57,7 +57,7 @@ mod tests {
         "), @"1");
     }
 
-    // TODO: minimize
+    // TODO: minimize (materialize frames on side exit)
     #[test]
     fn test_opt_plus_type_guard_nested_exit() {
         assert_snapshot!(inspect("
@@ -67,5 +67,18 @@ mod tests {
             entry(2) # profile send
             [entry(2), entry(2.0)]
         "), @"[4, 4.0]");
+    }
+
+    // TODO: minimize: do not overwrite the top-most frame's PC with jit_frame's PC on invalidation exit
+    #[test]
+    fn test_bop_invalidation() {
+        assert_snapshot!(inspect(r#"
+            def test
+              eval("class Integer; def +(_) = 100; end")
+              1 + 2
+            end
+            test
+            test
+        "#), @"100");
     }
 }
