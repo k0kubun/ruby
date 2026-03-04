@@ -5,7 +5,7 @@ use std::panic;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use crate::codegen::local_size_and_idx_to_ep_offset;
-use crate::cruby::{vm_stack_canary, EcPtr, Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32};
+use crate::cruby::{CfpPtr, Qundef, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, debug, get_option};
@@ -2248,9 +2248,9 @@ impl Assembler
 
             asm_comment!(asm, "materialize caller frames");
             unsafe extern "C" {
-                fn rb_zjit_materialize_frames(ec: EcPtr);
+                fn rb_zjit_materialize_frames(cfp: CfpPtr);
             }
-            asm_ccall!(asm, rb_zjit_materialize_frames, EC);
+            asm_ccall!(asm, rb_zjit_materialize_frames, CFP);
 
             asm_comment!(asm, "save cfp->pc");
             asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
