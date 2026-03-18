@@ -1110,7 +1110,7 @@ fn gen_ccall_variadic(
 fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
     // rb_ivar_get can raise Ractor::IsolationError for class/module ivars from non-main Ractors
     // TODO: consider assuming single ractor mode and adding this lazily
-    gen_prepare_non_leaf_call(jit, asm, state);
+    //gen_prepare_non_leaf_call(jit, asm, state);
     if ic.is_null() {
         asm_ccall!(asm, rb_ivar_get, recv, id.0.into())
     } else {
