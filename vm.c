@@ -583,9 +583,13 @@ jit_exec(rb_execution_context_t *ec)
             VALUE result = ((rb_zjit_func_t)zjit_entry)(ec, ec->cfp, func);
             // Materialize any remaining lightweight ZJIT frames on side exit.
             // This is done here (once per JIT entry) instead of in each side exit
-            // to reduce generated code size.
+            // to reduce generated code size. Save/restore cfp->pc because
+            // materialize_frames would overwrite it from jit_return (which has
+            // a different PC than the side exit wrote).
             if (UNDEF_P(result)) {
+                const VALUE *saved_pc = ec->cfp->pc;
                 zjit_materialize_frames(ec->cfp);
+                ec->cfp->pc = saved_pc;
             }
             return result;
         }

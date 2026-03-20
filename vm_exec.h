@@ -189,7 +189,11 @@ default:                        \
             rb_jit_func_t func = zjit_compile(ec); \
             if (func) { \
                 val = zjit_entry(ec, ec->cfp, func); \
-                if (UNDEF_P(val)) zjit_materialize_frames(ec->cfp); \
+                if (UNDEF_P(val)) { \
+                    const VALUE *saved_pc = ec->cfp->pc; \
+                    zjit_materialize_frames(ec->cfp); \
+                    ec->cfp->pc = saved_pc; \
+                } \
             } \
         } \
     } \
