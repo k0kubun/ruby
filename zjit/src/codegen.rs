@@ -55,6 +55,12 @@ struct JITState {
 
     /// ISEQ calls that need to be compiled later
     iseq_calls: Vec<IseqCallRef>,
+
+    /// Address range for Linux perf's JIT interface
+    perf_map: Rc<RefCell<Vec<(CodePtr, Option<CodePtr>, String)>>>,
+
+    /// Stack of symbol names for --zjit-perf
+    perf_stack: Vec<String>,
 }
 
 impl JITState {
@@ -67,12 +73,70 @@ impl JITState {
             labels: vec![None; num_blocks],
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
+            perf_map: Rc::default(),
+            perf_stack: vec![],
         }
     }
 
     /// Retrieve the output of a given instruction that has been compiled
     fn get_opnd(&self, insn_id: InsnId) -> lir::Opnd {
         self.opnds[insn_id.0].unwrap_or_else(|| panic!("Failed to get_opnd({insn_id})"))
+    }
+
+    /// Push a symbol for --zjit-perf
+    fn perf_symbol_push(&mut self, asm: &mut Assembler, symbol_name: &str) {
+        if !self.perf_stack.is_empty() {
+            self.perf_symbol_range_end(asm);
+        }
+        self.perf_stack.push(symbol_name.to_string());
+        self.perf_symbol_range_start(asm, symbol_name);
+    }
+
+    /// Pop the stack-top symbol for --zjit-perf
+    fn perf_symbol_pop(&mut self, asm: &mut Assembler) {
+        self.perf_symbol_range_end(asm);
+        self.perf_stack.pop();
+        if let Some(symbol_name) = self.perf_stack.get(0) {
+            self.perf_symbol_range_start(asm, symbol_name);
+        }
+    }
+
+    /// Mark the start address of a symbol to be reported to perf
+    fn perf_symbol_range_start(&self, asm: &mut Assembler, symbol_name: &str) {
+        let symbol_name = format!("zjit::{}", symbol_name);
+        let syms = self.perf_map.clone();
+        asm.pos_marker(move |start, _| syms.borrow_mut().push((start, None, symbol_name.clone())));
+    }
+
+    /// Mark the end address of a symbol to be reported to perf
+    fn perf_symbol_range_end(&self, asm: &mut Assembler) {
+        let syms = self.perf_map.clone();
+        asm.pos_marker(move |end, _| {
+            if let Some((_, end_store, _)) = syms.borrow_mut().last_mut() {
+                assert_eq!(None, *end_store);
+                *end_store = Some(end);
+            }
+        });
+    }
+
+    /// Flush addresses and symbols to /tmp/perf-{pid}.map
+    fn flush_perf_symbols(&self, cb: &CodeBlock) {
+        use std::io::Write;
+        assert_eq!(0, self.perf_stack.len());
+        let path = format!("/tmp/perf-{}.map", std::process::id());
+        let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            debug!("Failed to open perf map file: {path}");
+            return;
+        };
+        let mut f = std::io::BufWriter::new(file);
+        for sym in self.perf_map.borrow().iter() {
+            if let (start, Some(end), name) = sym {
+                let start_addr = start.raw_addr(cb);
+                let end_addr = end.raw_addr(cb);
+                let code_size = end_addr - start_addr;
+                let _ = writeln!(f, "{start_addr:#x} {code_size:#x} {name}");
+            }
+        }
     }
 
     /// Find or create a label for a given BlockId
@@ -319,6 +383,12 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     let mut jit = JITState::new(iseq, version, function.num_insns(), function.num_blocks());
     let mut asm = Assembler::new_with_stack_slots(num_spilled_params);
 
+    // Mark the start of an ISEQ for --zjit-perf
+    if get_option!(perf) {
+        let iseq_name = iseq_get_location(iseq, 0);
+        jit.perf_symbol_push(&mut asm, &iseq_name);
+    }
+
     // Mapping from HIR block IDs to LIR block IDs.
     // This is is a one-to-one mapping from HIR to LIR blocks used for finding
     // jump targets in LIR (LIR should always jump to the head of an HIR block)
@@ -469,15 +539,16 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     // Validate CFG invariants after HIR to LIR lowering
     asm.validate_jump_positions();
 
+    // Mark the end of an ISEQ for --zjit-perf
+    if get_option!(perf) {
+        jit.perf_symbol_pop(&mut asm);
+    }
+
     // Generate code if everything can be compiled
     let result = asm.compile(cb);
-    if let Ok((start_ptr, _)) = result {
+    if result.is_ok() {
         if get_option!(perf) {
-            let start_usize = start_ptr.raw_addr(cb);
-            let end_usize = cb.get_write_ptr().raw_addr(cb);
-            let code_size = end_usize - start_usize;
-            let iseq_name = iseq_get_location(iseq, 0);
-            register_with_perf(iseq_name, start_usize, code_size);
+            jit.flush_perf_symbols(cb);
         }
         if ZJITState::should_log_compiled_iseqs() {
             let iseq_name = iseq_get_location(iseq, 0);
