@@ -1511,7 +1511,7 @@ fn gen_send_iseq_direct(
         cme,
         frame_type,
         specval,
-        write_block_code: iseq_may_write_block_code(iseq),
+        write_block_code: cached_iseq_may_write_block_code(iseq),
     });
 
     // Write "keyword_bits" to the callee's frame if the callee accepts keywords.
@@ -2564,6 +2564,19 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
     false
 }
 
+/// Cached version of iseq_may_write_block_code. Looks up the result in the
+/// IseqPayload and only scans the ISEQ on the first call for a given ISEQ.
+fn cached_iseq_may_write_block_code(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    if let Some(val) = payload.may_write_block_code {
+        return val;
+    }
+    let val = iseq_may_write_block_code(iseq);
+    let payload = get_or_create_iseq_payload(iseq);
+    payload.may_write_block_code = Some(val);
+    val
+}
+
 /// Save only the PC to CFP. Use this when you need to call gen_save_sp()
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
@@ -2576,7 +2589,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     if let Some(pc) = PC_POISON {
         asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
     }
-    let jit_frame = JITFrame::new(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
+    let jit_frame = JITFrame::new(next_pc, state.iseq, !cached_iseq_may_write_block_code(state.iseq));
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
 }
 

@@ -13,6 +13,8 @@ pub struct IseqPayload {
     pub profile: IseqProfile,
     /// JIT code versions. Different versions should have different assumptions.
     pub versions: Vec<IseqVersionRef>,
+    /// Cached result of iseq_may_write_block_code() to avoid repeated ISEQ scans.
+    pub may_write_block_code: Option<bool>,
 }
 
 impl IseqPayload {
@@ -20,6 +22,7 @@ impl IseqPayload {
         Self {
             profile: IseqProfile::new(),
             versions: vec![],
+            may_write_block_code: None,
         }
     }
 }
