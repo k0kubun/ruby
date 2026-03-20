@@ -462,7 +462,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                     if let Some(iseq_name) = &perf_iseq_name {
                         let insn_name = insn.variant_name();
                         let entry_idx = perf_entries.borrow().len();
-                        perf_entries.borrow_mut().push((Cell::new(0), format!("zjit::{iseq_name}::{insn_name}")));
+                        perf_entries.borrow_mut().push((Cell::new(0), format!("zjit::{insn_name}")));
                         let entries = Rc::clone(&perf_entries);
                         asm.pos_marker(move |code_ptr, cb| {
                             entries.borrow()[entry_idx].0.set(code_ptr.raw_addr(cb));
