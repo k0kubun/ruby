@@ -23,7 +23,7 @@ use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NAT
 use crate::hir::{iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{Const, FrameState, Function, Insn, InsnId, SendFallbackReason};
 use crate::hir_type::{types, Type};
-use crate::options::get_option;
+use crate::options::{get_option, PerfMap};
 use crate::cast::IntoUsize;
 
 /// At the moment, we support recompiling each ISEQ only once.
@@ -210,8 +210,8 @@ pub fn gen_iseq_call(cb: &mut CodeBlock, iseq_call: &IseqCallRef) -> Result<(), 
     Ok(())
 }
 
-/// Write an entry to the perf map in /tmp
-fn register_with_perf(iseq_name: String, start_ptr: usize, code_size: usize) {
+/// Write entries to the perf map in /tmp
+fn write_perf_map(entries: &[(usize, usize, String)]) {
     use std::io::Write;
     let perf_map = format!("/tmp/perf-{}.map", std::process::id());
     let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&perf_map) else {
@@ -219,10 +219,13 @@ fn register_with_perf(iseq_name: String, start_ptr: usize, code_size: usize) {
         return;
     };
     let mut file = std::io::BufWriter::new(file);
-    let Ok(_) = writeln!(file, "{start_ptr:#x} {code_size:#x} zjit::{iseq_name}") else {
-        debug!("Failed to write {iseq_name} to perf map file: {perf_map}");
-        return;
-    };
+    for &(start_ptr, code_size, ref name) in entries {
+        if code_size == 0 { continue; }
+        let Ok(_) = writeln!(file, "{start_ptr:#x} {code_size:#x} {name}") else {
+            debug!("Failed to write {name} to perf map file: {perf_map}");
+            return;
+        };
+    }
 }
 
 /// Compile a shared JIT entry trampoline
@@ -244,11 +247,11 @@ pub fn gen_entry_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError>
 
     let (code_ptr, gc_offsets) = asm.compile(cb)?;
     assert!(gc_offsets.is_empty());
-    if get_option!(perf) {
+    if get_option!(perf).is_some() {
         let start_ptr = code_ptr.raw_addr(cb);
         let end_ptr = cb.get_write_ptr().raw_addr(cb);
         let code_size = end_ptr - start_ptr;
-        register_with_perf("ZJIT entry trampoline".into(), start_ptr, code_size);
+        write_perf_map(&[(start_ptr, code_size, "zjit::entry_trampoline".into())]);
     }
     Ok(code_ptr)
 }
@@ -318,6 +321,14 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     let num_spilled_params = max_num_params(function).saturating_sub(ALLOC_REGS.len());
     let mut jit = JITState::new(iseq, version, function.num_insns(), function.num_blocks());
     let mut asm = Assembler::new_with_stack_slots(num_spilled_params);
+
+    // For --zjit-perf (insn mode), collect per-instruction code ranges via pos_markers.
+    // Each entry is (start_addr, end_addr, symbol_name). Addresses are filled in by
+    // pos_marker callbacks after asm.compile() resolves final positions.
+    let perf_insn_mode = matches!(get_option!(perf), Some(PerfMap::Insn));
+    let perf_iseq_name = if perf_insn_mode { Some(iseq_get_location(iseq, 0)) } else { None };
+    let perf_entries: Rc<RefCell<Vec<(Cell<usize>, Cell<usize>, String)>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     // Mapping from HIR block IDs to LIR block IDs.
     // This is is a one-to-one mapping from HIR to LIR blocks used for finding
@@ -448,6 +459,16 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                     assert!(insn_idx == block.insns().len() - 1, "Jump must be the last instruction in HIR block");
                 },
                 _ => {
+                    // For --zjit-perf, record the start position of this instruction
+                    if let Some(iseq_name) = &perf_iseq_name {
+                        let insn_name = insn.variant_name();
+                        let entry_idx = perf_entries.borrow().len();
+                        perf_entries.borrow_mut().push((Cell::new(0), Cell::new(0), format!("zjit::{iseq_name}::{insn_name}")));
+                        let entries = Rc::clone(&perf_entries);
+                        asm.pos_marker(move |code_ptr, cb| {
+                            entries.borrow()[entry_idx].0.set(code_ptr.raw_addr(cb));
+                        });
+                    }
                     if let Err(last_snapshot) = gen_insn(cb, &mut jit, &mut asm, function, insn_id, &insn) {
                         debug!("ZJIT: gen_function: Failed to compile insn: {insn_id} {insn}. Generating side-exit.");
                         gen_incr_counter(&mut asm, exit_counter_for_unhandled_hir_insn(&insn));
@@ -456,7 +477,14 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         // TODO(max): Generate ud2 or equivalent.
                         break;
                     };
-                    // It's fine; we generated the instruction
+                    // For --zjit-perf, record the end position of this instruction
+                    if perf_iseq_name.is_some() {
+                        let entry_idx = perf_entries.borrow().len() - 1;
+                        let entries = Rc::clone(&perf_entries);
+                        asm.pos_marker(move |code_ptr, cb| {
+                            entries.borrow()[entry_idx].1.set(code_ptr.raw_addr(cb));
+                        });
+                    }
                 }
             }
         }
@@ -472,12 +500,24 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     // Generate code if everything can be compiled
     let result = asm.compile(cb);
     if let Ok((start_ptr, _)) = result {
-        if get_option!(perf) {
-            let start_usize = start_ptr.raw_addr(cb);
-            let end_usize = cb.get_write_ptr().raw_addr(cb);
-            let code_size = end_usize - start_usize;
-            let iseq_name = iseq_get_location(iseq, 0);
-            register_with_perf(iseq_name, start_usize, code_size);
+        match get_option!(perf) {
+            Some(PerfMap::Insn) => {
+                // Write per-instruction symbols collected via pos_markers
+                let entries: Vec<(usize, usize, String)> = perf_entries.borrow().iter().map(|(start, end, name)| {
+                    let s = start.get();
+                    let e = end.get();
+                    (s, e.saturating_sub(s), name.clone())
+                }).collect();
+                write_perf_map(&entries);
+            }
+            Some(PerfMap::ISEQ) => {
+                let start_usize = start_ptr.raw_addr(cb);
+                let end_usize = cb.get_write_ptr().raw_addr(cb);
+                let code_size = end_usize - start_usize;
+                let iseq_name = iseq_get_location(iseq, 0);
+                write_perf_map(&[(start_usize, code_size, format!("zjit::{iseq_name}"))]);
+            }
+            None => {}
         }
         if ZJITState::should_log_compiled_iseqs() {
             let iseq_name = iseq_get_location(iseq, 0);

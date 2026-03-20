@@ -1358,6 +1358,15 @@ macro_rules! for_each_operand_impl {
 }
 
 impl Insn {
+    /// Return the variant name of the instruction (e.g. "FixnumAdd", "Send").
+    /// Extracts the name from the Debug representation.
+    pub fn variant_name(&self) -> String {
+        let debug = format!("{self:?}");
+        // Debug format is "VariantName { ... }" or "VariantName(...)".
+        // Take everything before the first space, '(', or '{'.
+        debug.split([' ', '(', '{']).next().unwrap_or(&debug).to_string()
+    }
+
     /// Not every instruction returns a value. Return true if the instruction does and false otherwise.
     pub fn has_output(&self) -> bool {
         match self {

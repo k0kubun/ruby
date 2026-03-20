@@ -89,7 +89,7 @@ pub struct Options {
     pub trace_side_exits_sample_interval: usize,
 
     /// Dump code map to /tmp for performance profilers.
-    pub perf: bool,
+    pub perf: Option<PerfMap>,
 
     /// List of ISEQs that can be compiled, identified by their iseq_get_location()
     pub allowed_iseqs: Option<HashSet<String>>,
@@ -118,7 +118,7 @@ impl Default for Options {
             dump_disasm: None,
             trace_side_exits: None,
             trace_side_exits_sample_interval: 0,
-            perf: false,
+            perf: None,
             allowed_iseqs: None,
             log_compiled_iseqs: None,
         }
@@ -141,7 +141,8 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Collect ZJIT stats (=file to write to a file)."),
     ("--zjit-disable",
                      "Disable ZJIT for lazily enabling it with RubyVM::ZJIT.enable."),
-    ("--zjit-perf",  "Dump ISEQ symbols into /tmp/perf-{}.map for Linux perf."),
+    ("--zjit-perf[=mode]",
+                     "Dump symbols to /tmp/perf-{}.map (mode: insn (default), iseq)."),
     ("--zjit-log-compiled-iseqs=path",
                      "Log compiled ISEQs to the file. The file will be truncated."),
     ("--zjit-trace-exits[=counter]",
@@ -149,6 +150,15 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-trace-exits-sample-rate=num",
                      "Frequency at which to record side exits. Must be `usize`.")
 ];
+
+/// Perf map modes for --zjit-perf
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerfMap {
+    /// Dump one symbol per HIR instruction (default)
+    Insn,
+    /// Dump one symbol per compiled ISEQ
+    ISEQ,
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum TraceExits {
@@ -452,7 +462,8 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             }
         }
 
-        ("perf", "") => options.perf = true,
+        ("perf", "" | "insn") => options.perf = Some(PerfMap::Insn),
+        ("perf", "iseq") => options.perf = Some(PerfMap::ISEQ),
 
         ("allowed-iseqs", _) if !opt_val.is_empty() => options.allowed_iseqs = Some(parse_jit_list(opt_val)),
         ("log-compiled-iseqs", _) if !opt_val.is_empty() => {
