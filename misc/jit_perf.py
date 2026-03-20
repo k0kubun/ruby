@@ -14,6 +14,15 @@ def truncate_symbol(symbol, max_length=50):
     """ Truncate the symbol name to a maximum length """
     return symbol if len(symbol) <= max_length else symbol[:max_length-3] + '...'
 
+def zjit_insn_name(symbol):
+    """ Extract the HIR instruction name from a zjit insn-mode symbol.
+    e.g. 'zjit::each@<internal:array>:222::Send' -> 'Send' """
+    # Find the last :: separator — the instruction name follows it
+    idx = symbol.rfind('::')
+    if idx > 0:
+        return symbol[idx+2:]
+    return symbol
+
 def categorize_symbol(dso, symbol):
     """ Categorize the symbol based on the defined criteria """
     if dso == 'sqlite3_native.so':
@@ -22,8 +31,9 @@ def categorize_symbol(dso, symbol):
         return '[sha256]'
     elif symbol.startswith('[JIT] gen_send'):
         return '[JIT send]'
-    # TODO: Stop using zjit:: as the prefix for JIT code. Rust modules and JIT code should use different namespaces.
-    elif symbol.startswith('[JIT]') or (symbol.startswith('zjit::') and '@') or symbol == 'zjit::ZJIT entry trampoline':
+    elif symbol.startswith('[JIT]') or symbol == 'zjit::entry_trampoline':
+        return '[JIT code]'
+    elif symbol.startswith('zjit::') and 'perf-' in dso:
         return '[JIT code]'
     elif '::' in symbol or symbol.startswith('_ZN4yjit') or symbol.startswith('_ZN4zjit'):
         return '[JIT compile]'
@@ -63,7 +73,12 @@ def process_event(event):
 
     category = categorize_symbol(dso, symbol)
     category_cycles[category] += cycles
-    detailed_category_cycles[category][(dso, symbol)] += cycles
+    # For zjit insn-mode symbols, aggregate by instruction name
+    if category == '[JIT code]' and symbol.startswith('zjit::') and symbol != 'zjit::entry_trampoline':
+        insn = zjit_insn_name(symbol)
+        detailed_category_cycles[category][(dso, insn)] += cycles
+    else:
+        detailed_category_cycles[category][(dso, symbol)] += cycles
 
     if category.startswith('[') and category.endswith(']'):
         categories.add(category)

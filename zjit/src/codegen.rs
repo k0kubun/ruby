@@ -322,12 +322,11 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     let mut jit = JITState::new(iseq, version, function.num_insns(), function.num_blocks());
     let mut asm = Assembler::new_with_stack_slots(num_spilled_params);
 
-    // For --zjit-perf (insn mode), collect per-instruction code ranges via pos_markers.
-    // Each entry is (start_addr, end_addr, symbol_name). Addresses are filled in by
-    // pos_marker callbacks after asm.compile() resolves final positions.
+    // For --zjit-perf (insn mode), collect per-instruction start addresses via pos_markers.
+    // Sizes are computed from consecutive start addresses after compilation.
     let perf_insn_mode = matches!(get_option!(perf), Some(PerfMap::Insn));
     let perf_iseq_name = if perf_insn_mode { Some(iseq_get_location(iseq, 0)) } else { None };
-    let perf_entries: Rc<RefCell<Vec<(Cell<usize>, Cell<usize>, String)>>> =
+    let perf_entries: Rc<RefCell<Vec<(Cell<usize>, String)>>> =
         Rc::new(RefCell::new(Vec::new()));
 
     // Mapping from HIR block IDs to LIR block IDs.
@@ -463,7 +462,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                     if let Some(iseq_name) = &perf_iseq_name {
                         let insn_name = insn.variant_name();
                         let entry_idx = perf_entries.borrow().len();
-                        perf_entries.borrow_mut().push((Cell::new(0), Cell::new(0), format!("zjit::{iseq_name}::{insn_name}")));
+                        perf_entries.borrow_mut().push((Cell::new(0), format!("zjit::{iseq_name}::{insn_name}")));
                         let entries = Rc::clone(&perf_entries);
                         asm.pos_marker(move |code_ptr, cb| {
                             entries.borrow()[entry_idx].0.set(code_ptr.raw_addr(cb));
@@ -477,14 +476,6 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         // TODO(max): Generate ud2 or equivalent.
                         break;
                     };
-                    // For --zjit-perf, record the end position of this instruction
-                    if perf_iseq_name.is_some() {
-                        let entry_idx = perf_entries.borrow().len() - 1;
-                        let entries = Rc::clone(&perf_entries);
-                        asm.pos_marker(move |code_ptr, cb| {
-                            entries.borrow()[entry_idx].1.set(code_ptr.raw_addr(cb));
-                        });
-                    }
                 }
             }
         }
@@ -502,11 +493,14 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     if let Ok((start_ptr, _)) = result {
         match get_option!(perf) {
             Some(PerfMap::Insn) => {
-                // Write per-instruction symbols collected via pos_markers
-                let entries: Vec<(usize, usize, String)> = perf_entries.borrow().iter().map(|(start, end, name)| {
+                // Compute sizes from consecutive start addresses.
+                // The last entry extends to the end of the compiled code.
+                let end_addr = cb.get_write_ptr().raw_addr(cb);
+                let borrowed = perf_entries.borrow();
+                let entries: Vec<(usize, usize, String)> = borrowed.iter().enumerate().map(|(i, (start, name))| {
                     let s = start.get();
-                    let e = end.get();
-                    (s, e.saturating_sub(s), name.clone())
+                    let next = borrowed.get(i + 1).map_or(end_addr, |(next_start, _)| next_start.get());
+                    (s, next.saturating_sub(s), name.clone())
                 }).collect();
                 write_perf_map(&entries);
             }
