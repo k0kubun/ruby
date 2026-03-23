@@ -563,6 +563,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::Snapshot { .. } => return Ok(()), // we don't need to do anything for this instruction at the moment
         &Insn::Send { cd, blockiseq: None, state, reason, .. } => gen_send_without_block(jit, asm, cd, &function.frame_state(state), reason),
         &Insn::Send { cd, blockiseq: Some(blockiseq), state, reason, .. } => gen_send(jit, asm, cd, blockiseq, &function.frame_state(state), reason),
+        &Insn::Profile { cd, state, .. } => no_output!(gen_profile(jit, asm, cd, &function.frame_state(state))),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect { cme, iseq, recv, args, kw_bits, blockiseq, state, .. } => gen_send_iseq_direct(cb, jit, asm, *cme, *iseq, opnd!(recv), opnds!(args), *kw_bits, &function.frame_state(*state), *blockiseq),
         &Insn::InvokeSuper { cd, blockiseq, state, reason, .. } => gen_invokesuper(jit, asm, cd, blockiseq, &function.frame_state(state), reason),
@@ -1450,6 +1451,26 @@ fn gen_send_without_block(
         rb_vm_opt_send_without_block,
         EC, CFP, Opnd::const_ptr(cd)
     )
+}
+
+/// Compile a profiling call that collects operand types for a send.
+/// Triggers iseq recompilation after enough profiles are collected.
+fn gen_profile(
+    jit: &JITState,
+    asm: &mut Assembler,
+    cd: *const rb_call_data,
+    state: &FrameState,
+) {
+    gen_prepare_non_leaf_call(jit, asm, state);
+    asm_comment!(asm, "profile operands for #{}", ruby_call_method_name(cd));
+    asm_ccall!(
+        asm,
+        jit_profile_insn,
+        EC, CFP,
+        Opnd::const_ptr(cd),
+        Opnd::const_ptr(jit.iseq as *const u8),
+        (state.insn_idx() as u32).into()
+    );
 }
 
 /// Compile a direct call to an ISEQ method.
@@ -2831,6 +2852,54 @@ macro_rules! c_callable {
 }
 #[cfg(test)]
 pub(crate) use c_callable;
+
+c_callable! {
+    /// JIT-level profiling for send operands. Profiles operand types
+    /// and triggers recompilation when enough profiles are collected.
+    fn jit_profile_insn(ec: EcPtr, cfp: CfpPtr, cd: VALUE, iseq_val: VALUE, insn_idx: u32) -> VALUE {
+        let _ = ec; // unused but needed for calling convention
+        let iseq = iseq_val.0 as IseqPtr;
+        let cd_ptr = cd.0 as *const rb_call_data;
+        let argc = unsafe { vm_ci_argc((*cd_ptr).ci) };
+        jit_profile_operands(iseq, cfp, insn_idx as usize, (argc + 1) as usize);
+        Qnil
+    }
+}
+
+/// Profile operand types from JIT code and trigger recompilation if needed.
+fn jit_profile_operands(iseq: IseqPtr, cfp: CfpPtr, insn_idx: usize, num_operands: usize) {
+    with_vm_lock(src_loc!(), || {
+        let payload = get_or_create_iseq_payload(iseq);
+
+        // If we can't recompile, skip profiling entirely
+        if payload.versions.len() >= MAX_ISEQ_VERSIONS {
+            return;
+        }
+
+        let should_recompile = payload.profile.jit_profile_operands(iseq, cfp, insn_idx, num_operands);
+
+        if should_recompile {
+            // Invalidate current version and trigger recompilation on next call
+            let versions_len = payload.versions.len();
+            if let Some(version) = payload.versions.last().copied() {
+                if unsafe { version.as_ref() }.status != IseqStatus::Invalidated && versions_len < MAX_ISEQ_VERSIONS {
+                    let mut version = version;
+                    unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
+                    unsafe { rb_iseq_reset_jit_func(iseq) };
+
+                    // Recompile incoming JIT-to-JIT calls
+                    let cb = ZJITState::get_code_block();
+                    for incoming in unsafe { version.as_ref() }.incoming.iter() {
+                        if let Err(err) = gen_iseq_call(cb, incoming) {
+                            debug!("{err:?}: gen_iseq_call failed on Profile recompilation");
+                        }
+                    }
+                    cb.mark_all_executable();
+                }
+            }
+        }
+    });
+}
 
 c_callable! {
     /// Generated code calls this function with the SysV calling convention. See [gen_function_stub].

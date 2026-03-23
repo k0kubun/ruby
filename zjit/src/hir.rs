@@ -947,6 +947,16 @@ pub enum Insn {
         state: InsnId,
         reason: SendFallbackReason,
     },
+    /// Profile operand types for an opt_send_without_block at the JIT level.
+    /// Inserted before a Send that has no YARV-level profile data. After
+    /// collecting enough profiles, triggers iseq recompilation.
+    /// This instruction has no output; the following Send does the actual dispatch.
+    Profile {
+        recv: InsnId,
+        cd: *const rb_call_data,
+        args: Vec<InsnId>,
+        state: InsnId,
+    },
     SendForward {
         recv: InsnId,
         cd: *const rb_call_data,
@@ -1272,6 +1282,7 @@ macro_rules! for_each_operand_impl {
             }
             Insn::Send { recv, args, state, .. }
             | Insn::SendForward { recv, args, state, .. }
+            | Insn::Profile { recv, args, state, .. }
             | Insn::CCallVariadic { recv, args, state, .. }
             | Insn::CCallWithFrame { recv, args, state, .. }
             | Insn::SendDirect { recv, args, state, .. }
@@ -1369,7 +1380,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. } => false,
+            | Insn::ArrayAset { .. } | Insn::Profile { .. } => false,
             _ => true,
         }
     }
@@ -1527,6 +1538,7 @@ impl Insn {
             },
             Insn::CCallVariadic { .. } => effects::Any,
             Insn::Send { .. } => effects::Any,
+            Insn::Profile { .. } => effects::Any,
             Insn::SendForward { .. } => effects::Any,
             Insn::InvokeSuper { .. } => effects::Any,
             Insn::InvokeSuperForward { .. } => effects::Any,
@@ -1843,6 +1855,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                     write!(f, ", {arg}")?;
                 }
                 write!(f, " # SendFallbackReason: {reason}")?;
+                Ok(())
+            }
+            Insn::Profile { recv, cd, args, state: _ } => {
+                write!(f, "Profile {recv}, :{}", ruby_call_method_name(*cd))?;
+                for arg in args {
+                    write!(f, ", {arg}")?;
+                }
                 Ok(())
             }
             Insn::SendForward { recv, cd, args, blockiseq, reason, .. } => {
@@ -2702,6 +2721,12 @@ impl Function {
                 state,
                 reason,
             },
+            &Profile { recv, cd, ref args, state } => Profile {
+                recv: find!(recv),
+                cd,
+                args: find_vec!(args),
+                state,
+            },
             &SendForward { recv, cd, blockiseq, ref args, state, reason } => SendForward {
                 recv: find!(recv),
                 cd,
@@ -2844,7 +2869,8 @@ impl Function {
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint
-            | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. } =>
+            | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
+            | Insn::Profile { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn.0]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
             Insn::Const { val: Const::CBool(val) } => Type::from_cbool(*val),
@@ -3517,6 +3543,13 @@ impl Function {
                                 continue;
                             }
                             ReceiverTypeResolution::NoProfile => {
+                                // Insert Profile before Send for opt_send_without_block if there's room for recompilation
+                                let payload = get_or_create_iseq_payload(self.iseq);
+                                if !has_block && payload.versions.len() < crate::codegen::MAX_ISEQ_VERSIONS {
+                                    self.push_insn(block, Insn::Profile {
+                                        recv, cd, args: args.clone(), state,
+                                    });
+                                }
                                 if get_option!(stats) {
                                     let reason = if has_block { SendNoProfiles } else { SendWithoutBlockNoProfiles };
                                     self.set_dynamic_send_reason(insn_id, reason);
@@ -5927,7 +5960,8 @@ impl Function {
             | Insn::GetSpecialNumber { .. }
             | Insn::GetSpecialSymbol { .. }
             | Insn::GetBlockParam { .. }
-            | Insn::StoreField { .. } => {
+            | Insn::StoreField { .. }
+            | Insn::Profile { .. } => {
                 Ok(())
             }
             // Instructions with 1 Ruby object operand
@@ -6347,6 +6381,11 @@ pub struct FrameState {
 }
 
 impl FrameState {
+    /// Get the YARV instruction index for this frame state
+    pub fn insn_idx(&self) -> usize {
+        self.insn_idx
+    }
+
     /// Return itself without locals. Useful for side-exiting without spilling locals.
     fn without_locals(&self) -> Self {
         let mut state = self.clone();

@@ -432,6 +432,26 @@ impl IseqProfile {
         self.entry(insn_idx).map(|e| e.opnd_types.as_slice()).filter(|s| !s.is_empty())
     }
 
+    /// Profile operand types from JIT code. Reads operands from cfp->sp.
+    /// Returns true if enough profiles have been collected (triggering recompilation).
+    pub fn jit_profile_operands(&mut self, iseq: IseqPtr, cfp: CfpPtr, insn_idx: usize, n: usize) -> bool {
+        let entry = self.entry_mut(insn_idx);
+        if entry.opnd_types.is_empty() {
+            entry.opnd_types.resize(n, TypeDistribution::new());
+        }
+
+        let sp = unsafe { get_cfp_sp(cfp) };
+        for i in 0..n {
+            let obj = unsafe { *sp.offset(-(n as isize) + i as isize) };
+            let ty = ProfiledType::new(obj);
+            VALUE::from(iseq).write_barrier(ty.class());
+            entry.opnd_types[i].observe(ty);
+        }
+
+        entry.num_profiles = entry.num_profiles.saturating_add(1);
+        entry.num_profiles >= get_option!(num_profiles)
+    }
+
     pub fn get_super_method_entry(&self, insn_idx: usize) -> Option<*const rb_callable_method_entry_t> {
         let Some(entry) = self.super_cme.get(&insn_idx) else { return None };
         let summary = TypeDistributionSummary::new(entry);
