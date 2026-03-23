@@ -450,18 +450,16 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                 _ => {
                     // Start a new perf range for the HIR instruction. For now, we do this only for
                     // non-terminator instructions because LIR blocks must end with a terminator instruction.
-                    let perf_symbol = if get_option!(perf) == Some(PerfMap::HIR) && !insn.is_terminator() {
+                    if get_option!(perf) == Some(PerfMap::HIR) && !insn.is_terminator() {
                         let insn_name = format!("{insn}").split_whitespace().next().unwrap().to_string();
-                        Some(perf_symbol_range_start(&mut asm, &insn_name))
-                    } else {
-                        None
-                    };
+                        perf_symbol_range_start(&mut asm, &insn_name);
+                    }
 
                     let result = gen_insn(cb, &mut jit, &mut asm, function, insn_id, &insn);
 
                     // Close the current perf range for the HIR instruction.
-                    if let Some(perf_symbol) = &perf_symbol {
-                        perf_symbol_range_end(&mut asm, perf_symbol);
+                    if get_option!(perf) == Some(PerfMap::HIR) && !insn.is_terminator() {
+                        perf_symbol_range_end(&mut asm);
                     }
 
                     if let Err(last_snapshot) = result {
@@ -494,6 +492,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             let code_size = end_usize - start_usize;
             let iseq_name = iseq_get_location(iseq, 0);
             register_with_perf(iseq_name, start_usize, code_size);
+        } else if get_option!(perf) == Some(PerfMap::HIR) {
+            flush_perf_symbols(cb);
         }
         if ZJITState::should_log_compiled_iseqs() {
             let iseq_name = iseq_get_location(iseq, 0);
@@ -2580,12 +2580,14 @@ fn gen_incr_send_fallback_counter(asm: &mut Assembler, reason: SendFallbackReaso
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
 fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_start(asm, "save_pc"); }
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
     gen_incr_counter(asm, Counter::vm_write_pc_count);
     asm_comment!(asm, "save PC to CFP");
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(next_pc));
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_end(asm); }
 }
 
 /// Save the current PC on the CFP as a preparation for calling a C function
@@ -2623,6 +2625,7 @@ fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
 
 /// Save the current SP on the CFP
 fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_start(asm, "save_sp"); }
     // Update cfp->sp which will be read by the interpreter. We also have the SP register in JIT
     // code, and ZJIT's codegen currently assumes the SP register doesn't move, e.g. gen_param().
     // So we don't update the SP register here. We could update the SP register to avoid using
@@ -2632,20 +2635,24 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_end(asm); }
 }
 
 /// Spill locals onto the stack.
 fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_start(asm, "spill_locals"); }
     // TODO: Avoid spilling locals that have been spilled before and not changed.
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
     for (idx, &insn_id) in state.locals().enumerate() {
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(jit.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_end(asm); }
 }
 
 /// Spill the virtual stack onto the stack.
 fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_start(asm, "spill_stack"); }
     // This function does not call gen_save_sp() at the moment because
     // gen_send_without_block_direct() spills stack slots above SP for arguments.
     gen_incr_counter(asm, Counter::vm_write_stack_count);
@@ -2653,6 +2660,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
     for (idx, &insn_id) in state.stack().enumerate() {
         asm.mov(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_end(asm); }
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.
@@ -2685,6 +2693,7 @@ struct ControlFrame {
 
 /// Compile an interpreter frame
 fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: ControlFrame) {
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_start(asm, "push_frame"); }
     // Locals are written by the callee frame on side-exits or non-leaf calls
 
     // See vm_push_frame() for details
@@ -2729,6 +2738,7 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
     let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
     asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
     asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
+    if get_option!(perf) == Some(PerfMap::HIR) { perf_symbol_range_end(asm); }
 }
 
 /// Stack overflow check: fails if CFP<=SP at any point in the callee.
@@ -3264,31 +3274,54 @@ impl IseqCall {
     }
 }
 
-type PerfSymbol = Rc<RefCell<Option<(CodePtr, String)>>>;
+/// Perf symbol map shared via Rc so pos_marker closures can append to it
+type PerfSymbolMap = Rc<RefCell<Vec<(CodePtr, Option<CodePtr>, String)>>>;
 
-/// Mark the start of a perf symbol range via pos_marker.
-/// Returns a handle to pass to perf_symbol_range_end.
-pub fn perf_symbol_range_start(asm: &mut Assembler, symbol_name: &str) -> PerfSymbol {
-    let symbol_name = symbol_name.to_string();
-    let perf_symbol: PerfSymbol = Rc::new(RefCell::new(None));
-    let current = perf_symbol.clone();
-    asm.pos_marker(move |start, _| {
-        let mut current = current.borrow_mut();
-        assert!(current.is_none(), "perf symbol range already open");
-        *current = Some((start, symbol_name.clone()));
-    });
-    perf_symbol
+thread_local! {
+    /// Thread-local perf map used during compilation so that helper functions
+    /// can emit perf symbols without threading the map through every call site.
+    static PERF_MAP: PerfSymbolMap = Rc::default();
 }
 
-/// Mark the end of a perf symbol range via pos_marker.
-pub fn perf_symbol_range_end(asm: &mut Assembler, perf_symbol: &PerfSymbol) {
-    let current = perf_symbol.clone();
-    asm.pos_marker(move |end, cb| {
-        if let Some((start, name)) = current.borrow_mut().take() {
-            let start_addr = start.raw_addr(cb);
-            let code_size = end.raw_addr(cb) - start_addr;
-            register_with_perf(name, start_addr, code_size);
+/// Mark the start address of a symbol to be reported to perf.
+/// Supports stacking: multiple ranges can be open at the same time.
+fn perf_symbol_range_start(asm: &mut Assembler, symbol_name: &str) {
+    let symbol_name = format!("zjit::{}", symbol_name);
+    let syms = PERF_MAP.with(|m| m.clone());
+    asm.pos_marker(move |start, _| syms.borrow_mut().push((start, None, symbol_name.clone())));
+}
+
+/// Mark the end address of a symbol to be reported to perf.
+/// Closes the most recently opened range.
+fn perf_symbol_range_end(asm: &mut Assembler) {
+    let syms = PERF_MAP.with(|m| m.clone());
+    asm.pos_marker(move |end, _| {
+        if let Some((_, end_store, _)) = syms.borrow_mut().last_mut() {
+            assert_eq!(None, *end_store);
+            *end_store = Some(end);
         }
+    });
+}
+
+/// Flush perf symbols to /tmp/perf-{pid}.map and clear the map
+fn flush_perf_symbols(cb: &CodeBlock) {
+    use std::io::Write;
+    PERF_MAP.with(|perf_map| {
+        let path = format!("/tmp/perf-{}.map", std::process::id());
+        let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            debug!("Failed to open perf map file: {path}");
+            return;
+        };
+        let mut f = std::io::BufWriter::new(file);
+        for sym in perf_map.borrow().iter() {
+            if let (start, Some(end), name) = sym {
+                let start_addr = start.raw_addr(cb);
+                let end_addr = end.raw_addr(cb);
+                let code_size = end_addr - start_addr;
+                let _ = writeln!(f, "{start_addr:#x} {code_size:#x} {name}");
+            }
+        }
+        perf_map.borrow_mut().clear();
     });
 }
 
