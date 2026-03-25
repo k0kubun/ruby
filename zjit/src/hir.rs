@@ -9067,7 +9067,7 @@ mod graphviz_tests {
         mode=hier; overlap=false; splines=true;
           bb0 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb0()&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v25">Entries bb1, bb2&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v27">Entries bb1, bb2&nbsp;</TD></TR>
         </TABLE>>];
           bb1 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb1()&nbsp;</TD></TR>
@@ -9076,27 +9076,29 @@ mod graphviz_tests {
         <TR><TD ALIGN="left" PORT="v2">v2:CPtr = LoadSP&nbsp;</TD></TR>
         <TR><TD ALIGN="left" PORT="v3">v3:BasicObject = LoadField v2, :x@0x1000&nbsp;</TD></TR>
         <TR><TD ALIGN="left" PORT="v4">v4:BasicObject = LoadField v2, :y@0x1001&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v5">Jump bb3(v1, v3, v4)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v5">BumpSP&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v6">Jump bb3(v1, v3, v4)&nbsp;</TD></TR>
         </TABLE>>];
-          bb1:v5 -> bb3:params:n;
+          bb1:v6 -> bb3:params:n;
           bb2 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb2()&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v6">EntryPoint JIT(0)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v7">v7:BasicObject = LoadArg :self@0&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v8">v8:BasicObject = LoadArg :x@1&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v9">v9:BasicObject = LoadArg :y@2&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v10">Jump bb3(v7, v8, v9)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v7">EntryPoint JIT(0)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v8">BumpSP&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v9">v9:BasicObject = LoadArg :self@0&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v10">v10:BasicObject = LoadArg :x@1&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v11">v11:BasicObject = LoadArg :y@2&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v12">Jump bb3(v9, v10, v11)&nbsp;</TD></TR>
         </TABLE>>];
-          bb2:v10 -> bb3:params:n;
+          bb2:v12 -> bb3:params:n;
           bb3 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
-        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v16">PatchPoint NoTracePoint&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v27">PatchPoint MethodRedefined(Integer@0x1008, |@0x1010, cme:0x1018)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v28">v28:Fixnum = GuardType v12, Fixnum&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v29">v29:Fixnum = GuardType v13, Fixnum&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v30">v30:Fixnum = FixnumOr v28, v29&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v23">CheckInterrupts&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v24">Return v30&nbsp;</TD></TR>
+        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v18">PatchPoint NoTracePoint&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v29">PatchPoint MethodRedefined(Integer@0x1008, |@0x1010, cme:0x1018)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v30">v30:Fixnum = GuardType v14, Fixnum&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v31">v31:Fixnum = GuardType v15, Fixnum&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v32">v32:Fixnum = FixnumOr v30, v31&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v25">CheckInterrupts&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v26">Return v32&nbsp;</TD></TR>
         </TABLE>>];
         }
         "#);
@@ -9122,7 +9124,7 @@ mod graphviz_tests {
         mode=hier; overlap=false; splines=true;
           bb0 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb0()&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v37">Entries bb1, bb2&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v39">Entries bb1, bb2&nbsp;</TD></TR>
         </TABLE>>];
           bb1 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb1()&nbsp;</TD></TR>
@@ -9130,37 +9132,39 @@ mod graphviz_tests {
         <TR><TD ALIGN="left" PORT="v1">v1:BasicObject = LoadSelf&nbsp;</TD></TR>
         <TR><TD ALIGN="left" PORT="v2">v2:CPtr = LoadSP&nbsp;</TD></TR>
         <TR><TD ALIGN="left" PORT="v3">v3:BasicObject = LoadField v2, :c@0x1000&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v4">Jump bb3(v1, v3)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v4">BumpSP&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v5">Jump bb3(v1, v3)&nbsp;</TD></TR>
         </TABLE>>];
-          bb1:v4 -> bb3:params:n;
+          bb1:v5 -> bb3:params:n;
           bb2 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
         <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb2()&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v5">EntryPoint JIT(0)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v6">v6:BasicObject = LoadArg :self@0&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v7">v7:BasicObject = LoadArg :c@1&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v8">Jump bb3(v6, v7)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v6">EntryPoint JIT(0)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v7">BumpSP&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v8">v8:BasicObject = LoadArg :self@0&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v9">v9:BasicObject = LoadArg :c@1&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v10">Jump bb3(v8, v9)&nbsp;</TD></TR>
         </TABLE>>];
-          bb2:v8 -> bb3:params:n;
+          bb2:v10 -> bb3:params:n;
           bb3 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
-        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb3(v9:BasicObject, v10:BasicObject)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v13">PatchPoint NoTracePoint&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v15">CheckInterrupts&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v16">v16:CBool = Test v10&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v17">v17:Falsy = RefineType v10, Falsy&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v18">IfFalse v16, bb4(v9, v17)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v19">v19:Truthy = RefineType v10, Truthy&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v21">PatchPoint NoTracePoint&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v22">v22:Fixnum[3] = Const Value(3)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v25">CheckInterrupts&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v26">Return v22&nbsp;</TD></TR>
+        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb3(v11:BasicObject, v12:BasicObject)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v15">PatchPoint NoTracePoint&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v17">CheckInterrupts&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v18">v18:CBool = Test v12&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v19">v19:Falsy = RefineType v12, Falsy&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v20">IfFalse v18, bb4(v11, v19)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v21">v21:Truthy = RefineType v12, Truthy&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v23">PatchPoint NoTracePoint&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v24">v24:Fixnum[3] = Const Value(3)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v27">CheckInterrupts&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v28">Return v24&nbsp;</TD></TR>
         </TABLE>>];
-          bb3:v18 -> bb4:params:n;
+          bb3:v20 -> bb4:params:n;
           bb4 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
-        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb4(v27:BasicObject, v28:Falsy)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v31">PatchPoint NoTracePoint&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v32">v32:Fixnum[4] = Const Value(4)&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v35">CheckInterrupts&nbsp;</TD></TR>
-        <TR><TD ALIGN="left" PORT="v36">Return v32&nbsp;</TD></TR>
+        <TR><TD ALIGN="LEFT" PORT="params" BGCOLOR="gray">bb4(v29:BasicObject, v30:Falsy)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v33">PatchPoint NoTracePoint&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v34">v34:Fixnum[4] = Const Value(4)&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v37">CheckInterrupts&nbsp;</TD></TR>
+        <TR><TD ALIGN="left" PORT="v38">Return v34&nbsp;</TD></TR>
         </TABLE>>];
         }
         "#);

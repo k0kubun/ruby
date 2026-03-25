@@ -38,22 +38,24 @@ mod snapshot_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v8:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v10:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
           PatchPoint NoTracePoint
-          v10:Fixnum[1] = Const Value(1)
-          v12:Fixnum[2] = Const Value(2)
-          v13:Any = Snapshot FrameState { pc: 0x1008, stack: [v10, v12], locals: [] }
+          v12:Fixnum[1] = Const Value(1)
+          v14:Fixnum[2] = Const Value(2)
+          v15:Any = Snapshot FrameState { pc: 0x1008, stack: [v12, v14], locals: [] }
           PatchPoint MethodRedefined(Integer@0x1010, +@0x1018, cme:0x1020)
-          v33:Fixnum[6] = Const Value(6)
-          v21:Any = Snapshot FrameState { pc: 0x1048, stack: [v33], locals: [] }
+          v35:Fixnum[6] = Const Value(6)
+          v23:Any = Snapshot FrameState { pc: 0x1048, stack: [v35], locals: [] }
           CheckInterrupts
-          Return v33
+          Return v35
         ");
     }
 
@@ -70,24 +72,26 @@ mod snapshot_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v14:Any = Snapshot FrameState { pc: 0x1008, stack: [], locals: [a=v12, b=v13] }
-          v15:Any = Snapshot FrameState { pc: 0x1010, stack: [], locals: [a=v12, b=v13] }
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v16:Any = Snapshot FrameState { pc: 0x1008, stack: [], locals: [a=v14, b=v15] }
+          v17:Any = Snapshot FrameState { pc: 0x1010, stack: [], locals: [a=v14, b=v15] }
           PatchPoint NoTracePoint
-          v17:Any = Snapshot FrameState { pc: 0x1018, stack: [v12], locals: [a=v12, b=v13] }
-          v18:Any = Snapshot FrameState { pc: 0x1020, stack: [v12, v13], locals: [a=v12, b=v13] }
-          v19:ArrayExact = NewArray v12, v13
-          v20:Any = Snapshot FrameState { pc: 0x1028, stack: [v19], locals: [a=v12, b=v13] }
+          v19:Any = Snapshot FrameState { pc: 0x1018, stack: [v14], locals: [a=v14, b=v15] }
+          v20:Any = Snapshot FrameState { pc: 0x1020, stack: [v14, v15], locals: [a=v14, b=v15] }
+          v21:ArrayExact = NewArray v14, v15
+          v22:Any = Snapshot FrameState { pc: 0x1028, stack: [v21], locals: [a=v14, b=v15] }
           PatchPoint NoTracePoint
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -106,26 +110,28 @@ mod snapshot_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v8:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v10:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
           PatchPoint NoTracePoint
-          v11:Fixnum[3] = Const Value(3)
-          v13:Fixnum[1] = Const Value(1)
-          v15:Fixnum[2] = Const Value(2)
-          v16:Any = Snapshot FrameState { pc: 0x1008, stack: [v6, v11, v13, v15], locals: [] }
-          v23:Any = Snapshot FrameState { pc: 0x1008, stack: [v6, v13, v15, v11], locals: [] }
+          v13:Fixnum[3] = Const Value(3)
+          v15:Fixnum[1] = Const Value(1)
+          v17:Fixnum[2] = Const Value(2)
+          v18:Any = Snapshot FrameState { pc: 0x1008, stack: [v8, v13, v15, v17], locals: [] }
+          v25:Any = Snapshot FrameState { pc: 0x1008, stack: [v8, v15, v17, v13], locals: [] }
           PatchPoint MethodRedefined(Object@0x1010, foo@0x1018, cme:0x1020)
-          v25:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1010)]
-          v26:BasicObject = SendDirect v25, 0x1048, :foo (0x1058), v13, v15, v11
-          v18:Any = Snapshot FrameState { pc: 0x1060, stack: [v26], locals: [] }
+          v27:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1010)]
+          v28:BasicObject = SendDirect v27, 0x1048, :foo (0x1058), v15, v17, v13
+          v20:Any = Snapshot FrameState { pc: 0x1060, stack: [v28], locals: [] }
           PatchPoint NoTracePoint
           CheckInterrupts
-          Return v26
+          Return v28
         ");
     }
 
@@ -144,24 +150,26 @@ mod snapshot_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v8:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v10:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
           PatchPoint NoTracePoint
-          v11:Fixnum[1] = Const Value(1)
-          v13:Fixnum[2] = Const Value(2)
-          v14:Any = Snapshot FrameState { pc: 0x1008, stack: [v6, v11, v13], locals: [] }
+          v13:Fixnum[1] = Const Value(1)
+          v15:Fixnum[2] = Const Value(2)
+          v16:Any = Snapshot FrameState { pc: 0x1008, stack: [v8, v13, v15], locals: [] }
           PatchPoint MethodRedefined(Object@0x1010, foo@0x1018, cme:0x1020)
-          v22:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1010)]
-          v23:BasicObject = SendDirect v22, 0x1048, :foo (0x1058), v11, v13
-          v16:Any = Snapshot FrameState { pc: 0x1060, stack: [v23], locals: [] }
+          v24:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1010)]
+          v25:BasicObject = SendDirect v24, 0x1048, :foo (0x1058), v13, v15
+          v18:Any = Snapshot FrameState { pc: 0x1060, stack: [v25], locals: [] }
           PatchPoint NoTracePoint
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -180,28 +188,30 @@ mod snapshot_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v8:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v10:Any = Snapshot FrameState { pc: 0x1000, stack: [], locals: [] }
           PatchPoint NoTracePoint
-          v11:Fixnum[5] = Const Value(5)
-          v13:Fixnum[6] = Const Value(6)
-          v15:Fixnum[4] = Const Value(4)
-          v17:Fixnum[3] = Const Value(3)
-          v19:Fixnum[1] = Const Value(1)
-          v21:Fixnum[2] = Const Value(2)
-          v23:Fixnum[7] = Const Value(7)
-          v25:Fixnum[8] = Const Value(8)
-          v26:Any = Snapshot FrameState { pc: 0x1008, stack: [v6, v11, v13, v15, v17, v19, v21, v23, v25], locals: [] }
-          v27:BasicObject = Send v6, :foo, v11, v13, v15, v17, v19, v21, v23, v25 # SendFallbackReason: Too many arguments for LIR
-          v28:Any = Snapshot FrameState { pc: 0x1010, stack: [v27], locals: [] }
+          v13:Fixnum[5] = Const Value(5)
+          v15:Fixnum[6] = Const Value(6)
+          v17:Fixnum[4] = Const Value(4)
+          v19:Fixnum[3] = Const Value(3)
+          v21:Fixnum[1] = Const Value(1)
+          v23:Fixnum[2] = Const Value(2)
+          v25:Fixnum[7] = Const Value(7)
+          v27:Fixnum[8] = Const Value(8)
+          v28:Any = Snapshot FrameState { pc: 0x1008, stack: [v8, v13, v15, v17, v19, v21, v23, v25, v27], locals: [] }
+          v29:BasicObject = Send v8, :foo, v13, v15, v17, v19, v21, v23, v25, v27 # SendFallbackReason: Too many arguments for LIR
+          v30:Any = Snapshot FrameState { pc: 0x1010, stack: [v29], locals: [] }
           PatchPoint NoTracePoint
           CheckInterrupts
-          Return v27
+          Return v29
         ");
     }
 }
@@ -293,28 +303,31 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
-          v4:CPtr = LoadPC
-          v5:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
-          v6:CBool = IsBitEqual v4, v5
-          IfTrue v6, bb3(v1, v3)
+          BumpSP
+          v5:CPtr = LoadPC
+          v6:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
+          v7:CBool = IsBitEqual v5, v6
+          IfTrue v7, bb3(v1, v3)
           Jump bb5(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:NilClass = Const Value(nil)
-          Jump bb3(v10, v11)
-        bb3(v17:BasicObject, v18:BasicObject):
-          v21:Fixnum[1] = Const Value(1)
-          Jump bb5(v17, v21)
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:NilClass = Const Value(nil)
+          Jump bb3(v12, v13)
+        bb3(v20:BasicObject, v21:BasicObject):
+          v24:Fixnum[1] = Const Value(1)
+          Jump bb5(v20, v24)
         bb4():
           EntryPoint JIT(1)
-          v14:BasicObject = LoadArg :self@0
-          v15:BasicObject = LoadArg :x@1
-          Jump bb5(v14, v15)
-        bb5(v24:BasicObject, v25:BasicObject):
-          v29:Fixnum[123] = Const Value(123)
+          BumpSP
+          v17:BasicObject = LoadArg :self@0
+          v18:BasicObject = LoadArg :x@1
+          Jump bb5(v17, v18)
+        bb5(v27:BasicObject, v28:BasicObject):
+          v32:Fixnum[123] = Const Value(123)
           CheckInterrupts
-          Return v29
+          Return v32
         ");
     }
 
@@ -327,15 +340,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[123] = Const Value(123)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[123] = Const Value(123)
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -360,28 +375,30 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :o@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :o@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v14:NilClass = Const Value(nil)
-          v18:BasicObject = GetConstantPath 0x1008
-          v20:BasicObject = CheckMatch v10, v18, CASE
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v16:NilClass = Const Value(nil)
+          v20:BasicObject = GetConstantPath 0x1008
+          v22:BasicObject = CheckMatch v12, v20, CASE
           CheckInterrupts
-          v23:CBool = Test v20
-          v24:Truthy = RefineType v20, Truthy
-          IfTrue v23, bb4(v9, v10, v14, v10)
-          v26:Falsy = RefineType v20, Falsy
-          v31:Fixnum[2] = Const Value(2)
+          v25:CBool = Test v22
+          v26:Truthy = RefineType v22, Truthy
+          IfTrue v25, bb4(v11, v12, v16, v12)
+          v28:Falsy = RefineType v22, Falsy
+          v33:Fixnum[2] = Const Value(2)
           CheckInterrupts
-          Return v31
-        bb4(v36:BasicObject, v37:BasicObject, v38:NilClass, v39:BasicObject):
-          v44:Fixnum[1] = Const Value(1)
+          Return v33
+        bb4(v38:BasicObject, v39:BasicObject, v40:NilClass, v41:BasicObject):
+          v46:Fixnum[1] = Const Value(1)
           CheckInterrupts
-          Return v44
+          Return v46
         ");
     }
 
@@ -406,28 +423,30 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :o@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :o@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v17:ArrayExact = ArrayDup v16
-          v19:BasicObject = CheckMatch v10, v17, CASE|ARRAY
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v19:ArrayExact = ArrayDup v18
+          v21:BasicObject = CheckMatch v12, v19, CASE|ARRAY
           CheckInterrupts
-          v22:CBool = Test v19
-          v23:Truthy = RefineType v19, Truthy
-          IfTrue v22, bb4(v9, v10, v10)
-          v25:Falsy = RefineType v19, Falsy
-          v29:Fixnum[2] = Const Value(2)
+          v24:CBool = Test v21
+          v25:Truthy = RefineType v21, Truthy
+          IfTrue v24, bb4(v11, v12, v12)
+          v27:Falsy = RefineType v21, Falsy
+          v31:Fixnum[2] = Const Value(2)
           CheckInterrupts
-          Return v29
-        bb4(v34:BasicObject, v35:BasicObject, v36:BasicObject):
-          v41:Fixnum[1] = Const Value(1)
+          Return v31
+        bb4(v36:BasicObject, v37:BasicObject, v38:BasicObject):
+          v43:Fixnum[1] = Const Value(1)
           CheckInterrupts
-          Return v41
+          Return v43
         ");
     }
 
@@ -450,28 +469,30 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:NilClass = Const Value(nil)
-          v12:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v13:ArrayExact = ArrayDup v12
-          v15:BasicObject = CheckMatch v10, v13, WHEN|ARRAY
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:NilClass = Const Value(nil)
+          v14:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v15:ArrayExact = ArrayDup v14
+          v17:BasicObject = CheckMatch v12, v15, WHEN|ARRAY
           CheckInterrupts
-          v18:CBool = Test v15
-          v19:Truthy = RefineType v15, Truthy
-          IfTrue v18, bb4(v6)
-          v21:Falsy = RefineType v15, Falsy
-          v24:Fixnum[2] = Const Value(2)
+          v20:CBool = Test v17
+          v21:Truthy = RefineType v17, Truthy
+          IfTrue v20, bb4(v8)
+          v23:Falsy = RefineType v17, Falsy
+          v26:Fixnum[2] = Const Value(2)
           CheckInterrupts
-          Return v24
-        bb4(v29:BasicObject):
-          v33:Fixnum[1] = Const Value(1)
+          Return v26
+        bb4(v31:BasicObject):
+          v35:Fixnum[1] = Const Value(1)
           CheckInterrupts
-          Return v33
+          Return v35
         ");
     }
 
@@ -484,15 +505,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:ArrayExact = NewArray
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:ArrayExact = NewArray
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -507,16 +530,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:ArrayExact = NewArray v10
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:ArrayExact = NewArray v12
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -532,17 +557,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:ArrayExact = NewArray v12, v13
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:ArrayExact = NewArray v14, v15
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -557,17 +584,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:Fixnum[10] = Const Value(10)
-          v17:RangeExact = NewRange v10 NewRangeInclusive v15
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:Fixnum[10] = Const Value(10)
+          v19:RangeExact = NewRange v12 NewRangeInclusive v17
           CheckInterrupts
-          Return v17
+          Return v19
         ");
     }
 
@@ -583,17 +612,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:RangeExact = NewRange v12 NewRangeInclusive v13
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:RangeExact = NewRange v14 NewRangeInclusive v15
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -608,17 +639,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:Fixnum[10] = Const Value(10)
-          v17:RangeExact = NewRange v10 NewRangeExclusive v15
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:Fixnum[10] = Const Value(10)
+          v19:RangeExact = NewRange v12 NewRangeExclusive v17
           CheckInterrupts
-          Return v17
+          Return v19
         ");
     }
 
@@ -634,17 +667,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:RangeExact = NewRange v12 NewRangeExclusive v13
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:RangeExact = NewRange v14 NewRangeExclusive v15
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -657,16 +692,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v11:ArrayExact = ArrayDup v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:ArrayExact = ArrayDup v12
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -679,16 +716,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:HashExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v11:HashExact = HashDup v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:HashExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:HashExact = HashDup v12
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -701,15 +740,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:HashExact = NewHash
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:HashExact = NewHash
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -725,19 +766,21 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :aval@0x1000
           v4:BasicObject = LoadField v2, :bval@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :aval@1
-          v9:BasicObject = LoadArg :bval@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v17:StaticSymbol[:a] = Const Value(VALUE(0x1008))
-          v20:StaticSymbol[:b] = Const Value(VALUE(0x1010))
-          v23:HashExact = NewHash v17: v12, v20: v13
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :aval@1
+          v11:BasicObject = LoadArg :bval@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v19:StaticSymbol[:a] = Const Value(VALUE(0x1008))
+          v22:StaticSymbol[:b] = Const Value(VALUE(0x1010))
+          v25:HashExact = NewHash v19: v14, v22: v15
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -750,16 +793,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v11:StringExact = StringCopy v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:StringExact = StringCopy v12
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -772,15 +817,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Bignum[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Bignum[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -793,15 +840,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Flonum[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Flonum[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -814,15 +863,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:HeapFloat[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:HeapFloat[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -835,15 +886,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StaticSymbol[:foo] = Const Value(VALUE(0x1000))
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StaticSymbol[:foo] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -856,17 +909,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
-          v12:Fixnum[2] = Const Value(2)
-          v15:BasicObject = Send v10, :+, v12 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
+          v14:Fixnum[2] = Const Value(2)
+          v17:BasicObject = Send v12, :+, v14 # SendFallbackReason: Uncategorized(opt_plus)
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -881,16 +936,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint BOPRedefined(HASH_REDEFINED_OP_FLAG, BOP_FREEZE)
-          v11:HashExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:HashExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -908,12 +965,14 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           SideExit PatchPoint(BOPRedefined(HASH_REDEFINED_OP_FLAG, BOP_FREEZE))
         ");
     }
@@ -929,16 +988,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE)
-          v11:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -956,12 +1017,14 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE))
         ");
     }
@@ -977,16 +1040,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint BOPRedefined(STRING_REDEFINED_OP_FLAG, BOP_FREEZE)
-          v11:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -1004,12 +1069,14 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           SideExit PatchPoint(BOPRedefined(STRING_REDEFINED_OP_FLAG, BOP_FREEZE))
         ");
     }
@@ -1025,16 +1092,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint BOPRedefined(STRING_REDEFINED_OP_FLAG, BOP_UMINUS)
-          v11:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v13:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -1052,12 +1121,14 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           SideExit PatchPoint(BOPRedefined(STRING_REDEFINED_OP_FLAG, BOP_UMINUS))
         ");
     }
@@ -1077,16 +1148,18 @@ pub mod hir_build_tests {
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
           v2:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2)
         bb2():
           EntryPoint JIT(0)
-          v5:BasicObject = LoadArg :self@0
-          v6:NilClass = Const Value(nil)
-          Jump bb3(v5, v6)
-        bb3(v8:BasicObject, v9:NilClass):
-          v13:Fixnum[1] = Const Value(1)
+          BumpSP
+          v7:BasicObject = LoadArg :self@0
+          v8:NilClass = Const Value(nil)
+          Jump bb3(v7, v8)
+        bb3(v10:BasicObject, v11:NilClass):
+          v15:Fixnum[1] = Const Value(1)
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -1117,29 +1190,31 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:CPtr = GetEP 2
-          v11:BasicObject = LoadField v10, :l2@0x1000
-          SetLocal :l1, l1, EP@3, v11
-          v16:CPtr = GetEP 1
-          v17:BasicObject = LoadField v16, :l1@0x1001
-          v19:CPtr = GetEP 2
-          v20:BasicObject = LoadField v19, :l2@0x1000
-          v23:BasicObject = Send v17, :+, v20 # SendFallbackReason: Uncategorized(opt_plus)
-          SetLocal :l2, l2, EP@4, v23
-          v28:CPtr = GetEP 2
-          v29:BasicObject = LoadField v28, :l2@0x1000
-          v31:CPtr = GetEP 3
-          v32:BasicObject = LoadField v31, :l3@0x1002
-          v35:BasicObject = Send v29, :+, v32 # SendFallbackReason: Uncategorized(opt_plus)
-          SetLocal :l3, l3, EP@5, v35
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:CPtr = GetEP 2
+          v13:BasicObject = LoadField v12, :l2@0x1000
+          SetLocal :l1, l1, EP@3, v13
+          v18:CPtr = GetEP 1
+          v19:BasicObject = LoadField v18, :l1@0x1001
+          v21:CPtr = GetEP 2
+          v22:BasicObject = LoadField v21, :l2@0x1000
+          v25:BasicObject = Send v19, :+, v22 # SendFallbackReason: Uncategorized(opt_plus)
+          SetLocal :l2, l2, EP@4, v25
+          v30:CPtr = GetEP 2
+          v31:BasicObject = LoadField v30, :l2@0x1000
+          v33:CPtr = GetEP 3
+          v34:BasicObject = LoadField v33, :l3@0x1002
+          v37:BasicObject = Send v31, :+, v34 # SendFallbackReason: Uncategorized(opt_plus)
+          SetLocal :l3, l3, EP@5, v37
           CheckInterrupts
-          Return v35
+          Return v37
         "
         );
     }
@@ -1158,30 +1233,33 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:NilClass = Const Value(nil)
-          v5:CPtr = LoadPC
-          v6:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
-          v7:CBool = IsBitEqual v5, v6
-          IfTrue v7, bb3(v1, v3, v4)
+          BumpSP
+          v6:CPtr = LoadPC
+          v7:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
+          v8:CBool = IsBitEqual v6, v7
+          IfTrue v8, bb3(v1, v3, v4)
           Jump bb5(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v11:BasicObject = LoadArg :self@0
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v11, v12, v13)
-        bb3(v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v26:Fixnum[1] = Const Value(1)
-          Jump bb5(v20, v26, v26)
+          BumpSP
+          v13:BasicObject = LoadArg :self@0
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v13, v14, v15)
+        bb3(v23:BasicObject, v24:BasicObject, v25:NilClass):
+          v29:Fixnum[1] = Const Value(1)
+          Jump bb5(v23, v29, v29)
         bb4():
           EntryPoint JIT(1)
-          v16:BasicObject = LoadArg :self@0
-          v17:BasicObject = LoadArg :a@1
-          v18:NilClass = Const Value(nil)
-          Jump bb5(v16, v17, v18)
-        bb5(v31:BasicObject, v32:BasicObject, v33:NilClass|Fixnum):
-          v39:ArrayExact = NewArray v32, v33
+          BumpSP
+          v19:BasicObject = LoadArg :self@0
+          v20:BasicObject = LoadArg :a@1
+          v21:NilClass = Const Value(nil)
+          Jump bb5(v19, v20, v21)
+        bb5(v34:BasicObject, v35:BasicObject, v36:NilClass|Fixnum):
+          v42:ArrayExact = NewArray v35, v36
           CheckInterrupts
-          Return v39
+          Return v42
         ");
     }
 
@@ -1200,29 +1278,32 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:NilClass = Const Value(nil)
-          v5:CPtr = LoadPC
-          v6:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
-          v7:CBool = IsBitEqual v5, v6
-          IfTrue v7, bb3(v1, v3, v4)
+          BumpSP
+          v6:CPtr = LoadPC
+          v7:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
+          v8:CBool = IsBitEqual v6, v7
+          IfTrue v8, bb3(v1, v3, v4)
           Jump bb5(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v11:BasicObject = LoadArg :self@0
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v11, v12, v13)
-        bb3(v20:BasicObject, v21:BasicObject, v22:NilClass):
+          BumpSP
+          v13:BasicObject = LoadArg :self@0
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v13, v14, v15)
+        bb3(v23:BasicObject, v24:BasicObject, v25:NilClass):
           SideExit UnhandledYARVInsn(trace_putobject_INT2FIX_1_)
         bb4():
           EntryPoint JIT(1)
-          v16:BasicObject = LoadArg :self@0
-          v17:BasicObject = LoadArg :a@1
-          v18:NilClass = Const Value(nil)
-          Jump bb5(v16, v17, v18)
-        bb5(v27:BasicObject, v28:BasicObject, v29:NilClass):
-          v35:ArrayExact = NewArray v28, v29
+          BumpSP
+          v19:BasicObject = LoadArg :self@0
+          v20:BasicObject = LoadArg :a@1
+          v21:NilClass = Const Value(nil)
+          Jump bb5(v19, v20, v21)
+        bb5(v30:BasicObject, v31:BasicObject, v32:NilClass):
+          v38:ArrayExact = NewArray v31, v32
           CheckInterrupts
-          Return v35
+          Return v38
         ");
     }
 
@@ -1238,26 +1319,29 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
-          v4:CPtr = LoadPC
-          v5:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
-          v6:CBool = IsBitEqual v4, v5
-          IfTrue v6, bb3(v1, v3)
+          BumpSP
+          v5:CPtr = LoadPC
+          v6:CPtr[CPtr(0x1008)] = Const CPtr(0x1010)
+          v7:CBool = IsBitEqual v5, v6
+          IfTrue v7, bb3(v1, v3)
           Jump bb5(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:NilClass = Const Value(nil)
-          Jump bb3(v10, v11)
-        bb3(v17:BasicObject, v18:BasicObject):
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:NilClass = Const Value(nil)
+          Jump bb3(v12, v13)
+        bb3(v20:BasicObject, v21:BasicObject):
           SideExit UnhandledYARVInsn(definemethod)
         bb4():
           EntryPoint JIT(1)
-          v14:BasicObject = LoadArg :self@0
-          v15:BasicObject = LoadArg :a@1
-          Jump bb5(v14, v15)
-        bb5(v23:BasicObject, v24:BasicObject):
+          BumpSP
+          v17:BasicObject = LoadArg :self@0
+          v18:BasicObject = LoadArg :a@1
+          Jump bb5(v17, v18)
+        bb5(v26:BasicObject, v27:BasicObject):
           CheckInterrupts
-          Return v24
+          Return v27
         ");
     }
 
@@ -1273,20 +1357,23 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:NilClass = Const Value(nil)
-          Jump bb3(v6, v7)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:NilClass = Const Value(nil)
+          Jump bb3(v8, v9)
         bb4():
           EntryPoint JIT(1)
-          v10:BasicObject = LoadArg :self@0
-          v11:BasicObject = LoadArg :a@1
-          Jump bb3(v10, v11)
-        bb3(v13:BasicObject, v14:BasicObject):
+          BumpSP
+          v13:BasicObject = LoadArg :self@0
+          v14:BasicObject = LoadArg :a@1
+          Jump bb3(v13, v14)
+        bb3(v16:BasicObject, v17:BasicObject):
           CheckInterrupts
-          Return v14
+          Return v17
         ");
     }
 
@@ -1301,15 +1388,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact|NilClass = DefinedIvar v6, :@foo
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact|NilClass = DefinedIvar v8, :@foo
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -1330,25 +1419,27 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:TrueClass|NilClass = DefinedIvar v6, :@foo
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:TrueClass|NilClass = DefinedIvar v8, :@foo
           CheckInterrupts
-          v13:CBool = Test v10
-          v14:NilClass = RefineType v10, Falsy
-          IfFalse v13, bb4(v6)
-          v16:TrueClass = RefineType v10, Truthy
-          v19:Fixnum[3] = Const Value(3)
+          v15:CBool = Test v12
+          v16:NilClass = RefineType v12, Falsy
+          IfFalse v15, bb4(v8)
+          v18:TrueClass = RefineType v12, Truthy
+          v21:Fixnum[3] = Const Value(3)
           CheckInterrupts
-          Return v19
-        bb4(v24:BasicObject):
-          v28:Fixnum[4] = Const Value(4)
+          Return v21
+        bb4(v26:BasicObject):
+          v30:Fixnum[4] = Const Value(4)
           CheckInterrupts
-          Return v28
+          Return v30
         ");
     }
 
@@ -1363,20 +1454,22 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:NilClass = Const Value(nil)
-          v12:StringExact|NilClass = Defined constant, v10
-          v15:StringExact|NilClass = Defined func, v6
-          v17:NilClass = Const Value(nil)
-          v19:StringExact|NilClass = Defined global-variable, v17
-          v21:ArrayExact = NewArray v12, v15, v19
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:NilClass = Const Value(nil)
+          v14:StringExact|NilClass = Defined constant, v12
+          v17:StringExact|NilClass = Defined func, v8
+          v19:NilClass = Const Value(nil)
+          v21:StringExact|NilClass = Defined global-variable, v19
+          v23:ArrayExact = NewArray v14, v17, v21
           CheckInterrupts
-          Return v21
+          Return v23
         ");
     }
 
@@ -1391,16 +1484,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:NilClass = Const Value(nil)
-          v12:StringExact|NilClass = Defined yield, v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:NilClass = Const Value(nil)
+          v14:StringExact|NilClass = Defined yield, v12
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
@@ -1415,16 +1510,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:NilClass = Const Value(nil)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           v12:NilClass = Const Value(nil)
+          v14:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
@@ -1447,25 +1544,27 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :cond@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :cond@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :cond@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           CheckInterrupts
-          v16:CBool = Test v10
-          v17:Falsy = RefineType v10, Falsy
-          IfFalse v16, bb4(v9, v17)
-          v19:Truthy = RefineType v10, Truthy
-          v22:Fixnum[3] = Const Value(3)
+          v18:CBool = Test v12
+          v19:Falsy = RefineType v12, Falsy
+          IfFalse v18, bb4(v11, v19)
+          v21:Truthy = RefineType v12, Truthy
+          v24:Fixnum[3] = Const Value(3)
           CheckInterrupts
-          Return v22
-        bb4(v27:BasicObject, v28:Falsy):
-          v32:Fixnum[4] = Const Value(4)
+          Return v24
+        bb4(v29:BasicObject, v30:Falsy):
+          v34:Fixnum[4] = Const Value(4)
           CheckInterrupts
-          Return v32
+          Return v34
         ");
     }
 
@@ -1489,28 +1588,30 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :cond@0x1000
           v4:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :cond@1
-          v9:NilClass = Const Value(nil)
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:NilClass):
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :cond@1
+          v11:NilClass = Const Value(nil)
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass):
           CheckInterrupts
-          v19:CBool = Test v12
-          v20:Falsy = RefineType v12, Falsy
-          IfFalse v19, bb4(v11, v20, v13)
-          v22:Truthy = RefineType v12, Truthy
-          v25:Fixnum[3] = Const Value(3)
+          v21:CBool = Test v14
+          v22:Falsy = RefineType v14, Falsy
+          IfFalse v21, bb4(v13, v22, v15)
+          v24:Truthy = RefineType v14, Truthy
+          v27:Fixnum[3] = Const Value(3)
           CheckInterrupts
-          Jump bb5(v11, v22, v25)
-        bb4(v30:BasicObject, v31:Falsy, v32:NilClass):
-          v36:Fixnum[4] = Const Value(4)
-          Jump bb5(v30, v31, v36)
-        bb5(v39:BasicObject, v40:BasicObject, v41:Fixnum):
+          Jump bb5(v13, v24, v27)
+        bb4(v32:BasicObject, v33:Falsy, v34:NilClass):
+          v38:Fixnum[4] = Const Value(4)
+          Jump bb5(v32, v33, v38)
+        bb5(v41:BasicObject, v42:BasicObject, v43:Fixnum):
           CheckInterrupts
-          Return v41
+          Return v43
         ");
     }
 
@@ -1529,17 +1630,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :+, v13 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :+, v15 # SendFallbackReason: Uncategorized(opt_plus)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1558,17 +1661,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :-, v13 # SendFallbackReason: Uncategorized(opt_minus)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :-, v15 # SendFallbackReason: Uncategorized(opt_minus)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1587,17 +1692,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :*, v13 # SendFallbackReason: Uncategorized(opt_mult)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :*, v15 # SendFallbackReason: Uncategorized(opt_mult)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1616,17 +1723,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :/, v13 # SendFallbackReason: Uncategorized(opt_div)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :/, v15 # SendFallbackReason: Uncategorized(opt_div)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1645,17 +1754,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :%, v13 # SendFallbackReason: Uncategorized(opt_mod)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :%, v15 # SendFallbackReason: Uncategorized(opt_mod)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1674,17 +1785,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :==, v13 # SendFallbackReason: Uncategorized(opt_eq)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :==, v15 # SendFallbackReason: Uncategorized(opt_eq)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1703,17 +1816,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :!=, v13 # SendFallbackReason: Uncategorized(opt_neq)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :!=, v15 # SendFallbackReason: Uncategorized(opt_neq)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1732,17 +1847,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :<, v13 # SendFallbackReason: Uncategorized(opt_lt)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :<, v15 # SendFallbackReason: Uncategorized(opt_lt)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1761,17 +1878,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :<=, v13 # SendFallbackReason: Uncategorized(opt_le)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :<=, v15 # SendFallbackReason: Uncategorized(opt_le)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1790,17 +1909,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :>, v13 # SendFallbackReason: Uncategorized(opt_gt)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :>, v15 # SendFallbackReason: Uncategorized(opt_gt)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1825,35 +1946,37 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:NilClass = Const Value(nil)
           v3:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:NilClass = Const Value(nil)
-          v8:NilClass = Const Value(nil)
-          Jump bb3(v6, v7, v8)
-        bb3(v10:BasicObject, v11:NilClass, v12:NilClass):
-          v16:Fixnum[0] = Const Value(0)
-          v20:Fixnum[10] = Const Value(10)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:NilClass = Const Value(nil)
+          v10:NilClass = Const Value(nil)
+          Jump bb3(v8, v9, v10)
+        bb3(v12:BasicObject, v13:NilClass, v14:NilClass):
+          v18:Fixnum[0] = Const Value(0)
+          v22:Fixnum[10] = Const Value(10)
           CheckInterrupts
-          Jump bb5(v10, v16, v20)
-        bb5(v26:BasicObject, v27:BasicObject, v28:BasicObject):
-          v32:Fixnum[0] = Const Value(0)
-          v35:BasicObject = Send v28, :>, v32 # SendFallbackReason: Uncategorized(opt_gt)
+          Jump bb5(v12, v18, v22)
+        bb5(v28:BasicObject, v29:BasicObject, v30:BasicObject):
+          v34:Fixnum[0] = Const Value(0)
+          v37:BasicObject = Send v30, :>, v34 # SendFallbackReason: Uncategorized(opt_gt)
           CheckInterrupts
-          v38:CBool = Test v35
-          v39:Truthy = RefineType v35, Truthy
-          IfTrue v38, bb4(v26, v27, v28)
-          v41:Falsy = RefineType v35, Falsy
-          v43:NilClass = Const Value(nil)
+          v40:CBool = Test v37
+          v41:Truthy = RefineType v37, Truthy
+          IfTrue v40, bb4(v28, v29, v30)
+          v43:Falsy = RefineType v37, Falsy
+          v45:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v27
-        bb4(v51:BasicObject, v52:BasicObject, v53:BasicObject):
-          v58:Fixnum[1] = Const Value(1)
-          v61:BasicObject = Send v52, :+, v58 # SendFallbackReason: Uncategorized(opt_plus)
-          v66:Fixnum[1] = Const Value(1)
-          v69:BasicObject = Send v53, :-, v66 # SendFallbackReason: Uncategorized(opt_minus)
-          Jump bb5(v51, v61, v69)
+          Return v29
+        bb4(v53:BasicObject, v54:BasicObject, v55:BasicObject):
+          v60:Fixnum[1] = Const Value(1)
+          v63:BasicObject = Send v54, :+, v60 # SendFallbackReason: Uncategorized(opt_plus)
+          v68:Fixnum[1] = Const Value(1)
+          v71:BasicObject = Send v55, :-, v68 # SendFallbackReason: Uncategorized(opt_minus)
+          Jump bb5(v53, v63, v71)
         ");
     }
 
@@ -1872,17 +1995,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :>=, v13 # SendFallbackReason: Uncategorized(opt_ge)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :>=, v15 # SendFallbackReason: Uncategorized(opt_ge)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -1904,26 +2029,28 @@ pub mod hir_build_tests {
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
           v2:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2)
         bb2():
           EntryPoint JIT(0)
-          v5:BasicObject = LoadArg :self@0
-          v6:NilClass = Const Value(nil)
-          Jump bb3(v5, v6)
-        bb3(v8:BasicObject, v9:NilClass):
-          v13:TrueClass = Const Value(true)
+          BumpSP
+          v7:BasicObject = LoadArg :self@0
+          v8:NilClass = Const Value(nil)
+          Jump bb3(v7, v8)
+        bb3(v10:BasicObject, v11:NilClass):
+          v15:TrueClass = Const Value(true)
           CheckInterrupts
-          v19:CBool[true] = Test v13
-          v20 = RefineType v13, Falsy
-          IfFalse v19, bb4(v8, v20)
-          v22:TrueClass = RefineType v13, Truthy
-          v25:Fixnum[3] = Const Value(3)
+          v21:CBool[true] = Test v15
+          v22 = RefineType v15, Falsy
+          IfFalse v21, bb4(v10, v22)
+          v24:TrueClass = RefineType v15, Truthy
+          v27:Fixnum[3] = Const Value(3)
           CheckInterrupts
-          Return v25
-        bb4(v30, v31):
-          v35 = Const Value(4)
+          Return v27
+        bb4(v32, v33):
+          v37 = Const Value(4)
           CheckInterrupts
-          Return v35
+          Return v37
         ");
     }
 
@@ -1943,17 +2070,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v11:Fixnum[2] = Const Value(2)
-          v13:Fixnum[3] = Const Value(3)
-          v15:BasicObject = Send v6, :bar, v11, v13 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v13:Fixnum[2] = Const Value(2)
+          v15:Fixnum[3] = Const Value(3)
+          v17:BasicObject = Send v8, :bar, v13, v15 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -1975,18 +2104,20 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:BasicObject = Send v10, 0x1008, :each # SendFallbackReason: Uncategorized(send)
-          v16:CPtr = GetEP 0
-          v17:BasicObject = LoadField v16, :a@0x1030
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:BasicObject = Send v12, 0x1008, :each # SendFallbackReason: Uncategorized(send)
+          v18:CPtr = GetEP 0
+          v19:BasicObject = LoadField v18, :a@0x1030
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -2003,20 +2134,22 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v12:Fixnum[123] = Const Value(123)
-          v15:BasicObject = ObjToString v12
-          v17:String = AnyToString v12, str: v15
-          v19:StringExact = StringConcat v10, v17
-          v21:Symbol = StringIntern v19
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v14:Fixnum[123] = Const Value(123)
+          v17:BasicObject = ObjToString v14
+          v19:String = AnyToString v14, str: v17
+          v21:StringExact = StringConcat v12, v19
+          v23:Symbol = StringIntern v21
           CheckInterrupts
-          Return v21
+          Return v23
         ");
     }
 
@@ -2030,23 +2163,25 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v11:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v12:ArrayExact = ArrayDup v11
-          v14:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v15:ArrayExact = ArrayDup v14
-          v17:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
-          v18:StringExact = StringCopy v17
-          v20:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
-          v21:StringExact = StringCopy v20
-          v23:BasicObject = Send v6, :unknown_method, v12, v15, v18, v21 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v13:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v14:ArrayExact = ArrayDup v13
+          v16:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v17:ArrayExact = ArrayDup v16
+          v19:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v20:StringExact = StringCopy v19
+          v22:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v23:StringExact = StringCopy v22
+          v25:BasicObject = Send v8, :unknown_method, v14, v17, v20, v23 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -2062,17 +2197,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
-          v18:BasicObject = Send v9, :foo, v16 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:ArrayExact = ToArray v12
+          v20:BasicObject = Send v11, :foo, v18 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v18
+          Return v20
         ");
     }
 
@@ -2088,16 +2225,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = Send v9, 0x1008, :foo, v10 # SendFallbackReason: Uncategorized(send)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = Send v11, 0x1008, :foo, v12 # SendFallbackReason: Uncategorized(send)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2113,17 +2252,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:Fixnum[1] = Const Value(1)
-          v17:BasicObject = Send v9, :foo, v15 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:Fixnum[1] = Const Value(1)
+          v19:BasicObject = Send v11, :foo, v17 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v17
+          Return v19
         ");
     }
 
@@ -2139,16 +2280,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = Send v9, :foo, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = Send v11, :foo, v12 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2164,15 +2307,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v11:BasicObject = InvokeSuper v6, 0x1000 # SendFallbackReason: Uncategorized(invokesuper)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v13:BasicObject = InvokeSuper v8, 0x1000 # SendFallbackReason: Uncategorized(invokesuper)
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -2186,15 +2331,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v11:BasicObject = InvokeSuper v6, 0x1000 # SendFallbackReason: Uncategorized(invokesuper)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v13:BasicObject = InvokeSuper v8, 0x1000 # SendFallbackReason: Uncategorized(invokesuper)
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -2208,16 +2355,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v11:NilClass = Const Value(nil)
-          v13:BasicObject = InvokeSuper v6, 0x1000, v11 # SendFallbackReason: Uncategorized(invokesuper)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v13:NilClass = Const Value(nil)
+          v15:BasicObject = InvokeSuper v8, 0x1000, v13 # SendFallbackReason: Uncategorized(invokesuper)
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -2233,16 +2382,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = InvokeSuperForward v9, 0x1008, v10 # SendFallbackReason: Uncategorized(invokesuperforward)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = InvokeSuperForward v11, 0x1008, v12 # SendFallbackReason: Uncategorized(invokesuperforward)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2258,18 +2409,20 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = InvokeSuperForward v9, 0x1008, v10 # SendFallbackReason: Uncategorized(invokesuperforward)
-          v17:CPtr = GetEP 0
-          v18:BasicObject = LoadField v17, :...@0x1010
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = InvokeSuperForward v11, 0x1008, v12 # SendFallbackReason: Uncategorized(invokesuperforward)
+          v19:CPtr = GetEP 0
+          v20:BasicObject = LoadField v19, :...@0x1010
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2285,18 +2438,20 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = InvokeSuperForward v9, 0x1008, v10 # SendFallbackReason: Uncategorized(invokesuperforward)
-          v18:Fixnum[1] = Const Value(1)
-          v21:BasicObject = Send v16, :+, v18 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = InvokeSuperForward v11, 0x1008, v12 # SendFallbackReason: Uncategorized(invokesuperforward)
+          v20:Fixnum[1] = Const Value(1)
+          v23:BasicObject = Send v18, :+, v20 # SendFallbackReason: Uncategorized(opt_plus)
           CheckInterrupts
-          Return v21
+          Return v23
         ");
     }
 
@@ -2312,17 +2467,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:Fixnum[1] = Const Value(1)
-          v18:BasicObject = InvokeSuperForward v9, 0x1008, v15, v10 # SendFallbackReason: Uncategorized(invokesuperforward)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:Fixnum[1] = Const Value(1)
+          v20:BasicObject = InvokeSuperForward v11, 0x1008, v17, v12 # SendFallbackReason: Uncategorized(invokesuperforward)
           CheckInterrupts
-          Return v18
+          Return v20
         ");
     }
 
@@ -2336,16 +2493,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v14:NilClass = Const Value(nil)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v16:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v14
+          Return v16
         ");
     }
 
@@ -2363,24 +2522,26 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:Class[VMFrozenCore] = Const Value(VALUE(0x1008))
-          v17:HashExact = NewHash
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:Class[VMFrozenCore] = Const Value(VALUE(0x1008))
+          v19:HashExact = NewHash
           PatchPoint NoEPEscape(test)
-          v22:BasicObject = Send v15, :core#hash_merge_kwd, v17, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
-          v24:Class[VMFrozenCore] = Const Value(VALUE(0x1008))
-          v27:StaticSymbol[:b] = Const Value(VALUE(0x1010))
-          v29:Fixnum[1] = Const Value(1)
-          v31:BasicObject = Send v24, :core#hash_merge_ptr, v22, v27, v29 # SendFallbackReason: Uncategorized(opt_send_without_block)
-          v33:BasicObject = Send v9, :foo, v31 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v24:BasicObject = Send v17, :core#hash_merge_kwd, v19, v12 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v26:Class[VMFrozenCore] = Const Value(VALUE(0x1008))
+          v29:StaticSymbol[:b] = Const Value(VALUE(0x1010))
+          v31:Fixnum[1] = Const Value(1)
+          v33:BasicObject = Send v26, :core#hash_merge_ptr, v24, v29, v31 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v35:BasicObject = Send v11, :foo, v33 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v33
+          Return v35
         ");
     }
 
@@ -2396,19 +2557,21 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:ArrayExact = LoadField v2, :*@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :*@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToNewArray v10
-          v18:Fixnum[1] = Const Value(1)
-          ArrayPush v16, v18
-          v22:BasicObject = Send v9, :foo, v16 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :*@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:ArrayExact = ToNewArray v12
+          v20:Fixnum[1] = Const Value(1)
+          ArrayPush v18, v20
+          v24:BasicObject = Send v11, :foo, v18 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v22
+          Return v24
         ");
     }
 
@@ -2424,16 +2587,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :...@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :...@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = SendForward v9, 0x1008, :foo, v10 # SendFallbackReason: Uncategorized(sendforward)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :...@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = SendForward v11, 0x1008, :foo, v12 # SendFallbackReason: Uncategorized(sendforward)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2453,25 +2618,27 @@ pub mod hir_build_tests {
           v5:BasicObject = LoadField v2, :**@0x1002
           v6:BasicObject = LoadField v2, :&@0x1003
           v7:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6, v7)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:BasicObject = LoadArg :a@1
-          v12:BasicObject = LoadArg :*@2
-          v13:BasicObject = LoadArg :**@3
-          v14:BasicObject = LoadArg :&@4
-          v15:NilClass = Const Value(nil)
-          Jump bb3(v10, v11, v12, v13, v14, v15)
-        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v29:ArrayExact = ToArray v19
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:BasicObject = LoadArg :a@1
+          v14:BasicObject = LoadArg :*@2
+          v15:BasicObject = LoadArg :**@3
+          v16:BasicObject = LoadArg :&@4
+          v17:NilClass = Const Value(nil)
+          Jump bb3(v12, v13, v14, v15, v16, v17)
+        bb3(v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:BasicObject, v24:NilClass):
+          v31:ArrayExact = ToArray v21
           PatchPoint NoEPEscape(test)
-          v34:CPtr = GetEP 0
-          v35:CInt64 = LoadField v34, :_env_data_index_flags@0x1004
-          v36:CInt64 = GuardNoBitsSet v35, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v37:CInt64 = LoadField v34, :_env_data_index_specval@0x1005
-          v38:CInt64 = GuardAnyBitSet v37, CUInt64(1)
-          v39:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v36:CPtr = GetEP 0
+          v37:CInt64 = LoadField v36, :_env_data_index_flags@0x1004
+          v38:CInt64 = GuardNoBitsSet v37, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v39:CInt64 = LoadField v36, :_env_data_index_specval@0x1005
+          v40:CInt64 = GuardAnyBitSet v39, CUInt64(1)
+          v41:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
           SideExit SplatKwNotProfiled
         ");
     }
@@ -2488,26 +2655,28 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetConstantPath 0x1000
-          v12:NilClass = Const Value(nil)
-          v15:CBool = IsMethodCFunc v10, :new
-          IfFalse v15, bb4(v6, v12, v10)
-          v17:HeapBasicObject = ObjectAlloc v10
-          v19:BasicObject = Send v17, :initialize # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetConstantPath 0x1000
+          v14:NilClass = Const Value(nil)
+          v17:CBool = IsMethodCFunc v12, :new
+          IfFalse v17, bb4(v8, v14, v12)
+          v19:HeapBasicObject = ObjectAlloc v12
+          v21:BasicObject = Send v19, :initialize # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Jump bb5(v6, v17, v19)
-        bb4(v23:BasicObject, v24:NilClass, v25:BasicObject):
-          v28:BasicObject = Send v25, :new # SendFallbackReason: Uncategorized(opt_send_without_block)
-          Jump bb5(v23, v28, v24)
-        bb5(v31:BasicObject, v32:BasicObject, v33:BasicObject):
+          Jump bb5(v8, v19, v21)
+        bb4(v25:BasicObject, v26:NilClass, v27:BasicObject):
+          v30:BasicObject = Send v27, :new # SendFallbackReason: Uncategorized(opt_send_without_block)
+          Jump bb5(v25, v30, v26)
+        bb5(v33:BasicObject, v34:BasicObject, v35:BasicObject):
           CheckInterrupts
-          Return v32
+          Return v34
         ");
     }
 
@@ -2523,16 +2692,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_MAX)
-          v11:BasicObject = ArrayMax
+          v13:BasicObject = ArrayMax
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -2550,18 +2721,20 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_MAX)
-          v20:BasicObject = ArrayMax v12, v13
+          v22:BasicObject = ArrayMax v14, v15
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -2586,14 +2759,16 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_MAX))
         ");
     }
@@ -2619,17 +2794,19 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
           SideExit UnhandledNewarraySend(MIN)
         ");
     }
@@ -2655,26 +2832,28 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_HASH)
-          v33:Fixnum = ArrayHash v16, v17
+          v35:Fixnum = ArrayHash v18, v19
           PatchPoint NoEPEscape(test)
-          v40:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v41:ArrayExact = ArrayDup v40
-          v43:BasicObject = Send v15, :puts, v41 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v42:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v43:ArrayExact = ArrayDup v42
+          v45:BasicObject = Send v17, :puts, v43 # SendFallbackReason: Uncategorized(opt_send_without_block)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v33
+          Return v35
         ");
     }
 
@@ -2701,17 +2880,19 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_HASH))
         ");
     }
@@ -2737,19 +2918,21 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
-          v32:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v33:StringExact = StringCopy v32
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
+          v34:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v35:StringExact = StringCopy v34
           SideExit UnhandledNewarraySend(PACK)
         ");
     }
@@ -2775,28 +2958,30 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
-          v30:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v31:StringExact = StringCopy v30
-          v37:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
-          v38:StringExact = StringCopy v37
-          v40:CPtr = GetEP 0
-          v41:BasicObject = LoadField v40, :buf@0x1018
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
+          v32:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v33:StringExact = StringCopy v32
+          v39:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v40:StringExact = StringCopy v39
+          v42:CPtr = GetEP 0
+          v43:BasicObject = LoadField v42, :buf@0x1018
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_PACK)
-          v44:String = ArrayPackBuffer v16, v17, fmt: v38, buf: v41
+          v46:String = ArrayPackBuffer v18, v19, fmt: v40, buf: v43
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v31
+          Return v33
         ");
     }
 
@@ -2824,23 +3009,25 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
-          v30:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v31:StringExact = StringCopy v30
-          v37:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
-          v38:StringExact = StringCopy v37
-          v40:CPtr = GetEP 0
-          v41:BasicObject = LoadField v40, :buf@0x1018
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
+          v32:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v33:StringExact = StringCopy v32
+          v39:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v40:StringExact = StringCopy v39
+          v42:CPtr = GetEP 0
+          v43:BasicObject = LoadField v42, :buf@0x1018
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_PACK))
         ");
     }
@@ -2866,26 +3053,28 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_INCLUDE_P)
-          v34:BoolExact = ArrayInclude v16, v17 | v17
+          v36:BoolExact = ArrayInclude v18, v19 | v19
           PatchPoint NoEPEscape(test)
-          v41:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
-          v42:ArrayExact = ArrayDup v41
-          v44:BasicObject = Send v15, :puts, v42 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v43:ArrayExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v44:ArrayExact = ArrayDup v43
+          v46:BasicObject = Send v17, :puts, v44 # SendFallbackReason: Uncategorized(opt_send_without_block)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v34
+          Return v36
         ");
     }
 
@@ -2917,17 +3106,19 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :b@0x1001
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :a@1
-          v11:BasicObject = LoadArg :b@2
-          v12:NilClass = Const Value(nil)
-          v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:BasicObject, v18:NilClass, v19:NilClass):
-          v26:BasicObject = Send v16, :+, v17 # SendFallbackReason: Uncategorized(opt_plus)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :a@1
+          v13:BasicObject = LoadArg :b@2
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:NilClass, v21:NilClass):
+          v28:BasicObject = Send v18, :+, v19 # SendFallbackReason: Uncategorized(opt_plus)
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_INCLUDE_P))
         ");
     }
@@ -2947,17 +3138,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           PatchPoint BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_INCLUDE_P)
-          v16:BoolExact = DupArrayInclude VALUE(0x1008) | v10
+          v18:BoolExact = DupArrayInclude VALUE(0x1008) | v12
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -2982,13 +3175,15 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           SideExit PatchPoint(BOPRedefined(ARRAY_REDEFINED_OP_FLAG, BOP_INCLUDE_P))
         ");
     }
@@ -3007,18 +3202,20 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:ArrayExact = NewArray v12, v13
-          v22:BasicObject = Send v19, :length # SendFallbackReason: Uncategorized(opt_length)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:ArrayExact = NewArray v14, v15
+          v24:BasicObject = Send v21, :length # SendFallbackReason: Uncategorized(opt_length)
           CheckInterrupts
-          Return v22
+          Return v24
         ");
     }
 
@@ -3036,18 +3233,20 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:ArrayExact = NewArray v12, v13
-          v22:BasicObject = Send v19, :size # SendFallbackReason: Uncategorized(opt_size)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:ArrayExact = NewArray v14, v15
+          v24:BasicObject = Send v21, :size # SendFallbackReason: Uncategorized(opt_size)
           CheckInterrupts
-          Return v22
+          Return v24
         ");
     }
 
@@ -3066,17 +3265,19 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :klass@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :klass@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:FalseClass = Const Value(false)
-          v17:BasicObject = GetConstant v10, :ARGV, v15
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :klass@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:FalseClass = Const Value(false)
+          v19:BasicObject = GetConstant v12, :ARGV, v17
           CheckInterrupts
-          Return v17
+          Return v19
         ");
     }
 
@@ -3092,16 +3293,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
           PatchPoint SingleRactorMode
-          v11:BasicObject = GetIvar v6, :@foo
+          v13:BasicObject = GetIvar v8, :@foo
           CheckInterrupts
-          Return v11
+          Return v13
         ");
     }
 
@@ -3117,18 +3320,20 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
           PatchPoint SingleRactorMode
-          SetIvar v6, :@foo, v10
-          v15:HeapBasicObject = RefineType v6, HeapBasicObject
+          SetIvar v8, :@foo, v12
+          v17:HeapBasicObject = RefineType v8, HeapBasicObject
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -3174,15 +3379,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetClassVar :@@foo
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetClassVar :@@foo
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -3201,16 +3408,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[42] = Const Value(42)
-          SetClassVar :@@foo, v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[42] = Const Value(42)
+          SetClassVar :@@foo, v12
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -3226,16 +3435,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
-          SetGlobal :$foo, v10
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
+          SetGlobal :$foo, v12
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -3251,15 +3462,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetGlobal :$foo
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetGlobal :$foo
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -3275,27 +3488,29 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :block@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :block@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v14:CPtr = GetEP 0
-          v15:CBool = IsBlockParamModified v14
-          IfTrue v15, bb4(v9, v10)
-          Jump bb5(v9, v10)
-        bb4(v16:BasicObject, v17:BasicObject):
-          v24:CPtr = GetEP 0
-          v25:BasicObject = LoadField v24, :block@0x1001
-          Jump bb6(v16, v25, v25)
-        bb5(v19:BasicObject, v20:BasicObject):
-          v27:BasicObject = GetBlockParam :block, l0, EP@3
-          Jump bb6(v19, v27, v27)
-        bb6(v29:BasicObject, v30:BasicObject, v31:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :block@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v16:CPtr = GetEP 0
+          v17:CBool = IsBlockParamModified v16
+          IfTrue v17, bb4(v11, v12)
+          Jump bb5(v11, v12)
+        bb4(v18:BasicObject, v19:BasicObject):
+          v26:CPtr = GetEP 0
+          v27:BasicObject = LoadField v26, :block@0x1001
+          Jump bb6(v18, v27, v27)
+        bb5(v21:BasicObject, v22:BasicObject):
+          v29:BasicObject = GetBlockParam :block, l0, EP@3
+          Jump bb6(v21, v29, v29)
+        bb6(v31:BasicObject, v32:BasicObject, v33:BasicObject):
           CheckInterrupts
-          Return v31
+          Return v33
         ");
     }
 
@@ -3313,26 +3528,28 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:CPtr = GetEP 1
-          v11:CBool = IsBlockParamModified v10
-          IfTrue v11, bb4(v6)
-          Jump bb5(v6)
-        bb4(v12:BasicObject):
-          v18:CPtr = GetEP 1
-          v19:BasicObject = LoadField v18, :block@0x1000
-          Jump bb6(v12, v19)
-        bb5(v14:BasicObject):
-          v21:BasicObject = GetBlockParam :block, l1, EP@3
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:CPtr = GetEP 1
+          v13:CBool = IsBlockParamModified v12
+          IfTrue v13, bb4(v8)
+          Jump bb5(v8)
+        bb4(v14:BasicObject):
+          v20:CPtr = GetEP 1
+          v21:BasicObject = LoadField v20, :block@0x1000
           Jump bb6(v14, v21)
-        bb6(v23:BasicObject, v24:BasicObject):
+        bb5(v16:BasicObject):
+          v23:BasicObject = GetBlockParam :block, l1, EP@3
+          Jump bb6(v16, v23)
+        bb6(v25:BasicObject, v26:BasicObject):
           CheckInterrupts
-          Return v24
+          Return v26
         ");
     }
 
@@ -3351,20 +3568,22 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :kw@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :kw@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:CPtr = GetEP 0
-          v20:CInt64 = LoadField v19, :_env_data_index_flags@0x1002
-          v21:CInt64 = GuardNoBitsSet v20, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v22:CInt64 = LoadField v19, :_env_data_index_specval@0x1003
-          v23:CInt64 = GuardAnyBitSet v22, CUInt64(1)
-          v24:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :kw@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:CPtr = GetEP 0
+          v22:CInt64 = LoadField v21, :_env_data_index_flags@0x1002
+          v23:CInt64 = GuardNoBitsSet v22, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v24:CInt64 = LoadField v21, :_env_data_index_specval@0x1003
+          v25:CInt64 = GuardAnyBitSet v24, CUInt64(1)
+          v26:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
           SideExit SplatKwNotProfiled
         ");
     }
@@ -3388,29 +3607,31 @@ pub mod hir_build_tests {
           v5:BasicObject = LoadField v2, :**@0x1002
           v6:BasicObject = LoadField v2, :&@0x1003
           v7:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6, v7)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:BasicObject = LoadArg :a@1
-          v12:BasicObject = LoadArg :*@2
-          v13:BasicObject = LoadArg :**@3
-          v14:BasicObject = LoadArg :&@4
-          v15:NilClass = Const Value(nil)
-          Jump bb3(v10, v11, v12, v13, v14, v15)
-        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v29:ArrayExact = ToArray v19
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:BasicObject = LoadArg :a@1
+          v14:BasicObject = LoadArg :*@2
+          v15:BasicObject = LoadArg :**@3
+          v16:BasicObject = LoadArg :&@4
+          v17:NilClass = Const Value(nil)
+          Jump bb3(v12, v13, v14, v15, v16, v17)
+        bb3(v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:BasicObject, v24:NilClass):
+          v31:ArrayExact = ToArray v21
           PatchPoint NoEPEscape(test)
-          v34:CPtr = GetEP 0
-          v35:CInt64 = LoadField v34, :_env_data_index_flags@0x1004
-          v36:CInt64 = GuardNoBitsSet v35, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v37:CInt64 = LoadField v34, :_env_data_index_specval@0x1005
-          v38:CInt64[0] = GuardBitEquals v37, CInt64(0)
-          v39:NilClass = Const Value(nil)
-          v41:NilClass = GuardType v20, NilClass
-          v43:BasicObject = Send v17, 0x1004, :foo, v18, v29, v41, v39 # SendFallbackReason: Uncategorized(send)
+          v36:CPtr = GetEP 0
+          v37:CInt64 = LoadField v36, :_env_data_index_flags@0x1004
+          v38:CInt64 = GuardNoBitsSet v37, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v39:CInt64 = LoadField v36, :_env_data_index_specval@0x1005
+          v40:CInt64[0] = GuardBitEquals v39, CInt64(0)
+          v41:NilClass = Const Value(nil)
+          v43:NilClass = GuardType v22, NilClass
+          v45:BasicObject = Send v19, 0x1004, :foo, v20, v31, v43, v41 # SendFallbackReason: Uncategorized(send)
           CheckInterrupts
-          Return v43
+          Return v45
         ");
     }
 
@@ -3430,24 +3651,26 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :kw@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :kw@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:CPtr = GetEP 0
-          v20:CInt64 = LoadField v19, :_env_data_index_flags@0x1002
-          v21:CInt64 = GuardNoBitsSet v20, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v22:CInt64 = LoadField v19, :_env_data_index_specval@0x1003
-          v23:CInt64 = GuardAnyBitSet v22, CUInt64(1)
-          v24:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
-          v26:HashExact = GuardType v12, HashExact
-          v28:BasicObject = Send v11, 0x1002, :foo, v26, v24 # SendFallbackReason: Uncategorized(send)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :kw@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:CPtr = GetEP 0
+          v22:CInt64 = LoadField v21, :_env_data_index_flags@0x1002
+          v23:CInt64 = GuardNoBitsSet v22, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v24:CInt64 = LoadField v21, :_env_data_index_specval@0x1003
+          v25:CInt64 = GuardAnyBitSet v24, CUInt64(1)
+          v26:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v28:HashExact = GuardType v14, HashExact
+          v30:BasicObject = Send v13, 0x1002, :foo, v28, v26 # SendFallbackReason: Uncategorized(send)
           CheckInterrupts
-          Return v28
+          Return v30
         ");
     }
 
@@ -3467,24 +3690,26 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :kw@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :kw@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:CPtr = GetEP 0
-          v20:CInt64 = LoadField v19, :_env_data_index_flags@0x1002
-          v21:CInt64 = GuardNoBitsSet v20, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v22:CInt64 = LoadField v19, :_env_data_index_specval@0x1003
-          v23:CInt64 = GuardAnyBitSet v22, CUInt64(1)
-          v24:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
-          v26:HashExact = GuardType v12, HashExact
-          v28:BasicObject = Send v11, 0x1002, :foo, v26, v24 # SendFallbackReason: Uncategorized(send)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :kw@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:CPtr = GetEP 0
+          v22:CInt64 = LoadField v21, :_env_data_index_flags@0x1002
+          v23:CInt64 = GuardNoBitsSet v22, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v24:CInt64 = LoadField v21, :_env_data_index_specval@0x1003
+          v25:CInt64 = GuardAnyBitSet v24, CUInt64(1)
+          v26:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v28:HashExact = GuardType v14, HashExact
+          v30:BasicObject = Send v13, 0x1002, :foo, v28, v26 # SendFallbackReason: Uncategorized(send)
           CheckInterrupts
-          Return v28
+          Return v30
         ");
     }
 
@@ -3509,25 +3734,27 @@ pub mod hir_build_tests {
           v5:BasicObject = LoadField v2, :**@0x1002
           v6:BasicObject = LoadField v2, :&@0x1003
           v7:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6, v7)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:BasicObject = LoadArg :a@1
-          v12:BasicObject = LoadArg :*@2
-          v13:BasicObject = LoadArg :**@3
-          v14:BasicObject = LoadArg :&@4
-          v15:NilClass = Const Value(nil)
-          Jump bb3(v10, v11, v12, v13, v14, v15)
-        bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v29:ArrayExact = ToArray v19
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:BasicObject = LoadArg :a@1
+          v14:BasicObject = LoadArg :*@2
+          v15:BasicObject = LoadArg :**@3
+          v16:BasicObject = LoadArg :&@4
+          v17:NilClass = Const Value(nil)
+          Jump bb3(v12, v13, v14, v15, v16, v17)
+        bb3(v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:BasicObject, v24:NilClass):
+          v31:ArrayExact = ToArray v21
           PatchPoint NoEPEscape(test)
-          v34:CPtr = GetEP 0
-          v35:CInt64 = LoadField v34, :_env_data_index_flags@0x1004
-          v36:CInt64 = GuardNoBitsSet v35, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v37:CInt64 = LoadField v34, :_env_data_index_specval@0x1005
-          v38:CInt64[0] = GuardBitEquals v37, CInt64(0)
-          v39:NilClass = Const Value(nil)
+          v36:CPtr = GetEP 0
+          v37:CInt64 = LoadField v36, :_env_data_index_flags@0x1004
+          v38:CInt64 = GuardNoBitsSet v37, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v39:CInt64 = LoadField v36, :_env_data_index_specval@0x1005
+          v40:CInt64[0] = GuardBitEquals v39, CInt64(0)
+          v41:NilClass = Const Value(nil)
           SideExit SplatKwPolymorphic
         ");
     }
@@ -3550,20 +3777,22 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :obj@0x1000
           v4:BasicObject = LoadField v2, :block@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :obj@1
-          v9:BasicObject = LoadArg :block@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:CPtr = GetEP 0
-          v20:CInt64 = LoadField v19, :_env_data_index_flags@0x1002
-          v21:CInt64 = GuardNoBitsSet v20, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v22:CInt64 = LoadField v19, :_env_data_index_specval@0x1003
-          v23:CInt64 = GuardAnyBitSet v22, CUInt64(1)
-          v24:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :obj@1
+          v11:BasicObject = LoadArg :block@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:CPtr = GetEP 0
+          v22:CInt64 = LoadField v21, :_env_data_index_flags@0x1002
+          v23:CInt64 = GuardNoBitsSet v22, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v24:CInt64 = LoadField v21, :_env_data_index_specval@0x1003
+          v25:CInt64 = GuardAnyBitSet v24, CUInt64(1)
+          v26:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
           SideExit SplatKwNotNilOrHash
         ");
     }
@@ -3581,16 +3810,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:ArrayExact = ToNewArray v10
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:ArrayExact = ToNewArray v12
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -3607,19 +3838,21 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v14:Fixnum[1] = Const Value(1)
-          v16:ArrayExact = NewArray v14
-          v19:ArrayExact = ToArray v10
-          ArrayExtend v16, v19
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v16:Fixnum[1] = Const Value(1)
+          v18:ArrayExact = NewArray v16
+          v21:ArrayExact = ToArray v12
+          ArrayExtend v18, v21
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -3636,18 +3869,20 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:ArrayExact = ToNewArray v10
-          v17:Fixnum[1] = Const Value(1)
-          ArrayPush v15, v17
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:ArrayExact = ToNewArray v12
+          v19:Fixnum[1] = Const Value(1)
+          ArrayPush v17, v19
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -3664,22 +3899,24 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :a@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v15:ArrayExact = ToNewArray v10
-          v17:Fixnum[1] = Const Value(1)
-          v19:Fixnum[2] = Const Value(2)
-          v21:Fixnum[3] = Const Value(3)
-          ArrayPush v15, v17
-          ArrayPush v15, v19
-          ArrayPush v15, v21
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :a@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v17:ArrayExact = ToNewArray v12
+          v19:Fixnum[1] = Const Value(1)
+          v21:Fixnum[2] = Const Value(2)
+          v23:Fixnum[3] = Const Value(3)
+          ArrayPush v17, v19
+          ArrayPush v17, v21
+          ArrayPush v17, v23
           CheckInterrupts
-          Return v15
+          Return v17
         ");
     }
 
@@ -3697,19 +3934,21 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v17:NilClass = Const Value(nil)
-          v21:Fixnum[1] = Const Value(1)
-          v25:BasicObject = Send v12, :[]=, v13, v21 # SendFallbackReason: Uncategorized(opt_aset)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v19:NilClass = Const Value(nil)
+          v23:Fixnum[1] = Const Value(1)
+          v27:BasicObject = Send v14, :[]=, v15, v23 # SendFallbackReason: Uncategorized(opt_aset)
           CheckInterrupts
-          Return v21
+          Return v23
         ");
     }
 
@@ -3727,17 +3966,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :a@0x1000
           v4:BasicObject = LoadField v2, :b@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :a@1
-          v9:BasicObject = LoadArg :b@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :[], v13 # SendFallbackReason: Uncategorized(opt_aref)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :a@1
+          v11:BasicObject = LoadArg :b@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :[], v15 # SendFallbackReason: Uncategorized(opt_aref)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -3754,16 +3995,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = Send v10, :empty? # SendFallbackReason: Uncategorized(opt_empty_p)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = Send v12, :empty? # SendFallbackReason: Uncategorized(opt_empty_p)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -3780,16 +4023,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = Send v10, :succ # SendFallbackReason: Uncategorized(opt_succ)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = Send v12, :succ # SendFallbackReason: Uncategorized(opt_succ)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -3807,17 +4052,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
           v4:BasicObject = LoadField v2, :y@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :x@1
-          v9:BasicObject = LoadArg :y@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :&, v13 # SendFallbackReason: Uncategorized(opt_and)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :x@1
+          v11:BasicObject = LoadArg :y@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :&, v15 # SendFallbackReason: Uncategorized(opt_and)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -3835,17 +4082,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
           v4:BasicObject = LoadField v2, :y@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :x@1
-          v9:BasicObject = LoadArg :y@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :|, v13 # SendFallbackReason: Uncategorized(opt_or)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :x@1
+          v11:BasicObject = LoadArg :y@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :|, v15 # SendFallbackReason: Uncategorized(opt_or)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -3862,16 +4111,18 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = Send v10, :! # SendFallbackReason: Uncategorized(opt_not)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v18:BasicObject = Send v12, :! # SendFallbackReason: Uncategorized(opt_not)
           CheckInterrupts
-          Return v16
+          Return v18
         ");
     }
 
@@ -3889,17 +4140,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :regexp@0x1000
           v4:BasicObject = LoadField v2, :matchee@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :regexp@1
-          v9:BasicObject = LoadArg :matchee@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v20:BasicObject = Send v12, :=~, v13 # SendFallbackReason: Uncategorized(opt_regexpmatch2)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :regexp@1
+          v11:BasicObject = LoadArg :matchee@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v22:BasicObject = Send v14, :=~, v15 # SendFallbackReason: Uncategorized(opt_regexpmatch2)
           CheckInterrupts
-          Return v20
+          Return v22
         ");
     }
 
@@ -3918,19 +4171,21 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Class[VMFrozenCore] = Const Value(VALUE(0x1000))
-          v12:BasicObject = PutSpecialObject CBase
-          v14:StaticSymbol[:aliased] = Const Value(VALUE(0x1008))
-          v16:StaticSymbol[:__callee__] = Const Value(VALUE(0x1010))
-          v18:BasicObject = Send v10, :core#set_method_alias, v12, v14, v16 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Class[VMFrozenCore] = Const Value(VALUE(0x1000))
+          v14:BasicObject = PutSpecialObject CBase
+          v16:StaticSymbol[:aliased] = Const Value(VALUE(0x1008))
+          v18:StaticSymbol[:__callee__] = Const Value(VALUE(0x1010))
+          v20:BasicObject = Send v12, :core#set_method_alias, v14, v16, v18 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v18
+          Return v20
         ");
     }
 
@@ -3957,25 +4212,27 @@ pub mod hir_build_tests {
           v2:NilClass = Const Value(nil)
           v3:NilClass = Const Value(nil)
           v4:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:NilClass = Const Value(nil)
-          v9:NilClass = Const Value(nil)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
           v10:NilClass = Const Value(nil)
-          Jump bb3(v7, v8, v9, v10)
-        bb3(v12:BasicObject, v13:NilClass, v14:NilClass, v15:NilClass):
+          v11:NilClass = Const Value(nil)
+          v12:NilClass = Const Value(nil)
+          Jump bb3(v9, v10, v11, v12)
+        bb3(v14:BasicObject, v15:NilClass, v16:NilClass, v17:NilClass):
           PatchPoint SingleRactorMode
-          v20:BasicObject = GetIvar v12, :@a
+          v22:BasicObject = GetIvar v14, :@a
           PatchPoint SingleRactorMode
-          v23:BasicObject = GetIvar v12, :@b
+          v25:BasicObject = GetIvar v14, :@b
           PatchPoint SingleRactorMode
-          v26:BasicObject = GetIvar v12, :@c
+          v28:BasicObject = GetIvar v14, :@c
           PatchPoint NoEPEscape(reverse_odd)
-          v38:ArrayExact = NewArray v20, v23, v26
+          v40:ArrayExact = NewArray v22, v25, v28
           CheckInterrupts
-          Return v38
+          Return v40
 
         fn reverse_even@<compiled>:8:
         bb1():
@@ -3985,28 +4242,30 @@ pub mod hir_build_tests {
           v3:NilClass = Const Value(nil)
           v4:NilClass = Const Value(nil)
           v5:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2, v3, v4, v5)
         bb2():
           EntryPoint JIT(0)
-          v8:BasicObject = LoadArg :self@0
-          v9:NilClass = Const Value(nil)
-          v10:NilClass = Const Value(nil)
+          BumpSP
+          v10:BasicObject = LoadArg :self@0
           v11:NilClass = Const Value(nil)
           v12:NilClass = Const Value(nil)
-          Jump bb3(v8, v9, v10, v11, v12)
-        bb3(v14:BasicObject, v15:NilClass, v16:NilClass, v17:NilClass, v18:NilClass):
+          v13:NilClass = Const Value(nil)
+          v14:NilClass = Const Value(nil)
+          Jump bb3(v10, v11, v12, v13, v14)
+        bb3(v16:BasicObject, v17:NilClass, v18:NilClass, v19:NilClass, v20:NilClass):
           PatchPoint SingleRactorMode
-          v23:BasicObject = GetIvar v14, :@a
+          v25:BasicObject = GetIvar v16, :@a
           PatchPoint SingleRactorMode
-          v26:BasicObject = GetIvar v14, :@b
+          v28:BasicObject = GetIvar v16, :@b
           PatchPoint SingleRactorMode
-          v29:BasicObject = GetIvar v14, :@c
+          v31:BasicObject = GetIvar v16, :@c
           PatchPoint SingleRactorMode
-          v32:BasicObject = GetIvar v14, :@d
+          v34:BasicObject = GetIvar v16, :@d
           PatchPoint NoEPEscape(reverse_even)
-          v46:ArrayExact = NewArray v23, v26, v29, v32
+          v48:ArrayExact = NewArray v25, v28, v31, v34
           CheckInterrupts
-          Return v46
+          Return v48
         ");
     }
 
@@ -4023,23 +4282,25 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           CheckInterrupts
-          v17:CBool = IsNil v10
-          v18:NilClass = Const Value(nil)
-          IfTrue v17, bb4(v9, v18, v18)
-          v20:NotNil = RefineType v10, NotNil
-          v22:BasicObject = Send v20, :itself # SendFallbackReason: Uncategorized(opt_send_without_block)
-          Jump bb4(v9, v20, v22)
-        bb4(v24:BasicObject, v25:BasicObject, v26:BasicObject):
+          v19:CBool = IsNil v12
+          v20:NilClass = Const Value(nil)
+          IfTrue v19, bb4(v11, v20, v20)
+          v22:NotNil = RefineType v12, NotNil
+          v24:BasicObject = Send v22, :itself # SendFallbackReason: Uncategorized(opt_send_without_block)
+          Jump bb4(v11, v22, v24)
+        bb4(v26:BasicObject, v27:BasicObject, v28:BasicObject):
           CheckInterrupts
-          Return v26
+          Return v28
         ");
     }
 
@@ -4063,32 +4324,34 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           CheckInterrupts
-          v16:CBool = Test v10
-          v17:Falsy = RefineType v10, Falsy
-          IfFalse v16, bb4(v9, v17)
-          v19:Truthy = RefineType v10, Truthy
+          v18:CBool = Test v12
+          v19:Falsy = RefineType v12, Falsy
+          IfFalse v18, bb4(v11, v19)
+          v21:Truthy = RefineType v12, Truthy
           CheckInterrupts
-          v25:CBool[false] = IsNil v19
-          v26:NilClass = Const Value(nil)
-          IfTrue v25, bb5(v9, v26, v26)
-          v28:Truthy = RefineType v19, NotNil
-          v30:BasicObject = Send v28, :itself # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v27:CBool[false] = IsNil v21
+          v28:NilClass = Const Value(nil)
+          IfTrue v27, bb5(v11, v28, v28)
+          v30:Truthy = RefineType v21, NotNil
+          v32:BasicObject = Send v30, :itself # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v30
-        bb4(v35:BasicObject, v36:Falsy):
-          v40:Fixnum[4] = Const Value(4)
-          Jump bb5(v35, v36, v40)
-        bb5(v42:BasicObject, v43:Falsy, v44:Fixnum[4]):
+          Return v32
+        bb4(v37:BasicObject, v38:Falsy):
+          v42:Fixnum[4] = Const Value(4)
+          Jump bb5(v37, v38, v42)
+        bb5(v44:BasicObject, v45:Falsy, v46:Fixnum[4]):
           CheckInterrupts
-          Return v44
+          Return v46
         ");
     }
 
@@ -4118,43 +4381,45 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
           CheckInterrupts
-          v16:CBool = Test v10
-          v17:Falsy = RefineType v10, Falsy
-          IfFalse v16, bb6(v9, v17)
-          v19:Truthy = RefineType v10, Truthy
+          v18:CBool = Test v12
+          v19:Falsy = RefineType v12, Falsy
+          IfFalse v18, bb6(v11, v19)
+          v21:Truthy = RefineType v12, Truthy
           CheckInterrupts
-          v24:CBool[true] = Test v19
-          v25 = RefineType v19, Falsy
-          IfFalse v24, bb5(v9, v25)
-          v27:Truthy = RefineType v19, Truthy
+          v26:CBool[true] = Test v21
+          v27 = RefineType v21, Falsy
+          IfFalse v26, bb5(v11, v27)
+          v29:Truthy = RefineType v21, Truthy
           CheckInterrupts
-          v32:CBool[true] = Test v27
-          v33 = RefineType v27, Falsy
-          IfFalse v32, bb4(v9, v33)
-          v35:Truthy = RefineType v27, Truthy
-          v38:Fixnum[3] = Const Value(3)
+          v34:CBool[true] = Test v29
+          v35 = RefineType v29, Falsy
+          IfFalse v34, bb4(v11, v35)
+          v37:Truthy = RefineType v29, Truthy
+          v40:Fixnum[3] = Const Value(3)
           CheckInterrupts
-          Return v38
-        bb6(v43:BasicObject, v44:Falsy):
-          v48:Fixnum[6] = Const Value(6)
+          Return v40
+        bb6(v45:BasicObject, v46:Falsy):
+          v50:Fixnum[6] = Const Value(6)
           CheckInterrupts
-          Return v48
-        bb5(v53, v54):
-          v58 = Const Value(5)
+          Return v50
+        bb5(v55, v56):
+          v60 = Const Value(5)
           CheckInterrupts
-          Return v58
-        bb4(v63, v64):
-          v68 = Const Value(4)
+          Return v60
+        bb4(v65, v66):
+          v70 = Const Value(4)
           CheckInterrupts
-          Return v68
+          Return v70
         ");
     }
 
@@ -4170,21 +4435,23 @@ pub mod hir_build_tests {
           v3:BasicObject = LoadField v2, :arg@0x1000
           v4:BasicObject = LoadField v2, :exception@0x1001
           v5:BasicObject = LoadField v2, :<empty>@0x1002
+          BumpSP
           Jump bb3(v1, v3, v4, v5)
         bb2():
           EntryPoint JIT(0)
-          v8:BasicObject = LoadArg :self@0
-          v9:BasicObject = LoadArg :arg@1
-          v10:BasicObject = LoadArg :exception@2
-          v11:CPtr = GetEP 0
-          v12:BasicObject = LoadField v11, :<empty>@0x1003
-          Jump bb3(v8, v9, v10, v12)
-        bb3(v14:BasicObject, v15:BasicObject, v16:BasicObject, v17:BasicObject):
-          v21:Float = InvokeBuiltin rb_f_float, v14, v15, v16
-          Jump bb4(v14, v15, v16, v17, v21)
-        bb4(v23:BasicObject, v24:BasicObject, v25:BasicObject, v26:BasicObject, v27:Float):
+          BumpSP
+          v10:BasicObject = LoadArg :self@0
+          v11:BasicObject = LoadArg :arg@1
+          v12:BasicObject = LoadArg :exception@2
+          v13:CPtr = GetEP 0
+          v14:BasicObject = LoadField v13, :<empty>@0x1003
+          Jump bb3(v10, v11, v12, v14)
+        bb3(v16:BasicObject, v17:BasicObject, v18:BasicObject, v19:BasicObject):
+          v23:Float = InvokeBuiltin rb_f_float, v16, v17, v18
+          Jump bb4(v16, v17, v18, v19, v23)
+        bb4(v25:BasicObject, v26:BasicObject, v27:BasicObject, v28:BasicObject, v29:Float):
           CheckInterrupts
-          Return v27
+          Return v29
         ");
     }
 
@@ -4196,17 +4463,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:HeapObject = InvokeBuiltin leaf <inline_expr>, v6
-          Jump bb4(v6, v10)
-        bb4(v12:BasicObject, v13:HeapObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:HeapObject = InvokeBuiltin leaf <inline_expr>, v8
+          Jump bb4(v8, v12)
+        bb4(v14:BasicObject, v15:HeapObject):
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -4227,38 +4496,40 @@ pub mod hir_build_tests {
           v5:BasicObject = LoadField v2, :<empty>@0x1002
           v6:BasicObject = LoadField v2, :block@0x1003
           v7:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6, v7)
         bb2():
           EntryPoint JIT(0)
-          v10:BasicObject = LoadArg :self@0
-          v11:BasicObject = LoadArg :name@1
-          v12:BasicObject = LoadArg :encoding@2
-          v13:CPtr = GetEP 0
-          v14:BasicObject = LoadField v13, :<empty>@0x1003
-          v15:BasicObject = LoadArg :block@3
-          v16:NilClass = Const Value(nil)
-          Jump bb3(v10, v11, v12, v14, v15, v16)
-        bb3(v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:NilClass):
-          v27:BasicObject = InvokeBuiltin dir_s_open, v18, v19, v20
+          BumpSP
+          v12:BasicObject = LoadArg :self@0
+          v13:BasicObject = LoadArg :name@1
+          v14:BasicObject = LoadArg :encoding@2
+          v15:CPtr = GetEP 0
+          v16:BasicObject = LoadField v15, :<empty>@0x1003
+          v17:BasicObject = LoadArg :block@3
+          v18:NilClass = Const Value(nil)
+          Jump bb3(v12, v13, v14, v16, v17, v18)
+        bb3(v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:BasicObject, v24:BasicObject, v25:NilClass):
+          v29:BasicObject = InvokeBuiltin dir_s_open, v20, v21, v22
           PatchPoint NoEPEscape(open)
-          v33:CPtr = GetEP 0
-          v34:CInt64 = LoadField v33, :_env_data_index_flags@0x1004
-          v35:CInt64 = GuardNoBitsSet v34, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
-          v36:CInt64 = LoadField v33, :_env_data_index_specval@0x1005
-          v37:CInt64 = GuardAnyBitSet v36, CUInt64(1)
-          v38:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v35:CPtr = GetEP 0
+          v36:CInt64 = LoadField v35, :_env_data_index_flags@0x1004
+          v37:CInt64 = GuardNoBitsSet v36, VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM=CUInt64(512)
+          v38:CInt64 = LoadField v35, :_env_data_index_specval@0x1005
+          v39:CInt64 = GuardAnyBitSet v38, CUInt64(1)
+          v40:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
           CheckInterrupts
-          v41:CBool[true] = Test v38
-          v42 = RefineType v38, Falsy
-          IfFalse v41, bb4(v18, v19, v20, v21, v22, v27)
-          v44:ObjectSubclass[BlockParamProxy] = RefineType v38, Truthy
-          v48:BasicObject = InvokeBlock, v27 # SendFallbackReason: Uncategorized(invokeblock)
-          v51:BasicObject = InvokeBuiltin dir_s_close, v18, v27
+          v43:CBool[true] = Test v40
+          v44 = RefineType v40, Falsy
+          IfFalse v43, bb4(v20, v21, v22, v23, v24, v29)
+          v46:ObjectSubclass[BlockParamProxy] = RefineType v40, Truthy
+          v50:BasicObject = InvokeBlock, v29 # SendFallbackReason: Uncategorized(invokeblock)
+          v53:BasicObject = InvokeBuiltin dir_s_close, v20, v29
           CheckInterrupts
-          Return v48
-        bb4(v57, v58, v59, v60, v61, v62):
+          Return v50
+        bb4(v59, v60, v61, v62, v63, v64):
           CheckInterrupts
-          Return v62
+          Return v64
         ");
     }
 
@@ -4272,17 +4543,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = InvokeBuiltin gc_enable, v6
-          Jump bb4(v6, v10)
-        bb4(v12:BasicObject, v13:BasicObject):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = InvokeBuiltin gc_enable, v8
+          Jump bb4(v8, v12)
+        bb4(v14:BasicObject, v15:BasicObject):
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -4301,21 +4574,23 @@ pub mod hir_build_tests {
           v4:BasicObject = LoadField v2, :immediate_mark@0x1001
           v5:BasicObject = LoadField v2, :immediate_sweep@0x1002
           v6:BasicObject = LoadField v2, :<empty>@0x1003
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :full_mark@1
-          v11:BasicObject = LoadArg :immediate_mark@2
-          v12:BasicObject = LoadArg :immediate_sweep@3
-          v13:CPtr = GetEP 0
-          v14:BasicObject = LoadField v13, :<empty>@0x1004
-          Jump bb3(v9, v10, v11, v12, v14)
-        bb3(v16:BasicObject, v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject):
-          v27:FalseClass = Const Value(false)
-          v29:BasicObject = InvokeBuiltin gc_start_internal, v16, v17, v18, v19, v27
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :full_mark@1
+          v13:BasicObject = LoadArg :immediate_mark@2
+          v14:BasicObject = LoadArg :immediate_sweep@3
+          v15:CPtr = GetEP 0
+          v16:BasicObject = LoadField v15, :<empty>@0x1004
+          Jump bb3(v11, v12, v13, v14, v16)
+        bb3(v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:BasicObject):
+          v29:FalseClass = Const Value(false)
+          v31:BasicObject = InvokeBuiltin gc_start_internal, v18, v19, v20, v21, v29
           CheckInterrupts
-          Return v29
+          Return v31
         ");
     }
 
@@ -4328,17 +4603,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact = InvokeBuiltin leaf <inline_expr>, v6
-          Jump bb4(v6, v10)
-        bb4(v12:BasicObject, v13:StringExact):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact = InvokeBuiltin leaf <inline_expr>, v8
+          Jump bb4(v8, v12)
+        bb4(v14:BasicObject, v15:StringExact):
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -4351,17 +4628,19 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact = InvokeBuiltin leaf <inline_expr>, v6
-          Jump bb4(v6, v10)
-        bb4(v12:BasicObject, v13:StringExact):
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact = InvokeBuiltin leaf <inline_expr>, v8
+          Jump bb4(v8, v12)
+        bb4(v14:BasicObject, v15:StringExact):
           CheckInterrupts
-          Return v13
+          Return v15
         ");
     }
 
@@ -4378,29 +4657,31 @@ pub mod hir_build_tests {
           v1:BasicObject = LoadSelf
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
+          BumpSP
           Jump bb3(v1, v3)
         bb2():
           EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :x@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          v14:NilClass = Const Value(nil)
-          v17:Fixnum[0] = Const Value(0)
-          v19:Fixnum[1] = Const Value(1)
-          v22:BasicObject = Send v10, :[], v17, v19 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          Jump bb3(v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v16:NilClass = Const Value(nil)
+          v19:Fixnum[0] = Const Value(0)
+          v21:Fixnum[1] = Const Value(1)
+          v24:BasicObject = Send v12, :[], v19, v21 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          v26:CBool = Test v22
-          v27:Truthy = RefineType v22, Truthy
-          IfTrue v26, bb4(v9, v10, v14, v10, v17, v19, v27)
-          v29:Falsy = RefineType v22, Falsy
-          v32:Fixnum[2] = Const Value(2)
-          v35:BasicObject = Send v10, :[]=, v17, v19, v32 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v28:CBool = Test v24
+          v29:Truthy = RefineType v24, Truthy
+          IfTrue v28, bb4(v11, v12, v16, v12, v19, v21, v29)
+          v31:Falsy = RefineType v24, Falsy
+          v34:Fixnum[2] = Const Value(2)
+          v37:BasicObject = Send v12, :[]=, v19, v21, v34 # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v32
-        bb4(v41:BasicObject, v42:BasicObject, v43:NilClass, v44:BasicObject, v45:Fixnum[0], v46:Fixnum[1], v47:Truthy):
+          Return v34
+        bb4(v43:BasicObject, v44:BasicObject, v45:NilClass, v46:BasicObject, v47:Fixnum[0], v48:Fixnum[1], v49:Truthy):
           CheckInterrupts
-          Return v47
+          Return v49
         ");
     }
 
@@ -4415,19 +4696,21 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v12:Fixnum[1] = Const Value(1)
-          v15:BasicObject = ObjToString v12
-          v17:String = AnyToString v12, str: v15
-          v19:StringExact = StringConcat v10, v17
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v14:Fixnum[1] = Const Value(1)
+          v17:BasicObject = ObjToString v14
+          v19:String = AnyToString v14, str: v17
+          v21:StringExact = StringConcat v12, v19
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -4442,24 +4725,26 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
-          v13:BasicObject = ObjToString v10
-          v15:String = AnyToString v10, str: v13
-          v17:Fixnum[2] = Const Value(2)
-          v20:BasicObject = ObjToString v17
-          v22:String = AnyToString v17, str: v20
-          v24:Fixnum[3] = Const Value(3)
-          v27:BasicObject = ObjToString v24
-          v29:String = AnyToString v24, str: v27
-          v31:StringExact = StringConcat v15, v22, v29
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
+          v15:BasicObject = ObjToString v12
+          v17:String = AnyToString v12, str: v15
+          v19:Fixnum[2] = Const Value(2)
+          v22:BasicObject = ObjToString v19
+          v24:String = AnyToString v19, str: v22
+          v26:Fixnum[3] = Const Value(3)
+          v29:BasicObject = ObjToString v26
+          v31:String = AnyToString v26, str: v29
+          v33:StringExact = StringConcat v17, v24, v31
           CheckInterrupts
-          Return v31
+          Return v33
         ");
     }
 
@@ -4474,19 +4759,21 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          v12:NilClass = Const Value(nil)
-          v15:BasicObject = ObjToString v12
-          v17:String = AnyToString v12, str: v15
-          v19:StringExact = StringConcat v10, v17
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v14:NilClass = Const Value(nil)
+          v17:BasicObject = ObjToString v14
+          v19:String = AnyToString v14, str: v17
+          v21:StringExact = StringConcat v12, v19
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -4501,24 +4788,26 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
-          v13:BasicObject = ObjToString v10
-          v15:String = AnyToString v10, str: v13
-          v17:Fixnum[2] = Const Value(2)
-          v20:BasicObject = ObjToString v17
-          v22:String = AnyToString v17, str: v20
-          v24:Fixnum[3] = Const Value(3)
-          v27:BasicObject = ObjToString v24
-          v29:String = AnyToString v24, str: v27
-          v31:RegexpExact = ToRegexp v15, v22, v29
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
+          v15:BasicObject = ObjToString v12
+          v17:String = AnyToString v12, str: v15
+          v19:Fixnum[2] = Const Value(2)
+          v22:BasicObject = ObjToString v19
+          v24:String = AnyToString v19, str: v22
+          v26:Fixnum[3] = Const Value(3)
+          v29:BasicObject = ObjToString v26
+          v31:String = AnyToString v26, str: v29
+          v33:RegexpExact = ToRegexp v17, v24, v31
           CheckInterrupts
-          Return v31
+          Return v33
         ");
     }
 
@@ -4533,21 +4822,23 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:Fixnum[1] = Const Value(1)
-          v13:BasicObject = ObjToString v10
-          v15:String = AnyToString v10, str: v13
-          v17:Fixnum[2] = Const Value(2)
-          v20:BasicObject = ObjToString v17
-          v22:String = AnyToString v17, str: v20
-          v24:RegexpExact = ToRegexp v15, v22, MULTILINE|IGNORECASE|EXTENDED|NOENCODING
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:Fixnum[1] = Const Value(1)
+          v15:BasicObject = ObjToString v12
+          v17:String = AnyToString v12, str: v15
+          v19:Fixnum[2] = Const Value(2)
+          v22:BasicObject = ObjToString v19
+          v24:String = AnyToString v19, str: v22
+          v26:RegexpExact = ToRegexp v17, v24, MULTILINE|IGNORECASE|EXTENDED|NOENCODING
           CheckInterrupts
-          Return v24
+          Return v26
         ");
     }
 
@@ -4564,27 +4855,31 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v12:Fixnum[1] = Const Value(1)
-          Throw TAG_RETURN, v12
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v14:Fixnum[1] = Const Value(1)
+          Throw TAG_RETURN, v14
 
         fn block in <compiled>@<compiled>:3:
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v12:Fixnum[2] = Const Value(2)
-          Throw TAG_BREAK, v12
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v14:Fixnum[2] = Const Value(2)
+          Throw TAG_BREAK, v14
         ");
     }
 
@@ -4600,15 +4895,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = InvokeBlock # SendFallbackReason: Uncategorized(invokeblock)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = InvokeBlock # SendFallbackReason: Uncategorized(invokeblock)
           CheckInterrupts
-          Return v10
+          Return v12
         ");
     }
 
@@ -4627,17 +4924,19 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :x@0x1000
           v4:BasicObject = LoadField v2, :y@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :x@1
-          v9:BasicObject = LoadArg :y@2
-          Jump bb3(v7, v8, v9)
-        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:BasicObject = InvokeBlock, v12, v13 # SendFallbackReason: Uncategorized(invokeblock)
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :x@1
+          v11:BasicObject = LoadArg :y@2
+          Jump bb3(v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v21:BasicObject = InvokeBlock, v14, v15 # SendFallbackReason: Uncategorized(invokeblock)
           CheckInterrupts
-          Return v19
+          Return v21
         ");
     }
 
@@ -4658,26 +4957,28 @@ pub mod hir_build_tests {
           v3:BasicObject = LoadField v2, :o@0x1000
           v4:NilClass = Const Value(nil)
           v5:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5)
         bb2():
           EntryPoint JIT(0)
-          v8:BasicObject = LoadArg :self@0
-          v9:BasicObject = LoadArg :o@1
-          v10:NilClass = Const Value(nil)
-          v11:NilClass = Const Value(nil)
-          Jump bb3(v8, v9, v10, v11)
-        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
-          v22:ArrayExact = GuardType v14, ArrayExact
-          v23:CInt64 = ArrayLength v22
-          v24:CInt64[2] = Const CInt64(2)
-          v25:CInt64 = GuardGreaterEq v23, v24
-          v26:CInt64[1] = Const CInt64(1)
-          v27:BasicObject = ArrayAref v22, v26
-          v28:CInt64[0] = Const CInt64(0)
-          v29:BasicObject = ArrayAref v22, v28
+          BumpSP
+          v10:BasicObject = LoadArg :self@0
+          v11:BasicObject = LoadArg :o@1
+          v12:NilClass = Const Value(nil)
+          v13:NilClass = Const Value(nil)
+          Jump bb3(v10, v11, v12, v13)
+        bb3(v15:BasicObject, v16:BasicObject, v17:NilClass, v18:NilClass):
+          v24:ArrayExact = GuardType v16, ArrayExact
+          v25:CInt64 = ArrayLength v24
+          v26:CInt64[2] = Const CInt64(2)
+          v27:CInt64 = GuardGreaterEq v25, v26
+          v28:CInt64[1] = Const CInt64(1)
+          v29:BasicObject = ArrayAref v24, v28
+          v30:CInt64[0] = Const CInt64(0)
+          v31:BasicObject = ArrayAref v24, v30
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v14
+          Return v16
         ");
     }
 
@@ -4698,15 +4999,17 @@ pub mod hir_build_tests {
           v3:BasicObject = LoadField v2, :o@0x1000
           v4:NilClass = Const Value(nil)
           v5:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5)
         bb2():
           EntryPoint JIT(0)
-          v8:BasicObject = LoadArg :self@0
-          v9:BasicObject = LoadArg :o@1
-          v10:NilClass = Const Value(nil)
-          v11:NilClass = Const Value(nil)
-          Jump bb3(v8, v9, v10, v11)
-        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
+          BumpSP
+          v10:BasicObject = LoadArg :self@0
+          v11:BasicObject = LoadArg :o@1
+          v12:NilClass = Const Value(nil)
+          v13:NilClass = Const Value(nil)
+          Jump bb3(v10, v11, v12, v13)
+        bb3(v15:BasicObject, v16:BasicObject, v17:NilClass, v18:NilClass):
           SideExit UnhandledYARVInsn(expandarray)
         ");
     }
@@ -4729,16 +5032,18 @@ pub mod hir_build_tests {
           v4:NilClass = Const Value(nil)
           v5:NilClass = Const Value(nil)
           v6:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6)
         bb2():
           EntryPoint JIT(0)
-          v9:BasicObject = LoadArg :self@0
-          v10:BasicObject = LoadArg :o@1
-          v11:NilClass = Const Value(nil)
-          v12:NilClass = Const Value(nil)
+          BumpSP
+          v11:BasicObject = LoadArg :self@0
+          v12:BasicObject = LoadArg :o@1
           v13:NilClass = Const Value(nil)
-          Jump bb3(v9, v10, v11, v12, v13)
-        bb3(v15:BasicObject, v16:BasicObject, v17:NilClass, v18:NilClass, v19:NilClass):
+          v14:NilClass = Const Value(nil)
+          v15:NilClass = Const Value(nil)
+          Jump bb3(v11, v12, v13, v14, v15)
+        bb3(v17:BasicObject, v18:BasicObject, v19:NilClass, v20:NilClass, v21:NilClass):
           SideExit UnhandledYARVInsn(expandarray)
         ");
     }
@@ -4757,28 +5062,30 @@ pub mod hir_build_tests {
           v2:CPtr = LoadSP
           v3:BasicObject = LoadField v2, :kw@0x1000
           v4:BasicObject = LoadField v2, :<empty>@0x1001
+          BumpSP
           Jump bb3(v1, v3, v4)
         bb2():
           EntryPoint JIT(0)
-          v7:BasicObject = LoadArg :self@0
-          v8:BasicObject = LoadArg :kw@1
-          v9:CPtr = GetEP 0
-          v10:BasicObject = LoadField v9, :<empty>@0x1002
-          Jump bb3(v7, v8, v10)
-        bb3(v12:BasicObject, v13:BasicObject, v14:BasicObject):
-          v17:BoolExact = FixnumBitCheck v14, 0
+          BumpSP
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :kw@1
+          v11:CPtr = GetEP 0
+          v12:BasicObject = LoadField v11, :<empty>@0x1002
+          Jump bb3(v9, v10, v12)
+        bb3(v14:BasicObject, v15:BasicObject, v16:BasicObject):
+          v19:BoolExact = FixnumBitCheck v16, 0
           CheckInterrupts
-          v20:CBool = Test v17
-          v21:TrueClass = RefineType v17, Truthy
-          IfTrue v20, bb4(v12, v13, v14)
-          v23:FalseClass = RefineType v17, Falsy
-          v25:Fixnum[1] = Const Value(1)
+          v22:CBool = Test v19
+          v23:TrueClass = RefineType v19, Truthy
+          IfTrue v22, bb4(v14, v15, v16)
+          v25:FalseClass = RefineType v19, Falsy
           v27:Fixnum[1] = Const Value(1)
-          v30:BasicObject = Send v25, :+, v27 # SendFallbackReason: Uncategorized(opt_plus)
-          Jump bb4(v12, v30, v14)
-        bb4(v33:BasicObject, v34:BasicObject, v35:BasicObject):
+          v29:Fixnum[1] = Const Value(1)
+          v32:BasicObject = Send v27, :+, v29 # SendFallbackReason: Uncategorized(opt_plus)
+          Jump bb4(v14, v32, v16)
+        bb4(v35:BasicObject, v36:BasicObject, v37:BasicObject):
           CheckInterrupts
-          Return v34
+          Return v36
         ");
     }
 
@@ -4834,47 +5141,49 @@ pub mod hir_build_tests {
           v34:BasicObject = LoadField v2, :k32@0x101f
           v35:BasicObject = LoadField v2, :k33@0x1020
           v36:BasicObject = LoadField v2, :<empty>@0x1021
+          BumpSP
           Jump bb3(v1, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36)
         bb2():
           EntryPoint JIT(0)
-          v39:BasicObject = LoadArg :self@0
-          v40:BasicObject = LoadArg :k1@1
-          v41:BasicObject = LoadArg :k2@2
-          v42:BasicObject = LoadArg :k3@3
-          v43:BasicObject = LoadArg :k4@4
-          v44:BasicObject = LoadArg :k5@5
-          v45:BasicObject = LoadArg :k6@6
-          v46:BasicObject = LoadArg :k7@7
-          v47:BasicObject = LoadArg :k8@8
-          v48:BasicObject = LoadArg :k9@9
-          v49:BasicObject = LoadArg :k10@10
-          v50:BasicObject = LoadArg :k11@11
-          v51:BasicObject = LoadArg :k12@12
-          v52:BasicObject = LoadArg :k13@13
-          v53:BasicObject = LoadArg :k14@14
-          v54:BasicObject = LoadArg :k15@15
-          v55:BasicObject = LoadArg :k16@16
-          v56:BasicObject = LoadArg :k17@17
-          v57:BasicObject = LoadArg :k18@18
-          v58:BasicObject = LoadArg :k19@19
-          v59:BasicObject = LoadArg :k20@20
-          v60:BasicObject = LoadArg :k21@21
-          v61:BasicObject = LoadArg :k22@22
-          v62:BasicObject = LoadArg :k23@23
-          v63:BasicObject = LoadArg :k24@24
-          v64:BasicObject = LoadArg :k25@25
-          v65:BasicObject = LoadArg :k26@26
-          v66:BasicObject = LoadArg :k27@27
-          v67:BasicObject = LoadArg :k28@28
-          v68:BasicObject = LoadArg :k29@29
-          v69:BasicObject = LoadArg :k30@30
-          v70:BasicObject = LoadArg :k31@31
-          v71:BasicObject = LoadArg :k32@32
-          v72:BasicObject = LoadArg :k33@33
-          v73:CPtr = GetEP 0
-          v74:BasicObject = LoadField v73, :<empty>@0x1022
-          Jump bb3(v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62, v63, v64, v65, v66, v67, v68, v69, v70, v71, v72, v74)
-        bb3(v76:BasicObject, v77:BasicObject, v78:BasicObject, v79:BasicObject, v80:BasicObject, v81:BasicObject, v82:BasicObject, v83:BasicObject, v84:BasicObject, v85:BasicObject, v86:BasicObject, v87:BasicObject, v88:BasicObject, v89:BasicObject, v90:BasicObject, v91:BasicObject, v92:BasicObject, v93:BasicObject, v94:BasicObject, v95:BasicObject, v96:BasicObject, v97:BasicObject, v98:BasicObject, v99:BasicObject, v100:BasicObject, v101:BasicObject, v102:BasicObject, v103:BasicObject, v104:BasicObject, v105:BasicObject, v106:BasicObject, v107:BasicObject, v108:BasicObject, v109:BasicObject, v110:BasicObject):
+          BumpSP
+          v41:BasicObject = LoadArg :self@0
+          v42:BasicObject = LoadArg :k1@1
+          v43:BasicObject = LoadArg :k2@2
+          v44:BasicObject = LoadArg :k3@3
+          v45:BasicObject = LoadArg :k4@4
+          v46:BasicObject = LoadArg :k5@5
+          v47:BasicObject = LoadArg :k6@6
+          v48:BasicObject = LoadArg :k7@7
+          v49:BasicObject = LoadArg :k8@8
+          v50:BasicObject = LoadArg :k9@9
+          v51:BasicObject = LoadArg :k10@10
+          v52:BasicObject = LoadArg :k11@11
+          v53:BasicObject = LoadArg :k12@12
+          v54:BasicObject = LoadArg :k13@13
+          v55:BasicObject = LoadArg :k14@14
+          v56:BasicObject = LoadArg :k15@15
+          v57:BasicObject = LoadArg :k16@16
+          v58:BasicObject = LoadArg :k17@17
+          v59:BasicObject = LoadArg :k18@18
+          v60:BasicObject = LoadArg :k19@19
+          v61:BasicObject = LoadArg :k20@20
+          v62:BasicObject = LoadArg :k21@21
+          v63:BasicObject = LoadArg :k22@22
+          v64:BasicObject = LoadArg :k23@23
+          v65:BasicObject = LoadArg :k24@24
+          v66:BasicObject = LoadArg :k25@25
+          v67:BasicObject = LoadArg :k26@26
+          v68:BasicObject = LoadArg :k27@27
+          v69:BasicObject = LoadArg :k28@28
+          v70:BasicObject = LoadArg :k29@29
+          v71:BasicObject = LoadArg :k30@30
+          v72:BasicObject = LoadArg :k31@31
+          v73:BasicObject = LoadArg :k32@32
+          v74:BasicObject = LoadArg :k33@33
+          v75:CPtr = GetEP 0
+          v76:BasicObject = LoadField v75, :<empty>@0x1022
+          Jump bb3(v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62, v63, v64, v65, v66, v67, v68, v69, v70, v71, v72, v73, v74, v76)
+        bb3(v78:BasicObject, v79:BasicObject, v80:BasicObject, v81:BasicObject, v82:BasicObject, v83:BasicObject, v84:BasicObject, v85:BasicObject, v86:BasicObject, v87:BasicObject, v88:BasicObject, v89:BasicObject, v90:BasicObject, v91:BasicObject, v92:BasicObject, v93:BasicObject, v94:BasicObject, v95:BasicObject, v96:BasicObject, v97:BasicObject, v98:BasicObject, v99:BasicObject, v100:BasicObject, v101:BasicObject, v102:BasicObject, v103:BasicObject, v104:BasicObject, v105:BasicObject, v106:BasicObject, v107:BasicObject, v108:BasicObject, v109:BasicObject, v110:BasicObject, v111:BasicObject, v112:BasicObject):
           SideExit TooManyKeywordParameters
         ");
     }
@@ -4887,44 +5196,46 @@ pub mod hir_build_tests {
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
           v2:NilClass = Const Value(nil)
+          BumpSP
           Jump bb3(v1, v2)
         bb2():
           EntryPoint JIT(0)
-          v5:BasicObject = LoadArg :self@0
-          v6:NilClass = Const Value(nil)
-          Jump bb3(v5, v6)
-        bb3(v8:BasicObject, v9:NilClass):
-          v13:NilClass = Const Value(nil)
-          v15:TrueClass|NilClass = Defined yield, v13
-          v17:CBool = Test v15
-          v18:NilClass = RefineType v15, Falsy
-          IfFalse v17, bb4(v8, v9)
-          v20:TrueClass = RefineType v15, Truthy
-          Jump bb6(v8, v9)
-        bb4(v23:BasicObject, v24:NilClass):
-          v28:BasicObject = InvokeBuiltin <inline_expr>, v23
-          Jump bb5(v23, v24, v28)
-        bb5(v40:BasicObject, v41:NilClass, v42:BasicObject):
+          BumpSP
+          v7:BasicObject = LoadArg :self@0
+          v8:NilClass = Const Value(nil)
+          Jump bb3(v7, v8)
+        bb3(v10:BasicObject, v11:NilClass):
+          v15:NilClass = Const Value(nil)
+          v17:TrueClass|NilClass = Defined yield, v15
+          v19:CBool = Test v17
+          v20:NilClass = RefineType v17, Falsy
+          IfFalse v19, bb4(v10, v11)
+          v22:TrueClass = RefineType v17, Truthy
+          Jump bb6(v10, v11)
+        bb4(v25:BasicObject, v26:NilClass):
+          v30:BasicObject = InvokeBuiltin <inline_expr>, v25
+          Jump bb5(v25, v26, v30)
+        bb5(v42:BasicObject, v43:NilClass, v44:BasicObject):
           CheckInterrupts
-          Return v42
-        bb6(v30:BasicObject, v31:NilClass):
-          v35:Fixnum[0] = Const Value(0)
-          Jump bb8(v30, v35)
-        bb8(v48:BasicObject, v49:Fixnum):
-          v52:BoolExact = InvokeBuiltin rb_jit_ary_at_end, v48, v49
-          v54:CBool = Test v52
-          v55:FalseClass = RefineType v52, Falsy
-          IfFalse v54, bb7(v48, v49)
-          v57:TrueClass = RefineType v52, Truthy
-          v59:NilClass = Const Value(nil)
+          Return v44
+        bb6(v32:BasicObject, v33:NilClass):
+          v37:Fixnum[0] = Const Value(0)
+          Jump bb8(v32, v37)
+        bb8(v50:BasicObject, v51:Fixnum):
+          v54:BoolExact = InvokeBuiltin rb_jit_ary_at_end, v50, v51
+          v56:CBool = Test v54
+          v57:FalseClass = RefineType v54, Falsy
+          IfFalse v56, bb7(v50, v51)
+          v59:TrueClass = RefineType v54, Truthy
+          v61:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v48
-        bb7(v67:BasicObject, v68:Fixnum):
-          v72:BasicObject = InvokeBuiltin rb_jit_ary_at, v67, v68
-          v74:BasicObject = InvokeBlock, v72 # SendFallbackReason: Uncategorized(invokeblock)
-          v78:Fixnum = InvokeBuiltin rb_jit_fixnum_inc, v67, v68
+          Return v50
+        bb7(v69:BasicObject, v70:Fixnum):
+          v74:BasicObject = InvokeBuiltin rb_jit_ary_at, v69, v70
+          v76:BasicObject = InvokeBlock, v74 # SendFallbackReason: Uncategorized(invokeblock)
+          v80:Fixnum = InvokeBuiltin rb_jit_fixnum_inc, v69, v70
           PatchPoint NoEPEscape(each)
-          Jump bb8(v67, v78)
+          Jump bb8(v69, v80)
         ");
     }
 
@@ -4944,15 +5255,17 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetConstantPath 0x1000
-          v12:BasicObject = Send v10, :induce_side_exit! # SendFallbackReason: Uncategorized(opt_send_without_block)
-          v16:BasicObject = GetConstantPath 0x1000
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetConstantPath 0x1000
+          v14:BasicObject = Send v12, :induce_side_exit! # SendFallbackReason: Uncategorized(opt_send_without_block)
+          v18:BasicObject = GetConstantPath 0x1000
           SideExit DirectiveInduced
         ");
     }
@@ -4975,16 +5288,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetConstantPath 0x1000
-          v12:BasicObject = Send v10, :induce_side_exit! # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetConstantPath 0x1000
+          v14:BasicObject = Send v12, :induce_side_exit! # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
@@ -5013,16 +5328,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetConstantPath 0x1000
-          v12:BasicObject = Send v10, :induce_compile_failure! # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetConstantPath 0x1000
+          v14:BasicObject = Send v12, :induce_compile_failure! # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
@@ -5034,16 +5351,18 @@ pub mod hir_build_tests {
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
+          BumpSP
           Jump bb3(v1)
         bb2():
           EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:BasicObject = GetConstantPath 0x1000
-          v12:BasicObject = Send v10, :induce_compile_failure! # SendFallbackReason: Uncategorized(opt_send_without_block)
+          BumpSP
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v8:BasicObject):
+          v12:BasicObject = GetConstantPath 0x1000
+          v14:BasicObject = Send v12, :induce_compile_failure! # SendFallbackReason: Uncategorized(opt_send_without_block)
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
