@@ -1,4 +1,4 @@
-use crate::cruby::{IseqPtr, VALUE};
+use crate::cruby::{IseqPtr, VALUE, rb_get_iseq_body_stack_max};
 use crate::state::ZJITState;
 
 #[derive(Debug)]
@@ -7,13 +7,17 @@ pub struct JITFrame {
     pub pc: *const VALUE,
     pub iseq: IseqPtr, // marked in rb_execution_context_mark
     pub materialize_block_code: bool,
+    pub sp_offset: u32, // cfp->sp - sp_offset = actual SP (for GC marking)
 }
 
 impl JITFrame {
     /// Allocate a new JITFrame on the heap and register it with ZJITState.
     /// Returns a raw pointer that remains valid for the lifetime of the process.
-    pub fn new(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
-        let jit_frame = Box::new(JITFrame { pc, iseq, materialize_block_code });
+    /// sp_offset = stack_max - stack_size, so rb_zjit_cfp_sp can compute
+    /// actual SP as cfp->sp - sp_offset without depending on EP.
+    pub fn new(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool, stack_size: u32) -> *const Self {
+        let stack_max = if iseq.is_null() { 0 } else { unsafe { rb_get_iseq_body_stack_max(iseq) } };
+        let jit_frame = Box::new(JITFrame { pc, iseq, materialize_block_code, sp_offset: stack_max - stack_size });
         let raw_ptr = Box::into_raw(jit_frame) as *const _;
         ZJITState::get_jit_frames().push(raw_ptr);
         raw_ptr

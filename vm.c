@@ -3723,16 +3723,25 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);
-        VALUE *p = ec->vm_stack;
-        VALUE *sp = ec->cfp->sp;
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
-        for (long i = 0; i < (long)(sp - p); i++) {
-            rb_gc_mark_movable(p[i]);
-        }
+        // For ZJIT ISEQ frames, cfp->sp is bumped to max stack size on entry.
+        // Use the actual stack size from JITFrame to avoid marking uninitialized
+        // slots in the hole between actual usage and max. For leaf calls,
+        // stack_size=0 since stack values live on the C stack, not the VM stack.
+        VALUE *cur_sp = rb_zjit_cfp_sp(cfp);
 
         while (cfp != limit_cfp) {
+            // Mark VM stack values from this frame's actual SP up to cur_sp.
+            // For ZJIT ISEQ frames, zjit_cfp_sp uses JITFrame's stack_size
+            // instead of cfp->sp to skip uninitialized holes above actual usage.
+            VALUE *this_sp = rb_zjit_cfp_sp(cfp);
+            for (VALUE *v = this_sp; v < cur_sp; v++) {
+                rb_gc_mark_movable(*v);
+            }
+            cur_sp = this_sp;
+
             const VALUE *ep = cfp->ep;
             VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
 
@@ -3762,6 +3771,10 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
             }
 
             cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+        }
+        // Mark from vm_stack base up to the outermost frame's SP
+        for (VALUE *v = ec->vm_stack; v < cur_sp; v++) {
+            rb_gc_mark_movable(*v);
         }
     }
 

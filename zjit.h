@@ -15,6 +15,7 @@ typedef struct zjit_jit_frame {
     const VALUE *pc;
     const rb_iseq_t *iseq; // marked in rb_execution_context_mark
     bool materialize_block_code;
+    uint32_t sp_offset; // cfp->sp - sp_offset = actual SP (for GC marking)
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
@@ -106,6 +107,20 @@ rb_zjit_cfp_iseq(const rb_control_frame_t *cfp)
     }
     else {
         return cfp->iseq;
+    }
+}
+
+// Returns the actual SP for a frame. For ZJIT ISEQ frames where cfp->sp is
+// bumped to max stack size, this subtracts sp_offset to get the actual usage.
+// For all other frames (interpreter, C frames), returns cfp->sp as-is.
+static inline VALUE*
+rb_zjit_cfp_sp(const rb_control_frame_t *cfp)
+{
+    if (rb_zjit_enabled_p && CFP_JIT_RETURN(cfp)) {
+        return cfp->sp - ((const zjit_jit_frame_t *)cfp->jit_return)->sp_offset;
+    }
+    else {
+        return cfp->sp;
     }
 }
 
