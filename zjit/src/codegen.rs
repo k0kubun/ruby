@@ -988,7 +988,7 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, caller_stack_size);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1082,7 +1082,7 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, caller_stack_size);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1513,8 +1513,9 @@ fn gen_send_iseq_direct(
 
     // Save cfp->pc and cfp->sp for the caller frame
     // Can't use gen_prepare_non_leaf_call because we need special SP math.
-    gen_save_pc_for_gc(asm, state);
-    gen_save_sp(asm, state.stack().len() - args.len() - 1); // -1 for receiver
+    let caller_stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
+    gen_save_pc_for_gc(asm, state, caller_stack_size);
+    gen_save_sp(asm, caller_stack_size);
 
     gen_spill_locals(jit, asm, state);
     gen_spill_stack(jit, asm, state);
@@ -2101,6 +2102,13 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         });
     }
     asm.frame_setup(&[]);
+
+    let stack_max = unsafe { get_iseq_body_stack_max(jit.iseq) } as i32;
+    if stack_max > 0 {
+        asm_comment!(asm, "bump cfp->sp to max stack size: {}", stack_max);
+        let max_sp = asm.lea(Opnd::mem(64, SP, stack_max * SIZEOF_VALUE_I32));
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), max_sp);
+    }
 }
 
 /// Compile code that exits from JIT code with a return value
@@ -2618,10 +2626,10 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
     false
 }
 
-/// Save only the PC to CFP. Use this when you need to call gen_save_sp()
-/// immediately after with a custom stack size (e.g., gen_ccall_with_frame
-/// adjusts SP to exclude receiver and arguments).
-fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
+/// Save the PC and stack_size to CFP via JITFrame. Use this when you need to
+/// call gen_save_sp() immediately after with a custom stack size (e.g.,
+/// gen_ccall_with_frame adjusts SP to exclude receiver and arguments).
+fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState, stack_size: usize) {
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
@@ -2630,7 +2638,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     if let Some(pc) = PC_POISON {
         asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
     }
-    let jit_frame = JITFrame::new(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
+    let jit_frame = JITFrame::new(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq), stack_size as u32);
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
 }
 
@@ -2643,8 +2651,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
 /// However, to avoid marking uninitialized stack slots, this also updates SP,
 /// which may have cfp->sp for a past frame or a past non-leaf call.
 fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
-    gen_save_sp(asm, state.stack_size());
+    gen_save_pc_for_gc(asm, state, state.stack_size());
     if leaf {
         asm.expect_leaf_ccall(state.stack_size());
     }
@@ -2665,16 +2672,17 @@ fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
     // VM stack slots on leaf calls, which leaves those stack slots uninitialized. ZJIT keeps
     // live objects on the C stack, so they are protected from GC properly.
     gen_prepare_call_with_gc(asm, &state.without_stack(), true);
+    // Write cfp->sp = base so GC doesn't scan stale stack slots from a previous call
+    gen_save_sp(asm, 0);
 }
 
-/// Save the current SP on the CFP
+/// Write SP for interpreter dispatch (side-exit, non-leaf call, etc.)
 fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     // Update cfp->sp which will be read by the interpreter. We also have the SP register in JIT
     // code, and ZJIT's codegen currently assumes the SP register doesn't move, e.g. gen_param().
     // So we don't update the SP register here. We could update the SP register to avoid using
     // an extra register for asm.lea(), but you'll need to manage the SP offset like YJIT does.
-    gen_incr_counter(asm, Counter::vm_write_sp_count);
-    asm_comment!(asm, "save SP to CFP: {}", stack_size);
+    asm_comment!(asm, "save SP for interpreter dispatch: {}", stack_size);
     let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
@@ -2708,6 +2716,8 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
     gen_prepare_call_with_gc(asm, state, false);
+    // Non-leaf C functions may read cfp->sp, so write the correct SP
+    gen_save_sp(asm, state.stack_size());
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
@@ -2780,7 +2790,7 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
         // Without this, stale data from a previous frame occupying this CFP slot
         // can be used as an ifunc pointer, causing a segfault.
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
-        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), false);
+        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), false, 0);
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
     }
 

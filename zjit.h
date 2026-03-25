@@ -15,6 +15,7 @@ typedef struct zjit_jit_frame {
     const VALUE *pc;
     const rb_iseq_t *iseq; // marked in rb_execution_context_mark
     bool materialize_block_code;
+    uint32_t stack_size; // actual number of stack slots in use (for SP materialization and GC)
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
