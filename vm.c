@@ -3717,25 +3717,34 @@ mark_local_storage_i(VALUE local, void *data)
     return ID_TABLE_CONTINUE;
 }
 
+// end is exclusive
+static inline void
+mark_stack_range(VALUE *start, VALUE *end)
+{
+    while (start != end) {
+        rb_gc_mark_movable(*start);
+        start++;
+    }
+}
+
 void
 rb_execution_context_mark(const rb_execution_context_t *ec)
 {
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);
-        VALUE *p = ec->vm_stack;
         VALUE *sp = ec->cfp->sp;
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
-        for (long i = 0; i < (long)(sp - p); i++) {
-            rb_gc_mark_movable(p[i]);
-        }
+        //for (long i = 0; i < (long)(sp - p); i++) {
+        //    rb_gc_mark_movable(p[i]);
+        //}
 
+        VALUE *cur_sp = sp;
         while (cfp != limit_cfp) {
             const VALUE *ep = cfp->ep;
             VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
-
             rb_gc_mark_movable(cfp->self);
             rb_gc_mark_movable((VALUE)rb_zjit_cfp_iseq(cfp));
             // Mark block_code directly (not through rb_zjit_cfp_block_code)
@@ -3761,8 +3770,12 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
                 }
             }
 
+            mark_stack_range(cfp->sp, cur_sp); // scan the stack of the previous cfp
+            cur_sp = cfp->sp;
+
             cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
         }
+        mark_stack_range(ec->vm_stack, cur_sp); // scan the stack of the last cfp
     }
 
     /* mark machine stack */
