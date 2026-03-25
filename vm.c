@@ -3674,14 +3674,13 @@ rb_execution_context_update(rb_execution_context_t *ec)
             if (rb_zjit_enabled_p && CFP_JIT_RETURN(cfp)) {
                 zjit_jit_frame_t *jit_frame = (zjit_jit_frame_t *)cfp->jit_return;
                 if (jit_frame->iseq) {
-                    // ISEQ frame with JITFrame: relocate iseq in JITFrame
                     jit_frame->iseq = (const rb_iseq_t *)rb_gc_location((VALUE)jit_frame->iseq);
                 }
-                // block_code must always be relocated. For ISEQ frames, the JIT caller
-                // may have written it (gen_block_handler_specval) for passing blocks.
-                // For C frames, rb_iterate0 may have written an ifunc to block_code
-                // after the JIT pushed the frame. NULL is safe to pass to rb_gc_location.
-                cfp->block_code = (void *)rb_gc_location((VALUE)cfp->block_code);
+                if (!jit_frame->materialize_block_code) {
+                    // ISEQ frame: block_code may have been written by the JIT
+                    cfp->block_code = (void *)rb_gc_location((VALUE)cfp->block_code);
+                }
+                // C frame (materialize_block_code=true): block_code is stale, skip
             }
             else {
                 cfp->iseq = (rb_iseq_t *)rb_gc_location((VALUE)cfp->iseq);
@@ -3738,9 +3737,13 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
 
             rb_gc_mark_movable(cfp->self);
             rb_gc_mark_movable((VALUE)rb_zjit_cfp_iseq(cfp));
-            // Mark block_code directly (not through rb_zjit_cfp_block_code)
-            // because rb_iterate0 may write a valid ifunc after JIT frame push.
-            rb_gc_mark_movable((VALUE)cfp->block_code);
+            if (rb_zjit_enabled_p && CFP_JIT_RETURN(cfp) &&
+                ((const zjit_jit_frame_t *)cfp->jit_return)->materialize_block_code) {
+                // block_code is stale (C frame before rb_iterate0 writes to it). Skip.
+            }
+            else {
+                rb_gc_mark_movable((VALUE)cfp->block_code);
+            }
 
             if (VM_ENV_LOCAL_P(ep) && VM_ENV_BOXED_P(ep)) {
                 const rb_box_t *box = VM_ENV_BOX(ep);

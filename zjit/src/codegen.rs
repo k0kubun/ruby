@@ -2775,12 +2775,10 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
         }
         let new_sp = asm.lea(Opnd::mem(64, SP, (ep_offset + 1) * SIZEOF_VALUE_I32));
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SP), new_sp);
-        // block_code must be written explicitly because the interpreter reads
-        // captured->code.ifunc directly from cfp->block_code (not through JITFrame).
-        // Without this, stale data from a previous frame occupying this CFP slot
-        // can be used as an ifunc pointer, causing a segfault.
-        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
-        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), false);
+        // block_code is left stale here. rb_iterate0 will write a valid ifunc
+        // and clear jit_return before anyone reads it. GC skips stale block_code
+        // when materialize_block_code is true.
+        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), true);
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
     }
 

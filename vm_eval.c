@@ -1492,6 +1492,13 @@ rb_iterate0(VALUE (* it_proc) (VALUE), VALUE data1,
             if (ifunc) {
                 struct rb_captured_block *captured = VM_CFP_TO_CAPTURED_BLOCK(cfp);
                 captured->code.ifunc = ifunc;
+                // If ZJIT pushed this frame with a lightweight JITFrame,
+                // clear it so GC and block_code readers see the real ifunc.
+                // Also write iseq=0 so GC can safely relocate after clearing.
+                if (CFP_JIT_RETURN(cfp)) {
+                    cfp->iseq = 0;
+                    cfp->jit_return = 0;
+                }
                 block_handler = VM_BH_FROM_IFUNC_BLOCK(captured);
             }
             else {
