@@ -873,6 +873,8 @@ pub enum Insn {
     LoadEC,
     /// Load SP
     LoadSP,
+    /// Bump SP to stack_max
+    BumpSP,
     /// Load cfp->self
     LoadSelf,
     LoadField { recv: InsnId, id: ID, offset: i32, return_type: Type },
@@ -1095,6 +1097,7 @@ macro_rules! for_each_operand_impl {
             | Insn::EntryPoint { .. }
             | Insn::LoadPC
             | Insn::LoadSP
+            | Insn::BumpSP
             | Insn::LoadEC
             | Insn::GetEP { .. }
             | Insn::LoadSelf
@@ -1378,7 +1381,7 @@ impl Insn {
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
-            | Insn::CheckInterrupts { .. } | Insn::BreakPoint
+            | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::BumpSP
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
             | Insn::ArrayAset { .. } => false,
             _ => true,
@@ -1501,6 +1504,7 @@ impl Insn {
             Insn::LoadPC { .. } => Effect::read_write(abstract_heaps::PC, abstract_heaps::Empty),
             Insn::LoadEC { .. } => effects::Empty,
             Insn::LoadSP { .. } => effects::Empty,
+            Insn::BumpSP { .. } => effects::Any,
             // GetEP reads from the current frame pointer (abstract_heaps::Frame) and also traverses previous frames too.
             Insn::GetEP { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::LoadSelf { .. } => Effect::read_write(abstract_heaps::Frame, abstract_heaps::Empty),
@@ -2017,6 +2021,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::LoadPC => write!(f, "LoadPC"),
             Insn::LoadEC => write!(f, "LoadEC"),
             Insn::LoadSP => write!(f, "LoadSP"),
+            Insn::BumpSP => write!(f, "BumpSP"),
             &Insn::GetEP { level } => write!(f, "GetEP {level}"),
             Insn::LoadSelf => write!(f, "LoadSelf"),
             &Insn::LoadField { recv, id, offset, return_type: _ } => {
@@ -2640,6 +2645,7 @@ impl Function {
                     | LoadPC
                     | LoadSP
                     | LoadEC
+                    | BumpSP
                     | GetEP {..}
                     | LoadSelf
                     | BreakPoint
@@ -2877,7 +2883,7 @@ impl Function {
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
-            | Insn::CheckInterrupts { .. } | Insn::BreakPoint
+            | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::BumpSP
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn.0]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -5922,6 +5928,7 @@ impl Function {
             | Insn::LoadPC
             | Insn::LoadSP
             | Insn::LoadEC
+            | Insn::BumpSP
             | Insn::GetEP { .. }
             | Insn::BreakPoint
             | Insn::LoadSelf
@@ -8268,6 +8275,7 @@ fn compile_entry_state(fun: &mut Function) -> (InsnId, FrameState) {
             entry_state.locals.push(fun.push_insn(entry_block, Insn::Const { val: Const::Value(Qnil) }));
         }
     }
+    fun.push_insn(entry_block, Insn::BumpSP);
     (self_param, entry_state)
 }
 
@@ -8275,6 +8283,7 @@ fn compile_entry_state(fun: &mut Function) -> (InsnId, FrameState) {
 fn compile_jit_entry_block(fun: &mut Function, jit_entry_idx: usize, target_block: BlockId) {
     let jit_entry_block = fun.jit_entry_blocks[jit_entry_idx];
     fun.push_insn(jit_entry_block, Insn::EntryPoint { jit_entry_idx: Some(jit_entry_idx) });
+    fun.push_insn(jit_entry_block, Insn::BumpSP);
 
     // Prepare entry_state with basic block params
     let (self_param, entry_state) = compile_jit_entry_state(fun, jit_entry_block, jit_entry_idx);

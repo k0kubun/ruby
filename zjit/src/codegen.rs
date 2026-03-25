@@ -688,6 +688,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::LoadPC => gen_load_pc(asm),
         Insn::LoadEC => gen_load_ec(),
         Insn::LoadSP => gen_load_sp(),
+        Insn::BumpSP => no_output!(gen_bump_sp(jit, asm)),
         &Insn::GetEP { level } => gen_get_ep(asm, level),
         Insn::LoadSelf => gen_load_self(),
         &Insn::LoadField { recv, id, offset, return_type } => gen_load_field(asm, opnd!(recv), id, offset, return_type),
@@ -1303,6 +1304,15 @@ fn gen_load_ec() -> Opnd {
 
 fn gen_load_sp() -> Opnd {
     SP
+}
+
+fn gen_bump_sp(jit: &mut JITState, asm: &mut Assembler) {
+    let stack_max = unsafe { get_iseq_body_stack_max(jit.iseq) } as i32;
+    if stack_max > 0 {
+        asm_comment!(asm, "bump cfp->sp to max stack size: {}", stack_max);
+        let max_sp = asm.lea(Opnd::mem(64, SP, stack_max * SIZEOF_VALUE_I32));
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), max_sp);
+    }
 }
 
 fn gen_load_self() -> Opnd {
@@ -2102,13 +2112,6 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         });
     }
     asm.frame_setup(&[]);
-
-    let stack_max = unsafe { get_iseq_body_stack_max(jit.iseq) } as i32;
-    if stack_max > 0 {
-        asm_comment!(asm, "bump cfp->sp to max stack size: {}", stack_max);
-        let max_sp = asm.lea(Opnd::mem(64, SP, stack_max * SIZEOF_VALUE_I32));
-        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), max_sp);
-    }
 }
 
 /// Compile code that exits from JIT code with a return value
@@ -2714,6 +2717,8 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
     gen_prepare_call_with_gc(asm, state, false);
+    // Non-leaf C functions may read cfp->sp, so write the correct SP
+    gen_save_sp(asm, state.stack_size());
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
