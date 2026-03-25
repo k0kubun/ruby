@@ -2672,8 +2672,6 @@ fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
     // VM stack slots on leaf calls, which leaves those stack slots uninitialized. ZJIT keeps
     // live objects on the C stack, so they are protected from GC properly.
     gen_prepare_call_with_gc(asm, &state.without_stack(), true);
-    // Write cfp->sp = base so GC doesn't scan stale stack slots from a previous call
-    gen_save_sp(asm, 0);
 }
 
 /// Write SP for interpreter dispatch (side-exit, non-leaf call, etc.)
@@ -2716,8 +2714,6 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
     gen_prepare_call_with_gc(asm, state, false);
-    // Non-leaf C functions may read cfp->sp, so write the correct SP
-    gen_save_sp(asm, state.stack_size());
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
