@@ -15,7 +15,7 @@ typedef struct zjit_jit_frame {
     const VALUE *pc;
     const rb_iseq_t *iseq; // marked in rb_execution_context_mark
     bool materialize_block_code;
-    uint32_t stack_size; // actual number of stack slots in use (for SP materialization and GC)
+    uint32_t sp_offset;
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
@@ -96,6 +96,17 @@ rb_zjit_cfp_pc(const rb_control_frame_t *cfp)
     }
     else {
         return cfp->pc;
+    }
+}
+
+static inline VALUE*
+rb_zjit_cfp_sp(const rb_control_frame_t *cfp)
+{
+    if (rb_zjit_enabled_p && CFP_JIT_RETURN(cfp)) {
+        return cfp->sp - ((const zjit_jit_frame_t *)cfp->jit_return)->sp_offset;
+    }
+    else {
+        return cfp->sp;
     }
 }
 

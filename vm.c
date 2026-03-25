@@ -3733,7 +3733,7 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);
-        VALUE *sp = ec->cfp->sp;
+        VALUE *sp = rb_zjit_cfp_sp(ec->cfp);
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
@@ -3771,7 +3771,7 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
             }
 
             mark_stack_range(cfp->sp, cur_sp); // scan the stack of the previous cfp
-            cur_sp = cfp->sp;
+            cur_sp = rb_zjit_cfp_sp(cfp);
 
             cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
         }
