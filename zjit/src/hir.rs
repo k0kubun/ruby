@@ -698,6 +698,9 @@ pub enum SendFallbackReason {
     SuperPolymorphic,
     /// The `super` target call uses a complex argument pattern that the optimizer does not support.
     SuperTargetComplexArgsPass,
+    /// Fallback path for a guard type check on the final ISEQ version.
+    /// This Send must stay generic and not be re-specialized by later passes.
+    GuardTypeFallback,
     /// Initial fallback reason for every instruction, which should be mutated to
     /// a more actionable reason when an attempt to specialize the instruction fails.
     Uncategorized(ruby_vminsn_type),
@@ -745,6 +748,7 @@ impl Display for SendFallbackReason {
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             SuperTargetComplexArgsPass => write!(f, "super: complex argument passing to `super` target call"),
+            GuardTypeFallback => write!(f, "GuardType: fallback on final version"),
             Uncategorized(insn) => write!(f, "Uncategorized({})", insn_name(*insn as usize)),
         }
     }
@@ -2368,6 +2372,10 @@ pub struct Function {
     /// Whether previously, a function for this ISEQ was invalidated due to
     /// singleton class creation (violation of NoSingletonClass invariant).
     was_invalidated_for_singleton_class_creation: bool,
+    /// Whether this is the final version of the ISEQ (no more recompilations allowed).
+    /// On the final version, GuardType instructions are replaced with fallback Send branches
+    /// instead of side exits.
+    is_final_version: bool,
     /// The types for the parameters of this function. They are copied to the type
     /// of entry block params after infer_types() fills Empty to all insn_types.
     param_types: Vec<Type>,
@@ -2475,6 +2483,7 @@ impl Function {
         Function {
             iseq,
             was_invalidated_for_singleton_class_creation: false,
+            is_final_version: false,
             insns: vec![],
             insn_types: vec![],
             union_find: UnionFind::new().into(),
@@ -2489,6 +2498,10 @@ impl Function {
 
     pub fn iseq(&self) -> *const rb_iseq_t {
         self.iseq
+    }
+
+    pub fn set_final_version(&mut self, is_final: bool) {
+        self.is_final_version = is_final;
     }
 
     // Add an instruction to the function without adding it to any block
@@ -3369,6 +3382,20 @@ impl Function {
         None
     }
 
+    /// Get the type distribution summary for any profiled receiver (monomorphic, skewed polymorphic, etc.)
+    /// Used on the final version to generate polymorphic branches with fallback.
+    fn type_distribution_summary(&self, recv: InsnId, insn_idx: usize) -> Option<TypeDistributionSummary> {
+        let profiles = self.profiles.as_ref()?;
+        let entries = profiles.types.get(&insn_idx)?;
+        let recv = self.chase_insn(recv);
+        for (entry_insn, entry_type_summary) in entries {
+            if self.chase_insn(*entry_insn) == recv {
+                return Some(entry_type_summary.clone());
+            }
+        }
+        None
+    }
+
     /// Resolve the receiver type for method dispatch optimization from profile data.
     ///
     /// Returns:
@@ -3438,6 +3465,123 @@ impl Function {
     pub fn coerce_to(&mut self, block: BlockId, val: InsnId, guard_type: Type, state: InsnId) -> InsnId {
         if self.is_a(val, guard_type) { return val; }
         self.push_insn(block, Insn::GuardType { val, guard_type, state })
+    }
+
+    /// On the final ISEQ version, generate polymorphic branches for profiled types
+    /// with a fallback Send for unmatched types, instead of GuardType side exits.
+    ///
+    /// For each profiled type: HasType check → IfTrue → specialized SendDirect branch → Jump(join)
+    /// Fallthrough: generic Send (interpreter dispatch) → Jump(join)
+    /// Remaining old_insns are moved to join_block.
+    ///
+    /// Returns Some(join_block) if at least one branch was created, None otherwise.
+    fn specialize_send_with_type_fallback(
+        &mut self,
+        block: BlockId,
+        insn_id: InsnId,
+        recv: InsnId,
+        cd: *const rb_call_data,
+        state: InsnId,
+        blockiseq: Option<IseqPtr>,
+        args: &[InsnId],
+        remaining_insns: &[InsnId],
+    ) -> Option<BlockId> {
+        let has_block = blockiseq.is_some();
+        let frame_state = self.frame_state(state);
+        let ci = unsafe { get_call_data_ci(cd) };
+        let flags = unsafe { rb_vm_ci_flag(ci) };
+        let mid = unsafe { vm_ci_mid(ci) };
+
+        // Get the full type distribution for this receiver
+        let summary = self.type_distribution_summary(recv, frame_state.insn_idx)?;
+
+        // Create the join block where all branches converge
+        let join_block = self.new_block(u32::MAX);
+
+        let mut any_branch_created = false;
+        let mut seen_types = Vec::with_capacity(4);
+
+        for &profiled_type in summary.buckets() {
+            if profiled_type.is_empty() { break; }
+            let expected = Type::from_profiled_type(profiled_type);
+
+            // Dedup by type (immediate/heap variants of the same class)
+            if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
+                continue;
+            }
+            seen_types.push(expected);
+
+            let klass = profiled_type.class();
+
+            // Try to specialize this type: method lookup
+            let mut cme = unsafe { rb_callable_method_entry(klass, mid) };
+            if cme.is_null() { continue; }
+            cme = unsafe { rb_check_overloaded_cme(cme, ci) };
+
+            // Check visibility
+            let visibility = unsafe { METHOD_ENTRY_VISI(cme) };
+            match (visibility, flags & VM_CALL_FCALL != 0) {
+                (METHOD_VISI_PUBLIC, _) | (METHOD_VISI_PRIVATE, true) | (METHOD_VISI_PROTECTED, true) => {}
+                _ => continue,
+            }
+
+            let mut def_type = unsafe { get_cme_def_type(cme) };
+            while def_type == VM_METHOD_TYPE_ALIAS {
+                cme = unsafe { rb_aliased_callable_method_entry(cme) };
+                def_type = unsafe { get_cme_def_type(cme) };
+            }
+
+            // Only handle ISEQ methods for now (the most common case)
+            if def_type != VM_METHOD_TYPE_ISEQ { continue; }
+
+            let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+            if !can_direct_send(self, block, iseq, ci, insn_id, args) { continue; }
+            if def_type != VM_METHOD_TYPE_OPTIMIZED && unspecializable_call_type(flags) { continue; }
+
+            let Ok((send_state, processed_args, kw_bits)) = self.prepare_direct_send_args(block, &args.to_vec(), ci, iseq, state) else {
+                continue;
+            };
+
+            if !self.assume_no_singleton_classes(block, klass, state) { continue; }
+
+            // Emit the type check and branch in the current block
+            let has_type = self.push_insn(block, Insn::HasType { val: recv, expected });
+            let specialized_block = self.new_block(u32::MAX);
+            self.push_insn(block, Insn::IfTrue { val: has_type, target: BranchEdge { target: specialized_block, args: vec![] } });
+
+            // Build the specialized block: PatchPoint + SendDirect → Jump(join)
+            self.push_insn(specialized_block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+            let refined_recv = self.push_insn(specialized_block, Insn::RefineType { val: recv, new_type: expected });
+            let result = self.push_insn(specialized_block, Insn::SendDirect {
+                recv: refined_recv, cd, cme, iseq, args: processed_args, kw_bits, state: send_state, blockiseq,
+            });
+            self.push_insn(specialized_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+
+            any_branch_created = true;
+        }
+
+        if !any_branch_created {
+            self.remove_block(join_block);
+            return None;
+        }
+
+        // Fallthrough in current block: generic Send → Jump(join)
+        let reason = if has_block { SendFallbackReason::GuardTypeFallback } else { SendFallbackReason::GuardTypeFallback };
+        let fallback_send = self.push_insn(block, Insn::Send {
+            recv, cd, blockiseq, args: args.to_vec(), state, reason,
+        });
+        self.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_send] }));
+
+        // Join block: Param for the result + remaining instructions
+        let join_result = self.push_insn(join_block, Insn::Param);
+        self.make_equal_to(insn_id, join_result);
+
+        // Move remaining instructions from old_insns to join_block
+        for &remaining_id in remaining_insns {
+            self.push_insn_id(join_block, remaining_id);
+        }
+
+        Some(join_block)
     }
 
     fn count_complex_call_features(&mut self, block: BlockId, ci_flags: c_uint) {
@@ -3555,10 +3699,13 @@ impl Function {
     /// Also try and inline constant caches, specialize object allocations, and more.
     /// Calls to C functions are handled separately in optimize_c_calls.
     fn type_specialize(&mut self) {
-        for block in self.rpo() {
+        for mut block in self.rpo() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
             assert!(self.blocks[block.0].insns.is_empty());
-            for insn_id in old_insns {
+            let mut i = 0;
+            while i < old_insns.len() {
+                let insn_id = old_insns[i];
+                i += 1;
                 match self.find(insn_id) {
                     Insn::Send { recv, blockiseq: None, args, state, cd, .. } if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty() =>
                         self.try_rewrite_freeze(block, insn_id, recv, state),
@@ -3570,7 +3717,23 @@ impl Function {
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), frame_state.insn_idx) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
                             ReceiverTypeResolution::Monomorphic { profiled_type }
-                            | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
+                            | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => {
+                                // On the final version, generate polymorphic branches with a
+                                // fallback Send instead of GuardType side exits.
+                                if self.is_final_version {
+                                    if let Some(_join_block) = self.specialize_send_with_type_fallback(
+                                        block, insn_id, recv, cd, state, blockiseq, &args, &old_insns[i..],
+                                    ) {
+                                        // Remaining instructions were moved to join_block
+                                        break;
+                                    }
+                                    // Couldn't specialize any branch; use generic Send
+                                    self.set_dynamic_send_reason(insn_id, GuardTypeFallback);
+                                    self.push_insn_id(block, insn_id);
+                                    continue;
+                                }
+                                (profiled_type.class(), Some(profiled_type))
+                            }
                             ReceiverTypeResolution::SkewedMegamorphic { .. }
                             | ReceiverTypeResolution::Megamorphic => {
                                 if get_option!(stats) {
@@ -3870,7 +4033,7 @@ impl Function {
                             self.insn_types[guard.0] = self.infer_type(guard);
                             self.make_equal_to(insn_id, guard);
                         } else {
-                            let recv = self.push_insn(block, Insn::GuardType { val, guard_type: Type::from_profiled_type(recv_type), state});
+                            let recv = self.push_insn(block, Insn::GuardType { val, guard_type: Type::from_profiled_type(recv_type), state });
                             let send_to_s = self.push_insn(block, Insn::Send { recv, cd, blockiseq: None, args: vec![], state, reason: ObjToStringNotString });
                             self.make_equal_to(insn_id, send_to_s);
                         }
@@ -4595,7 +4758,15 @@ impl Function {
             let (recv_class, profiled_type) = match fun.resolve_receiver_type(recv, self_type, iseq_insn_idx) {
                 ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
                 ReceiverTypeResolution::Monomorphic { profiled_type }
-                | ReceiverTypeResolution::SkewedPolymorphic { profiled_type} => (profiled_type.class(), Some(profiled_type)),
+                | ReceiverTypeResolution::SkewedPolymorphic { profiled_type} => {
+                    // On the final version, profiled-type sends use interpreter dispatch
+                    // to avoid guard_type_failure exits.
+                    if fun.is_final_version {
+                        fun.set_dynamic_send_reason(send_insn_id, GuardTypeFallback);
+                        return Err(());
+                    }
+                    (profiled_type.class(), Some(profiled_type))
+                }
                 ReceiverTypeResolution::SkewedMegamorphic { .. } | ReceiverTypeResolution::Polymorphic | ReceiverTypeResolution::Megamorphic | ReceiverTypeResolution::NoProfile => return Err(()),
             };
 
@@ -4762,7 +4933,15 @@ impl Function {
             let (recv_class, profiled_type) = match fun.resolve_receiver_type(recv, self_type, iseq_insn_idx) {
                 ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
                 ReceiverTypeResolution::Monomorphic { profiled_type }
-                | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
+                | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => {
+                    // On the final version, profiled-type sends use interpreter dispatch
+                    // to avoid guard_type_failure exits.
+                    if fun.is_final_version {
+                        fun.set_dynamic_send_reason(send_insn_id, GuardTypeFallback);
+                        return Err(());
+                    }
+                    (profiled_type.class(), Some(profiled_type))
+                }
                 ReceiverTypeResolution::SkewedMegamorphic { .. } | ReceiverTypeResolution::Polymorphic | ReceiverTypeResolution::Megamorphic | ReceiverTypeResolution::NoProfile => return Err(()),
             };
 
@@ -8232,7 +8411,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                         break;  // End the block
                     }
                     let val = state.stack_pop()?;
-                    let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, });
+                    let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id });
                     let length = fun.push_insn(block, Insn::ArrayLength { array });
                     let expected = fun.push_insn(block, Insn::Const { val: Const::CInt64(num as i64) });
                     fun.push_insn(block, Insn::GuardGreaterEq { left: length, right: expected, reason: SideExitReason::ExpandArray, state: exit_id });

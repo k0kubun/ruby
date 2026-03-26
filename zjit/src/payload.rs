@@ -14,6 +14,9 @@ pub struct IseqPayload {
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
     pub was_invalidated_for_singleton_class_creation: bool,
+    /// Counter for guard_type_failure exits. When this reaches the threshold,
+    /// the ISEQ version is invalidated for recompilation.
+    pub guard_type_failure_count: u32,
 }
 
 impl IseqPayload {
@@ -22,6 +25,7 @@ impl IseqPayload {
             profile: IseqProfile::new(),
             versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
+            guard_type_failure_count: 0,
         }
     }
 }

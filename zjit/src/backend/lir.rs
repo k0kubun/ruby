@@ -556,13 +556,20 @@ pub struct SideExit {
     pub recompile: Option<SideExitRecompile>,
 }
 
-/// Arguments for the no-profile-send recompile callback.
+/// Recompile action to perform when a side exit is taken.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SideExitRecompile {
-    pub iseq: Opnd,
-    pub insn_idx: u32,
-    /// Number of arguments, not including the receiver.
-    pub argc: i32,
+pub enum SideExitRecompile {
+    /// Profile the send and invalidate the ISEQ for recompilation when enough profiles gathered.
+    NoProfileSend {
+        iseq: Opnd,
+        insn_idx: u32,
+        /// Number of arguments, not including the receiver.
+        argc: i32,
+    },
+    /// Invalidate the ISEQ immediately for recompilation (e.g. after guard_type_failure).
+    GuardType {
+        iseq: Opnd,
+    },
 }
 
 /// Branch target (something that we can jump to)
@@ -2663,14 +2670,26 @@ impl Assembler
             // compile_exit_save_state because it clobbers caller-saved registers
             // that may hold stack/local operands we need to save.
             if let Some(recompile) = &exit.recompile {
-                use crate::codegen::no_profile_send_recompile;
-                asm_comment!(asm, "profile and maybe recompile for no-profile send");
-                asm_ccall!(asm, no_profile_send_recompile,
-                    EC,
-                    recompile.iseq,
-                    Opnd::UImm(recompile.insn_idx as u64),
-                    Opnd::Imm(recompile.argc as i64)
-                );
+                match recompile {
+                    SideExitRecompile::NoProfileSend { iseq, insn_idx, argc } => {
+                        use crate::codegen::no_profile_send_recompile;
+                        asm_comment!(asm, "profile and maybe recompile for no-profile send");
+                        asm_ccall!(asm, no_profile_send_recompile,
+                            EC,
+                            *iseq,
+                            Opnd::UImm(*insn_idx as u64),
+                            Opnd::Imm(*argc as i64)
+                        );
+                    }
+                    SideExitRecompile::GuardType { iseq } => {
+                        use crate::codegen::guard_type_recompile;
+                        asm_comment!(asm, "recompile for guard type failure");
+                        asm_ccall!(asm, guard_type_recompile,
+                            EC,
+                            *iseq
+                        );
+                    }
+                }
             }
             compile_exit_return(asm);
         }

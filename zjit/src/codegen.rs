@@ -1213,7 +1213,7 @@ fn gen_setglobal(jit: &mut JITState, asm: &mut Assembler, id: ID, val: Opnd, sta
 /// Side-exit into the interpreter
 fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, reason: &SideExitReason, recompile: &Option<i32>, state: &FrameState) {
     let mut exit = build_side_exit(jit, state);
-    exit.recompile = recompile.map(|argc| SideExitRecompile {
+    exit.recompile = recompile.map(|argc| SideExitRecompile::NoProfileSend {
         iseq: Opnd::Value(VALUE::from(jit.iseq)),
         insn_idx: state.insn_idx() as u32,
         argc,
@@ -2429,30 +2429,34 @@ fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, ty: Typ
 
 /// Compile a type check with a side exit
 fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, guard_type: Type, state: &FrameState) -> lir::Opnd {
+    let mk_exit = |jit: &JITState, state: &FrameState| {
+        side_exit(jit, state, GuardType(guard_type))
+    };
+
     gen_incr_counter(asm, Counter::guard_type_count);
     if guard_type.is_subtype(types::Fixnum) {
         asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
-        asm.jz(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jz(jit, mk_exit(jit, state));
     } else if guard_type.is_subtype(types::Flonum) {
         // Flonum: (val & RUBY_FLONUM_MASK) == RUBY_FLONUM_FLAG
         let masked = asm.and(val, Opnd::UImm(RUBY_FLONUM_MASK as u64));
         asm.cmp(masked, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
-        asm.jne(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jne(jit, mk_exit(jit, state));
     } else if guard_type.is_subtype(types::StaticSymbol) {
         // Static symbols have (val & 0xff) == RUBY_SYMBOL_FLAG
         // Use 8-bit comparison like YJIT does. GuardType should not be used
         // for a known VALUE, which with_num_bits() does not support.
         asm.cmp(val.with_num_bits(8), Opnd::UImm(RUBY_SYMBOL_FLAG as u64));
-        asm.jne(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jne(jit, mk_exit(jit, state));
     } else if guard_type.is_subtype(types::NilClass) {
         asm.cmp(val, Qnil.into());
-        asm.jne(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jne(jit, mk_exit(jit, state));
     } else if guard_type.is_subtype(types::TrueClass) {
         asm.cmp(val, Qtrue.into());
-        asm.jne(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jne(jit, mk_exit(jit, state));
     } else if guard_type.is_subtype(types::FalseClass) {
         asm.cmp(val, Qfalse.into());
-        asm.jne(jit, side_exit(jit, state, GuardType(guard_type)));
+        asm.jne(jit, mk_exit(jit, state));
     } else if guard_type.is_immediate() {
         // All immediate types' guard should have been handled above
         panic!("unexpected immediate guard type: {guard_type}");
@@ -2464,59 +2468,59 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, guard
         let val = asm.load_mem(val);
 
         // Check if it's a special constant
-        let side_exit = side_exit(jit, state, GuardType(guard_type));
+        let exit = mk_exit(jit, state);
         asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
-        asm.jnz(jit, side_exit.clone());
+        asm.jnz(jit, exit.clone());
 
         // Check if it's false
         asm.cmp(val, Qfalse.into());
-        asm.je(jit, side_exit.clone());
+        asm.je(jit, exit.clone());
 
         // Load the class from the object's klass field
         let klass = asm.load(Opnd::mem(64, val, RUBY_OFFSET_RBASIC_KLASS));
 
         asm.cmp(klass, Opnd::Value(expected_class));
-        asm.jne(jit, side_exit);
+        asm.jne(jit, exit);
     } else if guard_type.is_subtype(types::String) {
-        let side = side_exit(jit, state, GuardType(guard_type));
+        let exit = mk_exit(jit, state);
 
         // Check special constant
         asm.test(val, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
-        asm.jnz(jit, side.clone());
+        asm.jnz(jit, exit.clone());
 
         // Check false
         asm.cmp(val, Qfalse.into());
-        asm.je(jit, side.clone());
+        asm.je(jit, exit.clone());
 
         let val = asm.load_mem(val);
 
         let flags = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS));
         let tag   = asm.and(flags, Opnd::UImm(RUBY_T_MASK as u64));
         asm.cmp(tag, Opnd::UImm(RUBY_T_STRING as u64));
-        asm.jne(jit, side);
+        asm.jne(jit, exit);
     } else if guard_type.is_subtype(types::Array) {
-        let side = side_exit(jit, state, GuardType(guard_type));
+        let exit = mk_exit(jit, state);
 
         // Check special constant
         asm.test(val, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
-        asm.jnz(jit, side.clone());
+        asm.jnz(jit, exit.clone());
 
         // Check false
         asm.cmp(val, Qfalse.into());
-        asm.je(jit, side.clone());
+        asm.je(jit, exit.clone());
 
         let val = asm.load_mem(val);
 
         let flags = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS));
         let tag   = asm.and(flags, Opnd::UImm(RUBY_T_MASK as u64));
         asm.cmp(tag, Opnd::UImm(RUBY_T_ARRAY as u64));
-        asm.jne(jit, side);
+        asm.jne(jit, exit);
     } else if guard_type.bit_equal(types::HeapBasicObject) {
-        let side_exit = side_exit(jit, state, GuardType(guard_type));
+        let exit = mk_exit(jit, state);
         asm.cmp(val, Opnd::Value(Qfalse));
-        asm.je(jit, side_exit.clone());
+        asm.je(jit, exit.clone());
         asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
-        asm.jnz(jit, side_exit);
+        asm.jnz(jit, exit);
     } else {
         unimplemented!("unsupported type: {guard_type}");
     }
@@ -2852,6 +2856,10 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
             return Err(CompileError::ParseError(err));
         }
     };
+    // On the final version, GuardType generates fallback Send instructions instead of side exits.
+    // Check the payload here (not in iseq_to_hir) because gen_iseq hasn't added the new version yet.
+    let payload = get_or_create_iseq_payload(iseq);
+    function.set_final_version(payload.versions.len() + 1 >= MAX_ISEQ_VERSIONS);
     if !get_option!(disable_hir_opt) {
         function.optimize();
     }
@@ -2949,6 +2957,31 @@ c_callable! {
                     }
                 }
             });
+        });
+    }
+}
+
+/// Threshold for guard type failures before triggering recompilation.
+/// Only ISEQs with frequent type mismatches will be recompiled.
+const GUARD_TYPE_RECOMPILE_THRESHOLD: u32 = 1_000;
+
+c_callable! {
+    /// Called from JIT side-exit code when a guard type check fails. This function counts
+    /// guard_type_failure exits and invalidates the ISEQ version for recompilation once
+    /// the count reaches the threshold.
+    pub(crate) fn guard_type_recompile(_ec: EcPtr, iseq_raw: VALUE) {
+        with_vm_lock(src_loc!(), || {
+            let iseq: IseqPtr = iseq_raw.as_iseq();
+            let payload = get_or_create_iseq_payload(iseq);
+            payload.guard_type_failure_count += 1;
+            // Only invalidate exactly once when threshold is reached
+            if payload.guard_type_failure_count == GUARD_TYPE_RECOMPILE_THRESHOLD {
+                if let Some(version) = payload.versions.last_mut() {
+                    let cb = ZJITState::get_code_block();
+                    invalidate_iseq_version(cb, iseq, version);
+                    cb.mark_all_executable();
+                }
+            }
         });
     }
 }
