@@ -986,10 +986,8 @@ fn gen_ccall_with_frame(
     let args_with_recv_len = args.len() + 1;
     let caller_stack_size = state.stack().len() - args_with_recv_len;
 
-    // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
-    // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
-    gen_save_sp(asm, caller_stack_size);
+    // cfp->sp stays at max. sp_offset tells GC/materialization the actual SP.
+    gen_save_pc_for_gc(asm, state, sp_offset_for_gc(jit.iseq, caller_stack_size));
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
 
@@ -1080,10 +1078,8 @@ fn gen_ccall_variadic(
     // state.stack() includes recv + args, so subtract both.
     let caller_stack_size = state.stack_size() - args_with_recv_len;
 
-    // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
-    // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
-    gen_save_sp(asm, caller_stack_size);
+    // cfp->sp stays at max. sp_offset tells GC/materialization the actual SP.
+    gen_save_pc_for_gc(asm, state, sp_offset_for_gc(jit.iseq, caller_stack_size));
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
 
@@ -1437,11 +1433,9 @@ fn gen_send(
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_send,
-        EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    let ret = asm_ccall!(asm, rb_vm_send, EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into());
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 /// Compile a dynamic dispatch with `...`
@@ -1456,16 +1450,13 @@ fn gen_send_forward(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call_with_sp(jit, asm, state);
-
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_sendforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_sendforward,
-        EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    let ret = asm_ccall!(asm, rb_vm_sendforward, EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into());
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 /// Compile a dynamic dispatch without block
@@ -1483,11 +1474,9 @@ fn gen_send_without_block(
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_opt_send_without_block,
-        EC, CFP, Opnd::const_ptr(cd)
-    )
+    let ret = asm_ccall!(asm, rb_vm_opt_send_without_block, EC, CFP, Opnd::const_ptr(cd));
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 /// Compile a direct call to an ISEQ method.
@@ -1513,8 +1502,9 @@ fn gen_send_iseq_direct(
 
     // Save cfp->pc and cfp->sp for the caller frame
     // Can't use gen_prepare_non_leaf_call because we need special SP math.
-    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
-    gen_save_sp(asm, state.stack().len() - args.len() - 1); // -1 for receiver
+    // cfp->sp stays at max. sp_offset tells GC/materialization the actual SP.
+    let caller_stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
+    gen_save_pc_for_gc(asm, state, sp_offset_for_gc(jit.iseq, caller_stack_size));
 
     gen_spill_locals(jit, asm, state);
     gen_spill_stack(jit, asm, state);
@@ -1666,11 +1656,9 @@ fn gen_invokeblock(
     unsafe extern "C" {
         fn rb_vm_invokeblock(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_invokeblock,
-        EC, CFP, Opnd::const_ptr(cd)
-    )
+    let ret = asm_ccall!(asm, rb_vm_invokeblock, EC, CFP, Opnd::const_ptr(cd));
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 fn gen_invokeproc(
@@ -1698,6 +1686,7 @@ fn gen_invokeproc(
         VM_BLOCK_HANDLER_NONE.into()
     );
     gen_pop_opnds(asm, &args);
+    gen_restore_sp_to_max(jit, asm);
 
     result
 }
@@ -1718,11 +1707,9 @@ fn gen_invokesuper(
     unsafe extern "C" {
         fn rb_vm_invokesuper(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_invokesuper,
-        EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    let ret = asm_ccall!(asm, rb_vm_invokesuper, EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into());
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 /// Compile a dynamic dispatch for `super` with `...`
@@ -1741,11 +1728,9 @@ fn gen_invokesuperforward(
     unsafe extern "C" {
         fn rb_vm_invokesuperforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
-        asm,
-        rb_vm_invokesuperforward,
-        EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    let ret = asm_ccall!(asm, rb_vm_invokesuperforward, EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into());
+    gen_restore_sp_to_max(jit, asm);
+    ret
 }
 
 /// Compile a string resurrection
@@ -2691,6 +2676,17 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
+}
+
+/// Re-bump cfp->sp to max after a send fallback that lowered it.
+/// This restores the invariant that cfp->sp is always at max during JIT execution.
+fn gen_restore_sp_to_max(jit: &JITState, asm: &mut Assembler) {
+    let stack_max = unsafe { get_iseq_body_stack_max(jit.iseq) } as i32;
+    if stack_max > 0 {
+        asm_comment!(asm, "restore cfp->sp to max");
+        let max_sp = asm.lea(Opnd::mem(64, SP, stack_max * SIZEOF_VALUE_I32));
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), max_sp);
+    }
 }
 
 /// Spill locals onto the stack.

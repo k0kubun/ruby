@@ -2859,6 +2859,12 @@ zjit_materialize_frames(rb_control_frame_t *cfp)
             if (jit_frame->materialize_block_code) {
                 cfp->block_code = NULL;
             }
+            // Materialize SP for ISEQ frames. cfp->sp was bumped to max on
+            // JIT entry; restore it to the actual value so vm_base_ptr() works.
+            // C frames (iseq==NULL) have correct SP from gen_push_frame.
+            if (jit_frame->iseq) {
+                cfp->sp = rb_zjit_cfp_sp(cfp);
+            }
             cfp->jit_return = 0;
         }
         if (VM_FRAME_FINISHED_P(cfp)) break;
