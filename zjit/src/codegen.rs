@@ -556,20 +556,20 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             gen_const_uint32(val.0)
         }
         Insn::Const { .. } => panic!("Unexpected Const in gen_insn: {insn}"),
-        Insn::NewArray { elements, state } => gen_new_array(asm, opnds!(elements), &function.frame_state(*state)),
+        Insn::NewArray { elements, state } => gen_new_array(jit, asm, opnds!(elements), &function.frame_state(*state)),
         Insn::NewHash { elements, state } => gen_new_hash(jit, asm, opnds!(elements), &function.frame_state(*state)),
         Insn::NewRange { low, high, flag, state } => gen_new_range(jit, asm, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
-        Insn::NewRangeFixnum { low, high, flag, state } => gen_new_range_fixnum(asm, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
-        Insn::ArrayDup { val, state } => gen_array_dup(asm, opnd!(val), &function.frame_state(*state)),
+        Insn::NewRangeFixnum { low, high, flag, state } => gen_new_range_fixnum(jit, asm, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
+        Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, opnd!(val), &function.frame_state(*state)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
-        Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), &function.frame_state(*state)),
+        Insn::ArrayPop { array, state } => gen_array_pop(jit, asm, opnd!(array), &function.frame_state(*state)),
         Insn::ArrayLength { array } => gen_array_length(asm, opnd!(array)),
         Insn::ObjectAlloc { val, state } => gen_object_alloc(jit, asm, opnd!(val), &function.frame_state(*state)),
-        &Insn::ObjectAllocClass { class, state } => gen_object_alloc_class(asm, class, &function.frame_state(state)),
-        Insn::StringCopy { val, chilled, state } => gen_string_copy(asm, opnd!(val), *chilled, &function.frame_state(*state)),
+        &Insn::ObjectAllocClass { class, state } => gen_object_alloc_class(jit, asm, class, &function.frame_state(state)),
+        Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, opnd!(val), *chilled, &function.frame_state(*state)),
         // concatstrings shouldn't have 0 strings
         // If it happens we abort the compilation for now
         Insn::StringConcat { strings, state, .. } if strings.is_empty() => return Err(*state),
@@ -579,7 +579,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringEqual { left, right } => gen_string_equal(asm, opnd!(left), opnd!(right)),
-        Insn::StringIntern { val, state } => gen_intern(asm, opnd!(val), &function.frame_state(*state)),
+        Insn::StringIntern { val, state } => gen_intern(jit, asm, opnd!(val), &function.frame_state(*state)),
         Insn::ToRegexp { opt, values, state } => gen_toregexp(jit, asm, *opt, opnds!(values), &function.frame_state(*state)),
         Insn::Param => unreachable!("block.insns should not have Insn::Param"),
         Insn::LoadArg { .. } => return Ok(()), // compiled in the LoadArg pre-pass above
@@ -667,20 +667,20 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FixnumBitCheck { val, index } => gen_fixnum_bit_check(asm, opnd!(val), *index),
         Insn::SideExit { state, reason } => no_output!(gen_side_exit(jit, asm, reason, &function.frame_state(*state))),
         Insn::PutSpecialObject { value_type } => gen_putspecialobject(asm, *value_type),
-        Insn::AnyToString { val, str, state } => gen_anytostring(asm, opnd!(val), opnd!(str), &function.frame_state(*state)),
+        Insn::AnyToString { val, str, state } => gen_anytostring(jit, asm, opnd!(val), opnd!(str), &function.frame_state(*state)),
         Insn::Defined { op_type, obj, pushval, v, state } => gen_defined(jit, asm, *op_type, *obj, *pushval, opnd!(v), &function.frame_state(*state)),
         Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
         Insn::GetSpecialSymbol { symbol_type, state: _ } => gen_getspecial_symbol(asm, *symbol_type),
-        Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
+        Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(jit, asm, *nth, &function.frame_state(*state)),
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         Insn::ObjToString { val, cd, state, .. } => gen_objtostring(jit, asm, opnd!(val), *cd, &function.frame_state(*state)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, &function.frame_state(state))),
         Insn::BreakPoint => no_output!(asm.breakpoint()),
-        &Insn::HashDup { val, state } => { gen_hash_dup(asm, opnd!(val), &function.frame_state(state)) },
+        &Insn::HashDup { val, state } => { gen_hash_dup(jit, asm, opnd!(val), &function.frame_state(state)) },
         &Insn::HashAref { hash, key, state } => { gen_hash_aref(jit, asm, opnd!(hash), opnd!(key), &function.frame_state(state)) },
         &Insn::HashAset { hash, key, val, state } => { no_output!(gen_hash_aset(jit, asm, opnd!(hash), opnd!(key), opnd!(val), &function.frame_state(state))) },
-        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
+        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(jit, asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
@@ -829,7 +829,7 @@ fn gen_is_block_param_modified(asm: &mut Assembler, ep: Opnd) -> Opnd {
 /// Get the block parameter as a Proc, write it to the environment,
 /// and mark the flag as modified.
 fn gen_getblockparam(jit: &mut JITState, asm: &mut Assembler, ep_offset: u32, level: u32, state: &FrameState) -> Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     // Bail out if write barrier is required.
     let ep = gen_get_ep(asm, level);
     let flags = Opnd::mem(VALUE_BITS, ep, SIZEOF_VALUE_I32 * (VM_ENV_DATA_INDEX_FLAGS as i32));
@@ -904,7 +904,7 @@ fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, state: &FrameState, bf
             unsafe { std::ffi::CStr::from_ptr(bf.name).to_str().unwrap() },
             bf.argc);
     if leaf {
-        gen_prepare_leaf_call_with_gc(asm, state);
+        gen_prepare_leaf_call_with_gc(jit, asm, state);
     } else {
         // Anything can happen inside builtin functions
         gen_prepare_non_leaf_call(jit, asm, state);
@@ -988,7 +988,7 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1082,7 +1082,7 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1170,8 +1170,8 @@ fn gen_getglobal(jit: &mut JITState, asm: &mut Assembler, id: ID, state: &FrameS
 }
 
 /// Intern a string
-fn gen_intern(asm: &mut Assembler, val: Opnd, state: &FrameState) -> Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+fn gen_intern(jit: &JITState, asm: &mut Assembler, val: Opnd, state: &FrameState) -> Opnd {
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     asm_ccall!(asm, rb_str_intern, val)
 }
@@ -1219,12 +1219,12 @@ fn gen_getspecial_symbol(asm: &mut Assembler, symbol_type: SpecialBackrefSymbol)
     }
 }
 
-fn gen_getspecial_number(asm: &mut Assembler, nth: u64, state: &FrameState) -> Opnd {
+fn gen_getspecial_number(jit: &JITState, asm: &mut Assembler, nth: u64, state: &FrameState) -> Opnd {
     // Fetch the N-th match from the last backref based on type shifted by 1
 
     let backref = asm_ccall!(asm, rb_backref_get,);
 
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     asm_ccall!(asm, rb_reg_nth_match, Opnd::Imm((nth >> 1).try_into().unwrap()), backref)
 }
@@ -1240,8 +1240,8 @@ fn gen_check_interrupts(jit: &mut JITState, asm: &mut Assembler, state: &FrameSt
     asm.jnz(jit, side_exit(jit, state, SideExitReason::Interrupt));
 }
 
-fn gen_hash_dup(asm: &mut Assembler, val: Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+fn gen_hash_dup(jit: &JITState, asm: &mut Assembler, val: Opnd, state: &FrameState) -> lir::Opnd {
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     asm_ccall!(asm, rb_hash_resurrect, val)
 }
 
@@ -1255,8 +1255,8 @@ fn gen_hash_aset(jit: &mut JITState, asm: &mut Assembler, hash: Opnd, key: Opnd,
     asm_ccall!(asm, rb_hash_aset, hash, key, val);
 }
 
-fn gen_array_push(asm: &mut Assembler, array: Opnd, val: Opnd, state: &FrameState) {
-    gen_prepare_leaf_call_with_gc(asm, state);
+fn gen_array_push(jit: &JITState, asm: &mut Assembler, array: Opnd, val: Opnd, state: &FrameState) {
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     asm_ccall!(asm, rb_ary_push, array, val);
 }
 
@@ -1432,7 +1432,7 @@ fn gen_send(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1455,7 +1455,7 @@ fn gen_send_forward(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
 
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
@@ -1478,7 +1478,7 @@ fn gen_send_without_block(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
@@ -1513,7 +1513,7 @@ fn gen_send_iseq_direct(
 
     // Save cfp->pc and cfp->sp for the caller frame
     // Can't use gen_prepare_non_leaf_call because we need special SP math.
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0); // sp_offset=0: gen_save_sp sets cfp->sp to actual
     gen_save_sp(asm, state.stack().len() - args.len() - 1); // -1 for receiver
 
     gen_spill_locals(jit, asm, state);
@@ -1660,7 +1660,7 @@ fn gen_invokeblock(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
 
     asm_comment!(asm, "call invokeblock");
     unsafe extern "C" {
@@ -1681,7 +1681,7 @@ fn gen_invokeproc(
     kw_splat: bool,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
 
     asm_comment!(asm, "call invokeproc");
 
@@ -1713,7 +1713,7 @@ fn gen_invokesuper(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
     asm_comment!(asm, "call super with dynamic dispatch");
     unsafe extern "C" {
         fn rb_vm_invokesuper(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1736,7 +1736,7 @@ fn gen_invokesuperforward(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_with_sp(jit, asm, state);
     asm_comment!(asm, "call super with dynamic dispatch (forwarding)");
     unsafe extern "C" {
         fn rb_vm_invokesuperforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1749,9 +1749,9 @@ fn gen_invokesuperforward(
 }
 
 /// Compile a string resurrection
-fn gen_string_copy(asm: &mut Assembler, recv: Opnd, chilled: bool, state: &FrameState) -> Opnd {
+fn gen_string_copy(jit: &JITState, asm: &mut Assembler, recv: Opnd, chilled: bool, state: &FrameState) -> Opnd {
     // TODO: split rb_ec_str_resurrect into separate functions
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     let chilled = if chilled { Opnd::Imm(1) } else { Opnd::Imm(0) };
     asm_ccall!(asm, rb_ec_str_resurrect, EC, recv, chilled)
 }
@@ -1762,22 +1762,24 @@ fn gen_string_equal(asm: &mut Assembler, left: Opnd, right: Opnd) -> lir::Opnd {
 
 /// Compile an array duplication instruction
 fn gen_array_dup(
+    jit: &JITState,
     asm: &mut Assembler,
     val: lir::Opnd,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     asm_ccall!(asm, rb_ary_resurrect, val)
 }
 
 /// Compile a new array instruction
 fn gen_new_array(
+    jit: &JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     let num: c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
 
@@ -1819,8 +1821,8 @@ fn gen_array_aset(
     asm.store(Opnd::mem(VALUE_BITS, elem_ptr, 0), val);
 }
 
-fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+fn gen_array_pop(jit: &JITState, asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::Opnd {
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     asm_ccall!(asm, rb_ary_pop, array)
 }
 
@@ -2058,13 +2060,14 @@ fn gen_new_range(
 }
 
 fn gen_new_range_fixnum(
+    jit: &JITState,
     asm: &mut Assembler,
     low: lir::Opnd,
     high: lir::Opnd,
     flag: RangeType,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     asm_ccall!(asm, rb_range_new, low, high, (flag as i64).into())
 }
 
@@ -2074,10 +2077,10 @@ fn gen_object_alloc(jit: &JITState, asm: &mut Assembler, val: lir::Opnd, state: 
     asm_ccall!(asm, rb_obj_alloc, val)
 }
 
-fn gen_object_alloc_class(asm: &mut Assembler, class: VALUE, state: &FrameState) -> lir::Opnd {
+fn gen_object_alloc_class(jit: &JITState, asm: &mut Assembler, class: VALUE, state: &FrameState) -> lir::Opnd {
     // Allocating an object for a known class with default allocator is leaf; see doc for
     // `ObjectAllocClass`.
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
     if unsafe { rb_zjit_class_has_default_allocator(class) } {
         // TODO(max): inline code to allocate an instance
         asm_ccall!(asm, rb_class_allocate_instance, class.into())
@@ -2101,6 +2104,15 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         });
     }
     asm.frame_setup(&[]);
+
+    // Bump cfp->sp to the max stack size so we don't need to update it on
+    // every leaf call. GC uses sp_offset in JITFrame to find the actual SP.
+    let stack_max = unsafe { get_iseq_body_stack_max(jit.iseq) } as i32;
+    if stack_max > 0 {
+        asm_comment!(asm, "bump cfp->sp to max stack size");
+        let max_sp = asm.lea(Opnd::mem(64, SP, stack_max * SIZEOF_VALUE_I32));
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), max_sp);
+    }
 }
 
 /// Compile code that exits from JIT code with a return value
@@ -2154,7 +2166,7 @@ fn gen_fixnum_mult(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, rig
 
 /// Compile Fixnum / Fixnum
 fn gen_fixnum_div(jit: &mut JITState, asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     // Side exit if rhs is 0
     asm.cmp(right, Opnd::from(VALUE::fixnum_from_usize(0)));
@@ -2286,8 +2298,8 @@ fn gen_box_fixnum(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, state
     asm.or(shifted, Opnd::UImm(RUBY_FIXNUM_FLAG as u64))
 }
 
-fn gen_anytostring(asm: &mut Assembler, val: lir::Opnd, str: lir::Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_leaf_call_with_gc(asm, state);
+fn gen_anytostring(jit: &JITState, asm: &mut Assembler, val: lir::Opnd, str: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    gen_prepare_leaf_call_with_gc(jit, asm, state);
 
     asm_ccall!(asm, rb_obj_as_string_result, str, val)
 }
@@ -2621,7 +2633,11 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
 /// Save only the PC to CFP. Use this when you need to call gen_save_sp()
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
-fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
+///
+/// `sp_offset` is how far cfp->sp is above the actual SP (in VALUE slots).
+/// When gen_save_sp is called after this, sp_offset must be 0 because
+/// gen_save_sp overwrites cfp->sp to the actual value.
+fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState, sp_offset: u32) {
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
@@ -2630,7 +2646,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     if let Some(pc) = PC_POISON {
         asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
     }
-    let jit_frame = JITFrame::new(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
+    let jit_frame = JITFrame::new(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq), sp_offset);
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
 }
 
@@ -2640,31 +2656,29 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
 ///
 /// Unlike YJIT, we don't need to save the stack slots to protect them from GC
 /// because the backend spills all live registers onto the C stack on CCall.
-/// However, to avoid marking uninitialized stack slots, this also updates SP,
-/// which may have cfp->sp for a past frame or a past non-leaf call.
-fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
-    gen_save_sp(asm, state.stack_size());
+/// cfp->sp stays at max; sp_offset tells GC how far above actual SP it is.
+fn gen_prepare_call_with_gc(jit: &JITState, asm: &mut Assembler, state: &FrameState, leaf: bool) {
+    let sp_offset = sp_offset_for_gc(jit.iseq, state.stack_size());
+    gen_save_pc_for_gc(asm, state, sp_offset);
     if leaf {
         asm.expect_leaf_ccall(state.stack_size());
     }
 }
 
-fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
-    // In gen_prepare_call_with_gc(), we update cfp->sp for leaf calls too.
+/// Compute sp_offset for JITFrame when cfp->sp stays at max (no gen_save_sp call).
+fn sp_offset_for_gc(iseq: IseqPtr, stack_size: usize) -> u32 {
+    let stack_max = unsafe { get_iseq_body_stack_max(iseq) };
+    stack_max - stack_size as u32
+}
+
+fn gen_prepare_leaf_call_with_gc(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    // cfp->sp stays at max (bumped at entry). sp_offset tells GC how far above
+    // actual SP it is, so GC won't mark uninitialized slots.
     //
-    // Here, cfp->sp may be pointing to either of the following:
-    //   1. cfp->sp for a past frame, which gen_push_frame() skips to initialize
-    //   2. cfp->sp set by gen_prepare_non_leaf_call() for the current frame
-    //
-    // When (1), to avoid marking dead objects, we need to set cfp->sp for the current frame.
-    // When (2), setting cfp->sp at gen_push_frame() and not updating cfp->sp here could lead to
-    // keeping objects longer than it should, so we set cfp->sp at every call of this function.
-    //
-    // We use state.without_stack() to pass stack_size=0 to gen_save_sp() because we don't write
+    // We use state.without_stack() to pass stack_size=0 because we don't write
     // VM stack slots on leaf calls, which leaves those stack slots uninitialized. ZJIT keeps
     // live objects on the C stack, so they are protected from GC properly.
-    gen_prepare_call_with_gc(asm, &state.without_stack(), true);
+    gen_prepare_call_with_gc(jit, asm, &state.without_stack(), true);
 }
 
 /// Save the current SP on the CFP
@@ -2673,7 +2687,6 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     // code, and ZJIT's codegen currently assumes the SP register doesn't move, e.g. gen_param().
     // So we don't update the SP register here. We could update the SP register to avoid using
     // an extra register for asm.lea(), but you'll need to manage the SP offset like YJIT does.
-    gen_incr_counter(asm, Counter::vm_write_sp_count);
     asm_comment!(asm, "save SP to CFP: {}", stack_size);
     let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
@@ -2705,15 +2718,25 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
 fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
     // TODO: Lazily materialize caller frames when needed
-    // Save PC for backtraces and allocation tracing
-    // and SP to avoid marking uninitialized stack slots
-    gen_prepare_call_with_gc(asm, state, false);
+    // Save PC for backtraces and allocation tracing.
+    // cfp->sp stays at max; sp_offset tells GC how far above actual SP it is.
+    gen_prepare_call_with_gc(jit, asm, state, false);
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
     gen_spill_stack(jit, asm, state);
 
     // Spill locals in case the method looks at caller Bindings
+    gen_spill_locals(jit, asm, state);
+}
+
+/// Like gen_prepare_non_leaf_call, but also writes cfp->sp to the actual value.
+/// Used by send fallbacks where the interpreter reads cfp->sp directly.
+fn gen_prepare_non_leaf_call_with_sp(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    // sp_offset=0 because gen_save_sp sets cfp->sp to actual
+    gen_save_pc_for_gc(asm, state, 0);
+    gen_save_sp(asm, state.stack_size());
+    gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
 }
 
@@ -2780,7 +2803,7 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
         // Without this, stale data from a previous frame occupying this CFP slot
         // can be used as an ifunc pointer, causing a segfault.
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
-        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), false);
+        let jit_frame = JITFrame::new(std::ptr::null(), std::ptr::null(), false, 0);
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
     }
 

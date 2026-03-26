@@ -7,13 +7,14 @@ pub struct JITFrame {
     pub pc: *const VALUE,
     pub iseq: IseqPtr, // marked in rb_execution_context_mark
     pub materialize_block_code: bool,
+    pub sp_offset: u32, // cfp->sp - sp_offset = actual SP (for GC)
 }
 
 impl JITFrame {
     /// Allocate a new JITFrame on the heap and register it with ZJITState.
     /// Returns a raw pointer that remains valid for the lifetime of the process.
-    pub fn new(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
-        let jit_frame = Box::new(JITFrame { pc, iseq, materialize_block_code });
+    pub fn new(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool, sp_offset: u32) -> *const Self {
+        let jit_frame = Box::new(JITFrame { pc, iseq, materialize_block_code, sp_offset });
         let raw_ptr = Box::into_raw(jit_frame) as *const _;
         ZJITState::get_jit_frames().push(raw_ptr);
         raw_ptr

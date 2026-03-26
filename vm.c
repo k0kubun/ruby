@@ -3723,18 +3723,23 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);
-        VALUE *p = ec->vm_stack;
-        VALUE *sp = ec->cfp->sp;
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
-        for (long i = 0; i < (long)(sp - p); i++) {
-            rb_gc_mark_movable(p[i]);
-        }
+        // Mark per-frame stack slots. ZJIT keeps cfp->sp at the max stack size,
+        // so we use rb_zjit_cfp_sp() to get the actual SP for each frame.
+        VALUE *cur_sp = rb_zjit_cfp_sp(cfp);
 
         while (cfp != limit_cfp) {
             const VALUE *ep = cfp->ep;
             VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
+
+            // Mark stack slots between this frame's SP and the previous frame's SP
+            VALUE *this_sp = rb_zjit_cfp_sp(cfp);
+            for (VALUE *v = this_sp; v < cur_sp; v++) {
+                rb_gc_mark_movable(*v);
+            }
+            cur_sp = this_sp;
 
             rb_gc_mark_movable(cfp->self);
             rb_gc_mark_movable((VALUE)rb_zjit_cfp_iseq(cfp));
@@ -3762,6 +3767,10 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
             }
 
             cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+        }
+        // Mark remaining stack slots from vm_stack to the bottom-most frame's SP
+        for (VALUE *v = ec->vm_stack; v < cur_sp; v++) {
+            rb_gc_mark_movable(*v);
         }
     }
 
