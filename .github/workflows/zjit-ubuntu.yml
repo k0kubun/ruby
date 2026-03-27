@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - zjit-skip-stack-spill
     paths-ignore:
       - 'doc/**'
       - '**/man/*'
