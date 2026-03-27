@@ -2787,12 +2787,13 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
 /// Like gen_prepare_non_leaf_call but skips writing stack values to the VM stack.
 /// The callee C function must NOT read from the VM stack.
 /// GC scanning skips the uninitialized stack area using JITFrame::stack_size.
-fn gen_prepare_non_leaf_call_light(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+fn gen_prepare_non_leaf_call_light(_jit: &JITState, asm: &mut Assembler, state: &FrameState) {
     let stack_size = state.stack_size();
     gen_save_pc_for_gc(asm, state, stack_size as u16);
     gen_save_sp(asm, stack_size);
-    // Skip gen_spill_stack — stack values stay in registers.
-    gen_spill_locals(jit, asm, state);
+    // Skip gen_spill_stack AND gen_spill_locals — values stay in registers.
+    // Locals are only needed if the callee inspects caller Bindings (rare).
+    // Stack values are only needed for exception handlers (which reset SP).
 }
 
 /// Frame metadata written by gen_push_frame()
