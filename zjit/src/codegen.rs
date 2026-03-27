@@ -2988,22 +2988,46 @@ c_callable! {
                     // Fill nils to uninitialized (non-parameter) locals
                     locals.get_mut(params_size..).unwrap_or_default().fill(Qnil);
 
-                    // When there are unfilled optionals
+                    // SendDirect packs args without gaps for unfilled optionals.
+                    // When we exit to the interpreter, we need to shift args right
+                    // to create the gap and nil-fill the unfilled optional slots.
+                    //
+                    // Example: def target(req, a = a, b = b, kw:); target(1, kw: 2)
+                    //   lead_num=1, opt_num=2, opts_filled=0, argc=2
+                    //
+                    //   locals[] as placed by SendDirect (argc=2, no gaps):
+                    //     [req, kw_val, ?, ?, ?, ...]
+                    //      0    1
+                    //      ^----caller's args----^
+                    //
+                    //   locals[] expected by interpreter (params_size=4):
+                    //     [req,  a,   b,  kw_val, ?, ...]
+                    //      0     1    2   3
+                    //            ^nil ^nil^--moved--^
+                    //
+                    //   gap_start = lead_num + opts_filled = 1
+                    //   gap_end   = lead_num + opt_num     = 3
+                    //   We move locals[gap_start..argc] to locals[gap_end..], then
+                    //   nil-fill locals[gap_start..gap_end].
                     let opt_num: usize = params.opt_num.try_into().expect("ISEQ opt_num should be non-negative");
-                    let opts_unfilled = opt_num.saturating_sub(num_opts_filled.to_usize());
+                    let opts_filled = num_opts_filled.to_usize();
+                    let opts_unfilled = opt_num.saturating_sub(opts_filled);
                     if opts_unfilled > 0 {
                         let lead_num: usize = params.lead_num.try_into().expect("ISEQ lead_num should be non-negative");
                         let param_locals = &mut locals[..params_size];
-                        let args_after_opts = lead_num + num_opts_filled.to_usize()..argc.to_usize();
-                        let after_opts_param_idx = lead_num + opt_num;
-                        // Move to the right args that are after the unfilled optionals
-                        if let Some(moved_by) = after_opts_param_idx.checked_sub(args_after_opts.start) {
-                            if after_opts_param_idx + args_after_opts.len() <= param_locals.len() {
-                                param_locals.copy_within(args_after_opts.clone(), after_opts_param_idx);
-                                // Nil-fill unfilled optionals
-                                param_locals.get_mut(args_after_opts.start..args_after_opts.start + moved_by).unwrap_or_default().fill(Qnil);
-                            }
+                        let argc = argc.to_usize();
+
+                        // The range of args that sit where unfilled optionals should be
+                        let gap_start = lead_num + opts_filled;
+                        let gap_end = lead_num + opt_num;
+                        let src = gap_start..argc;
+
+                        // Shift args right by opts_unfilled to their correct local slots
+                        if !src.is_empty() && gap_end + src.len() <= param_locals.len() {
+                            param_locals.copy_within(src, gap_end);
                         }
+                        // Nil-fill the now-vacant optional parameter slots
+                        param_locals[gap_start..gap_end].fill(Qnil);
                     }
                 }
 
