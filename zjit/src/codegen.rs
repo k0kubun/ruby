@@ -774,7 +774,7 @@ fn gen_get_ep(asm: &mut Assembler, level: u32) -> Opnd {
 }
 
 fn gen_objtostring(jit: &mut JITState, asm: &mut Assembler, val: Opnd, cd: *const rb_call_data, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     // TODO: Specialize for immediate types
     // Call rb_vm_objtostring(cfp, recv, cd)
     let ret = asm_ccall!(asm, rb_vm_objtostring, CFP, val, Opnd::const_ptr(cd));
@@ -807,7 +807,7 @@ fn gen_defined(jit: &JITState, asm: &mut Assembler, op_type: usize, obj: VALUE, 
         }
         _ => {
             // Save the PC and SP because the callee may allocate or call #respond_to?
-            gen_prepare_non_leaf_call(jit, asm, state);
+            gen_prepare_non_leaf_call_light(jit, asm, state);
 
             // TODO: Inline the cases for each op_type
             // Call vm_defined(ec, reg_cfp, op_type, obj, v)
@@ -910,7 +910,7 @@ fn gen_get_constant_path(jit: &JITState, asm: &mut Assembler, ic: *const iseq_in
     }
 
     // Anything could be called on const_missing
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     asm_ccall!(asm, rb_vm_opt_getconstant_path, EC, CFP, Opnd::const_ptr(ic))
 }
@@ -921,7 +921,7 @@ fn gen_getconstant(jit: &mut JITState, asm: &mut Assembler, klass: Opnd, id: ID,
     }
 
     // Constant lookup can raise and run arbitrary Ruby code via const_missing.
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     asm_ccall!(asm, rb_vm_get_ev_const, EC, klass, id.0.into(), allow_nil)
 }
@@ -941,7 +941,7 @@ fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, state: &FrameState, bf
         gen_prepare_leaf_call_with_gc(asm, state);
     } else {
         // Anything can happen inside builtin functions
-        gen_prepare_non_leaf_call(jit, asm, state);
+        gen_prepare_non_leaf_call_light(jit, asm, state);
     }
 
     let mut cargs = vec![EC];
@@ -1022,7 +1022,7 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1116,7 +1116,7 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1176,7 +1176,7 @@ fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: 
 /// Emit an uncached instance variable store
 fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val: Opnd, state: &FrameState) {
     // Setting an ivar can raise FrozenError, so we need proper frame state for exception handling.
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     if ic.is_null() {
         asm_ccall!(asm, rb_ivar_set, recv, id.0.into(), val);
     } else {
@@ -1186,19 +1186,19 @@ fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: 
 }
 
 fn gen_getclassvar(jit: &mut JITState, asm: &mut Assembler, id: ID, ic: *const iseq_inline_cvar_cache_entry, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_vm_getclassvariable, VALUE::from(jit.iseq).into(), CFP, id.0.into(), Opnd::const_ptr(ic))
 }
 
 fn gen_setclassvar(jit: &mut JITState, asm: &mut Assembler, id: ID, val: Opnd, ic: *const iseq_inline_cvar_cache_entry, state: &FrameState) {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_vm_setclassvariable, VALUE::from(jit.iseq).into(), CFP, id.0.into(), val, Opnd::const_ptr(ic));
 }
 
 /// Look up global variables
 fn gen_getglobal(jit: &mut JITState, asm: &mut Assembler, id: ID, state: &FrameState) -> Opnd {
     // `Warning` module's method `warn` can be called when reading certain global variables
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     asm_ccall!(asm, rb_gvar_get, id.0.into())
 }
@@ -1213,7 +1213,7 @@ fn gen_intern(asm: &mut Assembler, val: Opnd, state: &FrameState) -> Opnd {
 /// Set global variables
 fn gen_setglobal(jit: &mut JITState, asm: &mut Assembler, id: ID, val: Opnd, state: &FrameState) {
     // When trace_var is used, setting a global variable can cause exceptions
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     asm_ccall!(asm, rb_gvar_set, id.0.into(), val);
 }
@@ -1286,12 +1286,12 @@ fn gen_hash_dup(asm: &mut Assembler, val: Opnd, state: &FrameState) -> lir::Opnd
 }
 
 fn gen_hash_aref(jit: &mut JITState, asm: &mut Assembler, hash: Opnd, key: Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_hash_aref, hash, key)
 }
 
 fn gen_hash_aset(jit: &mut JITState, asm: &mut Assembler, hash: Opnd, key: Opnd, val: Opnd, state: &FrameState) {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_hash_aset, hash, key, val);
 }
 
@@ -1301,12 +1301,12 @@ fn gen_array_push(asm: &mut Assembler, array: Opnd, val: Opnd, state: &FrameStat
 }
 
 fn gen_to_new_array(jit: &mut JITState, asm: &mut Assembler, val: Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qtrue), val)
 }
 
 fn gen_to_array(jit: &mut JITState, asm: &mut Assembler, val: Opnd, state: &FrameState) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qfalse), val)
 }
 
@@ -1318,7 +1318,7 @@ fn gen_checkmatch(jit: &JITState, asm: &mut Assembler, target: Opnd, pattern: Op
     // rb_vm_check_match is not leaf unless flag is VM_CHECKMATCH_TYPE_WHEN.
     // See also: leafness_of_checkmatch() and check_match()
     if flag != VM_CHECKMATCH_TYPE_WHEN {
-        gen_prepare_non_leaf_call(jit, asm, state);
+        gen_prepare_non_leaf_call_light(jit, asm, state);
     }
 
     unsafe extern "C" {
@@ -1329,7 +1329,7 @@ fn gen_checkmatch(jit: &JITState, asm: &mut Assembler, target: Opnd, pattern: Op
 }
 
 fn gen_array_extend(jit: &mut JITState, asm: &mut Assembler, left: Opnd, right: Opnd, state: &FrameState) {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_ary_concat, left, right);
 }
 
@@ -1553,7 +1553,7 @@ fn gen_send_iseq_direct(
 
     // Save cfp->pc and cfp->sp for the caller frame
     // Can't use gen_prepare_non_leaf_call because we need special SP math.
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0);
     gen_save_sp(asm, state.stack().len() - args.len() - 1); // -1 for receiver
 
     gen_spill_locals(jit, asm, state);
@@ -2090,7 +2090,7 @@ fn gen_new_hash(
     elements: Vec<Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     let cap: c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
     let new_hash = asm_ccall!(asm, rb_hash_new_with_size, lir::Opnd::Imm(cap));
@@ -2115,7 +2115,7 @@ fn gen_new_range(
     state: &FrameState,
 ) -> lir::Opnd {
     // Sometimes calls `low.<=>(high)`
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     // Call rb_range_new(low, high, flag)
     asm_ccall!(asm, rb_range_new, low, high, (flag as i32).into())
@@ -2134,7 +2134,7 @@ fn gen_new_range_fixnum(
 
 fn gen_object_alloc(jit: &JITState, asm: &mut Assembler, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
     // Allocating an object from an unknown class is non-leaf; see doc for `ObjectAlloc`.
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_obj_alloc, val)
 }
 
@@ -2688,7 +2688,7 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
 /// Save only the PC to CFP. Use this when you need to call gen_save_sp()
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
-fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
+fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState, stack_size: u16) {
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
@@ -2697,7 +2697,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     if let Some(pc) = PC_POISON {
         asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
     }
-    let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
+    let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq), stack_size);
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
 }
 
@@ -2710,7 +2710,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
 /// However, to avoid marking uninitialized stack slots, this also updates SP,
 /// which may have cfp->sp for a past frame or a past non-leaf call.
 fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, 0);
     gen_save_sp(asm, state.stack_size());
     if leaf {
         asm.expect_leaf_ccall(state.stack_size());
@@ -2781,6 +2781,17 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
     gen_spill_stack(jit, asm, state);
 
     // Spill locals in case the method looks at caller Bindings
+    gen_spill_locals(jit, asm, state);
+}
+
+/// Like gen_prepare_non_leaf_call but skips writing stack values to the VM stack.
+/// The callee C function must NOT read from the VM stack.
+/// GC scanning skips the uninitialized stack area using JITFrame::stack_size.
+fn gen_prepare_non_leaf_call_light(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    let stack_size = state.stack_size();
+    gen_save_pc_for_gc(asm, state, stack_size as u16);
+    gen_save_sp(asm, stack_size);
+    // Skip gen_spill_stack — stack values stay in registers.
     gen_spill_locals(jit, asm, state);
 }
 
@@ -3267,7 +3278,7 @@ fn gen_pop_opnds(asm: &mut Assembler, opnds: &[Opnd]) {
 }
 
 fn gen_toregexp(jit: &mut JITState, asm: &mut Assembler, opt: usize, values: Vec<Opnd>, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     let first_opnd_ptr = gen_push_opnds(asm, &values);
 
@@ -3281,7 +3292,7 @@ fn gen_toregexp(jit: &mut JITState, asm: &mut Assembler, opt: usize, values: Vec
 }
 
 fn gen_string_concat(jit: &mut JITState, asm: &mut Assembler, strings: Vec<Opnd>, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
 
     let first_string_ptr = gen_push_opnds(asm, &strings);
     let result = asm_ccall!(asm, rb_str_concat_literals, strings.len().into(), first_string_ptr);
@@ -3326,12 +3337,12 @@ fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, val
 }
 
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_str_buf_append, string, val)
 }
 
 fn gen_string_append_codepoint(jit: &mut JITState, asm: &mut Assembler, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
+    gen_prepare_non_leaf_call_light(jit, asm, state);
     asm_ccall!(asm, rb_jit_str_concat_codepoint, string, val)
 }
 

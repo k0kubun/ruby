@@ -1916,6 +1916,7 @@ pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub stack_size: u16,
 }
 pub const ZJIT_JIT_RETURN_POISON: zjit_poison_values = 2;
 pub type zjit_poison_values = u32;

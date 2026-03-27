@@ -3724,7 +3724,15 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
-        for (long i = 0; i < (long)(sp - p); i++) {
+        // For the top JIT frame, skip uninitialized VM stack slots.
+        // ZJIT's gen_prepare_non_leaf_call doesn't write stack values to the
+        // VM stack, so stop scanning before the stack area to avoid garbage.
+        VALUE *scan_end = sp;
+        if (CFP_HAS_JIT_RETURN(cfp)) {
+            const zjit_jit_frame_t *jf = (const zjit_jit_frame_t *)cfp->jit_return;
+            scan_end = sp - jf->stack_size;
+        }
+        for (long i = 0; i < (long)(scan_end - p); i++) {
             rb_gc_mark_movable(p[i]);
         }
 

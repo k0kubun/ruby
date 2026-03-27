@@ -23,6 +23,10 @@ typedef struct zjit_jit_frame {
     // (which write block_code themselves), so we must restore it.
     // Always false for C frames.
     bool materialize_block_code;
+    // Number of VM stack slots that are NOT written to the VM stack.
+    // Used by GC to skip scanning uninitialized stack slots.
+    // 0 means all stack slots are valid (no skipping needed).
+    uint16_t stack_size;
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
