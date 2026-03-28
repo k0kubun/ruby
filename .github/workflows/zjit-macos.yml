@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - zjit-fork-ci
     paths-ignore:
       - 'doc/**'
       - '**/man/*'
