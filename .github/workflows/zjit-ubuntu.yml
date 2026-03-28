@@ -4,13 +4,6 @@ on:
     branches:
       - master
       - zjit-fork-ci
-    paths-ignore:
-      - 'doc/**'
-      - '**/man/*'
-      - '**.md'
-      - '**.rdoc'
-      - '**/.document'
-      - '.*.yml'
   pull_request:
     types:
       - opened
@@ -28,14 +21,6 @@ jobs:
     name: cargo clippy
 
     runs-on: ubuntu-22.04
-
-    if: >-
-      ${{!(false
-      || contains(github.event.head_commit.message, '[DOC]')
-      || contains(github.event.pull_request.title, '[DOC]')
-      || contains(github.event.pull_request.labels.*.name, 'Documentation')
-      || (github.event.pull_request.user.login == 'dependabot[bot]' && !startsWith(github.head_ref, 'dependabot/cargo'))
-      )}}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
