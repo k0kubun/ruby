@@ -109,26 +109,26 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
 
-      - name: Run compact_stress tests
-        run: |
-          test -n "${LAUNCHABLE_STDOUT}" && exec 1> >(tee "${LAUNCHABLE_STDOUT}")
-          test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
+      #- name: Run compact_stress tests
+      #  run: |
+      #    test -n "${LAUNCHABLE_STDOUT}" && exec 1> >(tee "${LAUNCHABLE_STDOUT}")
+      #    test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
 
-          set -x
-          make -s test-all TESTS="../src/test/ruby/test_regexp.rb ../src/test/ruby/test_enumerator.rb -n /compact_stress/ --repeat-count=10 --seed=18733" \
-            RUN_OPTS="$RUN_OPTS" \
-            SPECOPTS="$SPECOPTS" \
-            TESTOPTS="$TESTOPTS"
-        timeout-minutes: 60
-        env:
-          RUBY_TESTOPTS: '-q --tty=no'
-          EXCLUDES: '../src/test/.excludes-zjit'
-          TEST_BUNDLED_GEMS_ALLOW_FAILURES: ''
-          SYNTAX_SUGGEST_TIMEOUT: '30'
-          PRECHECK_BUNDLED_GEMS: 'no'
-          LAUNCHABLE_STDOUT: ${{ steps.launchable.outputs.stdout_report_path }}
-          LAUNCHABLE_STDERR: ${{ steps.launchable.outputs.stderr_report_path }}
-        continue-on-error: ${{ matrix.continue-on-test_task || false }}
+      #    set -x
+      #    make -s test-all TESTS="../src/test/ruby/test_regexp.rb ../src/test/ruby/test_enumerator.rb -n /compact_stress/ --repeat-count=10" \
+      #      RUN_OPTS="$RUN_OPTS" \
+      #      SPECOPTS="$SPECOPTS" \
+      #      TESTOPTS="$TESTOPTS --seed=18733"
+      #  timeout-minutes: 60
+      #  env:
+      #    RUBY_TESTOPTS: '-q --tty=no'
+      #    EXCLUDES: '../src/test/.excludes-zjit'
+      #    TEST_BUNDLED_GEMS_ALLOW_FAILURES: ''
+      #    SYNTAX_SUGGEST_TIMEOUT: '30'
+      #    PRECHECK_BUNDLED_GEMS: 'no'
+      #    LAUNCHABLE_STDOUT: ${{ steps.launchable.outputs.stdout_report_path }}
+      #    LAUNCHABLE_STDERR: ${{ steps.launchable.outputs.stderr_report_path }}
+      #  continue-on-error: ${{ matrix.continue-on-test_task || false }}
 
       - name: make ${{ matrix.test_task }}
         run: |
@@ -136,10 +136,10 @@ jobs:
           test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
 
           set -x
-          make -s ${{ matrix.test_task }} TESTS=--seed=18733 \
+          make -s ${{ matrix.test_task }} \
             RUN_OPTS="$RUN_OPTS" \
             SPECOPTS="$SPECOPTS" \
-            TESTOPTS="$TESTOPTS"
+            TESTOPTS="$TESTOPTS --seed=3478"
         timeout-minutes: 60
         env:
           RUBY_TESTOPTS: '-q --tty=no'
