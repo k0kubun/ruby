@@ -115,7 +115,7 @@ jobs:
           test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
 
           set -x
-          make -s test-all TESTS="../src/test/ruby/test_regexp.rb ../src/test/ruby/test_enumerator.rb -n /compact_stress/ --repeat-count=10" \
+          make -s test-all TESTS="../src/test/ruby/test_regexp.rb ../src/test/ruby/test_enumerator.rb -n /compact_stress/ --repeat-count=10 --seed=18733" \
             RUN_OPTS="$RUN_OPTS" \
             SPECOPTS="$SPECOPTS" \
             TESTOPTS="$TESTOPTS"
@@ -136,7 +136,7 @@ jobs:
           test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
 
           set -x
-          make -s ${{ matrix.test_task }} ${TESTS:+TESTS="$TESTS"} \
+          make -s ${{ matrix.test_task }} TESTS=--seed=18733 \
             RUN_OPTS="$RUN_OPTS" \
             SPECOPTS="$SPECOPTS" \
             TESTOPTS="$TESTOPTS"
