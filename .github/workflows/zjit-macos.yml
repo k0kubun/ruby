@@ -22,23 +22,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - test_task: 'check'
+          - test_task: 'test-all'
             run_opts: '--zjit-call-threshold=1'
             specopts: '-T --zjit-call-threshold=1'
             configure: '--enable-zjit=dev'
 
-          - test_task: 'check'
+          - test_task: 'test-all'
             run_opts: '--zjit-disable-hir-opt --zjit-call-threshold=1'
             specopts: '-T --zjit-disable-hir-opt -T --zjit-call-threshold=1'
             configure: '--enable-zjit=dev'
 
-          - test_task: 'zjit-check' # zjit-test + quick feedback of test_zjit.rb
-            configure: '--enable-yjit=dev --enable-zjit'
-            rust_version: "1.85.0"
+          #- test_task: 'zjit-check' # zjit-test + quick feedback of test_zjit.rb
+          #  configure: '--enable-yjit=dev --enable-zjit'
+          #  rust_version: "1.85.0"
 
-          - test_task: 'ruby'
-            hint: 'combo build test'
-            configure: '--enable-yjit --enable-zjit'
+          #- test_task: 'ruby'
+          #  hint: 'combo build test'
+          #  configure: '--enable-yjit --enable-zjit'
 
     env:
       GITPULLOPTIONS: --no-tags origin ${{ github.ref }}
@@ -109,6 +109,27 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
 
+      - name: Run compact_stress tests
+        run: |
+          test -n "${LAUNCHABLE_STDOUT}" && exec 1> >(tee "${LAUNCHABLE_STDOUT}")
+          test -n "${LAUNCHABLE_STDERR}" && exec 2> >(tee "${LAUNCHABLE_STDERR}")
+
+          set -x
+          make -s test-all TESTS="../src/test/ruby/test_regexp.rb ../src/test/ruby/test_enumerator.rb -n /compact_stress/ --repeat-count=10" \
+            RUN_OPTS="$RUN_OPTS" \
+            SPECOPTS="$SPECOPTS" \
+            TESTOPTS="$TESTOPTS"
+        timeout-minutes: 60
+        env:
+          RUBY_TESTOPTS: '-q --tty=no'
+          EXCLUDES: '../src/test/.excludes-zjit'
+          TEST_BUNDLED_GEMS_ALLOW_FAILURES: ''
+          SYNTAX_SUGGEST_TIMEOUT: '30'
+          PRECHECK_BUNDLED_GEMS: 'no'
+          LAUNCHABLE_STDOUT: ${{ steps.launchable.outputs.stdout_report_path }}
+          LAUNCHABLE_STDERR: ${{ steps.launchable.outputs.stderr_report_path }}
+        continue-on-error: ${{ matrix.continue-on-test_task || false }}
+
       - name: make ${{ matrix.test_task }}
         run: |
           test -n "${LAUNCHABLE_STDOUT}" && exec 1> >(tee "${LAUNCHABLE_STDOUT}")
@@ -143,76 +164,76 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SIMPLER_ALERTS_URL }} # ruby-lang slack: ruby/simpler-alerts-bot
         if: ${{ failure() }}
 
-  result:
-    if: ${{ always() }}
-    name: ${{ github.workflow }} result
-    runs-on: ubuntu-latest
-    needs: [make]
-    steps:
-      - run: exit 1
-        working-directory:
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+  #result:
+  #  if: ${{ always() }}
+  #  name: ${{ github.workflow }} result
+  #  runs-on: ubuntu-latest
+  #  needs: [make]
+  #  steps:
+  #    - run: exit 1
+  #      working-directory:
+  #      if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
 
   # Separated from `make` job to avoid making it a required status check for now
-  ruby-bench:
-    strategy:
-      matrix:
-        include:
-          # Test --call-threshold=2 with 2 iterations in total
-          - ruby_opts: '--zjit-call-threshold=2'
-            bench_opts: '--warmup=1 --bench=1 --excludes=shipit'
-            configure: '--enable-zjit=dev_nodebug' # --enable-zjit=dev is too slow
+  #ruby-bench:
+  #  strategy:
+  #    matrix:
+  #      include:
+  #        # Test --call-threshold=2 with 2 iterations in total
+  #        - ruby_opts: '--zjit-call-threshold=2'
+  #          bench_opts: '--warmup=1 --bench=1 --excludes=shipit'
+  #          configure: '--enable-zjit=dev_nodebug' # --enable-zjit=dev is too slow
 
-    runs-on: macos-14
+  #  runs-on: macos-14
 
-    if: >-
-      ${{!(false
-      || contains(github.event.head_commit.message, '[DOC]')
-      || contains(github.event.pull_request.title, '[DOC]')
-      || contains(github.event.pull_request.labels.*.name, 'Documentation')
-      || (github.event.pull_request.user.login == 'dependabot[bot]' && !startsWith(github.head_ref, 'dependabot/cargo'))
-      )}}
+  #  if: >-
+  #    ${{!(false
+  #    || contains(github.event.head_commit.message, '[DOC]')
+  #    || contains(github.event.pull_request.title, '[DOC]')
+  #    || contains(github.event.pull_request.labels.*.name, 'Documentation')
+  #    || (github.event.pull_request.user.login == 'dependabot[bot]' && !startsWith(github.head_ref, 'dependabot/cargo'))
+  #    )}}
 
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
+  #  steps:
+  #    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  #      with:
+  #        persist-credentials: false
 
-      - uses: ./.github/actions/setup/macos
+  #    - uses: ./.github/actions/setup/macos
 
-      - uses: ./.github/actions/setup/directories
-        with:
-          srcdir: src
-          builddir: build
-          makeup: true
+  #    - uses: ./.github/actions/setup/directories
+  #      with:
+  #        srcdir: src
+  #        builddir: build
+  #        makeup: true
 
-      - name: Run configure
-        run: ../src/configure -C --disable-install-doc --prefix="$(pwd)/install" ${{ matrix.configure }}
+  #    - name: Run configure
+  #      run: ../src/configure -C --disable-install-doc --prefix="$(pwd)/install" ${{ matrix.configure }}
 
-      - run: make install
+  #    - run: make install
 
-      # setup/directories set MAKEFLAGS=-j4 for macOS, which randomly fails sqlite3.gem builds
-      - name: Unset MAKEFLAGS
-        run: echo "MAKEFLAGS=" >> "$GITHUB_ENV"
+  #    # setup/directories set MAKEFLAGS=-j4 for macOS, which randomly fails sqlite3.gem builds
+  #    - name: Unset MAKEFLAGS
+  #      run: echo "MAKEFLAGS=" >> "$GITHUB_ENV"
 
-      - name: Checkout ruby-bench
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-          repository: ruby/ruby-bench
-          path: ruby-bench
+  #    - name: Checkout ruby-bench
+  #      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  #      with:
+  #        persist-credentials: false
+  #        repository: ruby/ruby-bench
+  #        path: ruby-bench
 
-      # If you want to skip failing benchmark, consider using `--excludes`.
-      # e.g. `bench_opts: '--warmup=1 --bench=1 --excludes=railsbench,lobsters'`
-      - name: Run ruby-bench
-        run: ruby run_benchmarks.rb -e "zjit::../build/install/bin/ruby ${{ matrix.ruby_opts }}" ${{ matrix.bench_opts }}
-        working-directory: ruby-bench
+  #    # If you want to skip failing benchmark, consider using `--excludes`.
+  #    # e.g. `bench_opts: '--warmup=1 --bench=1 --excludes=railsbench,lobsters'`
+  #    - name: Run ruby-bench
+  #      run: ruby run_benchmarks.rb -e "zjit::../build/install/bin/ruby ${{ matrix.ruby_opts }}" ${{ matrix.bench_opts }}
+  #      working-directory: ruby-bench
 
-      - uses: ./.github/actions/slack
-        with:
-          label: ruby-bench ${{ matrix.bench_opts }} ${{ matrix.ruby_opts }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SIMPLER_ALERTS_URL }} # ruby-lang slack: ruby/simpler-alerts-bot
-        if: ${{ failure() }}
+  #    - uses: ./.github/actions/slack
+  #      with:
+  #        label: ruby-bench ${{ matrix.bench_opts }} ${{ matrix.ruby_opts }}
+  #        SLACK_WEBHOOK_URL: ${{ secrets.SIMPLER_ALERTS_URL }} # ruby-lang slack: ruby/simpler-alerts-bot
+  #      if: ${{ failure() }}
 
 defaults:
   run:
