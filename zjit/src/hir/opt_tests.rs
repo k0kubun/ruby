@@ -11433,8 +11433,8 @@ mod hir_opt_tests {
 
     #[test]
     fn test_inline_send_with_block_with_no_params() {
-        // Passing a block to a method that doesn't use it falls back to the
-        // interpreter so that unused block warnings are properly emitted.
+        // After eval() profiles the method, warn_unused_block records the method in the
+        // dedup table. ZJIT sees the entry and allows SendDirect, which gets inlined.
         eval(r#"
             def callee = 123
             def test
@@ -11454,16 +11454,16 @@ mod hir_opt_tests {
           v4:BasicObject = LoadArg :self@0
           Jump bb3(v4)
         bb3(v6:BasicObject):
-          v11:BasicObject = Send v6, 0x1000, :callee # SendFallbackReason: Complex argument passing
+          PatchPoint MethodRedefined(Object@0x1000, callee@0x1008, cme:0x1010)
+          v19:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)]
+          v21:Fixnum[123] = Const Value(123)
           CheckInterrupts
-          Return v11
+          Return v21
         ");
     }
 
     #[test]
     fn test_inline_send_with_block_with_one_param() {
-        // Passing a block to a method that doesn't use it falls back to the
-        // interpreter so that unused block warnings are properly emitted.
         eval(r#"
             def callee = 123
             def test
@@ -11483,16 +11483,16 @@ mod hir_opt_tests {
           v4:BasicObject = LoadArg :self@0
           Jump bb3(v4)
         bb3(v6:BasicObject):
-          v11:BasicObject = Send v6, 0x1000, :callee # SendFallbackReason: Complex argument passing
+          PatchPoint MethodRedefined(Object@0x1000, callee@0x1008, cme:0x1010)
+          v19:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)]
+          v21:Fixnum[123] = Const Value(123)
           CheckInterrupts
-          Return v11
+          Return v21
         ");
     }
 
     #[test]
     fn test_inline_send_with_block_with_multiple_params() {
-        // Passing a block to a method that doesn't use it falls back to the
-        // interpreter so that unused block warnings are properly emitted.
         eval(r#"
             def callee = 123
             def test
@@ -11512,9 +11512,11 @@ mod hir_opt_tests {
           v4:BasicObject = LoadArg :self@0
           Jump bb3(v4)
         bb3(v6:BasicObject):
-          v11:BasicObject = Send v6, 0x1000, :callee # SendFallbackReason: Complex argument passing
+          PatchPoint MethodRedefined(Object@0x1000, callee@0x1008, cme:0x1010)
+          v19:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)]
+          v21:Fixnum[123] = Const Value(123)
           CheckInterrupts
-          Return v11
+          Return v21
         ");
     }
 

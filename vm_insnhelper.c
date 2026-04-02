@@ -3148,26 +3148,31 @@ vm_call_single_noarg_leaf_builtin(rb_execution_context_t *ec, rb_control_frame_t
 
 VALUE rb_gen_method_name(VALUE owner, VALUE name); // in vm_backtrace.c
 
+// Compute a unique key from a PC and a method definition pointer for use in
+// the unused block warning dedup table.
+static inline st_data_t
+unused_block_warning_key(const void *pc, const rb_method_definition_t *def)
+{
+    union { VALUE v; unsigned char b[SIZEOF_VALUE]; }
+        k1 = { .v = (VALUE)pc },
+        k2 = { .v = (VALUE)def };
+    st_data_t key = 0;
+    for (int i = 0; i < SIZEOF_VALUE; i++) {
+        key |= (st_data_t)(k1.b[i] ^ k2.b[SIZEOF_VALUE-1-i]) << (8 * i);
+    }
+    return key;
+}
+
 static void
 warn_unused_block(const rb_callable_method_entry_t *cme, const rb_iseq_t *iseq, void *pc)
 {
     rb_vm_t *vm = GET_VM();
     set_table *dup_check_table = &vm->unused_block_warning_table;
-    st_data_t key;
     bool strict_unused_block = rb_warning_category_enabled_p(RB_WARN_CATEGORY_STRICT_UNUSED_BLOCK);
-
-    union {
-        VALUE v;
-        unsigned char b[SIZEOF_VALUE];
-    } k1 = {
-        .v = (VALUE)pc,
-    }, k2 = {
-        .v = (VALUE)cme->def,
-    };
 
     // relax check
     if (!strict_unused_block) {
-        key = (st_data_t)cme->def->original_id;
+        st_data_t key = (st_data_t)cme->def->original_id;
 
         if (set_table_lookup(dup_check_table, key)) {
             return;
@@ -3175,18 +3180,7 @@ warn_unused_block(const rb_callable_method_entry_t *cme, const rb_iseq_t *iseq, 
     }
 
     // strict check
-    // make unique key from pc and me->def pointer
-    key = 0;
-    for (int i=0; i<SIZEOF_VALUE; i++) {
-        // fprintf(stderr, "k1:%3d k2:%3d\n", k1.b[i], k2.b[SIZEOF_VALUE-1-i]);
-        key |= (st_data_t)(k1.b[i] ^ k2.b[SIZEOF_VALUE-1-i]) << (8 * i);
-    }
-
-    if (0) {
-        fprintf(stderr, "SIZEOF_VALUE:%d\n", SIZEOF_VALUE);
-        fprintf(stderr, "pc:%p def:%p\n", pc, (void *)cme->def);
-        fprintf(stderr, "key:%p\n", (void *)key);
-    }
+    st_data_t key = unused_block_warning_key(pc, cme->def);
 
     // duplication check
     if (set_insert(dup_check_table, key)) {
@@ -3204,6 +3198,35 @@ warn_unused_block(const rb_callable_method_entry_t *cme, const rb_iseq_t *iseq, 
             rb_warn("the block may be ignored because '%"PRIsVALUE"' does not use a block", name);
         }
     }
+}
+
+// Check if warn_unused_block has already been called for the given call site.
+// Used by ZJIT at compile time: if set_insert in warn_unused_block has already
+// recorded this call site, the warning was already handled (whether or not the
+// text was printed depends on $VERBOSE), so ZJIT can compile as SendDirect.
+// `pc` is the PC of the send instruction; we advance it by the instruction
+// length to match cfp->pc as seen by warn_unused_block.
+bool
+rb_zjit_unused_block_warning_already_emitted(const rb_callable_method_entry_t *cme, const VALUE *pc)
+{
+    rb_vm_t *vm = GET_VM();
+    set_table *dup_check_table = &vm->unused_block_warning_table;
+    bool strict_unused_block = rb_warning_category_enabled_p(RB_WARN_CATEGORY_STRICT_UNUSED_BLOCK);
+
+    // Relaxed check: same as warn_unused_block
+    if (!strict_unused_block) {
+        st_data_t key = (st_data_t)cme->def->original_id;
+        if (set_table_lookup(dup_check_table, key)) {
+            return true;
+        }
+    }
+
+    // Strict check: the interpreter's cfp->pc points to the next instruction
+    // when vm_callee_setup_arg calls warn_unused_block, so advance pc.
+    int insn = rb_vm_insn_decode(*pc);
+    const VALUE *next_pc = pc + rb_insn_len(insn);
+    st_data_t key = unused_block_warning_key(next_pc, cme->def);
+    return set_table_lookup(dup_check_table, key) != 0;
 }
 
 static inline int
