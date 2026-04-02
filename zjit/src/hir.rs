@@ -1109,8 +1109,8 @@ pub enum Insn {
     /// so that it gets recompiled with the new profile data.
     SideExit { state: InsnId, reason: SideExitReason, recompile: Option<i32> },
 
-    /// Increment a counter in ZJIT stats
-    IncrCounter(Counter),
+    /// Increment a counter in ZJIT stats by the given amount
+    IncrCounter(Counter, u64),
 
     /// Increment a counter in ZJIT stats for the given counter pointer
     IncrCounterPtr { counter_ptr: *mut u64 },
@@ -1140,7 +1140,7 @@ macro_rules! for_each_operand_impl {
             | Insn::LoadSelf
             | Insn::BreakPoint
             | Insn::PutSpecialObject { .. }
-            | Insn::IncrCounter(_)
+            | Insn::IncrCounter(_, _)
             | Insn::IncrCounterPtr { .. } => {}
 
             Insn::IsBlockGiven { lep } => {
@@ -1429,7 +1429,7 @@ impl Insn {
             | Insn::IfTrue { .. } | Insn::IfFalse { .. } | Insn::EntryPoint { .. } | Insn::Return { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
-            | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
+            | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_, _) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
             | Insn::ArrayAset { .. } => false,
@@ -1641,7 +1641,7 @@ impl Insn {
             Insn::GuardLess { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::PatchPoint { .. } => Effect::read_write(abstract_heaps::PatchPoint, abstract_heaps::Control),
             Insn::SideExit { .. } => effects::Any,
-            Insn::IncrCounter(_) => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Other),
+            Insn::IncrCounter(_, _) => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Other),
             Insn::IncrCounterPtr { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Other),
             Insn::CheckInterrupts { .. } => Effect::read_write(abstract_heaps::InterruptFlag, abstract_heaps::Control),
             Insn::InvokeProc { .. } => effects::Any,
@@ -2164,7 +2164,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 }
                 write!(f, ", {val}")
             }
-            Insn::IncrCounter(counter) => write!(f, "IncrCounter {counter:?}"),
+            Insn::IncrCounter(counter, amount) => {
+                if *amount == 1 {
+                    write!(f, "IncrCounter {counter:?}")
+                } else {
+                    write!(f, "IncrCounter {counter:?}, {amount}")
+                }
+            }
             Insn::CheckInterrupts { .. } => write!(f, "CheckInterrupts"),
             Insn::IsA { val, class } => write!(f, "IsA {val}, {class}"),
             Insn::BreakPoint => write!(f, "BreakPoint"),
@@ -2695,7 +2701,7 @@ impl Function {
 
     pub fn count(&mut self, block: BlockId, counter: Counter) {
         if get_option!(stats) {
-            self.push_insn(block, Insn::IncrCounter(counter));
+            self.push_insn(block, Insn::IncrCounter(counter, 1));
         }
     }
 
@@ -2761,7 +2767,7 @@ impl Function {
                     | LoadSelf
                     | BreakPoint
                     | IncrCounterPtr {..}
-                    | IncrCounter(_)) => result.clone(),
+                    | IncrCounter(_, _)) => result.clone(),
             &Snapshot { state: FrameState { iseq, insn_idx, pc, ref stack, ref locals } } =>
                 Snapshot {
                     state: FrameState {
@@ -3003,7 +3009,7 @@ impl Function {
             | Insn::IfTrue { .. } | Insn::IfFalse { .. } | Insn::Return { .. } | Insn::Throw { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
-            | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
+            | Insn::IncrCounter(_, _) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn.0]),
@@ -4642,8 +4648,13 @@ impl Function {
         let called_id = unsafe { (*cme).called_id };
         let qualified_method_name = qualified_method_name(owner, called_id);
         let not_inlined_cfunc_counter_pointers = ZJITState::get_not_inlined_cfunc_counter_pointers();
-        let counter_ptr = not_inlined_cfunc_counter_pointers.entry(qualified_method_name.clone()).or_insert_with(|| Box::new(0));
-        let counter_ptr = &mut **counter_ptr as *mut u64;
+        // Use get first to avoid cloning the key for the common case
+        let counter_ptr = if let Some(boxed) = not_inlined_cfunc_counter_pointers.get_mut(&qualified_method_name) {
+            &mut **boxed as *mut u64
+        } else {
+            let boxed = not_inlined_cfunc_counter_pointers.entry(qualified_method_name).or_insert_with(|| Box::new(0));
+            &mut **boxed as *mut u64
+        };
 
         self.push_insn(block, Insn::IncrCounterPtr { counter_ptr });
     }
@@ -4651,8 +4662,13 @@ impl Function {
     fn count_iseq_calls(&mut self, block: BlockId) {
         let iseq_name = iseq_get_location(self.iseq, 0);
         let access_counter_ptrs = crate::state::ZJITState::get_iseq_calls_count_pointers();
-        let counter_ptr = access_counter_ptrs.entry(iseq_name.to_string()).or_insert_with(|| Box::new(0));
-        let counter_ptr: &mut u64 = counter_ptr.as_mut();
+        // Use get first to avoid cloning the key for the common case
+        let counter_ptr = if let Some(boxed) = access_counter_ptrs.get_mut(&iseq_name) {
+            boxed.as_mut() as *mut u64
+        } else {
+            let boxed = access_counter_ptrs.entry(iseq_name).or_insert_with(|| Box::new(0));
+            boxed.as_mut() as *mut u64
+        };
 
         self.push_insn(block, Insn::IncrCounterPtr { counter_ptr });
     }
@@ -4662,8 +4678,13 @@ impl Function {
         let called_id = unsafe { (*cme).called_id };
         let qualified_method_name = qualified_method_name(owner, called_id);
         let not_annotated_cfunc_counter_pointers = ZJITState::get_not_annotated_cfunc_counter_pointers();
-        let counter_ptr = not_annotated_cfunc_counter_pointers.entry(qualified_method_name.clone()).or_insert_with(|| Box::new(0));
-        let counter_ptr = &mut **counter_ptr as *mut u64;
+        // Use get first to avoid cloning the key for the common case
+        let counter_ptr = if let Some(boxed) = not_annotated_cfunc_counter_pointers.get_mut(&qualified_method_name) {
+            &mut **boxed as *mut u64
+        } else {
+            let boxed = not_annotated_cfunc_counter_pointers.entry(qualified_method_name).or_insert_with(|| Box::new(0));
+            &mut **boxed as *mut u64
+        };
 
         self.push_insn(block, Insn::IncrCounterPtr { counter_ptr });
     }
@@ -7103,8 +7124,9 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
             }
 
             // Increment zjit_insn_count for each YARV instruction if --zjit-stats is enabled.
-            if get_option!(stats) {
-                fun.push_insn(block, Insn::IncrCounter(Counter::zjit_insn_count));
+            // This can be disabled with --zjit-no-count-insns for faster stats collection.
+            if get_option!(stats) && !get_option!(no_count_insns) {
+                fun.push_insn(block, Insn::IncrCounter(Counter::zjit_insn_count, 1));
             }
             // Move to the next instruction to compile
             insn_idx += insn_len(opcode as usize);

@@ -51,7 +51,7 @@ macro_rules! make_counters {
 
         /// Enum to represent a counter
         #[allow(non_camel_case_types)]
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
         pub enum Counter {
             $($default_counter_name,)+
             $($exit_counter_name,)+
@@ -934,8 +934,9 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, &key_string, *count);
     }
 
-    // Only ZJIT_STATS builds support rb_vm_insn_count
-    if unsafe { rb_vm_insn_count } > 0 {
+    // Only ZJIT_STATS builds support rb_vm_insn_count.
+    // Instruction counting can be disabled with --zjit-no-count-insns for faster stats.
+    if !get_option!(no_count_insns) && unsafe { rb_vm_insn_count } > 0 {
         let vm_insn_count = unsafe { rb_vm_insn_count };
         set_stat_usize!(hash, "vm_insn_count", vm_insn_count);
 

@@ -108,6 +108,10 @@ pub struct Options {
 
     /// Maximum number of versions per ISEQ
     pub max_versions: usize,
+
+    /// Disable per-instruction zjit_insn_count counter emission for faster --zjit-stats.
+    /// When set, zjit_insn_count, total_insn_count, and ratio_in_zjit won't be reported.
+    pub no_count_insns: bool,
 }
 
 impl Default for Options {
@@ -134,6 +138,7 @@ impl Default for Options {
             allowed_iseqs: None,
             log_compiled_iseqs: None,
             max_versions: 2,
+            no_count_insns: false,
         }
     }
 }
@@ -347,6 +352,10 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
             Err(_) => return None,
+        },
+
+        ("no-count-insns", _) => {
+            options.no_count_insns = true;
         },
 
         ("stats-quiet", _) => {

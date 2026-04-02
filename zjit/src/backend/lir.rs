@@ -3513,9 +3513,14 @@ impl Assembler {
         // otherwise we have no counter pointers to read.
         if crate::state::ZJITState::has_instance() && get_option!(stats) {
             let ccall_counter_pointers = crate::state::ZJITState::get_ccall_counter_pointers();
-            let counter_ptr = ccall_counter_pointers.entry(fn_name.to_string()).or_insert_with(|| Box::new(0));
-            let counter_ptr: &mut u64 = counter_ptr.as_mut();
-            self.incr_counter(Opnd::const_ptr(counter_ptr), 1.into());
+            // Use get first to avoid allocating a String for the common case (key already exists)
+            let counter_ptr: *mut u64 = if let Some(boxed) = ccall_counter_pointers.get_mut(fn_name) {
+                boxed.as_mut() as *mut u64
+            } else {
+                let boxed = ccall_counter_pointers.entry(fn_name.to_string()).or_insert_with(|| Box::new(0));
+                boxed.as_mut() as *mut u64
+            };
+            self.incr_counter(Opnd::const_ptr(counter_ptr as *const u8), 1.into());
         }
     }
 

@@ -1080,11 +1080,11 @@ impl Assembler {
                     last_patch_pos = Some(cb.get_write_pos());
                 },
 
-                // Atomically increment a counter at a given memory location
+                // Increment a counter at a given memory location.
+                // No lock prefix needed: JIT code runs under the GVL (single-threaded).
                 Insn::IncrCounter { mem, value } => {
                     assert!(matches!(mem, Opnd::Mem(_)));
                     assert!(matches!(value, Opnd::UImm(_) | Opnd::Imm(_) ) );
-                    write_lock_prefix(cb);
                     add(cb, mem.into(), value.into());
                 },
 

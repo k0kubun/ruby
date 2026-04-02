@@ -724,7 +724,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
         Insn::GetSpecialSymbol { symbol_type, state: _ } => gen_getspecial_symbol(asm, *symbol_type),
         Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
-        &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
+        &Insn::IncrCounter(counter, amount) => no_output!(gen_incr_counter_by(asm, counter, amount)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         Insn::ObjToString { val, cd, state, .. } => gen_objtostring(jit, asm, opnd!(val), *cd, &function.frame_state(*state)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, &function.frame_state(state))),
@@ -2674,16 +2674,25 @@ fn gen_guard_no_bits_set(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd
 
 /// Generate code that records unoptimized C functions if --zjit-stats is enabled
 fn gen_incr_counter_ptr(asm: &mut Assembler, counter_ptr: *mut u64) {
+    gen_incr_counter_ptr_by(asm, counter_ptr, 1);
+}
+
+fn gen_incr_counter_ptr_by(asm: &mut Assembler, counter_ptr: *mut u64, amount: u64) {
     if get_option!(stats) {
-        asm.incr_counter(Opnd::const_ptr(counter_ptr as *const u8), Opnd::UImm(1));
+        asm.incr_counter(Opnd::const_ptr(counter_ptr as *const u8), Opnd::UImm(amount));
     }
 }
 
-/// Generate code that increments a counter if --zjit-stats
+/// Generate code that increments a counter by 1 if --zjit-stats
 fn gen_incr_counter(asm: &mut Assembler, counter: Counter) {
+    gen_incr_counter_by(asm, counter, 1);
+}
+
+/// Generate code that increments a counter by the given amount if --zjit-stats
+fn gen_incr_counter_by(asm: &mut Assembler, counter: Counter, amount: u64) {
     if get_option!(stats) {
         let ptr = counter_ptr(counter);
-        gen_incr_counter_ptr(asm, ptr);
+        gen_incr_counter_ptr_by(asm, ptr, amount);
     }
 }
 
