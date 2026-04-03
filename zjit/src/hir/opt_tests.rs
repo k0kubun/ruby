@@ -7030,7 +7030,6 @@ mod hir_opt_tests {
           IfFalse v16, bb4(v9, v17)
           v19:Truthy = RefineType v10, Truthy
           v21:FalseClass = Const Value(false)
-          CheckInterrupts
           Jump bb5(v9, v19, v21)
         bb4(v25:BasicObject, v26:Falsy):
           v29:NilClass = Const Value(nil)
@@ -14459,7 +14458,6 @@ mod hir_opt_tests {
           v17:Falsy = RefineType v10, Falsy
           IfFalse v16, bb6(v9, v17)
           v19:Truthy = RefineType v10, Truthy
-          CheckInterrupts
           v38:Fixnum[3] = Const Value(3)
           Return v38
         bb6(v43:BasicObject, v44:Falsy):

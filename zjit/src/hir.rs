@@ -5694,7 +5694,12 @@ impl Function {
                 if matches!(insn, Insn::CheckInterrupts { .. }) {
                     if seen { continue; }
                     seen = true;
-                } else if insn.effects_of().write_bits().overlaps(abstract_heaps::InterruptFlag) {
+                } else if !matches!(insn, Insn::IfTrue { .. } | Insn::IfFalse { .. })
+                    && insn.effects_of().write_bits().overlaps(abstract_heaps::InterruptFlag)
+                {
+                    // IfTrue/IfFalse are control-flow instructions that don't
+                    // actually write interrupt flags, despite having
+                    // effects::Any for instruction ordering purposes.
                     seen = false;
                 }
                 new_insns.push(insn_id);
