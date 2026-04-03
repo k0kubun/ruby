@@ -430,8 +430,6 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             match insn {
                 Insn::IfFalse { val, target } => {
 
-                    let val_opnd = jit.get_opnd(val);
-
                     let lir_target = hir_to_lir[target.target.0].unwrap();
 
                     let fall_through_target = asm.new_block(block_id, false, rpo_idx);
@@ -446,7 +444,11 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         args: vec![]
                     };
 
-                    gen_if_false(&mut asm, val_opnd, branch_edge, fall_through_edge);
+                    // Try to fuse Test(FixnumCmp) into a single cmp+jcc
+                    if !gen_fused_if_false(&mut asm, &jit, function, val, branch_edge.clone(), fall_through_edge.clone()) {
+                        let val_opnd = jit.get_opnd(val);
+                        gen_if_false(&mut asm, val_opnd, branch_edge, fall_through_edge);
+                    }
                     assert!(asm.current_block().insns.last().unwrap().is_terminator());
 
                     asm.set_current_block(fall_through_target);
@@ -455,7 +457,6 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                     asm.write_label(label);
                 },
                 Insn::IfTrue { val, target } => {
-                    let val_opnd = jit.get_opnd(val);
 
                     let lir_target = hir_to_lir[target.target.0].unwrap();
 
@@ -471,7 +472,11 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         args: vec![]
                     };
 
-                    gen_if_true(&mut asm, val_opnd, branch_edge, fall_through_edge);
+                    // Try to fuse Test(FixnumCmp) into a single cmp+jcc
+                    if !gen_fused_if_true(&mut asm, &jit, function, val, branch_edge.clone(), fall_through_edge.clone()) {
+                        let val_opnd = jit.get_opnd(val);
+                        gen_if_true(&mut asm, val_opnd, branch_edge, fall_through_edge);
+                    }
                     assert!(asm.current_block().insns.last().unwrap().is_terminator());
 
                     asm.set_current_block(fall_through_target);
@@ -1472,6 +1477,64 @@ fn gen_if_false(asm: &mut Assembler, val: lir::Opnd, branch: lir::BranchEdge, fa
     asm.test(val, val);
     asm.push_insn(lir::Insn::Jnz(Target::Block(fall_through)));
     asm.jmp(Target::Block(branch));
+}
+
+/// Fixnum comparison kind for fused branch generation.
+enum FixnumCmpKind { Lt, Le, Gt, Ge, Eq, Neq }
+
+/// Try to look through `Test(FixnumCmp(a, b))` and extract the comparison
+/// operands and kind. Returns `None` when the pattern doesn't match.
+fn try_extract_fixnum_cmp(jit: &JITState, function: &Function, val: InsnId) -> Option<(lir::Opnd, lir::Opnd, FixnumCmpKind)> {
+    let Insn::Test { val: inner } = function.find(val) else { return None };
+    let (left, right, kind) = match function.find(inner) {
+        Insn::FixnumLt  { left, right } => (left, right, FixnumCmpKind::Lt),
+        Insn::FixnumLe  { left, right } => (left, right, FixnumCmpKind::Le),
+        Insn::FixnumGt  { left, right } => (left, right, FixnumCmpKind::Gt),
+        Insn::FixnumGe  { left, right } => (left, right, FixnumCmpKind::Ge),
+        Insn::FixnumEq  { left, right } => (left, right, FixnumCmpKind::Eq),
+        Insn::FixnumNeq { left, right } => (left, right, FixnumCmpKind::Neq),
+        _ => return None,
+    };
+    Some((jit.get_opnd(left), jit.get_opnd(right), kind))
+}
+
+/// Try to generate a fused `cmp + jcc` for `IfFalse(Test(FixnumCmp(a, b)))`.
+/// IfFalse branches when the condition is false, so we invert the comparison.
+/// Returns `true` if fusion was performed.
+fn gen_fused_if_false(asm: &mut Assembler, jit: &JITState, function: &Function, val: InsnId, branch: lir::BranchEdge, fall_through: lir::BranchEdge) -> bool {
+    let Some((left, right, kind)) = try_extract_fixnum_cmp(jit, function, val) else { return false };
+    asm_comment!(asm, "fused cmp + branch (IfFalse)");
+    // IfFalse takes the branch when the condition is FALSE — use the inverted sense.
+    // For FixnumGt we swap operands and use Jge to avoid needing a Jle instruction.
+    match kind {
+        FixnumCmpKind::Lt  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jge(Target::Block(branch))); }
+        FixnumCmpKind::Le  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jg(Target::Block(branch)));  }
+        FixnumCmpKind::Gt  => { asm.cmp(right, left);  asm.push_insn(lir::Insn::Jge(Target::Block(branch))); }
+        FixnumCmpKind::Ge  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jl(Target::Block(branch)));  }
+        FixnumCmpKind::Eq  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jne(Target::Block(branch))); }
+        FixnumCmpKind::Neq => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Je(Target::Block(branch)));  }
+    }
+    asm.jmp(Target::Block(fall_through));
+    true
+}
+
+/// Try to generate a fused `cmp + jcc` for `IfTrue(Test(FixnumCmp(a, b)))`.
+/// IfTrue branches when the condition is true — use the comparison directly.
+/// Returns `true` if fusion was performed.
+fn gen_fused_if_true(asm: &mut Assembler, jit: &JITState, function: &Function, val: InsnId, branch: lir::BranchEdge, fall_through: lir::BranchEdge) -> bool {
+    let Some((left, right, kind)) = try_extract_fixnum_cmp(jit, function, val) else { return false };
+    asm_comment!(asm, "fused cmp + branch (IfTrue)");
+    // For FixnumLe we swap operands and use Jge to avoid needing a Jle instruction.
+    match kind {
+        FixnumCmpKind::Lt  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jl(Target::Block(branch)));  }
+        FixnumCmpKind::Le  => { asm.cmp(right, left);  asm.push_insn(lir::Insn::Jge(Target::Block(branch))); }
+        FixnumCmpKind::Gt  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jg(Target::Block(branch)));  }
+        FixnumCmpKind::Ge  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jge(Target::Block(branch))); }
+        FixnumCmpKind::Eq  => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Je(Target::Block(branch)));  }
+        FixnumCmpKind::Neq => { asm.cmp(left, right);  asm.push_insn(lir::Insn::Jne(Target::Block(branch))); }
+    }
+    asm.jmp(Target::Block(fall_through));
+    true
 }
 
 /// Compile a dynamic dispatch with block
