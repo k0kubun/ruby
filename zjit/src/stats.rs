@@ -854,10 +854,13 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     }
 
     // Memory usage stats
-    let code_region_bytes = ZJITState::get_code_block().mapped_region_size();
-    set_stat_usize!(hash, "code_region_bytes", code_region_bytes);
-    set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
-    set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + zjit_alloc_bytes());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let code_region_bytes = ZJITState::get_code_block().mapped_region_size();
+        set_stat_usize!(hash, "code_region_bytes", code_region_bytes);
+        set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
+        set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + zjit_alloc_bytes());
+    }
 
     // End of default stats. Every counter beyond this is provided only for --zjit-stats.
     if !get_option!(stats) {

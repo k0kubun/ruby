@@ -26,7 +26,21 @@ impl IntoUsize for u64 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
+impl IntoUsize for u64 {
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
 #[cfg(target_pointer_width = "64")]
+impl IntoUsize for u32 {
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
 impl IntoUsize for u32 {
     fn to_usize(self) -> usize {
         self as usize
@@ -57,6 +71,13 @@ pub(crate) trait IntoU64 {
 }
 
 #[cfg(target_pointer_width = "64")]
+impl IntoU64 for usize {
+    fn as_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
 impl IntoU64 for usize {
     fn as_u64(self) -> u64 {
         self as u64

@@ -217,6 +217,7 @@ pub enum DumpLIR {
 #[derive(Clone, Copy, Debug)]
 pub enum DumpDisasm {
     Stdout,
+    #[cfg(unix)]
     File(std::os::unix::io::RawFd),
 }
 
@@ -472,6 +473,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
             match opt_val {
                 "" => options.dump_disasm = Some(DumpDisasm::Stdout),
+                #[cfg(unix)]
                 directory => {
                     let path = format!("{directory}/zjit_{}.log", std::process::id());
                     match File::options().create(true).append(true).open(&path) {
@@ -482,6 +484,10 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
                         }
                         Err(err) => eprintln!("Failed to create {path}: {err}"),
                     }
+                }
+                #[cfg(not(unix))]
+                _directory => {
+                    eprintln!("ZJIT disasm dump to file is not supported on this platform");
                 }
             }
         }
@@ -610,6 +616,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn parse_dump_disasm_path() {
         unsafe { OPTIONS = Some(Options::default()); }
 

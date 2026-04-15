@@ -1,17 +1,26 @@
 //! Runtime state of ZJIT.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::codegen::{gen_entry_trampoline, gen_exit_trampoline, gen_exit_trampoline_with_counter, gen_function_stub_hit_trampoline};
-use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
+use crate::cruby::{self, rb_bug_panic_hook, src_loc, EcPtr, Qnil, Qtrue, VALUE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::cruby::{rb_vm_insn_count, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VM_INSTRUCTION_SIZE};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
 use std::sync::atomic::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::invariants::Invariants;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::asm::CodeBlock;
 use crate::options::{get_option, rb_zjit_prepare_options};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::jit_frame::JITFrame;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::stats::{Counters, InsnCounters, PerfettoTracer};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::virtualmem::CodePtr;
 use std::sync::atomic::AtomicUsize;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 use std::ptr::null;
 
@@ -26,6 +35,7 @@ pub fn zjit_enabled_p() -> bool {
 }
 
 /// Global state needed for code generation
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ZJITState {
     /// Inline code block (fast path)
     code_block: CodeBlock,
@@ -76,6 +86,13 @@ pub struct ZJITState {
     jit_frames: Vec<*mut JITFrame>,
 }
 
+/// Simplified state for wasm32 (no code generation)
+#[cfg(target_arch = "wasm32")]
+pub struct ZJITState {
+    /// Properties of core library methods
+    method_annotations: cruby_methods::Annotations,
+}
+
 /// Tracks the initialization progress
 enum InitializationState {
     Uninitialized,
@@ -99,6 +116,7 @@ enum InitializationState {
 /// Private singleton instance of the codegen globals
 static mut ZJIT_STATE: InitializationState = InitializationState::Uninitialized;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ZJITState {
     /// Initialize the ZJIT globals. Return the address of the JIT entry trampoline.
     pub fn init() -> *const u8 {
@@ -167,20 +185,6 @@ impl ZJITState {
         entry_trampoline
     }
 
-    /// Return true if zjit_state has been initialized
-    pub fn has_instance() -> bool {
-        matches!(unsafe { &ZJIT_STATE }, InitializationState::Enabled(_))
-    }
-
-    /// Get a mutable reference to the codegen globals instance
-    fn get_instance() -> &'static mut ZJITState {
-        if let InitializationState::Enabled(instance) = unsafe { &mut ZJIT_STATE } {
-            instance
-        } else {
-            panic!("ZJITState::get_instance called when ZJIT is not enabled")
-        }
-    }
-
     /// Get a mutable reference to the inline code block
     pub fn get_code_block() -> &'static mut CodeBlock {
         &mut ZJITState::get_instance().code_block
@@ -193,10 +197,6 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
-    }
-
-    pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
-        &ZJITState::get_instance().method_annotations
     }
 
     /// Return true if successful compilation should be asserted
@@ -251,6 +251,128 @@ impl ZJITState {
         &mut ZJITState::get_instance().iseq_calls_count_pointers
     }
 
+    /// Return a code pointer to the side-exit trampoline
+    pub fn get_exit_trampoline() -> CodePtr {
+        ZJITState::get_instance().exit_trampoline
+    }
+
+    /// Return a code pointer to the exit trampoline for function stubs
+    pub fn get_exit_trampoline_with_counter() -> CodePtr {
+        ZJITState::get_instance().exit_trampoline_with_counter
+    }
+
+    /// Return a code pointer to the function stub hit trampoline
+    pub fn get_function_stub_hit_trampoline() -> CodePtr {
+        ZJITState::get_instance().function_stub_hit_trampoline
+    }
+
+    /// Get a mutable reference to the Perfetto tracer
+    pub fn get_tracer() -> Option<&'static mut PerfettoTracer> {
+        if !ZJITState::has_instance() { return None; }
+        ZJITState::get_instance().perfetto_tracer.as_mut()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ZJITState {
+    /// Initialize the ZJIT globals for wasm (no code generation).
+    pub fn init() -> *const u8 {
+        use InitializationState::*;
+
+        let initialization_state = unsafe {
+            std::mem::replace(&mut ZJIT_STATE, Panicked)
+        };
+
+        let Initialized(method_annotations) = initialization_state else {
+            panic!("rb_zjit_init was never called");
+        };
+
+        let zjit_state = ZJITState {
+            method_annotations,
+        };
+        unsafe { ZJIT_STATE = Enabled(zjit_state); }
+
+        // Return null — no entry trampoline on wasm32
+        null()
+    }
+
+    // Stub counter/stats methods for wasm32 (counters are no-ops)
+    pub fn get_counters() -> &'static mut crate::stats::Counters {
+        static mut DUMMY_COUNTERS: Option<crate::stats::Counters> = None;
+        unsafe {
+            if DUMMY_COUNTERS.is_none() {
+                DUMMY_COUNTERS = Some(crate::stats::Counters::default());
+            }
+            DUMMY_COUNTERS.as_mut().unwrap()
+        }
+    }
+
+    pub fn get_exit_counters() -> &'static mut crate::stats::InsnCounters {
+        static mut DUMMY: crate::stats::InsnCounters = [0u64; crate::cruby::VM_INSTRUCTION_SIZE as usize];
+        unsafe { &mut DUMMY }
+    }
+
+    pub fn get_send_fallback_counters() -> &'static mut crate::stats::InsnCounters {
+        static mut DUMMY: crate::stats::InsnCounters = [0u64; crate::cruby::VM_INSTRUCTION_SIZE as usize];
+        unsafe { &mut DUMMY }
+    }
+
+    pub fn get_not_inlined_cfunc_counter_pointers() -> &'static mut std::collections::HashMap<String, Box<u64>> {
+        static mut DUMMY: Option<std::collections::HashMap<String, Box<u64>>> = None;
+        unsafe {
+            if DUMMY.is_none() { DUMMY = Some(std::collections::HashMap::new()); }
+            DUMMY.as_mut().unwrap()
+        }
+    }
+
+    pub fn get_not_annotated_cfunc_counter_pointers() -> &'static mut std::collections::HashMap<String, Box<u64>> {
+        static mut DUMMY: Option<std::collections::HashMap<String, Box<u64>>> = None;
+        unsafe {
+            if DUMMY.is_none() { DUMMY = Some(std::collections::HashMap::new()); }
+            DUMMY.as_mut().unwrap()
+        }
+    }
+
+    pub fn get_ccall_counter_pointers() -> &'static mut std::collections::HashMap<String, Box<u64>> {
+        static mut DUMMY: Option<std::collections::HashMap<String, Box<u64>>> = None;
+        unsafe {
+            if DUMMY.is_none() { DUMMY = Some(std::collections::HashMap::new()); }
+            DUMMY.as_mut().unwrap()
+        }
+    }
+
+    pub fn get_iseq_calls_count_pointers() -> &'static mut std::collections::HashMap<String, Box<u64>> {
+        static mut DUMMY: Option<std::collections::HashMap<String, Box<u64>>> = None;
+        unsafe {
+            if DUMMY.is_none() { DUMMY = Some(std::collections::HashMap::new()); }
+            DUMMY.as_mut().unwrap()
+        }
+    }
+
+    pub fn get_tracer() -> Option<&'static mut crate::stats::PerfettoTracer> {
+        None
+    }
+}
+
+impl ZJITState {
+    /// Return true if zjit_state has been initialized
+    pub fn has_instance() -> bool {
+        matches!(unsafe { &ZJIT_STATE }, InitializationState::Enabled(_))
+    }
+
+    /// Get a mutable reference to the codegen globals instance
+    fn get_instance() -> &'static mut ZJITState {
+        if let InitializationState::Enabled(instance) = unsafe { &mut ZJIT_STATE } {
+            instance
+        } else {
+            panic!("ZJITState::get_instance called when ZJIT is not enabled")
+        }
+    }
+
+    pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
+        &ZJITState::get_instance().method_annotations
+    }
+
     /// Was --zjit-save-compiled-iseqs specified?
     pub fn should_log_compiled_iseqs() -> bool {
         get_option!(log_compiled_iseqs).is_some()
@@ -281,27 +403,6 @@ impl ZJITState {
         } else {
             true // If no restrictions, allow all ISEQs
         }
-    }
-
-    /// Return a code pointer to the side-exit trampoline
-    pub fn get_exit_trampoline() -> CodePtr {
-        ZJITState::get_instance().exit_trampoline
-    }
-
-    /// Return a code pointer to the exit trampoline for function stubs
-    pub fn get_exit_trampoline_with_counter() -> CodePtr {
-        ZJITState::get_instance().exit_trampoline_with_counter
-    }
-
-    /// Return a code pointer to the function stub hit trampoline
-    pub fn get_function_stub_hit_trampoline() -> CodePtr {
-        ZJITState::get_instance().function_stub_hit_trampoline
-    }
-
-    /// Get a mutable reference to the Perfetto tracer
-    pub fn get_tracer() -> Option<&'static mut PerfettoTracer> {
-        if !ZJITState::has_instance() { return None; }
-        ZJITState::get_instance().perfetto_tracer.as_mut()
     }
 }
 
@@ -396,6 +497,7 @@ fn zjit_enable() {
         rb_bug_panic_hook();
 
         // Discard the instruction count for boot which we never compile
+        #[cfg(not(target_arch = "wasm32"))]
         unsafe { rb_vm_insn_count = 0; }
 
         // ZJIT enabled and initialized successfully
@@ -432,13 +534,21 @@ pub extern "C" fn rb_zjit_enable(_ec: EcPtr, _self: VALUE) -> VALUE {
 }
 
 /// Assert that any future ZJIT compilation will return a function pointer (not fail to compile)
+#[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_assert_compiles(_ec: EcPtr, _self: VALUE) -> VALUE {
     ZJITState::enable_assert_compiles();
     Qnil
 }
 
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_assert_compiles(_ec: EcPtr, _self: VALUE) -> VALUE {
+    Qnil
+}
+
 /// Resolve a profile frame VALUE to a human-readable "label (path)" string.
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_frame_label(frame: VALUE) -> String {
     unsafe {
         let label_str = ruby_str_to_rust_string_result(rb_profile_frame_full_label(frame)).unwrap_or("<unknown>".into());
@@ -452,6 +562,7 @@ fn resolve_frame_label(frame: VALUE) -> String {
 }
 
 /// Record a backtrace with ZJIT side exits as a Perfetto trace event
+#[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_record_exit_stack(reason: *const std::ffi::c_char) {
     if !zjit_enabled_p() || get_option!(trace_side_exits).is_none() {
@@ -486,8 +597,15 @@ pub extern "C" fn rb_zjit_record_exit_stack(reason: *const std::ffi::c_char) {
     tracer.write_event("side_exit", reason_str, &frames);
 }
 
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_record_exit_stack(_reason: *const std::ffi::c_char) {
+    // No-op on wasm32
+}
+
 /// Wrap a closure in a Perfetto duration event with category "invalidation"
 /// and a Ruby backtrace captured on the begin event.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn trace_invalidation<F, R>(reason: &str, func: F) -> R where F: FnOnce() -> R {
     if !get_option!(trace_invalidation) {
         return func();
@@ -510,6 +628,7 @@ pub fn trace_invalidation<F, R>(reason: &str, func: F) -> R where F: FnOnce() ->
 }
 
 /// Capture the current Ruby call stack as human-readable frame labels.
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_ruby_frames() -> Vec<String> {
     const BUFF_LEN: usize = 2048;
     let mut frames_buffer = vec![VALUE(0_usize); BUFF_LEN];
@@ -528,4 +647,10 @@ fn capture_ruby_frames() -> Vec<String> {
     (0..stack_length as usize)
         .map(|i| resolve_frame_label(frames_buffer[i]))
         .collect()
+}
+
+/// Wrap a closure in a Perfetto duration event (no-op on wasm32).
+#[cfg(target_arch = "wasm32")]
+pub fn trace_invalidation<F, R>(_reason: &str, func: F) -> R where F: FnOnce() -> R {
+    func()
 }

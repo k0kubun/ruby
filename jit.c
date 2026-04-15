@@ -22,7 +22,7 @@
 #include "ruby/internal/core/rtypeddata.h"
 #include "zjit.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
 #include <sys/mman.h>
 #endif
 
@@ -636,7 +636,9 @@ for_each_iseq_i(void *vstart, void *vend, size_t stride, void *data)
 uint32_t
 rb_jit_get_page_size(void)
 {
-#if defined(_SC_PAGESIZE)
+#if defined(__wasi__)
+    return 65536; // WASI page size
+#elif defined(_SC_PAGESIZE)
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) rb_bug("jit: failed to get page size");
 
@@ -675,7 +677,12 @@ align_ptr(uint8_t *ptr, uint32_t multiple)
 uint8_t *
 rb_jit_reserve_addr_space(uint32_t mem_size)
 {
-#ifndef _WIN32
+#if defined(__wasi__)
+    // WASI does not support mmap. Return NULL — ZJIT on WASI only does
+    // HIR analysis, not native code generation.
+    (void)mem_size;
+    return NULL;
+#elif !defined(_WIN32)
     uint8_t *mem_block;
 
     // On Linux
@@ -769,12 +776,21 @@ rb_jit_for_each_iseq(rb_iseq_callback callback, void *data)
 bool
 rb_jit_mark_writable(void *mem_block, uint32_t mem_size)
 {
+#if defined(__wasi__)
+    (void)mem_block; (void)mem_size;
+    return true; // No memory protection on WASI
+#else
     return mprotect(mem_block, mem_size, PROT_READ | PROT_WRITE) == 0;
+#endif
 }
 
 void
 rb_jit_mark_executable(void *mem_block, uint32_t mem_size)
 {
+#if defined(__wasi__)
+    (void)mem_block; (void)mem_size;
+    // No memory protection on WASI
+#else
     // Do not call mprotect when mem_size is zero. Some platforms may return
     // an error for it. https://github.com/Shopify/ruby/issues/450
     if (mem_size == 0) {
@@ -784,12 +800,17 @@ rb_jit_mark_executable(void *mem_block, uint32_t mem_size)
         rb_bug("Couldn't make JIT page (%p, %lu bytes) executable, errno: %s",
             mem_block, (unsigned long)mem_size, strerror(errno));
     }
+#endif
 }
 
 // Free the specified memory block.
 bool
 rb_jit_mark_unused(void *mem_block, uint32_t mem_size)
 {
+#if defined(__wasi__)
+    (void)mem_block; (void)mem_size;
+    return true; // No memory protection on WASI
+#else
     // On Linux, you need to use madvise MADV_DONTNEED to free memory.
     // We might not need to call this on macOS, but it's not really documented.
     // We generally prefer to do the same thing on both to ease testing too.
@@ -798,6 +819,7 @@ rb_jit_mark_unused(void *mem_block, uint32_t mem_size)
     // On macOS, mprotect PROT_NONE seems to reduce RSS.
     // We also call this on Linux to avoid executing unused pages.
     return mprotect(mem_block, mem_size, PROT_NONE) == 0;
+#endif
 }
 
 // Invalidate icache for arm64.
@@ -808,7 +830,10 @@ rb_jit_icache_invalidate(void *start, void *end)
     // Clear/invalidate the instruction cache. Compiles to nothing on x86_64
     // but required on ARM before running freshly written code.
     // On Darwin it's the same as calling sys_icache_invalidate().
-#ifdef __GNUC__
+#if defined(__wasi__)
+    // No instruction cache on WASI — not generating native code
+    (void)start; (void)end;
+#elif defined(__GNUC__)
     __builtin___clear_cache(start, end);
 #elif defined(__aarch64__)
 #error No instruction cache clear available with this compiler on Aarch64!

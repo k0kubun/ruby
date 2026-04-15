@@ -6,10 +6,30 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    backend::lir::C_ARG_OPNDS,
-    cast::IntoUsize, codegen::{local_idx_to_ep_offset, max_iseq_versions}, cruby::*, invariants::{self}, payload::{get_or_create_iseq_payload, IseqPayload}, options::{debug, get_option, DumpHIR}, state::ZJITState, json::Json,
+    cast::IntoUsize, cruby::*, payload::{get_or_create_iseq_payload, IseqPayload}, options::{debug, get_option, DumpHIR}, state::ZJITState, json::Json,
     state,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{backend::lir::C_ARG_OPNDS, codegen::{local_idx_to_ep_offset, max_iseq_versions}, invariants};
+#[cfg(target_arch = "wasm32")]
+use crate::invariants;
+
+// Provide wasm32-compatible versions of functions normally in codegen/backend
+#[cfg(target_arch = "wasm32")]
+const C_ARG_OPNDS: [(); 6] = [(); 6]; // Placeholder with same .len() as native
+
+#[cfg(target_arch = "wasm32")]
+fn local_idx_to_ep_offset(iseq: IseqPtr, local_idx: usize) -> i32 {
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) } as usize;
+    local_size as i32 - local_idx as i32 - 1 + VM_ENV_DATA_SIZE as i32
+}
+
+#[cfg(target_arch = "wasm32")]
+fn max_iseq_versions() -> usize {
+    unsafe { crate::options::OPTIONS.as_ref() }
+        .map_or(2, |opts| opts.max_versions)
+}
+
 use std::{
     cell::RefCell, collections::{BTreeSet, HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, mem::{align_of, size_of}, ptr, slice::Iter,
     sync::atomic::Ordering,
@@ -267,7 +287,7 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
                 write!(f, "MethodRedefined({class_name}@{:p}, {}@{:p}, cme:{:p})",
                     self.ptr_map.map_ptr(klass.as_ptr::<VALUE>()),
                     method.contents_lossy(),
-                    self.ptr_map.map_id(method.0),
+                    self.ptr_map.map_id(method.0 as usize),
                     self.ptr_map.map_ptr(cme)
                 )
             }
@@ -479,12 +499,12 @@ impl PtrPrintMap {
     }
 
     /// Map a Ruby ID (index into intern table) for printing
-    fn map_id(&self, id: u64) -> *const c_void {
+    fn map_id(&self, id: usize) -> *const c_void {
         self.map_ptr(id as *const c_void)
     }
 
     /// Map an index into a Ruby object (e.g. for an ivar) for printing
-    fn map_index(&self, id: u64) -> *const c_void {
+    fn map_index(&self, id: usize) -> *const c_void {
         self.map_ptr(id as *const c_void)
     }
 
@@ -2455,6 +2475,7 @@ impl CompilePolicy {
     fn new(iseq: *const rb_iseq_t) -> Self {
         // When a previous version was invalidated and we've reached the version
         // limit, avoid speculative optimizations that may side-exit.
+        #[cfg(not(target_arch = "wasm32"))]
         let no_side_exits = if iseq.is_null() {
             false
         } else {
@@ -2463,6 +2484,9 @@ impl CompilePolicy {
                 |v| unsafe { v.as_ref() }.is_invalidated()
             ) && payload.versions.len() + 1 >= max_iseq_versions()
         };
+        // On wasm32, no JIT recompilation, so never disable side exits
+        #[cfg(target_arch = "wasm32")]
+        let no_side_exits = false;
         Self { no_side_exits }
     }
 }
@@ -5001,9 +5025,12 @@ impl Function {
         // On the final version, recompilation is not possible, so converting sends to
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
-        let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
-            return;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let payload = get_or_create_iseq_payload(self.iseq);
+            if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+                return;
+            }
         }
         for block in self.rpo() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
@@ -5338,7 +5365,7 @@ impl Function {
                         let array_obj = self.type_of(array).ruby_object().unwrap();
                         match (array_obj.is_frozen(), self.type_of(index).cint64_value()) {
                             (true, Some(index)) => {
-                                let val = unsafe { rb_yarv_ary_entry_internal(array_obj, index) };
+                                let val = unsafe { rb_yarv_ary_entry_internal(array_obj, index as _) };
                                 self.new_insn(Insn::Const { val: Const::Value(val) })
                             }
                             _ => insn_id,
@@ -5797,6 +5824,35 @@ impl Function {
             let iseq_name = iseq_get_location(self.iseq, 0);
             self.dump_iongraph(&iseq_name, passes);
         }
+    }
+
+    /// Run all optimization passes and return iongraph JSON passes.
+    /// Unlike optimize(), this always collects passes regardless of --zjit-dump-hir-iongraph.
+    pub fn optimize_into_iongraph(&mut self) -> Vec<Json> {
+        let mut passes: Vec<Json> = Vec::new();
+
+        passes.push(self.to_iongraph_pass("unoptimized"));
+
+        macro_rules! run_pass {
+            ($name:ident) => {
+                self.$name();
+                passes.push(self.to_iongraph_pass(stringify!($name)));
+            }
+        }
+
+        run_pass!(type_specialize);
+        run_pass!(inline);
+        run_pass!(optimize_getivar);
+        run_pass!(optimize_c_calls);
+        run_pass!(convert_no_profile_sends);
+        run_pass!(optimize_load_store);
+        run_pass!(fold_constants);
+        run_pass!(clean_cfg);
+        run_pass!(remove_redundant_patch_points);
+        run_pass!(remove_duplicate_check_interrupts);
+        run_pass!(eliminate_dead_code);
+
+        passes
     }
 
     /// Dump HIR passed to codegen if specified by options.
@@ -7014,7 +7070,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     }
                     let target = state.stack_pop()?;
                     let bop = match method_id {
-                        x if x == ID!(include_p).0 => BOP_INCLUDE_P,
+                        x if x == ID!(include_p).0 as _ => BOP_INCLUDE_P,
                         _ => {
                             fun.push_insn(block, Insn::SideExit { state: exit_id, reason: SideExitReason::UnhandledDuparraySend(method_id), recompile: None });
                             break;
@@ -7128,7 +7184,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                 }
                 YARVINSN_definedivar => {
                     // (ID id, IVC ic, VALUE pushval)
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let pushval = get_arg(pc, 2);
                     state.stack_push(fun.push_insn(block, Insn::DefinedIvar { self_val: self_param, id, pushval, state: exit_id }));
                 }
@@ -7165,7 +7221,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     state.stack_push(result);
                 }
                 YARVINSN_getconstant => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let allow_nil = state.stack_pop()?;
                     let klass = state.stack_pop()?;
                     let result = fun.push_insn(block, Insn::GetConstant { klass, id, allow_nil, state: exit_id });
@@ -8131,17 +8187,17 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     state.stack_push(result);
                 }
                 YARVINSN_getglobal => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let result = fun.push_insn(block, Insn::GetGlobal { id, state: exit_id });
                     state.stack_push(result);
                 }
                 YARVINSN_setglobal => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let val = state.stack_pop()?;
                     fun.push_insn(block, Insn::SetGlobal { id, val, state: exit_id });
                 }
                 YARVINSN_getinstancevariable => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let ic = get_arg(pc, 1).as_ptr();
                     // ic is in arg 1
                     // Assume single-Ractor mode to omit gen_prepare_non_leaf_call on gen_getivar
@@ -8203,7 +8259,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     }
                 }
                 YARVINSN_setinstancevariable => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let ic = get_arg(pc, 1).as_ptr();
                     // Assume single-Ractor mode to omit gen_prepare_non_leaf_call on gen_setivar
                     // TODO: We only really need this if self_val is a class/module
@@ -8219,13 +8275,13 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     self_param = fun.push_insn(block, Insn::RefineType { val: self_param, new_type: types::HeapBasicObject });
                 }
                 YARVINSN_getclassvariable => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let ic = get_arg(pc, 1).as_ptr();
                     let result = fun.push_insn(block, Insn::GetClassVar { id, ic, state: exit_id });
                     state.stack_push(result);
                 }
                 YARVINSN_setclassvariable => {
-                    let id = ID(get_arg(pc, 0).as_u64());
+                    let id = ID(get_arg(pc, 0).as_u64() as _);
                     let ic = get_arg(pc, 1).as_ptr();
                     let val = state.stack_pop()?;
                     fun.push_insn(block, Insn::SetClassVar { id, val, ic, state: exit_id });

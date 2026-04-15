@@ -26,7 +26,10 @@
 
 // This build config impacts the pointer tagging scheme and we only want to
 // support one scheme for simplicity.
+// WASI/wasm32 is 32-bit and does not use FLONUM.
+#if !defined(__wasi__)
 STATIC_ASSERT(pointer_tagging_scheme, USE_FLONUM);
+#endif
 
 enum zjit_struct_offsets {
     ISEQ_BODY_OFFSET_PARAM = offsetof(struct rb_iseq_constant_body, param)
@@ -241,6 +244,30 @@ VALUE rb_zjit_print_stats_p(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_get_stats_file_path_p(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_trace_exit_locations_enabled_p(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_get_exit_locations(rb_execution_context_t *ec, VALUE self);
+
+// Defined in Rust (iongraph_api.rs)
+VALUE rb_zjit_dump_iongraph(const rb_iseq_t *iseq);
+
+// Primitive for RubyVM::ZJIT.dump_iongraph(method_or_proc)
+// Extracts the ISEQ from a Method/UnboundMethod/Proc and calls the Rust API.
+VALUE
+rb_zjit_dump_iongraph_method(rb_execution_context_t *ec, VALUE self, VALUE method_or_proc)
+{
+    const rb_iseq_t *iseq = NULL;
+
+    if (rb_obj_is_method(method_or_proc)) {
+        iseq = rb_method_iseq(method_or_proc);
+    }
+    else if (rb_obj_is_proc(method_or_proc)) {
+        iseq = rb_proc_get_iseq(method_or_proc, 0);
+    }
+
+    if (!iseq) {
+        return Qnil;
+    }
+
+    return rb_zjit_dump_iongraph(iseq);
+}
 
 // Preprocessed zjit.rb generated during build
 #include "zjit.rbinc"

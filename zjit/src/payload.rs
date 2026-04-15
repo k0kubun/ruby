@@ -1,9 +1,14 @@
 use std::ffi::c_void;
+#[cfg(not(target_arch = "wasm32"))]
 use std::ptr::NonNull;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::codegen::IseqCallRef;
 use crate::stats::CompileError;
-use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
+use crate::{cruby::*, profile::IseqProfile};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::virtualmem::CodePtr;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use crate::jit_frame::JITFrame;
 
 /// This is all the data ZJIT stores on an ISEQ. We mark objects in this struct on GC.
@@ -12,6 +17,7 @@ pub struct IseqPayload {
     /// Type information of YARV instruction operands
     pub profile: IseqProfile,
     /// JIT code versions. Different versions should have different assumptions.
+    #[cfg(not(target_arch = "wasm32"))]
     pub versions: Vec<IseqVersionRef>,
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
@@ -22,6 +28,7 @@ impl IseqPayload {
     fn new() -> Self {
         Self {
             profile: IseqProfile::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
         }
@@ -29,6 +36,7 @@ impl IseqPayload {
 }
 
 /// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct IseqVersion {
     /// ISEQ pointer. Stored here to minimize the size of PatchPoint.
@@ -48,8 +56,10 @@ pub struct IseqVersion {
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
+#[cfg(not(target_arch = "wasm32"))]
 pub type IseqVersionRef = NonNull<IseqVersion>;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IseqVersion {
     /// Check if this version was invalidated
     pub fn is_invalidated(&self) -> bool {
@@ -71,6 +81,7 @@ impl IseqVersion {
 }
 
 /// Set of CodePtrs for an ISEQ
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct IseqCodePtrs {
     /// Entry for the interpreter
@@ -81,6 +92,7 @@ pub struct IseqCodePtrs {
 
 #[derive(Debug, PartialEq)]
 pub enum IseqStatus {
+    #[cfg(not(target_arch = "wasm32"))]
     Compiled(IseqCodePtrs),
     CantCompile(CompileError),
     NotCompiled,
