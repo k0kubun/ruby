@@ -286,9 +286,8 @@ jobs:
 
       - name: Smoke test
         run: |
-          echo 'puts "Hello from Ruby+ZJIT on WASM"' > /tmp/test.rb
-          wasmtime run ./ruby --mapdir /::./ -- /tmp/test.rb
-        working-directory: build
+          echo 'puts "Hello from Ruby+ZJIT on WASM"' > test.rb
+          wasmtime run ./ruby --mapdir /::./ -- test.rb
 
 defaults:
   run:
