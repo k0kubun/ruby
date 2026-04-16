@@ -43,9 +43,9 @@ jobs:
     env:
       RUBY_TESTOPTS: '-q --tty=no'
       GITPULLOPTIONS: --no-tags origin ${{ github.ref }}
-      WASI_SDK_VERSION_MAJOR: 26
+      WASI_SDK_VERSION_MAJOR: 25
       WASI_SDK_VERSION_MINOR: 0
-      BINARYEN_VERSION: 121
+      BINARYEN_VERSION: 113
       WASMTIME_VERSION: v15.0.0
 
     runs-on: ubuntu-22.04

@@ -9,12 +9,18 @@
 module RubyVM::ZJIT
   # Blocks that are called when YJIT is enabled
   @jit_hooks = []
-  # Avoid calling a Ruby method here to avoid interfering with compilation tests
-  if Primitive.rb_zjit_get_stats_file_path_p
-    at_exit { print_stats_file }
-  end
-  if Primitive.rb_zjit_print_stats_p
-    at_exit { print_stats }
+  # Avoid calling a Ruby method here to avoid interfering with compilation tests.
+  # On wasm32, these primitives may not work correctly due to 32-bit VALUE differences,
+  # so we guard with a rescue.
+  begin
+    if Primitive.rb_zjit_get_stats_file_path_p
+      at_exit { print_stats_file }
+    end
+    if Primitive.rb_zjit_print_stats_p
+      at_exit { print_stats }
+    end
+  rescue NotImplementedError
+    # Ignore on platforms where these primitives are not supported (e.g., wasm32)
   end
 end
 
