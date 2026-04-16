@@ -278,15 +278,11 @@ jobs:
       - name: Build
         run: make mini ruby RUSTC_FLAGS="-g -C lto=thin -C opt-level=3 -C overflow-checks=on --target wasm32-wasip1"
 
-      - name: Apply asyncify
-        run: |
-          wasm-opt --asyncify --pass-arg=asyncify-ignore-imports -O2 -o ruby-zjit.wasm ruby
-
       - name: Upload ruby-zjit.wasm
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ruby-zjit-wasm
-          path: build/ruby-zjit.wasm
+          path: build/ruby
 
       - name: Smoke test
         run: |
