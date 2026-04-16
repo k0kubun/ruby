@@ -592,23 +592,38 @@ pub extern "C" fn rb_zjit_stats_enabled_p(_ec: EcPtr, _self: VALUE) -> VALUE {
 /// Return Qtrue if stats should be printed at exit.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_print_stats_p(_ec: EcPtr, _self: VALUE) -> VALUE {
-    // Builtin zjit.rb calls this even if ZJIT is disabled, so OPTIONS may not be set.
-    if unsafe { OPTIONS.as_ref() }.is_some_and(|opts| opts.stats && opts.print_stats) {
-        Qtrue
-    } else {
-        Qfalse
+    // On wasm32, the VALUE constants from generated bindings are wrong (64-bit values).
+    // Stats are never enabled on wasm32, so just return Qfalse (0 on all platforms).
+    #[cfg(target_arch = "wasm32")]
+    { return VALUE(0); }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Builtin zjit.rb calls this even if ZJIT is disabled, so OPTIONS may not be set.
+        if unsafe { OPTIONS.as_ref() }.is_some_and(|opts| opts.stats && opts.print_stats) {
+            Qtrue
+        } else {
+            Qfalse
+        }
     }
 }
 
 /// Return path if stats should be printed at exit to a specified file, else Qnil.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_get_stats_file_path_p(_ec: EcPtr, _self: VALUE) -> VALUE {
-    if let Some(opts) = unsafe { OPTIONS.as_ref() } {
-        if let Some(ref path) = opts.print_stats_file {
-            return rust_str_to_ruby(path.as_os_str().to_str().unwrap());
+    // On wasm32, return Qfalse (0) since stats files aren't supported.
+    #[cfg(target_arch = "wasm32")]
+    { return VALUE(0); }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(opts) = unsafe { OPTIONS.as_ref() } {
+            if let Some(ref path) = opts.print_stats_file {
+                return rust_str_to_ruby(path.as_os_str().to_str().unwrap());
+            }
         }
+        Qnil
     }
-    Qnil
 }
 
 #[cfg(test)]
