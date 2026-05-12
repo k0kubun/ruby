@@ -3,12 +3,12 @@ use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
+use crate::cast::IntoU64;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary};
+use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
-use crate::cruby::VALUE;
 use crate::payload::IseqVersionRef;
 use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
 use crate::virtualmem::CodePtr;
@@ -693,6 +693,7 @@ pub enum Insn {
         /// that are split from this CCall during register assignment.
         end_marker: Option<PosMarkerFn>,
         out: Opnd,
+        stack_map: Option<StackMap>,
     },
 
     // C function return
@@ -935,8 +936,11 @@ macro_rules! for_each_operand_impl {
                 visit_one!(opnd0);
                 visit_one!(opnd1);
             }
-            Insn::CCall { opnds, .. } => {
+            Insn::CCall { opnds, stack_map, .. } => {
                 visit_many!(opnds);
+                if let Some(StackMap { stack, .. }) = stack_map {
+                    visit_many!(stack);
+                }
             }
             // only iterate over preserved in the const iterator
             #[allow(unused_variables)]
@@ -1382,6 +1386,12 @@ impl StackState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StackMap {
+    stack: Vec<Opnd>,
+    jit_frame: *const zjit_jit_frame,
+}
+
 /// Initial capacity for asm.insns vector
 const ASSEMBLER_INSNS_CAPACITY: usize = 256;
 
@@ -1415,6 +1425,8 @@ pub struct Assembler {
 
     /// Current instruction index, incremented for each instruction pushed
     idx: usize,
+
+    stack_map: Option<StackMap>,
 }
 
 impl Assembler
@@ -1430,6 +1442,7 @@ impl Assembler
             current_block_id: BlockId(0),
             num_vregs: 0,
             idx: 0,
+            stack_map: None,
         }
     }
 
@@ -2101,6 +2114,7 @@ impl Assembler
         intervals: &[Interval],
         assignments: &[Option<Allocation>],
         regs: &[Reg],
+        total_stack_slots: usize,
     ) {
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, ALLOC_REGS};
@@ -2114,7 +2128,7 @@ impl Assembler
             let mut new_ids = Vec::with_capacity(old_ids.len());
 
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
-                if let Insn::CCall { opnds, out, start_marker, end_marker, fptr } = insn {
+                if let Insn::CCall { opnds, out, start_marker, end_marker, fptr, stack_map } = insn {
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
                     // Do we have a case where a ccall is emitted, but nobody
                     // uses the result?
@@ -2124,15 +2138,29 @@ impl Assembler
                             .end
                             .is_some_and(|end| end > insn_number);
 
+                    // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
+                    let stack_vreg_ids: HashSet<usize> = if let Some(StackMap { stack, .. }) = &stack_map {
+                        stack.iter().filter_map(|opnd| match opnd {
+                            Opnd::VReg { idx: VRegId(vreg_id), .. } => Some(*vreg_id),
+                            _ => None,
+                        }).collect()
+                    } else {
+                        HashSet::default()
+                    };
+
                     // Find survivors: intervals that survive this Call instruction
                     // We need to preserve the "surviving" registers past the ccall,
                     // so we're going to push them all on the stack, then pop
                     // after we make the ccall
                     let survivors: Vec<usize> = intervals.iter()
                         .filter(|interval| {
-                            interval.has_bounds()
+                            let allocation = assignments[interval.id];
+                            let stack_map_reg = stack_vreg_ids.contains(&interval.id)
+                                && matches!(allocation, Some(Allocation::Reg(_) | Allocation::Fixed(_)));
+                            stack_map_reg
+                                || interval.has_bounds()
                                 && interval.survives(insn_number)
-                                && assignments[interval.id].and_then(|alloc| alloc.alloc_pool_index(ALLOC_REGS.len())).is_some()
+                                && allocation.and_then(|alloc| alloc.alloc_pool_index(ALLOC_REGS.len())).is_some()
                         })
                         .map(|interval| interval.id)
                         .collect();
@@ -2154,6 +2182,59 @@ impl Assembler
                         }
                         new_ids.push(None);
                     }
+
+                    if let Some(StackMap { stack, jit_frame }) = stack_map {
+                        unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
+                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
+                        for stack_opnd in stack.iter() {
+                            let mut jit_frame_opnd = std::mem::MaybeUninit::<zjit_opnd_t>::uninit();
+                            let ptr = jit_frame_opnd.as_mut_ptr();
+                            match stack_opnd {
+                                Opnd::UImm(value) => {
+                                    let value = VALUE(*value as usize);
+                                    assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
+                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
+                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
+                                }
+                                Opnd::VReg { idx: VRegId(vreg_id), .. } => {
+                                    let stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
+                                        Allocation::Reg(_) | Allocation::Fixed(_) => {
+                                            let position = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
+                                            // rb_zjit_materialize_frames() reads vreg_stack_index as
+                                            // cfp->jit_return[-vreg_stack_index - 2]. For both arches, FrameSetup may
+                                            // add one native stack slot for alignment before these CPushPairs.
+                                            let frame_alignment_slots = if total_stack_slots % 2 == 1 {
+                                                1
+                                            } else {
+                                                0
+                                            };
+                                            (total_stack_slots + frame_alignment_slots)
+                                                .checked_sub(1)
+                                                .expect("StackMap requires a JITFrame slot")
+                                                + position
+                                        }
+                                        Allocation::Stack(stack_idx) => {
+                                            // StackState places allocator spills at:
+                                            //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
+                                            // so expose the matching materializer index.
+                                            self.stack_base_idx
+                                                .checked_sub(1)
+                                                .expect("StackMap requires a JITFrame slot")
+                                                + stack_idx
+                                        }
+                                    };
+                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VREG) };
+                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(stack_index.as_u64()) };
+                                }
+                                _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
+                            }
+                            let frame = unsafe { jit_frame_opnd.assume_init() };
+                            jit_frame_stack.push(frame);
+                        }
+                        let leaked = Box::leak(jit_frame_stack.into_boxed_slice()).as_mut_ptr();
+                        unsafe { (*jit_frame.cast_mut()).stack = leaked; }
+                    }
+
                     // Extract arguments from CCall, clear opnds
 
                     assert!(opnds.len() <= regs.len());
@@ -2196,7 +2277,8 @@ impl Assembler
                                         // be empty now
                         start_marker: None,
                         end_marker: None,
-                        fptr
+                        fptr,
+                        stack_map: None,
                     });
                     new_ids.push(insn_id);
 
@@ -3225,7 +3307,8 @@ impl Assembler {
         let canary_opnd = self.set_stack_canary();
         let out = self.new_vreg(Opnd::match_num_bits(&opnds));
         let fptr = Opnd::const_ptr(fptr);
-        self.push_insn(Insn::CCall { fptr, opnds, start_marker: None, end_marker: None, out });
+        let stack_map = self.stack_map.take();
+        self.push_insn(Insn::CCall { fptr, opnds, start_marker: None, end_marker: None, out, stack_map });
         self.clear_stack_canary(canary_opnd);
         out
     }
@@ -3234,14 +3317,16 @@ impl Assembler {
     /// new vreg for the result.
     pub fn ccall_into(&mut self, out: Opnd, fptr: *const u8, opnds: Vec<Opnd>) {
         let fptr = Opnd::const_ptr(fptr);
-        self.push_insn(Insn::CCall { fptr, opnds, start_marker: None, end_marker: None, out });
+        let stack_map = self.stack_map.take();
+        self.push_insn(Insn::CCall { fptr, opnds, start_marker: None, end_marker: None, out, stack_map });
     }
 
     /// Call a C function stored in a register
     pub fn ccall_reg(&mut self, fptr: Opnd, num_bits: u8) -> Opnd {
         assert!(matches!(fptr, Opnd::Reg(_)), "ccall_reg must be called with Opnd::Reg: {fptr:?}");
         let out = self.new_vreg(num_bits);
-        self.push_insn(Insn::CCall { fptr, opnds: vec![], start_marker: None, end_marker: None, out });
+        let stack_map = self.stack_map.take();
+        self.push_insn(Insn::CCall { fptr, opnds: vec![], start_marker: None, end_marker: None, out, stack_map });
         out
     }
 
@@ -3255,12 +3340,14 @@ impl Assembler {
         end_marker: impl Fn(CodePtr, &CodeBlock) + 'static,
     ) -> Opnd {
         let out = self.new_vreg(Opnd::match_num_bits(&opnds));
+        let stack_map = self.stack_map.take();
         self.push_insn(Insn::CCall {
             fptr: Opnd::const_ptr(fptr),
             opnds,
             start_marker: Some(Rc::new(start_marker)),
             end_marker: Some(Rc::new(end_marker)),
             out,
+            stack_map,
         });
         out
     }
@@ -3487,6 +3574,11 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&[opnd, shift]));
         self.push_insn(Insn::RShift { opnd, shift, out });
         out
+    }
+
+    pub fn stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
+        assert!(self.stack_map.is_none());
+        self.stack_map = Some(StackMap { stack, jit_frame });
     }
 
     pub fn store(&mut self, dest: Opnd, src: Opnd) {
@@ -4377,6 +4469,7 @@ mod tests {
             start_marker: None,
             end_marker: None,
             out: v3,
+            stack_map: None,
         });
 
         // v4 = Add(v3, v1)
@@ -4408,7 +4501,7 @@ mod tests {
             "v1 should be in a register");
 
         // Run the pipeline: handle_caller_saved_regs then resolve_ssa
-        asm.handle_caller_saved_regs(&intervals, &assignments, regs);
+        asm.handle_caller_saved_regs(&intervals, &assignments, regs, 0);
         asm.resolve_ssa(&intervals, &assignments);
 
         let insns = &asm.basic_blocks[b1.0].insns;

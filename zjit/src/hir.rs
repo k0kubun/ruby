@@ -6639,7 +6639,35 @@ impl ProfileOracle {
 }
 
 fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
+    fn is_simple_block_given_call(cd: *const rb_call_data) -> bool {
+        let ci = unsafe { rb_get_call_data_ci(cd) };
+        let flags = unsafe { rb_vm_ci_flag(ci) };
+
+        (unsafe { vm_ci_argc(ci) }) == 0
+            && flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) == 0
+            && unsafe { rb_vm_ci_mid(ci) } == ID!(block_given_p)
+    }
+
     match opcode {
+        YARVINSN_send => {
+            let cd: *const rb_call_data = unsafe { *operands }.as_ptr();
+            let blockiseq: IseqPtr = unsafe { *operands.offset(1) }.as_ptr();
+
+            if blockiseq.is_null() && is_simple_block_given_call(cd) {
+                return false;
+            }
+
+            unsafe { !rb_zjit_insn_leaf(opcode as i32, operands) }
+        }
+        YARVINSN_opt_send_without_block => {
+            let cd: *const rb_call_data = unsafe { *operands }.as_ptr();
+
+            if is_simple_block_given_call(cd) {
+                return false;
+            }
+
+            unsafe { !rb_zjit_insn_leaf(opcode as i32, operands) }
+        }
         // Control-flow is non-leaf in the interpreter because it can execute arbitrary code on
         // interrupt. But in the JIT, we side-exit if there is a pending interrupt.
         YARVINSN_jump
@@ -8561,6 +8589,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
     let opt_num: usize = params.opt_num.try_into().expect("iseq param opt_num >= 0");
     let lead_num: usize = params.lead_num.try_into().expect("iseq param lead_num >= 0");
     let passed_opt_num = jit_entry_idx;
+    let materialize_locals = crate::invariants::iseq_escapes_ep(iseq);
 
     // If the iseq has keyword parameters, the keyword bits local will be appended to the local table.
     let kw_bits_idx: Option<usize> = if unsafe { rb_get_iseq_flags_has_kw(iseq) } {
@@ -8580,9 +8609,9 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
     let mut entry_state = FrameState::new(iseq);
     let mut ep: Option<InsnId> = None;
     for local_idx in 0..num_locals(iseq) {
-        if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) {
+        let local = if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) {
             // Omitted optionals are locals, so they start as nils before their code run
-            entry_state.locals.push(fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) }));
+            fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) })
         } else if Some(local_idx) == kw_bits_idx {
             // Read the kw_bits value written by the caller to the callee frame.
             // This tells us which optional keywords were NOT provided and need their defaults evaluated.
@@ -8592,19 +8621,37 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
             let ep_offset_u32 = u32::try_from(ep_offset)
                 .unwrap_or_else(|_| panic!("Could not convert ep_offset {ep_offset} to u32"));
             let ep = *ep.get_or_insert_with(|| fun.push_insn(jit_entry_block, Insn::GetEP { level: 0 }));
-            entry_state.locals.push(fun.get_local_from_ep(
+            fun.get_local_from_ep(
                 jit_entry_block,
                 ep,
                 ep_offset_u32,
                 0,
                 types::BasicObject,
-            ));
+            )
         } else if local_idx < param_size {
             let id = unsafe { rb_zjit_local_id(iseq, local_idx.try_into().unwrap()) };
-            entry_state.locals.push(fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject }));
+            let local = fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject });
             arg_idx += 1;
+            local
         } else {
-            entry_state.locals.push(fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) }));
+            fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) })
+        };
+
+        entry_state.locals.push(local);
+
+        // Once an ISEQ has escaped EP, HIR getlocal may need to read from the
+        // VM frame instead of FrameState. Direct JIT-to-JIT entry passes locals
+        // as C arguments, so initialize the frame slots here before such reads.
+        if materialize_locals {
+            let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
+            let local_id = unsafe { rb_zjit_local_id(iseq, local_idx.try_into().unwrap()) };
+            let ep = *ep.get_or_insert_with(|| fun.push_insn(jit_entry_block, Insn::GetEP { level: 0 }));
+            fun.push_insn(jit_entry_block, Insn::StoreField {
+                recv: ep,
+                id: local_id.into(),
+                offset: -(SIZEOF_VALUE_I32 * ep_offset),
+                val: local,
+            });
         }
     }
     (self_param, entry_state)

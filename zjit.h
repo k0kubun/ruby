@@ -9,6 +9,19 @@
 # define ZJIT_STATS (USE_ZJIT && RUBY_DEBUG)
 #endif
 
+typedef enum zjit_opnd_type {
+    ZJIT_OPND_VALUE,
+    ZJIT_OPND_VREG,
+} zjit_opnd_type_t;
+
+typedef struct zjit_opnd {
+    zjit_opnd_type_t type;
+    union {
+        VALUE value;
+        size_t vreg_stack_index;
+    } as;
+} zjit_opnd_t;
+
 // JITFrame is defined here as the single source of truth and imported into
 // Rust via bindgen. C code reads fields directly; Rust uses an impl block.
 typedef struct zjit_jit_frame {
@@ -23,6 +36,9 @@ typedef struct zjit_jit_frame {
     // (which write block_code themselves), so we must restore it.
     // Always false for C frames.
     bool materialize_block_code;
+
+    uint32_t stack_size;
+    zjit_opnd_t *stack;
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
