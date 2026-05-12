@@ -1916,12 +1916,32 @@ pub const DEFINED_REF: defined_type = 15;
 pub const DEFINED_FUNC: defined_type = 16;
 pub const DEFINED_CONST_FROM: defined_type = 17;
 pub type defined_type = u32;
+pub const ZJIT_OPND_VALUE: zjit_operand_type = 0;
+pub const ZJIT_OPND_REG: zjit_operand_type = 1;
+pub const ZJIT_OPND_MEM: zjit_operand_type = 2;
+pub type zjit_operand_type = u32;
+pub use self::zjit_operand_type as zjit_operand_type_t;
+#[repr(C)]
+pub struct zjit_operand {
+    pub type_: zjit_operand_type_t,
+    pub as_: zjit_operand__bindgen_ty_1,
+}
+#[repr(C)]
+pub struct zjit_operand__bindgen_ty_1 {
+    pub value: __BindgenUnionField<VALUE>,
+    pub reg_stack_index: __BindgenUnionField<usize>,
+    pub mem_base_stack_index: __BindgenUnionField<usize>,
+    pub bindgen_union_field: u64,
+}
+pub type zjit_operand_t = zjit_operand;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub stack_size: u32,
+    pub stack: *mut zjit_operand_t,
 }
 pub const ISEQ_BODY_OFFSET_PARAM: zjit_struct_offsets = 16;
 pub type zjit_struct_offsets = u32;

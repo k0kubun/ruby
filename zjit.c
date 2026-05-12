@@ -236,6 +236,15 @@ rb_zjit_class_has_default_allocator(VALUE klass)
     return alloc == rb_class_allocate_instance;
 }
 
+#include "ruby/ruby.h"
+#include "ruby/debug.h"
+
+static VALUE
+callback(const rb_debug_inspector_t *dbg_context, void *data)
+{
+    return rb_debug_inspector_frame_binding_get(dbg_context, NUM2INT((VALUE)data));
+}
+
 
 VALUE rb_vm_untag_block_handler(VALUE block_handler);
 VALUE rb_vm_get_untagged_block_handler(rb_control_frame_t *reg_cfp);

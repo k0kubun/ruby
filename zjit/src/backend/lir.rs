@@ -4,7 +4,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary};
+use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -826,6 +826,8 @@ pub enum Insn {
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
+    StackMap { stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame },
+
     /// Shift a value right by a certain amount (signed).
     RShift { opnd: Opnd, shift: Opnd, out: Opnd },
 
@@ -946,6 +948,7 @@ impl Insn {
             Insn::PatchPoint { .. } => "PatchPoint",
             Insn::PadPatchPoint => "PadPatchPoint",
             Insn::PosMarker(_) => "PosMarker",
+            Insn::StackMap { .. } => "StackMap",
             Insn::RShift { .. } => "RShift",
             Insn::Store { .. } => "Store",
             Insn::Sub { .. } => "Sub",
@@ -1266,6 +1269,15 @@ impl<'a> Iterator for InsnOpndIterator<'a> {
                     None
                 }
             }
+            Insn::StackMap { stack, .. } => {
+                let stack_idx = self.idx;
+                if stack_idx < stack.len() {
+                    let opnd = &stack[stack_idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                None
+            }
         }
     }
 }
@@ -1436,6 +1448,15 @@ impl<'a> InsnOpndMutIterator<'a> {
                     None
                 }
             },
+            Insn::StackMap { stack, .. } => {
+                let stack_idx = self.idx;
+                if stack_idx < stack.len() {
+                    let opnd = &mut stack[stack_idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                None
+            }
         }
     }
 }
@@ -2353,6 +2374,8 @@ impl Assembler
             let mut new_insns = Vec::with_capacity(old_insns.len());
             let mut new_ids = Vec::with_capacity(old_ids.len());
 
+            let mut stack_map: Option<Insn> = None;
+
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
                 if let Insn::CCall { opnds, out, start_marker, end_marker, fptr } = insn {
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
@@ -2432,6 +2455,11 @@ impl Assembler
                         new_ids.push(None);
                     }
 
+                    if let Some(Insn::StackMap { stack, jit_frame }) = stack_map {
+                        // TODO: implement this
+                        stack_map = None;
+                    }
+
                     // Extract PosMarkers from the CCall so they get emitted
                     // as separate instructions at the right code positions.
                     // Emit start_marker PosMarker before the CCall
@@ -2496,6 +2524,9 @@ impl Assembler
                         }
                     }
                 } else {
+                    if let &Insn::StackMap { .. } = &insn {
+                        stack_map = Some(insn.clone());
+                    }
                     new_insns.push(insn);
                     new_ids.push(insn_id);
                 }
@@ -3746,6 +3777,10 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&[opnd, shift]));
         self.push_insn(Insn::RShift { opnd, shift, out });
         out
+    }
+
+    pub fn stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
+        self.push_insn(Insn::StackMap { stack, jit_frame })
     }
 
     pub fn store(&mut self, dest: Opnd, src: Opnd) {

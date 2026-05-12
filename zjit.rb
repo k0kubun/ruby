@@ -19,6 +19,10 @@ module RubyVM::ZJIT
 end
 
 class << RubyVM::ZJIT
+  def binding_of_caller(level)
+    Primitive.cexpr! 'rb_debug_inspector_open(callback, (void *)level)'
+  end
+
   # Check if ZJIT is enabled
   def enabled?
     Primitive.cexpr! 'RBOOL(rb_zjit_enabled_p)'

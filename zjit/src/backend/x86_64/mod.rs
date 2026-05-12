@@ -1110,6 +1110,7 @@ impl Assembler {
                     emit_csel(cb, *truthy, *falsy, *out, cmovge, cmovl);
                 }
                 Insn::LiveReg { .. } => (), // just a reg alloc signal, no code
+                Insn::StackMap { .. } => (), // just a reg alloc signal, no code
             };
 
             insn_idx += 1;
