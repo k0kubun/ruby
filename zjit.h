@@ -9,6 +9,24 @@
 # define ZJIT_STATS (USE_ZJIT && RUBY_DEBUG)
 #endif
 
+// Maximum number of stack-map entries per array (stack or locals).
+// Tripping this cap asserts in gen_prepare_non_leaf_call; raise if needed.
+#define ZJIT_STACK_MAP_CAP 32
+
+// How to materialize one stack-map entry back onto the VM stack.
+enum zjit_stack_map_kind {
+    ZJIT_SME_NONE   = 0,  // unused slot
+    ZJIT_SME_VALUE  = 1,  // .value holds the VALUE (Opnd::Value/Imm/UImm)
+    ZJIT_SME_CSTACK = 2,  // .payload32 = byte offset from jit_frame->saved_sp
+    ZJIT_SME_SPILL  = 3,  // .payload32 = byte disp from jit_frame->saved_fp
+};
+
+typedef struct zjit_stack_map_entry {
+    uint32_t kind;       // enum zjit_stack_map_kind
+    int32_t  payload32;  // CSTACK offset or SPILL disp
+    VALUE    value;      // VALUE for SME_VALUE; ignored otherwise
+} zjit_stack_map_entry_t;
+
 // JITFrame is defined here as the single source of truth and imported into
 // Rust via bindgen. C code reads fields directly; Rust uses an impl block.
 typedef struct zjit_jit_frame {
@@ -23,6 +41,16 @@ typedef struct zjit_jit_frame {
     // (which write block_code themselves), so we must restore it.
     // Always false for C frames.
     bool materialize_block_code;
+
+    // Stack map: NATIVE_STACK_PTR and NATIVE_BASE_PTR snapshots taken just
+    // before each non-leaf CCall, plus encoded entries describing where the
+    // HIR stack and local values live at that call site.
+    void *saved_sp;
+    void *saved_fp;
+    uint8_t stack_len;
+    uint8_t locals_len;
+    zjit_stack_map_entry_t stack[ZJIT_STACK_MAP_CAP];
+    zjit_stack_map_entry_t locals[ZJIT_STACK_MAP_CAP];
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
@@ -48,6 +76,7 @@ void rb_zjit_tracing_invalidate_all(void);
 void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
 void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
+void rb_zjit_materialize_frames_for_gc(rb_control_frame_t *cfp);
 #else
 #define rb_zjit_entry 0
 static inline void rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception) {}
@@ -62,6 +91,7 @@ static inline void rb_zjit_tracing_invalidate_all(void) {}
 static inline void rb_zjit_invalidate_no_singleton_class(VALUE klass) {}
 static inline void rb_zjit_invalidate_root_box(void) {}
 static inline void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame) {}
+static inline void rb_zjit_materialize_frames_for_gc(rb_control_frame_t *cfp) {}
 #endif // #if USE_ZJIT
 
 #define rb_zjit_enabled_p (rb_zjit_entry != 0)

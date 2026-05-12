@@ -2696,7 +2696,10 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
 /// Save only the PC to CFP. Use this when you need to call gen_save_sp()
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
-fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
+///
+/// Returns the heap-allocated JITFrame pointer so callers (like
+/// gen_prepare_non_leaf_call) can attach a stack map to it.
+fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *mut JITFrame {
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
@@ -2707,6 +2710,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     }
     let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
+    jit_frame
 }
 
 /// Save the current PC on the CFP as a preparation for calling a C function
@@ -2717,12 +2721,13 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
 /// because the backend spills all live registers onto the C stack on CCall.
 /// However, to avoid marking uninitialized stack slots, this also updates SP,
 /// which may have cfp->sp for a past frame or a past non-leaf call.
-fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
+fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) -> *mut JITFrame {
+    let jit_frame = gen_save_pc_for_gc(asm, state);
     gen_save_sp(asm, state.stack_size());
     if leaf {
         asm.expect_leaf_ccall(state.stack_size());
     }
+    jit_frame
 }
 
 fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
@@ -2779,17 +2784,30 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
 /// Prepare for calling a C function that may call an arbitrary method.
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
 fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
-    // and SP to avoid marking uninitialized stack slots
-    gen_prepare_call_with_gc(asm, state, false);
+    // and SP to avoid marking uninitialized stack slots.
+    // Returns the JITFrame pointer for the stack map below.
+    let jit_frame = gen_prepare_call_with_gc(asm, state, false);
 
-    // Spill the virtual stack in case it raises an exception
-    // and the interpreter uses the stack for handling the exception
+    // Eagerly spill stack and locals to the VM stack. Required for any
+    // call site whose C callee reads cfp->sp directly (e.g. rb_vm_send).
+    // The stack map below is the materialize-on-demand path used for
+    // exception unwinding and GC; it is additive — it doesn't replace
+    // the eager spill, it provides a structured way to recover values
+    // during raise / GC mark when the spill is also present (and a
+    // future path to drop spills selectively for call sites that don't
+    // need them).
     gen_spill_stack(jit, asm, state);
-
-    // Spill locals in case the method looks at caller Bindings
     gen_spill_locals(jit, asm, state);
+
+    // Attach a stack map so the interpreter can materialize VM-stack and
+    // locals on demand (raise, GC marking, rb_debug_inspector). The
+    // stack map is encoded into the JITFrame at codegen time and
+    // saved_sp/saved_fp are written into the JITFrame at runtime, just
+    // before the CCall.
+    let stack: Vec<Opnd> = state.stack().map(|&id| jit.get_opnd(id)).collect();
+    let locals: Vec<Opnd> = state.locals().map(|&id| jit.get_opnd(id)).collect();
+    asm.stack_map(stack, locals, jit_frame);
 }
 
 /// Frame metadata written by gen_push_frame()

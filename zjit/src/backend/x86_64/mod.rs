@@ -1110,6 +1110,9 @@ impl Assembler {
                     emit_csel(cb, *truthy, *falsy, *out, cmovge, cmovl);
                 }
                 Insn::LiveReg { .. } => (), // just a reg alloc signal, no code
+
+                // Consumed by handle_caller_saved_regs; must not survive to emit.
+                Insn::StackMap { .. } => unreachable!("Insn::StackMap should be consumed by handle_caller_saved_regs"),
             };
 
             insn_idx += 1;

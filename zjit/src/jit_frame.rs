@@ -1,34 +1,67 @@
 use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
-use crate::cruby::zjit_jit_frame;
+use crate::cruby::{zjit_jit_frame, zjit_stack_map_entry, ZJIT_SME_VALUE, ZJIT_STACK_MAP_CAP};
 use crate::state::ZJITState;
 
 /// JITFrame struct is defined in zjit.h (the single source of truth) and
 /// imported into Rust via bindgen. See zjit.h for field documentation.
 pub type JITFrame = zjit_jit_frame;
 
+const EMPTY_ENTRY: zjit_stack_map_entry = zjit_stack_map_entry {
+    kind: 0,
+    payload32: 0,
+    value: VALUE(0),
+};
+
 impl JITFrame {
     /// Allocate a JITFrame on the heap, register it with ZJITState, and return
     /// a raw pointer that remains valid for the lifetime of the process.
-    fn alloc(jit_frame: JITFrame) -> *const Self {
+    fn alloc(jit_frame: JITFrame) -> *mut Self {
         let raw_ptr = Box::into_raw(Box::new(jit_frame));
         ZJITState::get_jit_frames().push(raw_ptr);
-        raw_ptr as *const _
+        raw_ptr
     }
 
     /// Create a JITFrame for an ISEQ frame.
-    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
-        Self::alloc(JITFrame { pc, iseq, materialize_block_code })
+    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *mut Self {
+        Self::alloc(JITFrame {
+            pc,
+            iseq,
+            materialize_block_code,
+            saved_sp: std::ptr::null_mut(),
+            saved_fp: std::ptr::null_mut(),
+            stack_len: 0,
+            locals_len: 0,
+            stack: [EMPTY_ENTRY; ZJIT_STACK_MAP_CAP],
+            locals: [EMPTY_ENTRY; ZJIT_STACK_MAP_CAP],
+        })
     }
 
     /// Create a JITFrame for a C frame (no PC, no ISEQ).
-    pub fn new_cfunc() -> *const Self {
-        Self::alloc(JITFrame { pc: std::ptr::null(), iseq: std::ptr::null(), materialize_block_code: false })
+    pub fn new_cfunc() -> *mut Self {
+        Self::alloc(JITFrame {
+            pc: std::ptr::null(),
+            iseq: std::ptr::null(),
+            materialize_block_code: false,
+            saved_sp: std::ptr::null_mut(),
+            saved_fp: std::ptr::null_mut(),
+            stack_len: 0,
+            locals_len: 0,
+            stack: [EMPTY_ENTRY; ZJIT_STACK_MAP_CAP],
+            locals: [EMPTY_ENTRY; ZJIT_STACK_MAP_CAP],
+        })
     }
 
     /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
     pub fn mark(&self) {
         if !self.iseq.is_null() {
             unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
+        }
+        for entry in self.stack.iter().take(self.stack_len as usize)
+            .chain(self.locals.iter().take(self.locals_len as usize))
+        {
+            if entry.kind == ZJIT_SME_VALUE && !entry.value.special_const_p() {
+                unsafe { rb_gc_mark_movable(entry.value); }
+            }
         }
     }
 
@@ -38,6 +71,13 @@ impl JITFrame {
             let new_iseq = unsafe { rb_gc_location(VALUE::from(self.iseq)) }.as_iseq();
             if self.iseq != new_iseq {
                 self.iseq = new_iseq;
+            }
+        }
+        for entry in self.stack.iter_mut().take(self.stack_len as usize)
+            .chain(self.locals.iter_mut().take(self.locals_len as usize))
+        {
+            if entry.kind == ZJIT_SME_VALUE && !entry.value.special_const_p() {
+                entry.value = unsafe { rb_gc_location(entry.value) };
             }
         }
     }

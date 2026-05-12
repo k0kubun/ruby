@@ -5,6 +5,7 @@ use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
 use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, vm_stack_canary};
+use crate::jit_frame::JITFrame;
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -846,7 +847,14 @@ pub enum Insn {
 
     // This is the same as the OP_ADD instruction, except that it performs the
     // binary XOR operation.
-    Xor { left: Opnd, right: Opnd, out: Opnd }
+    Xor { left: Opnd, right: Opnd, out: Opnd },
+
+    /// Stack map metadata anchor placed immediately before a non-leaf CCall.
+    /// Records the HIR-level stack and locals operands live at the call site
+    /// so handle_caller_saved_regs can encode their resolved locations into
+    /// the JITFrame. The instruction itself emits no machine code — it is
+    /// consumed by handle_caller_saved_regs and dropped from the LIR.
+    StackMap { stack: Vec<Opnd>, locals: Vec<Opnd>, jit_frame: *mut JITFrame },
 }
 
 impl Insn {
@@ -952,7 +960,8 @@ impl Insn {
             Insn::Mul { .. } => "Mul",
             Insn::Test { .. } => "Test",
             Insn::URShift { .. } => "URShift",
-            Insn::Xor { .. } => "Xor"
+            Insn::Xor { .. } => "Xor",
+            Insn::StackMap { .. } => "StackMap",
         }
     }
 
@@ -1256,6 +1265,20 @@ impl<'a> Iterator for InsnOpndIterator<'a> {
                     None
                 }
             },
+            Insn::StackMap { stack, locals, .. } => {
+                if self.idx < stack.len() {
+                    let opnd = &stack[self.idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                let local_idx = self.idx - stack.len();
+                if local_idx < locals.len() {
+                    let opnd = &locals[local_idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                None
+            },
             Insn::FrameSetup { preserved, .. } |
             Insn::FrameTeardown { preserved } => {
                 if self.idx < preserved.len() {
@@ -1435,6 +1458,20 @@ impl<'a> InsnOpndMutIterator<'a> {
                 } else {
                     None
                 }
+            },
+            Insn::StackMap { stack, locals, .. } => {
+                if self.idx < stack.len() {
+                    let opnd = &mut stack[self.idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                let local_idx = self.idx - stack.len();
+                if local_idx < locals.len() {
+                    let opnd = &mut locals[local_idx];
+                    self.idx += 1;
+                    return Some(opnd);
+                }
+                None
             },
         }
     }
@@ -2344,6 +2381,8 @@ impl Assembler
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, ALLOC_REGS};
 
+        let stack_state = StackState::new(self.stack_base_idx);
+
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
             let old_insns = take(&mut block.insns);
@@ -2352,7 +2391,16 @@ impl Assembler
             let mut new_insns = Vec::with_capacity(old_insns.len());
             let mut new_ids = Vec::with_capacity(old_ids.len());
 
+            // StackMap is buffered until the following CCall consumes it.
+            let mut pending_stack_map: Option<(Vec<Opnd>, Vec<Opnd>, *mut JITFrame)> = None;
+
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
+                if let Insn::StackMap { stack, locals, jit_frame } = insn {
+                    assert!(pending_stack_map.is_none(),
+                        "StackMap without a following CCall before another StackMap");
+                    pending_stack_map = Some((stack, locals, jit_frame));
+                    continue;
+                }
                 if let Insn::CCall { opnds, out, start_marker, end_marker, fptr } = insn {
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
                     // Do we have a case where a ccall is emitted, but nobody
@@ -2403,6 +2451,52 @@ impl Assembler
                         new_insns.push(Insn::CPush(Opnd::Reg(ALLOC_REGS[0])));
                         new_ids.push(None);
                     }
+
+                    // Encode any pending stack map into the JITFrame and emit
+                    // runtime writes capturing the C-stack pointer + frame
+                    // pointer at the call site. Remember the JITFrame so we
+                    // can mark the stack map "stale" after the CCall returns
+                    // (its CSTACK entries point at the survivor push area,
+                    // which we pop right after the call).
+                    let stack_map_jit_frame: Option<*mut JITFrame> =
+                        if let Some((sm_stack, sm_locals, jit_frame)) = pending_stack_map.take() {
+                            Self::encode_stack_map(
+                                &sm_stack,
+                                &sm_locals,
+                                jit_frame,
+                                &survivors,
+                                &survivor_push_groups,
+                                needs_alignment,
+                                assignments,
+                                &stack_state,
+                            );
+
+                            // At runtime, capture NATIVE_STACK_PTR / NATIVE_BASE_PTR
+                            // *after* the survivor pushes so SME_CSTACK offsets are
+                            // relative to the SP value the materializer will read.
+                            //
+                            // Use Insn::Mov (not LoadInto) for the memory stores so
+                            // the x86 splitter doesn't reuse SCRATCH_REG as a memory
+                            // write scratch — that would clobber our base register.
+                            let jf_ptr = Opnd::const_ptr(jit_frame as *const u8);
+                            new_insns.push(Insn::LoadInto { dest: Opnd::Reg(SCRATCH_REG), opnd: jf_ptr });
+                            new_ids.push(None);
+                            let saved_sp_offset = std::mem::offset_of!(JITFrame, saved_sp) as i32;
+                            let saved_fp_offset = std::mem::offset_of!(JITFrame, saved_fp) as i32;
+                            new_insns.push(Insn::Mov {
+                                dest: Opnd::mem(64, Opnd::Reg(SCRATCH_REG), saved_sp_offset),
+                                src: NATIVE_STACK_PTR,
+                            });
+                            new_ids.push(None);
+                            new_insns.push(Insn::Mov {
+                                dest: Opnd::mem(64, Opnd::Reg(SCRATCH_REG), saved_fp_offset),
+                                src: NATIVE_BASE_PTR,
+                            });
+                            new_ids.push(None);
+                            Some(jit_frame)
+                        } else {
+                            None
+                        };
 
                     // Extract arguments from CCall, clear opnds
 
@@ -2494,15 +2588,175 @@ impl Assembler
                             new_ids.push(None);
                         }
                     }
+
+                    // If this CCall had a stack map, mark it stale by clearing
+                    // saved_sp on the JITFrame. The CSTACK survivor area has
+                    // been popped, and SPILL slots (NATIVE_BASE_PTR-relative)
+                    // may also have been overwritten by later JIT execution,
+                    // so any subsequent materialize (e.g. from GC during a
+                    // leaf call between two non-leaf calls) must skip stack
+                    // and locals to avoid reading garbage. The next non-leaf
+                    // call's prelude will re-arm saved_sp.
+                    if let Some(jit_frame) = stack_map_jit_frame {
+                        let jf_ptr = Opnd::const_ptr(jit_frame as *const u8);
+                        new_insns.push(Insn::LoadInto { dest: Opnd::Reg(SCRATCH_REG), opnd: jf_ptr });
+                        new_ids.push(None);
+                        let saved_sp_offset = std::mem::offset_of!(JITFrame, saved_sp) as i32;
+                        new_insns.push(Insn::Mov {
+                            dest: Opnd::mem(64, Opnd::Reg(SCRATCH_REG), saved_sp_offset),
+                            src: Opnd::UImm(0),
+                        });
+                        new_ids.push(None);
+                    }
                 } else {
                     new_insns.push(insn);
                     new_ids.push(insn_id);
                 }
             }
 
+            assert!(pending_stack_map.is_none(),
+                "StackMap without a following CCall at end of block");
+
             let block = &mut self.basic_blocks[block_id.0];
             block.insns = new_insns;
             block.insn_ids = new_ids;
+        }
+    }
+
+    /// Resolve each stack-map operand to a `zjit_stack_map_entry` and write
+    /// it into the heap-allocated JITFrame at codegen time. Survivor offsets
+    /// are computed relative to the C-stack pointer captured at runtime by
+    /// the LoadInto pair emitted right after this call.
+    fn encode_stack_map(
+        sm_stack: &[Opnd],
+        sm_locals: &[Opnd],
+        jit_frame: *mut JITFrame,
+        survivors: &[usize],
+        survivor_push_groups: &[Vec<Opnd>],
+        needs_alignment: bool,
+        assignments: &[Option<Allocation>],
+        stack_state: &StackState,
+    ) {
+        use crate::backend::current::ALLOC_REGS;
+        use crate::cruby::{zjit_stack_map_entry, ZJIT_SME_CSTACK, ZJIT_SME_SPILL, ZJIT_SME_VALUE};
+
+        // Compute the byte offset from final NATIVE_STACK_PTR (after all
+        // pushes including alignment padding) for each survivor index.
+        let total_bytes: i32 = if cfg!(target_arch = "aarch64") {
+            survivor_push_groups.len() as i32 * 16
+        } else {
+            (survivors.len() as i32 + if needs_alignment { 1 } else { 0 }) * 8
+        };
+
+        let mut survivor_offsets: Vec<i32> = vec![0; survivors.len()];
+        if cfg!(target_arch = "aarch64") {
+            for (c, group) in survivor_push_groups.iter().enumerate() {
+                let chunk_off = total_bytes - (c as i32 + 1) * 16;
+                match group.len() {
+                    2 => {
+                        // CPushPair stores opnd1 at lower addr, opnd0 at lower+8
+                        survivor_offsets[2 * c] = chunk_off + 8;
+                        survivor_offsets[2 * c + 1] = chunk_off;
+                    }
+                    1 => {
+                        survivor_offsets[2 * c] = chunk_off;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        } else {
+            for p in 0..survivors.len() {
+                survivor_offsets[p] = total_bytes - (p as i32 + 1) * 8;
+            }
+        }
+
+        // Map each survivor's physical register to its post-push offset.
+        let reg_to_offset: HashMap<u8, i32> = survivors
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let reg_no = match assignments[id].unwrap() {
+                    Allocation::Reg(n) => ALLOC_REGS[n].reg_no,
+                    Allocation::Fixed(reg) => reg.reg_no,
+                    _ => unreachable!(),
+                };
+                (reg_no, survivor_offsets[i])
+            })
+            .collect();
+
+        let encode = |opnd: &Opnd| -> zjit_stack_map_entry {
+            match *opnd {
+                Opnd::Value(v) => zjit_stack_map_entry {
+                    kind: ZJIT_SME_VALUE,
+                    payload32: 0,
+                    value: v,
+                },
+                Opnd::Imm(i) => zjit_stack_map_entry {
+                    kind: ZJIT_SME_VALUE,
+                    payload32: 0,
+                    value: VALUE(i as usize),
+                },
+                Opnd::UImm(u) => zjit_stack_map_entry {
+                    kind: ZJIT_SME_VALUE,
+                    payload32: 0,
+                    value: VALUE(u as usize),
+                },
+                Opnd::VReg { idx, .. } => {
+                    let alloc = assignments[idx.0]
+                        .unwrap_or_else(|| panic!("stack map VReg has no assignment: {opnd:?}"));
+                    match alloc {
+                        Allocation::Reg(n) => {
+                            let reg = ALLOC_REGS[n];
+                            // Same survivor fallback as the Fixed arm: a
+                            // VReg whose live range ends at the CCall is
+                            // not pushed; leave the stack-map slot
+                            // un-mapped so the materializer falls back to
+                            // the eagerly-spilled VM-stack value.
+                            match reg_to_offset.get(&reg.reg_no) {
+                                Some(&off) => zjit_stack_map_entry { kind: ZJIT_SME_CSTACK, payload32: off, value: VALUE(0) },
+                                None => zjit_stack_map_entry { kind: 0, payload32: 0, value: VALUE(0) },
+                            }
+                        }
+                        Allocation::Fixed(reg) => {
+                            // Locals/stack should never be a JIT_PRESERVED_REG
+                            // (CFP/SP/EC); if they are, the encoder must learn
+                            // about it.
+                            assert!(!JIT_PRESERVED_REGS.iter().any(|p| p.unwrap_reg().reg_no == reg.reg_no),
+                                "stack map VReg pinned to JIT-preserved reg {reg:?}: {opnd:?}");
+                            // If a Fixed-register VReg isn't tracked as a
+                            // survivor it means its live range ended at or
+                            // before the CCall (typical when it's the
+                            // destination of the parcopy mov for an arg
+                            // register). The value at the call site is
+                            // ambiguous — fall back to leaving the slot
+                            // un-mapped (SME_NONE) so the materializer
+                            // doesn't overwrite the eagerly-spilled VM-stack
+                            // slot.
+                            match reg_to_offset.get(&reg.reg_no) {
+                                Some(&off) => zjit_stack_map_entry { kind: ZJIT_SME_CSTACK, payload32: off, value: VALUE(0) },
+                                None => zjit_stack_map_entry { kind: 0, payload32: 0, value: VALUE(0) },
+                            }
+                        }
+                        Allocation::Stack(n) => {
+                            let disp = stack_state.stack_idx_to_disp(n);
+                            zjit_stack_map_entry { kind: ZJIT_SME_SPILL, payload32: disp, value: VALUE(0) }
+                        }
+                    }
+                }
+                _ => panic!("stack map operand kind not supported: {opnd:?}"),
+            }
+        };
+
+        unsafe {
+            let jf = &mut *jit_frame;
+            jf.stack_len = sm_stack.len() as u8;
+            jf.locals_len = sm_locals.len() as u8;
+            for (i, opnd) in sm_stack.iter().enumerate() {
+                jf.stack[i] = encode(opnd);
+            }
+            for (i, opnd) in sm_locals.iter().enumerate() {
+                jf.locals[i] = encode(opnd);
+            }
         }
     }
 
@@ -2994,10 +3248,17 @@ impl Assembler
                     }
                 }
 
+                // StackMap operands must survive the immediately-following CCall.
+                // Insn IDs increase by 2, so the CCall sits at insn_id + 2, and
+                // survives() requires end > N+2 ⇒ end ≥ N+3.
+                let stack_map_end = matches!(insn, Insn::StackMap { .. })
+                    .then(|| insn_id.0 + 3);
+
                 // For each VReg input (including memory base VRegs), add_range from block start to insn
                 for opnd in insn.opnd_iter() {
                     for idx in opnd.vreg_ids() {
-                        intervals[idx.0].add_range(block.from.0, insn_id.0);
+                        let to = stack_map_end.unwrap_or(insn_id.0);
+                        intervals[idx.0].add_range(block.from.0, to);
                     }
                 }
             }
@@ -3746,6 +4007,19 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&[opnd, shift]));
         self.push_insn(Insn::RShift { opnd, shift, out });
         out
+    }
+
+    /// Emit a StackMap anchor for the next CCall. The stack/locals operands
+    /// describe HIR-level live values at the call site; handle_caller_saved_regs
+    /// resolves them against the register allocation and writes the encoded
+    /// entries into the supplied JITFrame.
+    pub fn stack_map(&mut self, stack: Vec<Opnd>, locals: Vec<Opnd>, jit_frame: *mut JITFrame) {
+        use crate::cruby::ZJIT_STACK_MAP_CAP;
+        assert!(stack.len() <= ZJIT_STACK_MAP_CAP as usize,
+            "stack map exceeds ZJIT_STACK_MAP_CAP: {} > {}", stack.len(), ZJIT_STACK_MAP_CAP);
+        assert!(locals.len() <= ZJIT_STACK_MAP_CAP as usize,
+            "stack map exceeds ZJIT_STACK_MAP_CAP: {} > {}", locals.len(), ZJIT_STACK_MAP_CAP);
+        self.push_insn(Insn::StackMap { stack, locals, jit_frame });
     }
 
     pub fn store(&mut self, dest: Opnd, src: Opnd) {

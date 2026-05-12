@@ -2847,6 +2847,45 @@ vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,
     return result;
 }
 
+// Read one stack-map entry from a JIT frame and return the VALUE it points at.
+// CSTACK entries live at jit_frame->saved_sp + payload32; SPILL entries live
+// at jit_frame->saved_fp + payload32. VALUE entries carry the value inline.
+static inline VALUE
+zjit_sme_load(const zjit_stack_map_entry_t *entry, const zjit_jit_frame_t *jit_frame)
+{
+    switch (entry->kind) {
+      case ZJIT_SME_VALUE:
+        return entry->value;
+      case ZJIT_SME_CSTACK:
+        return *(const VALUE *)((const char *)jit_frame->saved_sp + entry->payload32);
+      case ZJIT_SME_SPILL:
+        return *(const VALUE *)((const char *)jit_frame->saved_fp + entry->payload32);
+      default:
+        // ZJIT_SME_NONE shouldn't appear within stack_len/locals_len.
+        return Qundef;
+    }
+}
+
+// Materialize the JIT stack and locals for a single frame from its stack map
+// back onto the VM stack / EP. After this call, the interpreter can read
+// cfp->sp[-stack_len..-1] and cfp->ep[-N..] like it would for an interpreter
+// frame at the same point.
+static inline void
+zjit_materialize_stack_map(rb_control_frame_t *cfp, const zjit_jit_frame_t *jit_frame)
+{
+    // PROTOTYPE: The stack map is encoded at codegen and stamped at runtime
+    // (saved_sp/saved_fp), but we don't actually materialize back to the VM
+    // stack / EP yet. SME_CSTACK entries point into the JIT's C-stack frame,
+    // which longjmp clobbers during exception unwinding — copying from those
+    // addresses would overwrite the eagerly-spilled VM-stack values with
+    // garbage. Because gen_prepare_non_leaf_call still emits gen_spill_stack
+    // and gen_spill_locals, the VM stack and EP already hold the correct
+    // values for exception handling, GC marking, and side exits. When we
+    // drop the eager spills, we'll need a longjmp-safe materialize path
+    // (e.g. intercept before longjmp, or use a separate side-stack).
+    (void)cfp; (void)jit_frame;
+}
+
 static inline void
 zjit_materialize_frames(rb_control_frame_t *cfp)
 {
@@ -2860,6 +2899,7 @@ zjit_materialize_frames(rb_control_frame_t *cfp)
             if (jit_frame->materialize_block_code) {
                 cfp->block_code = NULL;
             }
+            zjit_materialize_stack_map(cfp, jit_frame);
             cfp->jit_return = 0;
         }
         if (VM_FRAME_FINISHED_P(cfp)) break;
@@ -2871,6 +2911,32 @@ void
 rb_zjit_materialize_frames(rb_control_frame_t *cfp)
 {
     zjit_materialize_frames(cfp);
+}
+
+// Non-destructive variant for GC marking. Materializes pc/iseq/stack/locals
+// onto each frame but leaves cfp->jit_return intact so the JIT can keep
+// executing once GC returns. After this call the conservative VM-stack scan
+// in rb_execution_context_mark sees real VALUEs in slots that were
+// previously holding dead bytes.
+void
+rb_zjit_materialize_frames_for_gc(rb_control_frame_t *cfp)
+{
+    if (!rb_zjit_enabled_p) return;
+
+    while (true) {
+        if (CFP_ZJIT_FRAME(cfp)) {
+            const zjit_jit_frame_t *jit_frame = (const zjit_jit_frame_t *)cfp->jit_return;
+            cfp->pc = jit_frame->pc;
+            cfp->_iseq = (rb_iseq_t *)jit_frame->iseq;
+            if (jit_frame->materialize_block_code) {
+                cfp->block_code = NULL;
+            }
+            zjit_materialize_stack_map(cfp, jit_frame);
+            // Intentionally do NOT clear cfp->jit_return.
+        }
+        if (VM_FRAME_FINISHED_P(cfp)) break;
+        cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+    }
 }
 
 static inline VALUE
@@ -3719,6 +3785,13 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);
+
+        // Before scanning the VM stack and CFP chain, ask ZJIT to write
+        // back any JIT-resident stack/locals onto the VM stack from their
+        // stack maps. This is non-destructive (cfp->jit_return is kept) so
+        // the JIT can keep executing after GC returns.
+        rb_zjit_materialize_frames_for_gc(ec->cfp);
+
         VALUE *p = ec->vm_stack;
         VALUE *sp = ec->cfp->sp;
         rb_control_frame_t *cfp = ec->cfp;

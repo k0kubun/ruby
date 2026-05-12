@@ -1913,12 +1913,31 @@ pub const DEFINED_REF: defined_type = 15;
 pub const DEFINED_FUNC: defined_type = 16;
 pub const DEFINED_CONST_FROM: defined_type = 17;
 pub type defined_type = u32;
+pub const ZJIT_STACK_MAP_CAP: usize = 32;
+pub const ZJIT_SME_NONE:   zjit_stack_map_kind = 0;
+pub const ZJIT_SME_VALUE:  zjit_stack_map_kind = 1;
+pub const ZJIT_SME_CSTACK: zjit_stack_map_kind = 2;
+pub const ZJIT_SME_SPILL:  zjit_stack_map_kind = 3;
+pub type zjit_stack_map_kind = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct zjit_stack_map_entry {
+    pub kind: u32,
+    pub payload32: i32,
+    pub value: VALUE,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub saved_sp: *mut ::std::os::raw::c_void,
+    pub saved_fp: *mut ::std::os::raw::c_void,
+    pub stack_len: u8,
+    pub locals_len: u8,
+    pub stack: [zjit_stack_map_entry; ZJIT_STACK_MAP_CAP],
+    pub locals: [zjit_stack_map_entry; ZJIT_STACK_MAP_CAP],
 }
 pub const ISEQ_BODY_OFFSET_PARAM: zjit_struct_offsets = 16;
 pub type zjit_struct_offsets = u32;
