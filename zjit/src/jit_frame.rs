@@ -1,4 +1,8 @@
-use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
+use std::alloc::{alloc, handle_alloc_error, Layout};
+use std::mem::{align_of, size_of};
+use std::ptr;
+
+use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::zjit_jit_frame;
 use crate::codegen::iseq_may_write_block_code;
 use crate::state::ZJITState;
@@ -8,18 +12,41 @@ use crate::state::ZJITState;
 pub type JITFrame = zjit_jit_frame;
 
 impl JITFrame {
-    /// Allocate a JITFrame on the heap, register it with ZJITState, and return
-    /// a raw pointer that remains valid for the lifetime of the process.
-    fn alloc(jit_frame: JITFrame) -> *const Self {
-        let raw_ptr = Box::into_raw(Box::new(jit_frame));
+    /// Allocate a JITFrame and its trailing stack map on the heap, register it
+    /// with ZJITState, and return a raw pointer that remains valid for the
+    /// lifetime of the process.
+    fn alloc(
+        pc: *const VALUE,
+        iseq: IseqPtr,
+        materialize_block_code: bool,
+        stack_size: usize,
+    ) -> *const Self {
+        let frame_size = size_of::<JITFrame>()
+            .checked_add(stack_size.checked_mul(size_of::<VALUE>()).unwrap())
+            .unwrap();
+        let layout = Layout::from_size_align(frame_size, align_of::<JITFrame>()).unwrap();
+        let raw_ptr = unsafe { alloc(layout) as *mut JITFrame };
+        if raw_ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+
+        unsafe {
+            ptr::write(raw_ptr, JITFrame {
+                pc,
+                iseq,
+                materialize_block_code,
+                stack_size: stack_size.try_into().unwrap(),
+                stack: __IncompleteArrayField::new(),
+            });
+        }
         ZJITState::get_jit_frames().push(raw_ptr);
         raw_ptr as *const _
     }
 
     /// Create a JITFrame for an ISEQ frame.
-    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr) -> *const Self {
+    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, stack_size: usize) -> *const Self {
         let materialize_block_code = !iseq_may_write_block_code(iseq);
-        Self::alloc(JITFrame { pc, iseq, materialize_block_code })
+        Self::alloc(pc, iseq, materialize_block_code, stack_size)
     }
 
     /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.

@@ -2849,6 +2849,20 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             if (jit_frame->materialize_block_code) {
                 cfp->block_code = NULL;
             }
+
+            int32_t stack_size = (int32_t)jit_frame->stack_size;
+            if (stack_size > 0) {
+                VALUE *stack = cfp->sp - stack_size;
+                for (int32_t i = 0; i < stack_size; i++) {
+                    VALUE entry = jit_frame->stack[i];
+                    if (ZJIT_STACK_MAP_VREG_P(entry)) {
+                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)ZJIT_STACK_MAP_VREG_INDEX(entry) - 2];
+                    }
+                    else {
+                        stack[i] = entry;
+                    }
+                }
+            }
             cfp->jit_return = 0;
         }
         if (end_cfp == cfp) break;
@@ -3706,7 +3720,12 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
         for (long i = 0; i < (long)(sp - p); i++) {
-            rb_gc_mark_movable(p[i]);
+            if (rb_zjit_enabled_p) {
+                rb_gc_mark_maybe(p[i]);
+            }
+            else {
+                rb_gc_mark_movable(p[i]);
+            }
         }
 
         while (cfp != limit_cfp) {
