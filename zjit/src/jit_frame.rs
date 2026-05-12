@@ -17,7 +17,15 @@ impl JITFrame {
 
     /// Create a JITFrame for an ISEQ frame.
     pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
-        Self::alloc(JITFrame { pc, iseq, materialize_block_code })
+        Self::alloc(
+            JITFrame {
+                pc,
+                iseq,
+                materialize_block_code,
+                stack_size: 0,
+                stack: 0 as _,
+            }
+        )
     }
 
     /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.

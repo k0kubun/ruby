@@ -4,7 +4,7 @@ use std::{collections::{HashMap, HashSet}, mem};
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
-use crate::codegen::invalidate_iseq_version;
+use crate::codegen::{gen_iseq_call, invalidate_iseq_version};
 use crate::cruby::rb_iseq_reset_jit_func;
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
@@ -223,22 +223,31 @@ pub extern "C" fn rb_zjit_invalidate_no_ep_escape(iseq: IseqPtr) {
             let cb = ZJITState::get_code_block();
             compile_patch_points!(cb, patch_points, EP, "EP is escaped: {}", iseq_name(iseq));
 
-            // Also invalidate the ISEQ version so the method falls back to the
-            // interpreter on the next call. NoEPEscape PatchPoint side exits use
-            // without_locals() and don't save locals to the frame. If a PatchPoint
-            // fires on a later call (where EP hasn't escaped), the interpreter would
-            // read stale locals (e.g., nil instead of [] for keyword defaults).
+            // Also invalidate all ISEQ versions with this assumption. NoEPEscape
+            // PatchPoint side exits use without_locals() and don't save locals to
+            // the frame. If a PatchPoint fires on a later call, the interpreter
+            // would read stale locals (e.g., nil instead of [] for keyword defaults).
             //
-            // We can't use invalidate_iseq_version() here because it skips when
-            // at MAX_ISEQ_VERSIONS (to prevent unbounded recompilation). Instead,
-            // directly mark the version as invalidated and reset jit_func so the
-            // interpreter takes over permanently.
+            // We can't use invalidate_iseq_version() here because it handles one
+            // version and skips at MAX_ISEQ_VERSIONS. Old versions may still have
+            // incoming JIT-to-JIT calls, so every version must be marked invalid.
             let payload = crate::payload::get_or_create_iseq_payload(iseq);
-            if let Some(version) = payload.versions.last_mut() {
+            let mut incoming_calls = Vec::new();
+            for version in payload.versions.iter_mut() {
                 use crate::payload::IseqStatus;
+                incoming_calls.extend(unsafe { version.as_ref() }.incoming.iter().cloned());
                 if unsafe { version.as_ref() }.status != IseqStatus::Invalidated {
                     unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
-                    unsafe { rb_iseq_reset_jit_func(iseq) };
+                }
+            }
+            unsafe { rb_iseq_reset_jit_func(iseq) };
+
+            // Repatch incoming JIT-to-JIT calls to go through fresh stubs. Without
+            // this, callers can keep entering old versions whose NoEPEscape
+            // PatchPoints now side-exit without saving locals.
+            for incoming in incoming_calls {
+                if let Err(err) = gen_iseq_call(cb, &incoming) {
+                    debug!("{err:?}: gen_iseq_call failed during EP escape invalidation: {}", iseq_name(iseq));
                 }
             }
 
