@@ -48,21 +48,26 @@ void rb_zjit_before_ractor_spawn(void);
 void rb_zjit_tracing_invalidate_all(void);
 void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
-void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
+void rb_zjit_jit_frame_update_references(const zjit_jit_frame_t *jit_frame);
+void rb_zjit_materialize_frames(rb_control_frame_t *cfp);
 
-// Special value for cfp->jit_return that means "this is a C method frame, use
-// rb_zjit_c_frame as the JITFrame". We don't control the native stack layout
-// for C frames, so there's no per-call JITFrame storage; we set this sentinel
-// instead of a heap-allocated JITFrame pointer.
+// Special value for cfp->jit_return to use rb_zjit_c_frame. We don't have the control of the
+// native stack layout for C frames, so we don't have storage for JITFrame on the native stack.
+// We set ZJIT_JIT_RETURN_C_FRAME instead of NATIVE_BASE_PTR to skip reading the native stack.
 #define ZJIT_JIT_RETURN_C_FRAME 0x1
 
-static inline const zjit_jit_frame_t *
+static const zjit_jit_frame_t *
 CFP_ZJIT_FRAME(const rb_control_frame_t *cfp)
 {
     if ((VALUE)cfp->jit_return == ZJIT_JIT_RETURN_C_FRAME) {
         return &rb_zjit_c_frame;
     }
-    return (const zjit_jit_frame_t *)cfp->jit_return;
+    else {
+        // Read JITFrame from the stack slot. gen_entry_point() writes an initial
+        // frame describing the entry PC + iseq; subsequent gen_save_pc_for_gc()
+        // calls update it with a more accurate PC before any non-leaf C call.
+        return (const zjit_jit_frame_t *)((VALUE *)cfp->jit_return)[-1];
+    }
 }
 #else
 #define rb_zjit_entry 0
@@ -77,23 +82,18 @@ static inline void rb_zjit_before_ractor_spawn(void) {}
 static inline void rb_zjit_tracing_invalidate_all(void) {}
 static inline void rb_zjit_invalidate_no_singleton_class(VALUE klass) {}
 static inline void rb_zjit_invalidate_root_box(void) {}
-static inline void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame) {}
-static inline const zjit_jit_frame_t *CFP_ZJIT_FRAME(const rb_control_frame_t *cfp) { return NULL; }
+static inline void rb_zjit_jit_frame_update_references(const zjit_jit_frame_t *jit_frame) {}
+static inline void rb_zjit_materialize_frames(rb_control_frame_t *cfp) {}
+static inline const zjit_jit_frame_t* CFP_ZJIT_FRAME(const rb_control_frame_t *cfp) { return NULL; }
 #endif // #if USE_ZJIT
 
 #define rb_zjit_enabled_p (rb_zjit_entry != 0)
-
-// BADFrame. The high bit is set, so likely SEGV on linux and darwin if dereferenced.
-#define ZJIT_JIT_RETURN_POISON 0xbadfbadfbadfbadfULL
 
 // Return true if a given CFP has ZJIT's JITFrame.
 static inline bool
 CFP_ZJIT_FRAME_P(const rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return false;
-#if USE_ZJIT
-    RUBY_ASSERT((unsigned long long)cfp->jit_return != ZJIT_JIT_RETURN_POISON);
-#endif
     return cfp->jit_return != NULL;
 }
 

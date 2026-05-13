@@ -1018,6 +1018,7 @@ struct rb_vm_tag {
     struct rb_vm_tag *prev;
     enum ruby_tag_type state;
     unsigned int lock_rec;
+    bool already_materialized_zjit_frames;
 };
 
 STATIC_ASSERT(rb_vm_tag_buf_offset, offsetof(struct rb_vm_tag, buf) > 0);

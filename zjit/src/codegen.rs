@@ -19,7 +19,7 @@ use crate::state::ZJITState;
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_without_block_fallback_counter_for_method_type, send_without_block_fallback_counter_for_optimized_method_type};
 use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
-use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, Target, asm_ccall, asm_comment};
+use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, Target, asm_ccall, asm_comment};
 use crate::hir::{iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendFallbackReason};
 use crate::hir_type::{types, Type};
@@ -39,13 +39,6 @@ pub fn max_iseq_versions() -> usize {
 /// Sentinel program counter stored in C frames when runtime checks are enabled.
 const PC_POISON: Option<*const VALUE> = if cfg!(feature = "runtime_checks") {
     Some(usize::MAX as *const VALUE)
-} else {
-    None
-};
-
-/// Sentinel jit_return stored on ISEQ frame push when runtime checks are enabled.
-const JIT_RETURN_POISON: Option<usize> = if cfg!(feature = "runtime_checks") {
-    Some(ZJIT_JIT_RETURN_POISON as usize)
 } else {
     None
 };
@@ -376,7 +369,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     let (mut jit, asm) = trace_compile_phase("codegen", || {
         let num_spilled_params = max_num_params(function).saturating_sub(ALLOC_REGS.len());
         let mut jit = JITState::new(version, function.num_insns(), function.num_blocks());
-        let mut asm = Assembler::new_with_stack_slots(num_spilled_params);
+        let mut asm = Assembler::new_with_stack_slots(num_spilled_params + 1); // +1 for JITFrame
 
         // Mapping from HIR block IDs to LIR block IDs.
         // This is is a one-to-one mapping from HIR to LIR blocks used for finding
@@ -1223,7 +1216,7 @@ fn gen_putspecialobject(jit: &JITState, asm: &mut Assembler, value_type: Special
     // rb_vm_get_special_object for CBASE/CONST_BASE can call rb_singleton_class,
     // which allocates (may trigger GC) and can raise TypeError on non-class
     // receivers (e.g. `123.instance_eval { Const = 1 }`). Treat as non-leaf so
-    // the PC is saved for GC and stack/locals are spilled for rescue.
+    // the JITFrame is valid for GC and stack/locals are spilled for rescue.
     gen_prepare_non_leaf_call(jit, asm, state);
 
     // Get the EP of the current CFP and load it into a register
@@ -1234,11 +1227,11 @@ fn gen_putspecialobject(jit: &JITState, asm: &mut Assembler, value_type: Special
 }
 
 fn gen_getspecial_symbol(asm: &mut Assembler, symbol_type: SpecialBackrefSymbol, state: &FrameState) -> Opnd {
+    // Fetch a "special" backref based on the symbol type.
     // rb_backref_get reaches rb_vm_svar_lep, which calls CFP_PC/CFP_ISEQ on the
-    // current frame, so the PC must be saved before the call.
+    // current frame, so the JITFrame stack slot must be populated first.
     gen_prepare_leaf_call_with_gc(asm, state);
 
-    // Fetch a "special" backref based on the symbol type
     let backref = asm_ccall!(asm, rb_backref_get,);
 
     match symbol_type {
@@ -1258,11 +1251,11 @@ fn gen_getspecial_symbol(asm: &mut Assembler, symbol_type: SpecialBackrefSymbol,
 }
 
 fn gen_getspecial_number(asm: &mut Assembler, nth: u64, state: &FrameState) -> Opnd {
+    // Fetch the N-th match from the last backref based on type shifted by 1.
     // rb_backref_get reaches rb_vm_svar_lep, which calls CFP_PC/CFP_ISEQ on the
-    // current frame, so the PC must be saved before the call.
+    // current frame, so the JITFrame stack slot must be populated first.
     gen_prepare_leaf_call_with_gc(asm, state);
 
-    // Fetch the N-th match from the last backref based on type shifted by 1
     let backref = asm_ccall!(asm, rb_backref_get,);
 
     asm_ccall!(asm, rb_reg_nth_match, Opnd::Imm((nth >> 1).try_into().unwrap()), backref)
@@ -2188,6 +2181,12 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         });
     }
     asm.frame_setup(&[]);
+
+    // Publish the JITFrame slot's location via cfp->jit_return. The slot at
+    // [NATIVE_BASE_PTR - 8] is left uninitialized here; the JIT design relies on
+    // gen_save_pc_for_gc() to populate it before any C call, and on cross-ractor
+    // barriers ensuring that no other ractor scans this CFP before such a call.
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), NATIVE_BASE_PTR);
 }
 
 /// Compile code that exits from JIT code with a return value
@@ -2711,12 +2710,18 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
     gen_incr_counter(asm, Counter::vm_write_pc_count);
-    asm_comment!(asm, "save PC to CFP");
-    if let Some(pc) = PC_POISON {
-        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
-    }
+    asm_comment!(asm, "save PC for GC");
+    // CFP_PC for a live JIT frame routes through the JITFrame on the native
+    // stack (cfp->jit_return points to NATIVE_BASE_PTR), so we don't need to
+    // touch cfp->pc here. Poisoning cfp->pc would actively break the case
+    // where rb_zjit_materialize_frames() previously copied jit_frame->pc into
+    // cfp->pc and cleared cfp->jit_return: the JIT keeps running, lands on
+    // this routine again, and the poison would replace the valid materialized
+    // pc behind the GC's back.
+
+    // Write JITFrame into the stack slot read by CFP_ZJIT_FRAME().
     let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
-    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), Opnd::const_ptr(jit_frame));
+    asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
 }
 
 /// Save the current PC on the CFP as a preparation for calling a C function
@@ -2845,9 +2850,7 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
 
     if frame.iseq.is_some() {
         // PC, SP, and ISEQ are written lazily by the callee on side-exits, non-leaf calls, or GC.
-        if let Some(jit_return_poison) = JIT_RETURN_POISON {
-            asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), jit_return_poison.into());
-        }
+        // jit_return will be written by gen_entry_point() shortly after this frame push.
         if frame.write_block_code {
             asm_comment!(asm, "write block_code for iseq that may use it");
             asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
