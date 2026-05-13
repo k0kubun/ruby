@@ -3,6 +3,7 @@
 
 #include "ruby/ruby.h"
 #include "vm_core.h"
+#include "zjit.h"
 
 static inline void
 vm_passed_block_handler_set(rb_execution_context_t *ec, VALUE block_handler)
@@ -102,6 +103,7 @@ extern int select_large_fdset(int, fd_set *, fd_set *, fd_set *, struct timeval 
   _tag.tag = Qundef; \
   _tag.prev = _ec->tag; \
   _tag.lock_rec = rb_ec_vm_lock_rec(_ec); \
+  _tag.cfp = _ec->cfp; \
   rb_vm_tag_jmpbuf_init(&_tag.buf); \
 
 #define EC_POP_TAG() \
@@ -155,6 +157,23 @@ static inline void
 rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
 {
     RUBY_ASSERT(st > TAG_NONE && st <= TAG_FATAL, ": Invalid tag jump: %d", (int)st);
+
+    /*
+    if (ec->tag->already_materialized_zjit_frames) {
+        // do nothing
+    }
+    else {
+        // Materialize JIT frames before longjmp. The longjmp unwinds the native
+        // stack to the setjmp point, which may invalidate JIT native frames whose
+        // NATIVE_BASE_PTR is referenced by cfp->jit_return. After this call, the
+        // cfps no longer rely on jit_return, so they remain queryable post-longjmp.
+        rb_zjit_materialize_frames(ec->cfp);
+    }
+    ec->tag->already_materialized_zjit_frames = false;
+    */
+    void rb_zjit_materialize_frames_range(rb_control_frame_t *cfp, const rb_control_frame_t *end_cfp);
+    rb_zjit_materialize_frames_range(ec->cfp, ec->tag->cfp);
+
     ec->tag->state = st;
     ruby_longjmp(RB_VM_TAG_JMPBUF_GET(ec->tag->buf), 1);
 }

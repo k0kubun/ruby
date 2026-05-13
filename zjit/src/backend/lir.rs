@@ -1812,8 +1812,9 @@ impl Assembler
             Opnd::Reg(ALLOC_REGS[idx])
         } else {
             // With FrameSetup, the address that NATIVE_BASE_PTR points to stores an old value in the register.
-            // To avoid clobbering it, we need to start from the next slot, hence `+ 1` for the index.
-            Opnd::mem(64, NATIVE_BASE_PTR, (idx - ALLOC_REGS.len() + 1) as i32 * -SIZEOF_VALUE_I32)
+            // To avoid clobbering it, we need to start from the next slot, and we also reserve one space for
+            // JITFrame, hence `+ 2` for the index.
+            Opnd::mem(64, NATIVE_BASE_PTR, (idx - ALLOC_REGS.len() + 2) as i32 * -SIZEOF_VALUE_I32)
         }
     }
 
@@ -2620,7 +2621,7 @@ impl Assembler
     /// code is linearized and split.
     pub fn compile_exits(&mut self) -> Vec<Insn> {
         /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
-        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
+        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit, before_c_call: bool) {
             let SideExit { pc, stack, locals, iseq, .. } = exit;
 
             // Side exit blocks are not part of the CFG at the moment,
@@ -2638,6 +2639,14 @@ impl Assembler
             asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
 
             // cfp->block_code and cfp->jit_return are cleared by the caller jit_exec() or JIT_EXEC()
+            //
+            // However, when the exit is about to make a C call, e.g. exit_recompile, we need to clear
+            // cfp->jit_return because the C call can trigger GC, which walks the stack and would hit
+            // the assertion in CFP_ZJIT_FRAME if the stack still holds JIT_FRAME_POISON.
+            if before_c_call {
+                asm_comment!(asm, "clear cfp->jit_return");
+                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
+            }
 
             if !stack.is_empty() {
                 asm_comment!(asm, "write stack slots: {}", join_opnds(&stack, ", "));
@@ -2664,22 +2673,12 @@ impl Assembler
         /// Compile the main side-exit code. This function takes only SideExit so
         /// that it can be safely deduplicated by using SideExit as a dedup key.
         fn compile_exit(asm: &mut Assembler, exit: &SideExit) {
-            compile_exit_save_state(asm, exit);
+            compile_exit_save_state(asm, exit, exit.recompile.is_some());
             // If this side exit should trigger recompilation, call the recompile
             // function after saving VM state. The ccall must happen after
             // compile_exit_save_state because it clobbers caller-saved registers
             // that may hold stack/local operands we need to save.
             if let Some(recompile) = &exit.recompile {
-                if cfg!(feature = "runtime_checks") {
-                    // Clear jit_return to fully materialize the frame. This must happen
-                    // before any C call in the exit path (e.g. exit_recompile)
-                    // because that C call can trigger GC, which walks the stack and would
-                    // hit the CFP_JIT_RETURN assertion if jit_return still holds the
-                    // runtime_checks poison value (JIT_RETURN_POISON).
-                    asm_comment!(asm, "clear cfp->jit_return");
-                    asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
-                }
-
                 use crate::codegen::exit_recompile;
                 asm_comment!(asm, "profile and maybe recompile");
                 asm_ccall!(asm, exit_recompile,
@@ -2772,7 +2771,8 @@ impl Assembler
                         // rb_profile_frames sees valid cfp->pc and the
                         // ccall doesn't clobber caller-saved registers
                         // holding stack/local operands.
-                        compile_exit_save_state(self, &exit);
+                        compile_exit_save_state(self, &exit, true);
+
                         // Leak a CString with the reason so it's available at runtime
                         let reason_cstr = std::ffi::CString::new(reason.to_string())
                             .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());

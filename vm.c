@@ -2268,6 +2268,8 @@ next_not_local_frame(rb_control_frame_t *cfp)
 
 NORETURN(static void vm_iter_break(rb_execution_context_t *ec, VALUE val));
 
+static void zjit_materialize_frames_range(rb_control_frame_t *cfp, const rb_control_frame_t *end_cfp);
+
 static void
 vm_iter_break(rb_execution_context_t *ec, VALUE val)
 {
@@ -2276,6 +2278,10 @@ vm_iter_break(rb_execution_context_t *ec, VALUE val)
     const rb_control_frame_t *target_cfp = rb_vm_search_cf_from_ep(ec, cfp, ep);
 
     if (!target_cfp) {
+        // The target block lives outside this EC (e.g. yield across threads).
+        // Leave ZJIT frame materialization to the normal EC_JUMP_TAG path,
+        // which stops at VM_FRAME_FINISHED_P. zjit_materialize_frames_range
+        // would walk past the end of the cfp stack with end_cfp == NULL.
         rb_vm_localjump_error("unexpected break", val, TAG_BREAK);
     }
 
@@ -2861,11 +2867,42 @@ zjit_materialize_frames(rb_control_frame_t *cfp)
     }
 }
 
+// materialisze everything [cfp, end_cfp] (inclusive)
+static void
+zjit_materialize_frames_range(rb_control_frame_t *cfp, const rb_control_frame_t *end_cfp)
+{
+    if (!rb_zjit_enabled_p) return;
+    // TODO(alan): assert that end_cfp is previous to cfp.
+
+    while (true) {
+        if (CFP_ZJIT_FRAME_P(cfp)) {
+            const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+            cfp->pc = jit_frame->pc;
+            cfp->_iseq = (rb_iseq_t *)jit_frame->iseq;
+            if (jit_frame->materialize_block_code) {
+                cfp->block_code = NULL;
+            }
+            cfp->jit_return = 0;
+        }
+        if (end_cfp == cfp) break;
+        cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+    }
+}
+
+void
+rb_zjit_materialize_frames_range(rb_control_frame_t *cfp, const rb_control_frame_t *end_cfp)
+{
+    zjit_materialize_frames_range(cfp, end_cfp);
+}
+
+#if USE_ZJIT
+// Materialize frames up to the most recent VM_FRAME_FINISHED_P frame.
 void
 rb_zjit_materialize_frames(rb_control_frame_t *cfp)
 {
     zjit_materialize_frames(cfp);
 }
+#endif
 
 static inline VALUE
 vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, VALUE errinfo)
@@ -3663,7 +3700,7 @@ rb_execution_context_update(rb_execution_context_t *ec)
             const VALUE *ep = cfp->ep;
             cfp->self = rb_gc_location(cfp->self);
             if (CFP_ZJIT_FRAME_P(cfp)) {
-                rb_zjit_jit_frame_update_references((zjit_jit_frame_t *)CFP_ZJIT_FRAME(cfp));
+                rb_zjit_jit_frame_update_references(CFP_ZJIT_FRAME(cfp));
                 // block_code must always be relocated. For ISEQ frames, the JIT caller
                 // may have written it (gen_block_handler_specval) for passing blocks.
                 // For C frames, rb_iterate0 may have written an ifunc to block_code

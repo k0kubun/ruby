@@ -1015,6 +1015,7 @@ struct rb_vm_tag {
     struct rb_vm_tag *prev;
     enum ruby_tag_type state;
     unsigned int lock_rec;
+    rb_control_frame_t *cfp;
 };
 
 STATIC_ASSERT(rb_vm_tag_buf_offset, offsetof(struct rb_vm_tag, buf) > 0);
