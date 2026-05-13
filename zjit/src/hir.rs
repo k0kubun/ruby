@@ -3456,14 +3456,17 @@ impl Function {
         }
     }
 
-    fn polymorphic_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<TypeDistributionSummary> {
+    fn polymorphic_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId, include_monomorphic: bool) -> Option<TypeDistributionSummary> {
         let Some(entries) = profiles.get(state) else {
             return None;
         };
         let recv = self.chase_insn(recv);
         for (entry_insn, entry_type_summary) in entries {
             if self.chase_insn(*entry_insn) == recv {
-                if entry_type_summary.is_polymorphic() || entry_type_summary.is_skewed_polymorphic() {
+                let usable = entry_type_summary.is_polymorphic()
+                    || entry_type_summary.is_skewed_polymorphic()
+                    || (include_monomorphic && entry_type_summary.is_monomorphic());
+                if usable {
                     return Some(entry_type_summary.clone());
                 }
                 return None;
@@ -4880,9 +4883,8 @@ impl Function {
         }
         if self.policy.no_side_exits {
             // On the final version, skip GetIvar shape specialization.
-            // iseq_to_hir already generates polymorphic branches with a
-            // GetIvar C call fallback for getinstancevariable, so we don't
-            // need to wrap it again here.
+            // iseq_to_hir already generates side-exit-free branches with a
+            // GetIvar C call fallback for getinstancevariable.
             return Err(Counter::getivar_fallback_no_side_exits);
         }
         let self_val = self.guard_heap(block, self_val, state);
@@ -7761,7 +7763,7 @@ fn add_iseq_to_hir(
                         if profiled_shape.is_complex() { return None; }
                         Some(profiled_shape)
                     }
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, self_param, exit_id) {
+                    if let Some(summary) = fun.polymorphic_summary(&profiles, self_param, exit_id, false) {
                         self_param = fun.push_insn(block, Insn::GuardType { val: self_param, guard_type: types::HeapBasicObject, state: exit_id, recompile: None });
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
@@ -8615,7 +8617,7 @@ fn add_iseq_to_hir(
                     let args = state.stack_pop_n(argc as usize)?;
                     let recv = state.stack_pop()?;
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id, false) {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         // Dedup by expected type so immediate/heap variants
@@ -8951,7 +8953,7 @@ fn add_iseq_to_hir(
                         fun.push_insn(block, Insn::SideExit { state: exit_id, reason: SideExitReason::UnhandledYARVInsn(opcode), recompile: None });
                         break;  // End the block
                     }
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, self_param, exit_id) {
+                    if let Some(summary) = fun.polymorphic_summary(&profiles, self_param, exit_id, fun.policy.no_side_exits) {
                         self_param = fun.push_insn(block, Insn::GuardType { val: self_param, guard_type: types::HeapBasicObject, state: exit_id, recompile: None });
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
