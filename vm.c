@@ -2277,12 +2277,16 @@ vm_iter_break(rb_execution_context_t *ec, VALUE val)
     const VALUE *ep = VM_CF_PREV_EP(cfp);
     const rb_control_frame_t *target_cfp = rb_vm_search_cf_from_ep(ec, cfp, ep);
 
-    zjit_materialize_frames_range(cfp, target_cfp);
-    ec->tag->already_materialized_zjit_frames = true;
-
     if (!target_cfp) {
+        // The target block lives outside this EC (e.g. yield across threads).
+        // Leave ZJIT frame materialization to the normal EC_JUMP_TAG path,
+        // which stops at VM_FRAME_FINISHED_P. zjit_materialize_frames_range
+        // would walk past the end of the cfp stack with end_cfp == NULL.
         rb_vm_localjump_error("unexpected break", val, TAG_BREAK);
     }
+
+    zjit_materialize_frames_range(cfp, target_cfp);
+    ec->tag->already_materialized_zjit_frames = true;
 
     ec->errinfo = (VALUE)THROW_DATA_NEW(val, target_cfp, TAG_BREAK);
     EC_JUMP_TAG(ec, TAG_BREAK);
