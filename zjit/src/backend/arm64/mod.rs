@@ -21,7 +21,11 @@ pub const CFP: Opnd = Opnd::Reg(X19_REG);
 pub const EC: Opnd = Opnd::Reg(X20_REG);
 pub const SP: Opnd = Opnd::Reg(X21_REG);
 
-// C argument registers on this platform
+// C argument registers on this platform.
+// Kept at 6 because this is also the cap on JIT-to-JIT ISEQ direct sends
+// (see the `final_argc + 1 > C_ARG_OPNDS.len()` check in hir.rs); widening it
+// would shift entry-block params past ALLOC_REGS' [X11, X12] tail and require
+// matching changes to `param_opnd`.
 pub const C_ARG_OPNDS: [Opnd; 6] = [
     Opnd::Reg(X0_REG),
     Opnd::Reg(X1_REG),
@@ -29,6 +33,13 @@ pub const C_ARG_OPNDS: [Opnd; 6] = [
     Opnd::Reg(X3_REG),
     Opnd::Reg(X4_REG),
     Opnd::Reg(X5_REG)
+];
+
+// AAPCS64 passes the first 8 integer args in x0-x7. Used by
+// handle_caller_saved_regs to populate the reg portion of arbitrary C calls;
+// overflow beyond this lands on the stack at [SP + i*8].
+pub const C_ABI_ARG_REGS: [Reg; 8] = [
+    X0_REG, X1_REG, X2_REG, X3_REG, X4_REG, X5_REG, X6_REG, X7_REG,
 ];
 
 // Make sure we're using the same c args everywhere
@@ -1666,7 +1677,7 @@ impl Assembler {
             });
 
             trace_compile_phase("resolve_ssa", || {
-                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS);
+                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ABI_ARG_REGS);
                 asm.resolve_ssa(&intervals, &assignments);
             });
 
@@ -2845,25 +2856,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_stack_args_seven() {
-        // Seven args: one overflow, padded to 16 bytes for SP alignment.
-        // Stack arg lands at [sp + 0] in the reserved area below the call.
+    fn test_ccall_stack_args_nine() {
+        // Nine args on arm64 (AAPCS64 uses 8 reg args): one overflow, padded
+        // to 16 bytes for SP alignment. Stack arg lands at [sp + 0].
         let (mut asm, mut cb) = setup_asm();
-        let args: Vec<Opnd> = (0..7).map(|i| asm.load(Opnd::UImm((i + 1) as u64))).collect();
+        let args: Vec<Opnd> = (0..9).map(|i| asm.load(Opnd::UImm((i + 1) as u64))).collect();
         asm.ccall(0 as _, args);
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         let disasm = cb.disasm();
         assert!(disasm.contains("sub sp, sp, #0x10"), "expected sub sp, sp, #0x10:\n{disasm}");
-        // The 7th arg should be stored into [sp + 0]; the exact source register
+        // The 9th arg should be stored into [sp + 0]; the source register
         // depends on regalloc, so match on the addressing rather than the reg.
         assert!(disasm.contains(", [sp]") || disasm.contains(", [sp + 0]") || disasm.contains(", [sp, #0]"), "expected store into [sp]:\n{disasm}");
         assert!(disasm.contains("add sp, sp, #0x10"), "expected matching add sp, sp, #0x10:\n{disasm}");
     }
 
     #[test]
-    fn test_ccall_stack_args_eight_with_survivors() {
-        // Eight args (two overflow slots) with a survivor. This is the shape
+    fn test_ccall_stack_args_ten_with_survivors() {
+        // Ten args (two overflow slots) with a survivor. This is the shape
         // that exposed the bug in #15312: pushing the survivor first then
         // writing the stack arg at [sp + 0] overlapped, so the survivor's pop
         // restored garbage. With the SP sub between, the survivor sits below
@@ -2873,7 +2884,7 @@ mod tests {
         let surv = asm.load(Opnd::UImm(0x42));
         let a0 = asm.load(Opnd::UImm(1));
         let a1 = asm.load(Opnd::UImm(2));
-        asm.ccall(0 as _, vec![a0, a1, a0, a1, a0, a1, a0, a1]);
+        asm.ccall(0 as _, vec![a0, a1, a0, a1, a0, a1, a0, a1, a0, a1]);
         let _ = asm.add(surv, Opnd::UImm(1));
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
