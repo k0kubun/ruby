@@ -2182,10 +2182,19 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
     }
     asm.frame_setup(&[]);
 
-    // Publish the JITFrame slot's location via cfp->jit_return. The slot at
-    // [NATIVE_BASE_PTR - 8] is left uninitialized here; the JIT design relies on
-    // gen_save_pc_for_gc() to populate it before any C call, and on cross-ractor
-    // barriers ensuring that no other ractor scans this CFP before such a call.
+    // Initialize the JITFrame slot at [NATIVE_BASE_PTR - 8] with an initial frame
+    // for this ISEQ before publishing cfp->jit_return. Cross-Ractor GC can scan
+    // this CFP as soon as we enter any C call (e.g. allocation in another Ractor
+    // triggers a barrier), and some asm_ccall! sites do not call gen_save_pc_for_gc.
+    // Without this initializer, CFP_ZJIT_FRAME() would read garbage from the
+    // stack slot and CFP_ISEQ() would return a bogus pointer to gc_mark.
+    let iseq = unsafe { jit.version.as_ref() }.iseq;
+    let entry_pc = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
+    let jit_frame = JITFrame::new_iseq(entry_pc, iseq, !iseq_may_write_block_code(iseq));
+    asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
+
+    // Publish the JITFrame slot's location via cfp->jit_return so that CFP_ISEQ /
+    // CFP_PC route through the on-stack JITFrame from now on.
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), NATIVE_BASE_PTR);
 }
 
