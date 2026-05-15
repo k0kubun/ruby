@@ -2720,18 +2720,17 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) {
 
     gen_incr_counter(asm, Counter::vm_write_pc_count);
     asm_comment!(asm, "save PC for GC");
+    // CFP_PC for a live JIT frame routes through the JITFrame on the native
+    // stack (cfp->jit_return points to NATIVE_BASE_PTR), so we don't need to
+    // touch cfp->pc here. Poisoning cfp->pc would actively break the case
+    // where rb_zjit_materialize_frames() previously copied jit_frame->pc into
+    // cfp->pc and cleared cfp->jit_return: the JIT keeps running, lands on
+    // this routine again, and the poison would replace the valid materialized
+    // pc behind the GC's back.
 
     // Write JITFrame into the stack slot read by CFP_ZJIT_FRAME().
     let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
     asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
-
-    // Restore cfp->jit_return so that CFP_PC/CFP_ISEQ route through this freshly
-    // updated JITFrame. rb_zjit_materialize_frames() may have cleared jit_return
-    // to 0 (e.g. when an exception was caught earlier in this ISEQ), after which
-    // CFP_PC would read cfp->pc directly. cfp->pc is left at the materialization
-    // point and goes stale as the JIT keeps running, so we must republish the
-    // JITFrame slot's location here.
-    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), NATIVE_BASE_PTR);
 }
 
 /// Save the current PC on the CFP as a preparation for calling a C function
