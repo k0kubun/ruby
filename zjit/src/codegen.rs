@@ -2200,6 +2200,15 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
 
 /// Compile code that exits from JIT code with a return value
 fn gen_return(asm: &mut Assembler, val: lir::Opnd) {
+    // Clear cfp->jit_return before the cfp is popped. Otherwise the popped
+    // slot retains a NATIVE_BASE_PTR that becomes stale as soon as we tear
+    // down this native frame. If a later exception walks past
+    // VM_FRAME_FINISHED_P (via vm_exec_handle_exception or a subsequent
+    // rb_zjit_materialize_frames call) it would dereference that stale
+    // pointer in CFP_ZJIT_FRAME() and read garbage memory.
+    asm_comment!(asm, "clear cfp->jit_return on return");
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
+
     // Pop the current frame (ec->cfp++)
     // Note: the return PC is already in the previous CFP
     asm_comment!(asm, "pop stack frame");
@@ -2858,18 +2867,20 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
     asm_comment!(asm, "push callee control frame");
 
     if frame.iseq.is_some() {
-        // PC, SP, and ISEQ are written lazily by the callee on side-exits, non-leaf calls, or GC.
-        // jit_return will be written by gen_entry_point() shortly after this frame push.
+        // SP and ISEQ are written lazily by the callee on side-exits, non-leaf calls, or GC.
+        // jit_return is set by gen_entry_point() shortly after this frame push, but we reset
+        // it here so that stale data from a previous occupant of this CFP slot can never pose
+        // as a valid JIT frame to CFP_ZJIT_FRAME(). A prior C frame would have left
+        // jit_return = ZJIT_JIT_RETURN_C_FRAME; a prior ISEQ frame from a returned JIT call
+        // would have left jit_return pointing at a NATIVE_BASE_PTR that is no longer on the
+        // C stack. Either would corrupt CFP_PC/CFP_ISEQ during bug reports, GC validation,
+        // or exception unwinding that walks past VM_FRAME_FINISHED_P.
+        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
         if frame.write_block_code {
             asm_comment!(asm, "write block_code for iseq that may use it");
             asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
         }
     } else {
-        // C frames don't have a PC and ISEQ in normal operation. ISEQ frames set PC on gen_save_pc_for_gc().
-        // When runtime checks are enabled we poison the PC for C frames so accidental reads stand out.
-        if let (None, Some(pc)) = (frame.iseq, PC_POISON) {
-            asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
-        }
         let new_sp = asm.lea(Opnd::mem(64, SP, (ep_offset + 1) * SIZEOF_VALUE_I32));
         asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SP), new_sp);
         // block_code must be written explicitly because the interpreter reads
@@ -3340,6 +3351,15 @@ pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> 
     asm.new_block_without_id("exit_trampoline");
 
     asm_comment!(asm, "side-exit trampoline");
+    // Clear cfp->jit_return for the current frame before tearing down the native
+    // frame. NATIVE_BASE_PTR (= RBP) becomes invalid once frame_teardown runs, so
+    // any later read of cfp->jit_return must not see it. This matters for the
+    // JIT-to-JIT Qundef propagation path (gen_send_iseq_direct's `je
+    // exit_trampoline`): each unwinding frame routes through this trampoline,
+    // and without the clear, the cfps above the side-exiting callee retain
+    // stale NATIVE_BASE_PTRs that crash rb_zjit_materialize_frames or
+    // vm_exec_handle_exception when they later dereference them.
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
     asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
     asm.cret(Qundef.into());
 
