@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - zjit-spill-args-debug
     paths-ignore:
       - 'doc/**'
       - '**/man/*'
