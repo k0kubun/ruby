@@ -203,7 +203,7 @@ pub use crate::backend::current::{
     mem_base_reg,
     Reg,
     EC, CFP, SP,
-    NATIVE_STACK_PTR, NATIVE_BASE_PTR,
+    NATIVE_BASE_PTR,
     C_ARG_OPNDS, C_RET_OPND,
 };
 
@@ -1644,9 +1644,8 @@ pub struct Assembler {
     /// On `compile`, it also disables the backend's use of them.
     pub(super) accept_scratch_reg: bool,
 
-    /// The Assembler can use NATIVE_BASE_PTR + stack_base_idx as the
-    /// first stack slot in case it needs to allocate memory. This is
-    /// equal to the number of spilled basic block arguments.
+    /// The maximum number of stack slots that have been reserved
+    /// by Assembler::alloc_stack().
     pub(super) stack_base_idx: usize,
 
     /// If Some, the next ccall should verify its leafness
@@ -1670,11 +1669,6 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
         }
-    }
-
-    /// Create an Assembler, reserving a specified number of stack slots
-    pub fn new_with_stack_slots(stack_base_idx: usize) -> Self {
-        Self { stack_base_idx, ..Self::new() }
     }
 
     /// Create an Assembler that allows the use of scratch registers.
@@ -3433,6 +3427,11 @@ impl Assembler {
         self.push_insn(Insn::Add { left, right, out: left });
     }
 
+    /// Make sure this Assembler will reserve a given stack size
+    pub fn alloc_stack(&mut self, stack_size: usize) {
+        self.stack_base_idx = usize::max(self.stack_base_idx, stack_size);
+    }
+
     #[must_use]
     pub fn and(&mut self, left: Opnd, right: Opnd) -> Opnd {
         let out = self.new_vreg(Opnd::match_num_bits(&[left, right]));
@@ -3847,6 +3846,7 @@ pub(crate) use asm_ccall;
 mod tests {
     use super::*;
     use insta::assert_snapshot;
+    use crate::backend::current::NATIVE_STACK_PTR;
 
     fn scratch_reg() -> Opnd {
         Assembler::new_with_scratch_reg().1

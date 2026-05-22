@@ -19,7 +19,7 @@ use crate::state::ZJITState;
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_without_block_fallback_counter_for_method_type, send_without_block_fallback_counter_for_optimized_method_type};
 use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
-use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, Target, asm_ccall, asm_comment};
+use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, Opnd, SP, SideExit, SideExitRecompile, Target, asm_ccall, asm_comment};
 use crate::hir::{iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendFallbackReason};
 use crate::hir_type::{types, Type};
@@ -66,17 +66,22 @@ struct JITState {
 
     /// ISEQ calls that need to be compiled later
     iseq_calls: Vec<IseqCallRef>,
+
+    /// Stack size reserved for spilled block params and JITFrame.
+    /// See also: Assembler::param_opnd() and gen_save_pc_for_gc()
+    reserved_stack_size: usize,
 }
 
 impl JITState {
     /// Create a new JITState instance
-    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize) -> Self {
+    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, reserved_stack_size: usize) -> Self {
         JITState {
             version,
             opnds: vec![None; num_insns],
             labels: vec![None; num_blocks],
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
+            reserved_stack_size,
         }
     }
 
@@ -374,9 +379,13 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
 /// Compile a function
 fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     let (mut jit, asm) = trace_compile_phase("codegen", || {
+        // Reserve `num_spilled_params + 1` stack slots for spilled block params and JITFrame.
+        // See also: Assembler::param_opnd() and gen_save_pc_for_gc()
         let num_spilled_params = max_num_params(function).saturating_sub(ALLOC_REGS.len());
-        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks());
-        let mut asm = Assembler::new_with_stack_slots(num_spilled_params + 1); // +1 for JITFrame
+        let reserved_stack_size = num_spilled_params + 1; // +1 for JITFrame
+        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), reserved_stack_size);
+        let mut asm = Assembler::new();
+        asm.alloc_stack(reserved_stack_size);
 
         // Mapping from HIR block IDs to LIR block IDs.
         // This is is a one-to-one mapping from HIR to LIR blocks used for finding
@@ -583,7 +592,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             gen_const_uint32(val.0)
         }
         Insn::Const { .. } => panic!("Unexpected Const in gen_insn: {insn}"),
-        Insn::NewArray { elements, state } => gen_new_array(asm, opnds!(elements), &function.frame_state(*state)),
+        Insn::NewArray { elements, state } => gen_new_array(jit, asm, opnds!(elements), &function.frame_state(*state)),
         Insn::NewHash { elements, state } => gen_new_hash(jit, asm, opnds!(elements), &function.frame_state(*state)),
         Insn::NewRange { low, high, flag, state } => gen_new_range(jit, asm, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
         Insn::NewRangeFixnum { low, high, flag, state } => gen_new_range_fixnum(asm, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
@@ -1139,10 +1148,9 @@ fn gen_ccall_variadic(
     asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
 
-    let argv_ptr = gen_push_opnds(asm, &args);
+    let argv_ptr = gen_push_opnds(jit, asm, &args);
     asm.count_call_to(&name.contents_lossy());
     let result = asm.ccall(cfunc, vec![args.len().into(), argv_ptr, recv]);
-    gen_pop_opnds(asm, &args);
 
     asm_comment!(asm, "pop C frame");
     let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
@@ -1699,7 +1707,7 @@ fn gen_invokeblock_ifunc(
     gen_prepare_non_leaf_call(jit, asm, state);
 
     // Push args to memory so we can pass argv pointer
-    let argv_ptr = gen_push_opnds(asm, &args);
+    let argv_ptr = gen_push_opnds(jit, asm, &args);
 
     // Untag the block handler to get the captured block pointer
     // captured = block_handler & ~0x3
@@ -1715,9 +1723,7 @@ fn gen_invokeblock_ifunc(
             argv: *const VALUE,
         ) -> VALUE;
     }
-    let result = asm_ccall!(asm, rb_vm_yield_with_cfunc, EC, captured, (args.len() as i64).into(), argv_ptr);
-    gen_pop_opnds(asm, &args);
-    result
+    asm_ccall!(asm, rb_vm_yield_with_cfunc, EC, captured, (args.len() as i64).into(), argv_ptr)
 }
 
 fn gen_invokeproc(
@@ -1732,7 +1738,7 @@ fn gen_invokeproc(
 
     asm_comment!(asm, "call invokeproc");
 
-    let argv_ptr = gen_push_opnds(asm, &args);
+    let argv_ptr = gen_push_opnds(jit, asm, &args);
     let kw_splat_opnd = Opnd::Imm(i64::from(kw_splat));
     let result = asm_ccall!(
         asm,
@@ -1744,7 +1750,6 @@ fn gen_invokeproc(
         kw_splat_opnd,
         VM_BLOCK_HANDLER_NONE.into()
     );
-    gen_pop_opnds(asm, &args);
 
     result
 }
@@ -1820,6 +1825,7 @@ fn gen_array_dup(
 
 /// Compile a new array instruction
 fn gen_new_array(
+    jit: &JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     state: &FrameState,
@@ -1831,10 +1837,8 @@ fn gen_new_array(
     if elements.is_empty() {
         asm_ccall!(asm, rb_ec_ary_new_from_values, EC, 0i64.into(), Opnd::UImm(0))
     } else {
-        let argv = gen_push_opnds(asm, &elements);
-        let new_array = asm_ccall!(asm, rb_ec_ary_new_from_values, EC, num.into(), argv);
-        gen_pop_opnds(asm, &elements);
-        new_array
+        let argv = gen_push_opnds(jit, asm, &elements);
+        asm_ccall!(asm, rb_ec_ary_new_from_values, EC, num.into(), argv)
     }
 }
 
@@ -2117,10 +2121,8 @@ fn gen_new_hash(
     } else {
         gen_prepare_non_leaf_call(jit, asm, state);
 
-        let argv = gen_push_opnds(asm, &elements);
-        let hash = asm_ccall!(asm, rb_hash_new_with_bulk_insert, elements.len().into(), argv);
-        gen_pop_opnds(asm, &elements);
-        hash
+        let argv = gen_push_opnds(jit, asm, &elements);
+        asm_ccall!(asm, rb_hash_new_with_bulk_insert, elements.len().into(), argv)
     }
 }
 
@@ -3362,21 +3364,21 @@ pub fn gen_exit_trampoline_with_counter(cb: &mut CodeBlock, exit_trampoline: Cod
     })
 }
 
-fn gen_push_opnds(asm: &mut Assembler, opnds: &[Opnd]) -> lir::Opnd {
-    let n = opnds.len();
-    let allocation_size = aligned_stack_bytes(n);
-
-    // Bump the stack pointer to reserve the space for opnds
-    if n != 0 {
-        asm_comment!(asm, "allocate {} bytes on C stack for {} values", allocation_size, n);
-        asm.sub_into(NATIVE_STACK_PTR, allocation_size.into());
+/// Reserve a native stack space and write operands into it
+fn gen_push_opnds(jit: &JITState, asm: &mut Assembler, opnds: &[Opnd]) -> lir::Opnd {
+    let argv = if opnds.len() > 0 {
+        // Make sure the Assembler will reserve a sufficient stack size for given opnds
+        asm_comment!(asm, "allocate space on C stack for {} values", opnds.len());
+        let total_stack_size = jit.reserved_stack_size + opnds.len();
+        asm.alloc_stack(total_stack_size);
+        asm.sub(NATIVE_BASE_PTR, (SIZEOF_VALUE * total_stack_size).into())
     } else {
         asm_comment!(asm, "no opnds to allocate");
-    }
+        Opnd::UImm(0)
+    };
 
-    // Load NATIVE_STACK_PTR to get the address of a returned array
-    // to allow the backend to move it for its own use.
-    let argv = asm.load(NATIVE_STACK_PTR);
+    // gen_function() allocates `jit.reserved_stack_size` slots for spilled block params and JITFrame.
+    // The above asm.alloc_stack() reserves extra slots on top of it, so use stack slots from that index.
     for (idx, &opnd) in opnds.iter().enumerate() {
         asm.mov(Opnd::mem(VALUE_BITS, argv, idx as i32 * SIZEOF_VALUE_I32), opnd);
     }
@@ -3384,23 +3386,11 @@ fn gen_push_opnds(asm: &mut Assembler, opnds: &[Opnd]) -> lir::Opnd {
     argv
 }
 
-fn gen_pop_opnds(asm: &mut Assembler, opnds: &[Opnd]) {
-    if opnds.is_empty() {
-        asm_comment!(asm, "no opnds to restore");
-        return
-    }
-
-    asm_comment!(asm, "restore C stack pointer");
-    let allocation_size = aligned_stack_bytes(opnds.len());
-    asm.add_into(NATIVE_STACK_PTR, allocation_size.into());
-}
-
 fn gen_toregexp(jit: &mut JITState, asm: &mut Assembler, opt: usize, values: Vec<Opnd>, state: &FrameState) -> Opnd {
     gen_prepare_non_leaf_call(jit, asm, state);
 
-    let first_opnd_ptr = gen_push_opnds(asm, &values);
+    let first_opnd_ptr = gen_push_opnds(jit, asm, &values);
     let result = asm_ccall!(asm, rb_reg_new_from_values, values.len().into(), first_opnd_ptr, opt.into());
-    gen_pop_opnds(asm, &values);
 
     result
 }
@@ -3408,11 +3398,8 @@ fn gen_toregexp(jit: &mut JITState, asm: &mut Assembler, opt: usize, values: Vec
 fn gen_string_concat(jit: &mut JITState, asm: &mut Assembler, strings: Vec<Opnd>, state: &FrameState) -> Opnd {
     gen_prepare_non_leaf_call(jit, asm, state);
 
-    let first_string_ptr = gen_push_opnds(asm, &strings);
-    let result = asm_ccall!(asm, rb_str_concat_literals, strings.len().into(), first_string_ptr);
-    gen_pop_opnds(asm, &strings);
-
-    result
+    let first_string_ptr = gen_push_opnds(jit, asm, &strings);
+    asm_ccall!(asm, rb_str_concat_literals, strings.len().into(), first_string_ptr)
 }
 
 // Generate RSTRING_PTR
