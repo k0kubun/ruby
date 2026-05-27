@@ -3730,7 +3730,12 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
         for (long i = 0; i < (long)(sp - p); i++) {
-            rb_gc_mark_movable(p[i]);
+            if (rb_zjit_enabled_p) {
+                rb_gc_mark_maybe(p[i]);
+            }
+            else {
+                rb_gc_mark_movable(p[i]);
+            }
         }
 
         while (cfp != limit_cfp) {
