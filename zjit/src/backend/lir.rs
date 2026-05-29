@@ -2183,9 +2183,8 @@ impl Assembler
                     }
 
                     if let Some(StackMap { stack, jit_frame }) = stack_map {
-                        unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
-                        let mut jit_frame_stack: Vec<VALUE> = vec![];
-                        for stack_opnd in stack.iter() {
+                        assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
+                        for (idx, stack_opnd) in stack.iter().enumerate() {
                             let entry = match stack_opnd {
                                 Opnd::UImm(value) => {
                                     let value = VALUE(*value as usize);
@@ -2225,10 +2224,8 @@ impl Assembler
                                 }
                                 _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
                             };
-                            jit_frame_stack.push(entry);
+                            unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
                         }
-                        let leaked = Box::leak(jit_frame_stack.into_boxed_slice()).as_mut_ptr();
-                        unsafe { (*jit_frame.cast_mut()).stack = leaked; }
                     }
 
                     // Extract arguments from CCall, clear opnds
