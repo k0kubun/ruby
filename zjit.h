@@ -44,7 +44,7 @@ typedef struct zjit_jit_frame {
     bool materialize_block_code;
 
     uint32_t stack_size;
-    VALUE *stack;
+    VALUE stack[];
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
