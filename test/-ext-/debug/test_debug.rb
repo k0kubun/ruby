@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 require 'test/unit'
 require '-test-/debug'
+require_relative '../../lib/jit_support'
 
 class TestDebug < Test::Unit::TestCase
 
@@ -130,3 +131,21 @@ class TestDebugWithYJIT < Test::Unit::TestCase
     local # getlocal
   end
 end if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?
+
+class TestDebugWithZJIT < Test::Unit::TestCase
+  def test_zjit_materializes_caller_locals_for_binding
+    assert_in_out_err(%w[--disable-gems --zjit --zjit-call-threshold=1 --zjit-debug -r-test-/debug], <<~'RUBY', ["[1, 2, 3, 4, 5, 6]"], [])
+      def callee
+        Bug::Debug.inspector_frame_binding_get(2).local_variable_get(:local)
+      end
+
+      def test
+        local = [1, 2, 3]
+        local = callee + [4, 5, 6]
+      end
+
+      test
+      p test
+    RUBY
+  end
+end if defined?(RubyVM::ZJIT) && JITSupport.zjit_supported?

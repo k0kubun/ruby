@@ -1549,8 +1549,6 @@ fn gen_send_iseq_direct(
     let stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
-    //gen_spill_stack(jit, asm, state);
     gen_stack_map(jit, asm, state, stack_size, jit_frame);
 
     // This mirrors vm_caller_setup_arg_block() in for the `blockiseq != NULL` case.
@@ -2824,7 +2822,16 @@ fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: &FrameState, stack_
         assert!(matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }), "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}");
         stack.push(opnd);
     }
-    asm.stack_map(stack, jit_frame);
+
+    let mut locals = Vec::new();
+    for &insn_id in state.locals() {
+        let opnd = jit.get_opnd(insn_id);
+        // JITFrame only supports materializing Opnd::Value or Opnd::VReg out of the frame
+        assert!(matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }), "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}");
+        locals.push(opnd);
+    }
+
+    asm.stack_map(stack, locals, jit_frame);
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.

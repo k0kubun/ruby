@@ -1543,7 +1543,7 @@ RUBY_SYMBOL_EXPORT_END
 struct rb_debug_inspector_struct {
     rb_execution_context_t *ec;
     rb_control_frame_t *cfp;
-    VALUE contexts; /* [[klass, binding, iseq, cfp], ...] */
+    VALUE contexts; /* [[klass, binding, iseq, cfp, loc, depth], ...] */
     VALUE raw_backtrace;
 };
 
@@ -1555,6 +1555,7 @@ enum {
     CALLER_BINDING_CFP,
     CALLER_BINDING_LOC,
     CALLER_BINDING_DEPTH,
+    CALLER_BINDING_MAX,
 };
 
 struct collect_caller_bindings_data {
@@ -1599,7 +1600,7 @@ static void
 collect_caller_bindings_iseq(void *arg, const rb_control_frame_t *cfp)
 {
     struct collect_caller_bindings_data *data = (struct collect_caller_bindings_data *)arg;
-    VALUE frame = rb_ary_new2(6);
+    VALUE frame = rb_ary_new2(CALLER_BINDING_MAX);
     const rb_iseq_t *iseq = CFP_ISEQ(cfp);
 
     rb_ary_store(frame, CALLER_BINDING_SELF, cfp->self);
@@ -1624,7 +1625,7 @@ static void
 collect_caller_bindings_cfunc(void *arg, const rb_control_frame_t *cfp, ID mid)
 {
     struct collect_caller_bindings_data *data = (struct collect_caller_bindings_data *)arg;
-    VALUE frame = rb_ary_new2(6);
+    VALUE frame = rb_ary_new2(CALLER_BINDING_MAX);
 
     rb_ary_store(frame, CALLER_BINDING_SELF, cfp->self);
     rb_ary_store(frame, CALLER_BINDING_CLASS, get_klass(cfp));
@@ -1647,7 +1648,6 @@ collect_caller_bindings_cfunc(void *arg, const rb_control_frame_t *cfp, ID mid)
 static VALUE
 collect_caller_bindings(const rb_execution_context_t *ec)
 {
-    int i;
     VALUE result;
     struct collect_caller_bindings_data data = {
         rb_ary_new(), ec
@@ -1660,17 +1660,6 @@ collect_caller_bindings(const rb_execution_context_t *ec)
                    &data);
 
     result = rb_ary_reverse(data.ary);
-
-    /* bindings should be created from top of frame */
-    for (i=0; i<RARRAY_LEN(result); i++) {
-        VALUE entry = rb_ary_entry(result, i);
-        VALUE cfp_val = rb_ary_entry(entry, CALLER_BINDING_BINDING);
-
-        if (!NIL_P(cfp_val)) {
-            rb_control_frame_t *cfp = GC_GUARDED_PTR_REF(cfp_val);
-            rb_ary_store(entry, CALLER_BINDING_BINDING, rb_vm_make_binding(ec, cfp));
-        }
-    }
 
     return result;
 }
@@ -1688,9 +1677,6 @@ rb_debug_inspector_open(rb_debug_inspector_func_t func, void *data)
     enum ruby_tag_type state;
     volatile VALUE MAYBE_UNUSED(result);
     int i;
-
-    /* escape all env to heap */
-    rb_vm_stack_to_heap(ec);
 
     dbg_context.ec = ec;
     dbg_context.cfp = dbg_context.ec->cfp;
@@ -1742,8 +1728,19 @@ rb_debug_inspector_frame_class_get(const rb_debug_inspector_t *dc, long index)
 VALUE
 rb_debug_inspector_frame_binding_get(const rb_debug_inspector_t *dc, long index)
 {
-    VALUE frame = frame_get(dc, index);
-    return rb_ary_entry(frame, CALLER_BINDING_BINDING);
+    frame_get(dc, index);
+
+    for (long i = 0; i <= index; i++) {
+        VALUE frame = rb_ary_entry(dc->contexts, i);
+        VALUE binding = rb_ary_entry(frame, CALLER_BINDING_BINDING);
+        if (GC_GUARDED_PTR_P(binding)) {
+            rb_control_frame_t *cfp = GC_GUARDED_PTR_REF(binding);
+            rb_vm_stack_to_heap_until(dc->ec, cfp);
+            rb_ary_store(frame, CALLER_BINDING_BINDING, rb_vm_make_binding(dc->ec, cfp));
+        }
+    }
+
+    return rb_ary_entry(rb_ary_entry(dc->contexts, index), CALLER_BINDING_BINDING);
 }
 
 VALUE

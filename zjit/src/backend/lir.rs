@@ -938,8 +938,9 @@ macro_rules! for_each_operand_impl {
             }
             Insn::CCall { opnds, stack_map, .. } => {
                 visit_many!(opnds);
-                if let Some(StackMap { stack, .. }) = stack_map {
+                if let Some(StackMap { stack, locals, .. }) = stack_map {
                     visit_many!(stack);
+                    visit_many!(locals);
                 }
             }
             // only iterate over preserved in the const iterator
@@ -1389,6 +1390,7 @@ impl StackState {
 #[derive(Clone, Debug)]
 pub struct StackMap {
     stack: Vec<Opnd>,
+    locals: Vec<Opnd>,
     jit_frame: *const zjit_jit_frame,
 }
 
@@ -2138,9 +2140,9 @@ impl Assembler
                             .end
                             .is_some_and(|end| end > insn_number);
 
-                    // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
-                    let stack_vreg_ids: HashSet<usize> = if let Some(StackMap { stack, .. }) = &stack_map {
-                        stack.iter().filter_map(|opnd| match opnd {
+                    // Build a set of VRegIds that can be referenced by JITFrame for materialization.
+                    let stack_map_vreg_ids: HashSet<usize> = if let Some(StackMap { stack, locals, .. }) = &stack_map {
+                        stack.iter().chain(locals.iter()).filter_map(|opnd| match opnd {
                             Opnd::VReg { idx: VRegId(vreg_id), .. } => Some(*vreg_id),
                             _ => None,
                         }).collect()
@@ -2155,7 +2157,7 @@ impl Assembler
                     let survivors: Vec<usize> = intervals.iter()
                         .filter(|interval| {
                             let allocation = assignments[interval.id];
-                            let stack_map_reg = stack_vreg_ids.contains(&interval.id)
+                            let stack_map_reg = stack_map_vreg_ids.contains(&interval.id)
                                 && matches!(allocation, Some(Allocation::Reg(_) | Allocation::Fixed(_)));
                             stack_map_reg
                                 || interval.has_bounds()
@@ -2183,15 +2185,21 @@ impl Assembler
                         new_ids.push(None);
                     }
 
-                    if let Some(StackMap { stack, jit_frame }) = stack_map {
+                    if let Some(StackMap { stack, locals, jit_frame }) = stack_map {
                         unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
-                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
-                        for stack_opnd in stack.iter() {
+                        unsafe { (*jit_frame.cast_mut()).locals_size = locals.len().try_into().unwrap(); }
+
+                        fn make_jit_frame_opnd(
+                            opnd: &Opnd,
+                            assignments: &[Option<Allocation>],
+                            survivors: &[usize],
+                            total_stack_slots: usize,
+                            stack_base_idx: usize,
+                        ) -> zjit_opnd_t {
                             let mut jit_frame_opnd = std::mem::MaybeUninit::<zjit_opnd_t>::uninit();
                             let ptr = jit_frame_opnd.as_mut_ptr();
-                            match stack_opnd {
-                                Opnd::UImm(value) => {
-                                    let value = VALUE(*value as usize);
+                            match opnd {
+                                Opnd::Value(value) => {
                                     assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
                                     unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
                                     unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
@@ -2217,7 +2225,7 @@ impl Assembler
                                             // StackState places allocator spills at:
                                             //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
                                             // so expose the matching materializer index.
-                                            self.stack_base_idx
+                                            stack_base_idx
                                                 .checked_sub(1)
                                                 .expect("StackMap requires a JITFrame slot")
                                                 + stack_idx
@@ -2226,13 +2234,24 @@ impl Assembler
                                     unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VREG) };
                                     unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(stack_index.as_u64()) };
                                 }
-                                _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
+                                _ => unreachable!("unexpected operand in StackMap: {opnd:?}"),
                             }
-                            let frame = unsafe { jit_frame_opnd.assume_init() };
-                            jit_frame_stack.push(frame);
+                            unsafe { jit_frame_opnd.assume_init() }
+                        }
+
+                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
+                        for opnd in stack.iter() {
+                            jit_frame_stack.push(make_jit_frame_opnd(opnd, assignments, &survivors, total_stack_slots, self.stack_base_idx));
                         }
                         let leaked = Box::leak(jit_frame_stack.into_boxed_slice()).as_mut_ptr();
                         unsafe { (*jit_frame.cast_mut()).stack = leaked; }
+
+                        let mut jit_frame_locals: Vec<zjit_opnd_t> = vec![];
+                        for opnd in locals.iter() {
+                            jit_frame_locals.push(make_jit_frame_opnd(opnd, assignments, &survivors, total_stack_slots, self.stack_base_idx));
+                        }
+                        let leaked = Box::leak(jit_frame_locals.into_boxed_slice()).as_mut_ptr();
+                        unsafe { (*jit_frame.cast_mut()).locals = leaked; }
                     }
 
                     // Extract arguments from CCall, clear opnds
@@ -3576,9 +3595,9 @@ impl Assembler {
         out
     }
 
-    pub fn stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
+    pub fn stack_map(&mut self, stack: Vec<Opnd>, locals: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
         assert!(self.stack_map.is_none());
-        self.stack_map = Some(StackMap { stack, jit_frame });
+        self.stack_map = Some(StackMap { stack, locals, jit_frame });
     }
 
     pub fn store(&mut self, dest: Opnd, src: Opnd) {

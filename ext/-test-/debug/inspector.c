@@ -25,8 +25,21 @@ debug_inspector(VALUE self)
     return rb_debug_inspector_open(callback, NULL);
 }
 
+static VALUE
+binding_callback(const rb_debug_inspector_t *dbg_context, void *data)
+{
+    return rb_debug_inspector_frame_binding_get(dbg_context, NUM2LONG((VALUE)data));
+}
+
+static VALUE
+debug_inspector_frame_binding_get(VALUE self, VALUE index)
+{
+    return rb_debug_inspector_open(binding_callback, (void *)index);
+}
+
 void
 Init_inspector(VALUE klass)
 {
     rb_define_module_function(klass, "inspector", debug_inspector, 0);
+    rb_define_module_function(klass, "inspector_frame_binding_get", debug_inspector_frame_binding_get, 1);
 }

@@ -39,6 +39,8 @@ typedef struct zjit_jit_frame {
 
     uint32_t stack_size;
     zjit_opnd_t *stack;
+    uint32_t locals_size;
+    zjit_opnd_t *locals;
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
@@ -66,6 +68,7 @@ void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
 void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
 void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
+void rb_zjit_materialize_frame_locals(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
 
 // Special value for cfp->jit_return that means "this is a C method frame, use
 // rb_zjit_c_frame as the JITFrame". We don't control the native stack layout
@@ -107,6 +110,7 @@ static inline void rb_zjit_invalidate_no_singleton_class(VALUE klass) {}
 static inline void rb_zjit_invalidate_root_box(void) {}
 static inline void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame) {}
 static inline void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
+static inline void rb_zjit_materialize_frame_locals(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
 static inline const zjit_jit_frame_t *CFP_ZJIT_FRAME(const rb_control_frame_t *cfp) { return NULL; }
 #endif // #if USE_ZJIT
 

@@ -1,5 +1,7 @@
+use std::slice;
+
 use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
-use crate::cruby::zjit_jit_frame;
+use crate::cruby::{ZJIT_OPND_VALUE, zjit_jit_frame, zjit_opnd_t};
 use crate::state::ZJITState;
 
 /// JITFrame struct is defined in zjit.h (the single source of truth) and
@@ -24,6 +26,8 @@ impl JITFrame {
                 materialize_block_code,
                 stack_size: 0,
                 stack: 0 as _,
+                locals_size: 0,
+                locals: 0 as _,
             }
         )
     }
@@ -33,6 +37,14 @@ impl JITFrame {
         if !self.iseq.is_null() {
             unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
         }
+        self.for_each_mapped_opnd(|opnd| {
+            if opnd.type_ == ZJIT_OPND_VALUE {
+                let value = unsafe { *opnd.as_.value.as_ref() };
+                if value.heap_object_p() {
+                    unsafe { rb_gc_mark_movable(value); }
+                }
+            }
+        });
     }
 
     /// Update the iseq pointer after GC compaction.
@@ -41,6 +53,40 @@ impl JITFrame {
             let new_iseq = unsafe { rb_gc_location(VALUE::from(self.iseq)) }.as_iseq();
             if self.iseq != new_iseq {
                 self.iseq = new_iseq;
+            }
+        }
+        self.for_each_mapped_opnd_mut(|opnd| {
+            if opnd.type_ == ZJIT_OPND_VALUE {
+                let value = unsafe { *opnd.as_.value.as_ref() };
+                if value.heap_object_p() {
+                    unsafe { *opnd.as_.value.as_mut() = rb_gc_location(value); }
+                }
+            }
+        });
+    }
+
+    fn for_each_mapped_opnd(&self, mut f: impl FnMut(&zjit_opnd_t)) {
+        if !self.stack.is_null() {
+            for opnd in unsafe { slice::from_raw_parts(self.stack, self.stack_size as usize) } {
+                f(opnd);
+            }
+        }
+        if !self.locals.is_null() {
+            for opnd in unsafe { slice::from_raw_parts(self.locals, self.locals_size as usize) } {
+                f(opnd);
+            }
+        }
+    }
+
+    fn for_each_mapped_opnd_mut(&mut self, mut f: impl FnMut(&mut zjit_opnd_t)) {
+        if !self.stack.is_null() {
+            for opnd in unsafe { slice::from_raw_parts_mut(self.stack, self.stack_size as usize) } {
+                f(opnd);
+            }
+        }
+        if !self.locals.is_null() {
+            for opnd in unsafe { slice::from_raw_parts_mut(self.locals, self.locals_size as usize) } {
+                f(opnd);
             }
         }
     }

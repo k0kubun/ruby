@@ -1088,6 +1088,8 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
         return VM_ENV_ENVVAL(ep);
     }
 
+    rb_zjit_materialize_frame_locals(ec, cfp);
+
     if (!VM_ENV_LOCAL_P(ep)) {
         const VALUE *prev_ep = VM_ENV_PREV_EP(ep);
         if (!VM_ENV_ESCAPED_P(prev_ep)) {
@@ -1194,13 +1196,20 @@ vm_make_env_object(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
 }
 
 void
-rb_vm_stack_to_heap(rb_execution_context_t *ec)
+rb_vm_stack_to_heap_until(rb_execution_context_t *ec, const rb_control_frame_t *target_cfp)
 {
     rb_control_frame_t *cfp = ec->cfp;
     while ((cfp = rb_vm_get_binding_creatable_next_cfp(ec, cfp)) != 0) {
         vm_make_env_object(ec, cfp);
+        if (cfp == target_cfp) break;
         cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
     }
+}
+
+void
+rb_vm_stack_to_heap(rb_execution_context_t *ec)
+{
+    rb_vm_stack_to_heap_until(ec, NULL);
 }
 
 const rb_env_t *
@@ -2840,12 +2849,49 @@ vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,
 }
 
 #if USE_ZJIT
+static VALUE
+zjit_materialize_opnd(const rb_control_frame_t *cfp, const zjit_opnd_t *opnd)
+{
+    switch (opnd->type) {
+      case ZJIT_OPND_VALUE:
+        return opnd->as.value;
+      case ZJIT_OPND_VREG:
+        return ((VALUE *)cfp->jit_return)[-(ssize_t)(opnd->as.vreg_stack_index) - 2];
+      default:
+        rb_bug("unreachable");
+    }
+}
+
+void
+rb_zjit_materialize_frame_locals(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
+{
+    (void)ec;
+
+    if (!rb_zjit_enabled_p || !CFP_ZJIT_FRAME_P(cfp)) return;
+
+    const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+    if (jit_frame->locals_size == 0) return;
+
+    VM_ASSERT(CFP_ISEQ(cfp) == jit_frame->iseq);
+    VM_ASSERT(VM_FRAME_RUBYFRAME_P(cfp));
+    if (VM_ENV_ESCAPED_P(cfp->ep)) return;
+
+    int32_t locals_size = (int32_t)jit_frame->locals_size;
+    int32_t local_table_size = (int32_t)ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size;
+    VM_ASSERT(locals_size == local_table_size);
+
+    for (int32_t i = 0; i < locals_size; i++) {
+        VM_FORCE_WRITE(&cfp->ep[-local_table_size + i - VM_ENV_DATA_SIZE + 1],
+            zjit_materialize_opnd(cfp, &jit_frame->locals[i]));
+    }
+}
+
 // Materialize JITFrame-enabled CFP into interpreter-compatible CFP
 void
 rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return;
-    const rb_control_frame_t *end_cfp = ec->tag->cfp;
+    const rb_control_frame_t *end_cfp = ec->tag ? ec->tag->cfp : RUBY_VM_END_CONTROL_FRAME(ec);
     VM_ASSERT(cfp <= end_cfp);
 
     while (true) {
@@ -2861,18 +2907,10 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             if (stack_size > 0) {
                 VALUE *stack = cfp->sp - stack_size;
                 for (int32_t i = 0; i < stack_size; i++) {
-                    switch (jit_frame->stack[i].type) {
-                      case ZJIT_OPND_VALUE:
-                        stack[i] = jit_frame->stack[i].as.value;
-                        break;
-                      case ZJIT_OPND_VREG:
-                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)(jit_frame->stack[i].as.vreg_stack_index) - 2];
-                        break;
-                      default:
-                        rb_bug("unreachable");
-                    }
+                    stack[i] = zjit_materialize_opnd(cfp, &jit_frame->stack[i]);
                 }
             }
+            rb_zjit_materialize_frame_locals(ec, cfp);
             cfp->jit_return = 0;
         }
         if (end_cfp == cfp) break;

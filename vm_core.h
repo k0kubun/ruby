@@ -2011,6 +2011,7 @@ rb_control_frame_t *rb_vm_get_binding_creatable_next_cfp(const rb_execution_cont
 VALUE *rb_vm_svar_lep(const rb_execution_context_t *ec, const rb_control_frame_t *cfp);
 int rb_vm_get_sourceline(const rb_control_frame_t *);
 void rb_vm_stack_to_heap(rb_execution_context_t *ec);
+void rb_vm_stack_to_heap_until(rb_execution_context_t *ec, const rb_control_frame_t *target_cfp);
 void ruby_thread_init_stack(rb_thread_t *th, void *local_in_parent_frame);
 void rb_thread_malloc_stack_set(rb_thread_t *th, void *stack, size_t stack_size);
 rb_thread_t * ruby_thread_from_native(void);

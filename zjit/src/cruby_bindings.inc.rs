@@ -1940,6 +1940,8 @@ pub struct zjit_jit_frame {
     pub materialize_block_code: bool,
     pub stack_size: u32,
     pub stack: *mut zjit_opnd_t,
+    pub locals_size: u32,
+    pub locals: *mut zjit_opnd_t,
 }
 pub const ISEQ_BODY_OFFSET_PARAM: zjit_struct_offsets = 16;
 pub type zjit_struct_offsets = u32;
