@@ -1442,6 +1442,19 @@ enum vm_frame_env_flags {
 
 #define VM_ENV_INDEX_LAST_LVAR              (-VM_ENV_DATA_SIZE)
 
+#ifndef ZJIT_JIT_RETURN_C_FRAME
+# define ZJIT_JIT_RETURN_C_FRAME 0x1
+# define ZJIT_JIT_RETURN_DEFERRED_ENV 0x3
+#endif
+
+#ifndef ZJIT_JIT_FRAME_INDEX_FRAME
+# define ZJIT_JIT_FRAME_INDEX_FRAME          (-1)
+# define ZJIT_JIT_FRAME_INDEX_CME           (-2)
+# define ZJIT_JIT_FRAME_INDEX_SPECVAL       (-3)
+# define ZJIT_JIT_FRAME_INDEX_FLAGS         (-4)
+# define ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED (-5)
+#endif
+
 static inline void VM_FORCE_WRITE_SPECIAL_CONST(const VALUE *ptr, VALUE special_const_value);
 
 static inline void
@@ -1481,46 +1494,62 @@ VM_ENV_FRAME_TYPE_P(const VALUE *ep, unsigned long frame_type)
     return VM_ENV_FLAGS(ep, VM_FRAME_MAGIC_MASK) == frame_type;
 }
 
+static inline VALUE
+VM_FRAME_FLAGS(const rb_control_frame_t *cfp)
+{
+    return cfp->ep[VM_ENV_DATA_INDEX_FLAGS];
+}
+
 static inline unsigned long
 VM_FRAME_TYPE(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_MAGIC_MASK);
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return flags & VM_FRAME_MAGIC_MASK;
 }
 
 static inline unsigned long
 VM_FRAME_TYPE_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_MAGIC_MASK);
+    return VM_FRAME_FLAGS(cfp) & VM_FRAME_MAGIC_MASK;
 }
 
 static inline int
 VM_FRAME_LAMBDA_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_LAMBDA) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return (flags & VM_FRAME_FLAG_LAMBDA) != 0;
 }
 
 static inline int
 VM_FRAME_CFRAME_KW_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_CFRAME_KW) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return (flags & VM_FRAME_FLAG_CFRAME_KW) != 0;
 }
 
 static inline int
 VM_FRAME_FINISHED_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_FINISH) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return (flags & VM_FRAME_FLAG_FINISH) != 0;
 }
 
 static inline int
 VM_FRAME_FINISHED_P_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_FLAG_FINISH) != 0;
+    return (VM_FRAME_FLAGS(cfp) & VM_FRAME_FLAG_FINISH) != 0;
 }
 
 static inline int
 VM_FRAME_BMETHOD_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_BMETHOD) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return (flags & VM_FRAME_FLAG_BMETHOD) != 0;
 }
 
 static inline int
@@ -1536,7 +1565,9 @@ rb_obj_is_iseq(VALUE iseq)
 static inline int
 VM_FRAME_CFRAME_P(const rb_control_frame_t *cfp)
 {
-    int cframe_p = VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_CFRAME) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    int cframe_p = (flags & VM_FRAME_FLAG_CFRAME) != 0;
     // With ZJIT lightweight frames, cfp->_iseq may be stale (not yet materialized),
     // so skip this assertion when jit_return is set (zjit.h is not available here).
     VM_ASSERT(cfp->jit_return ||
@@ -1548,7 +1579,7 @@ VM_FRAME_CFRAME_P(const rb_control_frame_t *cfp)
 static inline int
 VM_FRAME_CFRAME_P_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_FLAG_CFRAME) != 0;
+    return (VM_FRAME_FLAGS(cfp) & VM_FRAME_FLAG_CFRAME) != 0;
 }
 
 static inline int
@@ -1566,7 +1597,9 @@ VM_FRAME_RUBYFRAME_P_UNCHECKED(const rb_control_frame_t *cfp)
 static inline int
 VM_FRAME_NS_REQUIRE_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_BOX_REQUIRE) != 0;
+    VALUE flags = VM_FRAME_FLAGS(cfp);
+    VM_ASSERT(FIXNUM_P(flags));
+    return (flags & VM_FRAME_FLAG_BOX_REQUIRE) != 0;
 }
 
 #define RUBYVM_CFUNC_FRAME_P(cfp) \

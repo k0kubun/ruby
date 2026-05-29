@@ -26,9 +26,19 @@ use crate::hir_type::{types, Type};
 use crate::options::{get_option, PerfMap};
 use crate::cast::IntoUsize;
 
-/// The number of stack slots used for JITFrame. gen_save_pc_for_gc() writes
-/// JITFrame into this number of slots at the bottom of the native stack.
-const JIT_FRAME_SIZE: usize = 1;
+/// The number of native stack slots reserved for JITFrame metadata.
+///
+/// Slot layout, relative to `cfp->jit_return == NATIVE_BASE_PTR`:
+///   -1: JITFrame pointer
+///   -2: staged ep[-2] CME
+///   -3: reserved for staged ep[-1] specval
+///   -4: reserved for staged ep[0] ENV_FLAGS
+///   -5: whether the VM stack env header has been materialized
+pub(crate) const JIT_FRAME_SIZE: usize = 5;
+const JIT_FRAME_INDEX_FRAME: i32 = -1;
+const JIT_FRAME_INDEX_CME: i32 = -2;
+const JIT_FRAME_INDEX_ENV_MATERIALIZED: i32 = -5;
+const JIT_RETURN_DEFERRED_ENV: usize = 0x3;
 
 /// Default maximum number of compiled versions per ISEQ.
 const DEFAULT_MAX_VERSIONS: usize = 2;
@@ -799,7 +809,7 @@ fn gen_objtostring(jit: &mut JITState, asm: &mut Assembler, val: Opnd, cd: *cons
     ret
 }
 
-fn gen_defined(jit: &JITState, asm: &mut Assembler, op_type: usize, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
+fn gen_defined(jit: &mut JITState, asm: &mut Assembler, op_type: usize, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
     match op_type as defined_type {
         DEFINED_YIELD => {
             // `lep_level` was precomputed at HIR construction so we can materialize the local EP
@@ -908,7 +918,7 @@ fn gen_guard_greater_eq(jit: &mut JITState, asm: &mut Assembler, left: Opnd, rig
     left
 }
 
-fn gen_get_constant_path(jit: &JITState, asm: &mut Assembler, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
+fn gen_get_constant_path(jit: &mut JITState, asm: &mut Assembler, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
     unsafe extern "C" {
         fn rb_vm_opt_getconstant_path(ec: EcPtr, cfp: CfpPtr, ic: *const iseq_inline_constant_cache) -> VALUE;
     }
@@ -936,7 +946,7 @@ fn gen_fixnum_bit_check(asm: &mut Assembler, val: Opnd, index: u8) -> Opnd {
     asm.csel_z(Qtrue.into(), Qfalse.into())
 }
 
-fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
+fn gen_invokebuiltin(jit: &mut JITState, asm: &mut Assembler, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
     assert!(bf.argc + 2 <= C_ARG_OPNDS.len() as i32,
             "gen_invokebuiltin should not be called for builtin function {} with too many arguments: {}",
             unsafe { std::ffi::CStr::from_ptr(bf.name).to_str().unwrap() },
@@ -1028,6 +1038,7 @@ fn gen_ccall_with_frame(
     // to account for the receiver and arguments (and block arguments if any)
     gen_save_pc_for_gc(asm, state);
     gen_save_sp(asm, caller_stack_size);
+    gen_materialize_frame_env(jit, asm);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
 
@@ -1049,6 +1060,7 @@ fn gen_ccall_with_frame(
         frame_type: VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL,
         specval: block_handler_specval,
         write_block_code: false,
+        defer_env_header: false,
     });
 
     asm_comment!(asm, "switch to new SP register");
@@ -1122,6 +1134,7 @@ fn gen_ccall_variadic(
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
     gen_save_pc_for_gc(asm, state);
     gen_save_sp(asm, caller_stack_size);
+    gen_materialize_frame_env(jit, asm);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
 
@@ -1138,6 +1151,7 @@ fn gen_ccall_variadic(
         frame_type: VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL,
         specval: block_handler_specval,
         write_block_code: false,
+        defer_env_header: false,
     });
 
     asm_comment!(asm, "switch to new SP register");
@@ -1227,7 +1241,7 @@ fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, reason: &SideExitReaso
 }
 
 /// Emit a special object lookup
-fn gen_putspecialobject(jit: &JITState, asm: &mut Assembler, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
+fn gen_putspecialobject(jit: &mut JITState, asm: &mut Assembler, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
     // rb_vm_get_special_object for CBASE/CONST_BASE can call rb_singleton_class,
     // which allocates (may trigger GC) and can raise TypeError on non-class
     // receivers (e.g. `123.instance_eval { Const = 1 }`). Treat as non-leaf so
@@ -1321,7 +1335,7 @@ fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE)
     asm_ccall!(asm, rb_zjit_defined_ivar, self_val, id.0.into(), Opnd::Value(pushval))
 }
 
-fn gen_checkmatch(jit: &JITState, asm: &mut Assembler, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
+fn gen_checkmatch(jit: &mut JITState, asm: &mut Assembler, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
     // rb_vm_check_match is not leaf unless flag is VM_CHECKMATCH_TYPE_WHEN.
     // See also: leafness_of_checkmatch() and check_match()
     if flag != VM_CHECKMATCH_TYPE_WHEN {
@@ -1558,6 +1572,7 @@ fn gen_send_iseq_direct(
     // not &block forwarding, &:foo, etc. Thise are rejected in `type_specialize` by
     // `unspecializable_call_type`.
     let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
+    let has_block_handler = block_handler.is_some();
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
@@ -1578,6 +1593,7 @@ fn gen_send_iseq_direct(
 
     // Set up the new frame
     // TODO: Lazily materialize caller frames on side exits or when needed
+    let defer_env_header = !callee_is_bmethod && !has_block_handler && !iseq_may_read_frame_env(iseq);
     gen_push_frame(asm, args.len(), state, ControlFrame {
         recv,
         iseq: Some(iseq),
@@ -1585,6 +1601,7 @@ fn gen_send_iseq_direct(
         frame_type,
         specval,
         write_block_code: iseq_may_write_block_code(iseq),
+        defer_env_header,
     });
 
     // Write "keyword_bits" to the callee's frame if the callee accepts keywords.
@@ -1914,7 +1931,7 @@ fn gen_array_ptr(asm: &mut Assembler, array: Opnd) -> lir::Opnd {
 
 /// Compile opt_newarray_hash - create a hash from array elements
 fn gen_opt_newarray_hash(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     state: &FrameState,
@@ -1942,7 +1959,7 @@ fn gen_opt_newarray_hash(
 
 /// Compile ArrayMax - find the maximum element among array elements
 fn gen_array_max(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     state: &FrameState,
@@ -1969,7 +1986,7 @@ fn gen_array_max(
 
 /// Find the minimum element among array elements
 fn gen_array_min(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     state: &FrameState,
@@ -1995,7 +2012,7 @@ fn gen_array_min(
 }
 
 fn gen_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     target: Opnd,
@@ -2023,7 +2040,7 @@ fn gen_array_include(
 }
 
 fn gen_array_pack_buffer(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     elements: Vec<Opnd>,
     fmt: Opnd,
@@ -2056,7 +2073,7 @@ fn gen_array_pack_buffer(
 }
 
 fn gen_dup_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     ary: VALUE,
     target: Opnd,
@@ -2143,7 +2160,7 @@ fn gen_new_hash(
 
 /// Compile a new range instruction
 fn gen_new_range(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     low: lir::Opnd,
     high: lir::Opnd,
@@ -2168,7 +2185,7 @@ fn gen_new_range_fixnum(
     asm_ccall!(asm, rb_range_new, low, high, (flag as i64).into())
 }
 
-fn gen_object_alloc(jit: &JITState, asm: &mut Assembler, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
+fn gen_object_alloc(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
     // Allocating an object from an unknown class is non-leaf; see doc for `ObjectAlloc`.
     gen_prepare_non_leaf_call(jit, asm, state);
     asm_ccall!(asm, rb_obj_alloc, val)
@@ -2202,6 +2219,52 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
     }
     asm.frame_setup(&[]);
 
+    fn native_slot(index: i32) -> Opnd {
+        Opnd::mem(64, NATIVE_BASE_PTR, index * SIZEOF_VALUE_I32)
+    }
+
+    let save_materialized_env = |asm: &mut Assembler| {
+        let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
+        let cme = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32));
+        asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
+        asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 1.into());
+    };
+
+    if jit_entry_idx.is_some() {
+        let hir_block_id = asm.current_block().hir_block_id;
+        let rpo_idx = asm.current_block().rpo_index;
+        let materialized_env_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let done_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let materialized_env_edge = Target::Block(lir::BranchEdge { target: materialized_env_block, args: vec![] });
+        let done_edge = Target::Block(lir::BranchEdge { target: done_block, args: vec![] });
+
+        asm_comment!(asm, "save staged env metadata");
+        let jit_return = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN));
+        asm.cmp(jit_return, JIT_RETURN_DEFERRED_ENV.into());
+        asm.jne(jit, materialized_env_edge);
+
+        // gen_push_frame() staged the dynamic CME in cfp->pc. This fast path is
+        // restricted to plain method frames without a block handler.
+        let cme = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC));
+        asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
+        asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 0.into());
+        asm.jmp(done_edge.clone());
+
+        asm.set_current_block(materialized_env_block);
+        let materialized_env_label = jit.get_label(asm, materialized_env_block, hir_block_id);
+        asm.write_label(materialized_env_label);
+        asm_comment!(asm, "save materialized env metadata");
+        save_materialized_env(asm);
+        asm.jmp(done_edge);
+
+        asm.set_current_block(done_block);
+        let done_label = jit.get_label(asm, done_block, hir_block_id);
+        asm.write_label(done_label);
+    } else {
+        asm_comment!(asm, "save materialized env metadata");
+        save_materialized_env(asm);
+    }
+
     // Publish the JITFrame slot's location via cfp->jit_return. The slot at
     // [NATIVE_BASE_PTR - 8] is left uninitialized here; the JIT design relies on
     // gen_save_pc_for_gc() to populate it before any C call, and on cross-ractor
@@ -2210,7 +2273,7 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
 
     // Poison the JITFrame slot. It should be read only after gen_save_pc_for_gc().
     if let Some(jit_return_poison) = JIT_RETURN_POISON {
-        asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), jit_return_poison.into());
+        asm.mov(native_slot(JIT_FRAME_INDEX_FRAME), jit_return_poison.into());
     }
 }
 
@@ -2727,6 +2790,51 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
     false
 }
 
+#[allow(non_upper_case_globals)]
+fn iseq_may_read_frame_env(iseq: IseqPtr) -> bool {
+    let mut insn_idx = 0;
+    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+
+    while insn_idx < iseq_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_opcode_at_pc(iseq, pc) };
+        match opcode as u32 {
+            YARVINSN_defined => {
+                let op_type = unsafe { *pc.offset(1) }.as_usize();
+                if op_type == DEFINED_YIELD as usize {
+                    return true;
+                }
+            }
+            YARVINSN_getlocal_WC_1 |
+            YARVINSN_setlocal_WC_1 |
+            YARVINSN_getlocal |
+            YARVINSN_setlocal => {
+                let level_arg = if opcode as u32 == YARVINSN_getlocal || opcode as u32 == YARVINSN_setlocal {
+                    Some(unsafe { *pc.offset(2) }.as_u32())
+                } else {
+                    Some(1)
+                };
+                if level_arg.is_some_and(|level| level > 0) {
+                    return true;
+                }
+            }
+            YARVINSN_setblockparam |
+            YARVINSN_getblockparamproxy |
+            YARVINSN_getblockparam |
+            YARVINSN_invokesuper |
+            YARVINSN_invokesuperforward |
+            YARVINSN_invokeblock => {
+                return true;
+            }
+            _ => {}
+        }
+
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+
+    false
+}
+
 /// Save only the PC to CFP. Use this when you need to call gen_save_sp()
 /// immediately after with a custom stack size (e.g., gen_ccall_with_frame
 /// adjusts SP to exclude receiver and arguments).
@@ -2737,7 +2845,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_ji
     gen_incr_counter(asm, Counter::vm_write_jit_frame_count);
     asm_comment!(asm, "save JITFrame to CFP");
     let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
-    asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
+    asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_FRAME * SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
 
     // CFP_PC for a live JIT frame routes through the JITFrame on the native
     // stack (cfp->jit_return points to NATIVE_BASE_PTR), so we don't need to
@@ -2827,13 +2935,38 @@ fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: &FrameState, stack_
     asm.stack_map(stack, jit_frame);
 }
 
+fn gen_materialize_frame_env(jit: &mut JITState, asm: &mut Assembler) {
+    let materialized = Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_ENV_MATERIALIZED * SIZEOF_VALUE_I32);
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let done_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let done_edge = Target::Block(lir::BranchEdge { target: done_block, args: vec![] });
+
+    asm_comment!(asm, "materialize deferred env header");
+    let materialized_val = asm.load(materialized);
+    asm.cmp(materialized_val, 0.into());
+    asm.jne(jit, done_edge.clone());
+
+    let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
+    let cme = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_CME * SIZEOF_VALUE_I32));
+    asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32), cme);
+    asm.store(materialized, 1.into());
+    asm.jmp(done_edge);
+
+    asm.set_current_block(done_block);
+    let done_label = jit.get_label(asm, done_block, hir_block_id);
+    asm.write_label(done_label);
+}
+
 /// Prepare for calling a C function that may call an arbitrary method.
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
-fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+fn gen_prepare_non_leaf_call(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
     // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
     gen_prepare_call_with_gc(asm, state, false);
+    gen_materialize_frame_env(jit, asm);
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
@@ -2855,6 +2988,9 @@ struct ControlFrame {
     /// Whether to write block_code = 0 at frame push time.
     /// True when the callee ISEQ may write to block_code (has send/invokesuper/invokeblock).
     write_block_code: bool,
+    /// Whether to stage env metadata in native-frame metadata instead of writing
+    /// ep[-2], ep[-1], and ep[0] during frame push.
+    defer_env_header: bool,
 }
 
 /// Compile an interpreter frame
@@ -2870,8 +3006,10 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
         0
     };
     let ep_offset = state.stack().len() as i32 + local_size - argc as i32 + VM_ENV_DATA_SIZE as i32 - 1;
-    // ep[-2]: CME
-    asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), VALUE::from(frame.cme).into());
+    if !frame.defer_env_header {
+        // ep[-2]: CME
+        asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), VALUE::from(frame.cme).into());
+    }
     // ep[-1]: specval
     asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), frame.specval);
     // ep[0]: ENV_FLAGS
@@ -2887,6 +3025,10 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
     if frame.iseq.is_some() {
         // PC, SP, and ISEQ are written lazily by the callee on side-exits, non-leaf calls, or GC.
         // cfp->jit_return will be written by gen_entry_point() on the callee after this frame push.
+        if frame.defer_env_header {
+            asm.mov(cfp_opnd(RUBY_OFFSET_CFP_PC), Opnd::const_ptr(frame.cme));
+            asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), JIT_RETURN_DEFERRED_ENV.into());
+        }
         if frame.write_block_code {
             asm_comment!(asm, "write block_code for iseq that may use it");
             asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
@@ -3107,6 +3249,13 @@ c_callable! {
             let entry_insn_idx = params.opt_table_slice().get(entry_idx)
                 .unwrap_or_else(|| panic!("function_stub: opt_table out of bounds. {params:#?}, entry_idx={entry_idx}"))
                 .as_u32();
+            if unsafe { (*cfp).jit_return as usize } == JIT_RETURN_DEFERRED_ENV {
+                let ep = unsafe { (*cfp).ep as *mut VALUE };
+                let cme = unsafe { (*cfp).pc as *const rb_callable_method_entry_t };
+                unsafe {
+                    *ep.offset(VM_ENV_DATA_INDEX_ME_CREF as isize) = VALUE::from(cme);
+                }
+            }
             // gen_push_frame() doesn't set PC or ISEQ, so we need to set them before exit.
             // function_stub_hit_body() may allocate and call gc_validate_pc(), so we always set PC and ISEQ.
             // Clear jit_return so the interpreter reads cfp->pc and cfp->iseq directly.
@@ -3512,7 +3661,7 @@ impl Assembler {
         // +------------------------+
         // | previous frame pointer | <- NATIVE_BASE_PTR == cfp->jit_return
         // +------------------------+
-        // | JITFrame pointer       | <- jit.jit_frame_size, read by CFP_ZJIT_FRAME(cfp)
+        // | JITFrame metadata      | <- jit.jit_frame_size, read by CFP_ZJIT_FRAME(cfp)
         // +------------------------+
         // | opnds.last()           |
         // +------------------------+

@@ -783,6 +783,10 @@ env_method_entry_unchecked(VALUE obj, int can_be_svar)
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 {
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return check_method_entry(CFP_ZJIT_FRAME_CME(cfp), TRUE);
+    }
+
     const VALUE *ep = cfp->ep;
     rb_callable_method_entry_t *me;
 
@@ -797,6 +801,10 @@ rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry_unchecked(const rb_control_frame_t *cfp)
 {
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return env_method_entry_unchecked(CFP_ZJIT_FRAME_CME(cfp), TRUE);
+    }
+
     const VALUE *ep = cfp->ep;
     rb_callable_method_entry_t *me;
 

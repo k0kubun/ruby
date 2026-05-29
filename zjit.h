@@ -71,10 +71,26 @@ void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_fra
 // rb_zjit_c_frame as the JITFrame". We don't control the native stack layout
 // for C frames, so there's no per-call JITFrame storage; we set this sentinel
 // instead of a heap-allocated JITFrame pointer.
-#define ZJIT_JIT_RETURN_C_FRAME 0x1
+#ifndef ZJIT_JIT_RETURN_C_FRAME
+# define ZJIT_JIT_RETURN_C_FRAME 0x1
+#endif
+// Temporary value used between gen_push_frame() and the callee entry point.
+// The callee entry point replaces it with NATIVE_BASE_PTR after copying the
+// staged env metadata into native-frame slots.
+#ifndef ZJIT_JIT_RETURN_DEFERRED_ENV
+# define ZJIT_JIT_RETURN_DEFERRED_ENV 0x3
+#endif
 
 // BADFrame. The high bit is set, so likely SEGV on linux and darwin if dereferenced.
 #define ZJIT_JIT_RETURN_POISON 0xbadfbadfbadfbadfULL
+
+#ifndef ZJIT_JIT_FRAME_INDEX_FRAME
+# define ZJIT_JIT_FRAME_INDEX_FRAME          (-1)
+# define ZJIT_JIT_FRAME_INDEX_CME           (-2)
+# define ZJIT_JIT_FRAME_INDEX_SPECVAL       (-3)
+# define ZJIT_JIT_FRAME_INDEX_FLAGS         (-4)
+# define ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED (-5)
+#endif
 
 static inline const zjit_jit_frame_t *
 CFP_ZJIT_FRAME(const rb_control_frame_t *cfp)
@@ -83,13 +99,14 @@ CFP_ZJIT_FRAME(const rb_control_frame_t *cfp)
         return &rb_zjit_c_frame;
     }
     else {
+        RUBY_ASSERT((VALUE)cfp->jit_return != ZJIT_JIT_RETURN_DEFERRED_ENV);
 #if USE_ZJIT
-        RUBY_ASSERT((unsigned long long)((VALUE *)cfp->jit_return)[-1] != ZJIT_JIT_RETURN_POISON);
+        RUBY_ASSERT((unsigned long long)((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_FRAME] != ZJIT_JIT_RETURN_POISON);
 #endif
         // Read JITFrame from the stack slot. gen_entry_point() writes an initial
         // frame describing the entry PC + iseq; subsequent gen_save_pc_for_gc()
         // calls update it with a more accurate PC before any non-leaf C call.
-        return (const zjit_jit_frame_t *)((VALUE *)cfp->jit_return)[-1];
+        return (const zjit_jit_frame_t *)((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_FRAME];
     }
 }
 #else
@@ -117,7 +134,47 @@ static inline bool
 CFP_ZJIT_FRAME_P(const rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return false;
-    return cfp->jit_return != NULL;
+    return cfp->jit_return != NULL && (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_DEFERRED_ENV;
+}
+
+static inline bool
+CFP_ZJIT_FRAME_NATIVE_ENV_P(const rb_control_frame_t *cfp)
+{
+    return CFP_ZJIT_FRAME_P(cfp) && (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_C_FRAME;
+}
+
+static inline bool
+CFP_ZJIT_FRAME_ENV_MATERIALIZED_P(const rb_control_frame_t *cfp)
+{
+    if (!CFP_ZJIT_FRAME_NATIVE_ENV_P(cfp)) return true;
+    return ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED] != 0;
+}
+
+static inline bool
+CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(const rb_control_frame_t *cfp)
+{
+    return CFP_ZJIT_FRAME_NATIVE_ENV_P(cfp) && !CFP_ZJIT_FRAME_ENV_MATERIALIZED_P(cfp);
+}
+
+static inline VALUE
+CFP_ZJIT_FRAME_CME(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_CME];
+    }
+    return cfp->ep[VM_ENV_DATA_INDEX_ME_CREF];
+}
+
+static inline VALUE
+CFP_ZJIT_FRAME_SPECVAL(const rb_control_frame_t *cfp)
+{
+    return cfp->ep[VM_ENV_DATA_INDEX_SPECVAL];
+}
+
+static inline VALUE
+CFP_ZJIT_FRAME_FLAGS(const rb_control_frame_t *cfp)
+{
+    return cfp->ep[VM_ENV_DATA_INDEX_FLAGS];
 }
 
 static inline const VALUE*

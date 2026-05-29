@@ -116,6 +116,10 @@ VM_EP_RUBY_LEP(const rb_execution_context_t *ec, const rb_control_frame_t *curre
     const rb_control_frame_t * const eocfp = RUBY_VM_END_CONTROL_FRAME(ec); /* end of control frame pointer */
     const rb_control_frame_t *cfp = current_cfp;
 
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(current_cfp)) {
+        return current_cfp->ep;
+    }
+
     if (VM_ENV_FRAME_TYPE_P(ep, VM_FRAME_MAGIC_IFUNC)) {
         ep = VM_EP_LEP(current_cfp->ep);
         /**
@@ -183,6 +187,9 @@ PUREFUNC(static inline const VALUE *VM_CF_LEP(const rb_control_frame_t * const c
 static inline const VALUE *
 VM_CF_LEP(const rb_control_frame_t * const cfp)
 {
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return cfp->ep;
+    }
     return VM_EP_LEP(cfp->ep);
 }
 
@@ -2851,6 +2858,10 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
     while (true) {
         if (CFP_ZJIT_FRAME_P(cfp)) {
             const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+            if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_ME_CREF], CFP_ZJIT_FRAME_CME(cfp));
+                ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED] = 1;
+            }
             cfp->pc = jit_frame->pc;
             cfp->_iseq = (rb_iseq_t *)jit_frame->iseq;
             if (jit_frame->materialize_block_code) {
@@ -3678,6 +3689,10 @@ rb_execution_context_update(rb_execution_context_t *ec)
             cfp->self = rb_gc_location(cfp->self);
             if (CFP_ZJIT_FRAME_P(cfp)) {
                 rb_zjit_jit_frame_update_references((zjit_jit_frame_t *)CFP_ZJIT_FRAME(cfp));
+                if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                    VALUE *native_frame = (VALUE *)cfp->jit_return;
+                    native_frame[ZJIT_JIT_FRAME_INDEX_CME] = rb_gc_location(native_frame[ZJIT_JIT_FRAME_INDEX_CME]);
+                }
                 // block_code must always be relocated. For ISEQ frames, the JIT caller
                 // may have written it (gen_block_handler_specval) for passing blocks.
                 // For C frames, rb_iterate0 may have written an ifunc to block_code
@@ -3689,7 +3704,10 @@ rb_execution_context_update(rb_execution_context_t *ec)
                 cfp->block_code = (void *)rb_gc_location((VALUE)cfp->block_code);
             }
 
-            if (!VM_ENV_LOCAL_P(ep)) {
+            if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                /* The deferred frames using this path are local method frames. */
+            }
+            else if (!VM_ENV_LOCAL_P(ep)) {
                 const VALUE *prev_ep = VM_ENV_PREV_EP(ep);
                 if (VM_ENV_FLAGS(prev_ep, VM_ENV_FLAG_ESCAPED)) {
                     VM_FORCE_WRITE(&prev_ep[VM_ENV_DATA_INDEX_ENV], rb_gc_location(prev_ep[VM_ENV_DATA_INDEX_ENV]));
@@ -3740,22 +3758,31 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
 
         while (cfp != limit_cfp) {
             const VALUE *ep = cfp->ep;
-            VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
+            if (!CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
+            }
 
             rb_gc_mark_movable(cfp->self);
             rb_gc_mark_movable((VALUE)CFP_ISEQ(cfp));
+            if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                VALUE *native_frame = (VALUE *)cfp->jit_return;
+                rb_gc_mark_maybe(native_frame[ZJIT_JIT_FRAME_INDEX_CME]);
+            }
             // Mark block_code directly (not through rb_zjit_cfp_block_code)
             // because rb_iterate0 may write a valid ifunc after JIT frame push.
             rb_gc_mark_movable((VALUE)cfp->block_code);
 
-            if (VM_ENV_LOCAL_P(ep) && VM_ENV_BOXED_P(ep)) {
+            if (!CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp) && VM_ENV_LOCAL_P(ep) && VM_ENV_BOXED_P(ep)) {
                 const rb_box_t *box = VM_ENV_BOX(ep);
                 if (BOX_USER_P(box)) {
                     rb_gc_mark_movable(box->box_object);
                 }
             }
 
-            if (!VM_ENV_LOCAL_P(ep)) {
+            if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+                /* The deferred frames using this path are local method frames. */
+            }
+            else if (!VM_ENV_LOCAL_P(ep)) {
                 const VALUE *prev_ep = VM_ENV_PREV_EP(ep);
                 if (VM_ENV_FLAGS(prev_ep, VM_ENV_FLAG_ESCAPED)) {
                     rb_gc_mark_movable(prev_ep[VM_ENV_DATA_INDEX_ENV]);

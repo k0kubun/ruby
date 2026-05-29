@@ -4,8 +4,8 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::cast::IntoU64;
-use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
+use crate::codegen::{JIT_FRAME_SIZE, local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
+use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_EP, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, VM_ENV_DATA_INDEX_ME_CREF, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -14,6 +14,9 @@ use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_coun
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
 use crate::state::rb_zjit_record_exit_stack;
+
+const JIT_FRAME_INDEX_CME: i32 = -2;
+const JIT_FRAME_INDEX_ENV_MATERIALIZED: i32 = -5;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
 /// we can differentiate it from HIR block ids.
@@ -1586,9 +1589,8 @@ impl Assembler
             Opnd::Reg(ALLOC_REGS[idx])
         } else {
             // With FrameSetup, the address that NATIVE_BASE_PTR points to stores an old value in the register.
-            // To avoid clobbering it, we need to start from the next slot, and we also reserve one space for
-            // JITFrame, hence `+ 2` for the index.
-            Opnd::mem(64, NATIVE_BASE_PTR, (idx - ALLOC_REGS.len() + 2) as i32 * -SIZEOF_VALUE_I32)
+            // To avoid clobbering it and the native JITFrame metadata, start after the reserved slots.
+            Opnd::mem(64, NATIVE_BASE_PTR, (idx - ALLOC_REGS.len() + JIT_FRAME_SIZE + 1) as i32 * -SIZEOF_VALUE_I32)
         }
     }
 
@@ -2444,6 +2446,25 @@ impl Assembler
     /// Returns the exit code as a list of instructions to be appended after the main
     /// code is linearized and split.
     pub fn compile_exits(&mut self) -> Vec<Insn> {
+        fn compile_exit_materialize_env(asm: &mut Assembler) {
+            let materialized = Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_ENV_MATERIALIZED * SIZEOF_VALUE_I32);
+            let done_label = asm.new_label("exit_env_materialized");
+
+            asm_comment!(asm, "materialize deferred env header");
+            asm.cmp(materialized, 0.into());
+            asm.push_insn(Insn::Jne(done_label.clone()));
+
+            // Side exits are compiled after register allocation, so use a
+            // fixed register instead of producing new VRegs here.
+            asm.load_into(C_ARG_OPNDS[0], Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
+            asm.store(
+                Opnd::mem(64, C_ARG_OPNDS[0], VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32),
+                Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_CME * SIZEOF_VALUE_I32),
+            );
+            asm.store(materialized, 1.into());
+            asm.write_label(done_label);
+        }
+
         /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
         fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
             let SideExit { pc, stack, locals, iseq, .. } = exit;
@@ -2477,6 +2498,8 @@ impl Assembler
                     asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(locals.len(), idx) - 1) * SIZEOF_VALUE_I32), opnd);
                 }
             }
+
+            compile_exit_materialize_env(asm);
         }
 
         /// Tear down the JIT frame and return to the interpreter.
