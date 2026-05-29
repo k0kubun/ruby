@@ -9,18 +9,24 @@
 # define ZJIT_STATS (USE_ZJIT && RUBY_DEBUG)
 #endif
 
-typedef enum zjit_opnd_type {
-    ZJIT_OPND_VALUE,
-    ZJIT_OPND_VREG,
-} zjit_opnd_type_t;
+// Stack map entries are either immediate Ruby VALUEs or tagged native-stack
+// locations. Stack maps never contain heap VALUEs, so 0x08 is available: it is
+// not Qfalse (0), and its low 3 bits are zero, so RB_SPECIAL_CONST_P is false.
+#define ZJIT_STACK_MAP_VREG_TAG 0x08
+#define ZJIT_STACK_MAP_TAG_MASK 0xff
+#define ZJIT_STACK_MAP_SHIFT 8
 
-typedef struct zjit_opnd {
-    zjit_opnd_type_t type;
-    union {
-        VALUE value;
-        size_t vreg_stack_index;
-    } as;
-} zjit_opnd_t;
+static inline bool
+ZJIT_STACK_MAP_VREG_P(VALUE entry)
+{
+    return (entry & ZJIT_STACK_MAP_TAG_MASK) == ZJIT_STACK_MAP_VREG_TAG;
+}
+
+static inline size_t
+ZJIT_STACK_MAP_VREG_INDEX(VALUE entry)
+{
+    return entry >> ZJIT_STACK_MAP_SHIFT;
+}
 
 // JITFrame is defined here as the single source of truth and imported into
 // Rust via bindgen. C code reads fields directly; Rust uses an impl block.
@@ -38,7 +44,7 @@ typedef struct zjit_jit_frame {
     bool materialize_block_code;
 
     uint32_t stack_size;
-    zjit_opnd_t *stack;
+    VALUE *stack;
 } zjit_jit_frame_t;
 
 #if USE_ZJIT
