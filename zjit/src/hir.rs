@@ -1316,9 +1316,10 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(right);
                 $visit_one!(state);
             }
-            Insn::Snapshot { state } => {
-                $visit_many!(state.stack);
-                $visit_many!(state.locals);
+            Insn::Snapshot { state: FrameState { self_param, stack, locals, .. } } => {
+                $visit_one!(self_param);
+                $visit_many!(stack);
+                $visit_many!(locals);
             }
             Insn::FixnumAdd { left, right, state }
             | Insn::FixnumSub { left, right, state }
@@ -6317,6 +6318,7 @@ pub struct FrameState {
     insn_idx: YarvInsnIdx,
     // Ruby bytecode instruction pointer
     pub pc: *const VALUE,
+    pub self_param: InsnId,
 
     stack: Vec<InsnId>,
     locals: Vec<InsnId>,
@@ -6400,7 +6402,7 @@ fn ep_offset_to_local_idx(iseq: IseqPtr, ep_offset: u32) -> usize {
 
 impl FrameState {
     fn new(iseq: IseqPtr) -> FrameState {
-        FrameState { iseq, pc: std::ptr::null::<VALUE>(), insn_idx: 0, stack: vec![], locals: vec![] }
+        FrameState { iseq, pc: std::ptr::null::<VALUE>(), self_param: InsnId(usize::MAX), insn_idx: 0, stack: vec![], locals: vec![] }
     }
 
     /// Get the number of stack operands
@@ -6756,6 +6758,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
         let mut self_param = fun.push_insn(block, Insn::Param);
         let mut state = {
             let mut result = FrameState::new(iseq);
+            result.self_param = self_param;
             let local_size = if jit_entry_insns.contains(&insn_idx) { num_locals(iseq) } else { incoming_state.locals.len() };
             for _ in 0..local_size {
                 result.locals.push(fun.push_insn(block, Insn::Param));
@@ -7865,6 +7868,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                             let block = fun.new_block(insn_idx);
                             let self_param = fun.push_insn(block, Insn::Param);
                             let mut state = exit_state.clone();
+                            state.self_param = self_param;
                             state.locals.clear();
                             state.stack.clear();
                             state.locals.extend((0..locals_count).map(|_| fun.push_insn(block, Insn::Param)));
@@ -8223,6 +8227,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     }
                     if let Some(summary) = fun.polymorphic_summary(&profiles, self_param, exit_state.insn_idx) {
                         self_param = fun.push_insn(block, Insn::GuardType { val: self_param, guard_type: types::HeapBasicObject, state: exit_id });
+                        state.self_param = self_param;
                         let rbasic_flags = fun.load_rbasic_flags(block, self_param);
                         let join_block = insn_idx_to_block.get(&insn_idx).copied().unwrap_or_else(|| fun.new_block(insn_idx));
                         let join_param = fun.push_insn(join_block, Insn::Param);
@@ -8294,6 +8299,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     // SetIvar will raise if self is an immediate. If it raises, we will have
                     // exited JIT code. So upgrade the type within JIT code to a heap object.
                     self_param = fun.push_insn(block, Insn::RefineType { val: self_param, new_type: types::HeapBasicObject });
+                    state.self_param = self_param;
                 }
                 YARVINSN_getclassvariable => {
                     let id = ID(get_arg(pc, 0).as_u64());
@@ -8534,6 +8540,7 @@ fn compile_entry_state(fun: &mut Function) -> (InsnId, FrameState) {
 
     let self_param = fun.push_insn(entry_block, Insn::LoadSelf);
     let mut entry_state = FrameState::new(iseq);
+    entry_state.self_param = self_param;
     // If the ISEQ does not escape EP, we can assume EP + 1 == SP
     // TODO: This should maybe also consider if the EP has historically been escaped in this iseq.
     // (see: https://github.com/Shopify/ruby/issues/774)
@@ -8607,6 +8614,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
     let self_param = fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: FieldName::SelfParam, val_type: types::BasicObject });
     arg_idx += 1;
     let mut entry_state = FrameState::new(iseq);
+    entry_state.self_param = self_param;
     let mut ep: Option<InsnId> = None;
     for local_idx in 0..num_locals(iseq) {
         let local = if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) {

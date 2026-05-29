@@ -1916,8 +1916,9 @@ pub const DEFINED_REF: defined_type = 15;
 pub const DEFINED_FUNC: defined_type = 16;
 pub const DEFINED_CONST_FROM: defined_type = 17;
 pub type defined_type = u32;
-pub const ZJIT_OPND_VALUE: zjit_opnd_type = 0;
-pub const ZJIT_OPND_VREG: zjit_opnd_type = 1;
+pub const ZJIT_OPND_UNDEF: zjit_opnd_type = 0;
+pub const ZJIT_OPND_VALUE: zjit_opnd_type = 1;
+pub const ZJIT_OPND_VREG: zjit_opnd_type = 2;
 pub type zjit_opnd_type = u32;
 pub use self::zjit_opnd_type as zjit_opnd_type_t;
 #[repr(C)]
@@ -1933,11 +1934,11 @@ pub struct zjit_opnd__bindgen_ty_1 {
 }
 pub type zjit_opnd_t = zjit_opnd;
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub self_: zjit_opnd_t,
     pub stack_size: u32,
     pub stack: *mut zjit_opnd_t,
 }

@@ -471,7 +471,7 @@ rb_vm_push_frame_fname(rb_execution_context_t *ec, VALUE fname)
     vm_push_frame(ec,
                   dmy_iseq, //const rb_iseq_t *iseq,
                   VM_FRAME_MAGIC_DUMMY | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH, // VALUE type,
-                  ec->cfp->self, // VALUE self,
+                  CFP_SELF(ec->cfp), // VALUE self,
                   VM_BLOCK_HANDLER_NONE, // VALUE specval,
                   Qfalse, // VALUE cref_or_me,
                   NULL, // const VALUE *pc,
@@ -1126,7 +1126,7 @@ vm_get_ev_const(rb_execution_context_t *ec, VALUE orig_klass, ID id, bool allow_
             klass = vm_get_iclass(ec->cfp, CREF_CLASS(root_cref));
         }
         else {
-            klass = CLASS_OF(ec->cfp->self);
+            klass = CLASS_OF(CFP_SELF(ec->cfp));
         }
 
         if (is_defined) {
@@ -4920,7 +4920,7 @@ vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_ca
           case METHOD_VISI_PROTECTED:
             if (!(vm_ci_flag(ci) & (VM_CALL_OPT_SEND | VM_CALL_FCALL))) {
                 VALUE defined_class = vm_defined_class_for_protected_call(vm_cc_cme(cc));
-                if (!rb_obj_is_kind_of(cfp->self, defined_class)) {
+                if (!rb_obj_is_kind_of(CFP_SELF(cfp), defined_class)) {
                     vm_cc_method_missing_reason_set(cc, MISSING_PROTECTED);
                     return vm_call_method_missing(ec, cfp, calling);
                 }
@@ -7437,7 +7437,7 @@ invoke_bf(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, const struct 
     const bool canary_p = ISEQ_BODY(CFP_ISEQ(reg_cfp))->builtin_attrs & BUILTIN_ATTR_LEAF; // Verify an assumption of `Primitive.attr! :leaf`
     SETUP_CANARY(canary_p);
     rb_insn_func_t func_ptr = (rb_insn_func_t)(uintptr_t)bf->func_ptr;
-    VALUE ret = (*lookup_builtin_invoker(bf->argc))(ec, reg_cfp->self, argv, func_ptr);
+    VALUE ret = (*lookup_builtin_invoker(bf->argc))(ec, CFP_SELF(reg_cfp), argv, func_ptr);
     CHECK_CANARY(canary_p, BIN(invokebuiltin));
     return ret;
 }

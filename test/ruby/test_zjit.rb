@@ -382,6 +382,33 @@ class TestZJIT < Test::Unit::TestCase
     }, call_threshold: 14, num_profiles: 5
   end
 
+  def test_lazy_self_materialized_for_binding_receiver
+    assert_runs ':ok', %q{
+      class LazySelf
+        def current
+          Object.new
+          binding.receiver
+        end
+
+        def via_missing_block
+          missing_call { binding.receiver }
+        end
+
+        def method_missing(_name, &block)
+          block.call
+        end
+      end
+
+      obj = LazySelf.new
+      3.times do
+        raise unless obj.current.equal?(obj)
+        raise unless obj.via_missing_block.equal?(obj)
+      end
+
+      :ok
+    }
+  end
+
   def test_exit_tracing
     # Smoke test: --zjit-trace-exits writes a Fuchsia trace (.fxt) file to /tmp
     assert_compiles('true', <<~RUBY, extra_args: ['--zjit-trace-exits'])

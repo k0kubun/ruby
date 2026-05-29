@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::cast::IntoU64;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
+use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SELF, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -546,6 +546,7 @@ impl From<VALUE> for Opnd {
 /// Context for a side exit. If `SideExit` matches, it reuses the same code.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SideExit {
+    pub self_opnd: Opnd,
     pub pc: Opnd,
     pub stack: Vec<Opnd>,
     pub locals: Vec<Opnd>,
@@ -848,9 +849,10 @@ pub enum Insn {
 }
 
 macro_rules! target_for_each_operand_impl {
-    ($self:expr, $visit_many:ident) => {
+    ($self:expr, $visit_one:ident, $visit_many:ident) => {
         match $self {
-            Target::SideExit { exit: SideExit { stack, locals, .. }, .. } => {
+            Target::SideExit { exit: SideExit { self_opnd, stack, locals, .. }, .. } => {
+                visit_one!(self_opnd);
                 visit_many!(stack);
                 visit_many!(locals);
             }
@@ -883,12 +885,12 @@ macro_rules! for_each_operand_impl {
             Insn::Label(target) |
             Insn::LeaJumpTarget { target, .. } |
             Insn::PatchPoint { target, .. } => {
-                target_for_each_operand_impl!(target, $visit_many);
+                target_for_each_operand_impl!(target, $visit_one, $visit_many);
             }
             Insn::Joz(opnd, target) |
             Insn::Jonz(opnd, target) => {
                 visit_one!(opnd);
-                target_for_each_operand_impl!(target, $visit_many);
+                target_for_each_operand_impl!(target, $visit_one, $visit_many);
             }
 
             Insn::BakeString(_) |
@@ -938,7 +940,10 @@ macro_rules! for_each_operand_impl {
             }
             Insn::CCall { opnds, stack_map, .. } => {
                 visit_many!(opnds);
-                if let Some(StackMap { stack, .. }) = stack_map {
+                if let Some(StackMap { self_opnd, stack, .. }) = stack_map {
+                    if let Some(self_opnd) = self_opnd {
+                        visit_one!(self_opnd);
+                    }
                     visit_many!(stack);
                 }
             }
@@ -1388,6 +1393,7 @@ impl StackState {
 
 #[derive(Clone, Debug)]
 pub struct StackMap {
+    self_opnd: Option<Opnd>,
     stack: Vec<Opnd>,
     jit_frame: *const zjit_jit_frame,
 }
@@ -2139,8 +2145,8 @@ impl Assembler
                             .is_some_and(|end| end > insn_number);
 
                     // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
-                    let stack_vreg_ids: HashSet<usize> = if let Some(StackMap { stack, .. }) = &stack_map {
-                        stack.iter().filter_map(|opnd| match opnd {
+                    let stack_vreg_ids: HashSet<usize> = if let Some(StackMap { self_opnd, stack, .. }) = &stack_map {
+                        self_opnd.iter().chain(stack.iter()).filter_map(|opnd| match opnd {
                             Opnd::VReg { idx: VRegId(vreg_id), .. } => Some(*vreg_id),
                             _ => None,
                         }).collect()
@@ -2183,23 +2189,26 @@ impl Assembler
                         new_ids.push(None);
                     }
 
-                    if let Some(StackMap { stack, jit_frame }) = stack_map {
-                        unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
-                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
-                        for stack_opnd in stack.iter() {
+                    if let Some(StackMap { self_opnd, stack, jit_frame }) = stack_map {
+                        fn make_jit_frame_opnd(stack_opnd: Opnd, assignments: &[Option<Allocation>], survivors: &[usize], total_stack_slots: usize, stack_base_idx: usize) -> zjit_opnd_t {
                             let mut jit_frame_opnd = std::mem::MaybeUninit::<zjit_opnd_t>::uninit();
                             let ptr = jit_frame_opnd.as_mut_ptr();
                             match stack_opnd {
+                                Opnd::Value(value) => {
+                                    assert!(value.special_const_p(), "JITFrame should only materialize immediate VALUEs, but got: {value:?}");
+                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
+                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
+                                }
                                 Opnd::UImm(value) => {
-                                    let value = VALUE(*value as usize);
-                                    assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
+                                    let value = VALUE(value as usize);
+                                    assert!(value.special_const_p(), "JITFrame should only materialize immediate VALUEs, but got: {value:?}");
                                     unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
                                     unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
                                 }
                                 Opnd::VReg { idx: VRegId(vreg_id), .. } => {
-                                    let stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
+                                    let stack_index = match assignments[vreg_id].expect("JITFrame VReg should have an allocation") {
                                         Allocation::Reg(_) | Allocation::Fixed(_) => {
-                                            let position = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
+                                            let position = survivors.iter().position(|&survivor_id| survivor_id == vreg_id).unwrap();
                                             // rb_zjit_materialize_frames() reads vreg_stack_index as
                                             // cfp->jit_return[-vreg_stack_index - 2]. For both arches, FrameSetup may
                                             // add one native stack slot for alignment before these CPushPairs.
@@ -2210,26 +2219,36 @@ impl Assembler
                                             };
                                             (total_stack_slots + frame_alignment_slots)
                                                 .checked_sub(1)
-                                                .expect("StackMap requires a JITFrame slot")
+                                                .expect("JITFrame requires a JITFrame slot")
                                                 + position
                                         }
                                         Allocation::Stack(stack_idx) => {
                                             // StackState places allocator spills at:
                                             //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
                                             // so expose the matching materializer index.
-                                            self.stack_base_idx
+                                            stack_base_idx
                                                 .checked_sub(1)
-                                                .expect("StackMap requires a JITFrame slot")
+                                                .expect("JITFrame requires a JITFrame slot")
                                                 + stack_idx
                                         }
                                     };
                                     unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VREG) };
                                     unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(stack_index.as_u64()) };
                                 }
-                                _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
+                                _ => unreachable!("unexpected operand in JITFrame: {stack_opnd:?}"),
                             }
-                            let frame = unsafe { jit_frame_opnd.assume_init() };
-                            jit_frame_stack.push(frame);
+                            unsafe { jit_frame_opnd.assume_init() }
+                        }
+
+                        if let Some(self_opnd) = self_opnd {
+                            let opnd = make_jit_frame_opnd(self_opnd, assignments, &survivors, total_stack_slots, self.stack_base_idx);
+                            unsafe { (*jit_frame.cast_mut()).self_ = opnd; }
+                        }
+
+                        unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
+                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
+                        for stack_opnd in stack.iter() {
+                            jit_frame_stack.push(make_jit_frame_opnd(*stack_opnd, assignments, &survivors, total_stack_slots, self.stack_base_idx));
                         }
                         let leaked = Box::leak(jit_frame_stack.into_boxed_slice()).as_mut_ptr();
                         unsafe { (*jit_frame.cast_mut()).stack = leaked; }
@@ -2461,6 +2480,9 @@ impl Assembler
 
             asm_comment!(asm, "save cfp->iseq");
             asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
+
+            asm_comment!(asm, "save cfp->self");
+            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF), exit.self_opnd);
 
             // cfp->block_code and cfp->jit_return are cleared by the caller jit_exec() or JIT_EXEC()
 
@@ -3576,9 +3598,9 @@ impl Assembler {
         out
     }
 
-    pub fn stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
+    pub fn stack_map(&mut self, self_opnd: Option<Opnd>, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
         assert!(self.stack_map.is_none());
-        self.stack_map = Some(StackMap { stack, jit_frame });
+        self.stack_map = Some(StackMap { self_opnd, stack, jit_frame });
     }
 
     pub fn store(&mut self, dest: Opnd, src: Opnd) {

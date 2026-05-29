@@ -115,7 +115,7 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
     }
 
     if (0) {
-        tmp = rb_inspect(cfp->self);
+        tmp = rb_inspect(CFP_SELF(cfp));
         selfstr = StringValueCStr(tmp);
     }
     else {
@@ -207,7 +207,7 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
             }
         }
 
-        kprintf("  self: %s\n", rb_raw_obj_info(buff, 0x100, cfp->self));
+        kprintf("  self: %s\n", rb_raw_obj_info(buff, 0x100, CFP_SELF(cfp)));
 
         if (iseq) {
             if (ISEQ_BODY(iseq)->local_table_size > 0) {

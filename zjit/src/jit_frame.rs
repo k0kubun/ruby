@@ -1,3 +1,4 @@
+use crate::codegen::undef_jit_frame_opnd;
 use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::zjit_jit_frame;
 use crate::state::ZJITState;
@@ -22,6 +23,7 @@ impl JITFrame {
                 pc,
                 iseq,
                 materialize_block_code,
+                self_: undef_jit_frame_opnd(),
                 stack_size: 0,
                 stack: 0 as _,
             }

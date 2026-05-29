@@ -329,7 +329,7 @@ rb_vm_call_kw(rb_execution_context_t *ec, VALUE recv, VALUE id, int argc, const 
 static inline VALUE
 vm_call_super(rb_execution_context_t *ec, int argc, const VALUE *argv, int kw_splat)
 {
-    VALUE recv = ec->cfp->self;
+    VALUE recv = CFP_SELF(ec->cfp);
     VALUE klass;
     ID id;
     rb_control_frame_t *cfp = ec->cfp;
@@ -372,7 +372,7 @@ rb_current_receiver(void)
     if (!ec || !(cfp = ec->cfp)) {
         rb_raise(rb_eRuntimeError, "no self, no life");
     }
-    return cfp->self;
+    return CFP_SELF(cfp);
 }
 
 static inline void
@@ -632,7 +632,7 @@ check_funcall_respond_to(rb_execution_context_t *ec, VALUE klass, VALUE recv, ID
 static int
 check_funcall_callable(rb_execution_context_t *ec, const rb_callable_method_entry_t *me)
 {
-    return rb_method_call_status(ec, me, CALL_FCALL, ec->cfp->self) == MISSING_NONE;
+    return rb_method_call_status(ec, me, CALL_FCALL, CFP_SELF(ec->cfp)) == MISSING_NONE;
 }
 
 static VALUE
@@ -892,7 +892,7 @@ static inline VALUE
 rb_call(VALUE recv, ID mid, int argc, const VALUE *argv, call_type scope)
 {
     rb_execution_context_t *ec = GET_EC();
-    return rb_call0(ec, recv, mid, argc, argv, scope, ec->cfp->self);
+    return rb_call0(ec, recv, mid, argc, argv, scope, CFP_SELF(ec->cfp));
 }
 
 NORETURN(static void raise_method_missing(rb_execution_context_t *ec, int argc, const VALUE *argv,
@@ -1061,7 +1061,7 @@ rb_funcallv_scope(VALUE recv, ID mid, int argc, const VALUE *argv, call_type sco
     scope_to_ci(scope, mid, argc, &ci);
 
     const struct rb_callcache *cc = gccct_method_search(ec, recv, mid, &ci);
-    VALUE self = ec->cfp->self;
+    VALUE self = CFP_SELF(ec->cfp);
 
     if (LIKELY(cc) &&
         LIKELY(rb_method_call_status(ec, vm_cc_cme(cc), scope, self) == MISSING_NONE)) {
@@ -1237,7 +1237,7 @@ send_internal(int argc, const VALUE *argv, VALUE recv, call_type scope)
         self = Qundef;
     }
     else {
-        self = RUBY_VM_PREVIOUS_CONTROL_FRAME(ec->cfp)->self;
+        self = CFP_SELF(RUBY_VM_PREVIOUS_CONTROL_FRAME(ec->cfp));
     }
 
     if (argc == 0) {
@@ -2100,7 +2100,7 @@ ruby_eval_string_from_file(const char *str, const char *filename)
     VALUE file = filename ? rb_str_new_cstr(filename) : 0;
     rb_execution_context_t *ec = GET_EC();
     rb_control_frame_t *cfp = ec ? rb_vm_get_ruby_level_next_cfp(ec, ec->cfp) : NULL;
-    VALUE self = cfp ? cfp->self : rb_vm_top_self();
+    VALUE self = cfp ? CFP_SELF(cfp) : rb_vm_top_self();
     return eval_string_with_cref(self, rb_str_new2(str), NULL, file, 1);
 }
 

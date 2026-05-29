@@ -129,7 +129,7 @@ enum vm_regan_acttype {
 /* deal with values                                       */
 /**********************************************************/
 
-#define GET_SELF() (COLLECT_USAGE_REGISTER_HELPER(SELF, GET, GET_CFP()->self))
+#define GET_SELF() (COLLECT_USAGE_REGISTER_HELPER(SELF, GET, CFP_SELF(GET_CFP())))
 
 /**********************************************************/
 /* deal with control flow 2: method/iterator              */

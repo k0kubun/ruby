@@ -10,6 +10,7 @@
 #endif
 
 typedef enum zjit_opnd_type {
+    ZJIT_OPND_UNDEF,
     ZJIT_OPND_VALUE,
     ZJIT_OPND_VREG,
 } zjit_opnd_type_t;
@@ -36,6 +37,10 @@ typedef struct zjit_jit_frame {
     // (which write block_code themselves), so we must restore it.
     // Always false for C frames.
     bool materialize_block_code;
+
+    // cfp->self for this frame. ZJIT skips writing it in direct ISEQ frame
+    // pushes and materializes it lazily from here when the interpreter needs it.
+    zjit_opnd_t self;
 
     uint32_t stack_size;
     zjit_opnd_t *stack;
@@ -118,6 +123,31 @@ CFP_ZJIT_FRAME_P(const rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return false;
     return cfp->jit_return != NULL;
+}
+
+static inline VALUE
+rb_zjit_materialize_opnd(const rb_control_frame_t *cfp, zjit_opnd_t opnd)
+{
+    switch (opnd.type) {
+      case ZJIT_OPND_VALUE:
+        return opnd.as.value;
+      case ZJIT_OPND_VREG:
+        return ((VALUE *)cfp->jit_return)[-(long)opnd.as.vreg_stack_index - 2];
+      default:
+        rb_bug("unreachable");
+    }
+}
+
+static inline VALUE
+CFP_SELF(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_FRAME_P(cfp)) {
+        const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+        if (jit_frame->self.type != ZJIT_OPND_UNDEF) {
+            return rb_zjit_materialize_opnd(cfp, jit_frame->self);
+        }
+    }
+    return cfp->self;
 }
 
 static inline const VALUE*

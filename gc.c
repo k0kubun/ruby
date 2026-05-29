@@ -226,7 +226,7 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
     }
 #endif
 
-    EXEC_EVENT_HOOK(ec, event, ec->cfp->self, 0, 0, 0, obj);
+    EXEC_EVENT_HOOK(ec, event, CFP_SELF(ec->cfp), 0, 0, 0, obj);
 
 #if USE_MODULAR_GC
     if (gc_thread_p) {
