@@ -418,7 +418,7 @@ rb_get_cfp_pc(struct rb_control_frame_struct *cfp)
 VALUE *
 rb_get_cfp_sp(struct rb_control_frame_struct *cfp)
 {
-    return cfp->sp;
+    return CFP_SP(cfp);
 }
 
 VALUE

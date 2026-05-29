@@ -637,7 +637,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         // TODO remove this check when we have stack args (we can use Time.new to test it)
         Insn::InvokeBuiltin { bf, state, .. } if bf.argc + 2 > (C_ARG_OPNDS.len() as i32) => return Err(*state),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, &function.frame_state(*state), bf, *leaf, opnds!(args)),
-        &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, jit_entry_idx)),
+        &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, function.iseq(), jit_entry_idx)),
         Insn::Return { val } => no_output!(gen_return(asm, opnd!(val))),
         Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, opnd!(left), opnd!(right), &function.frame_state(*state)),
@@ -1026,7 +1026,7 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, caller_stack_size);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1074,6 +1074,7 @@ fn gen_ccall_with_frame(
     asm_comment!(asm, "restore SP register for the caller");
     let new_sp = asm.sub(SP, sp_offset.into());
     asm.mov(SP, new_sp);
+    gen_save_sp_high_watermark(asm, state.iseq);
 
     result
 }
@@ -1120,7 +1121,7 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_for_gc(asm, state, caller_stack_size);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1162,6 +1163,7 @@ fn gen_ccall_variadic(
     asm_comment!(asm, "restore SP register for the caller");
     let new_sp = asm.sub(SP, sp_offset.into());
     asm.mov(SP, new_sp);
+    gen_save_sp_high_watermark(asm, state.iseq);
 
     result
 }
@@ -1462,16 +1464,19 @@ fn gen_send(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_send,
         EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile a dynamic dispatch with `...`
@@ -1486,17 +1491,20 @@ fn gen_send_forward(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
 
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_sendforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_sendforward,
         EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile a dynamic dispatch without block
@@ -1510,16 +1518,19 @@ fn gen_send_without_block(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_opt_send_without_block,
         EC, CFP, Opnd::const_ptr(cd)
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile a direct call to an ISEQ method.
@@ -1543,11 +1554,10 @@ fn gen_send_iseq_direct(
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, state, stack_growth);
 
-    // Save cfp->pc and cfp->sp for the caller frame
-    // Can't use gen_prepare_non_leaf_call because we need special SP math.
-    let jit_frame = gen_save_pc_for_gc(asm, state);
+    // Save caller PC and logical SP. The physical cfp->sp remains at the high
+    // watermark while the callee JIT frame may run and return to this frame.
     let stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
-    gen_save_sp(asm, stack_size);
+    let jit_frame = gen_save_pc_for_gc(asm, state, stack_size);
 
     gen_spill_locals(jit, asm, state);
     //gen_spill_stack(jit, asm, state);
@@ -1687,17 +1697,20 @@ fn gen_invokeblock(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
 
     asm_comment!(asm, "call invokeblock");
     unsafe extern "C" {
         fn rb_vm_invokeblock(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_invokeblock,
         EC, CFP, Opnd::const_ptr(cd)
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile invokeblock for IFUNC block handlers.
@@ -1774,16 +1787,19 @@ fn gen_invokesuper(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
     asm_comment!(asm, "call super with dynamic dispatch");
     unsafe extern "C" {
         fn rb_vm_invokesuper(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_invokesuper,
         EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile a dynamic dispatch for `super` with `...`
@@ -1798,16 +1814,19 @@ fn gen_invokesuperforward(
     gen_incr_send_fallback_counter(asm, reason);
 
     gen_prepare_non_leaf_call(jit, asm, state);
+    gen_save_sp(asm, state.stack_size());
     gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
     asm_comment!(asm, "call super with dynamic dispatch (forwarding)");
     unsafe extern "C" {
         fn rb_vm_invokesuperforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
     }
-    asm_ccall!(
+    let ret = asm_ccall!(
         asm,
         rb_vm_invokesuperforward,
         EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
-    )
+    );
+    gen_save_sp_high_watermark(asm, state.iseq);
+    ret
 }
 
 /// Compile a string resurrection
@@ -2192,7 +2211,7 @@ fn gen_object_alloc_class(asm: &mut Assembler, class: VALUE, state: &FrameState)
 }
 
 /// Compile a frame setup. If jit_entry_idx is Some, remember the address of it as a JIT entry.
-fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Option<usize>) {
+fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, iseq: IseqPtr, jit_entry_idx: Option<usize>) {
     if let Some(jit_entry_idx) = jit_entry_idx {
         let jit_entry = JITEntry::new(jit_entry_idx);
         jit.jit_entries.push(jit_entry.clone());
@@ -2212,6 +2231,8 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
     if let Some(jit_return_poison) = JIT_RETURN_POISON {
         asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), jit_return_poison.into());
     }
+
+    gen_save_sp_high_watermark(asm, iseq);
 }
 
 /// Compile code that exits from JIT code with a return value
@@ -2727,16 +2748,17 @@ fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
     false
 }
 
-/// Save only the PC to CFP. Use this when you need to call gen_save_sp()
-/// immediately after with a custom stack size (e.g., gen_ccall_with_frame
-/// adjusts SP to exclude receiver and arguments).
-fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_jit_frame {
+/// Save the current PC and logical SP offset to JITFrame.
+///
+/// Use this with a custom sp_offset when the VM-visible logical stack excludes
+/// receiver/arguments that are about to be consumed by a manually pushed frame.
+fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState, sp_offset: usize) -> *const zjit_jit_frame {
     let opcode: usize = state.get_opcode().try_into().unwrap();
     let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
 
     gen_incr_counter(asm, Counter::vm_write_jit_frame_count);
     asm_comment!(asm, "save JITFrame to CFP");
-    let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
+    let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq), sp_offset);
     asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
 
     // CFP_PC for a live JIT frame routes through the JITFrame on the native
@@ -2755,31 +2777,24 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_ji
 ///
 /// Unlike YJIT, we don't need to save the stack slots to protect them from GC
 /// because the backend spills all live registers onto the C stack on CCall.
-/// However, to avoid marking uninitialized stack slots, this also updates SP,
-/// which may have cfp->sp for a past frame or a past non-leaf call.
-fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
-    gen_save_sp(asm, state.stack_size());
+/// cfp->sp stays at the high watermark; JITFrame records the logical SP and
+/// stack map needed if the frame is materialized.
+fn gen_prepare_call_with_gc(jit: &JITState, asm: &mut Assembler, state: &FrameState, leaf: bool) {
+    let jit_frame = gen_save_pc_for_gc(asm, state, state.stack_size());
+    if !leaf {
+        gen_stack_map(jit, asm, state, state.stack_size(), jit_frame);
+    }
     if leaf {
-        asm.expect_leaf_ccall(state.stack_size());
+        asm.expect_leaf_ccall(0);
     }
 }
 
 fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
-    // In gen_prepare_call_with_gc(), we update cfp->sp for leaf calls too.
-    //
-    // Here, cfp->sp may be pointing to either of the following:
-    //   1. cfp->sp for a past frame, which gen_push_frame() skips to initialize
-    //   2. cfp->sp set by gen_prepare_non_leaf_call() for the current frame
-    //
-    // When (1), to avoid marking dead objects, we need to set cfp->sp for the current frame.
-    // When (2), setting cfp->sp at gen_push_frame() and not updating cfp->sp here could lead to
-    // keeping objects longer than it should, so we set cfp->sp at every call of this function.
-    //
-    // We use state.without_stack() to pass stack_size=0 to gen_save_sp() because we don't write
-    // VM stack slots on leaf calls, which leaves those stack slots uninitialized. ZJIT keeps
-    // live objects on the C stack, so they are protected from GC properly.
-    gen_prepare_call_with_gc(asm, &state.without_stack(), true);
+    // Leaf calls don't need VM stack materialization; the backend preserves live
+    // values on the native stack around CCall. Still publish the logical SP in
+    // JITFrame for VM helpers that query CFP_SP().
+    gen_save_pc_for_gc(asm, state, state.stack_size());
+    asm.expect_leaf_ccall(0);
 }
 
 /// Save the current SP on the CFP
@@ -2791,6 +2806,16 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     gen_incr_counter(asm, Counter::vm_write_sp_count);
     asm_comment!(asm, "save SP to CFP: {}", stack_size);
     let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
+    let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
+    asm.mov(cfp_sp, sp_addr);
+}
+
+/// Keep cfp->sp at the reserved high watermark for the current JIT frame.
+fn gen_save_sp_high_watermark(asm: &mut Assembler, iseq: IseqPtr) {
+    let stack_max = unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
+    gen_incr_counter(asm, Counter::vm_write_sp_count);
+    asm_comment!(asm, "save SP high watermark to CFP: {}", stack_max);
+    let sp_addr = asm.lea(Opnd::mem(64, SP, stack_max as i32 * SIZEOF_VALUE_I32));
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
 }
@@ -2831,13 +2856,9 @@ fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: &FrameState, stack_
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
 fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
     // TODO: Lazily materialize caller frames when needed
-    // Save PC for backtraces and allocation tracing
-    // and SP to avoid marking uninitialized stack slots
-    gen_prepare_call_with_gc(asm, state, false);
-
-    // Spill the virtual stack in case it raises an exception
-    // and the interpreter uses the stack for handling the exception
-    //gen_spill_stack(jit, asm, state);
+    // Save PC and logical SP for backtraces, allocation tracing, and frame
+    // materialization. cfp->sp stays at the high watermark while JIT can resume.
+    gen_prepare_call_with_gc(jit, asm, state, false);
 
     // Spill locals in case the method looks at caller Bindings
     gen_spill_locals(jit, asm, state);

@@ -1,4 +1,4 @@
-use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
+use crate::cruby::{IseqPtr, VALUE, ZJIT_OPND_VALUE, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::zjit_jit_frame;
 use crate::state::ZJITState;
 
@@ -16,31 +16,49 @@ impl JITFrame {
     }
 
     /// Create a JITFrame for an ISEQ frame.
-    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
+    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool, sp_offset: usize) -> *const Self {
         Self::alloc(
             JITFrame {
                 pc,
                 iseq,
                 materialize_block_code,
+                sp_offset: sp_offset.try_into().expect("sp_offset must fit in u32"),
                 stack_size: 0,
                 stack: 0 as _,
             }
         )
     }
 
-    /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
+    /// Mark GC objects retained by this JITFrame. Called from rb_zjit_root_mark.
     pub fn mark(&self) {
         if !self.iseq.is_null() {
             unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
         }
+        if !self.stack.is_null() {
+            for idx in 0..self.stack_size {
+                let opnd = unsafe { &*self.stack.add(idx as usize) };
+                if opnd.type_ == ZJIT_OPND_VALUE {
+                    unsafe { rb_gc_mark_movable(VALUE(opnd.as_.bindgen_union_field as usize)); }
+                }
+            }
+        }
     }
 
-    /// Update the iseq pointer after GC compaction.
+    /// Update object pointers after GC compaction.
     pub fn update_references(&mut self) {
         if !self.iseq.is_null() {
             let new_iseq = unsafe { rb_gc_location(VALUE::from(self.iseq)) }.as_iseq();
             if self.iseq != new_iseq {
                 self.iseq = new_iseq;
+            }
+        }
+        if !self.stack.is_null() {
+            for idx in 0..self.stack_size {
+                let opnd = unsafe { &mut *self.stack.add(idx as usize) };
+                if opnd.type_ == ZJIT_OPND_VALUE {
+                    let value = VALUE(opnd.as_.bindgen_union_field as usize);
+                    opnd.as_.bindgen_union_field = unsafe { rb_gc_location(value) }.as_u64();
+                }
             }
         }
     }

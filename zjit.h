@@ -37,6 +37,12 @@ typedef struct zjit_jit_frame {
     // Always false for C frames.
     bool materialize_block_code;
 
+    // Logical VM stack size from the frame base (cfp->ep + 1). While JIT code
+    // may resume, cfp->sp stays at the high watermark so ZJIT can reserve all
+    // temp stack slots. This field is committed to cfp->sp only when execution
+    // transfers to the interpreter.
+    uint32_t sp_offset;
+
     uint32_t stack_size;
     zjit_opnd_t *stack;
 } zjit_jit_frame_t;
@@ -66,6 +72,7 @@ void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
 void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
 void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
+void rb_zjit_materialize_frames_for_exit(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
 
 // Special value for cfp->jit_return that means "this is a C method frame, use
 // rb_zjit_c_frame as the JITFrame". We don't control the native stack layout
@@ -107,6 +114,7 @@ static inline void rb_zjit_invalidate_no_singleton_class(VALUE klass) {}
 static inline void rb_zjit_invalidate_root_box(void) {}
 static inline void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame) {}
 static inline void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
+static inline void rb_zjit_materialize_frames_for_exit(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
 static inline const zjit_jit_frame_t *CFP_ZJIT_FRAME(const rb_control_frame_t *cfp) { return NULL; }
 #endif // #if USE_ZJIT
 
@@ -136,6 +144,18 @@ CFP_ISEQ(const rb_control_frame_t *cfp)
         return CFP_ZJIT_FRAME(cfp)->iseq;
     }
     return cfp->_iseq;
+}
+
+static inline VALUE *
+CFP_SP(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_FRAME_P(cfp)) {
+        const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+        if (jit_frame->iseq) {
+            return (VALUE *)cfp->ep + 1 + jit_frame->sp_offset;
+        }
+    }
+    return cfp->sp;
 }
 
 #endif // #ifndef ZJIT_H

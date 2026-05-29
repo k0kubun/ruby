@@ -2190,6 +2190,10 @@ impl Assembler
                             let mut jit_frame_opnd = std::mem::MaybeUninit::<zjit_opnd_t>::uninit();
                             let ptr = jit_frame_opnd.as_mut_ptr();
                             match stack_opnd {
+                                Opnd::Value(value) => {
+                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
+                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
+                                }
                                 Opnd::UImm(value) => {
                                     let value = VALUE(*value as usize);
                                     assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");

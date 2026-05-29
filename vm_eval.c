@@ -1219,8 +1219,9 @@ current_vm_stack_arg(const rb_execution_context_t *ec, const VALUE *argv)
 {
     rb_control_frame_t *prev_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(ec->cfp);
     if (RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(ec, prev_cfp)) return NULL;
-    if (prev_cfp->sp + 1 != argv) return NULL;
-    return prev_cfp->sp + 1;
+    VALUE *prev_sp = CFP_SP(prev_cfp);
+    if (prev_sp + 1 != argv) return NULL;
+    return prev_sp + 1;
 }
 
 static VALUE

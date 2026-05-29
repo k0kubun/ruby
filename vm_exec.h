@@ -191,7 +191,7 @@ default:                        \
                 val = zjit_entry(ec, ec->cfp, func); \
                 if (UNDEF_P(val)) { \
                     ec->cfp->jit_return = 0; \
-                    rb_zjit_materialize_frames(ec, ec->cfp); \
+                    rb_zjit_materialize_frames_for_exit(ec, ec->cfp); \
                 } \
             } \
         } \

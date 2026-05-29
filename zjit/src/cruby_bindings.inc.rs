@@ -1938,6 +1938,7 @@ pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub sp_offset: u32,
     pub stack_size: u32,
     pub stack: *mut zjit_opnd_t,
 }

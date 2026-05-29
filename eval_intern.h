@@ -167,7 +167,7 @@ rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
 {
     RUBY_ASSERT(st > TAG_NONE && st <= TAG_FATAL, ": Invalid tag jump: %d", (int)st);
 #if USE_ZJIT
-    rb_zjit_materialize_frames(ec, ec->cfp);
+    rb_zjit_materialize_frames_for_exit(ec, ec->cfp);
 #endif
     ec->tag->state = st;
     ruby_longjmp(RB_VM_TAG_JMPBUF_GET(ec->tag->buf), 1);

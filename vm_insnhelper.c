@@ -2545,7 +2545,7 @@ vm_base_ptr(const rb_control_frame_t *cfp)
     const rb_control_frame_t *prev_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
 
     if (CFP_ISEQ(cfp) && VM_FRAME_RUBYFRAME_P(cfp)) {
-        VALUE *bp = prev_cfp->sp + ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size + VM_ENV_DATA_SIZE;
+        VALUE *bp = CFP_SP(prev_cfp) + ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size + VM_ENV_DATA_SIZE;
 
         if (ISEQ_BODY(CFP_ISEQ(cfp))->param.flags.forwardable && VM_ENV_LOCAL_P(cfp->ep)) {
             int lts = ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size;

@@ -579,7 +579,7 @@ jit_exec(rb_execution_context_t *ec)
             // to reduce generated code size.
             if (UNDEF_P(result)) {
                 ec->cfp->jit_return = 0; // exit code already cleared most fields except jit_return
-                rb_zjit_materialize_frames(ec, ec->cfp);
+                rb_zjit_materialize_frames_for_exit(ec, ec->cfp);
             }
             return result;
         }
@@ -2840,9 +2840,11 @@ vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,
 }
 
 #if USE_ZJIT
-// Materialize JITFrame-enabled CFP into interpreter-compatible CFP
-void
-rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
+// Materialize JITFrame-enabled CFPs. When commit_sp is false, cfp->sp remains
+// at the high watermark so JIT code can still safely resume and materialize
+// stack slots above the logical SP later.
+static void
+zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp, bool commit_sp)
 {
     if (!rb_zjit_enabled_p) return;
     const rb_control_frame_t *end_cfp = ec->tag->cfp;
@@ -2858,8 +2860,8 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             }
 
             int32_t stack_size = (int32_t)jit_frame->stack_size;
-            if (stack_size > 0) {
-                VALUE *stack = cfp->sp - stack_size;
+            if (jit_frame->iseq && stack_size > 0) {
+                VALUE *stack = (VALUE *)cfp->ep + 1;
                 for (int32_t i = 0; i < stack_size; i++) {
                     switch (jit_frame->stack[i].type) {
                       case ZJIT_OPND_VALUE:
@@ -2873,11 +2875,32 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
                     }
                 }
             }
-            cfp->jit_return = 0;
+            if (commit_sp) {
+                if (jit_frame->iseq) {
+                    cfp->sp = (VALUE *)cfp->ep + 1 + jit_frame->sp_offset;
+                }
+                cfp->jit_return = 0;
+            }
         }
         if (end_cfp == cfp) break;
         cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
     }
+}
+
+// Materialize JITFrame-enabled CFPs for temporary VM inspection while JIT code
+// may still resume.
+void
+rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
+{
+    zjit_materialize_frames(ec, cfp, false);
+}
+
+// Materialize JITFrame-enabled CFPs before transferring execution to the
+// interpreter or before native JIT frames expire.
+void
+rb_zjit_materialize_frames_for_exit(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
+{
+    zjit_materialize_frames(ec, cfp, true);
 }
 #endif
 
@@ -2950,9 +2973,9 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                 }
                 else {
                     /* TAG_BREAK */
+                    rb_zjit_materialize_frames_for_exit(ec, cfp);
                     *cfp->sp++ = THROW_DATA_VAL(err);
                     ec->errinfo = Qnil;
-                    rb_zjit_materialize_frames(ec, cfp);
                     return Qundef;
                 }
             }
@@ -2990,7 +3013,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         const rb_control_frame_t *escape_cfp;
                         escape_cfp = THROW_DATA_CATCH_FRAME(err);
                         if (cfp == escape_cfp) {
-                            rb_zjit_materialize_frames(ec, cfp);
+                            rb_zjit_materialize_frames_for_exit(ec, cfp);
                             cfp->pc = ISEQ_BODY(CFP_ISEQ(cfp))->iseq_encoded + entry->cont;
                             ec->errinfo = Qnil;
                             return Qundef;
@@ -3021,7 +3044,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         break;
                     }
                     else if (entry->type == type) {
-                        rb_zjit_materialize_frames(ec, cfp);
+                        rb_zjit_materialize_frames_for_exit(ec, cfp);
                         cfp->pc = ISEQ_BODY(CFP_ISEQ(cfp))->iseq_encoded + entry->cont;
                         cfp->sp = vm_base_ptr(cfp) + entry->sp;
 
@@ -3056,7 +3079,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
             const int arg_size = 1;
 
             rb_iseq_check(catch_iseq);
-            rb_zjit_materialize_frames(ec, cfp); // vm_base_ptr looks at cfp->_iseq
+            rb_zjit_materialize_frames_for_exit(ec, cfp); // vm_base_ptr looks at cfp->_iseq
             cfp->sp = vm_base_ptr(cfp) + cont_sp;
             cfp->pc = ISEQ_BODY(CFP_ISEQ(cfp))->iseq_encoded + cont_pc;
 
