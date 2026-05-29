@@ -27,8 +27,11 @@ use crate::options::{get_option, PerfMap};
 use crate::cast::IntoUsize;
 
 /// The number of stack slots used for JITFrame. gen_save_pc_for_gc() writes
-/// JITFrame into this number of slots at the bottom of the native stack.
-const JIT_FRAME_SIZE: usize = 1;
+/// the ISEQ JITFrame pointer into the first slot. Optimized C frame pushes use
+/// the remaining slots for an in-place C JITFrame.
+const C_JIT_FRAME_OFFSET: usize = 1;
+const C_JIT_FRAME_SIZE: usize = std::mem::size_of::<zjit_jit_frame>().div_ceil(SIZEOF_VALUE);
+const JIT_FRAME_SIZE: usize = C_JIT_FRAME_OFFSET + C_JIT_FRAME_SIZE;
 
 /// Default maximum number of compiled versions per ISEQ.
 const DEFAULT_MAX_VERSIONS: usize = 2;
@@ -39,13 +42,6 @@ pub fn max_iseq_versions() -> usize {
     unsafe { crate::options::OPTIONS.as_ref() }
         .map_or(DEFAULT_MAX_VERSIONS, |opts| opts.max_versions)
 }
-
-/// Sentinel program counter stored in C frames when runtime checks are enabled.
-const PC_POISON: Option<*const VALUE> = if cfg!(feature = "runtime_checks") {
-    Some(usize::MAX as *const VALUE)
-} else {
-    None
-};
 
 /// Sentinel jit_return stored on ISEQ frame push when runtime checks are enabled.
 const JIT_RETURN_POISON: Option<usize> = if cfg!(feature = "runtime_checks") {
@@ -2741,7 +2737,7 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_ji
 
     // CFP_PC for a live JIT frame routes through the JITFrame on the native
     // stack (cfp->jit_return points to NATIVE_BASE_PTR), so we don't need to
-    // touch cfp->pc here. Poisoning cfp->pc with PC_POISON would actively
+    // touch cfp->pc here. Poisoning cfp->pc would actively
     // break the case where rb_zjit_materialize_frames() previously copied
     // jit_frame->pc into cfp->pc and cleared cfp->jit_return: the JIT keeps
     // running, lands on this routine again, and the poison would replace
@@ -2892,28 +2888,28 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
             asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
         }
     } else {
-        // C frames don't have a PC and ISEQ in normal operation. ISEQ frames set PC on gen_save_pc_for_gc().
-        // When runtime checks are enabled we poison the PC for C frames so accidental reads stand out.
-        if let (None, Some(pc)) = (frame.iseq, PC_POISON) {
-            asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
-        }
         let new_sp = asm.lea(Opnd::mem(64, SP, (ep_offset + 1) * SIZEOF_VALUE_I32));
-        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SP), new_sp);
-        // block_code must be written explicitly because the interpreter reads
-        // captured->code.ifunc directly from cfp->block_code (not through JITFrame).
-        // Without this, stale data from a previous frame occupying this CFP slot
-        // can be used as an ifunc pointer, causing a segfault.
-        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
-        // C frames share a single static JITFrame (rb_zjit_c_frame). Setting
-        // cfp->jit_return to the ZJIT_JIT_RETURN_C_FRAME sentinel tells
-        // CFP_ZJIT_FRAME() to use that shared frame, so we don't need to
-        // allocate a per-call JITFrame for C method pushes.
-        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), (ZJIT_JIT_RETURN_C_FRAME as usize).into());
+        let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
+
+        let jit_frame = asm.lea(Opnd::mem(64, NATIVE_BASE_PTR, -(C_JIT_FRAME_OFFSET as i32 + C_JIT_FRAME_SIZE as i32) * SIZEOF_VALUE_I32));
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, pc) as i32), 0.into());
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, iseq) as i32), 0.into());
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, sp) as i32), new_sp);
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, self_) as i32), frame.recv);
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, ep) as i32), ep);
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, block_code) as i32), 0.into());
+        asm.mov(Opnd::mem(8, jit_frame, std::mem::offset_of!(zjit_jit_frame, materialize_block_code) as i32), 0.into());
+        asm.mov(Opnd::mem(32, jit_frame, std::mem::offset_of!(zjit_jit_frame, stack_size) as i32), 0.into());
+        asm.mov(Opnd::mem(64, jit_frame, std::mem::offset_of!(zjit_jit_frame, stack) as i32), 0.into());
+        let tagged_jit_frame = asm.or(jit_frame, (ZJIT_JIT_RETURN_C_FRAME as u64).into());
+        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), tagged_jit_frame);
     }
 
-    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SELF), frame.recv);
-    let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
-    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+    if frame.iseq.is_some() {
+        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SELF), frame.recv);
+        let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
+        asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+    }
 }
 
 /// Stack overflow check: fails if CFP<=SP at any point in the callee.

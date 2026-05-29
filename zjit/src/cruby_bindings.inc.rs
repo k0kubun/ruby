@@ -1937,6 +1937,10 @@ pub type zjit_opnd_t = zjit_opnd;
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
+    pub sp: *mut VALUE,
+    pub self_: VALUE,
+    pub ep: *const VALUE,
+    pub block_code: *const ::std::os::raw::c_void,
     pub materialize_block_code: bool,
     pub stack_size: u32,
     pub stack: *mut zjit_opnd_t,

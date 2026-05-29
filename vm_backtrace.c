@@ -1602,7 +1602,7 @@ collect_caller_bindings_iseq(void *arg, const rb_control_frame_t *cfp)
     VALUE frame = rb_ary_new2(6);
     const rb_iseq_t *iseq = CFP_ISEQ(cfp);
 
-    rb_ary_store(frame, CALLER_BINDING_SELF, cfp->self);
+    rb_ary_store(frame, CALLER_BINDING_SELF, CFP_SELF(cfp));
     rb_ary_store(frame, CALLER_BINDING_CLASS, get_klass(cfp));
     rb_ary_store(frame, CALLER_BINDING_BINDING, GC_GUARDED_PTR(cfp)); /* create later */
     rb_ary_store(frame, CALLER_BINDING_ISEQ, iseq ? (VALUE)iseq : Qnil);
@@ -1626,7 +1626,7 @@ collect_caller_bindings_cfunc(void *arg, const rb_control_frame_t *cfp, ID mid)
     struct collect_caller_bindings_data *data = (struct collect_caller_bindings_data *)arg;
     VALUE frame = rb_ary_new2(6);
 
-    rb_ary_store(frame, CALLER_BINDING_SELF, cfp->self);
+    rb_ary_store(frame, CALLER_BINDING_SELF, CFP_SELF(cfp));
     rb_ary_store(frame, CALLER_BINDING_CLASS, get_klass(cfp));
     rb_ary_store(frame, CALLER_BINDING_BINDING, Qnil); /* not available */
     rb_ary_store(frame, CALLER_BINDING_ISEQ, Qnil); /* not available */

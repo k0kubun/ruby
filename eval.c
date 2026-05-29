@@ -602,7 +602,7 @@ setup_exception(rb_execution_context_t *ec, enum ruby_tag_type tag, volatile VAL
 
     if (tag != TAG_FATAL) {
         RUBY_DTRACE_HOOK(RAISE, rb_obj_classname(ec->errinfo));
-        EXEC_EVENT_HOOK(ec, RUBY_EVENT_RAISE, ec->cfp->self, 0, 0, 0, mesg);
+        EXEC_EVENT_HOOK(ec, RUBY_EVENT_RAISE, CFP_SELF(ec->cfp), 0, 0, 0, mesg);
     }
     return;
 
@@ -996,7 +996,7 @@ rb_raise_jump(VALUE mesg, VALUE cause)
     const rb_control_frame_t *cfp = ec->cfp;
     const rb_callable_method_entry_t *me = rb_vm_frame_method_entry(cfp);
     VALUE klass = me->owner;
-    VALUE self = cfp->self;
+    VALUE self = CFP_SELF(cfp);
     ID mid = me->called_id;
 
     rb_vm_pop_frame(ec);
@@ -1650,7 +1650,7 @@ mod_using(VALUE self, VALUE module)
         rb_raise(rb_eRuntimeError,
                  "Module#using is not permitted in methods");
     }
-    if (prev_cfp && prev_cfp->self != self) {
+    if (prev_cfp && CFP_SELF(prev_cfp) != self) {
         rb_raise(rb_eRuntimeError, "Module#using is not called on self");
     }
     if (rb_block_given_p()) {

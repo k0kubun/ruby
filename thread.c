@@ -2714,7 +2714,7 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
                 th->running_time_us += 10 * 1000; // 10ms = 10_000us // TODO: use macro
 
             VM_ASSERT(th->ec->cfp);
-            EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, th->ec->cfp->self,
+            EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, CFP_SELF(th->ec->cfp),
                             0, 0, 0, Qundef);
 
             rb_thread_schedule_limits(limits_us);
@@ -6322,4 +6322,3 @@ rb_ractor_interrupt_exec(struct rb_ractor_struct *target_r,
     rb_thread_t *main_th = target_r->threads.main;
     rb_threadptr_interrupt_exec(main_th, func, data, flags | rb_interrupt_exec_flag_new_thread);
 }
-

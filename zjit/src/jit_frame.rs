@@ -1,4 +1,4 @@
-use crate::cruby::{IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
+use crate::cruby::{IseqPtr, Qnil, VALUE, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::zjit_jit_frame;
 use crate::state::ZJITState;
 
@@ -21,6 +21,10 @@ impl JITFrame {
             JITFrame {
                 pc,
                 iseq,
+                sp: std::ptr::null_mut(),
+                self_: Qnil,
+                ep: std::ptr::null(),
+                block_code: std::ptr::null(),
                 materialize_block_code,
                 stack_size: 0,
                 stack: 0 as _,
@@ -317,5 +321,26 @@ mod tests {
             test
             test
         "), @"[2, 22, 4, 24]");
+    }
+
+    // A C method without a block may still call back into Ruby. That path
+    // mutates the current C frame's SP, so the lazy C frame must be
+    // materialized before the interpreter re-enters.
+    #[test]
+    fn test_cfunc_without_block_calls_ruby_method() {
+        assert_snapshot!(inspect(r#"
+            class SortKey
+              def initialize(value) = @value = value
+              def <=>(other) = @value <=> other.instance_variable_get(:@value)
+              def value = @value
+            end
+
+            def test
+              [SortKey.new(2), SortKey.new(1)].sort.map(&:value)
+            end
+
+            test
+            test
+        "#), @"[1, 2]");
     }
 }

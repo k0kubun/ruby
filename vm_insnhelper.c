@@ -458,7 +458,7 @@ vm_pop_frame(rb_execution_context_t *ec, rb_control_frame_t *cfp, const VALUE *e
 void
 rb_vm_pop_frame(rb_execution_context_t *ec)
 {
-    vm_pop_frame(ec, ec->cfp, ec->cfp->ep);
+    vm_pop_frame(ec, ec->cfp, CFP_EP(ec->cfp));
 }
 
 // it pushes pseudo-frame with fname filename.
@@ -471,11 +471,11 @@ rb_vm_push_frame_fname(rb_execution_context_t *ec, VALUE fname)
     vm_push_frame(ec,
                   dmy_iseq, //const rb_iseq_t *iseq,
                   VM_FRAME_MAGIC_DUMMY | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH, // VALUE type,
-                  ec->cfp->self, // VALUE self,
+                  CFP_SELF(ec->cfp), // VALUE self,
                   VM_BLOCK_HANDLER_NONE, // VALUE specval,
                   Qfalse, // VALUE cref_or_me,
                   NULL, // const VALUE *pc,
-                  ec->cfp->sp, // VALUE *sp,
+                  CFP_SP(ec->cfp), // VALUE *sp,
                   0, // int local_size,
                   0); // int stack_max
 
@@ -783,7 +783,7 @@ env_method_entry_unchecked(VALUE obj, int can_be_svar)
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 {
-    const VALUE *ep = cfp->ep;
+    const VALUE *ep = CFP_EP(cfp);
     rb_callable_method_entry_t *me;
 
     while (!VM_ENV_LOCAL_P(ep)) {
@@ -797,7 +797,7 @@ rb_vm_frame_method_entry(const rb_control_frame_t *cfp)
 const rb_callable_method_entry_t *
 rb_vm_frame_method_entry_unchecked(const rb_control_frame_t *cfp)
 {
-    const VALUE *ep = cfp->ep;
+    const VALUE *ep = CFP_EP(cfp);
     rb_callable_method_entry_t *me;
 
     while (!VM_ENV_LOCAL_P_UNCHECKED(ep)) {
@@ -3788,7 +3788,7 @@ vm_call_cfunc_with_frame_(rb_execution_context_t *ec, rb_control_frame_t *reg_cf
 
     vm_push_frame(ec, NULL, frame_type, recv,
                   block_handler, (VALUE)me,
-                  0, ec->cfp->sp, 0, 0);
+                  0, CFP_SP(ec->cfp), 0, 0);
 
     int len = cfunc->argc;
     if (len >= 0) rb_check_arity(argc, len, len);
@@ -3815,15 +3815,15 @@ rb_vm_push_cfunc_frame(const rb_callable_method_entry_t *cme, int recv_idx)
 {
     VM_ASSERT(cme->def->type == VM_METHOD_TYPE_CFUNC);
     rb_execution_context_t *ec = GET_EC();
-    VALUE *sp = ec->cfp->sp;
+    VALUE *sp = CFP_SP(ec->cfp);
     VALUE recv = *(sp - recv_idx - 1);
     VALUE frame_type = VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL;
     VALUE block_handler = VM_BLOCK_HANDLER_NONE;
 #if VM_CHECK_MODE > 0
     // Clean up the stack canary since we're about to satisfy the "leaf or lazy push" assumption
-    *(GET_EC()->cfp->sp) = Qfalse;
+    *(CFP_SP(GET_EC()->cfp)) = Qfalse;
 #endif
-    vm_push_frame(ec, NULL, frame_type, recv, block_handler, (VALUE)cme, 0, ec->cfp->sp, 0, 0);
+    vm_push_frame(ec, NULL, frame_type, recv, block_handler, (VALUE)cme, 0, CFP_SP(ec->cfp), 0, 0);
 }
 
 // If true, cc->call needs to include `CALLER_SETUP_ARG` (i.e. can't be skipped in fastpath)
@@ -5154,7 +5154,7 @@ vm_yield_with_cfunc(rb_execution_context_t *ec,
                   self,
                   VM_GUARDED_PREV_EP(captured->ep),
                   (VALUE)me,
-                  0, ec->cfp->sp, 0, 0);
+                  0, CFP_SP(ec->cfp), 0, 0);
     val = (*ifunc->func)(arg, (VALUE)ifunc->data, argc, argv, blockarg);
     rb_vm_pop_frame(ec);
 

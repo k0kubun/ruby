@@ -412,32 +412,32 @@ rb_get_cfp_iseq(struct rb_control_frame_struct *cfp)
 VALUE *
 rb_get_cfp_pc(struct rb_control_frame_struct *cfp)
 {
-    return (VALUE*)cfp->pc;
+    return (VALUE*)CFP_PC(cfp);
 }
 
 VALUE *
 rb_get_cfp_sp(struct rb_control_frame_struct *cfp)
 {
-    return cfp->sp;
+    return CFP_SP(cfp);
 }
 
 VALUE
 rb_get_cfp_self(struct rb_control_frame_struct *cfp)
 {
-    return cfp->self;
+    return CFP_SELF(cfp);
 }
 
 VALUE *
 rb_get_cfp_ep(struct rb_control_frame_struct *cfp)
 {
-    return (VALUE*)cfp->ep;
+    return (VALUE*)CFP_EP(cfp);
 }
 
 const VALUE *
 rb_get_cfp_ep_level(struct rb_control_frame_struct *cfp, uint32_t lv)
 {
     uint32_t i;
-    const VALUE *ep = (VALUE*)cfp->ep;
+    const VALUE *ep = (VALUE*)CFP_EP(cfp);
     for (i = 0; i < lv; i++) {
         ep = VM_ENV_PREV_EP(ep);
     }

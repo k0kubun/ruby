@@ -17,7 +17,7 @@ pass_passed_block_handler(rb_execution_context_t *ec)
 {
     VALUE block_handler = rb_vm_frame_block_handler(ec->cfp);
     vm_passed_block_handler_set(ec, block_handler);
-    VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_PASSED);
+    VM_ENV_FLAGS_SET(CFP_EP(ec->cfp), VM_FRAME_FLAG_PASSED);
 }
 
 #define PASS_PASSED_BLOCK_HANDLER_EC(ec) pass_passed_block_handler(ec)

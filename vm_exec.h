@@ -168,7 +168,7 @@ default:                        \
 // Run the interpreter from the JIT
 #define VM_EXEC(ec, val) do { \
     if (UNDEF_P(val)) { \
-        VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH); \
+        VM_ENV_FLAGS_SET(rb_zjit_cfp_ep(ec->cfp), VM_FRAME_FLAG_FINISH); \
         val = vm_exec(ec); \
     } \
 } while (0)

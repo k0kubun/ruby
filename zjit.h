@@ -31,6 +31,13 @@ typedef struct zjit_jit_frame {
     // The ISEQ this frame belongs to. Marked via rb_execution_context_mark.
     // NULL for C frames.
     const rb_iseq_t *iseq;
+    // Stack pointer, self, EP, and block code for C frames. These fields are
+    // materialized into rb_control_frame_t only when something needs the
+    // interpreter-compatible frame layout. They are unused for ISEQ frames.
+    VALUE *sp;
+    VALUE self;
+    const VALUE *ep;
+    const void *block_code;
     // Whether to materialize block_code when this frame is materialized.
     // True when the ISEQ doesn't contain send/invokesuper/invokeblock
     // (which write block_code themselves), so we must restore it.
@@ -43,7 +50,6 @@ typedef struct zjit_jit_frame {
 
 #if USE_ZJIT
 extern void *rb_zjit_entry;
-extern const zjit_jit_frame_t rb_zjit_c_frame;
 extern uint64_t rb_zjit_call_threshold;
 extern uint64_t rb_zjit_profile_threshold;
 void rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception);
@@ -65,13 +71,8 @@ void rb_zjit_tracing_invalidate_all(void);
 void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
 void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
+void rb_zjit_materialize_frame(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
 void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
-
-// Special value for cfp->jit_return that means "this is a C method frame, use
-// rb_zjit_c_frame as the JITFrame". We don't control the native stack layout
-// for C frames, so there's no per-call JITFrame storage; we set this sentinel
-// instead of a heap-allocated JITFrame pointer.
-#define ZJIT_JIT_RETURN_C_FRAME 0x1
 
 // BADFrame. The high bit is set, so likely SEGV on linux and darwin if dereferenced.
 #define ZJIT_JIT_RETURN_POISON 0xbadfbadfbadfbadfULL
@@ -79,8 +80,8 @@ void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_fra
 static inline const zjit_jit_frame_t *
 CFP_ZJIT_FRAME(const rb_control_frame_t *cfp)
 {
-    if ((VALUE)cfp->jit_return == ZJIT_JIT_RETURN_C_FRAME) {
-        return &rb_zjit_c_frame;
+    if ((VALUE)cfp->jit_return & ZJIT_JIT_RETURN_C_FRAME) {
+        return (const zjit_jit_frame_t *)((VALUE)cfp->jit_return & ~(VALUE)ZJIT_JIT_RETURN_C_FRAME);
     }
     else {
 #if USE_ZJIT
@@ -106,6 +107,7 @@ static inline void rb_zjit_tracing_invalidate_all(void) {}
 static inline void rb_zjit_invalidate_no_singleton_class(VALUE klass) {}
 static inline void rb_zjit_invalidate_root_box(void) {}
 static inline void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame) {}
+static inline void rb_zjit_materialize_frame(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
 static inline void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp) {}
 static inline const zjit_jit_frame_t *CFP_ZJIT_FRAME(const rb_control_frame_t *cfp) { return NULL; }
 #endif // #if USE_ZJIT
@@ -118,6 +120,14 @@ CFP_ZJIT_FRAME_P(const rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return false;
     return cfp->jit_return != NULL;
+}
+
+static inline bool
+CFP_ZJIT_CFRAME_P(const rb_control_frame_t *cfp)
+{
+    if (!CFP_ZJIT_FRAME_P(cfp)) return false;
+    const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+    return jit_frame->pc == NULL && jit_frame->iseq == NULL;
 }
 
 static inline const VALUE*
@@ -136,6 +146,48 @@ CFP_ISEQ(const rb_control_frame_t *cfp)
         return CFP_ZJIT_FRAME(cfp)->iseq;
     }
     return cfp->_iseq;
+}
+
+static inline VALUE *
+CFP_SP(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_CFRAME_P(cfp)) {
+        return CFP_ZJIT_FRAME(cfp)->sp;
+    }
+    return cfp->sp;
+}
+
+static inline VALUE
+CFP_SELF(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_CFRAME_P(cfp)) {
+        return CFP_ZJIT_FRAME(cfp)->self;
+    }
+    return cfp->self;
+}
+
+static inline const VALUE *
+CFP_EP(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_CFRAME_P(cfp)) {
+        return CFP_ZJIT_FRAME(cfp)->ep;
+    }
+    return cfp->ep;
+}
+
+static inline const void *
+CFP_BLOCK_CODE(const rb_control_frame_t *cfp)
+{
+    if (CFP_ZJIT_CFRAME_P(cfp)) {
+        return CFP_ZJIT_FRAME(cfp)->block_code;
+    }
+    return cfp->block_code;
+}
+
+static inline unsigned long
+CFP_FRAME_TYPE(const rb_control_frame_t *cfp)
+{
+    return VM_ENV_FLAGS(CFP_EP(cfp), VM_FRAME_MAGIC_MASK);
 }
 
 #endif // #ifndef ZJIT_H

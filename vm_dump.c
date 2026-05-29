@@ -55,7 +55,9 @@ static bool
 control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *cfp, FILE *errout)
 {
     ptrdiff_t pc = -1;
-    ptrdiff_t ep = cfp->ep - ec->vm_stack;
+    const VALUE *cfp_ep = CFP_EP(cfp);
+    VALUE *cfp_sp = CFP_SP(cfp);
+    ptrdiff_t ep = cfp_ep - ec->vm_stack;
     char ep_in_heap = ' ';
     char posbuf[MAX_POSBUF+1];
     int line = 0;
@@ -66,14 +68,14 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
     const rb_box_t *box = NULL;
 
     if (ep < 0 || (size_t)ep > ec->vm_stack_size) {
-        ep = (ptrdiff_t)cfp->ep;
+        ep = (ptrdiff_t)cfp_ep;
         ep_in_heap = 'p';
     }
 
     switch (VM_FRAME_TYPE_UNCHECKED(cfp)) {
       case VM_FRAME_MAGIC_TOP:
         magic = "TOP";
-        box = VM_ENV_BOX_UNCHECKED(cfp->ep);
+        box = VM_ENV_BOX_UNCHECKED(cfp_ep);
         break;
       case VM_FRAME_MAGIC_METHOD:
         magic = "METHOD";
@@ -83,7 +85,7 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
         break;
       case VM_FRAME_MAGIC_CLASS:
         magic = "CLASS";
-        box = VM_ENV_BOX_UNCHECKED(cfp->ep);
+        box = VM_ENV_BOX_UNCHECKED(cfp_ep);
         break;
       case VM_FRAME_MAGIC_BLOCK:
         magic = "BLOCK";
@@ -115,7 +117,7 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
     }
 
     if (0) {
-        tmp = rb_inspect(cfp->self);
+        tmp = rb_inspect(CFP_SELF(cfp));
         selfstr = StringValueCStr(tmp);
     }
     else {
@@ -164,9 +166,9 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
     else {
         kprintf("p:%04"PRIdPTRDIFF" ", pc);
     }
-    kprintf("s:%04"PRIdPTRDIFF" ", cfp->sp - ec->vm_stack);
+    kprintf("s:%04"PRIdPTRDIFF" ", cfp_sp - ec->vm_stack);
     kprintf(ep_in_heap == ' ' ? "e:%06"PRIdPTRDIFF" " : "E:%06"PRIxPTRDIFF" ", ep % 10000);
-    kprintf("l:%s ", VM_ENV_LOCAL_P(cfp->ep) ? "y" : "n");
+    kprintf("l:%s ", VM_ENV_LOCAL_P(cfp_ep) ? "y" : "n");
     if (box) {
         kprintf("b:%04ld ", box->box_id % 10000);
     }
@@ -207,13 +209,13 @@ control_frame_dump(const rb_execution_context_t *ec, const rb_control_frame_t *c
             }
         }
 
-        kprintf("  self: %s\n", rb_raw_obj_info(buff, 0x100, cfp->self));
+        kprintf("  self: %s\n", rb_raw_obj_info(buff, 0x100, CFP_SELF(cfp)));
 
         if (iseq) {
             if (ISEQ_BODY(iseq)->local_table_size > 0) {
                 kprintf("  lvars:\n");
                 for (unsigned int i=0; i<ISEQ_BODY(iseq)->local_table_size; i++) {
-                    const VALUE *argv = cfp->ep - ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size - VM_ENV_DATA_SIZE + 1;
+                    const VALUE *argv = cfp_ep - ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size - VM_ENV_DATA_SIZE + 1;
                     kprintf("    %s: %s\n",
                             rb_id2name(ISEQ_BODY(iseq)->local_table[i]),
                             rb_raw_obj_info(buff, 0x100, argv[i]));
@@ -236,7 +238,7 @@ vmdebug_search_cf_from_ep(const rb_execution_context_t *ec, const rb_control_fra
         const rb_control_frame_t * const eocfp = RUBY_VM_END_CONTROL_FRAME(ec); /* end of control frame pointer */
 
         while (cfp < eocfp) {
-            if (cfp->ep == ep) {
+            if (CFP_EP(cfp) == ep) {
                 return cfp;
             }
             cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
@@ -295,7 +297,7 @@ box_env_dump(const rb_execution_context_t *ec, const VALUE *env, const rb_contro
 
     if (ep < 0 || (size_t)ep > ec->vm_stack_size) {
         if (cfp) {
-            ep = (ptrdiff_t)cfp->ep;
+            ep = (ptrdiff_t)CFP_EP(cfp);
             ep_in_heap = 'p';
         }
     }
@@ -425,7 +427,7 @@ bool
 rb_vmdebug_box_env_dump_raw(const rb_execution_context_t *ec, const rb_control_frame_t *current_cfp, FILE *errout)
 {
     // See VM_EP_RUBY_LEP for the original logic
-    const VALUE *ep = current_cfp->ep;
+    const VALUE *ep = CFP_EP(current_cfp);
     const rb_control_frame_t * const eocfp = RUBY_VM_END_CONTROL_FRAME(ec); /* end of control frame pointer */
     const rb_control_frame_t *cfp = current_cfp, *checkpoint_cfp = current_cfp;
 
@@ -451,7 +453,7 @@ rb_vmdebug_box_env_dump_raw(const rb_execution_context_t *ec, const rb_control_f
             kprintf("[PREVIOUS CONTROL FRAME IS OUT OF BOUND]\n");
             goto stop;
         }
-        ep = cfp->ep;
+        ep = CFP_EP(cfp);
         box_env_dump_unchecked(ec, ep, checkpoint_cfp, errout);
         if (!ep) {
             goto stop;
@@ -570,7 +572,7 @@ static const VALUE *
 vm_base_ptr(const rb_control_frame_t *cfp)
 {
     const rb_control_frame_t *prev_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
-    const VALUE *bp = prev_cfp->sp + ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size + VM_ENV_DATA_SIZE;
+    const VALUE *bp = CFP_SP(prev_cfp) + ISEQ_BODY(CFP_ISEQ(cfp))->local_table_size + VM_ENV_DATA_SIZE;
 
     if (ISEQ_BODY(CFP_ISEQ(cfp))->type == ISEQ_TYPE_METHOD || VM_FRAME_BMETHOD_P(cfp)) {
         bp += 1;
@@ -583,8 +585,8 @@ vm_stack_dump_each(const rb_execution_context_t *ec, const rb_control_frame_t *c
 {
     int i, argc = 0, local_table_size = 0;
     VALUE rstr;
-    VALUE *sp = cfp->sp;
-    const VALUE *ep = cfp->ep;
+    VALUE *sp = CFP_SP(cfp);
+    const VALUE *ep = CFP_EP(cfp);
 
     if (VM_FRAME_RUBYFRAME_P(cfp)) {
         const rb_iseq_t *iseq = CFP_ISEQ(cfp);
@@ -654,11 +656,13 @@ rb_vmdebug_debug_print_register(const rb_execution_context_t *ec, FILE *errout)
 {
     rb_control_frame_t *cfp = ec->cfp;
     ptrdiff_t pc = -1;
-    ptrdiff_t ep = cfp->ep - ec->vm_stack;
+    const VALUE *cfp_ep = CFP_EP(cfp);
+    VALUE *cfp_sp = CFP_SP(cfp);
+    ptrdiff_t ep = cfp_ep - ec->vm_stack;
     ptrdiff_t cfpi;
 
     if (VM_FRAME_RUBYFRAME_P(cfp)) {
-        pc = cfp->pc - ISEQ_BODY(CFP_ISEQ(cfp))->iseq_encoded;
+        pc = CFP_PC(cfp) - ISEQ_BODY(CFP_ISEQ(cfp))->iseq_encoded;
     }
 
     if (ep < 0 || (size_t)ep > ec->vm_stack_size) {
@@ -667,7 +671,7 @@ rb_vmdebug_debug_print_register(const rb_execution_context_t *ec, FILE *errout)
 
     cfpi = ((rb_control_frame_t *)(ec->vm_stack + ec->vm_stack_size)) - cfp;
     kprintf("  [PC] %04"PRIdPTRDIFF", [SP] %04"PRIdPTRDIFF", [EP] %04"PRIdPTRDIFF", [CFP] %04"PRIdPTRDIFF"\n",
-            pc, (cfp->sp - ec->vm_stack), ep, cfpi);
+            pc, (cfp_sp - ec->vm_stack), ep, cfpi);
     return true;
 
   error:
@@ -748,8 +752,8 @@ rb_vmdebug_thread_dump_state(FILE *errout, VALUE self)
     rb_control_frame_t *cfp = th->ec->cfp;
 
     kprintf("Thread state dump:\n");
-    kprintf("pc : %p, sp : %p\n", (void *)cfp->pc, (void *)cfp->sp);
-    kprintf("cfp: %p, ep : %p\n", (void *)cfp, (void *)cfp->ep);
+    kprintf("pc : %p, sp : %p\n", (void *)CFP_PC(cfp), (void *)CFP_SP(cfp));
+    kprintf("cfp: %p, ep : %p\n", (void *)cfp, (void *)CFP_EP(cfp));
 
   error:
     return Qnil;

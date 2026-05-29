@@ -928,6 +928,52 @@ typedef struct rb_control_frame_struct {
 #endif
 } rb_control_frame_t;
 
+// Prefix of ZJIT's zjit_jit_frame_t. Keep this layout in sync with zjit.h.
+// vm_core.h can't include zjit.h, but frame flag helpers need to read EP for
+// lightweight C frames before they are materialized.
+typedef struct rb_zjit_jit_frame_prefix {
+    const VALUE *pc;
+    const rb_iseq_t *iseq;
+    VALUE *sp;
+    VALUE self;
+    const VALUE *ep;
+    const void *block_code;
+} rb_zjit_jit_frame_prefix_t;
+
+#define ZJIT_JIT_RETURN_C_FRAME 0x1
+
+#if USE_ZJIT
+extern void *rb_zjit_entry;
+#endif
+
+static inline const rb_zjit_jit_frame_prefix_t *
+rb_zjit_frame_prefix(const rb_control_frame_t *cfp)
+{
+#if USE_ZJIT
+    if (rb_zjit_entry && ((VALUE)cfp->jit_return & ZJIT_JIT_RETURN_C_FRAME)) {
+        return (const rb_zjit_jit_frame_prefix_t *)((VALUE)cfp->jit_return & ~(VALUE)ZJIT_JIT_RETURN_C_FRAME);
+    }
+#endif
+    return NULL;
+}
+
+static inline int
+rb_zjit_cframe_p(const rb_control_frame_t *cfp)
+{
+    const rb_zjit_jit_frame_prefix_t *jit_frame = rb_zjit_frame_prefix(cfp);
+    return jit_frame && jit_frame->pc == NULL && jit_frame->iseq == NULL;
+}
+
+static inline const VALUE *
+rb_zjit_cfp_ep(const rb_control_frame_t *cfp)
+{
+    const rb_zjit_jit_frame_prefix_t *jit_frame = rb_zjit_frame_prefix(cfp);
+    if (jit_frame && jit_frame->pc == NULL && jit_frame->iseq == NULL) {
+        return jit_frame->ep;
+    }
+    return cfp->ep;
+}
+
 extern const rb_data_type_t ruby_threadptr_data_type;
 
 static inline struct rb_thread_struct *
@@ -1484,43 +1530,43 @@ VM_ENV_FRAME_TYPE_P(const VALUE *ep, unsigned long frame_type)
 static inline unsigned long
 VM_FRAME_TYPE(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_MAGIC_MASK);
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_MAGIC_MASK);
 }
 
 static inline unsigned long
 VM_FRAME_TYPE_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_MAGIC_MASK);
+    return VM_ENV_FLAGS_UNCHECKED(rb_zjit_cfp_ep(cfp), VM_FRAME_MAGIC_MASK);
 }
 
 static inline int
 VM_FRAME_LAMBDA_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_LAMBDA) != 0;
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_LAMBDA) != 0;
 }
 
 static inline int
 VM_FRAME_CFRAME_KW_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_CFRAME_KW) != 0;
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_CFRAME_KW) != 0;
 }
 
 static inline int
 VM_FRAME_FINISHED_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_FINISH) != 0;
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_FINISH) != 0;
 }
 
 static inline int
 VM_FRAME_FINISHED_P_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_FLAG_FINISH) != 0;
+    return VM_ENV_FLAGS_UNCHECKED(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_FINISH) != 0;
 }
 
 static inline int
 VM_FRAME_BMETHOD_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_BMETHOD) != 0;
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_BMETHOD) != 0;
 }
 
 static inline int
@@ -1536,7 +1582,7 @@ rb_obj_is_iseq(VALUE iseq)
 static inline int
 VM_FRAME_CFRAME_P(const rb_control_frame_t *cfp)
 {
-    int cframe_p = VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_CFRAME) != 0;
+    int cframe_p = VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_CFRAME) != 0;
     // With ZJIT lightweight frames, cfp->_iseq may be stale (not yet materialized),
     // so skip this assertion when jit_return is set (zjit.h is not available here).
     VM_ASSERT(cfp->jit_return ||
@@ -1548,7 +1594,7 @@ VM_FRAME_CFRAME_P(const rb_control_frame_t *cfp)
 static inline int
 VM_FRAME_CFRAME_P_UNCHECKED(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS_UNCHECKED(cfp->ep, VM_FRAME_FLAG_CFRAME) != 0;
+    return VM_ENV_FLAGS_UNCHECKED(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_CFRAME) != 0;
 }
 
 static inline int
@@ -1566,7 +1612,7 @@ VM_FRAME_RUBYFRAME_P_UNCHECKED(const rb_control_frame_t *cfp)
 static inline int
 VM_FRAME_NS_REQUIRE_P(const rb_control_frame_t *cfp)
 {
-    return VM_ENV_FLAGS(cfp->ep, VM_FRAME_FLAG_BOX_REQUIRE) != 0;
+    return VM_ENV_FLAGS(rb_zjit_cfp_ep(cfp), VM_FRAME_FLAG_BOX_REQUIRE) != 0;
 }
 
 #define RUBYVM_CFUNC_FRAME_P(cfp) \
