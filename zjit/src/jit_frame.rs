@@ -10,6 +10,14 @@ use crate::state::ZJITState;
 /// imported into Rust via bindgen. See zjit.h for field documentation.
 pub type JITFrame = zjit_jit_frame;
 
+const ZJIT_STACK_MAP_SHORT_TAG_MASK: u16 = 0xe000;
+const ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG: u16 = 0xe000;
+const ZJIT_STACK_MAP_SHORT_PAYLOAD_MASK: u16 = 0x1fff;
+
+fn align_to_value(bytes: usize) -> usize {
+    (bytes + size_of::<VALUE>() - 1) & !(size_of::<VALUE>() - 1)
+}
+
 impl JITFrame {
     /// Allocate a JITFrame and its trailing stack map on the heap, register it
     /// with ZJITState, and return a raw pointer that remains valid for the
@@ -19,9 +27,12 @@ impl JITFrame {
         iseq: IseqPtr,
         materialize_block_code: bool,
         stack_size: usize,
+        stack_map_wide_count: usize,
     ) -> *const Self {
         let frame_size = size_of::<JITFrame>()
-            .checked_add(stack_size.checked_mul(size_of::<VALUE>()).unwrap())
+            .checked_add(align_to_value(stack_size.checked_mul(size_of::<u16>()).unwrap()))
+            .unwrap()
+            .checked_add(stack_map_wide_count.checked_mul(size_of::<VALUE>()).unwrap())
             .unwrap();
         let layout = Layout::from_size_align(frame_size, align_of::<JITFrame>()).unwrap();
         let raw_ptr = unsafe { alloc(layout) as *mut JITFrame };
@@ -33,9 +44,11 @@ impl JITFrame {
             ptr::write(raw_ptr, JITFrame {
                 pc,
                 iseq,
-                materialize_block_code,
                 stack_size: stack_size.try_into().unwrap(),
-                stack: __IncompleteArrayField::new(),
+                stack_map_wide_count: stack_map_wide_count.try_into().unwrap(),
+                materialize_block_code,
+                stack_map_padding: [0; 3],
+                stack_map: __IncompleteArrayField::new(),
             });
         }
         ZJITState::get_jit_frames().push(raw_ptr);
@@ -43,14 +56,41 @@ impl JITFrame {
     }
 
     /// Create a JITFrame for an ISEQ frame.
-    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool, stack_size: usize) -> *const Self {
-        Self::alloc(pc, iseq, materialize_block_code, stack_size)
+    pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool, stack_size: usize, stack_map_wide_count: usize) -> *const Self {
+        Self::alloc(pc, iseq, materialize_block_code, stack_size, stack_map_wide_count)
+    }
+
+    pub unsafe fn stack_map_entries(&mut self) -> *mut u16 {
+        self.stack_map.as_mut_ptr()
+    }
+
+    pub unsafe fn stack_map_entries_const(&self) -> *const u16 {
+        self.stack_map.as_ptr()
+    }
+
+    pub unsafe fn stack_map_wide_values(&self) -> *const VALUE {
+        let wide_offset = align_to_value(self.stack_size as usize * size_of::<u16>());
+        unsafe { (self.stack_map.as_ptr() as *const u8).add(wide_offset) as *const VALUE }
+    }
+
+    pub unsafe fn stack_map_wide_values_mut(&mut self) -> *mut VALUE {
+        let wide_offset = align_to_value(self.stack_size as usize * size_of::<u16>());
+        unsafe { (self.stack_map.as_mut_ptr() as *mut u8).add(wide_offset) as *mut VALUE }
     }
 
     /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
     pub fn mark(&self) {
         if !self.iseq.is_null() {
             unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
+        }
+        let entries = unsafe { self.stack_map_entries_const() };
+        let wide_values = unsafe { self.stack_map_wide_values() };
+        for stack_index in 0..self.stack_size {
+            let entry = unsafe { *entries.add(stack_index as usize) };
+            if (entry & ZJIT_STACK_MAP_SHORT_TAG_MASK) == ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG {
+                let wide_index = (entry & ZJIT_STACK_MAP_SHORT_PAYLOAD_MASK) as usize;
+                unsafe { rb_gc_mark_movable(*wide_values.add(wide_index)); }
+            }
         }
     }
 
@@ -60,6 +100,17 @@ impl JITFrame {
             let new_iseq = unsafe { rb_gc_location(VALUE::from(self.iseq)) }.as_iseq();
             if self.iseq != new_iseq {
                 self.iseq = new_iseq;
+            }
+        }
+        let entries = unsafe { self.stack_map_entries_const() };
+        let wide_values = unsafe { self.stack_map_wide_values_mut() };
+        for stack_index in 0..self.stack_size {
+            let entry = unsafe { *entries.add(stack_index as usize) };
+            if (entry & ZJIT_STACK_MAP_SHORT_TAG_MASK) == ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG {
+                let wide_index = (entry & ZJIT_STACK_MAP_SHORT_PAYLOAD_MASK) as usize;
+                let value_ptr = unsafe { wide_values.add(wide_index) };
+                let value = unsafe { *value_ptr };
+                unsafe { value_ptr.write(rb_gc_location(value)); }
             }
         }
     }

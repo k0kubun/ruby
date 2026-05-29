@@ -9,12 +9,28 @@
 # define ZJIT_STATS (USE_ZJIT && RUBY_DEBUG)
 #endif
 
-// Stack map entries are either immediate Ruby VALUEs or tagged native-stack
-// locations. Stack maps never contain heap VALUEs, so 0x08 is available: it is
-// not Qfalse (0), and its low 3 bits are zero, so RB_SPECIAL_CONST_P is false.
+// Full-width native-stack locations are encoded as VALUEs when they need to be
+// stored in an out-of-line stack map. 0x08 is not Qfalse (0), and its low 3
+// bits are zero, so RB_SPECIAL_CONST_P is false.
 #define ZJIT_STACK_MAP_VREG_TAG 0x08
 #define ZJIT_STACK_MAP_TAG_MASK 0xff
 #define ZJIT_STACK_MAP_SHIFT 8
+
+// Most stack map entries are native-stack locations. Store those in 16 bits
+// and use a trailing VALUE table only for rare full-width immediates or large
+// native-stack indexes.
+#define ZJIT_STACK_MAP_SHORT_CONST_TAG 0x8000
+#define ZJIT_STACK_MAP_SHORT_WIDE_TAG 0xc000
+#define ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG 0xe000
+#define ZJIT_STACK_MAP_SHORT_TAG_MASK 0xe000
+#define ZJIT_STACK_MAP_SHORT_PAYLOAD_MASK 0x1fff
+#define ZJIT_STACK_MAP_SHORT_VREG_MAX 0x7fff
+#define ZJIT_STACK_MAP_WIDE_MAX 0x1fff
+
+#define ZJIT_STACK_MAP_CONST_FALSE 0
+#define ZJIT_STACK_MAP_CONST_NIL 1
+#define ZJIT_STACK_MAP_CONST_TRUE 2
+#define ZJIT_STACK_MAP_CONST_UNDEF 3
 
 static inline bool
 ZJIT_STACK_MAP_VREG_P(VALUE entry)
@@ -28,6 +44,43 @@ ZJIT_STACK_MAP_VREG_INDEX(VALUE entry)
     return entry >> ZJIT_STACK_MAP_SHIFT;
 }
 
+static inline bool
+ZJIT_STACK_MAP_SHORT_VREG_P(uint16_t entry)
+{
+    return (entry & ZJIT_STACK_MAP_SHORT_CONST_TAG) == 0;
+}
+
+static inline bool
+ZJIT_STACK_MAP_SHORT_CONST_P(uint16_t entry)
+{
+    return (entry & ZJIT_STACK_MAP_SHORT_TAG_MASK) == ZJIT_STACK_MAP_SHORT_CONST_TAG;
+}
+
+static inline bool
+ZJIT_STACK_MAP_SHORT_WIDE_P(uint16_t entry)
+{
+    uint16_t tag = entry & ZJIT_STACK_MAP_SHORT_TAG_MASK;
+    return tag == ZJIT_STACK_MAP_SHORT_WIDE_TAG || tag == ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG;
+}
+
+static inline bool
+ZJIT_STACK_MAP_SHORT_WIDE_GC_P(uint16_t entry)
+{
+    return (entry & ZJIT_STACK_MAP_SHORT_TAG_MASK) == ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG;
+}
+
+static inline uint16_t
+ZJIT_STACK_MAP_SHORT_PAYLOAD(uint16_t entry)
+{
+    return entry & ZJIT_STACK_MAP_SHORT_PAYLOAD_MASK;
+}
+
+static inline size_t
+ZJIT_STACK_MAP_ALIGN_BYTES(size_t bytes)
+{
+    return (bytes + sizeof(VALUE) - 1) & ~(sizeof(VALUE) - 1);
+}
+
 // JITFrame is defined here as the single source of truth and imported into
 // Rust via bindgen. C code reads fields directly; Rust uses an impl block.
 typedef struct zjit_jit_frame {
@@ -37,14 +90,16 @@ typedef struct zjit_jit_frame {
     // The ISEQ this frame belongs to. Marked via rb_execution_context_mark.
     // NULL for C frames.
     const rb_iseq_t *iseq;
+    uint16_t stack_size;
+    uint16_t stack_map_wide_count;
     // Whether to materialize block_code when this frame is materialized.
     // True when the ISEQ doesn't contain send/invokesuper/invokeblock
     // (which write block_code themselves), so we must restore it.
     // Always false for C frames.
     bool materialize_block_code;
+    uint8_t stack_map_padding[3];
 
-    uint32_t stack_size;
-    VALUE stack[];
+    uint16_t stack_map[];
 } zjit_jit_frame_t;
 
 #if USE_ZJIT

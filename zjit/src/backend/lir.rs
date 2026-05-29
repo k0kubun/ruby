@@ -4,7 +4,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame};
+use crate::cruby::{IseqPtr, Qfalse, Qnil, Qtrue, Qundef, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -1391,8 +1391,39 @@ pub struct StackMap {
     jit_frame: *const zjit_jit_frame,
 }
 
-const ZJIT_STACK_MAP_VREG_TAG: usize = 0x08;
-const ZJIT_STACK_MAP_SHIFT: usize = 8;
+const ZJIT_STACK_MAP_SHORT_CONST_TAG: u16 = 0x8000;
+const ZJIT_STACK_MAP_SHORT_WIDE_TAG: u16 = 0xc000;
+const ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG: u16 = 0xe000;
+const ZJIT_STACK_MAP_SHORT_VREG_MAX: usize = 0x7fff;
+const ZJIT_STACK_MAP_WIDE_MAX: usize = 0x1fff;
+const ZJIT_STACK_MAP_CONST_FALSE: u16 = 0;
+const ZJIT_STACK_MAP_CONST_NIL: u16 = 1;
+const ZJIT_STACK_MAP_CONST_TRUE: u16 = 2;
+const ZJIT_STACK_MAP_CONST_UNDEF: u16 = 3;
+
+fn stack_map_const_entry(value: VALUE) -> Option<u16> {
+    let payload = if value == Qfalse {
+        ZJIT_STACK_MAP_CONST_FALSE
+    } else if value == Qnil {
+        ZJIT_STACK_MAP_CONST_NIL
+    } else if value == Qtrue {
+        ZJIT_STACK_MAP_CONST_TRUE
+    } else if value == Qundef {
+        ZJIT_STACK_MAP_CONST_UNDEF
+    } else {
+        return None;
+    };
+    Some(ZJIT_STACK_MAP_SHORT_CONST_TAG | payload)
+}
+
+fn stack_map_wide_entry(wide_index: usize, gc_visible: bool) -> u16 {
+    assert!(wide_index <= ZJIT_STACK_MAP_WIDE_MAX, "too many wide StackMap entries: {wide_index}");
+    if gc_visible {
+        ZJIT_STACK_MAP_SHORT_WIDE_GC_TAG | wide_index as u16
+    } else {
+        ZJIT_STACK_MAP_SHORT_WIDE_TAG | wide_index as u16
+    }
+}
 
 /// Initial capacity for asm.insns vector
 const ASSEMBLER_INSNS_CAPACITY: usize = 256;
@@ -2187,12 +2218,31 @@ impl Assembler
 
                     if let Some(StackMap { stack, jit_frame }) = stack_map {
                         assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
+                        let stack_map_entries = unsafe { (*jit_frame.cast_mut()).stack_map_entries() };
+                        let wide_values = unsafe { (*jit_frame.cast_mut()).stack_map_wide_values_mut() };
+                        let mut wide_index = 0;
                         for (idx, stack_opnd) in stack.iter().enumerate() {
-                            let entry = match stack_opnd {
+                            let entry: u16 = match stack_opnd {
+                                Opnd::Value(value) => {
+                                    if let Some(entry) = stack_map_const_entry(*value) {
+                                        entry
+                                    } else {
+                                        let entry = stack_map_wide_entry(wide_index, !value.special_const_p());
+                                        unsafe { wide_values.add(wide_index).write(*value); }
+                                        wide_index += 1;
+                                        entry
+                                    }
+                                }
                                 Opnd::UImm(value) => {
                                     let value = VALUE(*value as usize);
-                                    assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
-                                    value
+                                    if let Some(entry) = stack_map_const_entry(value) {
+                                        entry
+                                    } else {
+                                        let entry = stack_map_wide_entry(wide_index, false);
+                                        unsafe { wide_values.add(wide_index).write(value); }
+                                        wide_index += 1;
+                                        entry
+                                    }
                                 }
                                 Opnd::VReg { idx: VRegId(vreg_id), .. } => {
                                     let stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
@@ -2221,13 +2271,12 @@ impl Assembler
                                                 + stack_idx
                                         }
                                     };
-                                    let encoded = (stack_index << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_VREG_TAG;
-                                    debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap VReg should not look like an immediate VALUE");
-                                    VALUE(encoded)
+                                    assert!(stack_index <= ZJIT_STACK_MAP_SHORT_VREG_MAX, "StackMap VReg stack index too large: {stack_index}");
+                                    stack_index as u16
                                 }
                                 _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
                             };
-                            unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
+                            unsafe { stack_map_entries.add(idx).write(entry); }
                         }
                     }
 

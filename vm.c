@@ -2860,13 +2860,34 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             int32_t stack_size = (int32_t)jit_frame->stack_size;
             if (stack_size > 0) {
                 VALUE *stack = cfp->sp - stack_size;
+                const VALUE *wide_values = (const VALUE *)((const uint8_t *)jit_frame->stack_map +
+                    ZJIT_STACK_MAP_ALIGN_BYTES((size_t)stack_size * sizeof(uint16_t)));
                 for (int32_t i = 0; i < stack_size; i++) {
-                    VALUE entry = jit_frame->stack[i];
-                    if (ZJIT_STACK_MAP_VREG_P(entry)) {
-                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)ZJIT_STACK_MAP_VREG_INDEX(entry) - 2];
+                    uint16_t entry = jit_frame->stack_map[i];
+                    if (ZJIT_STACK_MAP_SHORT_VREG_P(entry)) {
+                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)entry - 2];
+                    }
+                    else if (ZJIT_STACK_MAP_SHORT_CONST_P(entry)) {
+                        switch (ZJIT_STACK_MAP_SHORT_PAYLOAD(entry)) {
+                          case ZJIT_STACK_MAP_CONST_FALSE:
+                            stack[i] = Qfalse;
+                            break;
+                          case ZJIT_STACK_MAP_CONST_NIL:
+                            stack[i] = Qnil;
+                            break;
+                          case ZJIT_STACK_MAP_CONST_TRUE:
+                            stack[i] = Qtrue;
+                            break;
+                          case ZJIT_STACK_MAP_CONST_UNDEF:
+                            stack[i] = Qundef;
+                            break;
+                          default:
+                            rb_bug("unknown ZJIT stack map constant: %u", ZJIT_STACK_MAP_SHORT_PAYLOAD(entry));
+                        }
                     }
                     else {
-                        stack[i] = entry;
+                        VM_ASSERT(ZJIT_STACK_MAP_SHORT_WIDE_P(entry));
+                        stack[i] = wide_values[ZJIT_STACK_MAP_SHORT_PAYLOAD(entry)];
                     }
                 }
             }

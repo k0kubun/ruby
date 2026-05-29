@@ -1921,9 +1921,11 @@ pub type defined_type = u32;
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
+    pub stack_size: u16,
+    pub stack_map_wide_count: u16,
     pub materialize_block_code: bool,
-    pub stack_size: u32,
-    pub stack: __IncompleteArrayField<VALUE>,
+    pub stack_map_padding: [u8; 3usize],
+    pub stack_map: __IncompleteArrayField<u16>,
 }
 pub const ISEQ_BODY_OFFSET_PARAM: zjit_struct_offsets = 16;
 pub type zjit_struct_offsets = u32;
