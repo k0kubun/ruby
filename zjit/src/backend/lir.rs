@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::cast::IntoU64;
 use crate::codegen::{JIT_FRAME_SIZE, local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_EP, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, VM_ENV_DATA_INDEX_ME_CREF, VM_ENV_DATA_INDEX_SPECVAL, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
+use crate::cruby::{IseqPtr, Qundef, RUBY_OFFSET_CFP_EP, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, VM_ENV_DATA_INDEX_FLAGS, VM_ENV_DATA_INDEX_ME_CREF, VM_ENV_DATA_INDEX_SPECVAL, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -17,6 +17,7 @@ use crate::state::rb_zjit_record_exit_stack;
 
 const JIT_FRAME_INDEX_CME: i32 = -2;
 const JIT_FRAME_INDEX_SPECVAL: i32 = -3;
+const JIT_FRAME_INDEX_FLAGS: i32 = -4;
 const JIT_FRAME_INDEX_ENV_MATERIALIZED: i32 = -5;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
@@ -2465,6 +2466,10 @@ impl Assembler
             asm.store(
                 Opnd::mem(64, C_ARG_OPNDS[0], VM_ENV_DATA_INDEX_SPECVAL * SIZEOF_VALUE_I32),
                 Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_SPECVAL * SIZEOF_VALUE_I32),
+            );
+            asm.store(
+                Opnd::mem(64, C_ARG_OPNDS[0], VM_ENV_DATA_INDEX_FLAGS as i32 * SIZEOF_VALUE_I32),
+                Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_FLAGS * SIZEOF_VALUE_I32),
             );
             asm.store(materialized, 1.into());
             asm.write_label(done_label);

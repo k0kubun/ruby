@@ -1494,11 +1494,40 @@ VM_ENV_FRAME_TYPE_P(const VALUE *ep, unsigned long frame_type)
     return VM_ENV_FLAGS(ep, VM_FRAME_MAGIC_MASK) == frame_type;
 }
 
+#if USE_ZJIT
+extern void *rb_zjit_entry;
+
+static inline bool
+VM_ZJIT_FRAME_NATIVE_ENV_P(const rb_control_frame_t *cfp)
+{
+    return rb_zjit_entry != 0 &&
+           cfp->jit_return != NULL &&
+           (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_C_FRAME &&
+           (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_DEFERRED_ENV;
+}
+
+static inline bool
+VM_ZJIT_FRAME_ENV_MATERIALIZED_P(const rb_control_frame_t *cfp)
+{
+    return !VM_ZJIT_FRAME_NATIVE_ENV_P(cfp) ||
+           ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED] != 0;
+}
+
+static inline VALUE
+VM_FRAME_FLAGS(const rb_control_frame_t *cfp)
+{
+    if (VM_ZJIT_FRAME_NATIVE_ENV_P(cfp) && !VM_ZJIT_FRAME_ENV_MATERIALIZED_P(cfp)) {
+        return ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_FLAGS];
+    }
+    return cfp->ep[VM_ENV_DATA_INDEX_FLAGS];
+}
+#else
 static inline VALUE
 VM_FRAME_FLAGS(const rb_control_frame_t *cfp)
 {
     return cfp->ep[VM_ENV_DATA_INDEX_FLAGS];
 }
+#endif
 
 static inline unsigned long
 VM_FRAME_TYPE(const rb_control_frame_t *cfp)

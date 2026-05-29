@@ -31,13 +31,14 @@ use crate::cast::IntoUsize;
 /// Slot layout, relative to `cfp->jit_return == NATIVE_BASE_PTR`:
 ///   -1: JITFrame pointer
 ///   -2: staged ep[-2] CME
-///   -3: reserved for staged ep[-1] specval
-///   -4: reserved for staged ep[0] ENV_FLAGS
+///   -3: staged ep[-1] specval
+///   -4: staged ep[0] ENV_FLAGS
 ///   -5: whether the VM stack env header has been materialized
 pub(crate) const JIT_FRAME_SIZE: usize = 5;
 const JIT_FRAME_INDEX_FRAME: i32 = -1;
 const JIT_FRAME_INDEX_CME: i32 = -2;
 const JIT_FRAME_INDEX_SPECVAL: i32 = -3;
+const JIT_FRAME_INDEX_FLAGS: i32 = -4;
 const JIT_FRAME_INDEX_ENV_MATERIALIZED: i32 = -5;
 const JIT_RETURN_DEFERRED_ENV: usize = 0x3;
 
@@ -2228,8 +2229,10 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
         let cme = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32));
         let specval = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_SPECVAL * SIZEOF_VALUE_I32));
+        let flags = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_FLAGS as i32 * SIZEOF_VALUE_I32));
         asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
         asm.mov(native_slot(JIT_FRAME_INDEX_SPECVAL), specval);
+        asm.mov(native_slot(JIT_FRAME_INDEX_FLAGS), flags);
         asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 1.into());
     };
 
@@ -2251,6 +2254,7 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         let cme = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC));
         asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
         asm.mov(native_slot(JIT_FRAME_INDEX_SPECVAL), VM_BLOCK_HANDLER_NONE.into());
+        asm.mov(native_slot(JIT_FRAME_INDEX_FLAGS), (VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL).into());
         asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 0.into());
         asm.jmp(done_edge.clone());
 
@@ -2955,8 +2959,10 @@ fn gen_materialize_frame_env(jit: &mut JITState, asm: &mut Assembler) {
     let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
     let cme = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_CME * SIZEOF_VALUE_I32));
     let specval = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_SPECVAL * SIZEOF_VALUE_I32));
+    let flags = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_FLAGS * SIZEOF_VALUE_I32));
     asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32), cme);
     asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_SPECVAL * SIZEOF_VALUE_I32), specval);
+    asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_FLAGS as i32 * SIZEOF_VALUE_I32), flags);
     asm.store(materialized, 1.into());
     asm.jmp(done_edge);
 
@@ -3017,9 +3023,9 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
         asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), VALUE::from(frame.cme).into());
         // ep[-1]: specval
         asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), frame.specval);
+        // ep[0]: ENV_FLAGS
+        asm.store(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32), frame.frame_type.into());
     }
-    // ep[0]: ENV_FLAGS
-    asm.store(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32), frame.frame_type.into());
 
     // Write to the callee CFP
     fn cfp_opnd(offset: i32) -> Opnd {
@@ -3261,6 +3267,7 @@ c_callable! {
                 unsafe {
                     *ep.offset(VM_ENV_DATA_INDEX_ME_CREF as isize) = VALUE::from(cme);
                     *ep.offset(VM_ENV_DATA_INDEX_SPECVAL as isize) = VALUE(VM_BLOCK_HANDLER_NONE as usize);
+                    *ep.offset(VM_ENV_DATA_INDEX_FLAGS as isize) = VALUE((VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL) as usize);
                 }
             }
             // gen_push_frame() doesn't set PC or ISEQ, so we need to set them before exit.

@@ -2864,6 +2864,7 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
                 VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_ME_CREF], CFP_ZJIT_FRAME_CME(cfp));
                 VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_SPECVAL], CFP_ZJIT_FRAME_SPECVAL(cfp));
+                VM_FORCE_WRITE_SPECIAL_CONST(&cfp->ep[VM_ENV_DATA_INDEX_FLAGS], CFP_ZJIT_FRAME_FLAGS(cfp));
                 ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED] = 1;
             }
             cfp->pc = jit_frame->pc;
