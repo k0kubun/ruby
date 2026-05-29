@@ -3,9 +3,8 @@ use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
-use crate::cast::IntoU64;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame, zjit_opnd_t};
+use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -1392,6 +1391,9 @@ pub struct StackMap {
     jit_frame: *const zjit_jit_frame,
 }
 
+const ZJIT_STACK_MAP_VREG_TAG: usize = 0x08;
+const ZJIT_STACK_MAP_SHIFT: usize = 8;
+
 /// Initial capacity for asm.insns vector
 const ASSEMBLER_INSNS_CAPACITY: usize = 256;
 
@@ -2182,16 +2184,13 @@ impl Assembler
 
                     if let Some(StackMap { stack, jit_frame }) = stack_map {
                         unsafe { (*jit_frame.cast_mut()).stack_size = stack.len().try_into().unwrap(); }
-                        let mut jit_frame_stack: Vec<zjit_opnd_t> = vec![];
+                        let mut jit_frame_stack: Vec<VALUE> = vec![];
                         for stack_opnd in stack.iter() {
-                            let mut jit_frame_opnd = std::mem::MaybeUninit::<zjit_opnd_t>::uninit();
-                            let ptr = jit_frame_opnd.as_mut_ptr();
-                            match stack_opnd {
+                            let entry = match stack_opnd {
                                 Opnd::UImm(value) => {
                                     let value = VALUE(*value as usize);
                                     assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
-                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VALUE) };
-                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(value.as_u64()) };
+                                    value
                                 }
                                 Opnd::VReg { idx: VRegId(vreg_id), .. } => {
                                     let stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
@@ -2220,13 +2219,13 @@ impl Assembler
                                                 + stack_idx
                                         }
                                     };
-                                    unsafe { (&raw mut (*ptr).type_).write(crate::cruby::ZJIT_OPND_VREG) };
-                                    unsafe { (&raw mut (*ptr).as_.bindgen_union_field).write(stack_index.as_u64()) };
+                                    let encoded = (stack_index << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_VREG_TAG;
+                                    debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap VReg should not look like an immediate VALUE");
+                                    VALUE(encoded)
                                 }
                                 _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
-                            }
-                            let frame = unsafe { jit_frame_opnd.assume_init() };
-                            jit_frame_stack.push(frame);
+                            };
+                            jit_frame_stack.push(entry);
                         }
                         let leaked = Box::leak(jit_frame_stack.into_boxed_slice()).as_mut_ptr();
                         unsafe { (*jit_frame.cast_mut()).stack = leaked; }

@@ -2854,15 +2854,12 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             if (stack_size > 0) {
                 VALUE *stack = cfp->sp - stack_size;
                 for (int32_t i = 0; i < stack_size; i++) {
-                    switch (jit_frame->stack[i].type) {
-                      case ZJIT_OPND_VALUE:
-                        stack[i] = jit_frame->stack[i].as.value;
-                        break;
-                      case ZJIT_OPND_VREG:
-                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)(jit_frame->stack[i].as.vreg_stack_index) - 2];
-                        break;
-                      default:
-                        rb_bug("unreachable");
+                    VALUE entry = jit_frame->stack[i];
+                    if (ZJIT_STACK_MAP_VREG_P(entry)) {
+                        stack[i] = ((VALUE *)cfp->jit_return)[-(ssize_t)ZJIT_STACK_MAP_VREG_INDEX(entry) - 2];
+                    }
+                    else {
+                        stack[i] = entry;
                     }
                 }
             }
