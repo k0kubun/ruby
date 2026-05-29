@@ -204,6 +204,9 @@ static inline VALUE
 VM_CF_BLOCK_HANDLER(const rb_control_frame_t * const cfp)
 {
     const VALUE *ep;
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return CFP_ZJIT_FRAME_SPECVAL(cfp);
+    }
     if (VM_ENV_BOXED_P(cfp->ep)) {
         VM_ASSERT(VM_ENV_LOCAL_P(cfp->ep));
         /* Never set black_handler for VM_FRAME_MAGIC_TOP or VM_FRAME_MAGIC_CLASS
@@ -2860,6 +2863,7 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
             const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
             if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
                 VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_ME_CREF], CFP_ZJIT_FRAME_CME(cfp));
+                VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_SPECVAL], CFP_ZJIT_FRAME_SPECVAL(cfp));
                 ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_ENV_MATERIALIZED] = 1;
             }
             cfp->pc = jit_frame->pc;
@@ -3692,6 +3696,7 @@ rb_execution_context_update(rb_execution_context_t *ec)
                 if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
                     VALUE *native_frame = (VALUE *)cfp->jit_return;
                     native_frame[ZJIT_JIT_FRAME_INDEX_CME] = rb_gc_location(native_frame[ZJIT_JIT_FRAME_INDEX_CME]);
+                    native_frame[ZJIT_JIT_FRAME_INDEX_SPECVAL] = rb_gc_location(native_frame[ZJIT_JIT_FRAME_INDEX_SPECVAL]);
                 }
                 // block_code must always be relocated. For ISEQ frames, the JIT caller
                 // may have written it (gen_block_handler_specval) for passing blocks.
@@ -3767,6 +3772,7 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
             if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
                 VALUE *native_frame = (VALUE *)cfp->jit_return;
                 rb_gc_mark_maybe(native_frame[ZJIT_JIT_FRAME_INDEX_CME]);
+                rb_gc_mark_maybe(native_frame[ZJIT_JIT_FRAME_INDEX_SPECVAL]);
             }
             // Mark block_code directly (not through rb_zjit_cfp_block_code)
             // because rb_iterate0 may write a valid ifunc after JIT frame push.

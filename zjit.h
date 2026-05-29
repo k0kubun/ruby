@@ -168,6 +168,9 @@ CFP_ZJIT_FRAME_CME(const rb_control_frame_t *cfp)
 static inline VALUE
 CFP_ZJIT_FRAME_SPECVAL(const rb_control_frame_t *cfp)
 {
+    if (CFP_ZJIT_FRAME_UNMATERIALIZED_ENV_P(cfp)) {
+        return ((VALUE *)cfp->jit_return)[ZJIT_JIT_FRAME_INDEX_SPECVAL];
+    }
     return cfp->ep[VM_ENV_DATA_INDEX_SPECVAL];
 }
 

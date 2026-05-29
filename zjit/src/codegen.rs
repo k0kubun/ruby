@@ -37,6 +37,7 @@ use crate::cast::IntoUsize;
 pub(crate) const JIT_FRAME_SIZE: usize = 5;
 const JIT_FRAME_INDEX_FRAME: i32 = -1;
 const JIT_FRAME_INDEX_CME: i32 = -2;
+const JIT_FRAME_INDEX_SPECVAL: i32 = -3;
 const JIT_FRAME_INDEX_ENV_MATERIALIZED: i32 = -5;
 const JIT_RETURN_DEFERRED_ENV: usize = 0x3;
 
@@ -2226,7 +2227,9 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
     let save_materialized_env = |asm: &mut Assembler| {
         let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
         let cme = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32));
+        let specval = asm.load(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_SPECVAL * SIZEOF_VALUE_I32));
         asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
+        asm.mov(native_slot(JIT_FRAME_INDEX_SPECVAL), specval);
         asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 1.into());
     };
 
@@ -2247,6 +2250,7 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
         // restricted to plain method frames without a block handler.
         let cme = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC));
         asm.mov(native_slot(JIT_FRAME_INDEX_CME), cme);
+        asm.mov(native_slot(JIT_FRAME_INDEX_SPECVAL), VM_BLOCK_HANDLER_NONE.into());
         asm.mov(native_slot(JIT_FRAME_INDEX_ENV_MATERIALIZED), 0.into());
         asm.jmp(done_edge.clone());
 
@@ -2950,7 +2954,9 @@ fn gen_materialize_frame_env(jit: &mut JITState, asm: &mut Assembler) {
 
     let ep = asm.load(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_EP));
     let cme = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_CME * SIZEOF_VALUE_I32));
+    let specval = asm.load(Opnd::mem(64, NATIVE_BASE_PTR, JIT_FRAME_INDEX_SPECVAL * SIZEOF_VALUE_I32));
     asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_ME_CREF * SIZEOF_VALUE_I32), cme);
+    asm.store(Opnd::mem(64, ep, VM_ENV_DATA_INDEX_SPECVAL * SIZEOF_VALUE_I32), specval);
     asm.store(materialized, 1.into());
     asm.jmp(done_edge);
 
@@ -3009,9 +3015,9 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
     if !frame.defer_env_header {
         // ep[-2]: CME
         asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), VALUE::from(frame.cme).into());
+        // ep[-1]: specval
+        asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), frame.specval);
     }
-    // ep[-1]: specval
-    asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), frame.specval);
     // ep[0]: ENV_FLAGS
     asm.store(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32), frame.frame_type.into());
 
@@ -3254,6 +3260,7 @@ c_callable! {
                 let cme = unsafe { (*cfp).pc as *const rb_callable_method_entry_t };
                 unsafe {
                     *ep.offset(VM_ENV_DATA_INDEX_ME_CREF as isize) = VALUE::from(cme);
+                    *ep.offset(VM_ENV_DATA_INDEX_SPECVAL as isize) = VALUE(VM_BLOCK_HANDLER_NONE as usize);
                 }
             }
             // gen_push_frame() doesn't set PC or ISEQ, so we need to set them before exit.
