@@ -1026,7 +1026,7 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_to_cfp_for_gc(asm, state);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -1120,7 +1120,7 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_to_cfp_for_gc(asm, state);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, state);
     gen_spill_locals(jit, asm, state);
@@ -2191,8 +2191,9 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
 
     // Publish the JITFrame slot's location via cfp->jit_return. The slot at
     // [NATIVE_BASE_PTR - 8] is left uninitialized here; the JIT design relies on
-    // gen_save_pc_for_gc() to populate it before any C call, and on cross-ractor
-    // barriers ensuring that no other ractor scans this CFP before such a call.
+    // gen_save_pc_for_gc() or gen_save_pc_to_cfp_for_gc() to populate it before
+    // any C call, and on cross-ractor barriers ensuring that no other ractor
+    // scans this CFP before such a call.
     asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), NATIVE_BASE_PTR);
 
     // Poison the JITFrame slot. It should be read only after gen_save_pc_for_gc().
@@ -2706,15 +2707,28 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_ji
     asm_comment!(asm, "save JITFrame to CFP");
     let jit_frame = JITFrame::new_iseq(next_pc, state.iseq, !iseq_may_write_block_code(state.iseq));
     asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, -SIZEOF_VALUE_I32), Opnd::const_ptr(jit_frame));
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), NATIVE_BASE_PTR);
 
     // CFP_PC for a live JIT frame routes through the JITFrame on the native
-    // stack (cfp->jit_return points to NATIVE_BASE_PTR), so we don't need to
-    // touch cfp->pc here. Poisoning cfp->pc with PC_POISON would actively
-    // break the case where rb_zjit_materialize_frames() previously copied
-    // jit_frame->pc into cfp->pc and cleared cfp->jit_return: the JIT keeps
-    // running, lands on this routine again, and the poison would replace
-    // the valid materialized pc behind the GC's back.
+    // stack, so we don't need to touch cfp->pc here.
     jit_frame
+}
+
+/// Save the current PC/ISEQ directly in the CFP without allocating JITFrame.
+/// Use this only when VM stack slots are fully materialized before the C call.
+fn gen_save_pc_to_cfp_for_gc(asm: &mut Assembler, state: &FrameState) {
+    let opcode: usize = state.get_opcode().try_into().unwrap();
+    let next_pc: *const VALUE = unsafe { state.pc.offset(insn_len(opcode) as isize) };
+
+    asm_comment!(asm, "save PC and ISEQ to CFP");
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(next_pc));
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(state.iseq).into());
+
+    if !iseq_may_write_block_code(state.iseq) {
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
+    }
+
+    asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
 }
 
 /// Save the current PC on the CFP as a preparation for calling a C function
@@ -2791,7 +2805,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
 /// writing stack slots. Otherwise spilling the stack can overwrite frame
 /// metadata below the real VM-stack base.
 fn gen_prepare_stack_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    gen_save_pc_for_gc(asm, state);
+    gen_save_pc_to_cfp_for_gc(asm, state);
     gen_save_sp(asm, state.stack_size());
     gen_spill_locals(jit, asm, state);
     gen_spill_stack(jit, asm, state);
