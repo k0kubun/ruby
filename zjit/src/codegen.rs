@@ -1461,8 +1461,7 @@ fn gen_send(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1485,8 +1484,7 @@ fn gen_send_forward(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
@@ -1509,8 +1507,7 @@ fn gen_send_without_block(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
@@ -1686,8 +1683,7 @@ fn gen_invokeblock(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     asm_comment!(asm, "call invokeblock");
     unsafe extern "C" {
@@ -1712,8 +1708,7 @@ fn gen_invokeblock_ifunc(
 ) -> lir::Opnd {
     let _ = cd; // cd is not needed for the direct call
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     // Push args to memory so we can pass argv pointer
     let argv_ptr = gen_push_opnds(jit, asm, &args);
@@ -1743,8 +1738,7 @@ fn gen_invokeproc(
     kw_splat: bool,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     asm_comment!(asm, "call invokeproc");
 
@@ -1773,8 +1767,7 @@ fn gen_invokesuper(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
     asm_comment!(asm, "call super with dynamic dispatch");
     unsafe extern "C" {
         fn rb_vm_invokesuper(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1797,8 +1790,7 @@ fn gen_invokesuperforward(
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
 
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
     asm_comment!(asm, "call super with dynamic dispatch (forwarding)");
     unsafe extern "C" {
         fn rb_vm_invokesuperforward(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1920,8 +1912,7 @@ fn gen_opt_newarray_hash(
     state: &FrameState,
 ) -> lir::Opnd {
     // `Array#hash` will hash the elements of the array.
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     let array_len: c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
 
@@ -1947,8 +1938,7 @@ fn gen_array_max(
     elements: Vec<Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     let array_len: u32 = elements.len().try_into().expect("Unable to fit length of elements into u32");
 
@@ -1974,8 +1964,7 @@ fn gen_array_min(
     elements: Vec<Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     let array_len: u32 = elements.len().try_into().expect("Unable to fit length of elements into u32");
 
@@ -2001,8 +1990,7 @@ fn gen_array_include(
     target: Opnd,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     let array_len: c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
 
@@ -2030,8 +2018,7 @@ fn gen_array_pack_buffer(
     buffer: Option<Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
-    gen_prepare_non_leaf_call(jit, asm, state);
-    gen_spill_stack(jit, asm, state); // pass arguments through the VM stack
+    gen_prepare_stack_call(jit, asm, state);
 
     let array_len: c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
 
@@ -2738,12 +2725,13 @@ fn gen_save_pc_for_gc(asm: &mut Assembler, state: &FrameState) -> *const zjit_ji
 /// because the backend spills all live registers onto the C stack on CCall.
 /// However, to avoid marking uninitialized stack slots, this also updates SP,
 /// which may have cfp->sp for a past frame or a past non-leaf call.
-fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) {
-    gen_save_pc_for_gc(asm, state);
+fn gen_prepare_call_with_gc(asm: &mut Assembler, state: &FrameState, leaf: bool) -> *const zjit_jit_frame {
+    let jit_frame = gen_save_pc_for_gc(asm, state);
     gen_save_sp(asm, state.stack_size());
     if leaf {
         asm.expect_leaf_ccall(state.stack_size());
     }
+    jit_frame
 }
 
 fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
@@ -2797,6 +2785,18 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
     }
 }
 
+/// Prepare for VM helpers that read arguments from the VM stack.
+///
+/// Direct JIT-to-JIT calls keep cfp->sp lazy, so this must publish SP before
+/// writing stack slots. Otherwise spilling the stack can overwrite frame
+/// metadata below the real VM-stack base.
+fn gen_prepare_stack_call(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+    gen_save_pc_for_gc(asm, state);
+    gen_save_sp(asm, state.stack_size());
+    gen_spill_locals(jit, asm, state);
+    gen_spill_stack(jit, asm, state);
+}
+
 fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: &FrameState, stack_size: usize, jit_frame: *const zjit_jit_frame) {
     let mut stack = Vec::new();
     for &insn_id in state.stack().take(stack_size) {
@@ -2814,11 +2814,12 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
     // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
-    gen_prepare_call_with_gc(asm, state, false);
+    let jit_frame = gen_prepare_call_with_gc(asm, state, false);
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
     //gen_spill_stack(jit, asm, state);
+    gen_stack_map(jit, asm, state, state.stack_size(), jit_frame);
 
     // Spill locals in case the method looks at caller Bindings
     gen_spill_locals(jit, asm, state);
