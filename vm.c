@@ -3655,11 +3655,15 @@ rb_execution_context_update(rb_execution_context_t *ec)
         rb_control_frame_t *cfp = ec->cfp;
         rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
 
-        for (i = 0; i < (long)(sp - p); i++) {
-            VALUE ref = p[i];
-            VALUE update = rb_gc_location(ref);
-            if (ref != update) {
-                p[i] = update;
+        // ZJIT leaves uninitialized slots on the VM stack, so we cannot
+        // safely use rb_gc_location on such slots.
+        if (!rb_zjit_enabled_p) {
+            for (i = 0; i < (long)(sp - p); i++) {
+                VALUE ref = p[i];
+                VALUE update = rb_gc_location(ref);
+                if (ref != update) {
+                    p[i] = update;
+                }
             }
         }
 
@@ -3721,6 +3725,8 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
 
         for (long i = 0; i < (long)(sp - p); i++) {
             if (rb_zjit_enabled_p) {
+                // ZJIT leaves uninitialized slots on the VM stack, so we need
+                // to mark such slots conservatively.
                 rb_gc_mark_maybe(p[i]);
             }
             else {
