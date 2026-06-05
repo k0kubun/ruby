@@ -8685,7 +8685,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
     let opt_num: usize = params.opt_num.try_into().expect("iseq param opt_num >= 0");
     let lead_num: usize = params.lead_num.try_into().expect("iseq param lead_num >= 0");
     let passed_opt_num = jit_entry_idx;
-    let materialize_locals = crate::invariants::iseq_escapes_ep(iseq);
+    let iseq_escapes_ep = crate::invariants::iseq_escapes_ep(iseq);
 
     // If the iseq has keyword parameters, the keyword bits local will be appended to the local table.
     let kw_bits_idx: Option<usize> = if unsafe { rb_get_iseq_flags_has_kw(iseq) } {
@@ -8741,7 +8741,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         // Once an ISEQ has escaped EP, HIR getlocal may need to read from the
         // VM frame instead of FrameState. Direct JIT-to-JIT entry passes locals
         // as C arguments, so initialize the frame slots here before such reads.
-        if materialize_locals {
+        if iseq_escapes_ep {
             let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
             let local_id = unsafe { rb_zjit_local_id(iseq, local_idx.try_into().unwrap()) };
             let ep = *ep.get_or_insert_with(|| fun.push_insn(jit_entry_block, Insn::GetEP { level: 0 }));

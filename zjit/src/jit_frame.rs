@@ -121,6 +121,29 @@ mod tests {
         "), @"1");
     }
 
+    // Direct JIT-to-JIT entry passes callee locals as native arguments. If the
+    // callee ISEQ has already escaped EP, later getlocal reads use EP memory,
+    // so JIT entry must materialize those locals into the callee frame.
+    #[test]
+    fn test_jit_entry_materializes_ep_escaped_locals() {
+        assert_snapshot!(inspect("
+            def poison(*) = nil
+
+            def victim(a, b, c)
+              lambda { a }
+              a
+            end
+
+            def jit_entry
+              poison([], [], [], [])
+              victim(:expected, 1, 2)
+            end
+
+            jit_entry
+            Array.new(100) { jit_entry }.uniq
+        "), @"[:expected]");
+    }
+
     // Materialize frames on side exit: a type guard triggers a side exit with
     // multiple JIT frames on the stack. All frames must be materialized before
     // the interpreter resumes.
