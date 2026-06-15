@@ -879,6 +879,10 @@ impl Assembler {
                     mov(cb, dest.into(), src.into());
                 },
 
+                Insn::MaterializeStackMap { .. } => {
+                    unreachable!("MaterializeStackMap should be removed before emit");
+                },
+
                 // Load effective address
                 Insn::Lea { opnd, out } => {
                     lea(cb, out.into(), opnd.into());
@@ -1154,7 +1158,10 @@ impl Assembler {
             }
 
             let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
-            let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
+            let materialized_stack_map_vregs = trace_compile_phase("materialized_stack_map_vregs", || asm.materialized_stack_map_vregs());
+            let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || {
+                asm.linear_scan_with_forced_stack_allocations(intervals.clone(), regs.len(), &preferred_registers, &materialized_stack_map_vregs)
+            });
 
             let total_stack_slots = asm.stack_base_idx + num_stack_slots;
             if total_stack_slots > Self::MAX_FRAME_STACK_SLOTS {
@@ -1196,6 +1203,7 @@ impl Assembler {
 
             trace_compile_phase("resolve_ssa", || {
                 asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS, total_stack_slots);
+                asm.materialize_stack_maps(&assignments);
                 asm.resolve_ssa(&intervals, &assignments);
             });
 

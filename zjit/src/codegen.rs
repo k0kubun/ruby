@@ -67,6 +67,10 @@ struct JITState {
     jit_frame_size: usize,
 }
 
+struct StackMapState {
+    stack: Vec<InsnId>,
+}
+
 impl JITState {
     /// Create a new JITState instance
     fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, jit_frame_size: usize) -> Self {
@@ -1569,11 +1573,11 @@ fn gen_push_inline_frame(
     // Save cfp->pc and cfp->sp for the caller frame.
     // Cannot use gen_prepare_non_leaf_call because we need special SP math.
     let stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
-    gen_save_pc_for_gc(asm, state, 0);
+    let jit_frame = gen_save_pc_for_gc(asm, state, stack_size);
     gen_save_sp(asm, stack_size);
 
     gen_spill_locals(jit, asm, state);
-    gen_spill_stack(jit, asm, state);
+    gen_stack_map(jit, asm, StackMapState::current(state).take(stack_size), jit_frame, true);
 
     // This mirrors vm_caller_setup_arg_block() for the `blockiseq != NULL` case.
     // The HIR specialization guards ensure we will only reach here for literal blocks,
@@ -1710,7 +1714,7 @@ fn gen_send_iseq_direct(
     gen_save_sp(asm, stack_size);
 
     gen_spill_locals(jit, asm, state);
-    gen_stack_map(jit, asm, state, stack_size, jit_frame);
+    gen_stack_map(jit, asm, StackMapState::current(state).take(stack_size), jit_frame, false);
 
     // This mirrors vm_caller_setup_arg_block() in for the `blockiseq != NULL` case.
     // The HIR specialization guards ensure we will only reach here for literal blocks,
@@ -2995,15 +2999,30 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
 /// Record the Ruby stack values needed to materialize this frame after the next
 /// non-leaf C call. The actual JITFrame entries are encoded by the register
 /// allocator, where VReg locations on the native stack are known.
-fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: &FrameState, stack_size: usize, jit_frame: *const zjit_jit_frame) {
+impl StackMapState {
+    fn current(state: &FrameState) -> Self {
+        StackMapState { stack: state.stack().copied().collect() }
+    }
+
+    fn take(mut self, stack_size: usize) -> Self {
+        self.stack.truncate(stack_size);
+        self
+    }
+}
+
+fn gen_stack_map(jit: &JITState, asm: &mut Assembler, state: StackMapState, jit_frame: *const zjit_jit_frame, materialize_now: bool) {
     let mut stack = Vec::new();
-    for &insn_id in state.stack().take(stack_size) {
+    for insn_id in state.stack {
         let opnd = jit.get_opnd(insn_id);
-        // JITFrame only supports materializing Opnd::Value or Opnd::VReg out of the frame
-        assert!(matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }), "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}");
+        // JITFrame only supports materializing immediate VALUEs or VRegs out of the frame
+        assert!(matches!(opnd, Opnd::Value(_) | Opnd::UImm(_) | Opnd::VReg { .. }), "FrameState should only reference Opnd::Value, Opnd::UImm, or Opnd::VReg, but got: {opnd:?}");
         stack.push(opnd);
     }
-    asm.stack_map(stack, jit_frame);
+    if materialize_now {
+        asm.materialize_stack_map(stack, jit_frame);
+    } else {
+        asm.stack_map(stack, jit_frame);
+    }
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.
@@ -3016,7 +3035,7 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
 
     // Spill the virtual stack in case it raises an exception
     // and the interpreter uses the stack for handling the exception
-    gen_stack_map(jit, asm, state, state.stack_size(), jit_frame);
+    gen_stack_map(jit, asm, StackMapState::current(state), jit_frame, false);
 
     // Spill locals in case the method looks at caller Bindings
     gen_spill_locals(jit, asm, state);

@@ -808,6 +808,9 @@ pub enum Insn {
     // A low-level mov instruction. It accepts two operands.
     Mov { dest: Opnd, src: Opnd },
 
+    /// Materialize a JITFrame stack map outside a CCall.
+    MaterializeStackMap { stack_map: StackMap },
+
     // Perform the NOT operation on an individual operand, and return the result
     // as a new operand. This operand can then be used as the operand on another
     // instruction.
@@ -946,6 +949,9 @@ macro_rules! for_each_operand_impl {
                     visit_many!(stack);
                 }
             }
+            Insn::MaterializeStackMap { stack_map: StackMap { stack, .. } } => {
+                visit_many!(stack);
+            }
             // only iterate over preserved in the const iterator
             #[allow(unused_variables)]
             Insn::FrameSetup { preserved, .. } |
@@ -1067,6 +1073,7 @@ impl Insn {
             Insn::LoadInto { .. } => "LoadInto",
             Insn::LoadSExt { .. } => "LoadSExt",
             Insn::LShift { .. } => "LShift",
+            Insn::MaterializeStackMap { .. } => "MaterializeStackMap",
             Insn::Mov { .. } => "Mov",
             Insn::Not { .. } => "Not",
             Insn::Or { .. } => "Or",
@@ -1400,6 +1407,41 @@ pub struct StackMap {
     /// Heap-allocated JITFrame whose trailing stack map storage receives the
     /// encoded entries once this CCall's register allocation is known.
     jit_frame: *const zjit_jit_frame,
+}
+
+impl StackMap {
+    fn encode_stack_slot(stack_idx: usize) -> VALUE {
+        let encoded = (stack_idx << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_VREG_TAG as usize;
+        debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap VReg should not look like an immediate VALUE");
+        VALUE(encoded)
+    }
+
+    fn encode_opnd(&self, idx: usize, stack_opnd: &Opnd, stack_slot: Option<usize>) -> VALUE {
+        match stack_opnd {
+            Opnd::UImm(value) => {
+                let value = VALUE(*value as usize);
+                assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
+                value
+            }
+            Opnd::Value(value) => {
+                assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
+                *value
+            }
+            Opnd::VReg { .. } => Self::encode_stack_slot(stack_slot.unwrap_or_else(|| {
+                panic!("StackMap VReg at index {idx} should have a native stack slot")
+            })),
+            _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
+        }
+    }
+
+    fn write_entries(&self, stack_slots: &[Option<usize>]) {
+        assert_eq!(unsafe { (*self.jit_frame).stack_size } as usize, self.stack.len());
+        assert_eq!(stack_slots.len(), self.stack.len());
+        for (idx, stack_opnd) in self.stack.iter().enumerate() {
+            let entry = self.encode_opnd(idx, stack_opnd, stack_slots[idx]);
+            unsafe { (*self.jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
+        }
+    }
 }
 
 /// Initial capacity for asm.insns vector
@@ -1813,6 +1855,26 @@ impl Assembler
         preferred
     }
 
+    /// Discover VRegs that need persistent native stack slots for stack maps
+    /// that are materialized before a CCall can temporarily push live registers.
+    pub fn materialized_stack_map_vregs(&self) -> HashSet<usize> {
+        let mut vregs = HashSet::default();
+
+        for block in &self.basic_blocks {
+            for insn in &block.insns {
+                if let Insn::MaterializeStackMap { stack_map: StackMap { stack, .. } } = insn {
+                    for opnd in stack {
+                        if let Opnd::VReg { idx: VRegId(vreg_id), .. } = opnd {
+                            vregs.insert(*vreg_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        vregs
+    }
+
     // TODO: We want to make the following refactoring so that we DON'T have
     // to parcopy in to entry blocks
     //
@@ -1825,6 +1887,21 @@ impl Assembler
         intervals: Vec<Interval>,
         num_registers: usize,
         preferred_registers: &[Option<Reg>],
+    ) -> (Vec<Option<Allocation>>, usize) {
+        self.linear_scan_with_forced_stack_allocations(
+            intervals,
+            num_registers,
+            preferred_registers,
+            &HashSet::default(),
+        )
+    }
+
+    pub fn linear_scan_with_forced_stack_allocations(
+        &self,
+        intervals: Vec<Interval>,
+        num_registers: usize,
+        preferred_registers: &[Option<Reg>],
+        forced_stack_allocations: &HashSet<usize>,
     ) -> (Vec<Option<Allocation>>, usize) {
         assert_eq!(preferred_registers.len(), intervals.len());
 
@@ -1869,6 +1946,12 @@ impl Assembler
                     false
                 }
             });
+
+            if forced_stack_allocations.contains(&interval.id) {
+                assignment[interval.id] = Some(Allocation::Stack(num_stack_slots));
+                num_stack_slots += 1;
+                continue;
+            }
 
             let preferred_reg = preferred_registers[interval.id];
             let preferred_taken = preferred_reg.is_some_and(|reg| {
@@ -2193,56 +2276,42 @@ impl Assembler
                         new_ids.push(None);
                     }
 
-                    if let Some(StackMap { stack, jit_frame }) = stack_map {
-                        assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
-                        for (idx, stack_opnd) in stack.iter().enumerate() {
-                            let entry = match stack_opnd {
-                                Opnd::UImm(value) => {
-                                    let value = VALUE(*value as usize);
-                                    // TODO: Investigate using a constant pool to track any value reference in the stack map
-                                    assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
-                                    value
-                                }
-                                Opnd::VReg { idx: VRegId(vreg_id), .. } => {
-                                    // Calculate the offset from NATIVE_BASE_PTR to the stack slot for this VReg.
-                                    let vreg_stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
-                                        Allocation::Reg(_) | Allocation::Fixed(_) => {
-                                            let position = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
-                                            // See Assembler::alloc_stack's native stack diagram. rb_zjit_materialize_frames()
-                                            // reads vreg_stack_index as cfp->jit_return[-vreg_stack_index].
-                                            // For both arches, FrameSetup may add one native stack slot for
-                                            // alignment before these CPushPairs.
-                                            // TODO: Centralize stack slot offset calculation in StackState.
-                                            let frame_alignment_slots = if total_stack_slots % 2 == 1 {
-                                                1
-                                            } else {
-                                                0
-                                            };
-                                            (total_stack_slots + frame_alignment_slots)
-                                                .checked_add(1)
-                                                .expect("StackMap requires a JITFrame slot")
-                                                + position
-                                        }
-                                        Allocation::Stack(stack_idx) => {
-                                            // StackState places allocator spills at:
-                                            //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
-                                            // so encode the matching materializer index.
-                                            self.stack_base_idx
-                                                .checked_add(1)
-                                                .expect("StackMap requires a JITFrame slot")
-                                                + stack_idx
-                                        }
-                                    };
-
-                                    // Encode the offset as a shifted-and-tagged integer.
-                                    let encoded = (vreg_stack_index << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_VREG_TAG as usize;
-                                    debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap VReg should not look like an immediate VALUE");
-                                    VALUE(encoded)
-                                }
-                                _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
-                            };
-                            unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
+                    if let Some(stack_map) = stack_map {
+                        let mut stack_slots = vec![None; stack_map.stack.len()];
+                        for (idx, stack_opnd) in stack_map.stack.iter().enumerate() {
+                            if let Opnd::VReg { idx: VRegId(vreg_id), .. } = stack_opnd {
+                                // Calculate the offset from NATIVE_BASE_PTR to the stack slot for this VReg.
+                                stack_slots[idx] = Some(match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
+                                    Allocation::Reg(_) | Allocation::Fixed(_) => {
+                                        let position = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
+                                        // See Assembler::alloc_stack's native stack diagram. rb_zjit_materialize_frames()
+                                        // reads vreg_stack_index as cfp->jit_return[-vreg_stack_index].
+                                        // For both arches, FrameSetup may add one native stack slot for
+                                        // alignment before these CPushPairs.
+                                        // TODO: Centralize stack slot offset calculation in StackState.
+                                        let frame_alignment_slots = if total_stack_slots % 2 == 1 {
+                                            1
+                                        } else {
+                                            0
+                                        };
+                                        (total_stack_slots + frame_alignment_slots)
+                                            .checked_add(1)
+                                            .expect("StackMap requires a JITFrame slot")
+                                            + position
+                                    }
+                                    Allocation::Stack(stack_idx) => {
+                                        // StackState places allocator spills at:
+                                        //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
+                                        // so encode the matching materializer index.
+                                        self.stack_base_idx
+                                            .checked_add(1)
+                                            .expect("StackMap requires a JITFrame slot")
+                                            + stack_idx
+                                    }
+                                });
+                            }
                         }
+                        stack_map.write_entries(&stack_slots);
                     }
 
                     // Extract arguments from CCall, clear opnds
@@ -2347,6 +2416,9 @@ impl Assembler
     fn rewrite_instructions(&mut self, assignments: &[Option<Allocation>]) {
         for block_id in self.block_order() {
             for insn in self.basic_blocks[block_id.0].insns.iter_mut() {
+                if matches!(insn, Insn::MaterializeStackMap { .. }) {
+                    continue;
+                }
                 insn.for_each_operand_mut(|opnd| {
                     Self::rewrite_opnd(opnd, assignments);
                 });
@@ -2354,6 +2426,45 @@ impl Assembler
                     Self::rewrite_opnd(out, assignments);
                 }
             }
+        }
+    }
+
+    pub fn materialize_stack_maps(&mut self, assignments: &[Option<Allocation>]) {
+        let stack_base_idx = self.stack_base_idx;
+        for block_id in self.block_order() {
+            let block = &mut self.basic_blocks[block_id.0];
+            let old_insns = take(&mut block.insns);
+            let old_ids = take(&mut block.insn_ids);
+
+            let mut new_insns = Vec::with_capacity(old_insns.len());
+            let mut new_ids = Vec::with_capacity(old_ids.len());
+
+            for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
+                if let Insn::MaterializeStackMap { stack_map } = insn {
+                    let mut stack_slots = vec![None; stack_map.stack.len()];
+                    for (idx, stack_opnd) in stack_map.stack.iter().enumerate() {
+                        if let Opnd::VReg { idx: VRegId(vreg_id), .. } = stack_opnd {
+                            stack_slots[idx] = Some(match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
+                                Allocation::Stack(stack_idx) => stack_base_idx
+                                    .checked_add(1)
+                                    .expect("StackMap requires a JITFrame slot")
+                                    + stack_idx,
+                                Allocation::Reg(_) | Allocation::Fixed(_) => {
+                                    panic!("MaterializeStackMap VReg should be allocated to a stack slot")
+                                }
+                            });
+                        }
+                    }
+                    stack_map.write_entries(&stack_slots);
+                } else {
+                    new_insns.push(insn);
+                    new_ids.push(insn_id);
+                }
+            }
+
+            let block = &mut self.basic_blocks[block_id.0];
+            block.insns = new_insns;
+            block.insn_ids = new_ids;
         }
     }
 
@@ -3596,6 +3707,12 @@ impl Assembler {
         self.stack_map = Some(StackMap { stack, jit_frame });
     }
 
+    pub fn materialize_stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame) {
+        self.push_insn(Insn::MaterializeStackMap {
+            stack_map: StackMap { stack, jit_frame },
+        });
+    }
+
     pub fn store(&mut self, dest: Opnd, src: Opnd) {
         assert!(!matches!(dest, Opnd::VReg { .. }), "Destination of store must not be Opnd::VReg, got: {dest:?}");
         self.push_insn(Insn::Store { dest, src });
@@ -4220,6 +4337,35 @@ mod tests {
         assert_eq!(assignments[r13_idx.0], Some(Allocation::Reg(0)));
         assert_eq!(assignments[r14_idx.0], Some(Allocation::Stack(2)));
         assert_eq!(assignments[r15_idx.0], Some(Allocation::Reg(0)));
+    }
+
+    #[test]
+    fn test_linear_scan_forced_stack_allocation() {
+        let mut asm = Assembler::new();
+        let block = asm.new_block(hir::BlockId(0), true, 0);
+        asm.set_current_block(block);
+        let label = asm.new_label("bb0");
+        asm.write_label(label);
+
+        let vreg = asm.load(Opnd::UImm(1));
+        asm.materialize_stack_map(vec![vreg], std::ptr::null());
+        asm.cret(0.into());
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let intervals = asm.build_intervals(live_in);
+        let preferred_registers = asm.preferred_register_assignments(&intervals);
+        let forced_stack_allocations = asm.materialized_stack_map_vregs();
+        let (assignments, num_stack_slots) = asm.linear_scan_with_forced_stack_allocations(
+            intervals,
+            5,
+            &preferred_registers,
+            &forced_stack_allocations,
+        );
+
+        assert_eq!(forced_stack_allocations, HashSet::from([vreg.vreg_idx().0]));
+        assert_eq!(num_stack_slots, 1);
+        assert_eq!(assignments[vreg.vreg_idx().0], Some(Allocation::Stack(0)));
     }
 
     #[test]
