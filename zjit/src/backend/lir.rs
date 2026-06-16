@@ -1366,17 +1366,56 @@ impl Allocation {
 pub struct StackState {
     /// Copy of Assembler::stack_base_idx. Used for calculating stack slot offsets.
     stack_base_idx: usize,
+    /// Number of stack slots assigned by the register allocator.
+    spill_stack_slots: usize,
 }
 
 impl StackState {
-    /// Initialize a stack allocator
+    /// Initialize StackState before register allocation has assigned spill slots.
     pub(super) fn new(stack_base_idx: usize) -> Self {
-        StackState { stack_base_idx }
+        StackState { stack_base_idx, spill_stack_slots: 0 }
+    }
+
+    /// Initialize a stack allocator after register allocation has assigned
+    /// spill slots.
+    pub(super) fn with_spill_slots(stack_base_idx: usize, spill_stack_slots: usize) -> Self {
+        StackState { stack_base_idx, spill_stack_slots }
+    }
+
+    /// Number of native stack slots reserved by FrameSetup before alignment.
+    pub(super) fn total_stack_slots(&self) -> usize {
+        self.stack_base_idx
+            .checked_add(self.spill_stack_slots)
+            .expect("stack slot index calculation overflowed")
+    }
+
+    /// Number of extra slots FrameSetup needs to keep the native stack aligned.
+    fn frame_alignment_slots(&self) -> usize {
+        self.total_stack_slots() % 2
+    }
+
+    /// Convert an allocator spill slot to the index used by
+    /// `cfp->jit_return[-index]`.
+    fn spill_slot_index(&self, stack_idx: usize) -> usize {
+        self.stack_base_idx
+            .checked_add(1)
+            .and_then(|index| index.checked_add(stack_idx))
+            .expect("stack slot index calculation overflowed")
+    }
+
+    /// Convert a caller-saved register position to the index used by
+    /// `cfp->jit_return[-index]`.
+    fn caller_saved_slot_index(&self, save_idx: usize) -> usize {
+        self.total_stack_slots()
+            .checked_add(self.frame_alignment_slots())
+            .and_then(|index| index.checked_add(1))
+            .and_then(|index| index.checked_add(save_idx))
+            .expect("stack slot index calculation overflowed")
     }
 
     /// Convert a stack index to the `disp` of the stack slot
     fn stack_idx_to_disp(&self, stack_idx: usize) -> i32 {
-        (self.stack_base_idx + stack_idx + 1) as i32 * -SIZEOF_VALUE_I32
+        self.spill_slot_index(stack_idx) as i32 * -SIZEOF_VALUE_I32
     }
     /// Convert MemBase::Stack to Mem
     pub(super) fn stack_membase_to_mem(&self, membase: MemBase) -> Mem {
@@ -2124,7 +2163,7 @@ impl Assembler
         intervals: &[Interval],
         assignments: &[Option<Allocation>],
         regs: &[Reg],
-        total_stack_slots: usize,
+        stack_state: &StackState,
     ) {
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, ALLOC_REGS};
@@ -2204,33 +2243,16 @@ impl Assembler
                                     value
                                 }
                                 Opnd::VReg { idx: VRegId(vreg_id), .. } => {
-                                    // Calculate the offset from NATIVE_BASE_PTR to the stack slot for this VReg.
+                                    // Calculate the materializer index for this VReg.
                                     let vreg_stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
                                         Allocation::Reg(_) | Allocation::Fixed(_) => {
                                             let position = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
                                             // See Assembler::alloc_stack's native stack diagram. rb_zjit_materialize_frames()
                                             // reads vreg_stack_index as cfp->jit_return[-vreg_stack_index].
-                                            // For both arches, FrameSetup may add one native stack slot for
-                                            // alignment before these CPushPairs.
-                                            // TODO: Centralize stack slot offset calculation in StackState.
-                                            let frame_alignment_slots = if total_stack_slots % 2 == 1 {
-                                                1
-                                            } else {
-                                                0
-                                            };
-                                            (total_stack_slots + frame_alignment_slots)
-                                                .checked_add(1)
-                                                .expect("StackMap requires a JITFrame slot")
-                                                + position
+                                            stack_state.caller_saved_slot_index(position)
                                         }
                                         Allocation::Stack(stack_idx) => {
-                                            // StackState places allocator spills at:
-                                            //   cfp->jit_return[-(self.stack_base_idx + stack_idx + 1)]
-                                            // so encode the matching materializer index.
-                                            self.stack_base_idx
-                                                .checked_add(1)
-                                                .expect("StackMap requires a JITFrame slot")
-                                                + stack_idx
+                                            stack_state.spill_slot_index(stack_idx)
                                         }
                                     };
 
@@ -4529,7 +4551,7 @@ mod tests {
         let intervals = asm.build_intervals(live_in);
         let num_regs = 2;
         let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, _) = asm.linear_scan(intervals.clone(), num_regs, &preferred_registers);
+        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), num_regs, &preferred_registers);
 
         let regs = &ALLOC_REGS[..num_regs];
 
@@ -4541,7 +4563,8 @@ mod tests {
             "v1 should be in a register");
 
         // Run the pipeline: handle_caller_saved_regs then resolve_ssa
-        asm.handle_caller_saved_regs(&intervals, &assignments, regs, 0);
+        let stack_state = StackState::with_spill_slots(asm.stack_base_idx, num_stack_slots);
+        asm.handle_caller_saved_regs(&intervals, &assignments, regs, &stack_state);
         asm.resolve_ssa(&intervals, &assignments);
 
         let insns = &asm.basic_blocks[b1.0].insns;

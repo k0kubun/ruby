@@ -1156,7 +1156,8 @@ impl Assembler {
             let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
             let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
 
-            let total_stack_slots = asm.stack_base_idx + num_stack_slots;
+            let stack_state = StackState::with_spill_slots(asm.stack_base_idx, num_stack_slots);
+            let total_stack_slots = stack_state.total_stack_slots();
             if total_stack_slots > Self::MAX_FRAME_STACK_SLOTS {
                 return Err(CompileError::NativeStackTooLarge);
             }
@@ -1195,7 +1196,7 @@ impl Assembler {
             });
 
             trace_compile_phase("resolve_ssa", || {
-                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS, total_stack_slots);
+                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS, &stack_state);
                 asm.resolve_ssa(&intervals, &assignments);
             });
 
