@@ -4,7 +4,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{local_size_and_idx_to_ep_offset, perf_symbol_range_start, perf_symbol_range_end};
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame};
+use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -943,7 +943,11 @@ macro_rules! for_each_operand_impl {
             Insn::CCall { opnds, stack_map, .. } => {
                 visit_many!(opnds);
                 if let Some(StackMap { stack, .. }) = stack_map {
-                    visit_many!(stack);
+                    for entry in stack {
+                        if let StackMapEntry::Opnd(opnd) = entry {
+                            visit_one!(opnd);
+                        }
+                    }
                 }
             }
             // only iterate over preserved in the const iterator
@@ -1493,15 +1497,22 @@ impl StackState {
 #[derive(Clone, Debug)]
 pub struct StackMap {
     /// Ruby stack slots to reconstruct if this frame is materialized.
-    /// Each operand must be either an immediate Ruby VALUE or a VReg whose
-    /// final register/spill location will be encoded after register allocation.
-    stack: Vec<Opnd>,
+    stack: Vec<StackMapEntry>,
     /// Heap-allocated JITFrame whose trailing stack map storage receives the
     /// encoded entries once this CCall's register allocation is known.
     jit_frame: *const zjit_jit_frame,
     /// Inlining depth of the frame whose stack is described by this map.
     /// Stack-map indexes are decoded from that frame's cfp->jit_return.
     frame_depth: usize,
+}
+
+/// Entry in a JITFrame stack map.
+#[derive(Clone, Copy, Debug)]
+pub enum StackMapEntry {
+    /// Immediate Ruby VALUE or VReg to materialize.
+    Opnd(Opnd),
+    /// Number of VM stack slots to skip when materializing across inlined frames.
+    Skip(usize),
 }
 
 /// Initial capacity for asm.insns vector
@@ -2257,8 +2268,8 @@ impl Assembler
 
                     // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
                     let stack_vreg_ids: HashSet<usize> = if let Some(StackMap { stack, .. }) = &stack_map {
-                        stack.iter().filter_map(|opnd| match opnd {
-                            Opnd::VReg { idx: VRegId(vreg_id), .. } => Some(*vreg_id),
+                        stack.iter().filter_map(|entry| match entry {
+                            StackMapEntry::Opnd(Opnd::VReg { idx: VRegId(vreg_id), .. }) => Some(*vreg_id),
                             _ => None,
                         }).collect()
                     } else {
@@ -2302,18 +2313,23 @@ impl Assembler
 
                     if let Some(StackMap { stack, jit_frame, frame_depth }) = stack_map {
                         assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
-                        for (idx, stack_opnd) in stack.iter().enumerate() {
-                            let entry = match stack_opnd {
-                                Opnd::UImm(value) => {
-                                    let value = VALUE(*value as usize);
+                        for (idx, stack_entry) in stack.iter().enumerate() {
+                            let entry = match *stack_entry {
+                                StackMapEntry::Opnd(Opnd::UImm(value)) => {
+                                    let value = VALUE(value as usize);
                                     // TODO: Investigate using a constant pool to track any value reference in the stack map
                                     assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
                                     value
                                 }
-                                Opnd::VReg { idx: VRegId(vreg_id), .. } => {
-                                    let vreg_stack_index = match assignments[*vreg_id].expect("StackMap VReg should have an allocation") {
+                                StackMapEntry::Skip(size) => {
+                                    let encoded = (size << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_SKIP_TAG as usize;
+                                    debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap skip should not look like an immediate VALUE");
+                                    VALUE(encoded)
+                                }
+                                StackMapEntry::Opnd(Opnd::VReg { idx: VRegId(vreg_id), .. }) => {
+                                    let vreg_stack_index = match assignments[vreg_id].expect("StackMap VReg should have an allocation") {
                                         Allocation::Reg(_) | Allocation::Fixed(_) => {
-                                            let caller_saved_reg_idx = survivors.iter().position(|&survivor_id| survivor_id == *vreg_id).unwrap();
+                                            let caller_saved_reg_idx = survivors.iter().position(|&survivor_id| survivor_id == vreg_id).unwrap();
                                             let stack_idx = self.stack_state.stack_idx_for_caller_saved_reg(caller_saved_reg_idx);
                                             self.stack_state.stack_map_index_for_spill(stack_idx, frame_depth)
                                         }
@@ -2327,7 +2343,7 @@ impl Assembler
                                     debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap VReg should not look like an immediate VALUE");
                                     VALUE(encoded)
                                 }
-                                _ => unreachable!("unexpected operand in StackMap: {stack_opnd:?}"),
+                                _ => unreachable!("unexpected entry in StackMap: {stack_entry:?}"),
                             };
                             unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
                         }
@@ -3684,7 +3700,7 @@ impl Assembler {
     /// HIR function currently reserves multiple native JITFrame slots, one per
     /// inlining depth, stack-map indexes must be encoded relative to the target
     /// frame's own cfp->jit_return.
-    pub fn stack_map(&mut self, stack: Vec<Opnd>, jit_frame: *const zjit_jit_frame, frame_depth: usize) {
+    pub fn stack_map(&mut self, stack: Vec<StackMapEntry>, jit_frame: *const zjit_jit_frame, frame_depth: usize) {
         assert!(self.stack_map.is_none());
         self.stack_map = Some(StackMap { stack, jit_frame, frame_depth });
     }

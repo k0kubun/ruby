@@ -2821,6 +2821,13 @@ impl Function {
         }
     }
 
+    pub fn frame_states(&self) -> Vec<Option<FrameState>> {
+        self.insns.iter().map(|insn| match insn {
+            Insn::Snapshot { state } => Some(state.clone()),
+            _ => None,
+        }).collect()
+    }
+
     /// Return the inlining depth recorded on the `Snapshot` at the given
     /// instruction index. This peeks the field directly so callers that only
     /// need the depth avoid cloning the whole `FrameState`, including its stack
@@ -4549,6 +4556,7 @@ impl Function {
                 // callee sits one level deeper (caller_depth + 1).
                 let caller_depth = self.frame_depth(state);
 
+                let caller_stack_size = call_state.stack_size() - args.len() - 1; // -1 for receiver
                 let mode = AddIseqMode::Inlined { return_block: continuation, caller: state, depth: caller_depth + 1 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -4695,6 +4703,20 @@ impl Function {
 
                 // The original SendDirect result is now the continuation's return value param.
                 self.make_equal_to(send_insn_id, return_val_param);
+
+                // Reuse the consumed SendDirect slot for the post-send caller Snapshot metadata.
+                // It no longer lives in the CFG, but JITState::frame_states can still find it.
+                let caller = send_insn_id;
+                self.insns[caller.0] = Insn::Snapshot { state: call_state.with_stack_size(caller_stack_size) };
+                self.insn_types[caller.0] = types::Any;
+                for insn in &mut self.insns[pre_insns_len..] {
+                    match insn {
+                        Insn::Snapshot { state: frame_state } if frame_state.caller == Some(state) => {
+                            frame_state.caller = Some(caller);
+                        }
+                        _ => {}
+                    }
+                }
 
                 // Insert PushLightweightFrame and jump to callee body entry.
                 self.push_insn(block, Insn::PushInlineFrame {
@@ -6891,7 +6913,7 @@ pub struct FrameState {
     stack: Vec<InsnId>,
     locals: Vec<InsnId>,
 
-    /// `InsnId` of the caller's call-site `Snapshot` for inlined frames; `None`
+    /// `InsnId` of the caller's post-send `Snapshot` for inlined frames; `None`
     /// for non-inlined frames. Stored as an instruction reference rather than
     /// an owned `FrameState` so that value remapping in the caller's `Snapshot`
     /// propagates here automatically, and so the caller's state has a single
@@ -6923,6 +6945,13 @@ impl FrameState {
     pub fn without_stack(&self) -> Self {
         let mut state = self.clone();
         state.stack.clear();
+        state
+    }
+
+    /// Return itself with a truncated stack.
+    pub fn with_stack_size(&self, stack_size: usize) -> Self {
+        let mut state = self.clone();
+        state.stack.truncate(stack_size);
         state
     }
 
@@ -6988,7 +7017,7 @@ impl FrameState {
     }
 
     /// Construct a `FrameState` for an inlined callee. `caller` is the `InsnId`
-    /// of the caller's call-site `Snapshot`; `depth` is this frame's inlining depth.
+    /// of the caller's post-send `Snapshot`; `depth` is this frame's inlining depth.
     fn inlined(iseq: IseqPtr, caller: InsnId, depth: InlineDepth) -> FrameState {
         FrameState { caller: Some(caller), depth, ..FrameState::new(iseq) }
     }
@@ -7001,6 +7030,10 @@ impl FrameState {
     /// Iterate over all stack slots
     pub fn stack(&self) -> Iter<'_, InsnId> {
         self.stack.iter()
+    }
+
+    pub fn caller(&self) -> Option<InsnId> {
+        self.caller
     }
 
     /// Iterate over all local variables
@@ -7314,7 +7347,8 @@ enum AddIseqMode {
     Standalone,
     Inlined {
         return_block: BlockId,
-        /// The caller's call-site `Snapshot`. Allows side-exits to restore the outer frame.
+        /// The caller `Snapshot` installed in generated FrameStates. The method inliner
+        /// retargets it to a post-send Snapshot once the inline commits.
         caller: InsnId,
         /// Inlining depth of every frame emitted for the callee.
         depth: InlineDepth,
@@ -7386,7 +7420,7 @@ fn add_iseq_to_hir(
     let mut num_returns: usize = 0;
 
     // Build the initial FrameState for a block being translated. In inlined
-    // mode it carries the caller's call-site Snapshot and this frame's depth;
+    // mode it carries the caller Snapshot and this frame's depth;
     // because every Snapshot emitted for the callee is cloned from one of these
     // initial states, those values propagate to the whole inlined body without a
     // separate rewrite pass.
