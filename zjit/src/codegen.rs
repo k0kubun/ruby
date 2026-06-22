@@ -3013,8 +3013,9 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, state: &FrameS
 fn build_stack_map(jit: &JITState, state: &FrameState) -> Vec<StackMapEntry> {
     let mut stack = Vec::new();
     let mut current_state = state;
+    let mut stack_size = current_state.stack_size();
     loop {
-        stack.extend(current_state.stack().rev().copied().map(|insn_id| {
+        stack.extend(current_state.stack().take(stack_size).rev().copied().map(|insn_id| {
             let opnd = jit.get_opnd(insn_id);
             assert!(
                 matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }),
@@ -3027,6 +3028,7 @@ fn build_stack_map(jit: &JITState, state: &FrameState) -> Vec<StackMapEntry> {
             break;
         };
         stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq)));
+        stack_size = current_state.caller_stack_size().unwrap_or_else(|| caller_state.stack_size());
         current_state = caller_state;
     }
     stack
