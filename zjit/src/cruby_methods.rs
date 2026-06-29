@@ -316,21 +316,11 @@ fn inline_string_to_s(fun: &mut hir::Function, block: hir::BlockId, recv: hir::I
 
 fn inline_thread_current(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[] = args else { return None; };
-    let ec = fun.push_insn(block, hir::Insn::LoadEC);
-    let thread_ptr = fun.push_insn(block, hir::Insn::LoadField {
-        recv: ec,
-        id: FieldName::thread_ptr,
-        offset: RUBY_OFFSET_EC_THREAD_PTR,
-        return_type: types::CPtr,
-    });
-    let thread_self = fun.push_insn(block, hir::Insn::LoadField {
-        recv: thread_ptr,
-        id: FieldName::SelfParam,
-        offset: RUBY_OFFSET_THREAD_SELF,
-        // TODO(max): Add Thread type. But Thread.current is not guaranteed to be an exact Thread.
-        // You can make subclasses...
-        return_type: types::BasicObject,
-    });
+    let ec = fun.load_ec(block);
+    let thread_ptr = fun.load_field(block, ec, FieldName::thread_ptr, RUBY_OFFSET_EC_THREAD_PTR, types::CPtr);
+    // TODO(max): Add Thread type. But Thread.current is not guaranteed to be an exact Thread.
+    // You can make subclasses...
+    let thread_self = fun.load_field(block, thread_ptr, FieldName::SelfParam, RUBY_OFFSET_THREAD_SELF, types::BasicObject);
     Some(thread_self)
 }
 
@@ -356,10 +346,10 @@ fn inline_kernel_block_given_p(fun: &mut hir::Function, block: hir::BlockId, _re
         // Get the EP of the ISeq of the containing method, or "local level", skipping over block-level EPs.
         // Equivalent of GET_LEP() macro.
         let level = crate::cruby::get_lvar_level(call_site_iseq);
-        let lep = fun.push_insn(block, hir::Insn::GetEP { level });
-        Some(fun.push_insn(block, hir::Insn::IsBlockGiven { lep }))
+        let lep = fun.get_ep(block, level);
+        Some(fun.is_block_given(block, lep))
     } else {
-        Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) }))
+        Some(fun.const_value(block, Qfalse))
     }
 }
 
@@ -370,14 +360,14 @@ fn inline_array_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
         {
             let recv = fun.coerce_to(block, recv, types::Array, state);
             let index = fun.coerce_to(block, index, types::Fixnum, state);
-            let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
-            let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: SideExitReason::GuardLess, state });
-            let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
+            let index = fun.unbox_fixnum(block, index);
+            let length = fun.array_length(block, recv);
+            let index = fun.guard_less(block, index, length, SideExitReason::GuardLess, state);
+            let index = fun.adjust_bounds(block, index, length);
+            let zero = fun.const_cint64(block, 0);
             use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: SideExitReason::GuardGreaterEq, state });
-            let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
+            let index = fun.guard_greater_eq(block, index, zero, SideExitReason::GuardGreaterEq, state);
+            let result = fun.array_aref(block, recv, index);
             return Some(result);
         }
     }
@@ -395,16 +385,16 @@ fn inline_array_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             fun.guard_not_shared(block, recv, state);
 
             // Bounds check: unbox Fixnum index and guard 0 <= idx < length.
-            let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
-            let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: SideExitReason::GuardLess, state });
-            let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
+            let index = fun.unbox_fixnum(block, index);
+            let length = fun.array_length(block, recv);
+            let index = fun.guard_less(block, index, length, SideExitReason::GuardLess, state);
+            let index = fun.adjust_bounds(block, index, length);
+            let zero = fun.const_cint64(block, 0);
             use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: SideExitReason::GuardGreaterEq, state });
+            let index = fun.guard_greater_eq(block, index, zero, SideExitReason::GuardGreaterEq, state);
 
-            let _ = fun.push_insn(block, hir::Insn::ArrayAset { array: recv, index, val });
-            fun.push_insn(block, hir::Insn::WriteBarrier { recv, val });
+            let _ = fun.array_aset(block, recv, index, val);
+            fun.write_barrier(block, recv, val);
             return Some(val);
         }
     }
@@ -417,7 +407,7 @@ fn inline_array_push(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
         if !fun.likely_a(recv, types::Array, state) { return None; }
         let recv = fun.coerce_to(block, recv, types::Array, state);
         fun.guard_not_frozen(block, recv, state);
-        let _ = fun.push_insn(block, hir::Insn::ArrayPush { array: recv, val, state });
+        let _ = fun.array_push(block, recv, val, state);
         return Some(recv);
     }
     None
@@ -430,7 +420,7 @@ fn inline_array_pop(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
     let recv = fun.coerce_to(block, recv, types::Array, state);
     fun.guard_not_frozen(block, recv, state);
     fun.guard_not_shared(block, recv, state);
-    Some(fun.push_insn(block, hir::Insn::ArrayPop { array: recv, state }))
+    Some(fun.array_pop(block, recv, state))
 }
 
 fn inline_hash_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
@@ -439,7 +429,7 @@ fn inline_hash_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
     // Only optimize exact Hash, not subclasses
     if fun.likely_a(recv, types::HashExact, state) {
         let recv = fun.coerce_to(block, recv, types::HashExact, state);
-        let result = fun.push_insn(block, hir::Insn::HashAref { hash: recv, key, state });
+        let result = fun.hash_aref(block, recv, key, state);
         Some(result)
     } else {
         None
@@ -452,7 +442,7 @@ fn inline_hash_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
     // Only optimize exact Hash, not subclasses
     if fun.likely_a(recv, types::HashExact, state) {
         let recv = fun.coerce_to(block, recv, types::HashExact, state);
-        let _ = fun.push_insn(block, hir::Insn::HashAset { hash: recv, key, val, state });
+        let _ = fun.hash_aset(block, recv, key, val, state);
         // Hash#[]= returns the value, not the hash
         Some(val)
     } else {
@@ -463,17 +453,9 @@ fn inline_hash_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
 fn inline_string_bytesize(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     if args.is_empty() && fun.likely_a(recv, types::String, state) {
         let recv = fun.coerce_to(block, recv, types::String, state);
-        let len = fun.push_insn(block, hir::Insn::LoadField {
-            recv,
-            id: FieldName::len,
-            offset: RUBY_OFFSET_RSTRING_LEN,
-            return_type: types::CInt64,
-        });
+        let len = fun.load_field(block, recv, FieldName::len, RUBY_OFFSET_RSTRING_LEN, types::CInt64);
 
-        let result = fun.push_insn(block, hir::Insn::BoxFixnum {
-            val: len,
-            state,
-        });
+        let result = fun.box_fixnum(block, len, state);
 
         return Some(result);
     }
@@ -486,23 +468,18 @@ fn inline_string_getbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir
         // String#getbyte with a Fixnum is leaf and nogc; otherwise it may run arbitrary Ruby code
         // when converting the index to a C integer.
         let index = fun.coerce_to(block, index, types::Fixnum, state);
-        let unboxed_index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
-        let len = fun.push_insn(block, hir::Insn::LoadField {
-            recv,
-            id: FieldName::len,
-            offset: RUBY_OFFSET_RSTRING_LEN,
-            return_type: types::CInt64,
-        });
+        let unboxed_index = fun.unbox_fixnum(block, index);
+        let len = fun.load_field(block, recv, FieldName::len, RUBY_OFFSET_RSTRING_LEN, types::CInt64);
         // TODO(max): Find a way to mark these guards as not needed for correctness... as in, once
         // the data dependency is gone (say, the StringGetbyte is elided), they can also be elided.
         //
         // This is unlike most other guards.
-        let unboxed_index = fun.push_insn(block, hir::Insn::GuardLess { left: unboxed_index, right: len, reason: SideExitReason::GuardLess, state });
-        let unboxed_index = fun.push_insn(block, hir::Insn::AdjustBounds { index: unboxed_index, length: len });
-        let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
+        let unboxed_index = fun.guard_less(block, unboxed_index, len, SideExitReason::GuardLess, state);
+        let unboxed_index = fun.adjust_bounds(block, unboxed_index, len);
+        let zero = fun.const_cint64(block, 0);
         use crate::hir::SideExitReason;
-        let _ = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: unboxed_index, right: zero, reason: SideExitReason::GuardGreaterEq, state });
-        let result = fun.push_insn(block, hir::Insn::StringGetbyte { string: recv, index: unboxed_index });
+        let _ = fun.guard_greater_eq(block, unboxed_index, zero, SideExitReason::GuardGreaterEq, state);
+        let result = fun.string_getbyte(block, recv, unboxed_index);
         return Some(result);
     }
     None
@@ -514,21 +491,16 @@ fn inline_string_setbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir
         let index = fun.coerce_to(block, index, types::Fixnum, state);
         let value = fun.coerce_to(block, value, types::Fixnum, state);
 
-        let unboxed_index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
-        let len = fun.push_insn(block, hir::Insn::LoadField {
-            recv,
-            id: FieldName::len,
-            offset: RUBY_OFFSET_RSTRING_LEN,
-            return_type: types::CInt64,
-        });
-        let unboxed_index = fun.push_insn(block, hir::Insn::GuardLess { left: unboxed_index, right: len, reason: SideExitReason::GuardLess, state });
-        let unboxed_index = fun.push_insn(block, hir::Insn::AdjustBounds { index: unboxed_index, length: len });
-        let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
+        let unboxed_index = fun.unbox_fixnum(block, index);
+        let len = fun.load_field(block, recv, FieldName::len, RUBY_OFFSET_RSTRING_LEN, types::CInt64);
+        let unboxed_index = fun.guard_less(block, unboxed_index, len, SideExitReason::GuardLess, state);
+        let unboxed_index = fun.adjust_bounds(block, unboxed_index, len);
+        let zero = fun.const_cint64(block, 0);
         use crate::hir::SideExitReason;
-        let _ = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: unboxed_index, right: zero, reason: SideExitReason::GuardGreaterEq, state });
+        let _ = fun.guard_greater_eq(block, unboxed_index, zero, SideExitReason::GuardGreaterEq, state);
         // We know that all String are HeapObject, so no need to insert a GuardType(HeapObject).
         fun.guard_not_frozen(block, recv, state);
-        let _ = fun.push_insn(block, hir::Insn::StringSetbyteFixnum { string: recv, index, value });
+        let _ = fun.string_setbyte_fixnum(block, recv, index, value);
         // String#setbyte returns the fixnum provided as its `value` argument back to the caller.
         Some(value)
     } else {
@@ -538,15 +510,10 @@ fn inline_string_setbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir
 
 fn inline_string_empty_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[] = args else { return None; };
-    let len = fun.push_insn(block, hir::Insn::LoadField {
-        recv,
-        id: FieldName::len,
-        offset: RUBY_OFFSET_RSTRING_LEN,
-        return_type: types::CInt64,
-    });
-    let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-    let is_zero = fun.push_insn(block, hir::Insn::IsBitEqual { left: len, right: zero });
-    let result = fun.push_insn(block, hir::Insn::BoxBool { val: is_zero });
+    let len = fun.load_field(block, recv, FieldName::len, RUBY_OFFSET_RSTRING_LEN, types::CInt64);
+    let zero = fun.const_cint64(block, 0);
+    let is_zero = fun.is_bit_equal(block, len, zero);
+    let result = fun.box_bool(block, is_zero);
     Some(result)
 }
 
@@ -558,26 +525,26 @@ fn guard_string_coderange(fun: &mut hir::Function, block: hir::BlockId, args: &[
     if !fun.likely_a(recv, types::String, state) { return None; }
     let recv = fun.coerce_to(block, recv, types::String, state);
     let flags = fun.load_rbasic_flags(block, recv);
-    let mask = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CUInt64(RUBY_ENC_CODERANGE_MASK.into()) });
-    let cr = fun.push_insn(block, hir::Insn::IntAnd { left: flags, right: mask });
-    let min_known = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_7BIT.into()) });
-    Some(fun.push_insn(block, hir::Insn::GuardGreaterEq { left: cr, right: min_known, reason: SideExitReason::GuardGreaterEq, state }))
+    let mask = fun.const_cuint64(block, RUBY_ENC_CODERANGE_MASK.into());
+    let cr = fun.int_and(block, flags, mask);
+    let min_known = fun.const_cint64(block, RUBY_ENC_CODERANGE_7BIT.into());
+    Some(fun.guard_greater_eq(block, cr, min_known, SideExitReason::GuardGreaterEq, state))
 }
 
 // Inlines String#ascii_only? (rb_str_is_ascii_only_p): coderange == 7BIT.
 fn inline_string_ascii_only_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let cr = guard_string_coderange(fun, block, args, state)?;
-    let seven_bit = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_7BIT.into()) });
-    let is_7bit = fun.push_insn(block, hir::Insn::IsBitEqual { left: cr, right: seven_bit });
-    Some(fun.push_insn(block, hir::Insn::BoxBool { val: is_7bit }))
+    let seven_bit = fun.const_cint64(block, RUBY_ENC_CODERANGE_7BIT.into());
+    let is_7bit = fun.is_bit_equal(block, cr, seven_bit);
+    Some(fun.box_bool(block, is_7bit))
 }
 
 // Inlines String#valid_encoding? (rb_str_valid_encoding_p): coderange != BROKEN.
 fn inline_string_valid_encoding_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let cr = guard_string_coderange(fun, block, args, state)?;
-    let broken = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_BROKEN.into()) });
-    let is_valid = fun.push_insn(block, hir::Insn::IsBitNotEqual { left: cr, right: broken });
-    Some(fun.push_insn(block, hir::Insn::BoxBool { val: is_valid }))
+    let broken = fun.const_cint64(block, RUBY_ENC_CODERANGE_BROKEN.into());
+    let is_valid = fun.is_bit_not_equal(block, cr, broken);
+    Some(fun.box_bool(block, is_valid))
 }
 
 fn inline_string_append(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
@@ -587,13 +554,13 @@ fn inline_string_append(fun: &mut hir::Function, block: hir::BlockId, recv: hir:
     if fun.likely_a(recv, types::StringExact, state) && fun.likely_a(other, types::String, state) {
         let recv = fun.coerce_to(block, recv, types::StringExact, state);
         let other = fun.coerce_to(block, other, types::String, state);
-        let _ = fun.push_insn(block, hir::Insn::StringAppend { recv, other, state });
+        let _ = fun.string_append(block, recv, other, state);
         return Some(recv);
     }
     if fun.likely_a(recv, types::StringExact, state) && fun.likely_a(other, types::Fixnum, state) {
         let recv = fun.coerce_to(block, recv, types::StringExact, state);
         let other = fun.coerce_to(block, other, types::Fixnum, state);
-        let _ = fun.push_insn(block, hir::Insn::StringAppendCodepoint { recv, other, state });
+        let _ = fun.string_append_codepoint(block, recv, other, state);
         return Some(recv);
     }
     None
@@ -603,7 +570,7 @@ fn try_inline_string_equal(fun: &mut hir::Function, block: hir::BlockId, recv: h
     if fun.likely_a(recv, types::String, state) && fun.likely_a(other, types::String, state) {
         let recv = fun.coerce_to(block, recv, types::String, state);
         let other = fun.coerce_to(block, other, types::String, state);
-        let result = fun.push_insn(block, hir::Insn::StringEqual { left: recv, right: other });
+        let result = fun.string_equal(block, recv, other);
         return Some(result);
     }
     None
@@ -617,7 +584,7 @@ fn inline_string_eq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
 fn inline_module_eqq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     if fun.is_a(recv, types::Class) {
-        let result = fun.push_insn(block, hir::Insn::IsA { val: other, class: recv });
+        let result = fun.is_a_class(block, other, recv);
         return Some(result);
     }
     None
@@ -627,8 +594,8 @@ fn inline_array_length(fun: &mut hir::Function, block: hir::BlockId, recv: hir::
     let &[] = args else { return None; };
     if fun.likely_a(recv, types::Array, state) {
         let recv = fun.coerce_to(block, recv, types::Array, state);
-        let length_cint = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-        let result = fun.push_insn(block, hir::Insn::BoxFixnum { val: length_cint, state });
+        let length_cint = fun.array_length(block, recv);
+        let result = fun.box_fixnum(block, length_cint, state);
         return Some(result);
     }
     None
@@ -638,10 +605,10 @@ fn inline_array_empty_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir:
     let &[] = args else { return None; };
     if fun.likely_a(recv, types::Array, state) {
         let recv = fun.coerce_to(block, recv, types::Array, state);
-        let length_cint = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-        let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-        let result_c = fun.push_insn(block, hir::Insn::IsBitEqual { left: length_cint, right: zero });
-        let result = fun.push_insn(block, hir::Insn::BoxBool { val: result_c });
+        let length_cint = fun.array_length(block, recv);
+        let zero = fun.const_cint64(block, 0);
+        let result_c = fun.is_bit_equal(block, length_cint, zero);
+        let result = fun.box_bool(block, result_c);
         return Some(result);
     }
     None
@@ -651,8 +618,8 @@ fn inline_integer_succ(fun: &mut hir::Function, block: hir::BlockId, recv: hir::
     if !args.is_empty() { return None; }
     if fun.likely_a(recv, types::Fixnum, state) {
         let left = fun.coerce_to(block, recv, types::Fixnum, state);
-        let right = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(1)) });
-        let result = fun.push_insn(block, hir::Insn::FixnumAdd { left, right, state });
+        let right = fun.const_value(block, VALUE::fixnum_from_usize(1));
+        let result = fun.fixnum_add(block, left, right, state);
         return Some(result);
     }
     None
@@ -663,7 +630,7 @@ fn inline_integer_xor(fun: &mut hir::Function, block: hir::BlockId, recv: hir::I
     if fun.likely_a(recv, types::Fixnum, state) && fun.likely_a(right, types::Fixnum, state) {
         let left = fun.coerce_to(block, recv, types::Fixnum, state);
         let right = fun.coerce_to(block, right, types::Fixnum, state);
-        let result = fun.push_insn(block, hir::Insn::FixnumXor { left, right });
+        let result = fun.fixnum_xor(block, left, right);
         return Some(result);
     }
     None
@@ -712,7 +679,7 @@ fn inline_float_to_i(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
     let &[] = args else { return None; };
     if fun.likely_a(recv, types::Flonum, state) {
         let recv = fun.coerce_to(block, recv, types::Flonum, state);
-        return Some(fun.push_insn(block, hir::Insn::FloatToInt { recv, state }));
+        return Some(fun.float_to_int(block, recv, state));
     }
     None
 }
@@ -725,7 +692,7 @@ fn try_inline_fixnum_op(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn
     if fun.likely_a(left, types::Fixnum, state) && fun.likely_a(right, types::Fixnum, state) {
         if bop == BOP_NEQ {
             // For opt_neq, the interpreter checks that both neq and eq are unchanged.
-            fun.push_insn(block, hir::Insn::PatchPoint { invariant: hir::Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQ }, state });
+            fun.patch_point(block, hir::Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQ }, state);
         }
         // Rely on the MethodRedefined PatchPoint for other bops.
         let left = fun.coerce_to(block, left, types::Fixnum, state);
@@ -819,7 +786,7 @@ fn inline_integer_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::
     if fun.likely_a(recv, types::Fixnum, state) && fun.likely_a(index, types::Fixnum, state) {
         let recv = fun.coerce_to(block, recv, types::Fixnum, state);
         let index = fun.coerce_to(block, index, types::Fixnum, state);
-        let result = fun.push_insn(block, hir::Insn::FixnumAref { recv, index });
+        let result = fun.fixnum_aref(block, recv, index);
         return Some(result);
     }
     None
@@ -827,19 +794,19 @@ fn inline_integer_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::
 
 fn inline_basic_object_eq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
-    let c_result = fun.push_insn(block, hir::Insn::IsBitEqual { left: recv, right: other });
-    let result = fun.push_insn(block, hir::Insn::BoxBool { val: c_result });
+    let c_result = fun.is_bit_equal(block, recv, other);
+    let result = fun.box_bool(block, c_result);
     Some(result)
 }
 
 fn inline_basic_object_not(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[] = args else { return None; };
     if fun.type_of(recv).is_known_truthy() {
-        let result = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) });
+        let result = fun.const_value(block, Qfalse);
         return Some(result);
     }
     if fun.type_of(recv).is_known_falsy() {
-        let result = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qtrue) });
+        let result = fun.const_value(block, Qtrue);
         return Some(result);
     }
     None
@@ -860,9 +827,9 @@ fn try_inline_string_not_equal(fun: &mut hir::Function, block: hir::BlockId, rec
     let eq_result = try_inline_string_equal(fun, block, recv, other, state)?;
     // StringEqual always returns a Ruby boolean (Qtrue/Qfalse),
     // so `!=` can be lowered to `eq_result != Qtrue`.
-    let true_val = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qtrue) });
-    let not_equal = fun.push_insn(block, hir::Insn::IsBitNotEqual { left: eq_result, right: true_val });
-    Some(fun.push_insn(block, hir::Insn::BoxBool { val: not_equal }))
+    let true_val = fun.const_value(block, Qtrue);
+    let not_equal = fun.is_bit_not_equal(block, eq_result, true_val);
+    Some(fun.box_bool(block, not_equal))
 }
 
 fn inline_basic_object_neq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
@@ -879,8 +846,8 @@ fn inline_basic_object_neq(fun: &mut hir::Function, block: hir::BlockId, recv: h
     if !fun.assume_expected_cfunc(block, recv_class, ID!(eq), rb_obj_equal as _, state) {
         return None;
     }
-    let c_result = fun.push_insn(block, hir::Insn::IsBitNotEqual { left: recv, right: other });
-    let result = fun.push_insn(block, hir::Insn::BoxBool { val: c_result });
+    let c_result = fun.is_bit_not_equal(block, recv, other);
+    let result = fun.box_bool(block, c_result);
     Some(result)
 }
 
@@ -893,13 +860,13 @@ fn inline_class_allocate(fun: &mut hir::Function, block: hir::BlockId, recv: hir
 
 fn inline_basic_object_initialize(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     if !args.is_empty() { return None; }
-    let result = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qnil) });
+    let result = fun.const_value(block, Qnil);
     Some(result)
 }
 
 fn inline_nilclass_nil_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     if !args.is_empty() { return None; }
-    Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qtrue) }))
+    Some(fun.const_value(block, Qtrue))
 }
 
 fn inline_eqq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
@@ -908,15 +875,15 @@ fn inline_eqq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, a
     if !fun.assume_expected_cfunc(block, recv_class, ID!(eq), rb_obj_equal as _, state) {
         return None;
     }
-    let c_result = fun.push_insn(block, hir::Insn::IsBitEqual { left: recv, right: other });
-    let result = fun.push_insn(block, hir::Insn::BoxBool { val: c_result });
+    let c_result = fun.is_bit_equal(block, recv, other);
+    let result = fun.box_bool(block, c_result);
     Some(result)
 }
 
 fn inline_kernel_is_a_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     if fun.is_a(other, types::Class) {
-        let result = fun.push_insn(block, hir::Insn::IsA { val: recv, class: other });
+        let result = fun.is_a_class(block, recv, other);
         return Some(result);
     }
     None
@@ -924,7 +891,7 @@ fn inline_kernel_is_a_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir:
 
 fn inline_kernel_nil_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     if !args.is_empty() { return None; }
-    Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) }))
+    Some(fun.const_value(block, Qfalse))
 }
 
 fn inline_kernel_respond_to_p(
@@ -988,24 +955,12 @@ fn inline_kernel_respond_to_p(
             let respond_to_missing_cme =
                 unsafe { rb_callable_method_entry(recv_class, respond_to_missing) };
             // Protect against redefinition of `respond_to_missing?`
-            fun.push_insn(
-                block,
-                hir::Insn::PatchPoint {
-                    invariant: hir::Invariant::NoTracePoint,
-                    state,
-                },
-            );
-            fun.push_insn(
-                block,
-                hir::Insn::PatchPoint {
-                    invariant: hir::Invariant::MethodRedefined {
+            fun.patch_point(block, hir::Invariant::NoTracePoint, state);
+            fun.patch_point(block, hir::Invariant::MethodRedefined {
                         klass: recv_class,
                         method: respond_to_missing,
                         cme: respond_to_missing_cme,
-                    },
-                    state,
-                },
-            );
+                    }, state);
             Qfalse
         }
         // Private method with allow priv=false, so `respond_to?` returns false
@@ -1026,30 +981,28 @@ fn inline_kernel_respond_to_p(
     if !fun.assume_no_singleton_classes(block, recv_class, state) {
         return None;
     }
-    fun.push_insn(block, hir::Insn::PatchPoint { invariant: hir::Invariant::NoTracePoint, state });
-    fun.push_insn(block, hir::Insn::PatchPoint {
-        invariant: hir::Invariant::MethodRedefined {
+    fun.patch_point(block, hir::Invariant::NoTracePoint, state);
+    fun.patch_point(block, hir::Invariant::MethodRedefined {
             klass: recv_class,
             method: mid,
             cme: target_cme
-        }, state
-    });
-    Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(result) }))
+        }, state);
+    Some(fun.const_value(block, result))
 }
 
 fn inline_kernel_class(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[recv] = args else { return None; };
     let recv_class = fun.type_of(recv).runtime_exact_ruby_class()?;
     let real_class = unsafe { rb_class_real(recv_class) };
-    Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(real_class) }))
+    Some(fun.const_value(block, real_class))
 }
 
 /// Inline `fixnum_inc(ec, self, num)` implies FixnumAdd(num, 1).
 /// num is always a Fixnum (starts at 0 and is incremented by fixnum_inc).
 fn inline_fixnum_inc(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[_self, num] = args else { return None; };
-    let one = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(1)) });
-    let result = fun.push_insn(block, hir::Insn::FixnumAdd { left: num, right: one, state });
+    let one = fun.const_value(block, VALUE::fixnum_from_usize(1));
+    let result = fun.fixnum_add(block, num, one, state);
     Some(result)
 }
 
@@ -1057,9 +1010,9 @@ fn inline_fixnum_inc(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::I
 /// Called from Array#each etc. where self is Array and index is in bounds.
 fn inline_ary_at(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[recv, index] = args else { return None; };
-    let recv = fun.push_insn(block, hir::Insn::RefineType { val: recv, new_type: types::Array });
-    let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
-    let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
+    let recv = fun.refine_type(block, recv, types::Array);
+    let index = fun.unbox_fixnum(block, index);
+    let result = fun.array_aref(block, recv, index);
     Some(result)
 }
 
@@ -1067,9 +1020,9 @@ fn inline_ary_at(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnI
 /// Called from Array#each etc. where self is Array and index is Fixnum.
 fn inline_ary_at_end(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[recv, index] = args else { return None; };
-    let recv = fun.push_insn(block, hir::Insn::RefineType { val: recv, new_type: types::Array });
-    let length_cint = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-    let length = fun.push_insn(block, hir::Insn::BoxFixnum { val: length_cint, state });
-    let result = fun.push_insn(block, hir::Insn::FixnumGe { left: index, right: length });
+    let recv = fun.refine_type(block, recv, types::Array);
+    let length_cint = fun.array_length(block, recv);
+    let length = fun.box_fixnum(block, length_cint, state);
+    let result = fun.fixnum_ge(block, index, length);
     Some(result)
 }
