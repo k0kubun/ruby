@@ -15,6 +15,11 @@ mod hir_opt_tests {
     fn hir_string_proc(proc: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(proc));
         unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        hir_string_iseq(iseq)
+    }
+
+    #[track_caller]
+    fn hir_string_iseq(iseq: IseqPtr) -> String {
         let mut function = iseq_to_hir(iseq).unwrap();
         function.optimize();
         function.validate().unwrap();
@@ -24,6 +29,18 @@ mod hir_opt_tests {
     #[track_caller]
     fn hir_string(method: &str) -> String {
         hir_string_proc(&format!("{}.method(:{})", "self", method))
+    }
+
+    #[track_caller]
+    fn hir_string_keep_profile(method: &str) -> String {
+        let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
+        hir_string_iseq(iseq)
+    }
+
+    #[track_caller]
+    fn hir_string_proc_keep_profile(proc: &str) -> String {
+        let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(proc));
+        hir_string_iseq(iseq)
     }
 
     #[test]
@@ -5614,11 +5631,28 @@ mod hir_opt_tests {
           v37:NilClass = Const Value(nil)
           Jump bb8(v37, v13)
         bb8(v27:BasicObject, v28:BasicObject):
-          v40:BasicObject = Send v25, &block, :then, v27 # SendFallbackReason: Send: block argument is not nil
+          v57:NilClass = GuardBitEquals v27, Value(nil) recompile
+          PatchPoint MethodRedefined(Integer@0x1008, then@0x1010, cme:0x1018)
+          PushInlineFrame v25 (0x1040)
+          v67:NilClass = Const Value(nil)
+          v69:TrueClass|NilClass = Defined yield, v67
           CheckInterrupts
-          Return v40
+          v72:CBool = Test v69
+          CondBranch v72, bb12(v25), bb13()
+        bb12(v80:Fixnum[0]):
+          v85:BasicObject = InvokeBlock v80 # SendFallbackReason: InvokeBlock: not yet specialized
+          CheckInterrupts
+          Jump bb9(v85)
+        bb13():
+          v78:BasicObject = InvokeBuiltin <inline_expr>, v25
+          CheckInterrupts
+          Jump bb9(v78)
+        bb9(v97:BasicObject):
+          PopInlineFrame
+          CheckInterrupts
+          Return v97
         bb4(v45:BasicObject, v46:Falsy, v47:BasicObject):
-          v51:StaticSymbol[:skip] = Const Value(VALUE(0x1008))
+          v51:StaticSymbol[:skip] = Const Value(VALUE(0x1048))
           CheckInterrupts
           Return v51
         ");
@@ -9190,12 +9224,17 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:HeapBasicObject, v10:BasicObject):
           v17:Fixnum[5] = Const Value(5)
+          v21:CBool = HasType v10, ObjectSubclass[class_exact:C]
+          CondBranch v21, bb5(), bb6()
+        bb5():
+          v24:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
-          v28:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
-          v30:CShape = LoadField v28, :shape_id@0x1040
-          v31:CShape[0x1041] = GuardBitEquals v30, CShape(0x1041)
-          StoreField v28, :@foo@0x1042, v17
-          WriteBarrier v28, v17
+          SetIvar v24, :@foo, v17
+          Jump bb4(v17)
+        bb6():
+          v27:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: SendWithoutBlock: polymorphic fallback
+          Jump bb4(v27)
+        bb4(v20:BasicObject):
           CheckInterrupts
           Return v17
         ");
@@ -18397,7 +18436,7 @@ mod hir_opt_tests {
             30.times { test_float_mul_recompile(1.5, 2.5) }
         "#);
 
-        let intermediate_hir = hir_string("test_float_mul_recompile");
+        let intermediate_hir = hir_string_keep_profile("test_float_mul_recompile");
         assert!(intermediate_hir.contains("FloatMul"), "{intermediate_hir}");
 
         eval(r#"
@@ -18462,7 +18501,7 @@ mod hir_opt_tests {
             30.times { test_float_mul_recompile(1.5, 2.5) }
         "#);
 
-        let intermediate_hir = hir_string("test_float_mul_recompile");
+        let intermediate_hir = hir_string_keep_profile("test_float_mul_recompile");
         assert!(intermediate_hir.contains("FloatMul"), "{intermediate_hir}");
 
         eval(r#"
@@ -18698,7 +18737,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_trigger_guard_type_recompilation() {
+    fn test_guard_type_recompile_profile_window() {
         set_max_versions(2);
         set_inline_threshold(0);
         eval("
@@ -18722,14 +18761,15 @@ mod hir_opt_tests {
 
         ");
 
-        let intermediate_hir = hir_string_proc("C.new.method(:f)");
+        let intermediate_hir = hir_string_proc_keep_profile("C.new.method(:f)");
 
         eval("
             # Supposed to be the same as the earlier Ruby method in this test
             num_to_compile = 30
             c = C.new
-            # Call this with a float in order to trigger a guard failure
-            # Do this enough times to cause a recompilation
+            # Call this with a float in order to trigger guard failures and
+            # fill the recompile profiling window. The N+1 exit recompilation
+            # lifecycle is covered by codegen::tests::test_recompile_exit_profiles_before_recompiling.
             num_to_compile.times { c.f(1.5) }
         ");
         let final_hir = hir_string_proc("C.new.method(:f)");
@@ -18836,42 +18876,24 @@ mod hir_opt_tests {
         bb4():
           PatchPoint NoEPEscape(f)
           v44:Fixnum[1] = Const Value(1)
-          v48:CBool = HasType v12, Flonum
-          CondBranch v48, bb10(), bb11()
-        bb10():
-          v51:Flonum = RefineType v12, Flonum
-          PatchPoint MethodRedefined(Float@0x1008, +@0x1010, cme:0x1018)
-          v86:Float = FloatAdd v51, v44
-          Jump bb9(v86)
-        bb11():
-          v54:CBool = HasType v12, Fixnum
-          CondBranch v54, bb12(), bb13()
-        bb12():
-          v57:Fixnum = RefineType v12, Fixnum
-          PatchPoint MethodRedefined(Integer@0x1040, +@0x1010, cme:0x1048)
-          v89:Fixnum = FixnumAdd v57, v44
-          Jump bb9(v89)
-        bb13():
-          PatchPoint MethodRedefined(Float@0x1008, +@0x1010, cme:0x1018)
-          v92:Flonum = GuardType v12, Flonum recompile
-          v93:Float = FloatAdd v92, v44
-          Jump bb9(v93)
-        bb9(v47:Float|Fixnum):
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
+          v72:Fixnum = GuardType v12, Fixnum recompile
+          v73:Fixnum = FixnumAdd v72, v44
           PatchPoint SingleRactorMode
-          v69:CShape = LoadField v11, :shape_id@0x1001
-          v70:CShape[0x1002] = Const CShape(0x1002)
-          v71:CBool = IsBitEqual v69, v70
-          CondBranch v71, bb15(), bb16()
-        bb15():
-          StoreField v11, :@a@0x1003, v47
-          WriteBarrier v11, v47
-          Jump bb14()
-        bb16():
-          SetIvar v11, :@a, v47
-          Jump bb14()
-        bb14():
+          v55:CShape = LoadField v11, :shape_id@0x1001
+          v56:CShape[0x1002] = Const CShape(0x1002)
+          v57:CBool = IsBitEqual v55, v56
+          CondBranch v57, bb10(), bb11()
+        bb10():
+          StoreField v11, :@a@0x1003, v73
+          WriteBarrier v11, v73
+          Jump bb9()
+        bb11():
+          SetIvar v11, :@a, v73
+          Jump bb9()
+        bb9():
           CheckInterrupts
-          Return v47
+          Return v73
         ");
     }
 

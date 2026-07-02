@@ -110,7 +110,9 @@ fn main() {
         .allowlist_function("rb_funcallv")
         .allowlist_function("rb_protect")
         .allowlist_function("rb_zjit_profile_disable")
+        .allowlist_function("rb_zjit_profile_enable")
         .allowlist_function("rb_zjit_insn_to_bare_insn")
+        .allowlist_function("rb_zjit_iseq_set_jit_entry")
         .allowlist_function("rb_zjit_hash_new_size")
         .allowlist_function("rb_zjit_class_allocate_instance_fastpath")
 
@@ -309,7 +311,6 @@ fn main() {
         .allowlist_function("rb_jit_iseq_builtin_attrs")
         .allowlist_function("rb_jit_str_concat_codepoint")
         .allowlist_function("rb_zjit_iseq_inspect")
-        .allowlist_function("rb_zjit_iseq_insn_set")
         .allowlist_function("rb_zjit_local_id")
         .allowlist_function("rb_id_table_lookup")
         .allowlist_function("rb_set_cfp_(pc|sp)")
