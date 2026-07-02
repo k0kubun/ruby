@@ -267,8 +267,22 @@ impl CodeBlock {
 
             // Verify number of bytes written when the callback returns Ok
             if encode_result.is_ok() {
-                assert_eq!(self.write_pos, ref_pos + label_ref.num_bytes, "label_ref \
-                    callback didn't write number of bytes it claimed to write upfront");
+                if self.dropped_bytes {
+                    // Back-patching this label reference ran past the end of the mapped
+                    // region / the code memory limit. write_byte() silently drops on a
+                    // failed write and does NOT advance write_pos, so the callback wrote
+                    // fewer bytes than it reserved even though it returned Ok. Treat this
+                    // as a link failure and bail out instead of asserting on the short
+                    // write. Mirrors how the emit phase turns a dropped byte into
+                    // CompileError::OutOfMemory; the caller maps this Err to
+                    // CompileError::LabelLinkingFailure and discards the code. (Entering
+                    // link_labels() dropped_bytes is guaranteed false, so this only fires
+                    // for drops caused by the back-patch itself.)
+                    link_result = Err(());
+                } else {
+                    assert_eq!(self.write_pos, ref_pos + label_ref.num_bytes, "label_ref \
+                        callback didn't write number of bytes it claimed to write upfront");
+                }
             }
         }
 
