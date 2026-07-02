@@ -652,6 +652,13 @@ pub fn set_num_profiles(num_profiles: NumProfiles) {
     update_profile_threshold();
 }
 
+/// Update --zjit-max-versions for testing
+#[cfg(test)]
+pub fn set_max_versions(max_versions: usize) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().max_versions = max_versions; }
+}
+
 /// Enable --zjit-stats for testing
 #[cfg(test)]
 pub fn enable_zjit_stats() {

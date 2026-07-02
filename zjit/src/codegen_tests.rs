@@ -5,8 +5,8 @@ use crate::asm::CodeBlock;
 use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
-use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_num_profiles};
+use crate::hir::{FunctionPrinter, Insn, iseq_to_hir};
+use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -34,6 +34,13 @@ fn iseq_contains_raw_opcode(iseq: IseqPtr, expected_opcode: u32) -> bool {
 fn assert_last_version_compiled(iseq: IseqPtr) {
     let payload = get_or_create_iseq_payload(iseq);
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+fn optimized_hir_string(iseq: IseqPtr) -> String {
+    let mut function = iseq_to_hir(iseq).unwrap();
+    function.optimize();
+    function.validate().unwrap();
+    format!("{}", FunctionPrinter::without_snapshot(&function))
 }
 
 /// Run the Ruby fragment with the inliner enabled with the default inline
@@ -206,6 +213,61 @@ fn test_recompile_exit_profiles_before_recompiling() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(payload.versions.len(), 2);
     assert_last_version_compiled(iseq);
+}
+
+#[test]
+fn test_no_profile_getivar_recompiles_after_profiles() {
+    rb_zjit_prepare_options();
+    let old_max_versions = get_option!(max_versions);
+    set_max_versions(4);
+    set_call_threshold(2);
+    set_num_profiles(2);
+
+    eval(r#"
+        class NoProfileGetivarRecompile
+          def initialize
+            @x = 1
+          end
+
+          def test(flag)
+            if flag
+              @x
+            else
+              0
+            end
+          end
+        end
+
+        $no_profile_getivar_recompile = NoProfileGetivarRecompile.new
+        $no_profile_getivar_recompile.test(false)
+        $no_profile_getivar_recompile.test(false)
+    "#);
+
+    let iseq = get_instance_method_iseq("NoProfileGetivarRecompile", "test");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("$no_profile_getivar_recompile.test(true)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("$no_profile_getivar_recompile.test(true)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("$no_profile_getivar_recompile.test(true)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 2);
+    assert_last_version_compiled(iseq);
+
+    let hir = optimized_hir_string(iseq);
+    assert!(!hir.contains("GetIvar"), "{hir}");
+    assert!(hir.contains("GuardBitEquals"), "{hir}");
+
+    set_max_versions(old_max_versions);
 }
 
 #[test]

@@ -2172,6 +2172,7 @@ unsafe extern "C" {
     pub fn rb_profile_frame_absolute_path(frame: VALUE) -> VALUE;
     pub fn rb_profile_frame_full_label(frame: VALUE) -> VALUE;
     pub fn rb_jit_cont_each_iseq(callback: rb_iseq_callback, data: *mut ::std::os::raw::c_void);
+    pub fn rb_zjit_profile_enable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
     pub fn rb_zjit_iseq_set_jit_entry(iseq: *const rb_iseq_t, code_ptr: *const u8);

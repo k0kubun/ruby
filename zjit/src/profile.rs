@@ -152,6 +152,9 @@ pub fn profile_recompile_insn(ec: EcPtr) -> bool {
         return true;
     }
 
+    // Re-arm the whole ISEQ so the interpreter can collect profiles for other
+    // zjit_* sites reached after this exit before we spend another version.
+    unsafe { rb_zjit_profile_enable(profiler.iseq); }
     let enabled = unsafe {
         rb_zjit_iseq_insn_enable_profile(profiler.iseq, insn_idx as u32, bare_opcode)
     };

@@ -2590,6 +2590,11 @@ impl CompilePolicy {
     }
 }
 
+fn can_recompile_iseq(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    payload.versions.len() + 1 < max_iseq_versions()
+}
+
 /// A [`Function`], which is analogous to a Ruby ISeq, is a control-flow graph of [`Block`]s
 /// containing instructions.
 #[derive(Debug)]
@@ -5279,8 +5284,7 @@ impl Function {
         // On the final version, recompilation is not possible, so converting sends to
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
-        let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if !can_recompile_iseq(self.iseq) {
             return;
         }
         for block in self.reverse_post_order() {
