@@ -7031,7 +7031,7 @@ impl FrameState {
 
     /// Get the opcode for the current instruction
     pub fn get_opcode(&self) -> i32 {
-        unsafe { rb_iseq_opcode_at_pc(self.iseq, self.pc) }
+        unsafe { rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(self.iseq, self.pc)) }
     }
 
     pub fn print<'a>(&'a self, ptr_map: &'a PtrPrintMap) -> FrameStatePrinter<'a> {

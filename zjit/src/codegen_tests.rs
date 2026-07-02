@@ -6,11 +6,35 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold};
+use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
 use insta::assert_snapshot;
+
+fn iseq_contains_raw_opcode(iseq: IseqPtr, expected_opcode: u32) -> bool {
+    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    let mut insn_idx = 0;
+    while insn_idx < iseq_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
+            .try_into()
+            .unwrap();
+        if opcode == expected_opcode {
+            return true;
+        }
+        let bare_opcode: u32 = unsafe { rb_zjit_insn_to_bare_insn(opcode.try_into().unwrap()) }
+            .try_into()
+            .unwrap();
+        insn_idx += insn_len(bare_opcode as usize);
+    }
+    false
+}
+
+fn assert_last_version_compiled(iseq: IseqPtr) {
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
 
 /// Run the Ruby fragment with the inliner enabled with the default inline
 /// threshold for tests. Most inliner tests should use this. `with_inlining_threshold`
@@ -120,6 +144,68 @@ fn test_putobject() {
         test
         test
     "), @"1");
+}
+
+#[test]
+fn test_non_final_compile_keeps_zjit_profile_insns() {
+    set_call_threshold(2);
+    eval("
+        def test(a, b) = a + b
+        test(1, 2)
+        test(1, 2)
+    ");
+
+    let iseq = get_method_iseq("self", "test");
+    assert!(iseq_contains_raw_opcode(iseq, YARVINSN_zjit_opt_plus));
+}
+
+#[test]
+fn test_recompile_exit_profiles_before_recompiling() {
+    set_call_threshold(2);
+    set_num_profiles(2);
+    eval(r#"
+        module RecompileExitProfileTest
+          def test = @x
+        end
+
+        class RecompileExitProfileA
+          include RecompileExitProfileTest
+          def initialize
+            @x = 1
+          end
+        end
+
+        class RecompileExitProfileB
+          include RecompileExitProfileTest
+          def initialize
+            @y = 0
+            @x = 2
+          end
+        end
+
+        RecompileExitProfileA.new.test
+        RecompileExitProfileA.new.test
+    "#);
+
+    let iseq = get_instance_method_iseq("RecompileExitProfileTest", "test");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("RecompileExitProfileB.new.test");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("RecompileExitProfileB.new.test");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert_last_version_compiled(iseq);
+
+    eval("RecompileExitProfileB.new.test");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 2);
+    assert_last_version_compiled(iseq);
 }
 
 #[test]

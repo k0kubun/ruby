@@ -43,6 +43,7 @@ const zjit_jit_frame_t rb_zjit_c_frame = (zjit_jit_frame_t) {
 
 void rb_zjit_profile_disable(const rb_iseq_t *iseq);
 int rb_zjit_insn_to_bare_insn(int insn);
+void rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, const uint8_t *code_ptr);
 
 void
 rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception)
@@ -114,7 +115,7 @@ rb_zjit_insn_to_bare_insn(int insn)
     return vm_zjit_insn_to_bare_insn(insn);
 }
 
-// Update a YARV instruction to a given opcode (to disable ZJIT profiling).
+// Update a YARV instruction to its bare opcode (to disable ZJIT profiling).
 void
 rb_zjit_iseq_insn_set(const rb_iseq_t *iseq, unsigned int insn_idx, enum ruby_vminsn_type bare_insn)
 {
@@ -124,6 +125,30 @@ rb_zjit_iseq_insn_set(const rb_iseq_t *iseq, unsigned int insn_idx, enum ruby_vm
 #endif
     const void *const *insn_table = rb_vm_get_insns_address_table();
     iseq->body->iseq_encoded[insn_idx] = (VALUE)insn_table[bare_insn];
+}
+
+// Update a YARV instruction to its zjit_* opcode so the interpreter profiles it.
+bool
+rb_zjit_iseq_insn_enable_profile(const rb_iseq_t *iseq, unsigned int insn_idx, enum ruby_vminsn_type bare_insn)
+{
+    int zjit_insn = vm_bare_insn_to_zjit_insn(bare_insn);
+    if (zjit_insn == (int)bare_insn) {
+        return false;
+    }
+
+#if RUBY_DEBUG
+    int insn = rb_vm_insn_addr2opcode((void *)iseq->body->iseq_encoded[insn_idx]);
+    RUBY_ASSERT(vm_zjit_insn_to_bare_insn(insn) == (int)bare_insn);
+#endif
+    const void *const *insn_table = rb_vm_get_insns_address_table();
+    iseq->body->iseq_encoded[insn_idx] = (VALUE)insn_table[zjit_insn];
+    return true;
+}
+
+void
+rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, const uint8_t *code_ptr)
+{
+    iseq->body->jit_entry = (rb_jit_func_t)code_ptr;
 }
 
 // Get profiling information for ISEQ

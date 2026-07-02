@@ -122,7 +122,13 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     }
 }
 
-/// Profile the instruction at the current CFP for a recompile side exit.
+/// Handle profiling state for the instruction at the current CFP after a recompile side exit.
+///
+/// The first exit starts a fresh interpreter profiling window for this bytecode
+/// site and returns false. The interpreter then runs the zjit_* instruction and
+/// collects the requested samples. A later exit returns true only after those
+/// samples have already been collected, so the caller can compile the next
+/// version without consuming an extra sample in the exit hook itself.
 pub fn profile_recompile_insn(ec: EcPtr) -> bool {
     let profiler = &mut Profiler::new(ec);
     let pc = unsafe { get_cfp_pc(profiler.cfp) };
@@ -130,28 +136,29 @@ pub fn profile_recompile_insn(ec: EcPtr) -> bool {
         rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(profiler.iseq, pc))
     } as ruby_vminsn_type;
     let profile = &mut get_or_create_iseq_payload(profiler.iseq).profile;
+    let insn_idx = profiler.insn_idx;
 
-    let is_send = matches!(bare_opcode, YARVINSN_send | YARVINSN_opt_send_without_block);
-    // For now, send recompile exits only fill in missing profiles. Once the send site
-    // has finished profiling, don't recompile it on later exits.
-    if is_send && profile.done_profiling_at(profiler.insn_idx) {
-        return false;
-    }
-    // For now, non-send recompile exits reset the profiling counter before requesting recompilation
-    // so that we can collect enough samples.
-    if !is_send && profile.done_profiling_at(profiler.insn_idx) {
-        profile.entry_mut(profiler.insn_idx)
-            .set_profiles_remaining(get_option!(num_profiles));
+    if profile.recompile_profile_ready(insn_idx) {
+        profile.finish_recompile_profile(insn_idx);
+        return true;
     }
 
-    // If this opcode can't be sampled here, this exit has no profile data to collect.
-    if !profile_insn_sample(bare_opcode, profiler, profile) {
+    if profile.recompile_profile_started(insn_idx) {
         return false;
     }
 
-    let entry = profile.entry_mut(profiler.insn_idx);
-    entry.profiles_remaining = entry.profiles_remaining.saturating_sub(1);
-    entry.profiles_remaining == 0
+    let num_profiles = get_option!(num_profiles);
+    if num_profiles == 0 {
+        return true;
+    }
+
+    let enabled = unsafe {
+        rb_zjit_iseq_insn_enable_profile(profiler.iseq, insn_idx as u32, bare_opcode)
+    };
+    if enabled {
+        profile.start_recompile_profile(insn_idx, num_profiles);
+    }
+    false
 }
 
 /// Return the argc as stated in the calldata plus:
@@ -415,11 +422,26 @@ pub struct ProfileEntry {
     opnd_types: Vec<TypeDistribution>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
+    /// Whether a recompile side exit has started a fresh profiling window for this entry.
+    recompile_profile_started: bool,
 }
 
 impl ProfileEntry {
-    pub fn set_profiles_remaining(&mut self, num_profiles: NumProfiles) {
+    fn profiles_remaining(&self) -> NumProfiles {
+        self.profiles_remaining
+    }
+
+    fn start_recompile_profile(&mut self, num_profiles: NumProfiles) {
         self.profiles_remaining = num_profiles;
+        self.recompile_profile_started = true;
+    }
+
+    fn finish_recompile_profile(&mut self) {
+        self.recompile_profile_started = false;
+    }
+
+    fn recompile_profile_started(&self) -> bool {
+        self.recompile_profile_started
     }
 }
 
@@ -451,6 +473,7 @@ impl IseqProfile {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
+                    recompile_profile_started: false,
                 });
                 &mut self.entries[i]
             }
@@ -464,9 +487,36 @@ impl IseqProfile {
             .ok().map(|i| &self.entries[i])
     }
 
-    /// Check if enough profiles have been gathered for this instruction.
-    pub fn done_profiling_at(&self, insn_idx: YarvInsnIdx) -> bool {
-        self.entry(insn_idx).map_or(false, |e| e.profiles_remaining == 0)
+    pub fn start_recompile_profile(&mut self, insn_idx: YarvInsnIdx, num_profiles: NumProfiles) {
+        self.entry_mut(insn_idx).start_recompile_profile(num_profiles);
+    }
+
+    pub fn finish_recompile_profile(&mut self, insn_idx: YarvInsnIdx) {
+        if let Some(entry) = self.entry_mut_existing(insn_idx) {
+            entry.finish_recompile_profile();
+        }
+    }
+
+    pub fn recompile_profile_started(&self, insn_idx: YarvInsnIdx) -> bool {
+        self.entry(insn_idx).is_some_and(ProfileEntry::recompile_profile_started)
+    }
+
+    pub fn recompile_profile_ready(&self, insn_idx: YarvInsnIdx) -> bool {
+        self.entry(insn_idx).is_some_and(|entry| {
+            entry.recompile_profile_started() && entry.profiles_remaining() == 0
+        })
+    }
+
+    pub fn clear_recompile_profiles(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.finish_recompile_profile();
+        }
+    }
+
+    fn entry_mut_existing(&mut self, insn_idx: YarvInsnIdx) -> Option<&mut ProfileEntry> {
+        let idx = insn_idx as u32;
+        self.entries.binary_search_by_key(&idx, |e| e.insn_idx)
+            .ok().map(|i| &mut self.entries[i])
     }
 
     /// Get profiled operand types for a given instruction index

@@ -2174,6 +2174,7 @@ unsafe extern "C" {
     pub fn rb_jit_cont_each_iseq(callback: rb_iseq_callback, data: *mut ::std::os::raw::c_void);
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+    pub fn rb_zjit_iseq_set_jit_entry(iseq: *const rb_iseq_t, code_ptr: *const u8);
     pub fn rb_vm_base_ptr(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
     pub fn rb_zjit_constcache_shareable(ice: *const iseq_inline_constant_cache_entry) -> bool;
     pub fn rb_zjit_iseq_insn_set(
@@ -2181,6 +2182,11 @@ unsafe extern "C" {
         insn_idx: ::std::os::raw::c_uint,
         bare_insn: ruby_vminsn_type,
     );
+    pub fn rb_zjit_iseq_insn_enable_profile(
+        iseq: *const rb_iseq_t,
+        insn_idx: ::std::os::raw::c_uint,
+        bare_insn: ruby_vminsn_type,
+    ) -> bool;
     pub fn rb_iseq_get_zjit_payload(iseq: *const rb_iseq_t) -> *mut ::std::os::raw::c_void;
     pub fn rb_iseq_set_zjit_payload(iseq: *const rb_iseq_t, payload: *mut ::std::os::raw::c_void);
     pub fn rb_zjit_print_exception();

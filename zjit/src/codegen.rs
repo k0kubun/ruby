@@ -3148,8 +3148,19 @@ pub fn local_size_and_idx_to_bp_offset(local_size: usize, local_idx: usize) -> i
 
 /// Convert ISEQ into High-level IR
 fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
-    // Convert ZJIT instructions back to bare instructions
-    unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+    {
+        let payload = get_or_create_iseq_payload(iseq);
+        payload.profile.clear_recompile_profiles();
+
+        // Keep zjit_* instructions active while compiling a version that can be
+        // invalidated and recompiled. Recompile exits rely on the interpreter
+        // profiling those instructions after the exit. For the final version,
+        // remove the profiling overhead because there is no later version to
+        // feed with fresh samples.
+        if payload.versions.len() + 1 >= max_iseq_versions() {
+            unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        }
+    }
 
     // Reject ISEQs with very large temp stacks.
     // We cannot encode too large offsets to access locals in arm64.
@@ -3273,6 +3284,15 @@ c_callable! {
                 if let Some(version) = payload.versions.last_mut() {
                     let cb = ZJITState::get_code_block();
                     invalidate_iseq_version(cb, compiled_iseq, version);
+
+                    match gen_iseq(cb, compiled_iseq, None) {
+                        Ok(code_ptrs) => unsafe {
+                            rb_zjit_iseq_set_jit_entry(compiled_iseq, code_ptrs.start_ptr.raw_ptr(cb));
+                        },
+                        Err(err) => {
+                            debug!("{err:?}: gen_iseq failed during recompilation: {}", iseq_get_location(compiled_iseq, 0));
+                        }
+                    }
                     cb.mark_all_executable();
                 }
             }

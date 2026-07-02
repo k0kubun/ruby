@@ -99,6 +99,7 @@ fn main() {
         .allowlist_function("rb_protect")
         .allowlist_function("rb_zjit_profile_disable")
         .allowlist_function("rb_zjit_insn_to_bare_insn")
+        .allowlist_function("rb_zjit_iseq_set_jit_entry")
 
         // For crashing
         .allowlist_function("rb_bug")
@@ -296,6 +297,7 @@ fn main() {
         .allowlist_function("rb_jit_str_concat_codepoint")
         .allowlist_function("rb_zjit_iseq_inspect")
         .allowlist_function("rb_zjit_iseq_insn_set")
+        .allowlist_function("rb_zjit_iseq_insn_enable_profile")
         .allowlist_function("rb_zjit_local_id")
         .allowlist_function("rb_set_cfp_(pc|sp)")
         .allowlist_function("rb_c_method_tracing_currently_enabled")

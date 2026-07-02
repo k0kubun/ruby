@@ -8735,12 +8735,17 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:HeapBasicObject, v10:BasicObject):
           v17:Fixnum[5] = Const Value(5)
+          v21:CBool = HasType v10, ObjectSubclass[class_exact:C]
+          CondBranch v21, bb5(), bb6()
+        bb5():
+          v24:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
-          v28:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
-          v30:CShape = LoadField v28, :shape_id@0x1040
-          v31:CShape[0x1041] = GuardBitEquals v30, CShape(0x1041)
-          StoreField v28, :@foo@0x1042, v17
-          WriteBarrier v28, v17
+          SetIvar v24, :@foo, v17
+          Jump bb4(v17)
+        bb6():
+          v27:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: SendWithoutBlock: polymorphic fallback
+          Jump bb4(v27)
+        bb4(v20:BasicObject):
           CheckInterrupts
           Return v17
         ");
@@ -17849,7 +17854,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_trigger_guard_type_recompilation() {
+    fn test_guard_type_recompile_profile_window() {
         set_inline_threshold(0);
         eval("
             class C
@@ -17878,8 +17883,9 @@ mod hir_opt_tests {
             # Supposed to be the same as the earlier Ruby method in this test
             num_to_compile = 30
             c = C.new
-            # Call this with a float in order to trigger a guard failure
-            # Do this enough times to cause a recompilation
+            # Call this with a float in order to trigger guard failures and
+            # fill the recompile profiling window. The N+1 exit recompilation
+            # lifecycle is covered by codegen::tests::test_recompile_exit_profiles_before_recompiling.
             num_to_compile.times { c.f(1.5) }
         ");
         let final_hir = hir_string_proc("C.new.method(:f)");
@@ -17933,31 +17939,13 @@ mod hir_opt_tests {
           SetIvar v11, :@a, v17
           PatchPoint NoEPEscape(f)
           v27:Fixnum[1] = Const Value(1)
-          v31:CBool = HasType v12, Flonum
-          CondBranch v31, bb5(), bb6()
-        bb5():
-          v34:Flonum = RefineType v12, Flonum
-          PatchPoint MethodRedefined(Float@0x1008, +@0x1010, cme:0x1018)
-          v60:Float = FloatAdd v34, v27
-          Jump bb4(v60)
-        bb6():
-          v37:CBool = HasType v12, Fixnum
-          CondBranch v37, bb7(), bb8()
-        bb7():
-          v40:Fixnum = RefineType v12, Fixnum
-          PatchPoint MethodRedefined(Integer@0x1040, +@0x1010, cme:0x1048)
-          v63:Fixnum = FixnumAdd v40, v27
-          Jump bb4(v63)
-        bb8():
-          PatchPoint MethodRedefined(Float@0x1008, +@0x1010, cme:0x1018)
-          v66:Flonum = GuardType v12, Flonum recompile
-          v67:Float = FloatAdd v66, v27
-          Jump bb4(v67)
-        bb4(v30:Float|Fixnum):
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
+          v46:Fixnum = GuardType v12, Fixnum recompile
+          v47:Fixnum = FixnumAdd v46, v27
           PatchPoint SingleRactorMode
-          SetIvar v11, :@a, v30
+          SetIvar v11, :@a, v47
           CheckInterrupts
-          Return v30
+          Return v47
         ");
     }
 
