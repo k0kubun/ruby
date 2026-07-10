@@ -18,6 +18,7 @@ class JITPerf
     @category_cycles = Hash.new(0)
     @detailed_category_cycles = Hash.new { |hash, category| hash[category] = Hash.new(0) }
     @categories = {}
+    @perf_maps = {}
   end
 
   def read(path)
@@ -93,11 +94,19 @@ class JITPerf
     symbol = fields[6][0...dso_start].split("+", 2).first
     dso = dso_with_suffix[0...dso_end]
 
-    [dso, symbol, period]
+    begin
+      pid = Integer(fields[1].split("/", 2).first)
+      ip = Integer(fields[5], 16)
+    rescue ArgumentError, TypeError
+      raise ArgumentError, "unexpected pid or IP in perf script line: #{line.chomp}"
+    end
+
+    [pid, ip, dso, symbol, period]
   end
 
   def process_event(event)
-    full_dso, symbol, cycles = event
+    pid, ip, full_dso, symbol, cycles = event
+    full_dso, symbol = resolve_jit_symbol(pid, ip, full_dso, symbol)
     dso = File.basename(full_dso || "Unknown_dso")
     symbol ||= "[unknown]"
 
@@ -108,6 +117,60 @@ class JITPerf
     @detailed_category_cycles[category][[dso, symbol]] += cycles
 
     @categories[category] = true if category.start_with?("[") && category.end_with?("]")
+  end
+
+  def resolve_jit_symbol(pid, ip, dso, symbol)
+    return [dso, symbol] unless symbol == "[unknown]"
+    return [dso, symbol] unless dso == "[anon:Ruby:rb_jit_reserve_addr_space]" || (dso && File.basename(dso).start_with?("perf-"))
+
+    if (perf_symbol = lookup_perf_symbol(pid, ip))
+      ["/tmp/perf-#{pid}.map", perf_symbol]
+    else
+      [dso, symbol]
+    end
+  end
+
+  def lookup_perf_symbol(pid, ip)
+    entries = perf_map_entries(pid)
+    return nil if entries.empty?
+
+    idx = entries.bsearch_index { |entry| entry[0] > ip } || entries.length
+    idx -= 1
+    while idx >= 0 && entries[idx][4] > ip
+      entry = entries[idx]
+      return entry[3] if entry[1] > ip
+
+      idx -= 1
+    end
+    nil
+  end
+
+  def perf_map_entries(pid)
+    @perf_maps.fetch(pid) do
+      path = "/tmp/perf-#{pid}.map"
+      entries = []
+      File.foreach(path).with_index do |line, index|
+        start, size, *symbol = line.split
+        next unless start && size
+
+        start_addr = Integer(start, 16)
+        code_size = Integer(size, 16)
+        next if code_size == 0
+
+        entries << [start_addr, start_addr + code_size, index, symbol.join(" ")]
+      rescue ArgumentError
+        next
+      end
+      entries.sort_by! { |start_addr, _end_addr, index, _symbol| [start_addr, index] }
+      max_end_addr = 0
+      entries.each do |entry|
+        max_end_addr = [max_end_addr, entry[1]].max
+        entry << max_end_addr
+      end
+      @perf_maps[pid] = entries
+    rescue SystemCallError
+      @perf_maps[pid] = []
+    end
   end
 
   def truncate_symbol(symbol, max_length = 50)
