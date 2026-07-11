@@ -135,6 +135,37 @@ pub struct BasicBlock {
 
 pub struct EdgePair(Option<BranchEdge>, Option<BranchEdge>);
 
+/// Build PosMarkers that register a generated-code range under `symbol_name` in HIR perf output.
+fn perf_symbol_markers(symbol_name: &str, end_at_block_end: bool) -> Option<(Insn, Insn)> {
+    if get_option!(perf, None) != Some(PerfMap::HIR) {
+        return None;
+    }
+
+    let symbol_name = symbol_name.to_string();
+    let start = Rc::new(RefCell::new(None));
+    let current = start.clone();
+    let start_marker = Insn::PosMarker(Rc::new(move |code_ptr, _| {
+        let mut current = current.borrow_mut();
+        assert!(current.is_none(), "perf symbol range already open");
+        *current = Some(code_ptr);
+    }));
+    let end_marker: PosMarkerFn = Rc::new(move |end, cb| {
+        if let Some(start) = start.borrow_mut().take() {
+            let start_addr = start.raw_addr(cb);
+            let end_addr = end.raw_addr(cb);
+            if start_addr < end_addr {
+                register_with_perf(symbol_name.clone(), start_addr, end_addr - start_addr);
+            }
+        }
+    });
+    let end_marker = if end_at_block_end {
+        Insn::PosMarkerAtBlockEnd(end_marker)
+    } else {
+        Insn::PosMarker(end_marker)
+    };
+    Some((start_marker, end_marker))
+}
+
 impl BasicBlock {
     fn new(id: BlockId, hir_block_id: hir::BlockId, is_entry: bool, rpo_index: usize) -> Self {
         Self {
@@ -2223,6 +2254,35 @@ impl Assembler
         use crate::backend::parcopy;
         use crate::backend::current::SCRATCH_REG;
 
+        /// Insert generated LIR instructions and optionally wrap them in a HIR perf symbol range.
+        fn insert_insns_with_perf_symbol(
+            block: &mut BasicBlock,
+            insert_pos: usize,
+            symbol_name: &str,
+            end_at_block_end: bool,
+            mut insns: Vec<Insn>,
+        ) {
+            if insns.is_empty() {
+                return;
+            }
+
+            if let Some((start, end)) = perf_symbol_markers(symbol_name, end_at_block_end) {
+                insns.insert(0, start);
+                if end_at_block_end {
+                    let end_pos = insns.len() - 1;
+                    assert!(insns[end_pos].is_terminator());
+                    insns.insert(end_pos, end);
+                } else {
+                    insns.push(end);
+                }
+            }
+
+            for (i, insn) in insns.into_iter().enumerate() {
+                block.insns.insert(insert_pos + i, insn);
+                block.insn_ids.insert(insert_pos + i, None);
+            }
+        }
+
         // Count predecessors for each block
         let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
         for block_id in self.block_order() {
@@ -2286,13 +2346,19 @@ impl Assembler
                     let new_block_id = self.new_block(pred_hir_block_id, false, pred_rpo_index);
                     let label = self.new_label("split");
                     self.basic_blocks[new_block_id.0].push_insn(Insn::Label(label));
-                    for mov in moves {
-                        self.basic_blocks[new_block_id.0].push_insn(mov);
-                    }
-                    self.basic_blocks[new_block_id.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+                    let mut block_param_insns = moves;
+                    block_param_insns.push(Insn::Jmp(Target::Block(Box::new(BranchEdge {
                         target: successor,
                         args: vec![],
                     }))));
+                    let insert_pos = self.basic_blocks[new_block_id.0].insns.len();
+                    insert_insns_with_perf_symbol(
+                        &mut self.basic_blocks[new_block_id.0],
+                        insert_pos,
+                        "BlockParam",
+                        true,
+                        block_param_insns,
+                    );
 
                     // Redirect predecessor's branch to the new block
                     let pred_insns = &mut self.basic_blocks[pred_id.0].insns;
@@ -2309,18 +2375,12 @@ impl Assembler
                     }
                 } else if num_successors > 1 {
                     // Multi-succ: insert at start of successor (after Label)
-                    for (i, mov) in moves.into_iter().enumerate() {
-                        self.basic_blocks[successor.0].insns.insert(1 + i, mov);
-                        self.basic_blocks[successor.0].insn_ids.insert(1 + i, None);
-                    }
+                    insert_insns_with_perf_symbol(&mut self.basic_blocks[successor.0], 1, "BlockParam", false, moves);
                 } else {
                     assert_eq!(num_successors, 1);
                     // Single-succ: insert at end of predecessor before terminator
                     let len = self.basic_blocks[pred_id.0].insns.len();
-                    for (i, mov) in moves.into_iter().enumerate() {
-                        self.basic_blocks[pred_id.0].insns.insert(len - 1 + i, mov);
-                        self.basic_blocks[pred_id.0].insn_ids.insert(len - 1 + i, None);
-                    }
+                    insert_insns_with_perf_symbol(&mut self.basic_blocks[pred_id.0], len - 1, "BlockParam", false, moves);
                 }
             }
         }
@@ -2379,10 +2439,7 @@ impl Assembler
                 .or_else(|| self.basic_blocks[block_id.0].insns.iter().position(|insn| matches!(insn, Insn::Label(_))).map(|idx| idx + 1))
                 .unwrap_or(0);
 
-            for (i, mov) in moves.into_iter().enumerate() {
-                self.basic_blocks[block_id.0].insns.insert(insert_pos + i, mov);
-                self.basic_blocks[block_id.0].insn_ids.insert(insert_pos + i, None);
-            }
+            insert_insns_with_perf_symbol(&mut self.basic_blocks[block_id.0], insert_pos, "EntryParam", false, moves);
         }
 
         // Clear edge args on all branch instructions since the moves have been
