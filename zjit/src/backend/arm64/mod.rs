@@ -895,6 +895,9 @@ impl Assembler {
                 &mut Insn::PatchPoint(ref data) => {
                     split_patch_point(asm, &data.target, data.invariant, data.version);
                 }
+                Insn::PadPatchPoint => {
+                    asm.push_insn_with_perf_symbol("PadPatchPoint", insn);
+                }
                 _ => {
                     asm.push_insn(insn);
                 }
