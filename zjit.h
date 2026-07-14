@@ -17,6 +17,7 @@
 // zero, so RB_SPECIAL_CONST_P is false.
 #define ZJIT_STACK_MAP_VREG_TAG 0x08
 #define ZJIT_STACK_MAP_SKIP_TAG 0x10
+#define ZJIT_STACK_MAP_CONST_TAG 0x18
 #define ZJIT_STACK_MAP_TAG_MASK 0xff
 #define ZJIT_STACK_MAP_SHIFT 8
 
@@ -44,6 +45,28 @@ ZJIT_STACK_MAP_SKIP_SIZE(VALUE entry)
     return entry >> ZJIT_STACK_MAP_SHIFT;
 }
 
+static inline bool
+ZJIT_STACK_MAP_CONST_P(VALUE entry)
+{
+    return (entry & ZJIT_STACK_MAP_TAG_MASK) == ZJIT_STACK_MAP_CONST_TAG;
+}
+
+static inline size_t
+ZJIT_STACK_MAP_CONST_INDEX(VALUE entry)
+{
+    return entry >> ZJIT_STACK_MAP_SHIFT;
+}
+
+typedef struct zjit_side_exit {
+    // The compiled unit to recompile after taking this exit, or NULL.
+    const rb_iseq_t *compiled_iseq;
+    // Heap VALUE constants referenced by tagged stack-map entries.
+    VALUE *constants;
+    // Perfetto side-exit reason, or NULL when this exit is not traced.
+    const char *reason;
+    uint32_t constants_size;
+} zjit_side_exit_t;
+
 // JITFrame is defined here as the single source of truth and imported into
 // Rust via bindgen. C code reads fields directly; Rust uses an impl block.
 typedef struct zjit_jit_frame {
@@ -59,11 +82,19 @@ typedef struct zjit_jit_frame {
     // Always false for C frames.
     bool materialize_block_code;
 
+    // Number of operand-stack slots in the top frame. The side-exit
+    // materializer adds this to the live ZJIT SP register.
+    uint32_t sp_size;
+
+    // Side-exit-only metadata. NULL for entry and C-call JITFrames.
+    zjit_side_exit_t *side_exit;
+
     // Number of stack map entries in stack[].
     uint32_t stack_size;
     // Flexible array of stack map entries. Each entry is either an immediate
     // VALUE, a tagged native-stack index from cfp->jit_return for a value
-    // kept by the JIT, or a tagged count of VM stack slots to skip.
+    // kept by the JIT, a tagged side-exit constant-table index, or a tagged
+    // count of VM stack slots to skip.
     VALUE stack[];
 } zjit_jit_frame_t;
 
@@ -92,6 +123,7 @@ void rb_zjit_invalidate_no_singleton_class(VALUE klass);
 void rb_zjit_invalidate_root_box(void);
 void rb_zjit_jit_frame_update_references(zjit_jit_frame_t *jit_frame);
 void rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cfp);
+void rb_zjit_materialize_side_exit(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp);
 size_t rb_zjit_hash_new_size(void);
 bool rb_zjit_class_allocate_instance_fastpath(VALUE klass, size_t *size_out, shape_id_t *shape_id_out);
 

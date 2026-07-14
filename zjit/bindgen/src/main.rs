@@ -336,6 +336,7 @@ fn main() {
         .allowlist_var("ZJIT_STACK_MAP_SHIFT")
         .allowlist_var("ZJIT_STACK_MAP_VREG_TAG")
         .allowlist_var("ZJIT_STACK_MAP_SKIP_TAG")
+        .allowlist_var("ZJIT_STACK_MAP_CONST_TAG")
         .allowlist_var("ZJIT_JIT_RETURN_C_FRAME")
         .allowlist_function("rb_assert_holding_vm_lock")
         .allowlist_function("rb_jit_shape_complex_p")

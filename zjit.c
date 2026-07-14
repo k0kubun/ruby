@@ -42,6 +42,8 @@ const zjit_jit_frame_t rb_zjit_c_frame = (zjit_jit_frame_t) {
     .pc = 0,
     .iseq = 0,
     .materialize_block_code = false,
+    .sp_size = 0,
+    .side_exit = NULL,
 };
 
 void rb_zjit_profile_disable(const rb_iseq_t *iseq);

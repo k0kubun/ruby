@@ -2853,10 +2853,9 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
                 cfp->block_code = NULL;
             }
 
-            // Materialize Ruby stack slots kept off the VM stack. On side exit,
-            // the exiting frame is already written by compile_exit_save_state()
-            // and skipped here after materialize_exit_trampoline clears its
-            // jit_return, so this restores older ZJIT frames from stack maps.
+            // Materialize Ruby stack slots kept off the VM stack. Regular
+            // JITFrames restore one frame at a time. A side-exit JITFrame starts
+            // at the current frame and may span older inlined frames.
             int32_t stack_size = (int32_t)jit_frame->stack_size;
             if (stack_size > 0) {
                 VALUE *stack = cfp->sp;
@@ -2872,6 +2871,13 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
                     else if (ZJIT_STACK_MAP_SKIP_P(entry)) {
                         stack -= ZJIT_STACK_MAP_SKIP_SIZE(entry);
                     }
+                    else if (ZJIT_STACK_MAP_CONST_P(entry)) {
+                        size_t index = ZJIT_STACK_MAP_CONST_INDEX(entry);
+                        VM_ASSERT(jit_frame->side_exit != NULL);
+                        VM_ASSERT(index < jit_frame->side_exit->constants_size);
+                        stack--;
+                        *stack = jit_frame->side_exit->constants[index];
+                    }
                     else {
                         stack--;
                         *stack = entry;
@@ -2882,6 +2888,31 @@ rb_zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t 
         }
         if (end_cfp == cfp) break;
         cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+    }
+}
+
+void rb_zjit_record_exit_stack(const char *reason);
+void rb_zjit_exit_recompile(rb_execution_context_t *ec, VALUE compiled_iseq);
+
+// Materialize a side exit while its native frame and saved registers are still
+// available, then run optional cold-path instrumentation and recompilation.
+void
+rb_zjit_materialize_side_exit(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp)
+{
+    const zjit_jit_frame_t *jit_frame = CFP_ZJIT_FRAME(cfp);
+    zjit_side_exit_t *side_exit = jit_frame->side_exit;
+    VM_ASSERT(side_exit != NULL);
+
+    // EP may point to an escaped heap environment for block frames, so restore
+    // SP from the live ZJIT SP register rather than deriving it from cfp->ep.
+    cfp->sp = sp + jit_frame->sp_size;
+    rb_zjit_materialize_frames(ec, cfp);
+
+    if (side_exit->reason != NULL) {
+        rb_zjit_record_exit_stack(side_exit->reason);
+    }
+    if (side_exit->compiled_iseq != NULL) {
+        rb_zjit_exit_recompile(ec, (VALUE)side_exit->compiled_iseq);
     }
 }
 #endif

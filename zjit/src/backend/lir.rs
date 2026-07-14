@@ -1,19 +1,20 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
+use crate::cruby::{IseqPtr, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_CONST_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
-use crate::options::{TraceExits, PerfMap, get_option};
-use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
-use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
+use crate::options::{PerfMap, get_option};
+use crate::payload::{IseqVersionRef, JITFrame, get_or_create_iseq_payload};
+use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, CompileError};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
-use crate::state::{ZJITState, rb_zjit_record_exit_stack};
+use crate::state::ZJITState;
 use crate::cast::IntoUsize;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
@@ -587,12 +588,14 @@ pub struct SideExit {
     pub locals: Vec<Opnd>,
     pub iseq: IseqPtr,
     /// Stack map for older inlined frames that are not written directly by this
-    /// side exit. The current frame's stack and locals are still handled by
-    /// `stack` and `locals` above.
+    /// side exit, as well as the current frame's stack and locals.
     pub stack_map: Option<StackMap>,
     /// If set, the side exit will profile the current instruction and invalidate
     /// the compiled ISEQ for recompilation.
     pub recompile: Option<SideExitRecompile>,
+    /// Side exits traced to Perfetto carry their reason in the shared handler's
+    /// metadata. Keeping it here prevents merging exits with different reasons.
+    pub trace_reason: Option<String>,
 }
 
 /// Metadata for the recompile callback on side exit.
@@ -600,7 +603,7 @@ pub struct SideExit {
 pub struct SideExitRecompile {
     /// The compiled unit whose version must be invalidated to force a recompile. For inlined
     /// methods, this will be the outer function it was inlined into.
-    pub compiled_iseq: Opnd,
+    pub compiled_iseq: IseqPtr,
     pub insn_idx: u32,
 }
 
@@ -1505,13 +1508,6 @@ const JIT_FRAME_OFFSET_FROM_JIT_RETURN: usize = 1;
 ///                num_spill_slots | +-------------------------+ |
 ///                                v | allocator spill slot X  | |
 ///                                  +-------------------------+ |
-///                                ^ | side-exit stack-map     | |
-///                                | | capture slot 0          | |
-///                                | +-------------------------+ |
-/// num_side_exit_stack_map_slots  | |          ...            | |
-///                                | +-------------------------+ |
-///                                v | capture slot X          | v
-///                                  +-------------------------+
 ///                                  | FrameSetup align slot   | if needed
 ///                                  +-------------------------+
 ///                                           low addr
@@ -1524,20 +1520,17 @@ pub struct StackState {
     /// The number of stack slots needed by register allocator spills.
     pub(crate) num_spill_slots: usize,
 
-    /// The maximum number of stack slots needed to capture side-exit stack-map
-    /// operands that cannot be encoded directly.
-    pub(crate) num_side_exit_stack_map_slots: usize,
 }
 
 impl StackState {
     /// Initialize an empty stack state.
     fn new() -> Self {
-        StackState { stack_base_idx: 0, num_spill_slots: 0, num_side_exit_stack_map_slots: 0 }
+        StackState { stack_base_idx: 0, num_spill_slots: 0 }
     }
 
     /// Initialize a stack state with a fixed number of reserved stack slots.
     fn new_with_stack_slots(stack_base_idx: usize) -> Self {
-        StackState { stack_base_idx, num_spill_slots: 0, num_side_exit_stack_map_slots: 0 }
+        StackState { stack_base_idx, num_spill_slots: 0 }
     }
 
     /// Reserve native stack slots for JITFrame storage and stack-allocated operands.
@@ -1549,9 +1542,9 @@ impl StackState {
     }
 
     /// Return the total number of native stack slots used for the frame's
-    /// reserved data, register allocator spills, and side-exit captures.
+    /// reserved data and register allocator spills.
     pub(crate) fn stack_slot_count(&self) -> usize {
-        self.stack_base_idx + self.num_spill_slots + self.num_side_exit_stack_map_slots
+        self.stack_base_idx + self.num_spill_slots
     }
 
     /// Return the stack-map index for a VReg stored below StackState-managed
@@ -1573,13 +1566,7 @@ impl StackState {
     /// Return a stack index for a register saved by handle_caller_saved_regs().
     fn stack_idx_for_caller_saved_reg(&self, caller_saved_reg_idx: usize) -> usize {
         let frame_alignment_slots = self.stack_slot_count() % 2;
-        self.num_spill_slots + self.num_side_exit_stack_map_slots + frame_alignment_slots + caller_saved_reg_idx
-    }
-
-    /// Return a stack index reserved for side-exit stack-map register capture.
-    fn stack_idx_for_side_exit_stack_map(&self, slot_idx: usize) -> usize {
-        assert!(slot_idx < self.num_side_exit_stack_map_slots);
-        self.num_spill_slots + slot_idx
+        self.num_spill_slots + frame_alignment_slots + caller_saved_reg_idx
     }
 
     /// Convert a stack index to the `disp` of the stack slot
@@ -1600,16 +1587,34 @@ impl StackState {
 }
 
 /// Stack map to materialize Ruby stack slots from JIT-kept values.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StackMap {
     /// Ruby stack slots to reconstruct if this frame is materialized.
     stack: Vec<StackMapEntry>,
     /// Heap-allocated JITFrame whose trailing stack map storage receives the
-    /// encoded entries once this CCall's register allocation is known.
+    /// encoded entries once register allocation is known. Side exits leave
+    /// this null and allocate only after equivalent exits are deduplicated.
     jit_frame: *const zjit_jit_frame,
     /// Inlining depth of the frame whose stack is described by this map.
     /// Stack-map indexes are decoded from that frame's cfp->jit_return.
     frame_depth: usize,
+}
+
+// JITFrame pointers are allocation details, not part of the logical exit
+// state. Ignoring them lets equivalent side exits share their tiny stubs.
+impl PartialEq for StackMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.stack == other.stack && self.frame_depth == other.frame_depth
+    }
+}
+
+impl Eq for StackMap {}
+
+impl Hash for StackMap {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.stack.hash(state);
+        self.frame_depth.hash(state);
+    }
 }
 
 impl StackMap {
@@ -1623,6 +1628,10 @@ impl StackMap {
 pub enum StackMapEntry {
     /// Immediate Ruby VALUE or VReg to materialize.
     Opnd(Opnd),
+    /// Heap VALUE stored in the side exit's GC-managed constant table. Keep
+    /// the VALUE here as part of the logical stack-map identity, while the
+    /// stable table index is what gets encoded into the JITFrame.
+    Const { index: usize, value: VALUE },
     /// Number of VM stack slots to skip when materializing across inlined frames.
     Skip(usize),
 }
@@ -2491,6 +2500,9 @@ impl Assembler
                                     assert!(value.special_const_p(), "StackMap should only materialize immediate VALUEs, but got: {value:?}");
                                     value
                                 }
+                                StackMapEntry::Const { .. } => {
+                                    unreachable!("constant-table entries are only used by side exits")
+                                }
                                 StackMapEntry::Skip(size) => {
                                     let encoded = (size << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_SKIP_TAG as usize;
                                     debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap skip should not look like an immediate VALUE");
@@ -2618,40 +2630,6 @@ impl Assembler
         }
     }
 
-    /// Return the maximum number of stack-map entries that any side exit needs
-    /// to copy into reserved native stack slots.
-    pub fn side_exit_stack_map_slots(&self, assignments: &[Option<Allocation>]) -> usize {
-        self.block_order().into_iter().fold(0, |max_slots, block_id| {
-            let block = &self.basic_blocks[block_id.0];
-            block.insns.iter().fold(max_slots, |max_slots, insn| {
-                let slots = insn.target().map(|target| Self::side_exit_target_stack_map_slots(target, assignments)).unwrap_or(0);
-                max_slots.max(slots)
-            })
-        })
-    }
-
-    fn side_exit_target_stack_map_slots(target: &Target, assignments: &[Option<Allocation>]) -> usize {
-        let Target::SideExit(data) = target else {
-            return 0;
-        };
-        let Some(StackMap { stack, .. }) = &data.exit.stack_map else {
-            return 0;
-        };
-
-        stack.iter().filter(|entry| match entry {
-            StackMapEntry::Opnd(Opnd::Value(value)) => !value.special_const_p(),
-            StackMapEntry::Opnd(Opnd::UImm(value)) => !VALUE(*value as usize).special_const_p(),
-            StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => {
-                matches!(
-                    assignments[idx.to_usize()].expect("StackMap VReg should have an allocation"),
-                    Allocation::Reg(_) | Allocation::Fixed(_)
-                )
-            }
-            StackMapEntry::Opnd(Opnd::Reg(_)) => true,
-            _ => false,
-        }).count()
-    }
-
     /// Walk every instruction and replace VReg operands with the physical
     /// register (or stack slot) from the allocation assignments.
     fn rewrite_instructions(&mut self, assignments: &[Option<Allocation>]) {
@@ -2764,15 +2742,6 @@ impl Assembler
     /// Returns the exit code as a list of instructions to be appended after the main
     /// code is linearized and split.
     pub fn compile_exits(&mut self) -> Vec<Insn> {
-        fn immediate_stack_map_value(opnd: Opnd) -> Option<VALUE> {
-            let value = match opnd {
-                Opnd::Value(value) => value,
-                Opnd::UImm(value) => VALUE(value as usize),
-                _ => unreachable!("unexpected immediate StackMap operand: {opnd:?}"),
-            };
-            value.special_const_p().then_some(value)
-        }
-
         fn encode_stack_map_index(asm: &Assembler, stack_idx: usize, frame_depth: usize) -> VALUE {
             let vreg_stack_index = asm.stack_state.stack_map_index_for_spill(stack_idx, frame_depth);
             let encoded = (vreg_stack_index << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_VREG_TAG as usize;
@@ -2780,31 +2749,46 @@ impl Assembler
             VALUE(encoded)
         }
 
-        fn capture_stack_map_opnd(asm: &mut Assembler, opnd: Opnd, capture_idx: &mut usize, frame_depth: usize) -> VALUE {
-            let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(*capture_idx);
-            *capture_idx += 1;
-            let capture_slot = Opnd::Mem(Mem {
-                base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
-                disp: 0,
-                num_bits: 64,
-            });
-            let opnd = if matches!(opnd, Opnd::Reg(_)) { opnd.with_num_bits(64) } else { opnd };
-            asm.store(capture_slot, opnd);
-            encode_stack_map_index(asm, stack_idx, frame_depth)
-        }
+        fn compile_exit_stack_map(asm: &mut Assembler, exit: &SideExit, stack_map: &StackMap) {
+            use crate::backend::current::ALLOC_REGS;
 
-        fn compile_exit_stack_map(asm: &mut Assembler, stack_map: &StackMap) {
-            let StackMap { stack, jit_frame, frame_depth } = stack_map;
-            let jit_frame = *jit_frame;
+            let StackMap { stack, jit_frame: pending_jit_frame, frame_depth } = stack_map;
+            assert!(pending_jit_frame.is_null(), "side-exit JITFrame should be allocated after deduplication");
+            let constants = stack.iter().filter_map(|entry| match entry {
+                StackMapEntry::Const { value, .. } => Some(*value),
+                _ => None,
+            }).collect();
+            let compiled_iseq = exit.recompile.as_ref()
+                .map_or(std::ptr::null(), |recompile| recompile.compiled_iseq);
+            let pc = match exit.pc {
+                Opnd::UImm(pc) => pc as *const VALUE,
+                _ => unreachable!("side-exit PC should be a constant pointer"),
+            };
+            let jit_frame = JITFrame::new_side_exit(
+                pc,
+                exit.iseq,
+                exit.stack.len(),
+                stack.len(),
+                compiled_iseq,
+                constants,
+                exit.trace_reason.as_deref(),
+            );
             assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
 
-            let mut capture_idx = 0;
+            let mut constant_idx = 0;
             for (idx, stack_entry) in stack.iter().enumerate() {
                 let entry = match *stack_entry {
-                    StackMapEntry::Opnd(Opnd::Value(_) | Opnd::UImm(_)) => {
-                        let StackMapEntry::Opnd(opnd) = *stack_entry else { unreachable!() };
-                        immediate_stack_map_value(opnd)
-                            .unwrap_or_else(|| capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth))
+                    StackMapEntry::Opnd(Opnd::Value(value)) if value.special_const_p() => value,
+                    StackMapEntry::Const { index, .. } => {
+                        assert_eq!(index, constant_idx, "SideExit StackMap constants should be densely indexed");
+                        let encoded = (constant_idx << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_CONST_TAG as usize;
+                        constant_idx += 1;
+                        VALUE(encoded)
+                    }
+                    StackMapEntry::Opnd(Opnd::UImm(value)) => {
+                        let value = VALUE(value as usize);
+                        assert!(value.special_const_p(), "SideExit StackMap UImm should be a special constant");
+                        value
                     }
                     StackMapEntry::Skip(size) => {
                         let encoded = (size << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_SKIP_TAG as usize;
@@ -2816,109 +2800,43 @@ impl Assembler
                         encode_stack_map_index(asm, stack_idx.to_usize(), *frame_depth)
                     }
                     StackMapEntry::Opnd(Opnd::Reg(_)) => {
-                        let StackMapEntry::Opnd(opnd) = *stack_entry else { unreachable!() };
-                        capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth)
+                        let StackMapEntry::Opnd(Opnd::Reg(reg)) = *stack_entry else { unreachable!() };
+                        let saved_reg_idx = ALLOC_REGS.iter()
+                            .position(|saved| saved.reg_no == reg.reg_no)
+                            .unwrap_or_else(|| panic!("SideExit StackMap register is not saved by the trampoline: {reg:?}"));
+                        let stack_idx = asm.stack_state.stack_idx_for_caller_saved_reg(saved_reg_idx);
+                        encode_stack_map_index(asm, stack_idx, *frame_depth)
                     }
                     _ => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 };
                 unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
             }
 
-            assert!(capture_idx <= asm.stack_state.num_side_exit_stack_map_slots);
-            asm_comment!(asm, "install side-exit JITFrame for caller depth {}", frame_depth);
+            let constants_size = unsafe { (*(*jit_frame).side_exit).constants_size as usize };
+            assert_eq!(constant_idx, constants_size);
+            asm_comment!(asm, "install side-exit JITFrame for depth {}", frame_depth);
             let jit_frame_slot = Opnd::mem(64, NATIVE_BASE_PTR, -((*frame_depth as i32 + 1) * SIZEOF_VALUE_I32));
             asm.store(jit_frame_slot, Opnd::const_ptr(jit_frame));
         }
 
-        /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
-        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
-            let SideExit { pc, stack, locals, iseq, stack_map, .. } = exit;
-
+        fn compile_exit(asm: &mut Assembler, exit: &SideExit) {
             // Side exit blocks are not part of the CFG at the moment,
             // so we need to manually ensure that patchpoints get padded
             // so that nobody stomps on us
             asm.pad_patch_point();
 
-            asm_comment!(asm, "save cfp->pc");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
-
-            asm_comment!(asm, "save cfp->sp");
-            asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
-
-            asm_comment!(asm, "save cfp->iseq");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
-
-            // cfp->block_code and cfp->jit_return are cleared by the materialize_exit trampoline
-
-            if !stack.is_empty() {
-                asm_comment!(asm, "write stack slots: {}", join_opnds(&stack, ", "));
-                for (idx, &opnd) in stack.iter().enumerate() {
-                    asm.store(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
-                }
+            if let Some(stack_map) = &exit.stack_map {
+                compile_exit_stack_map(asm, exit, stack_map);
             }
-
-            if !locals.is_empty() {
-                asm_comment!(asm, "write locals: {}", join_opnds(&locals, ", "));
-                for (idx, &opnd) in locals.iter().enumerate() {
-                    asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(locals.len(), idx) - 1) * SIZEOF_VALUE_I32), opnd);
-                }
-            }
-
-            if let Some(stack_map) = stack_map {
-                compile_exit_stack_map(asm, stack_map);
-            }
-        }
-
-        /// Tear down the JIT frame and return to the interpreter.
-        fn compile_exit_return(asm: &mut Assembler) {
             asm_comment!(asm, "exit to the interpreter");
-            asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
+            asm.jmp(Target::CodePtr(ZJITState::get_side_exit_trampoline()));
         }
 
-        fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
+        fn prepare_exit_recompile(exit: &SideExit) {
             if let Some(recompile) = &exit.recompile {
                 let payload = get_or_create_iseq_payload(exit.iseq);
                 payload.reset_profiles_remaining(recompile.insn_idx as YarvInsnIdx);
-                use crate::codegen::exit_recompile;
-                asm_comment!(asm, "profile and maybe recompile");
-                asm_ccall!(asm, exit_recompile,
-                    EC,
-                    recompile.compiled_iseq
-                );
             }
-        }
-
-        /// Compile the main side-exit code.  The side exit will optionally record a traced exit
-        /// stack, optionally trigger recompilation, and then return to the interpreter. Shared
-        /// exits pass no trace reason so they can still be deduplicated by SideExit.
-        /// IOW, we should never pass a trace reason if we expect the exit to be
-        /// deduplicated.
-        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
-            // Save VM state before the ccall so that
-            // rb_profile_frames sees valid cfp->pc and the
-            // ccall doesn't clobber caller-saved registers
-            // holding stack/local operands.
-            compile_exit_save_state(asm, exit);
-            if trace_reason.is_some() || exit.recompile.is_some() {
-                // Clear cfp->jit_return to prepare for a C call. Normally, cfp->jit_return
-                // is cleared by the materialize_exit trampoline, but if we're about to
-                // make a C call, we need to clear any stale JITFrame.
-                asm_comment!(asm, "clear cfp->jit_return");
-                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
-            }
-            if let Some(reason) = trace_reason {
-                // Leak a CString with the reason so it's available at runtime
-                let reason_cstr = std::ffi::CString::new(reason.to_string())
-                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
-                let reason_ptr = reason_cstr.into_raw() as *const u8;
-                asm_ccall!(asm, rb_zjit_record_exit_stack, Opnd::const_ptr(reason_ptr));
-            }
-            compile_exit_recompile(asm, exit);
-            compile_exit_return(asm);
-        }
-
-        fn join_opnds(opnds: &Vec<Opnd>, delimiter: &str) -> String {
-            opnds.iter().map(|opnd| format!("{opnd}")).collect::<Vec<_>>().join(delimiter)
         }
 
         // Extract targets first so that we can update instructions while referencing part of them.
@@ -2967,37 +2885,25 @@ impl Assembler
             // so you can't use an instruction that returns a VReg.
             if let Target::SideExit(data) = target {
                 let SideExitTarget { exit, reason } = *data;
-                // Only record the exit if `trace_side_exits` is defined and the counter is either the one specified
-                let should_record_exit = get_option!(trace_side_exits).map(|trace| match trace {
-                    TraceExits::All => true,
-                    TraceExits::Counter(counter) if counter == side_exit_counter(reason) => true,
-                    _ => false,
-                }).unwrap_or(false);
 
                 // If enabled, instrument exits first, and then jump to a shared exit.
-                let counted_exit = if get_option!(stats) || should_record_exit || cfg!(test) {
+                let counted_exit = if get_option!(stats) || cfg!(test) {
                     let counted_exit = self.new_label("counted_exit");
                     self.write_label(counted_exit.clone());
                     asm_comment!(self, "Counted Exit: {reason}");
 
-                    if get_option!(stats) || cfg!(test) {
-                        asm_comment!(self, "increment a side exit counter");
-                        self.incr_counter(Opnd::const_ptr(exit_counter_ptr(reason)), 1.into());
+                    asm_comment!(self, "increment a side exit counter");
+                    self.incr_counter(Opnd::const_ptr(exit_counter_ptr(reason)), 1.into());
 
-                        if let SideExitReason::UnhandledYARVInsn(opcode) = reason {
-                            asm_comment!(self, "increment an unhandled YARV insn counter");
-                            self.incr_counter(Opnd::const_ptr(exit_counter_ptr_for_opcode(opcode)), 1.into());
-                        }
+                    if let SideExitReason::UnhandledYARVInsn(opcode) = reason {
+                        asm_comment!(self, "increment an unhandled YARV insn counter");
+                        self.incr_counter(Opnd::const_ptr(exit_counter_ptr_for_opcode(opcode)), 1.into());
                     }
 
-                    if should_record_exit {
-                        compile_exit(self, &exit, Some(reason));
-                    } else {
-                        // If the side exit has already been compiled, jump to it.
-                        // Otherwise, let it fall through and compile the exit next.
-                        if let Some(&exit_label) = compiled_exits.get(&exit) {
-                            self.jmp(Target::Label(exit_label));
-                        }
+                    // If the side exit has already been compiled, jump to it.
+                    // Otherwise, let it fall through and compile the exit next.
+                    if let Some(&exit_label) = compiled_exits.get(&exit) {
+                        self.jmp(Target::Label(exit_label));
                     }
                     Some(counted_exit)
                 } else {
@@ -3011,7 +2917,8 @@ impl Assembler
                     let new_exit = self.new_label("side_exit");
                     self.write_label(new_exit.clone());
                     asm_comment!(self, "Exit: {}", exit.pc);
-                    compile_exit(self, &exit, None);
+                    prepare_exit_recompile(&exit);
+                    compile_exit(self, &exit);
                     compiled_exits.insert(exit, new_exit.unwrap_label());
                     new_exit
                 };

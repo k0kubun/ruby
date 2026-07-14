@@ -18,14 +18,14 @@ use crate::invariants::{
 use crate::gc::append_gc_offsets;
 use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
 use crate::state::ZJITState;
-use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_without_block_fallback_counter_for_method_type, send_without_block_fallback_counter_for_optimized_method_type};
+use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_without_block_fallback_counter_for_method_type, send_without_block_fallback_counter_for_optimized_method_type, side_exit_counter};
 use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
 use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, InlineDepth, PerfMap, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, InlineDepth, PerfMap, TraceExits, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
@@ -970,7 +970,7 @@ fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, function: &Function, s
 /// Record a patch point that should be invalidated on a given invariant
 fn gen_patch_point(jit: &mut JITState, asm: &mut Assembler, function: &Function, invariant: &Invariant, state: &FrameState) {
     let invariant = *invariant;
-    let exit = build_side_exit(jit, function, state);
+    let exit = build_side_exit(jit, function, state, PatchPoint(invariant), None);
 
     // Let compile_exits compile a side exit. Let scratch_split lower it with split_patch_point.
     asm.patch_point(Target::SideExit(Box::new(SideExitTarget { exit, reason: PatchPoint(invariant) })), invariant, jit.version);
@@ -1620,8 +1620,9 @@ fn gen_push_inline_frame(
     // cfp->sp is left stale at frame push, matching the non-inlined gen_push_frame, which
     // also skips the cfp->sp write for ISEQ frames. The first gen_save_sp call inside the
     // inlined body (reached via gen_prepare_call_with_gc or gen_prepare_leaf_call_with_gc
-    // before any GC-triggering operation) installs the correct value. Side-exits write
-    // cfp->sp themselves via compile_exit_save_state in lir.rs before returning Qundef.
+    // before any GC-triggering operation) installs the correct value. The shared
+    // side-exit materializer restores cfp->sp from the live SP register before
+    // returning Qundef.
     fn cfp_opnd(offset: i32) -> Opnd {
         Opnd::mem(64, CFP, offset - (RUBY_SIZEOF_CONTROL_FRAME as i32))
     }
@@ -3183,6 +3184,9 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
                 offset -= 1;
                 asm.mov(Opnd::mem(64, SP, offset * SIZEOF_VALUE_I32), opnd);
             }
+            StackMapEntry::Const { .. } => {
+                unreachable!("constant-table entries are only used by side exits")
+            }
             StackMapEntry::Skip(skip) => {
                 offset -= skip as i32;
             }
@@ -3369,22 +3373,28 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
 
 /// Build a Target::SideExit
 fn side_exit(jit: &JITState, function: &Function, state: &FrameState, reason: SideExitReason) -> Target {
-    let exit = build_side_exit(jit, function, state);
+    let exit = build_side_exit(jit, function, state, reason, None);
     Target::SideExit(Box::new(SideExitTarget { exit, reason }))
 }
 
 /// Build a Target::SideExit that optionally triggers exit_recompile on the exit path.
 fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameState, reason: SideExitReason, recompile: Option<Recompile>) -> Target {
-    let mut exit = build_side_exit(jit, function, state);
-    exit.recompile = recompile.map(|_| SideExitRecompile {
-        compiled_iseq: Opnd::Value(VALUE::from(jit.iseq())),
+    let recompile = recompile.map(|_| SideExitRecompile {
+        compiled_iseq: jit.iseq(),
         insn_idx: state.insn_idx() as u32,
     });
+    let exit = build_side_exit(jit, function, state, reason, recompile);
     Target::SideExit(Box::new(SideExitTarget { exit, reason }))
 }
 
 /// Build a side-exit context
-fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> SideExit {
+fn build_side_exit(
+    jit: &JITState,
+    function: &Function,
+    state: &FrameState,
+    reason: SideExitReason,
+    recompile: Option<SideExitRecompile>,
+) -> SideExit {
     let mut stack = Vec::new();
     for &insn_id in state.stack() {
         stack.push(jit.get_opnd(insn_id));
@@ -3395,26 +3405,44 @@ fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> S
         locals.push(jit.get_opnd(insn_id));
     }
 
+    // A side exit describes the current operand stack and locals, followed by
+    // older inlined operand stacks. Locals in older frames were spilled before
+    // their callees were pushed. Starting at cfp->sp, skipping the three ENV
+    // slots reaches the nearest local; skipping the receiver after the locals
+    // reaches the caller's operand stack.
+    let mut stack_map = Vec::new();
+    stack_map.extend(stack.iter().rev().copied().map(StackMapEntry::Opnd));
+    stack_map.push(StackMapEntry::Skip(VM_ENV_DATA_SIZE.to_usize()));
+    stack_map.extend(locals.iter().rev().copied().map(StackMapEntry::Opnd));
+    if let Some(caller) = state.caller() {
+        stack_map.push(StackMapEntry::Skip(1));
+        let caller_state = function.frame_state(caller);
+        stack_map.extend(build_stack_map(jit, function, &caller_state));
+    }
+
+    let mut constant_idx = 0;
+    for entry in &mut stack_map {
+        if let StackMapEntry::Opnd(Opnd::Value(value)) = *entry {
+            if !value.special_const_p() {
+                *entry = StackMapEntry::Const { index: constant_idx, value };
+                constant_idx += 1;
+            }
+        }
+    }
+    let trace_reason = get_option!(trace_side_exits).and_then(|trace| match trace {
+        TraceExits::All => Some(reason.to_string()),
+        TraceExits::Counter(counter) if counter == side_exit_counter(reason) => Some(reason.to_string()),
+        _ => None,
+    });
     SideExit{
         pc: Opnd::const_ptr(state.pc),
         stack,
         locals,
         iseq: state.iseq,
-        stack_map: build_caller_stack_map(jit, function, state),
-        recompile: None,
+        stack_map: Some(StackMap::new(stack_map, std::ptr::null(), state.depth)),
+        recompile,
+        trace_reason,
     }
-}
-
-fn build_caller_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Option<StackMap> {
-    let caller = state.caller()?;
-    let caller_state = function.frame_state(caller);
-    let stack_map = build_stack_map(jit, function, &caller_state);
-    if stack_map.is_empty() {
-        return None;
-    }
-
-    let jit_frame = jit_frame_for_state(&caller_state, stack_map.len());
-    Some(StackMap::new(stack_map, jit_frame, caller_state.depth))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3444,7 +3472,8 @@ c_callable! {
     /// of inlined code, the inliner folds the callee's body into the outer ISEQ, so
     /// the outer ISEQ's version holds the failing guard and must be invalidated to
     /// force a recompile. For non-inlined code, it is the same as the frame ISEQ.
-    pub(crate) fn exit_recompile(ec: EcPtr, compiled_iseq_raw: VALUE) {
+    #[unsafe(no_mangle)]
+    pub(crate) fn rb_zjit_exit_recompile(ec: EcPtr, compiled_iseq_raw: VALUE) {
         // Fast check before taking the VM lock: skip if the compiled unit is already
         // invalidated or at the version limit. This avoids expensive lock acquisition
         // on every shape guard exit after the recompile has already been triggered.
@@ -3774,6 +3803,40 @@ pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
         register_current_code_range_with_perf(cb, "exit trampoline", code_ptr);
+        code_ptr
+    })
+}
+
+/// Generate the shared side-exit bailout handler. Per-exit code only installs
+/// a JITFrame and jumps here; this trampoline saves every allocatable register
+/// in a fixed layout before C decodes the stack map and rebuilds VM frames.
+pub fn gen_side_exit_trampoline(cb: &mut CodeBlock, exit_trampoline: CodePtr) -> Result<CodePtr, CompileError> {
+    unsafe extern "C" {
+        fn rb_zjit_materialize_side_exit(ec: EcPtr, cfp: CfpPtr, sp: *mut VALUE);
+    }
+
+    let mut asm = Assembler::new();
+    asm.new_block_without_id("side_exit_trampoline");
+
+    asm_comment!(asm, "save side-exit registers");
+    for pair in ALLOC_REGS.chunks(2) {
+        match *pair {
+            [reg0, reg1] => asm.cpush_pair(Opnd::Reg(reg0), Opnd::Reg(reg1)),
+            [reg] => asm.cpush(Opnd::Reg(reg)),
+            _ => unreachable!("chunks(2)"),
+        }
+    }
+    if cfg!(target_arch = "x86_64") && ALLOC_REGS.len() % 2 == 1 {
+        asm.cpush(Opnd::Reg(ALLOC_REGS[0]));
+    }
+
+    asm_comment!(asm, "materialize side-exit JITFrame");
+    asm_ccall!(asm, rb_zjit_materialize_side_exit, EC, CFP, SP);
+    asm.jmp(Target::CodePtr(exit_trampoline));
+
+    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+        assert_eq!(gc_offsets.len(), 0);
+        register_current_code_range_with_perf(cb, "side exit trampoline", code_ptr);
         code_ptr
     })
 }

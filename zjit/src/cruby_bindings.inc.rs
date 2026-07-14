@@ -236,6 +236,7 @@ pub const VM_BLOCK_HANDLER_NONE: u32 = 0;
 pub const SHAPE_ID_NUM_BITS: u32 = 32;
 pub const ZJIT_STACK_MAP_VREG_TAG: u32 = 8;
 pub const ZJIT_STACK_MAP_SKIP_TAG: u32 = 16;
+pub const ZJIT_STACK_MAP_CONST_TAG: u32 = 24;
 pub const ZJIT_STACK_MAP_SHIFT: u32 = 8;
 pub const ZJIT_JIT_RETURN_C_FRAME: u32 = 1;
 pub const RB_GC_ZJIT_FASTPATH_DATA_WORDS: u32 = 19;
@@ -1942,10 +1943,21 @@ pub const DEFINED_FUNC: defined_type = 16;
 pub const DEFINED_CONST_FROM: defined_type = 17;
 pub type defined_type = u32;
 #[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct zjit_side_exit {
+    pub compiled_iseq: *const rb_iseq_t,
+    pub constants: *mut VALUE,
+    pub reason: *const ::std::os::raw::c_char,
+    pub constants_size: u32,
+}
+pub type zjit_side_exit_t = zjit_side_exit;
+#[repr(C)]
 pub struct zjit_jit_frame {
     pub pc: *const VALUE,
     pub iseq: *const rb_iseq_t,
     pub materialize_block_code: bool,
+    pub sp_size: u32,
+    pub side_exit: *mut zjit_side_exit_t,
     pub stack_size: u32,
     pub stack: __IncompleteArrayField<VALUE>,
 }

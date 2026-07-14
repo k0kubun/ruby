@@ -1,9 +1,10 @@
 use std::alloc::{alloc, handle_alloc_error, Layout};
+use std::ffi::{c_char, CString};
 use std::mem::{align_of, size_of};
 use std::ptr;
 
 use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
-use crate::cruby::zjit_jit_frame;
+use crate::cruby::{zjit_jit_frame, zjit_side_exit};
 use crate::codegen::iseq_may_write_block_code;
 use crate::state::ZJITState;
 
@@ -19,6 +20,8 @@ impl JITFrame {
         pc: *const VALUE,
         iseq: IseqPtr,
         materialize_block_code: bool,
+        sp_size: usize,
+        side_exit: *mut zjit_side_exit,
         stack_size: usize,
     ) -> *const Self {
         // JITFrame ends with a flexible stack[] array, so allocate enough
@@ -37,6 +40,8 @@ impl JITFrame {
                 pc,
                 iseq,
                 materialize_block_code,
+                sp_size: sp_size.try_into().unwrap(),
+                side_exit,
                 stack_size: stack_size.try_into().unwrap(),
                 stack: __IncompleteArrayField::new(),
             });
@@ -48,13 +53,49 @@ impl JITFrame {
     /// Create a JITFrame for an ISEQ frame.
     pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, stack_size: usize) -> *const Self {
         let materialize_block_code = !iseq_may_write_block_code(iseq);
-        Self::alloc(pc, iseq, materialize_block_code, stack_size)
+        Self::alloc(pc, iseq, materialize_block_code, 0, ptr::null_mut(), stack_size)
+    }
+
+    /// Create a JITFrame containing all metadata needed by the shared side-exit
+    /// trampoline. Heap constants live outside the tagged stack map so the GC
+    /// can mark and relocate them safely.
+    pub fn new_side_exit(
+        pc: *const VALUE,
+        iseq: IseqPtr,
+        sp_size: usize,
+        stack_size: usize,
+        compiled_iseq: IseqPtr,
+        constants: Vec<VALUE>,
+        reason: Option<&str>,
+    ) -> *const Self {
+        let constants = Box::leak(constants.into_boxed_slice());
+        let reason = reason.map_or(ptr::null(), |reason| {
+            CString::new(reason)
+                .unwrap_or_else(|_| CString::new("unknown").unwrap())
+                .into_raw() as *const c_char
+        });
+        let side_exit = Box::into_raw(Box::new(zjit_side_exit {
+            compiled_iseq,
+            constants: constants.as_mut_ptr(),
+            reason,
+            constants_size: constants.len().try_into().unwrap(),
+        }));
+        let materialize_block_code = !iseq_may_write_block_code(iseq);
+        Self::alloc(pc, iseq, materialize_block_code, sp_size, side_exit, stack_size)
     }
 
     /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
     pub fn mark(&self) {
         if !self.iseq.is_null() {
             unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
+        }
+        if let Some(side_exit) = unsafe { self.side_exit.as_ref() } {
+            if !side_exit.compiled_iseq.is_null() {
+                unsafe { rb_gc_mark_movable(VALUE::from(side_exit.compiled_iseq)); }
+            }
+            for index in 0..side_exit.constants_size as usize {
+                unsafe { rb_gc_mark_movable(*side_exit.constants.add(index)); }
+            }
         }
     }
 
@@ -64,6 +105,15 @@ impl JITFrame {
             let new_iseq = unsafe { rb_gc_location(VALUE::from(self.iseq)) }.as_iseq();
             if self.iseq != new_iseq {
                 self.iseq = new_iseq;
+            }
+        }
+        if let Some(side_exit) = unsafe { self.side_exit.as_mut() } {
+            if !side_exit.compiled_iseq.is_null() {
+                side_exit.compiled_iseq = unsafe { rb_gc_location(VALUE::from(side_exit.compiled_iseq)) }.as_iseq();
+            }
+            for index in 0..side_exit.constants_size as usize {
+                let value = unsafe { side_exit.constants.add(index) };
+                unsafe { *value = rb_gc_location(*value); }
             }
         }
     }
@@ -158,6 +208,22 @@ mod tests {
             entry(2)
             [entry(2), entry(2.0)]
         "), @"[4, 4.0]");
+    }
+
+    #[test]
+    fn test_side_exit_constant_survives_compaction() {
+        assert_snapshot!(inspect(r#"
+            def side_exit_constant(n)
+              value = "constant".freeze
+              1 + n
+              value
+            end
+
+            side_exit_constant(1)
+            side_exit_constant(1)
+            GC.compact
+            side_exit_constant(1.0)
+        "#), @r#""constant""#);
     }
 
     // BOP invalidation must not overwrite the top-most frame's PC with
