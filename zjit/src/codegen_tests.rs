@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{gen_insn, JITState};
+use super::{find_fused_branch_tests, gen_insn, JITState};
 use crate::asm::CodeBlock;
 use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
@@ -111,6 +111,30 @@ fn test_nil() {
         test
         test
     "), @"nil");
+}
+
+#[test]
+fn test_fuse_test_with_condbranch() {
+    rb_zjit_prepare_options();
+
+    eval("def test_fuse_test_with_condbranch(cond) = cond ? 1 : 2");
+    let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", "test_fuse_test_with_condbranch"));
+    unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+    let mut function = iseq_to_hir(iseq).unwrap();
+    function.optimize();
+    let reverse_post_order = function.reverse_post_order();
+    let fused_tests = find_fused_branch_tests(&function, &reverse_post_order);
+    assert_eq!(fused_tests.into_iter().filter(|fused| *fused).count(), 1);
+
+    assert_snapshot!(inspect("
+        def test_fuse_test_with_condbranch(cond) = cond ? :truthy : :falsy
+        [
+            test_fuse_test_with_condbranch(nil),
+            test_fuse_test_with_condbranch(false),
+            test_fuse_test_with_condbranch(true),
+            test_fuse_test_with_condbranch(0),
+        ]
+    "), @"[:falsy, :falsy, :truthy, :truthy]");
 }
 
 #[test]

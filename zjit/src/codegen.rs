@@ -109,6 +109,36 @@ impl JITState {
 
 }
 
+/// Find `Test` instructions whose only use is a `CondBranch`.
+///
+/// These can be fused during HIR-to-LIR lowering: the branch can test the
+/// original Ruby value directly and the standalone C boolean result is not
+/// needed.
+fn find_fused_branch_tests(function: &Function, reverse_post_order: &[BlockId]) -> Vec<bool> {
+    let mut use_counts = vec![0; function.num_insns()];
+    for &block_id in reverse_post_order {
+        let block = function.block(block_id);
+        for &insn_id in block.params().chain(block.insns()) {
+            function.find(insn_id).for_each_operand(|operand| {
+                use_counts[operand.0] += 1;
+            });
+        }
+    }
+
+    let mut fused_tests = vec![false; function.num_insns()];
+    for &block_id in reverse_post_order {
+        for &insn_id in function.block(block_id).insns() {
+            if let Insn::CondBranch { val, .. } = function.find(insn_id)
+                && use_counts[val.0] == 1
+                && matches!(function.find(val), Insn::Test { .. })
+            {
+                fused_tests[val.0] = true;
+            }
+        }
+    }
+    fused_tests
+}
+
 impl Assembler {
     /// Emit a conditional jump that splits the current block, creating a new
     /// fall-through block for instructions that follow.
@@ -416,6 +446,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         let mut hir_to_lir: Vec<Option<lir::BlockId>> = vec![None; function.num_blocks()];
 
         let reverse_post_order = function.reverse_post_order();
+        let fused_branch_tests = find_fused_branch_tests(function, &reverse_post_order);
 
         // Create all LIR basic blocks corresponding to HIR basic blocks
         for (rpo_idx, &block_id) in reverse_post_order.iter().enumerate() {
@@ -476,7 +507,12 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
                 let result = match &insn {
                     Insn::CondBranch { val, if_true, if_false } => {
-                        let val_opnd = jit.get_opnd(*val);
+                        let (val_opnd, ruby_truthiness) = if fused_branch_tests[val.0] {
+                            let Insn::Test { val } = function.find(*val) else { unreachable!() };
+                            (jit.get_opnd(val), true)
+                        } else {
+                            (jit.get_opnd(*val), false)
+                        };
                         let true_target = hir_to_lir[if_true.target.0].unwrap();
                         let false_target = hir_to_lir[if_false.target.0].unwrap();
 
@@ -490,7 +526,13 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                             args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
                         };
 
-                        asm.test(val_opnd, val_opnd);
+                        if ruby_truthiness {
+                            // Test Ruby truthiness directly, avoiding Test's C boolean
+                            // materialization and CondBranch's second test.
+                            asm.test(val_opnd, Opnd::Imm(!Qnil.as_i64()));
+                        } else {
+                            asm.test(val_opnd, val_opnd);
+                        }
                         asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(true_branch))));
                         asm.jmp(Target::Block(Box::new(false_branch)));
 
@@ -510,6 +552,10 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         assert!(insn_idx == block.insns().len() - 1, "Jump must be the last instruction in HIR block");
                         Ok(())
                     },
+                    Insn::Test { .. } if fused_branch_tests[insn_id.0] => {
+                        // CondBranch reads Test's input directly, so Test has no LIR output.
+                        Ok(())
+                    }
                     _ => {
                         gen_insn(cb, &mut jit, &mut asm, function, insn_id, &insn)
                     }
