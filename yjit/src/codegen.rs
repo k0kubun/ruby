@@ -6,6 +6,7 @@ use crate::backend::ir::*;
 use crate::backend::current::TEMP_REGS;
 use crate::core::*;
 use crate::cruby::*;
+use crate::hir::Insn as HIRInsn;
 use crate::invariants::*;
 use crate::options::*;
 use crate::stats::*;
@@ -21,7 +22,6 @@ use std::ffi::c_void;
 use std::ffi::CStr;
 use std::mem;
 use std::os::raw::c_int;
-use std::ptr;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::slice;
@@ -56,14 +56,8 @@ pub struct JITState<'a> {
     /// The placement for the machine code of the [Block]
     output_ptr: CodePtr,
 
-    /// Index of the current instruction being compiled
-    insn_idx: IseqIdx,
-
-    /// Opcode for the instruction being compiled
-    opcode: usize,
-
-    /// PC of the instruction being compiled
-    pc: *mut VALUE,
+    /// HIR instruction currently being compiled
+    current_insn: Option<HIRInsn>,
 
     /// stack_size when it started to compile the current instruction.
     stack_size_for_pc: u8,
@@ -133,9 +127,7 @@ impl<'a> JITState<'a> {
             starting_insn_idx: blockid.idx,
             starting_ctx,
             output_ptr,
-            insn_idx: 0,
-            opcode: 0,
-            pc: ptr::null_mut::<VALUE>(),
+            current_insn: None,
             stack_size_for_pc: starting_ctx.get_stack_size(),
             pending_outgoing: vec![],
             ec,
@@ -156,7 +148,7 @@ impl<'a> JITState<'a> {
     }
 
     pub fn get_insn_idx(&self) -> IseqIdx {
-        self.insn_idx
+        self.get_current_insn().insn_idx()
     }
 
     pub fn get_iseq(&self) -> IseqPtr {
@@ -164,11 +156,11 @@ impl<'a> JITState<'a> {
     }
 
     pub fn get_opcode(&self) -> usize {
-        self.opcode
+        self.get_current_insn().opcode()
     }
 
     pub fn get_pc(&self) -> *mut VALUE {
-        self.pc
+        self.get_current_insn().pc()
     }
 
     pub fn get_starting_insn_idx(&self) -> IseqIdx {
@@ -184,10 +176,15 @@ impl<'a> JITState<'a> {
     }
 
     pub fn get_arg(&self, arg_idx: isize) -> VALUE {
-        // insn_len require non-test config
-        #[cfg(not(test))]
-        assert!(insn_len(self.get_opcode()) > (arg_idx + 1).try_into().unwrap());
-        unsafe { *(self.pc.offset(arg_idx + 1)) }
+        self.get_current_insn().get_arg(arg_idx)
+    }
+
+    fn get_current_insn(&self) -> HIRInsn {
+        self.current_insn.expect("codegen requires a current HIR instruction")
+    }
+
+    fn set_current_insn(&mut self, insn: HIRInsn) {
+        self.current_insn = Some(insn);
     }
 
     /// Get [Self::outlined_code_block]
@@ -269,7 +266,7 @@ impl<'a> JITState<'a> {
 
     // Get the index of the next instruction
     fn next_insn_idx(&self) -> u16 {
-        self.insn_idx + insn_len(self.get_opcode()) as u16
+        self.get_current_insn().next_insn_idx()
     }
 
     /// Get the index of the next instruction of the next instruction
@@ -290,7 +287,7 @@ impl<'a> JITState<'a> {
         }
 
         let ec_pc: *mut VALUE = unsafe { get_cfp_pc(self.get_cfp()) };
-        ec_pc == self.pc
+        ec_pc == self.get_pc()
     }
 
     // Peek at the nth topmost value on the Ruby stack.
@@ -469,7 +466,7 @@ impl<'a> JITState<'a> {
 
     /// Return true if we're compiling a send-like instruction, not an opt_* instruction.
     pub fn is_sendish(&self) -> bool {
-        match unsafe { rb_iseq_opcode_at_pc(self.iseq, self.pc) } as u32 {
+        match self.get_opcode() as u32 {
             YARVINSN_send |
             YARVINSN_opt_send_without_block |
             YARVINSN_invokesuper => true,
@@ -539,7 +536,7 @@ pub enum JCCKinds {
 /// the counter is traced when it's incremented by this function.
 #[inline(always)]
 fn gen_counter_incr(jit: &JITState, asm: &mut Assembler, counter: Counter) {
-    gen_counter_incr_with_pc(asm, counter, jit.pc);
+    gen_counter_incr_with_pc(asm, counter, jit.get_pc());
 }
 
 /// Same as gen_counter_incr(), but takes PC isntead of JITState.
@@ -967,9 +964,9 @@ pub fn jit_ensure_block_entry_exit(jit: &mut JITState, asm: &mut Assembler) -> O
     let block_starting_context = &jit.get_starting_ctx();
 
     // If we're compiling the first instruction in the block.
-    if jit.insn_idx == jit.starting_insn_idx {
+    if jit.get_insn_idx() == jit.starting_insn_idx {
         // Generate the exit with the cache in Assembler.
-        let side_exit_context = SideExitContext::new(jit.pc, *block_starting_context);
+        let side_exit_context = SideExitContext::new(jit.get_pc(), *block_starting_context);
         let entry_exit = asm.get_side_exit(&side_exit_context, None, jit.get_ocb());
         jit.block_entry_exit = Some(entry_exit?);
     } else {
@@ -1335,12 +1332,10 @@ pub fn gen_single_block(
     // For each instruction to compile
     // NOTE: could rewrite this loop with a std::iter::Iterator
     while insn_idx < iseq_size {
-        // Get the current pc and opcode
-        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx.into()) };
-        // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
-        let opcode: usize = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
-            .try_into()
-            .unwrap();
+        // Translate the current YARV instruction to HIR.
+        let insn = HIRInsn::from_iseq(iseq, insn_idx);
+        let pc = insn.pc();
+        let opcode = insn.opcode();
 
         // We need opt_getconstant_path to be in a block all on its own. Cut the block short
         // if we run into it. This is necessary because we want to invalidate based on the
@@ -1351,9 +1346,7 @@ pub fn gen_single_block(
         }
 
         // Set the current instruction
-        jit.insn_idx = insn_idx;
-        jit.opcode = opcode;
-        jit.pc = pc;
+        jit.set_current_insn(insn);
         jit.stack_size_for_pc = asm.ctx.get_stack_size();
         asm.set_side_exit_context(pc, asm.ctx.get_stack_size());
 
@@ -1366,7 +1359,7 @@ pub fn gen_single_block(
         // If previous instruction requested to record the boundary
         if jit.record_boundary_patch_point {
             // Generate an exit to this instruction and record it
-            let exit_pos = jit.gen_outlined_exit(jit.pc, &asm.ctx).ok_or(())?;
+            let exit_pos = jit.gen_outlined_exit(jit.get_pc(), &asm.ctx).ok_or(())?;
             record_global_inval_patch(&mut asm, exit_pos);
             jit.record_boundary_patch_point = false;
         }
@@ -1383,7 +1376,7 @@ pub fn gen_single_block(
 
         // Lookup the codegen function for this instruction
         let mut status = None;
-        if let Some(gen_fn) = get_gen_fn(VALUE(opcode)) {
+        if let Some(gen_fn) = get_gen_fn(&insn) {
             // Add a comment for the name of the YARV instruction
             asm_comment!(asm, "Insn: {:04} {} (stack_size: {})", insn_idx, insn_name(opcode), asm.ctx.get_stack_size());
 
@@ -1412,7 +1405,7 @@ pub fn gen_single_block(
             // Rewind stack_size using ctx.with_stack_size to allow stack_size changes
             // before you return None.
             asm.ctx = asm.ctx.with_stack_size(jit.stack_size_for_pc);
-            gen_exit(jit.pc, &mut asm);
+            gen_exit(jit.get_pc(), &mut asm);
 
             // If this is the first instruction in the block, then
             // the entry address is the address for block_entry_exit
@@ -1428,7 +1421,7 @@ pub fn gen_single_block(
         asm.ctx.reset_chain_depth_and_defer();
 
         // Move to the next instruction to compile
-        insn_idx += insn_len(opcode) as u16;
+        insn_idx = insn.next_insn_idx();
 
         // If the instruction terminates this block
         if status == Some(EndBlock) {
@@ -1589,7 +1582,7 @@ fn gen_putobject_int2fix(
     jit: &mut JITState,
     asm: &mut Assembler,
 ) -> Option<CodegenStatus> {
-    let opcode = jit.opcode;
+    let opcode = jit.get_opcode();
     let cst_val: usize = if opcode == YARVINSN_putobject_INT2FIX_0_.as_usize() {
         0
     } else {
@@ -1626,7 +1619,14 @@ fn fuse_putobject_opt_ltlt(
     asm: &mut Assembler,
     constant_object: VALUE,
 ) -> Option<CodegenStatus> {
-    let next_opcode = unsafe { rb_vm_insn_addr2opcode(jit.pc.add(insn_len(jit.opcode).as_usize()).read().as_ptr()) };
+    let next_opcode = unsafe {
+        rb_vm_insn_addr2opcode(
+            jit.get_pc()
+                .add(insn_len(jit.get_opcode()).as_usize())
+                .read()
+                .as_ptr(),
+        )
+    };
     if next_opcode == YARVINSN_opt_ltlt as i32 && constant_object.fixnum_p() {
         // Untag the fixnum shift amount
         let shift_amt = constant_object.as_isize() >> 1;
@@ -2892,7 +2892,7 @@ fn jit_chain_guard(
         deeper.increment_chain_depth();
         let bid = BlockId {
             iseq: jit.iseq,
-            idx: jit.insn_idx,
+            idx: jit.get_insn_idx(),
         };
 
         jit.gen_branch(asm, bid, &deeper, None, None, target0_gen_fn);
@@ -10807,10 +10807,9 @@ fn gen_opt_invokebuiltin_delegate(
     Some(KeepCompiling)
 }
 
-/// Maps a YARV opcode to a code generation function (if supported)
-fn get_gen_fn(opcode: VALUE) -> Option<InsnGenFn> {
-    let VALUE(opcode) = opcode;
-    let opcode = opcode as ruby_vminsn_type;
+/// Maps an HIR instruction to its current code generation function (if supported).
+fn get_gen_fn(insn: &HIRInsn) -> Option<InsnGenFn> {
+    let opcode = insn.opcode() as ruby_vminsn_type;
     assert!(opcode < VM_INSTRUCTION_SIZE);
 
     match opcode {
@@ -11278,6 +11277,7 @@ impl CodegenGlobals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr;
 
     fn setup_codegen() -> (Context, Assembler, CodeBlock, OutlinedCb) {
         let cb = CodeBlock::new_dummy(256 * 1024);
@@ -11299,6 +11299,10 @@ mod tests {
             ocb,
             true,
         )
+    }
+
+    fn set_test_insn(jit: &mut JITState, pc: *mut VALUE) {
+        jit.set_current_insn(HIRInsn::from_raw_parts(0, 0, pc));
     }
 
     #[test]
@@ -11383,7 +11387,7 @@ mod tests {
 
         let mut value_array: [u64; 2] = [0, 2]; // We only compile for n == 2
         let pc: *mut VALUE = &mut value_array as *mut u64 as *mut VALUE;
-        jit.pc = pc;
+        set_test_insn(&mut jit, pc);
 
         let status = gen_dupn(&mut jit, &mut asm);
 
@@ -11410,7 +11414,7 @@ mod tests {
         asm.stack_push(Type::CString);
 
         let mut fake_encoded_iseq: [VALUE; 2] = [VALUE(0), VALUE(3)];
-        jit.pc = &mut fake_encoded_iseq[0];
+        set_test_insn(&mut jit, &mut fake_encoded_iseq[0]);
 
         let mut status = gen_opt_reverse(&mut jit, &mut asm);
 
@@ -11487,7 +11491,7 @@ mod tests {
 
         let mut value_array: [u64; 2] = [0, 2];
         let pc: *mut VALUE = &mut value_array as *mut u64 as *mut VALUE;
-        jit.pc = pc;
+        set_test_insn(&mut jit, pc);
 
         let status = gen_setn(&mut jit, &mut asm);
 
@@ -11510,7 +11514,7 @@ mod tests {
 
         let mut value_array: [u64; 2] = [0, 1];
         let pc: *mut VALUE = &mut value_array as *mut u64 as *mut VALUE;
-        jit.pc = pc;
+        set_test_insn(&mut jit, pc);
 
         let status = gen_topn(&mut jit, &mut asm);
 
@@ -11534,7 +11538,7 @@ mod tests {
 
         let mut value_array: [u64; 3] = [0, 2, 0];
         let pc: *mut VALUE = &mut value_array as *mut u64 as *mut VALUE;
-        jit.pc = pc;
+        set_test_insn(&mut jit, pc);
 
         let status = gen_adjuststack(&mut jit, &mut asm);
 

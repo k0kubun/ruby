@@ -22,6 +22,7 @@ mod codegen;
 mod core;
 mod cruby;
 mod disasm;
+mod hir;
 mod invariants;
 mod options;
 mod stats;
