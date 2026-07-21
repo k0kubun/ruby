@@ -68,6 +68,9 @@ pub struct Options {
     /// Dump compiled and executed instructions for debugging
     pub dump_insns: bool,
 
+    /// Dump the HIR lifted from YARV for each compiled block
+    pub dump_hir: bool,
+
     /// Dump all compiled instructions of target cbs.
     pub dump_disasm: Option<DumpDisasm>,
 
@@ -104,6 +107,7 @@ pub static mut OPTIONS: Options = Options {
     trace_exits_sample_rate: 0,
     disable: false,
     dump_insns: false,
+    dump_hir: false,
     dump_disasm: None,
     verify_ctx: false,
     dump_iseq_disasm: None,
@@ -379,6 +383,7 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             OPTIONS.trace_exits_sample_rate = sample_rate.parse().unwrap();
         },
         ("dump-insns", "") => unsafe { OPTIONS.dump_insns = true },
+        ("dump-hir", "") => unsafe { OPTIONS.dump_hir = true },
         ("verify-ctx", "") => unsafe { OPTIONS.verify_ctx = true },
 
         // Option name not recognized

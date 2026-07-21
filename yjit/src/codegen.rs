@@ -1332,15 +1332,24 @@ pub fn gen_single_block(
         asm.ctx.clear_return_landing();
     }
 
-    // For each instruction to compile
-    // NOTE: could rewrite this loop with a std::iter::Iterator
-    while insn_idx < iseq_size {
-        // Get the current pc and opcode
-        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx.into()) };
-        // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
-        let opcode: usize = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
-            .try_into()
-            .unwrap();
+    // Lift this block's YARV instructions into HIR as-is, then lower each HIR
+    // instruction below using the existing per-instruction codegen functions.
+    // This introduces an HIR layer between YARV decoding and code generation
+    // without changing the generated code -- an experiment toward a ZJIT-like
+    // design. Each HirInsn keeps the real pc, so the gen_* functions that read
+    // their operands from jit.pc keep working unchanged.
+    let block_hir = crate::hir::BlockHir::from_iseq(iseq, insn_idx, iseq_size);
+
+    if get_option!(dump_hir) {
+        println!("== HIR: {} ==", iseq_get_location(blockid.iseq, blockid.idx));
+        print!("{block_hir}");
+    }
+
+    // For each HIR instruction to compile
+    for hir_insn in block_hir.insns.iter() {
+        let pc = hir_insn.pc;
+        let opcode = hir_insn.opcode;
+        insn_idx = hir_insn.insn_idx;
 
         // We need opt_getconstant_path to be in a block all on its own. Cut the block short
         // if we run into it. This is necessary because we want to invalidate based on the

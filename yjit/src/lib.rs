@@ -20,6 +20,7 @@ pub mod asm;
 mod backend;
 mod codegen;
 mod core;
+mod hir;
 mod cruby;
 mod disasm;
 mod invariants;
