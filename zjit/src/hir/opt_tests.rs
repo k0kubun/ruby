@@ -4028,8 +4028,8 @@ mod hir_opt_tests {
           PushInlineFrame v26 (0x1038), v23
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v49:CInt64 = ArrayLength v23
-          v50:Fixnum = BoxFixnum v49
+          v51:CInt64[3] = Const CInt64(3)
+          v50:Fixnum = BoxFixnum v51
           CheckInterrupts
           PopInlineFrame
           Return v50
@@ -4068,8 +4068,8 @@ mod hir_opt_tests {
           PushInlineFrame v34 (0x1038), v31
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v57:CInt64 = ArrayLength v31
-          v58:Fixnum = BoxFixnum v57
+          v59:CInt64[7] = Const CInt64(7)
+          v58:Fixnum = BoxFixnum v59
           CheckInterrupts
           PopInlineFrame
           Return v58
@@ -4104,8 +4104,8 @@ mod hir_opt_tests {
           PushInlineFrame v26 (0x1038), v23
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v55:CInt64 = ArrayLength v23
-          v56:Fixnum = BoxFixnum v55
+          v57:CInt64[3] = Const CInt64(3)
+          v56:Fixnum = BoxFixnum v57
           v38:CPtr = GetEP 0
           v39:CInt64 = LoadField v38, :VM_ENV_DATA_INDEX_SPECVAL@0x1078
           v40:CInt64[-4] = Const CInt64(-4)
@@ -4159,8 +4159,8 @@ mod hir_opt_tests {
         bb8(v35:BasicObject, v36:BasicObject):
           PatchPoint NoSingletonClass(Array@0x1050)
           PatchPoint MethodRedefined(Array@0x1050, length@0x1058, cme:0x1060)
-          v66:CInt64 = ArrayLength v23
-          v67:Fixnum = BoxFixnum v66
+          v68:CInt64[3] = Const CInt64(3)
+          v67:Fixnum = BoxFixnum v68
           v52:BasicObject = Send v35, :call, v67 # SendFallbackReason: Send: unsupported optimized method type BlockCall
           CheckInterrupts
           PopInlineFrame
@@ -4197,8 +4197,8 @@ mod hir_opt_tests {
           PushInlineFrame v28 (0x1038), v11, v25, v17
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v61:CInt64 = ArrayLength v25
-          v62:Fixnum = BoxFixnum v61
+          v71:CInt64[2] = Const CInt64(2)
+          v62:Fixnum = BoxFixnum v71
           PatchPoint MethodRedefined(Integer@0x1078, +@0x1080, cme:0x1088)
           v66:Fixnum = FixnumAdd v62, v11
           v70:Fixnum = FixnumAdd v66, v17
@@ -4237,8 +4237,8 @@ mod hir_opt_tests {
           PushInlineFrame v26 (0x1038), v23, v15
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v56:CInt64 = ArrayLength v23
-          v57:Fixnum = BoxFixnum v56
+          v62:CInt64[2] = Const CInt64(2)
+          v57:Fixnum = BoxFixnum v62
           PatchPoint MethodRedefined(Integer@0x1078, +@0x1080, cme:0x1088)
           v61:Fixnum = FixnumAdd v57, v15
           CheckInterrupts
@@ -4276,8 +4276,8 @@ mod hir_opt_tests {
           PushInlineFrame v25 (0x1038), v22, v21
           PatchPoint NoSingletonClass(Array@0x1040)
           PatchPoint MethodRedefined(Array@0x1040, length@0x1048, cme:0x1050)
-          v55:CInt64 = ArrayLength v22
-          v56:Fixnum = BoxFixnum v55
+          v61:CInt64[2] = Const CInt64(2)
+          v56:Fixnum = BoxFixnum v61
           PatchPoint MethodRedefined(Integer@0x1078, +@0x1080, cme:0x1088)
           v60:Fixnum = FixnumAdd v56, v21
           CheckInterrupts
@@ -19062,6 +19062,76 @@ mod hir_opt_tests {
           PopInlineFrame
           Return v47
         ");
+    }
+
+    #[test]
+    fn test_inline_non_escaping_rest_array_folds_element_reads() {
+        eval("
+            def add_rest(*rest)
+              rest[0] + rest[1]
+            end
+            def test
+              add_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected add_rest to be inlined:\n{result}");
+        assert!(result.contains("Fixnum[3] = Const Value(3)"),
+            "Expected the inlined rest reads and addition to fold to 3:\n{result}");
+        assert!(!result.contains("ArrayLength") && !result.contains("ArrayAref"),
+            "Expected reads from the non-escaping rest Array to be scalarized:\n{result}");
+        assert!(!result.contains("FixnumAdd"),
+            "Expected the addition of scalarized rest elements to be folded:\n{result}");
+    }
+
+    #[test]
+    fn test_inline_mutated_rest_array_does_not_fold_element_reads() {
+        eval("
+            def mutate_rest(*rest)
+              rest[0] = 10
+              rest[0] + rest[1]
+            end
+            def test
+              mutate_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected mutate_rest to be inlined:\n{result}");
+        assert!(result.contains("ArrayAset") && result.contains("ArrayAref"),
+            "Expected mutation to prevent rest Array scalarization:\n{result}");
+        assert!(!result.contains("Fixnum[3] = Const Value(3)"),
+            "Must not fold reads across a rest Array mutation:\n{result}");
+    }
+
+    #[test]
+    fn test_inline_escaping_rest_array_does_not_fold_element_reads() {
+        eval("
+            def escape_rest(*rest)
+              $zjit_escaped_rest = rest
+              rest[0] + rest[1]
+            end
+            def test
+              escape_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected escape_rest to be inlined:\n{result}");
+        assert!(result.contains("SetGlobal") && result.contains("ArrayAref"),
+            "Expected the global store to prevent rest Array scalarization:\n{result}");
+        assert!(!result.contains("Fixnum[3] = Const Value(3)"),
+            "Must not fold reads from an escaping rest Array:\n{result}");
     }
 
     #[test]

@@ -6707,6 +6707,32 @@ fn test_inlined_method_with_rest_parameter() {
 }
 
 #[test]
+fn test_inlined_method_with_rest_array_escape_analysis() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def add_rest(*rest) = rest[0] + rest[1]
+
+            def mutate_rest(*rest)
+              rest[0] = 10
+              rest[0] + rest[1]
+            end
+
+            def escape_rest(*rest)
+              $zjit_escaped_rest = rest
+              rest[0] + rest[1]
+            end
+
+            def test
+              [add_rest(1, 2), mutate_rest(1, 2), escape_rest(1, 2), $zjit_escaped_rest]
+            end
+
+            test
+            test
+        "), @"[3, 12, 3, [1, 2]]");
+    });
+}
+
+#[test]
 fn test_inlined_method_deoptimizes_on_redefinition() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines("

@@ -5760,6 +5760,106 @@ impl Function {
             .unwrap_or(insn_id)
     }
 
+    /// Find packed rest arrays whose inlined uses do not escape or mutate the Array.
+    ///
+    /// Rest arguments are packed into a NewArray before SendDirect. Once the call is
+    /// inlined, PushInlineFrame identifies which NewArray initializes the callee's
+    /// rest local. Inspect its canonical SSA uses and reject an Array if anything
+    /// other than a read, identity-preserving type guard, Snapshot, or inline-frame
+    /// argument can observe it. Passing the value through any other SSA definition is
+    /// conservatively treated as escape. The allocation remains available for frame
+    /// materialization; this analysis only allows reads from the Array to be forwarded
+    /// from NewArray's elements.
+    fn non_escaping_rest_arrays(&self) -> HashMap<InsnId, Vec<InsnId>> {
+        let rpo = self.reverse_post_order();
+        let mut candidates = HashMap::new();
+
+        // Find NewArrays occupying the rest slot of an inlined callee. Restricting
+        // candidates this way means Snapshot uses are callee rest locals, whose EP is
+        // already required not to escape by can_inline.
+        for &block in &rpo {
+            for &insn_id in &self.blocks[block.0].insns {
+                let Insn::PushInlineFrame { iseq, args, .. } = self.find(insn_id) else {
+                    continue;
+                };
+                let params = unsafe { iseq.params() };
+                if params.flags.has_rest() == 0 {
+                    continue;
+                }
+
+                // Packed args end in [rest, post..., keyword...]. Optional args
+                // before rest may be omitted, so locate rest relative to the end.
+                let trailing = 1 + params.post_num as usize + callee_kw_num(iseq);
+                let Some(rest_idx) = args.len().checked_sub(trailing) else {
+                    continue;
+                };
+                let rest = args[rest_idx];
+                if let Insn::NewArray { elements, .. } = self.find(rest) {
+                    candidates.entry(rest).or_insert(elements);
+                }
+            }
+        }
+
+        let mut non_escaping = HashMap::new();
+        for (array, elements) in candidates {
+            // Canonicalization forwards a guarded value to later instructions, so
+            // account for the SSA names produced by identity-preserving guards.
+            // We deliberately do not follow block parameters or arbitrary copies:
+            // those remain conservative escapes below.
+            let mut aliases = HashSet::from([array]);
+            for &block in &rpo {
+                for &insn_id in &self.blocks[block.0].insns {
+                    match self.find(insn_id) {
+                        Insn::GuardType { val, .. } | Insn::RefineType { val, .. }
+                            if aliases.contains(&val) =>
+                        {
+                            let canonical_id = self.union_find.borrow().find_const(insn_id);
+                            aliases.insert(canonical_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut escaped = false;
+            'uses: for &block in &rpo {
+                for &insn_id in &self.blocks[block.0].insns {
+                    let insn = self.find(insn_id);
+                    let bad_use = match &insn {
+                        // Snapshot and PushInlineFrame preserve the concrete Array for
+                        // deoptimization but do not expose it to Ruby code.
+                        Insn::Snapshot { .. } => false,
+                        Insn::PushInlineFrame { recv, .. } => aliases.contains(recv),
+
+                        // These are the reads this analysis enables us to fold.
+                        Insn::ArrayLength { .. } => false,
+                        Insn::ArrayAref { index, .. } => aliases.contains(index),
+
+                        // Type checks preserve identity; their result aliases were
+                        // collected above so downstream uses are still inspected.
+                        Insn::GuardType { .. } | Insn::RefineType { .. } => false,
+
+                        // Every other use may retain, expose, or mutate the Array.
+                        _ => {
+                            let mut found = false;
+                            insn.for_each_operand(|operand| found |= aliases.contains(&operand));
+                            found
+                        }
+                    };
+                    if bad_use {
+                        escaped = true;
+                        break 'uses;
+                    }
+                }
+            }
+
+            if !escaped {
+                non_escaping.insert(array, elements);
+            }
+        }
+        non_escaping
+    }
+
     /// Block-local canonicalize: rewrite each operand through union-find and a
     /// per-block map of the most recent `Guard*` for that value. Forwards
     /// guarded values into branch-edge args (so `infer_types` narrows merge-block
@@ -5820,6 +5920,7 @@ impl Function {
         //
         // This would require 1) fixpointing, 2) worklist, or 3) (slightly less powerful) calling a
         // function-level infer_types after each pruned branch.
+        let rest_arrays = self.non_escaping_rest_arrays();
         for block in self.reverse_post_order() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
             let mut new_insns = vec![];
@@ -5860,6 +5961,10 @@ impl Function {
                             }
                             _ => insn_id,
                         }
+                    }
+                    Insn::ArrayLength { array } if rest_arrays.contains_key(&array) => {
+                        let length = rest_arrays[&array].len().try_into().unwrap();
+                        self.new_insn(Insn::Const { val: Const::CInt64(length) })
                     }
                     Insn::ArrayLength { array } => {
                         match self.type_of(array).ruby_object() {
@@ -6062,6 +6167,19 @@ impl Function {
                             (Some(l), Some(r)) => Some(l >= r),
                             _ => None,
                         })
+                    }
+                    Insn::ArrayAref { array, index } if rest_arrays.contains_key(&array) => {
+                        let element = self.type_of(index).cint64_value()
+                            .and_then(|index| usize::try_from(index).ok())
+                            .and_then(|index| rest_arrays[&array].get(index))
+                            .copied();
+                        match element {
+                            Some(element) => {
+                                self.make_equal_to(insn_id, element);
+                                continue;
+                            }
+                            None => insn_id,
+                        }
                     }
                     Insn::ArrayAref { array, index }
                         if self.type_of(array).ruby_object_known()
