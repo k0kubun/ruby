@@ -5760,7 +5760,8 @@ impl Function {
             .unwrap_or(insn_id)
     }
 
-    /// Find packed rest arrays whose inlined uses do not escape or mutate the Array.
+    /// Find packed rest arrays whose inlined uses do not escape or mutate the Array,
+    /// along with the set of reads that may be forwarded from the Array's elements.
     ///
     /// Rest arguments are packed into a NewArray before SendDirect. Once the call is
     /// inlined, PushInlineFrame identifies which NewArray initializes the callee's
@@ -5770,7 +5771,14 @@ impl Function {
     /// conservatively treated as escape. The allocation remains available for frame
     /// materialization; this analysis only allows reads from the Array to be forwarded
     /// from NewArray's elements.
-    fn non_escaping_rest_arrays(&self) -> HashMap<InsnId, Vec<InsnId>> {
+    ///
+    /// Escape analysis alone is not enough to forward a read: the Array is always
+    /// reachable from the heap itself, so code run by any Send (or a C call that can
+    /// call back into Ruby) may find it through ObjectSpace.each_object and mutate it
+    /// in place without any SSA use of the Array. The second return value therefore
+    /// only contains reads with no instruction that may run arbitrary code on any
+    /// path from the NewArray to the read.
+    fn non_escaping_rest_arrays(&self) -> (HashMap<InsnId, Vec<InsnId>>, HashSet<InsnId>) {
         let rpo = self.reverse_post_order();
         let mut candidates = HashMap::new();
 
@@ -5800,7 +5808,50 @@ impl Function {
             }
         }
 
+        let may_run_arbitrary_code = |insn: &Insn| -> bool {
+            match insn {
+                // Branches have conservative effects but only transfer control;
+                // the CFG walk below follows them explicitly.
+                Insn::Jump(_) | Insn::CondBranch { .. } => false,
+                // These lower to raw memory accesses or bit operations and cannot
+                // call back into Ruby, despite their conservative declared effects.
+                // Without this, the specialized Array#[] sequence for rest[0] would
+                // block forwarding rest[0] itself and any later read like rest[1].
+                Insn::ArrayLength { .. } | Insn::ArrayAref { .. } | Insn::UnboxFixnum { .. } => false,
+                // The effect lattice has no bit for "the object heap" alone, so
+                // writing every abstract heap (effects::Any) is the closest
+                // over-approximation of running arbitrary code: every send,
+                // invoke, and non-elidable C call declares it, as does any newly
+                // added instruction by default, while instructions with refined
+                // effects (PushInlineFrame, CheckInterrupts, guards, ...) cannot
+                // call back into Ruby.
+                insn => insn.effects_of().write_bits().includes(abstract_heaps::Any),
+            }
+        };
+        // Whether a path through `block` starting at `from` with `dirty` barriers
+        // behind it has crossed a barrier by the end of the block.
+        let scan = |block: BlockId, from: usize, mut dirty: bool| -> bool {
+            for &insn_id in &self.blocks[block.0].insns[from..] {
+                dirty |= may_run_arbitrary_code(&self.find(insn_id));
+            }
+            dirty
+        };
+        // Raise `block`'s entry state to `dirty` and queue it for (re)processing
+        // when the state changed. States only go missing -> clean -> dirty, so
+        // the dataflow below terminates.
+        fn join(entry_dirty: &mut HashMap<BlockId, bool>, worklist: &mut VecDeque<BlockId>, block: BlockId, dirty: bool) {
+            match entry_dirty.get(&block) {
+                Some(true) => {}
+                Some(false) if !dirty => {}
+                _ => {
+                    entry_dirty.insert(block, dirty);
+                    worklist.push_back(block);
+                }
+            }
+        }
+
         let mut non_escaping = HashMap::new();
+        let mut foldable_reads = HashSet::new();
         for (array, elements) in candidates {
             // Canonicalization forwards a guarded value to later instructions, so
             // account for the SSA names produced by identity-preserving guards.
@@ -5853,11 +5904,69 @@ impl Function {
                 }
             }
 
-            if !escaped {
-                non_escaping.insert(array, elements);
+            if escaped {
+                continue;
             }
+
+            // Locate the NewArray in the CFG.
+            let mut def_site = None;
+            'def: for &block in &rpo {
+                for (insn_idx, &insn_id) in self.blocks[block.0].insns.iter().enumerate() {
+                    if self.union_find.borrow().find_const(insn_id) == array {
+                        def_site = Some((block, insn_idx));
+                        break 'def;
+                    }
+                }
+            }
+            let Some((def_block, def_idx)) = def_site else { continue };
+
+            // Forward dataflow from the NewArray: entry_dirty[block] is true when
+            // some path from the NewArray reaches the block having crossed a
+            // barrier, false when every such path is barrier-free. Blocks absent
+            // from the map are unreachable from the NewArray, and by SSA dominance
+            // cannot use it.
+            let mut entry_dirty: HashMap<BlockId, bool> = HashMap::new();
+            let mut worklist = VecDeque::new();
+            let seed_out = scan(def_block, def_idx + 1, false);
+            for succ in self.successors(def_block) {
+                join(&mut entry_dirty, &mut worklist, succ, seed_out);
+            }
+            while let Some(block) = worklist.pop_front() {
+                let dirty_out = scan(block, 0, entry_dirty[&block]);
+                for succ in self.successors(block) {
+                    join(&mut entry_dirty, &mut worklist, succ, dirty_out);
+                }
+            }
+
+            // Record each read of the Array along with whether a barrier precedes
+            // it on the scanned path. Reads may still refer to the Array through
+            // an unfolded GuardType/RefineType, so match any collected alias.
+            let mut reads: Vec<(InsnId, bool)> = vec![];
+            let collect = |block: BlockId, from: usize, mut dirty: bool, reads: &mut Vec<(InsnId, bool)>| {
+                for &insn_id in &self.blocks[block.0].insns[from..] {
+                    let insn = self.find(insn_id);
+                    match insn {
+                        Insn::ArrayLength { array: a } | Insn::ArrayAref { array: a, .. } if aliases.contains(&a) => {
+                            reads.push((insn_id, dirty));
+                        }
+                        _ => {}
+                    }
+                    dirty |= may_run_arbitrary_code(&insn);
+                }
+            };
+            // The NewArray's own block is scanned twice when a loop re-enters it:
+            // reads after the NewArray must be barrier-free both on the
+            // straight-line path from the NewArray and on re-entering paths.
+            collect(def_block, def_idx + 1, false, &mut reads);
+            for (&block, &dirty_in) in &entry_dirty {
+                collect(block, 0, dirty_in, &mut reads);
+            }
+            let dirty_reads: HashSet<InsnId> = reads.iter().filter(|&&(_, dirty)| dirty).map(|&(insn_id, _)| insn_id).collect();
+            foldable_reads.extend(reads.iter().map(|&(insn_id, _)| insn_id).filter(|insn_id| !dirty_reads.contains(insn_id)));
+
+            non_escaping.insert(array, elements);
         }
-        non_escaping
+        (non_escaping, foldable_reads)
     }
 
     /// Block-local canonicalize: rewrite each operand through union-find and a
@@ -5920,7 +6029,7 @@ impl Function {
         //
         // This would require 1) fixpointing, 2) worklist, or 3) (slightly less powerful) calling a
         // function-level infer_types after each pruned branch.
-        let rest_arrays = self.non_escaping_rest_arrays();
+        let (rest_arrays, rest_array_reads) = self.non_escaping_rest_arrays();
         for block in self.reverse_post_order() {
             let old_insns = std::mem::take(&mut self.blocks[block.0].insns);
             let mut new_insns = vec![];
@@ -5962,7 +6071,7 @@ impl Function {
                             _ => insn_id,
                         }
                     }
-                    Insn::ArrayLength { array } if rest_arrays.contains_key(&array) => {
+                    Insn::ArrayLength { array } if rest_arrays.contains_key(&array) && rest_array_reads.contains(&insn_id) => {
                         let length = rest_arrays[&array].len().try_into().unwrap();
                         self.new_insn(Insn::Const { val: Const::CInt64(length) })
                     }
@@ -6168,7 +6277,7 @@ impl Function {
                             _ => None,
                         })
                     }
-                    Insn::ArrayAref { array, index } if rest_arrays.contains_key(&array) => {
+                    Insn::ArrayAref { array, index } if rest_arrays.contains_key(&array) && rest_array_reads.contains(&insn_id) => {
                         let element = self.type_of(index).cint64_value()
                             .and_then(|index| usize::try_from(index).ok())
                             .and_then(|index| rest_arrays[&array].get(index))

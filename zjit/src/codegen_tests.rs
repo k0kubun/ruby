@@ -6733,6 +6733,36 @@ fn test_inlined_method_with_rest_array_escape_analysis() {
 }
 
 #[test]
+fn test_inlined_method_rest_array_mutated_through_object_space() {
+    // The rest Array never escapes through HIR dataflow, but the heap itself is
+    // reachable: the send inside the inlined callee finds the Array through
+    // ObjectSpace.each_object and mutates it, so reads after the send must
+    // observe the mutation instead of values forwarded from NewArray.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            SENTINEL_A = :sentinel_a_value
+            SENTINEL_B = :sentinel_b_value
+
+            def poke
+              ObjectSpace.each_object(Array) do |a|
+                a[0] = :mutated if a.length == 2 && a[0].equal?(SENTINEL_A) && a[1].equal?(SENTINEL_B)
+              end
+            end
+
+            def read_rest(*rest)
+              poke
+              rest[0]
+            end
+
+            def test = read_rest(SENTINEL_A, SENTINEL_B)
+
+            test
+            test
+        "), @":mutated");
+    });
+}
+
+#[test]
 fn test_inlined_method_deoptimizes_on_redefinition() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines("

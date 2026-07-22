@@ -19112,6 +19112,58 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_send_between_pack_and_read_does_not_fold_element_reads() {
+        // Even though the rest Array never escapes through HIR dataflow, the
+        // send can find it through ObjectSpace.each_object and mutate it, so
+        // reads after the send must not be forwarded from NewArray's elements.
+        eval("
+            def opaque(**) = nil
+            def read_rest(*rest)
+              opaque
+              rest[0] + rest[1]
+            end
+            def test
+              read_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected read_rest to be inlined:\n{result}");
+        assert!(result.contains("ArrayAref"),
+            "Expected the intervening send to prevent forwarding rest reads:\n{result}");
+        assert!(!result.contains("Fixnum[3] = Const Value(3)"),
+            "Must not fold reads across a send that can reach the rest Array through the heap:\n{result}");
+    }
+
+    #[test]
+    fn test_inline_send_after_read_folds_earlier_element_read() {
+        // Reads on barrier-free paths from the pack may still be forwarded;
+        // only reads after the send have to stay.
+        eval("
+            def opaque(**) = nil
+            def mixed_rest(*rest)
+              a = rest[0]
+              opaque
+              a + rest[1]
+            end
+            def test
+              mixed_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected mixed_rest to be inlined:\n{result}");
+        assert_eq!(result.matches("ArrayAref").count(), 1,
+            "Expected rest[0] to be forwarded and rest[1] to stay a read:\n{result}");
+    }
+
+    #[test]
     fn test_inline_escaping_rest_array_does_not_fold_element_reads() {
         eval("
             def escape_rest(*rest)
