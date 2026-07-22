@@ -6763,6 +6763,40 @@ fn test_inlined_method_rest_array_mutated_through_object_space() {
 }
 
 #[test]
+fn test_inlined_method_deferred_rest_array_materializes_on_deopt() {
+    // The rest Array allocation is deferred to side exits. The Float arguments
+    // fail the Fixnum guards inside the inlined callee, so the exit must
+    // allocate the Array, write it into the materialized frame, and let the
+    // interpreter finish the call correctly.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def add_rest(*rest) = rest[0] + rest[1]
+            def test(a, b) = add_rest(a, b)
+
+            test(1, 2)
+            test(3, 4)
+
+            [test(5, 6), test(2.5, 0.25), test(7, 8)]
+        "), @"[11, 2.75, 15]");
+    });
+}
+
+#[test]
+fn test_inlined_method_deferred_empty_rest_array_materializes_on_deopt() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def opt_rest(x, *rest) = x + 1
+            def test(x) = opt_rest(x)
+
+            test(1)
+            test(2)
+
+            [test(3), test(1.5), test(4)]
+        "), @"[4, 2.5, 5]");
+    });
+}
+
+#[test]
 fn test_inlined_method_deoptimizes_on_redefinition() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines("

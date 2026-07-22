@@ -579,12 +579,30 @@ impl From<VALUE> for Opnd {
     }
 }
 
+/// An Array allocation deferred from the hot path to this side exit. The exit
+/// writes `Qnil` placeholders through `stack`/`locals`, then allocates the Array
+/// from `elements` and overwrites each listed slot with it, so multiple slots
+/// referencing the same HIR value observe a single identical Array.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SideExitLazyArray {
+    /// Element values of the Array. Visited as branch operands so the register
+    /// allocator keeps them alive up to the exit.
+    pub elements: Vec<Opnd>,
+    /// Indexes into `SideExit::stack` to overwrite with the allocated Array.
+    pub stack_slots: Vec<usize>,
+    /// Indexes into `SideExit::locals` to overwrite with the allocated Array.
+    pub local_slots: Vec<usize>,
+}
+
 /// Context for a side exit. If `SideExit` matches, it reuses the same code.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SideExit {
     pub pc: Opnd,
     pub stack: Vec<Opnd>,
     pub locals: Vec<Opnd>,
+    /// Arrays allocated on the exit path instead of the hot path. Their slots in
+    /// `stack`/`locals` hold `Qnil` placeholders.
+    pub lazy_arrays: Vec<SideExitLazyArray>,
     pub iseq: IseqPtr,
     /// Stack map for older inlined frames that are not written directly by this
     /// side exit. The current frame's stack and locals are still handled by
@@ -931,6 +949,9 @@ macro_rules! target_for_each_operand_impl {
             Target::SideExit(data) => {
                 visit_many!(data.exit.stack);
                 visit_many!(data.exit.locals);
+                for lazy_array in $reborrow!(data.exit.lazy_arrays) {
+                    visit_many!(lazy_array.elements);
+                }
                 if let Some(StackMap { stack, .. }) = $reborrow!(data.exit.stack_map) {
                     for entry in stack {
                         if let StackMapEntry::Opnd(opnd) = entry {
@@ -1625,6 +1646,11 @@ pub enum StackMapEntry {
     Opnd(Opnd),
     /// Number of VM stack slots to skip when materializing across inlined frames.
     Skip(usize),
+    /// Index into the side exit's `lazy_arrays`: the slot holds an Array that the
+    /// exit allocates lazily. Encoded as the reserved native stack slot that
+    /// receives the allocated Array. Only valid in side-exit stack maps; hot-path
+    /// stack maps never contain deferred Arrays.
+    LazyArray(usize),
 }
 
 /// Initial capacity for asm.insns vector
@@ -2618,8 +2644,8 @@ impl Assembler
         }
     }
 
-    /// Return the maximum number of stack-map entries that any side exit needs
-    /// to copy into reserved native stack slots.
+    /// Return the maximum number of stack-map entries and lazy Array elements
+    /// that any side exit needs to copy into reserved native stack slots.
     pub fn side_exit_stack_map_slots(&self, assignments: &[Option<Allocation>]) -> usize {
         self.block_order().into_iter().fold(0, |max_slots, block_id| {
             let block = &self.basic_blocks[block_id.0];
@@ -2634,11 +2660,18 @@ impl Assembler
         let Target::SideExit(data) = target else {
             return 0;
         };
+
+        // Lazy Arrays reserve one slot per element to build the argv for the
+        // allocation, plus one slot for the allocated Array itself so that
+        // caller-frame stack maps can reference it. This region comes first;
+        // ordinary stack-map captures follow it.
+        let lazy_array_slots: usize = data.exit.lazy_arrays.iter().map(|lazy_array| lazy_array.elements.len() + 1).sum();
+
         let Some(StackMap { stack, .. }) = &data.exit.stack_map else {
-            return 0;
+            return lazy_array_slots;
         };
 
-        stack.iter().filter(|entry| match entry {
+        lazy_array_slots + stack.iter().filter(|entry| match entry {
             StackMapEntry::Opnd(Opnd::Value(value)) => !value.special_const_p(),
             StackMapEntry::Opnd(Opnd::UImm(value)) => !VALUE(*value as usize).special_const_p(),
             StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => {
@@ -2648,6 +2681,8 @@ impl Assembler
                 )
             }
             StackMapEntry::Opnd(Opnd::Reg(_)) => true,
+            // Lazy Arrays' slots are counted above; the stack-map entry itself
+            // only encodes the Array's result slot and captures nothing.
             _ => false,
         }).count()
     }
@@ -2780,6 +2815,31 @@ impl Assembler
             VALUE(encoded)
         }
 
+        // Reserved-slot layout for lazy Arrays: every element capture first (each
+        // Array's elements contiguous), then one result slot per Array holding the
+        // allocated Array so caller-frame stack maps can reference it. Ordinary
+        // stack-map captures start after this region.
+        fn lazy_array_element_base(lazy_arrays: &[SideExitLazyArray], idx: usize) -> usize {
+            lazy_arrays[..idx].iter().map(|lazy_array| lazy_array.elements.len()).sum()
+        }
+
+        fn lazy_array_result_slot(lazy_arrays: &[SideExitLazyArray], idx: usize) -> usize {
+            lazy_array_element_base(lazy_arrays, lazy_arrays.len()) + idx
+        }
+
+        fn lazy_array_slot_count(lazy_arrays: &[SideExitLazyArray]) -> usize {
+            lazy_array_result_slot(lazy_arrays, lazy_arrays.len())
+        }
+
+        fn side_exit_capture_slot(asm: &Assembler, slot_idx: usize) -> Opnd {
+            let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(slot_idx);
+            Opnd::Mem(Mem {
+                base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
+                disp: 0,
+                num_bits: 64,
+            })
+        }
+
         fn capture_stack_map_opnd(asm: &mut Assembler, opnd: Opnd, capture_idx: &mut usize, frame_depth: usize) -> VALUE {
             let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(*capture_idx);
             *capture_idx += 1;
@@ -2793,12 +2853,12 @@ impl Assembler
             encode_stack_map_index(asm, stack_idx, frame_depth)
         }
 
-        fn compile_exit_stack_map(asm: &mut Assembler, stack_map: &StackMap) {
+        fn compile_exit_stack_map(asm: &mut Assembler, stack_map: &StackMap, lazy_arrays: &[SideExitLazyArray]) {
             let StackMap { stack, jit_frame, frame_depth } = stack_map;
             let jit_frame = *jit_frame;
             assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
 
-            let mut capture_idx = 0;
+            let mut capture_idx = lazy_array_slot_count(lazy_arrays);
             for (idx, stack_entry) in stack.iter().enumerate() {
                 let entry = match *stack_entry {
                     StackMapEntry::Opnd(Opnd::Value(_) | Opnd::UImm(_)) => {
@@ -2819,6 +2879,13 @@ impl Assembler
                         let StackMapEntry::Opnd(opnd) = *stack_entry else { unreachable!() };
                         capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth)
                     }
+                    // Point at the reserved slot that compile_exit_lazy_arrays
+                    // fills with the allocated Array. No capture: the slot is
+                    // only read by rb_zjit_materialize_frames, after allocation.
+                    StackMapEntry::LazyArray(lazy_idx) => {
+                        let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(lazy_array_result_slot(lazy_arrays, lazy_idx));
+                        encode_stack_map_index(asm, stack_idx, *frame_depth)
+                    }
                     _ => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 };
                 unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
@@ -2832,7 +2899,7 @@ impl Assembler
 
         /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
         fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
-            let SideExit { pc, stack, locals, iseq, stack_map, .. } = exit;
+            let SideExit { pc, stack, locals, iseq, stack_map, lazy_arrays, .. } = exit;
 
             // Side exit blocks are not part of the CFG at the moment,
             // so we need to manually ensure that patchpoints get padded
@@ -2865,7 +2932,66 @@ impl Assembler
             }
 
             if let Some(stack_map) = stack_map {
-                compile_exit_stack_map(asm, stack_map);
+                compile_exit_stack_map(asm, stack_map, lazy_arrays);
+            }
+        }
+
+        /// Allocate Arrays deferred from the hot path and store each into its VM
+        /// stack and local slots, replacing the Qnil placeholders written by
+        /// compile_exit_save_state. Must run after cfp->jit_return is cleared:
+        /// allocation can trigger GC, which walks this frame as a plain
+        /// interpreter frame whose pc/sp/stack/locals are all valid by now.
+        /// Element values survive GC and earlier allocations because they sit in
+        /// reserved native stack slots, which the machine stack scan visits.
+        fn compile_exit_lazy_arrays(asm: &mut Assembler, exit: &SideExit) {
+            if exit.lazy_arrays.is_empty() {
+                return;
+            }
+            use crate::cruby::rb_ec_ary_new_from_values;
+            assert!(lazy_array_slot_count(&exit.lazy_arrays) <= asm.stack_state.num_side_exit_stack_map_slots);
+
+            // Capture every element into reserved native stack slots first: the
+            // allocation C calls below clobber caller-saved registers, and a later
+            // Array's elements must survive an earlier Array's allocation. Elements
+            // are laid out contiguously in ascending-address order to form each
+            // Array's argv. Reserved slot indexes grow downward in memory, so
+            // element 0 takes the highest index of its Array's range.
+            for (lazy_idx, lazy_array) in exit.lazy_arrays.iter().enumerate() {
+                let element_base = lazy_array_element_base(&exit.lazy_arrays, lazy_idx);
+                let len = lazy_array.elements.len();
+                asm_comment!(asm, "capture lazy Array elements: {}", join_opnds(&lazy_array.elements, ", "));
+                for (idx, &opnd) in lazy_array.elements.iter().enumerate() {
+                    let capture_slot = side_exit_capture_slot(asm, element_base + len - 1 - idx);
+                    let opnd = if matches!(opnd, Opnd::Reg(_)) { opnd.with_num_bits(64) } else { opnd };
+                    asm.store(capture_slot, opnd);
+                }
+            }
+
+            for (lazy_idx, lazy_array) in exit.lazy_arrays.iter().enumerate() {
+                let element_base = lazy_array_element_base(&exit.lazy_arrays, lazy_idx);
+                let len = lazy_array.elements.len();
+                asm_comment!(asm, "allocate lazy Array from {} elements", len);
+                let argv = if len == 0 {
+                    Opnd::UImm(0)
+                } else {
+                    // Element 0 has the highest slot index, i.e. the lowest address.
+                    asm.lea_into(C_ARG_OPNDS[2], side_exit_capture_slot(asm, element_base + len - 1));
+                    C_ARG_OPNDS[2]
+                };
+                asm_ccall!(asm, rb_ec_ary_new_from_values, EC, Opnd::UImm(len as u64), argv);
+                // Store the Array into its result slot, which caller-frame stack
+                // maps reference (see StackMapEntry::LazyArray). Later Arrays'
+                // allocations can trigger GC, and this slot also keeps the Array
+                // alive through them: reserved slots are conservatively scanned.
+                asm.store(side_exit_capture_slot(asm, lazy_array_result_slot(&exit.lazy_arrays, lazy_idx)), C_RET_OPND);
+                // SP survives the C call (it's callee-saved), so store the Array
+                // into each VM stack/local slot that referenced the HIR value.
+                for &slot in &lazy_array.stack_slots {
+                    asm.store(Opnd::mem(64, SP, slot as i32 * SIZEOF_VALUE_I32), C_RET_OPND);
+                }
+                for &slot in &lazy_array.local_slots {
+                    asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(exit.locals.len(), slot) - 1) * SIZEOF_VALUE_I32), C_RET_OPND);
+                }
             }
         }
 
@@ -2899,13 +3025,14 @@ impl Assembler
             // ccall doesn't clobber caller-saved registers
             // holding stack/local operands.
             compile_exit_save_state(asm, exit);
-            if trace_reason.is_some() || exit.recompile.is_some() {
+            if trace_reason.is_some() || exit.recompile.is_some() || !exit.lazy_arrays.is_empty() {
                 // Clear cfp->jit_return to prepare for a C call. Normally, cfp->jit_return
                 // is cleared by the materialize_exit trampoline, but if we're about to
                 // make a C call, we need to clear any stale JITFrame.
                 asm_comment!(asm, "clear cfp->jit_return");
                 asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
             }
+            compile_exit_lazy_arrays(asm, exit);
             if let Some(reason) = trace_reason {
                 // Leak a CString with the reason so it's available at runtime
                 let reason_cstr = std::ffi::CString::new(reason.to_string())

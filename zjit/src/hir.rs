@@ -926,6 +926,12 @@ pub enum Insn {
     /// called `to_a`, duplicate the returned array.
     ToNewArray { val: InsnId, state: InsnId },
     NewArray { elements: Vec<InsnId>, state: InsnId },
+    /// A `NewArray` whose allocation has been deferred to side exits. The hot path
+    /// generates no code for it; every side exit whose `FrameState` contains this
+    /// instruction allocates the Array from `elements` while materializing the frame.
+    /// Created by `defer_rest_array_allocations` after all other optimizations, and
+    /// only when every use of the Array is a cold (side-exit-only) frame slot.
+    DeferredNewArray { elements: Vec<InsnId> },
     /// NewHash contains a vec of (key, value) pairs
     NewHash { elements: Vec<InsnId>, state: InsnId },
     NewRange { low: InsnId, high: InsnId, flag: RangeType, state: InsnId },
@@ -1295,6 +1301,9 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(elements);
                 $visit_one!(*state);
             }
+            Insn::DeferredNewArray { elements } => {
+                $visit_many!(elements);
+            }
             Insn::ArrayInclude { elements, target, state, .. } => {
                 $visit_many!(elements);
                 $visit_one!(*target);
@@ -1656,6 +1665,9 @@ impl Insn {
             Insn::ToArray { .. } => effects::Any,
             Insn::ToNewArray { .. } => effects::Any,
             Insn::NewArray { .. } => allocates,
+            // No code runs at its position; side exits allocate the Array while
+            // materializing the frame.
+            Insn::DeferredNewArray { .. } => effects::Empty,
             Insn::NewHash { elements, .. } => {
                 // NewHash's operands may be hashed and compared for equality, which could have
                 // side-effects. Empty hashes are definitely elidable.
@@ -1955,6 +1967,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::NewArray { elements, .. } => {
                 write!(f, "NewArray")?;
+                write_separated!(f, " ", ", ", elements);
+                Ok(())
+            }
+            Insn::DeferredNewArray { elements } => {
+                write!(f, "DeferredNewArray")?;
                 write_separated!(f, " ", ", ", elements);
                 Ok(())
             }
@@ -3138,6 +3155,12 @@ impl Function {
         result
     }
 
+    /// Return the canonical representative of `insn_id` in the union-find, so
+    /// callers can compare instruction identities without cloning instructions.
+    pub fn canonical_id(&self, insn_id: InsnId) -> InsnId {
+        self.union_find.borrow().find_const(insn_id)
+    }
+
     /// Update DynamicSendReason for the instruction at insn_id
     fn set_dynamic_send_reason(&mut self, insn_id: InsnId, dynamic_send_reason: SendFallbackReason) {
         use Insn::*;
@@ -3226,6 +3249,7 @@ impl Function {
             Insn::StringEqual { .. } => types::BoolExact,
             Insn::ToRegexp { .. } => types::RegexpExact,
             Insn::NewArray { .. } => types::ArrayExact,
+            Insn::DeferredNewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
             Insn::ArrayPop { .. } => types::BasicObject,
@@ -5969,6 +5993,157 @@ impl Function {
         (non_escaping, foldable_reads)
     }
 
+    /// Replace rest-parameter `NewArray`s whose Array is only ever needed on side
+    /// exits with `DeferredNewArray`, eliminating the allocation from the hot path.
+    /// Side exits allocate the Array from its elements while materializing the frame.
+    ///
+    /// This must run after every other optimization: it requires that all reads of
+    /// the Array (and identity-preserving guards on it) have already been folded
+    /// away, so the remaining uses are only deoptimization metadata. A `NewArray`
+    /// qualifies when:
+    ///
+    /// 1. It passes the escape analysis in `non_escaping_rest_arrays`, and every
+    ///    surviving direct use is either a `Snapshot` (the callee's rest local or a
+    ///    stack copy of it) or a non-receiver `PushInlineFrame` argument. Any
+    ///    surviving read or guard observes the runtime Array and disqualifies it.
+    /// 2. Every instruction that holds a `Snapshot` from which the Array is
+    ///    reachable only materializes that frame state on side exits. Reachability
+    ///    follows `caller` edges: materializing a frame also materializes every
+    ///    caller frame through its stack map, and side-exit stack maps allocate
+    ///    lazy Arrays (see `StackMapEntry::LazyArray`), while hot-path stack maps
+    ///    do not. Instructions that write frame state on the hot path -- sends and
+    ///    other calls that may run arbitrary code (which spill locals for
+    ///    `Binding` and build hot-path stack maps) -- disqualify it.
+    ///    `PushInlineFrame` writes only its frame state's locals on the hot path
+    ///    (its JITFrame carries an empty stack map), so it disqualifies the Array
+    ///    only when a caller local slot would hold it. `Insn::SideExit` declares
+    ///    conservative effects but only ever jumps to a side exit, so it is
+    ///    explicitly allowed.
+    fn defer_rest_array_allocations(&mut self) {
+        let (rest_arrays, _) = self.non_escaping_rest_arrays();
+        if rest_arrays.is_empty() {
+            return;
+        }
+        let rpo = self.reverse_post_order();
+
+        // Same rationale as the barrier predicate in non_escaping_rest_arrays, but
+        // for a different question: does this instruction write the frame state it
+        // references on the hot path? Every instruction that can run arbitrary code
+        // spills locals and builds a hot-path stack map before the call so that
+        // `Binding` and exception handling can observe them. PushInlineFrame is
+        // handled separately below: it spills only its frame state's locals.
+        // Branch and read instructions never reference a Snapshot, so unlike
+        // may_run_arbitrary_code, they need no exceptions here.
+        let materializes_frames_on_hot_path = |insn: &Insn| -> bool {
+            match insn {
+                // SideExit is an unconditional jump to a side exit: the frame state
+                // is only ever materialized on the exit path.
+                Insn::SideExit { .. } => false,
+                insn => insn.effects_of().write_bits().includes(abstract_heaps::Any),
+            }
+        };
+
+        'candidate: for (array, elements) in rest_arrays {
+            let array = self.union_find.borrow().find_const(array);
+
+            // Collect the Snapshots whose stack or locals contain the Array, and
+            // reject any other surviving use (condition 1).
+            let mut snapshots = HashSet::new();
+            for &block in &rpo {
+                for &insn_id in &self.blocks[block.0].insns {
+                    let canonical_id = self.union_find.borrow().find_const(insn_id);
+                    match self.find(insn_id) {
+                        Insn::Snapshot { state } => {
+                            if state.stack.iter().chain(state.locals.iter())
+                                .any(|&insn_id| self.union_find.borrow().find_const(insn_id) == array)
+                            {
+                                snapshots.insert(canonical_id);
+                            }
+                        }
+                        Insn::PushInlineFrame { recv, .. } => {
+                            // The Array may be forwarded as the callee's rest local
+                            // (an `args` member), but not observed as the receiver.
+                            if self.union_find.borrow().find_const(recv) == array {
+                                continue 'candidate;
+                            }
+                        }
+                        insn => {
+                            let mut used = false;
+                            insn.for_each_operand(|operand| {
+                                used |= self.union_find.borrow().find_const(operand) == array;
+                            });
+                            if used && canonical_id != array {
+                                continue 'candidate;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The Array taints the whole snapshot chain: materializing a frame
+            // also materializes every caller frame through its stack map, so a
+            // Snapshot whose (transitive) caller contains the Array needs the
+            // Array on materialization too.
+            loop {
+                let mut changed = false;
+                for &block in &rpo {
+                    for &insn_id in &self.blocks[block.0].insns {
+                        let canonical_id = self.union_find.borrow().find_const(insn_id);
+                        if snapshots.contains(&canonical_id) {
+                            continue;
+                        }
+                        if let Insn::Snapshot { state } = self.find(insn_id) {
+                            if let Some(caller) = state.caller {
+                                if snapshots.contains(&self.union_find.borrow().find_const(caller)) {
+                                    snapshots.insert(canonical_id);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            // Check every holder of those Snapshots (condition 2).
+            for &block in &rpo {
+                for &insn_id in &self.blocks[block.0].insns {
+                    let insn = self.find(insn_id);
+                    if matches!(insn, Insn::Snapshot { .. }) {
+                        continue;
+                    }
+                    // gen_push_inline_frame writes its frame state's locals on the
+                    // hot path, but not its stack (the JITFrame it installs has an
+                    // empty stack map), so the Array may sit on the caller's stack
+                    // as the send's outgoing argument.
+                    if let Insn::PushInlineFrame { state, .. } = insn {
+                        let frame_state = self.frame_state(state);
+                        if frame_state.locals.iter()
+                            .any(|&insn_id| self.union_find.borrow().find_const(insn_id) == array)
+                        {
+                            continue 'candidate;
+                        }
+                        continue;
+                    }
+                    let mut references_snapshot = false;
+                    insn.for_each_operand(|operand| {
+                        references_snapshot |= snapshots.contains(&self.union_find.borrow().find_const(operand));
+                    });
+                    if references_snapshot && materializes_frames_on_hot_path(&insn) {
+                        continue 'candidate;
+                    }
+                }
+            }
+
+            let elements = elements.iter()
+                .map(|&insn_id| self.union_find.borrow().find_const(insn_id))
+                .collect();
+            self.insns[array.0] = Insn::DeferredNewArray { elements };
+        }
+    }
+
     /// Block-local canonicalize: rewrite each operand through union-find and a
     /// per-block map of the most recent `Guard*` for that value. Forwards
     /// guarded values into branch-edge args (so `infer_types` narrows merge-block
@@ -6691,6 +6866,7 @@ impl Function {
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
             (remove_duplicate_check_interrupts) => { Counter::compile_hir_remove_duplicate_check_interrupts_time_ns };
             (eliminate_dead_code) => { Counter::compile_hir_eliminate_dead_code_time_ns };
+            (defer_rest_array_allocations) => { Counter::compile_hir_defer_rest_array_allocations_time_ns };
             ($name:ident) => { unimplemented!("Counter for pass {}", stringify!($name)) };
         }
 
@@ -6746,6 +6922,11 @@ impl Function {
                 break;
             }
         }
+
+        // Runs last: it requires that all reads of candidate Arrays have already
+        // been folded away, and no later pass understands that DeferredNewArray's
+        // value only exists on side exits.
+        run_pass!(defer_rest_array_allocations);
 
         if should_dump {
             let iseq_name = iseq_get_location(self.iseq, 0);
@@ -7061,6 +7242,7 @@ impl Function {
             | Insn::InvokeBlockIseqDirect { ref args, .. }
             | Insn::InvokeBlockIfunc { ref args, .. }
             | Insn::NewArray { elements: ref args, .. }
+            | Insn::DeferredNewArray { elements: ref args }
             | Insn::ArrayHash { elements: ref args, .. }
             | Insn::ArrayMin { elements: ref args, .. }
             | Insn::ArrayMax { elements: ref args, .. } => {

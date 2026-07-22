@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
+use std::collections::HashMap;
 
 use crate::backend::current::ALLOC_REGS;
 use crate::invariants::{
@@ -22,7 +23,7 @@ use crate::state::ZJITState;
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
 use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
-use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
+use crate::backend::lir::{self, Assembler, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, Opnd, SP, SideExit, SideExitLazyArray, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
@@ -616,6 +617,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         }
         Insn::Const { .. } => panic!("Unexpected Const in gen_insn: {insn}"),
         Insn::NewArray { elements, state } => gen_new_array(jit, asm, opnds!(elements), &function.frame_state(*state)),
+        // The Array is allocated by side exits that materialize it; the hot path
+        // only carries a placeholder. build_side_exit() substitutes the real
+        // allocation wherever a FrameState references this instruction.
+        Insn::DeferredNewArray { .. } => Opnd::Value(Qnil),
         Insn::NewHash { elements, state } => {
             let sym_keys = elements.iter().step_by(2).all(|&key| function.type_of(key).is_subtype(types::Symbol));
             gen_new_hash(jit, asm, function, opnds!(elements), sym_keys, &function.frame_state(*state))
@@ -1046,7 +1051,7 @@ fn gen_ccall_with_frame(
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, function, state);
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
 
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
         // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
@@ -1141,7 +1146,7 @@ fn gen_ccall_variadic(
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
     gen_spill_stack(jit, asm, function, state);
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
 
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
         gen_block_handler_specval(asm, blockiseq)
@@ -1587,7 +1592,7 @@ fn gen_push_inline_frame(
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
 
     // This mirrors vm_caller_setup_arg_block() for the `blockiseq != NULL` case.
     // The HIR specialization guards ensure we will only reach here for literal blocks,
@@ -1722,11 +1727,11 @@ fn gen_send_iseq_direct(
     // Save cfp->pc and cfp->sp for the caller frame
     // Can't use gen_prepare_non_leaf_call because we need special SP math.
     let stack_size = state.stack().len() - args.len() - 1; // -1 for receiver
-    let stack_map = build_stack_map(jit, function, &state.with_stack_size(stack_size));
+    let stack_map = build_stack_map(jit, function, &state.with_stack_size(stack_size), None);
     let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     // This mirrors vm_caller_setup_arg_block() in for the `blockiseq != NULL` case.
@@ -1952,11 +1957,11 @@ fn gen_invoke_block_iseq_direct(
     let specval = asm.or(captured_ep, Opnd::Imm(0x1));
 
     let stack_size = state.stack().len() - args.len();
-    let stack_map = build_stack_map(jit, function, &state.with_stack_size(stack_size));
+    let stack_map = build_stack_map(jit, function, &state.with_stack_size(stack_size), None);
     let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     gen_push_frame(asm, args.len(), state, ControlFrame {
@@ -3270,11 +3275,18 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
 }
 
 /// Spill locals onto the stack.
-fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
+fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     // TODO: Avoid spilling locals that have been spilled before and not changed.
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
     for (idx, &insn_id) in state.locals().enumerate() {
+        // defer_rest_array_allocations only defers an Array when no instruction
+        // spills the frame states holding it on the hot path, so its placeholder
+        // must never reach here.
+        debug_assert!(
+            !matches!(function.find(insn_id), Insn::DeferredNewArray { .. }),
+            "hot-path local spill would write a DeferredNewArray placeholder",
+        );
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
 }
@@ -3287,7 +3299,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
     asm_comment!(asm, "spill stack");
 
     let mut offset = state.stack_size() as i32;
-    for entry in build_stack_map(jit, function, state) {
+    for entry in build_stack_map(jit, function, state, None) {
         match entry {
             StackMapEntry::Opnd(opnd) => {
                 offset -= 1;
@@ -3295,6 +3307,9 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
             }
             StackMapEntry::Skip(skip) => {
                 offset -= skip as i32;
+            }
+            StackMapEntry::LazyArray(_) => {
+                unreachable!("hot-path stack spill would write a DeferredNewArray placeholder")
             }
         }
     }
@@ -3308,25 +3323,63 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
 fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, state.stack_size());
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
     gen_spill_stack(jit, asm, function, state);
 }
 
 /// Build entries for Ruby stack values that need materialization. The actual
 /// JITFrame entries are encoded by the register allocator, where VReg locations
 /// on the native stack are known.
-fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
+/// Accumulates the lazy Array allocations of one side exit while its stack,
+/// locals, and caller stack map are built, deduplicating by canonical HIR
+/// instruction so every slot referencing the same `DeferredNewArray` receives
+/// the same Array.
+#[derive(Default)]
+struct LazyArrays {
+    arrays: Vec<SideExitLazyArray>,
+    indexes: HashMap<InsnId, usize>,
+}
+
+impl LazyArrays {
+    /// Return the index of the lazy Array for `insn_id` (a canonical
+    /// `DeferredNewArray`), registering it on first use.
+    fn index_for(&mut self, jit: &JITState, insn_id: InsnId, elements: &[InsnId]) -> usize {
+        if let Some(&index) = self.indexes.get(&insn_id) {
+            return index;
+        }
+        self.arrays.push(SideExitLazyArray {
+            elements: elements.iter().map(|&element| jit.get_opnd(element)).collect(),
+            stack_slots: vec![],
+            local_slots: vec![],
+        });
+        let index = self.arrays.len() - 1;
+        self.indexes.insert(insn_id, index);
+        index
+    }
+}
+
+fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState, mut lazy_arrays: Option<&mut LazyArrays>) -> Vec<StackMapEntry> {
     let mut stack = Vec::new();
     let mut current_state = state.clone();
     loop {
-        stack.extend(current_state.stack().rev().copied().map(|insn_id| {
+        for &insn_id in current_state.stack().rev() {
+            if let Insn::DeferredNewArray { elements } = function.find(insn_id) {
+                // Side-exit caller frames allocate deferred Arrays lazily while
+                // materializing. Hot-path stack maps never contain one:
+                // defer_rest_array_allocations rejects Arrays reachable from a
+                // frame state that a hot-path instruction may cover.
+                let lazy_arrays = lazy_arrays.as_deref_mut()
+                    .expect("hot-path stack map would capture a DeferredNewArray placeholder");
+                stack.push(StackMapEntry::LazyArray(lazy_arrays.index_for(jit, function.canonical_id(insn_id), &elements)));
+                continue;
+            }
             let opnd = jit.get_opnd(insn_id);
             assert!(
                 matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }),
                 "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}",
             );
-            StackMapEntry::Opnd(opnd)
-        }));
+            stack.push(StackMapEntry::Opnd(opnd));
+        }
 
         let Some(caller) = current_state.caller() else {
             break;
@@ -3350,7 +3403,7 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, function: &Fun
     // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots
-    let stack_map = build_stack_map(jit, function, state);
+    let stack_map = build_stack_map(jit, function, state, None);
     let jit_frame = gen_prepare_call_with_gc(asm, state, false, stack_map.len());
 
     // Remember the stack map in case it raises an exception
@@ -3358,7 +3411,7 @@ fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, function: &Fun
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     // Spill locals in case the method looks at caller Bindings
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals(jit, asm, function, state);
 }
 
 /// Frame metadata written by gen_push_frame()
@@ -3499,30 +3552,49 @@ fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameSt
 
 /// Build a side-exit context
 fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> SideExit {
+    // DeferredNewArray slots get a Qnil placeholder; the exit allocates the Array
+    // and overwrites every slot referencing the same instruction, so Ruby observes
+    // a single Array with a consistent object identity. Caller-frame stack maps
+    // instead reference the reserved slot the exit stores the Array into.
+    let mut lazy_arrays = LazyArrays::default();
+    fn exit_opnd(jit: &JITState, function: &Function, lazy_arrays: &mut LazyArrays, insn_id: InsnId, slot_idx: usize, is_local: bool) -> Opnd {
+        if let Insn::DeferredNewArray { elements } = function.find(insn_id) {
+            let index = lazy_arrays.index_for(jit, function.canonical_id(insn_id), &elements);
+            let lazy_array = &mut lazy_arrays.arrays[index];
+            let slots = if is_local { &mut lazy_array.local_slots } else { &mut lazy_array.stack_slots };
+            slots.push(slot_idx);
+            Opnd::Value(Qnil)
+        } else {
+            jit.get_opnd(insn_id)
+        }
+    }
+
     let mut stack = Vec::new();
-    for &insn_id in state.stack() {
-        stack.push(jit.get_opnd(insn_id));
+    for (idx, &insn_id) in state.stack().enumerate() {
+        stack.push(exit_opnd(jit, function, &mut lazy_arrays, insn_id, idx, false));
     }
 
     let mut locals = Vec::new();
-    for &insn_id in state.locals() {
-        locals.push(jit.get_opnd(insn_id));
+    for (idx, &insn_id) in state.locals().enumerate() {
+        locals.push(exit_opnd(jit, function, &mut lazy_arrays, insn_id, idx, true));
     }
 
+    let stack_map = build_caller_stack_map(jit, function, state, &mut lazy_arrays);
     SideExit{
         pc: Opnd::const_ptr(state.pc),
         stack,
         locals,
+        lazy_arrays: lazy_arrays.arrays,
         iseq: state.iseq,
-        stack_map: build_caller_stack_map(jit, function, state),
+        stack_map,
         recompile: None,
     }
 }
 
-fn build_caller_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Option<StackMap> {
+fn build_caller_stack_map(jit: &JITState, function: &Function, state: &FrameState, lazy_arrays: &mut LazyArrays) -> Option<StackMap> {
     let caller = state.caller()?;
     let caller_state = function.frame_state(caller);
-    let stack_map = build_stack_map(jit, function, &caller_state);
+    let stack_map = build_stack_map(jit, function, &caller_state, Some(lazy_arrays));
     if stack_map.is_empty() {
         return None;
     }

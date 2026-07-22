@@ -4022,7 +4022,7 @@ mod hir_opt_tests {
           v11:Fixnum[1] = Const Value(1)
           v13:Fixnum[2] = Const Value(2)
           v15:Fixnum[3] = Const Value(3)
-          v23:ArrayExact = NewArray v11, v13, v15
+          v23:ArrayExact = DeferredNewArray v11, v13, v15
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v26:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           PushInlineFrame v26 (0x1038), v23
@@ -4062,7 +4062,7 @@ mod hir_opt_tests {
           v19:Fixnum[5] = Const Value(5)
           v21:Fixnum[6] = Const Value(6)
           v23:Fixnum[7] = Const Value(7)
-          v31:ArrayExact = NewArray v11, v13, v15, v17, v19, v21, v23
+          v31:ArrayExact = DeferredNewArray v11, v13, v15, v17, v19, v21, v23
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v34:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           PushInlineFrame v34 (0x1038), v31
@@ -4191,7 +4191,7 @@ mod hir_opt_tests {
           v13:Fixnum[2] = Const Value(2)
           v15:Fixnum[3] = Const Value(3)
           v17:Fixnum[4] = Const Value(4)
-          v25:ArrayExact = NewArray v13, v15
+          v25:ArrayExact = DeferredNewArray v13, v15
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v28:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           PushInlineFrame v28 (0x1038), v11, v25, v17
@@ -4230,7 +4230,7 @@ mod hir_opt_tests {
           v11:Fixnum[1] = Const Value(1)
           v13:Fixnum[2] = Const Value(2)
           v15:Fixnum[40] = Const Value(40)
-          v23:ArrayExact = NewArray v11, v13
+          v23:ArrayExact = DeferredNewArray v11, v13
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v26:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v47:Fixnum[0] = Const Value(0)
@@ -4269,7 +4269,7 @@ mod hir_opt_tests {
           v11:Fixnum[1] = Const Value(1)
           v13:Fixnum[2] = Const Value(2)
           v21:Fixnum[40] = Const Value(40)
-          v22:ArrayExact = NewArray v11, v13
+          v22:ArrayExact = DeferredNewArray v11, v13
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v25:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v46:Fixnum[0] = Const Value(0)
@@ -19184,6 +19184,78 @@ mod hir_opt_tests {
             "Expected the global store to prevent rest Array scalarization:\n{result}");
         assert!(!result.contains("Fixnum[3] = Const Value(3)"),
             "Must not fold reads from an escaping rest Array:\n{result}");
+    }
+
+    #[test]
+    fn test_defer_non_escaping_rest_array_allocation() {
+        eval("
+            def add_rest(*rest)
+              rest[0] + rest[1]
+            end
+            def test
+              add_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected add_rest to be inlined:\n{result}");
+        assert!(result.contains("DeferredNewArray"),
+            "Expected the rest Array allocation to be deferred to side exits:\n{result}");
+        assert!(!result.contains("= NewArray"),
+            "Expected no rest Array allocation on the hot path:\n{result}");
+    }
+
+    #[test]
+    fn test_defer_rest_array_allocation_rejected_by_hot_frame_write() {
+        eval("
+            def add_rest(*rest)
+              x = rest[0] + rest[1]
+              rand # non-leaf call: spills the frame state holding rest on the hot path
+              x
+            end
+            def test
+              add_rest(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        assert!(result.contains("PushInlineFrame"),
+            "Expected add_rest to be inlined:\n{result}");
+        assert!(result.contains("= NewArray"),
+            "Expected the rest Array to stay allocated when a call spills the frame state holding it:\n{result}");
+        assert!(!result.contains("DeferredNewArray"),
+            "Must not defer an Array that a hot-path local spill would write:\n{result}");
+    }
+
+    #[test]
+    fn test_defer_rest_array_allocation_rejected_by_inline_frame_local_spill() {
+        eval("
+            def inner(*rest)
+              rest[0] + rest[1]
+            end
+            def mid(*rest)
+              inner(rest[0], rest[1])
+            end
+            def test
+              mid(1, 2)
+            end
+            test
+            test
+        ");
+
+        let result = hir_string_with_inlining("test");
+        // PushInlineFrame(inner) spills mid's locals, including mid's rest Array,
+        // on the hot path, so mid's allocation stays; inner's rest is only needed
+        // on side exits and is deferred.
+        assert!(result.contains("= NewArray"),
+            "Expected mid's rest Array to stay allocated: PushInlineFrame spills it as a local:\n{result}");
+        assert!(result.contains("DeferredNewArray"),
+            "Expected inner's rest Array allocation to be deferred to side exits:\n{result}");
     }
 
     #[test]
