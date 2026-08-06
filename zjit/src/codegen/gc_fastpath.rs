@@ -13,6 +13,7 @@ use super::JITState;
 struct RbGcZjitDefaultNewObjFastpath {
     cursor_offset: usize,
     cursor_end_offset: usize,
+    alloc_count_offset: usize,
     slot_size: usize,
     flags: VALUE,
     klass: VALUE,
@@ -61,7 +62,13 @@ unsafe extern "C" {
         klass: VALUE,
         fastpath: *mut RbGcZjitFastpath,
     ) -> bool;
+
+    /// Global event flags (rb_event_flag_t) checked by rb_gc_event_hook_required_p().
+    static ruby_vm_event_flags: u32;
 }
+
+/// RUBY_INTERNAL_EVENT_NEWOBJ in include/ruby/internal/event.h
+const RUBY_INTERNAL_EVENT_NEWOBJ: u64 = 0x100000;
 
 enum PreparedNewObjFastpath {
     Default(RbGcZjitDefaultNewObjFastpath),
@@ -177,7 +184,17 @@ fn emit_default_new_obj_fastpath(
 ) -> Option<Opnd> {
     let cursor_offset: i32 = fastpath.cursor_offset.try_into().ok()?;
     let cursor_end_offset: i32 = fastpath.cursor_end_offset.try_into().ok()?;
+    let alloc_count_offset: i32 = fastpath.alloc_count_offset.try_into().ok()?;
     let slot_size: u64 = fastpath.slot_size.try_into().ok()?;
+
+    // Take the slow path while NEWOBJ event hooks are enabled, like
+    // rb_gc_event_hook_required_p() in rb_newobj(). The slow path fires the
+    // hook for tracing (e.g. ObjectSpace) tools; the inline fast path doesn't.
+    asm_comment!(asm, "check newobj event hooks");
+    let event_flags_ptr = asm.load(Opnd::const_ptr(&raw const ruby_vm_event_flags as *const u8));
+    let event_flags = asm.load(Opnd::mem(32, event_flags_ptr, 0));
+    asm.test(event_flags, Opnd::UImm(RUBY_INTERNAL_EVENT_NEWOBJ));
+    asm.jnz(jit, miss.clone());
 
     let thread = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_THREAD_PTR as i32));
     let ractor = asm.load(Opnd::mem(64, thread, RUBY_OFFSET_THREAD_RACTOR as i32));
@@ -194,6 +211,15 @@ fn emit_default_new_obj_fastpath(
     asm.jl(jit, miss.clone());
 
     asm.store(Opnd::mem(64, gc_cache, cursor_offset), new_cursor);
+
+    // Count the allocation like ractor_cache_allocate_slot() so that
+    // total_allocated_objects and incremental marking step pacing stay
+    // accurate. GC.verify_internal_consistency reports "inconsistent live
+    // slot number" when this count is missed.
+    let alloc_count = asm.load(Opnd::mem(64, gc_cache, alloc_count_offset));
+    let new_alloc_count = asm.add(alloc_count, Opnd::UImm(1));
+    asm.store(Opnd::mem(64, gc_cache, alloc_count_offset), new_alloc_count);
+
     asm.store(
         Opnd::mem(VALUE_BITS, cursor, RUBY_OFFSET_RBASIC_FLAGS),
         fastpath.flags.as_u64().into(),
