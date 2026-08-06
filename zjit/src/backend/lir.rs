@@ -3898,15 +3898,6 @@ impl Assembler {
         self.push_insn(Insn::IncrCounter { mem, value });
     }
 
-    pub fn jb(&mut self, target: Target) {
-        self.push_insn(Insn::Jb(target));
-    }
-
-    #[allow(dead_code)]
-    pub fn jg(&mut self, target: Target) {
-        self.push_insn(Insn::Jg(target));
-    }
-
     pub fn jmp(&mut self, target: Target) {
         self.push_insn(Insn::Jmp(target));
     }
