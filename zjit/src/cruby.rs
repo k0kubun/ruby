@@ -130,7 +130,6 @@ unsafe extern "C" {
 
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
     pub fn rb_ary_new_from_args(n: c_long, ...) -> VALUE;
-    pub fn rb_str_setbyte(str: VALUE, index: VALUE, value: VALUE) -> VALUE;
     pub fn rb_str_getbyte(str: VALUE, index: VALUE) -> VALUE;
     pub fn rb_vm_splat_array(flag: VALUE, ary: VALUE) -> VALUE;
     pub fn rb_jit_fix_div_fix(x: VALUE, y: VALUE) -> VALUE;
@@ -1713,6 +1712,7 @@ pub(crate) mod ids {
         name: rb_ivar_get_at_no_ractor_check
         name: RUBY_FL_FREEZE
         name: RUBY_ELTS_SHARED
+        name: RSTRING_DEPENDANT_MASK
         name: RubyVM
         name: ZJIT
         name: induce_side_exit_bang       content: b"induce_side_exit!"

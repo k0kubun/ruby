@@ -2723,6 +2723,8 @@ str_dependent_p(VALUE str)
 // If none of these flags are set, we know we have an independent string.
 // If any is set, we need to do more detailed checks.
 #define STR_DEPENDANT_MASK (STR_UNMODIFIABLE_MASK | STR_SHARED | STR_NOFREE)
+// JITs rely on RSTRING_DEPENDANT_MASK to write bytes into string buffers in place.
+STATIC_ASSERT(rstring_dependant_mask, STR_DEPENDANT_MASK == RSTRING_DEPENDANT_MASK);
 static inline int
 str_independent(VALUE str)
 {

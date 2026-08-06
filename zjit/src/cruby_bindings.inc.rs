@@ -1616,6 +1616,7 @@ pub struct rb_call_data {
     pub cc: *const rb_callcache,
 }
 pub const RSTRING_CHILLED: ruby_rstring_private_flags = 16384;
+pub const RSTRING_DEPENDANT_MASK: ruby_rstring_private_flags = 1074288640;
 pub type ruby_rstring_private_flags = u32;
 pub const RHASH_PASS_AS_KEYWORDS: ruby_rhash_flags = 8192;
 pub const RHASH_PROC_DEFAULT: ruby_rhash_flags = 16384;
