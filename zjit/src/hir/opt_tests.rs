@@ -12868,8 +12868,8 @@ mod hir_opt_tests {
           v39:CInt64[0] = Const CInt64(0)
           v40:CInt64 = GuardGreaterEq v38, v39
           v41:CUInt64 = LoadField v32, :RBASIC_FLAGS@0x1041
-          v42:CUInt64 = GuardNoBitsSet v41, RUBY_FL_FREEZE=CUInt64(2048)
-          v43:Fixnum = StringSetbyteFixnum v32, v33, v34
+          v42:CUInt64 = GuardNoBitsSet v41, RSTRING_DEPENDANT_MASK=CUInt64(1074288640)
+          v43:Fixnum = StringSetbyteFixnum v32, v40, v34
           CheckInterrupts
           Return v34
         ");
@@ -12915,8 +12915,8 @@ mod hir_opt_tests {
           v39:CInt64[0] = Const CInt64(0)
           v40:CInt64 = GuardGreaterEq v38, v39
           v41:CUInt64 = LoadField v32, :RBASIC_FLAGS@0x1041
-          v42:CUInt64 = GuardNoBitsSet v41, RUBY_FL_FREEZE=CUInt64(2048)
-          v43:Fixnum = StringSetbyteFixnum v32, v33, v34
+          v42:CUInt64 = GuardNoBitsSet v41, RSTRING_DEPENDANT_MASK=CUInt64(1074288640)
+          v43:Fixnum = StringSetbyteFixnum v32, v40, v34
           CheckInterrupts
           Return v34
         ");

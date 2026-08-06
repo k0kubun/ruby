@@ -613,6 +613,7 @@ pub enum SideExitReason {
     ExpandArray,
     GuardNotFrozen,
     GuardNotShared,
+    GuardNotDependant,
     GuardLess,
     GuardGreaterEq,
     GuardSuperMethodEntry,
@@ -980,6 +981,9 @@ pub enum Insn {
     StringConcat { strings: Vec<InsnId>, state: InsnId },
     /// Call rb_str_getbyte with known-Fixnum index
     StringGetbyte { string: InsnId, index: InsnId },
+    /// Write the low byte of the Fixnum `value` into `string`'s buffer at the already
+    /// bounds-checked C integer `index`, clearing the cached coderange. The string must be
+    /// guarded with `guard_string_not_dependant` so that writing in place is possible.
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
     StringAppend { recv: InsnId, other: InsnId, state: InsnId },
     StringAppendCodepoint { recv: InsnId, other: InsnId, state: InsnId },
@@ -1723,7 +1727,8 @@ impl Insn {
             Insn::StringIntern { .. } => effects::Any,
             Insn::StringConcat { .. } => effects::Any,
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
-            Insn::StringSetbyteFixnum { .. } => effects::Any,
+            // Writes both the string contents and the flags (to clear the coderange)
+            Insn::StringSetbyteFixnum { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Other),
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
             Insn::StringEqual { .. } => Effect::write(abstract_heaps::Allocator),
@@ -4147,6 +4152,14 @@ impl Function {
     pub fn guard_not_shared(&mut self, block: BlockId, recv: InsnId, state: InsnId) {
         let flags = self.load_rbasic_flags(block, recv);
         self.push_insn(block, Insn::GuardNoBitsSet { val: flags, mask: Const::CUInt64(RUBY_ELTS_SHARED as u64), mask_name: Some(ID!(RUBY_ELTS_SHARED)), reason: Box::new(SideExitReason::GuardNotShared), state });
+    }
+
+    /// Guard that the string `recv` can be written to in place: it is modifiable (not frozen,
+    /// tmp-locked, or chilled) and owns its buffer (not shared or nofree). See
+    /// STR_DEPENDANT_MASK in string.c.
+    pub fn guard_string_not_dependant(&mut self, block: BlockId, recv: InsnId, state: InsnId) {
+        let flags = self.load_rbasic_flags(block, recv);
+        self.push_insn(block, Insn::GuardNoBitsSet { val: flags, mask: Const::CUInt64(RSTRING_DEPENDANT_MASK as u64), mask_name: Some(ID!(RSTRING_DEPENDANT_MASK)), reason: Box::new(SideExitReason::GuardNotDependant), state });
     }
 
     /// `iseq` is the ISEQ that `ep_offset` is relative to, which is the ISEQ that
@@ -7458,7 +7471,7 @@ impl Function {
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;
-                self.assert_subtype(insn_id, index, types::Fixnum)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
                 self.assert_subtype(insn_id, value, types::Fixnum)
             }
             Insn::IsA { val, class } => {
