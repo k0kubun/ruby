@@ -5959,32 +5959,69 @@ impl Function {
     /// Inspired by Cranelift's aegraph canonicalize step
     /// (<https://cfallin.org/blog/2026/04/09/aegraph/>).
     fn canonicalize(&mut self) {
+        // Build the dominator tree. Children are pushed in RPO order, so the DFS below
+        // visits each dominator subtree in a deterministic order.
+        let dominators = Dominators::new(self);
+        let rpo = self.reverse_post_order();
+        let mut dom_children: Vec<Vec<BlockId>> = vec![vec![]; self.blocks.len()];
+        for &block in &rpo {
+            let idom = dominators.idom(block);
+            if idom != block {
+                dom_children[idom.0].push(block);
+            }
+        }
+
+        // Pre-order DFS over the dominator tree with a scoped rewrite map: a guard
+        // registered in a block applies to the rest of that block and every block it
+        // dominates. `undo_log` records displaced entries so each subtree's rewrites
+        // are dropped when the DFS leaves it.
         let mut rewrite_map: HashMap<InsnId, InsnId> = HashMap::new();
-        for block in self.reverse_post_order() {
-            rewrite_map.clear();
-            for i in 0..self.blocks[block.0].insns.len() {
-                let insn_id = self.blocks[block.0].insns[i];
-                let canonical_id = self.union_find.borrow().find_const(insn_id);
+        let mut undo_log: Vec<(InsnId, Option<InsnId>)> = Vec::new();
+        // (block, next dominator-tree child to visit, undo_log length at block entry)
+        let mut stack: Vec<(BlockId, usize, usize)> = vec![(self.entries_block, 0, 0)];
+        let mut visited = BlockSet::with_capacity(self.blocks.len());
+        while let Some(&mut (block, ref mut child_idx, undo_len)) = stack.last_mut() {
+            if !visited.get(block) {
+                visited.insert(block);
+                for i in 0..self.blocks[block.0].insns.len() {
+                    let insn_id = self.blocks[block.0].insns[i];
+                    let canonical_id = self.union_find.borrow().find_const(insn_id);
 
-                let union_find = &self.union_find;
-                self.insns[canonical_id.0].for_each_operand_mut(|operand| {
-                    let canon = union_find.borrow().find_const(*operand);
-                    *operand = rewrite_map.get(&canon).copied().unwrap_or(canon);
-                });
+                    let union_find = &self.union_find;
+                    self.insns[canonical_id.0].for_each_operand_mut(|operand| {
+                        let canon = union_find.borrow().find_const(*operand);
+                        *operand = rewrite_map.get(&canon).copied().unwrap_or(canon);
+                    });
 
-                // For the binary guards only `left` is registered because their infer_type is
-                // type_of(left).
-                match &self.insns[canonical_id.0] {
-                    Insn::GuardType      { val:  src, .. }
-                    | Insn::GuardBitEquals { val:  src, .. }
-                    | Insn::GuardAnyBitSet { val:  src, .. }
-                    | Insn::GuardNoBitsSet { val:  src, .. }
-                    | Insn::GuardGreaterEq { left: src, .. }
-                    | Insn::GuardLess      { left: src, .. } => {
-                        rewrite_map.insert(*src, canonical_id);
+                    // For the binary guards only `left` is registered because their infer_type is
+                    // type_of(left).
+                    match &self.insns[canonical_id.0] {
+                        Insn::GuardType      { val:  src, .. }
+                        | Insn::GuardBitEquals { val:  src, .. }
+                        | Insn::GuardAnyBitSet { val:  src, .. }
+                        | Insn::GuardNoBitsSet { val:  src, .. }
+                        | Insn::GuardGreaterEq { left: src, .. }
+                        | Insn::GuardLess      { left: src, .. } => {
+                            undo_log.push((*src, rewrite_map.insert(*src, canonical_id)));
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+            }
+            if *child_idx < dom_children[block.0].len() {
+                let child = dom_children[block.0][*child_idx];
+                *child_idx += 1;
+                stack.push((child, 0, undo_log.len()));
+            } else {
+                // Leaving this block's subtree; undo its rewrites.
+                while undo_log.len() > undo_len {
+                    let (key, prev) = undo_log.pop().unwrap();
+                    match prev {
+                        Some(prev) => { rewrite_map.insert(key, prev); }
+                        None => { rewrite_map.remove(&key); }
+                    }
+                }
+                stack.pop();
             }
         }
 

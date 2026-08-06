@@ -8055,7 +8055,7 @@ mod hir_opt_tests {
           v23:String = RefineType v39, String
           Jump bb6(v23)
         bb5():
-          v25:StringExact = AnyToString v10
+          v25:StringExact = AnyToString v18
           Jump bb6(v25)
         bb6(v27:String):
           v29:StringExact = StringConcat v14, v27
@@ -18629,6 +18629,34 @@ mod hir_opt_tests {
         assert_eq!(
             guard_count, 2,
             "expected 2 GuardType instructions after cross-block dedup, found {guard_count}\n\nHIR:\n{hir}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_guard_type_dominated_branch_into_loop() {
+        // The bytesize call guards `a` as StringExact in the entry block. Both arms of
+        // the `if` and the loop they feed are dominated by that guard, so the guarded
+        // value must flow through the side block's branch args and the loop's block
+        // parameters: getbyte must not re-guard `a` on every loop iteration.
+        eval("
+            def test(a)
+              l = a.bytesize
+              if l > 60
+                l = 60
+              end
+              i = 0
+              while i < l
+                a.getbyte(i)
+                i += 1
+              end
+            end
+            test('foo'); test('foo')
+        ");
+        let hir = hir_string("test");
+        let guard_count = hir.matches("GuardType").count();
+        assert_eq!(
+            guard_count, 1,
+            "expected 1 GuardType instruction after dominator-scoped guard forwarding, found {guard_count}\n\nHIR:\n{hir}"
         );
     }
 
