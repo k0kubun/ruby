@@ -7624,3 +7624,77 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       :done
     "#), @":done");
 }
+
+#[test]
+fn test_gc_fastpath_counts_allocated_objects() {
+    // The inline GC allocation fastpath must count allocations like
+    // ractor_cache_allocate_slot() does, or total_allocated_objects
+    // undercounts objects allocated from JIT code and
+    // GC.verify_internal_consistency fails with "inconsistent live slot
+    // number". Regression test for GH-17731.
+    //
+    // Note that the fastpath is compiled out on RUBY_DEBUG builds
+    // (RACTOR_CHECK_MODE), where this passes vacuously.
+    assert_snapshot!(inspect("
+        def zjit_alloc_ary = []
+        zjit_alloc_ary; zjit_alloc_ary # compile
+        before = GC.stat(:total_allocated_objects)
+        10_000.times { zjit_alloc_ary }
+        GC.verify_internal_consistency
+        GC.stat(:total_allocated_objects) - before >= 10_000
+    "), @"true");
+}
+
+#[test]
+fn test_gc_fastpath_newobj_event_hook() {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// RUBY_INTERNAL_EVENT_NEWOBJ in include/ruby/internal/event.h
+    const RUBY_INTERNAL_EVENT_NEWOBJ: u32 = 0x100000;
+
+    unsafe extern "C" {
+        fn rb_tracepoint_new(
+            target_thread: VALUE,
+            events: u32,
+            func: extern "C" fn(VALUE, *mut c_void),
+            data: *mut c_void,
+        ) -> VALUE;
+        fn rb_tracepoint_enable(tpval: VALUE) -> VALUE;
+        fn rb_tracepoint_disable(tpval: VALUE) -> VALUE;
+    }
+
+    static NEWOBJ_COUNT: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn count_newobj(_tpval: VALUE, _data: *mut c_void) {
+        NEWOBJ_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Compile the allocating method before enabling the hook, so the check
+    // below exercises code that was compiled without an active hook.
+    eval("
+        def zjit_alloc_ary_for_hook = []
+        zjit_alloc_ary_for_hook; zjit_alloc_ary_for_hook # compile
+    ");
+
+    // While a RUBY_INTERNAL_EVENT_NEWOBJ hook is enabled, the inline GC
+    // allocation fastpath must take the slow path so the hook fires for every
+    // allocation, like rb_newobj() does. Regression test for GH-17731.
+    // While enabled, the VM's event hook list keeps tpval alive.
+    let tpval = with_rubyvm(|| unsafe {
+        let tpval = rb_tracepoint_new(
+            VALUE(0),
+            RUBY_INTERNAL_EVENT_NEWOBJ,
+            count_newobj,
+            std::ptr::null_mut(),
+        );
+        rb_tracepoint_enable(tpval);
+        tpval
+    });
+    NEWOBJ_COUNT.store(0, Ordering::Relaxed);
+    eval("100.times { zjit_alloc_ary_for_hook }");
+    let count = NEWOBJ_COUNT.load(Ordering::Relaxed);
+    with_rubyvm(|| unsafe { rb_tracepoint_disable(tpval) });
+    // Note that the fastpath is compiled out on RUBY_DEBUG builds
+    // (RACTOR_CHECK_MODE), where this passes vacuously.
+    assert!(count >= 100, "NEWOBJ hook fired only {count} times for 100 JIT allocations");
+}
