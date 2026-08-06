@@ -5,6 +5,7 @@
 mod gc_fastpath;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
@@ -409,6 +410,92 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
     Ok(iseq_code_ptrs)
 }
 
+/// Comparison kind of a fixnum compare instruction folded into a CondBranch.
+#[derive(Clone, Copy)]
+enum FusedCmpKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// How to emit a CondBranch whose condition computation is folded into the branch.
+#[derive(Clone, Copy)]
+enum FusedCond {
+    /// Branch on the truthiness of a Ruby VALUE: `test val, !Qnil; jnz`.
+    /// Replaces a single-use `Test` whose CBool output fed the CondBranch.
+    Truthy(InsnId),
+    /// Branch on a fixnum comparison: `cmp left, right; jcc`. Comparing the boxed
+    /// operands preserves the fixnum order because tagging is monotonic.
+    /// Replaces a single-use fixnum compare feeding a single-use `Test`.
+    Cmp(FusedCmpKind, InsnId, InsnId),
+}
+
+/// Codegen plan that folds `FixnumLt`-style compares and `Test` instructions into the
+/// CondBranch that consumes them, so their results are branched on directly from CPU
+/// flags instead of being materialized into Qtrue/Qfalse and then 0/1.
+struct BranchFusion {
+    /// Instructions whose only consumer is a fused CondBranch; their codegen is skipped.
+    /// Indexed by resolved InsnId.
+    elided: Vec<bool>,
+    /// CondBranch (by resolved InsnId) -> how to emit its condition.
+    fused: HashMap<InsnId, FusedCond>,
+}
+
+/// Decide which Test/compare instructions can be folded into the CondBranch that uses
+/// them. A candidate must be in the same block as the CondBranch and have exactly one
+/// use, counting side-exit snapshots: a value captured by a snapshot must stay
+/// materialized for the interpreter, so it cannot be elided.
+fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> BranchFusion {
+    let mut use_count = vec![0u32; function.num_insns()];
+    for &block_id in reverse_post_order {
+        for &insn_id in function.block(block_id).insns() {
+            function.find(insn_id).for_each_operand(|operand| {
+                use_count[operand.to_usize()] += 1;
+            });
+        }
+    }
+
+    let mut fusion = BranchFusion { elided: vec![false; function.num_insns()], fused: HashMap::new() };
+    for &block_id in reverse_post_order {
+        let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
+        let Some(&branch_id) = insns.last() else { continue };
+        let branch_id = function.find_id(branch_id);
+        let Insn::CondBranch { val, .. } = function.find(branch_id) else { continue };
+        // The Test must be exclusively consumed by this CondBranch, and must live in the
+        // same block so that its operands are still in scope at the branch. (The compare
+        // may be separated from the branch by flag-clobbering code like CheckInterrupts,
+        // which is why the flags test is re-emitted at the branch instead of reused.)
+        let Insn::Test { val: cond } = function.find(val) else { continue };
+        if use_count[val.to_usize()] != 1 { continue; }
+        let in_this_block = |insn_id: InsnId| insns.iter().any(|&id| function.find_id(id) == insn_id);
+        if !in_this_block(val) { continue; }
+        fusion.elided[val.to_usize()] = true;
+
+        let fused_cmp = match function.find(cond) {
+            Insn::FixnumLt  { left, right } => Some((FusedCmpKind::Lt, left, right)),
+            Insn::FixnumLe  { left, right } => Some((FusedCmpKind::Le, left, right)),
+            Insn::FixnumGt  { left, right } => Some((FusedCmpKind::Gt, left, right)),
+            Insn::FixnumGe  { left, right } => Some((FusedCmpKind::Ge, left, right)),
+            Insn::FixnumEq  { left, right } => Some((FusedCmpKind::Eq, left, right)),
+            Insn::FixnumNeq { left, right } => Some((FusedCmpKind::Ne, left, right)),
+            _ => None,
+        };
+        match fused_cmp {
+            Some((kind, left, right)) if use_count[cond.to_usize()] == 1 && in_this_block(cond) => {
+                fusion.elided[cond.to_usize()] = true;
+                fusion.fused.insert(branch_id, FusedCond::Cmp(kind, left, right));
+            }
+            _ => {
+                fusion.fused.insert(branch_id, FusedCond::Truthy(cond));
+            }
+        }
+    }
+    fusion
+}
+
 /// Compile a function
 fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     let (mut jit, asm) = trace_compile_phase("codegen", || {
@@ -432,6 +519,9 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         let mut hir_to_lir: Vec<Option<lir::BlockId>> = vec![None; function.num_blocks()];
 
         let reverse_post_order = function.reverse_post_order();
+
+        // Fold single-use Test/compare instructions into the CondBranch that consumes them.
+        let fusion = plan_branch_fusion(function, &reverse_post_order);
 
         // Create all LIR basic blocks corresponding to HIR basic blocks
         for (rpo_idx, &block_id) in reverse_post_order.iter().enumerate() {
@@ -487,12 +577,15 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
             // Compile all instructions
             for (insn_idx, &insn_id) in block.insns().enumerate() {
+                // Skip instructions that a fused CondBranch emits as part of its branch.
+                if fusion.elided[function.find_id(insn_id).to_usize()] {
+                    continue;
+                }
                 let insn = function.find(insn_id);
                 let perf_symbol = hir_perf_symbol_range_start(&mut asm, &insn);
 
                 let result = match &insn {
                     Insn::CondBranch { val, if_true, if_false } => {
-                        let val_opnd = jit.get_opnd(*val);
                         let true_target = hir_to_lir[if_true.target.to_usize()].unwrap();
                         let false_target = hir_to_lir[if_false.target.to_usize()].unwrap();
 
@@ -506,8 +599,32 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                             args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
                         };
 
-                        asm.test(val_opnd, val_opnd);
-                        asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(true_branch))));
+                        let true_target = Target::Block(Box::new(true_branch));
+                        match fusion.fused.get(&function.find_id(insn_id)) {
+                            Some(&FusedCond::Truthy(cond)) => {
+                                // Branch on truthiness like gen_test, without materializing 0/1.
+                                asm.test(jit.get_opnd(cond), Opnd::Imm(!Qnil.as_i64()));
+                                asm.push_insn(lir::Insn::Jnz(true_target));
+                            }
+                            Some(&FusedCond::Cmp(kind, left, right)) => {
+                                // Branch on the comparison directly, without materializing
+                                // Qtrue/Qfalse and then 0/1.
+                                asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
+                                asm.push_insn(match kind {
+                                    FusedCmpKind::Lt => lir::Insn::Jl(true_target),
+                                    FusedCmpKind::Le => lir::Insn::Jle(true_target),
+                                    FusedCmpKind::Gt => lir::Insn::Jg(true_target),
+                                    FusedCmpKind::Ge => lir::Insn::Jge(true_target),
+                                    FusedCmpKind::Eq => lir::Insn::Je(true_target),
+                                    FusedCmpKind::Ne => lir::Insn::Jne(true_target),
+                                });
+                            }
+                            None => {
+                                let val_opnd = jit.get_opnd(*val);
+                                asm.test(val_opnd, val_opnd);
+                                asm.push_insn(lir::Insn::Jnz(true_target));
+                            }
+                        }
                         asm.jmp(Target::Block(Box::new(false_branch)));
 
                         assert!(asm.current_block().insns.last().unwrap().is_terminator());

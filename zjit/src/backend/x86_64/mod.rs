@@ -1077,6 +1077,15 @@ impl Assembler {
                     }
                 },
 
+                Insn::Jle(target) => {
+                    match *target {
+                        Target::CodePtr(code_ptr) => jle_ptr(cb, code_ptr),
+                        Target::Label(label) => jle_label(cb, label),
+                        Target::Block(ref edge) => jle_label(cb, self.block_label(edge.target)),
+                        Target::SideExit(..) => unreachable!("Target::SideExit should have been compiled by compile_exits"),
+                    }
+                },
+
                 Insn::Jg(target) => {
                     match *target {
                         Target::CodePtr(code_ptr) => jg_ptr(cb, code_ptr),
