@@ -181,6 +181,11 @@ pub const ALLOC_REGS: &[Reg] = &[
     X12_REG,
 ];
 
+/// Callee-saved registers that the allocator may additionally assign to VRegs that live
+/// across a CCall. Empty on arm64 for now: enabling it only requires listing free
+/// callee-saved registers here, the shared allocator handles the rest.
+pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[];
+
 /// Special scratch registers for intermediate processing. They should be used only by
 /// [`Assembler::arm64_scratch_split`] or [`Assembler::new_with_scratch_reg`].
 const SCRATCH0_OPND: Opnd = Opnd::Reg(X15_REG);
@@ -1632,7 +1637,10 @@ impl Assembler {
             }
 
             let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
-            let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
+            let num_callee_regs = if asm.allow_callee_saved { CALLEE_SAVED_ALLOC_REGS.len() } else { 0 };
+            let call_positions = asm.ccall_positions();
+            let (assignments, mut num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), num_callee_regs, &call_positions, &preferred_registers));
+            asm.preserve_callee_saved_regs(&assignments, &mut num_stack_slots);
 
             asm.stack_state.num_spill_slots = num_stack_slots;
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&assignments);
@@ -1648,7 +1656,7 @@ impl Assembler {
                         if let Some(alloc) = alloc {
                             let range = &intervals[i].range;
                             let alloc_str = match alloc {
-                                Allocation::Reg(n) => format!("{}", regs[*n]),
+                                Allocation::Reg(n) => format!("{}", crate::backend::lir::alloc_pool_reg(*n)),
                                 Allocation::Fixed(reg) => format!("{}", reg),
                                 Allocation::Stack(n) => format!("Stack[{}]", n),
                             };

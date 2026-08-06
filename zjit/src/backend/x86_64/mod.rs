@@ -102,6 +102,16 @@ pub const ALLOC_REGS: &[Reg] = &[
     RAX_REG,
 ];
 
+/// Callee-saved registers that the allocator may additionally assign to VRegs that live
+/// across a CCall, so they don't have to be pushed and popped around every call. Functions
+/// that use them save them to stack slots after FrameSetup and restore them on every exit
+/// path (FrameTeardown and side exits). RBX/R12/R13 hold SP/EC/CFP and RBP is the frame
+/// pointer, so R14 and R15 are the only free callee-saved registers.
+pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[
+    R14_REG,
+    R15_REG,
+];
+
 /// Special scratch register for intermediate processing. It should be used only by
 /// [`Assembler::x86_scratch_split`] or [`Assembler::new_with_scratch_reg`].
 const SCRATCH0_OPND: Opnd = Opnd::Reg(R11_REG);
@@ -1163,7 +1173,10 @@ impl Assembler {
             }
 
             let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
-            let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
+            let num_callee_regs = if asm.allow_callee_saved { CALLEE_SAVED_ALLOC_REGS.len() } else { 0 };
+            let call_positions = asm.ccall_positions();
+            let (assignments, mut num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), num_callee_regs, &call_positions, &preferred_registers));
+            asm.preserve_callee_saved_regs(&assignments, &mut num_stack_slots);
 
             asm.stack_state.num_spill_slots = num_stack_slots;
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&assignments);
@@ -1182,7 +1195,7 @@ impl Assembler {
                         if let Some(alloc) = alloc {
                             let range = &intervals[i].range;
                             let alloc_str = match alloc {
-                                Allocation::Reg(n) => format!("{}", regs[*n]),
+                                Allocation::Reg(n) => format!("{}", crate::backend::lir::alloc_pool_reg(*n)),
                                 Allocation::Fixed(reg) => format!("{}", reg),
                                 Allocation::Stack(n) => format!("Stack[{}]", n),
                             };
