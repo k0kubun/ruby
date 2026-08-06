@@ -6855,6 +6855,54 @@ fn test_if_else() {
 }
 
 #[test]
+fn test_if_fixnum_compare_kinds() {
+    // Each fixnum compare fused into its CondBranch must still branch correctly
+    // in both directions.
+    assert_snapshot!(inspect("
+        def lt(a, b)  = a <  b ? 1 : 0
+        def le(a, b)  = a <= b ? 1 : 0
+        def gt(a, b)  = a >  b ? 1 : 0
+        def ge(a, b)  = a >= b ? 1 : 0
+        def eq(a, b)  = a == b ? 1 : 0
+        def neq(a, b) = a != b ? 1 : 0
+        r = []
+        2.times do
+          r = [lt(1, 2), lt(2, 1), le(1, 1), le(2, 1), gt(2, 1), gt(1, 2),
+               ge(1, 1), ge(1, 2), eq(1, 1), eq(1, 2), neq(1, 2), neq(1, 1)]
+        end
+        r
+    "), @"[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]");
+}
+
+#[test]
+fn test_if_compare_result_also_used() {
+    // The comparison result is both branched on and returned, so it cannot be
+    // folded away into the branch and must still be materialized.
+    assert_snapshot!(inspect("
+        def test(a, b)
+          x = a < b
+          if x
+            x
+          else
+            :nope
+          end
+        end
+        test(1, 2)
+        [test(1, 2), test(2, 1)]
+    "), @"[true, :nope]");
+}
+
+#[test]
+fn test_if_truthiness_of_non_boolean() {
+    // Branching on an arbitrary VALUE: nil and false are falsy, everything else truthy.
+    assert_snapshot!(inspect("
+        def test(x) = x ? 1 : 0
+        test(1)
+        [test(1), test(true), test(:sym), test(nil), test(false), test(0)]
+    "), @"[1, 1, 1, 0, 0, 1]");
+}
+
+#[test]
 fn test_if_else_params() {
     assert_snapshot!(inspect("
         def test(n, a, b)
