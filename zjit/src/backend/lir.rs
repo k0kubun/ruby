@@ -857,6 +857,9 @@ pub enum Insn {
     /// Jump if lower
     Jl(Target),
 
+    /// Jump if lower or equal
+    Jle(Target),
+
     /// Jump if greater
     Jg(Target),
 
@@ -1011,6 +1014,7 @@ macro_rules! for_each_operand_impl {
             Insn::Jb(target) |
             Insn::Je(target) |
             Insn::Jl(target) |
+            Insn::Jle(target) |
             Insn::Jg(target) |
             Insn::Jge(target) |
             Insn::Jmp(target) |
@@ -1153,6 +1157,7 @@ impl Insn {
             Insn::Jb(target) |
             Insn::Je(target) |
             Insn::Jl(target) |
+            Insn::Jle(target) |
             Insn::Jg(target) |
             Insn::Jge(target) |
             Insn::Jmp(target) |
@@ -1206,6 +1211,7 @@ impl Insn {
             Insn::Jb(_) => "Jb",
             Insn::Je(_) => "Je",
             Insn::Jl(_) => "Jl",
+            Insn::Jle(_) => "Jle",
             Insn::Jg(_) => "Jg",
             Insn::Jge(_) => "Jge",
             Insn::Jmp(_) => "Jmp",
@@ -1312,6 +1318,7 @@ impl Insn {
             Insn::Jb(target) |
             Insn::Je(target) |
             Insn::Jl(target) |
+            Insn::Jle(target) |
             Insn::Jg(target) |
             Insn::Jge(target) |
             Insn::Jmp(target) |
@@ -1354,6 +1361,7 @@ impl Insn {
             Insn::Jb(_) |
             Insn::Je(_) |
             Insn::Jl(_) |
+            Insn::Jle(_) |
             Insn::Jg(_) |
             Insn::Jge(_) |
             Insn::Jmp(_) |
@@ -2125,6 +2133,7 @@ impl Assembler
             Insn::Je(Target::Block(edge)) => Insn::Je(Target::Label(process_edge(edge))),
             Insn::Jne(Target::Block(edge)) => Insn::Jne(Target::Label(process_edge(edge))),
             Insn::Jl(Target::Block(edge)) => Insn::Jl(Target::Label(process_edge(edge))),
+            Insn::Jle(Target::Block(edge)) => Insn::Jle(Target::Label(process_edge(edge))),
             Insn::Jg(Target::Block(edge)) => Insn::Jg(Target::Label(process_edge(edge))),
             Insn::Jge(Target::Block(edge)) => Insn::Jge(Target::Label(process_edge(edge))),
             Insn::Jbe(Target::Block(edge)) => Insn::Jbe(Target::Label(process_edge(edge))),
