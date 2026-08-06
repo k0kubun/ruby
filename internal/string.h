@@ -23,6 +23,12 @@
 
 enum ruby_rstring_private_flags {
     RSTRING_CHILLED = STR_CHILLED,
+    /* Flags that prevent JITs from writing bytes into the string buffer in
+     * place: the string is either unmodifiable (frozen, tmp-locked, or
+     * chilled) or does not own its buffer (shared, nofree). Kept in sync
+     * with STR_DEPENDANT_MASK by a static assertion in string.c. */
+    RSTRING_DEPENDANT_MASK = RUBY_FL_FREEZE | FL_USER7 /* STR_TMPLOCK */ |
+                             STR_CHILLED | STR_SHARED | FL_USER18 /* STR_NOFREE */,
 };
 
 #ifdef rb_fstring_cstr

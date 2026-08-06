@@ -508,8 +508,10 @@ fn inline_string_setbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir
         use crate::hir::SideExitReason;
         let _ = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: unboxed_index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
         // We know that all String are HeapObject, so no need to insert a GuardType(HeapObject).
-        fun.guard_not_frozen(block, recv, state);
-        let _ = fun.push_insn(block, hir::Insn::StringSetbyteFixnum { string: recv, index, value });
+        // Guard that we can write to the string buffer in place, which lets StringSetbyteFixnum
+        // write the byte without calling rb_str_setbyte.
+        fun.guard_string_not_dependant(block, recv, state);
+        let _ = fun.push_insn(block, hir::Insn::StringSetbyteFixnum { string: recv, index: unboxed_index, value });
         // String#setbyte returns the fixnum provided as its `value` argument back to the caller.
         Some(value)
     } else {
