@@ -124,7 +124,7 @@ impl Assembler {
         emit(self, target);
         self.jmp(Target::Block(Box::new(fall_through_edge)));
 
-        self.set_current_block(fall_through_target);
+        self.set_current_block_fall_through(fall_through_target);
 
         let label = jit.get_label(self, fall_through_target, hir_block_id);
         self.write_label(label);
@@ -858,6 +858,9 @@ fn gen_unbox_fixnum(asm: &mut Assembler, val: Opnd) -> Opnd {
 /// We generate this instruction with level=0 only when the local variable is on the heap, so we
 /// can't optimize the level=0 case using the SP register.
 fn gen_setlocal(asm: &mut Assembler, val: Opnd, val_type: Type, local_ep_offset: u32, level: u32) {
+    // This writes a local slot outside gen_spill_locals(), so forget the local
+    // slot values it may have recorded.
+    asm.clear_spilled_locals();
     let local_ep_offset = c_int::try_from(local_ep_offset).unwrap_or_else(|_| panic!("Could not convert local_ep_offset {local_ep_offset} to i32"));
     if level > 0 {
         gen_incr_counter(asm, Counter::vm_write_to_parent_iseq_local_count);
@@ -897,6 +900,9 @@ fn gen_getblockparam(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     let block_handler = asm.load(Opnd::mem(VALUE_BITS, ep, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL));
     let proc = asm_ccall!(asm, rb_vm_bh_to_procval, EC, block_handler);
 
+    // This writes a local slot outside gen_spill_locals(), so forget the local
+    // slot values it may have recorded.
+    asm.clear_spilled_locals();
     let local_ep_offset = c_int::try_from(ep_offset).unwrap_or_else(|_| {
         panic!("Could not convert local_ep_offset {ep_offset} to i32")
     });
@@ -1679,6 +1685,10 @@ fn gen_push_inline_frame(
     let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
     asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
+
+    // The SP/CFP registers now point at the callee frame, so frame writes
+    // recorded for the caller frame no longer describe the same locations.
+    asm.clear_frame_write_cache();
 }
 
 /// Pop the interpreter frame for an inlined callee, restoring the caller's SP and CFP.
@@ -1697,6 +1707,11 @@ fn gen_pop_inline_frame(
     asm_comment!(asm, "restore caller CFP after inline");
     asm.add_into(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
+
+    // The SP/CFP registers now point at the caller frame again, so frame
+    // writes recorded for the callee frame no longer describe the same
+    // locations.
+    asm.clear_frame_write_cache();
 }
 
 /// Compile a direct call to an ISEQ method.
@@ -3323,6 +3338,14 @@ fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
 
 /// Save the current SP on the CFP
 fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
+    // Skip the store if an earlier store in this block already wrote the same
+    // value. Nothing modifies a frame's cfp->sp while it's not the innermost
+    // frame: callees write only their own cfp->sp, side exits and exception
+    // unwinding never return to this code, and rb_zjit_materialize_frames()
+    // only reads cfp->sp.
+    if asm.note_sp_save(stack_size) {
+        return;
+    }
     // Update cfp->sp which will be read by the interpreter. We also have the SP register in JIT
     // code, and ZJIT's codegen currently assumes the SP register doesn't move, e.g. gen_param().
     // So we don't update the SP register here. We could update the SP register to avoid using
@@ -3336,11 +3359,20 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
 
 /// Spill locals onto the stack.
 fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Avoid spilling locals that have been spilled before and not changed.
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
     for (idx, &insn_id) in state.locals().enumerate() {
-        asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
+        let disp = (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32;
+        let opnd = jit.get_opnd(insn_id);
+        // Skip the store if an earlier spill in this block already wrote the
+        // same value. The slot can't have changed in between: the HIR keeps
+        // using the same SSA value for the local only when nothing can write
+        // it (a callee writing caller locals makes the HIR reload the local,
+        // which changes the SSA value and misses this cache).
+        if asm.note_local_spill(disp, opnd) {
+            continue;
+        }
+        asm.mov(Opnd::mem(64, SP, disp), opnd);
     }
 }
 
@@ -3375,6 +3407,12 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
     gen_save_sp(asm, state.stack_size());
     gen_spill_locals(jit, asm, state);
     gen_spill_stack(jit, asm, function, state);
+
+    // VM fallback helpers execute an instruction on the current frame, which
+    // moves cfp->sp (e.g. vm_sendish() pops the receiver and arguments), so
+    // frame writes recorded above no longer describe the frame's memory once
+    // the helper returns. Forget them so that later calls store fresh values.
+    asm.clear_frame_write_cache();
 }
 
 /// Build entries for Ruby stack values that need materialization. The actual

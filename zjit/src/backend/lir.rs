@@ -1702,6 +1702,21 @@ pub struct Assembler {
     /// consumes this through Insn::CCall, after it knows whether each live VReg
     /// is in a saved register or an allocator spill slot.
     stack_map: Option<StackMap>,
+
+    /// The stack size whose corresponding value is known to be already stored
+    /// in the current frame's cfp->sp by an earlier store in the current basic
+    /// block. Used by codegen to skip redundant cfp->sp stores. Cleared at
+    /// block boundaries and whenever codegen changes which frame the SP/CFP
+    /// registers point at.
+    saved_sp_stack_size: Option<usize>,
+
+    /// Local variable slots (keyed by their SP-relative byte displacement)
+    /// known to already hold the given operand's value, written by an earlier
+    /// spill in the current basic block. Used by codegen to skip redundant
+    /// local spills. Operands are SSA at this stage, so an equal operand
+    /// implies an equal value. Cleared alongside `saved_sp_stack_size`, and
+    /// whenever codegen writes a local slot outside gen_spill_locals().
+    spilled_locals: HashMap<i32, Opnd>,
 }
 
 impl Assembler
@@ -1718,6 +1733,8 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
             stack_map: None,
+            saved_sp_stack_size: None,
+            spilled_locals: HashMap::default(),
         }
     }
 
@@ -1794,6 +1811,58 @@ impl Assembler
 
     pub fn set_current_block(&mut self, block_id: BlockId) {
         self.current_block_id = block_id;
+        // Conservatively assume the new block can be entered with a different
+        // frame memory state, e.g. join blocks with multiple predecessors.
+        self.clear_frame_write_cache();
+    }
+
+    /// Like set_current_block(), but preserves the frame write cache. Only
+    /// safe when the new block is a fresh fall-through block whose single
+    /// predecessor is the current block, like the ones split_block_jump()
+    /// creates: control falls through linearly, so frame writes recorded so
+    /// far still describe the memory state.
+    pub fn set_current_block_fall_through(&mut self, block_id: BlockId) {
+        let saved_sp_stack_size = self.saved_sp_stack_size;
+        let spilled_locals = take(&mut self.spilled_locals);
+        self.set_current_block(block_id);
+        self.saved_sp_stack_size = saved_sp_stack_size;
+        self.spilled_locals = spilled_locals;
+    }
+
+    /// Record that the current frame's cfp->sp is being stored for `stack_size`.
+    /// Returns true if an earlier store in the current block already wrote the
+    /// same value, in which case the store can be skipped.
+    pub fn note_sp_save(&mut self, stack_size: usize) -> bool {
+        if self.saved_sp_stack_size == Some(stack_size) {
+            return true;
+        }
+        self.saved_sp_stack_size = Some(stack_size);
+        false
+    }
+
+    /// Record that the local slot at the SP-relative byte displacement `disp`
+    /// is being spilled with `opnd`'s value. Returns true if an earlier spill
+    /// in the current block already wrote the same value, in which case the
+    /// store can be skipped.
+    pub fn note_local_spill(&mut self, disp: i32, opnd: Opnd) -> bool {
+        if self.spilled_locals.get(&disp) == Some(&opnd) {
+            return true;
+        }
+        self.spilled_locals.insert(disp, opnd);
+        false
+    }
+
+    /// Forget local slot values recorded by note_local_spill(). Call this when
+    /// writing a local slot outside gen_spill_locals().
+    pub fn clear_spilled_locals(&mut self) {
+        self.spilled_locals.clear();
+    }
+
+    /// Forget all frame writes recorded by note_sp_save() and note_local_spill().
+    /// Call this when the SP/CFP registers change which frame they point at.
+    pub fn clear_frame_write_cache(&mut self) {
+        self.saved_sp_stack_size = None;
+        self.spilled_locals.clear();
     }
 
     pub fn current_block(&mut self) -> &mut BasicBlock {
