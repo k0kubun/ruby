@@ -6177,28 +6177,47 @@ impl Function {
                     &Insn::FixnumDiv { left, right, .. } => {
                         match (self.type_of(left).fixnum_value(), self.type_of(right).fixnum_value()) {
                             (_, Some(1)) => { self.make_equal_to(insn_id, left); continue; }
-                            _ => {}
+                            // Strength-reduce division by a power of two to an arithmetic right
+                            // shift. Both Ruby's Integer#/ and a sign-extending shift round the
+                            // quotient towards negative infinity, so this holds for all fixnums.
+                            (None, Some(d)) if d > 1 && (d & (d - 1)) == 0 => {
+                                let shift = self.new_insn(Insn::Const { val: Const::Value(VALUE::fixnum_from_isize(d.trailing_zeros() as isize)) });
+                                self.insn_types[shift.0] = self.infer_type(shift);
+                                new_insns.push(shift);
+                                self.new_insn(Insn::FixnumRShift { left, right: shift })
+                            }
+                            _ => self.fold_fixnum_bop(insn_id, left, right, |l, r| match (l, r) {
+                                (Some(l), Some(r)) if l == (RUBY_FIXNUM_MIN as i64) && r == -1 => None, // Avoid Fixnum overflow
+                                (Some(_l), Some(r)) if r == 0 => None, // Avoid Divide by zero.
+                                (Some(l), Some(r)) => {
+                                    let l_obj = VALUE::fixnum_from_isize(l as isize);
+                                    let r_obj = VALUE::fixnum_from_isize(r as isize);
+                                    Some(unsafe { rb_jit_fix_div_fix(l_obj, r_obj) }.as_fixnum())
+                                },
+                                _ => None,
+                            }),
                         }
-                        self.fold_fixnum_bop(insn_id, left, right, |l, r| match (l, r) {
-                            (Some(l), Some(r)) if l == (RUBY_FIXNUM_MIN as i64) && r == -1 => None, // Avoid Fixnum overflow
-                            (Some(_l), Some(r)) if r == 0 => None, // Avoid Divide by zero.
-                            (Some(l), Some(r)) => {
-                                let l_obj = VALUE::fixnum_from_isize(l as isize);
-                                let r_obj = VALUE::fixnum_from_isize(r as isize);
-                                Some(unsafe { rb_jit_fix_div_fix(l_obj, r_obj) }.as_fixnum())
-                            },
-                            _ => None,
-                        })
                     }
                     &Insn::FixnumMod { left, right, .. } => {
-                        self.fold_fixnum_bop(insn_id, left, right, |l, r| match (l, r) {
-                            (Some(l), Some(r)) if r != 0 => {
-                                let l_obj = VALUE::fixnum_from_isize(l as isize);
-                                let r_obj = VALUE::fixnum_from_isize(r as isize);
-                                Some(unsafe { rb_jit_fix_mod_fix(l_obj, r_obj) }.as_fixnum())
-                            },
-                            _ => None,
-                        })
+                        match (self.type_of(left).fixnum_value(), self.type_of(right).fixnum_value()) {
+                            // Strength-reduce modulo by a power of two to a bitwise AND. The sign
+                            // of Ruby's Integer#% follows the (positive) divisor, so the result is
+                            // in [0, d), which matches two's complement AND for all fixnums.
+                            (None, Some(d)) if d > 0 && (d & (d - 1)) == 0 => {
+                                let mask = self.new_insn(Insn::Const { val: Const::Value(VALUE::fixnum_from_isize((d - 1) as isize)) });
+                                self.insn_types[mask.0] = self.infer_type(mask);
+                                new_insns.push(mask);
+                                self.new_insn(Insn::FixnumAnd { left, right: mask })
+                            }
+                            _ => self.fold_fixnum_bop(insn_id, left, right, |l, r| match (l, r) {
+                                (Some(l), Some(r)) if r != 0 => {
+                                    let l_obj = VALUE::fixnum_from_isize(l as isize);
+                                    let r_obj = VALUE::fixnum_from_isize(r as isize);
+                                    Some(unsafe { rb_jit_fix_mod_fix(l_obj, r_obj) }.as_fixnum())
+                                },
+                                _ => None,
+                            }),
+                        }
                     }
                     &Insn::FixnumXor { left, right, .. } => {
                         self.fold_fixnum_bop(insn_id, left, right, |l, r| match (l, r) {
