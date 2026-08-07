@@ -1091,6 +1091,9 @@ fn gen_unbox_fixnum(asm: &mut Assembler, val: Opnd) -> Opnd {
 /// We generate this instruction with level=0 only when the local variable is on the heap, so we
 /// can't optimize the level=0 case using the SP register.
 fn gen_setlocal(asm: &mut Assembler, val: Opnd, val_type: Type, local_ep_offset: u32, level: u32) {
+    // This writes a local slot outside gen_spill_locals(), so forget the local
+    // slot values it may have recorded.
+    asm.clear_spilled_locals();
     let local_ep_offset = c_int::try_from(local_ep_offset).unwrap_or_else(|_| panic!("Could not convert local_ep_offset {local_ep_offset} to i32"));
     if level > 0 {
         gen_incr_counter(asm, Counter::vm_write_to_parent_iseq_local_count);
@@ -1130,6 +1133,9 @@ fn gen_getblockparam(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     let block_handler = asm.load(Opnd::mem(VALUE_BITS, ep, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL));
     let proc = asm_ccall!(asm, rb_vm_bh_to_procval, EC, block_handler);
 
+    // This writes a local slot outside gen_spill_locals(), so forget the local
+    // slot values it may have recorded.
+    asm.clear_spilled_locals();
     let local_ep_offset = c_int::try_from(ep_offset).unwrap_or_else(|_| {
         panic!("Could not convert local_ep_offset {ep_offset} to i32")
     });
@@ -5130,11 +5136,20 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
 
 /// Spill locals onto the stack.
 fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Avoid spilling locals that have been spilled before and not changed.
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
     for (idx, &insn_id) in state.locals().enumerate() {
-        asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
+        let disp = (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32;
+        let opnd = jit.get_opnd(insn_id);
+        // Skip the store if an earlier spill in this block already wrote the
+        // same value. The slot can't have changed in between: the HIR keeps
+        // using the same SSA value for the local only when nothing can write
+        // it (a callee writing caller locals makes the HIR reload the local,
+        // which changes the SSA value and misses this cache).
+        if asm.note_local_spill(disp, opnd) {
+            continue;
+        }
+        asm.mov(Opnd::mem(64, SP, disp), opnd);
     }
 }
 
