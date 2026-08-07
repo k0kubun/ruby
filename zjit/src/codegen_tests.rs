@@ -657,12 +657,13 @@ fn test_yield_polymorphic_symbol_handler_falls_back() {
 }
 
 #[test]
-fn test_yield_polymorphic_ifunc_handler_falls_back() {
-    // An ifunc handler (Enumerator#each yields to the enumerator's C block) at a polymorphic
-    // yield site fails the ISEQ tag check and takes the generic InvokeBlock fallback in-line.
-    // Threshold 4 keeps calls 1-3 in the profile window (num_profiles defaults to 5), so
-    // invoke's first compile already sees both blocks and installs the polymorphic dispatch;
-    // the standalone version matters here because the Enumerator calls invoke from C.
+fn test_yield_unprofiled_ifunc_handler_falls_back() {
+    // An ifunc handler (Enumerator#each yields to the enumerator's C block) that never
+    // showed up in the profile gets no InvokeBlockIfunc arm: it fails the ISEQ tag check
+    // and takes the generic InvokeBlock fallback in-line. Threshold 4 keeps calls 1-3 in
+    // the profile window (num_profiles defaults to 5), so invoke's first compile already
+    // sees both blocks and installs the polymorphic dispatch; the standalone version
+    // matters here because the Enumerator calls invoke from C.
     set_call_threshold(4);
     eval("
         def invoke = yield(10)
@@ -671,6 +672,23 @@ fn test_yield_polymorphic_ifunc_handler_falls_back() {
         def via_enum = to_enum(:invoke).to_a
         add_one; double
         add_one; double
+    ");
+    assert_snapshot!(assert_compiles("[add_one, double, via_enum]"), @"[11, 20, [10]]");
+}
+
+#[test]
+fn test_yield_profiled_ifunc_handler_dispatches_directly() {
+    // When the profile mixes ISEQ blocks with an ifunc handler, the polymorphic dispatch
+    // gets a direct arm per ISEQ plus a tag-checked InvokeBlockIfunc arm, so all three
+    // handler kinds dispatch without the generic fallback or side exits. Threshold 4
+    // keeps calls 1-3 in the profile window (num_profiles defaults to 5).
+    set_call_threshold(4);
+    eval("
+        def invoke = yield(10)
+        def add_one = invoke { |x| x + 1 }
+        def double = invoke { |x| x * 2 }
+        def via_enum = to_enum(:invoke).to_a
+        add_one; double; via_enum
     ");
     assert_snapshot!(assert_compiles("[add_one, double, via_enum]"), @"[11, 20, [10]]");
 }
