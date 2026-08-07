@@ -138,7 +138,7 @@ impl Assembler {
         emit(self, target);
         self.jmp(Target::Block(Box::new(fall_through_edge)));
 
-        self.set_current_block(fall_through_target);
+        self.set_current_block_fall_through(fall_through_target);
 
         let label = jit.get_label(self, fall_through_target, hir_block_id);
         self.write_label(label);
@@ -2758,6 +2758,10 @@ fn gen_push_inline_frame(
     let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
     asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
+
+    // The SP/CFP registers now point at the callee frame, so frame writes
+    // recorded for the caller frame no longer describe the same locations.
+    asm.clear_frame_write_cache();
 }
 
 /// Pop the interpreter frame for an inlined callee, restoring the caller's SP and CFP.
@@ -2779,6 +2783,11 @@ fn gen_pop_inline_frame(
     asm_comment!(asm, "restore caller CFP after inline");
     asm.add_into(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
+
+    // The SP/CFP registers now point at the caller frame again, so frame
+    // writes recorded for the callee frame no longer describe the same
+    // locations.
+    asm.clear_frame_write_cache();
 }
 
 /// Compile a direct call to an ISEQ method.
@@ -5084,6 +5093,14 @@ fn gen_prepare_leaf_call_with_gc(asm: &mut Assembler, state: &FrameState) {
 
 /// Save the current SP on the CFP
 fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
+    // Skip the store if an earlier store in this block already wrote the same
+    // value. Nothing modifies a frame's cfp->sp while it's not the innermost
+    // frame: callees write only their own cfp->sp, side exits and exception
+    // unwinding never return to this code, and rb_zjit_materialize_frames()
+    // only reads cfp->sp.
+    if asm.note_sp_save(stack_size) {
+        return;
+    }
     // Update cfp->sp which will be read by the interpreter. We also have the SP register in JIT
     // code, and ZJIT's codegen currently assumes the SP register doesn't move, e.g. gen_param().
     // So we don't update the SP register here. We could update the SP register to avoid using
@@ -5138,6 +5155,12 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
     gen_save_sp(asm, state.stack_size());
     gen_spill_locals(jit, asm, state);
     gen_spill_stack(jit, asm, function, state);
+
+    // VM fallback helpers execute an instruction on the current frame, which
+    // moves cfp->sp (e.g. vm_sendish() pops the receiver and arguments), so
+    // frame writes recorded above no longer describe the frame's memory once
+    // the helper returns. Forget them so that later calls store fresh values.
+    asm.clear_frame_write_cache();
 }
 
 /// Build entries for Ruby stack values that need materialization. The actual
