@@ -2250,6 +2250,136 @@ impl Assembler
         (assignment, num_stack_slots)
     }
 
+    /// Coalesce webs of block parameters and the branch arguments that flow into them so
+    /// that every VReg in a web shares one allocation. resolve_ssa's copies for edges
+    /// within a web then become no-ops, which removes the per-iteration location
+    /// shuffling of loop-carried values at loop backedges.
+    ///
+    /// Two VRegs are joined when one is passed as a branch argument to the other's block
+    /// parameter. A web is only kept when sharing one location cannot clobber a live
+    /// value: members hold the same value by construction (they are copies of each
+    /// other), except where a value from *outside* the web enters it. For each such
+    /// entry point, no other member may be live: an external value entering a block
+    /// parameter is rejected if another member is live into that block, and an external
+    /// definition of a non-parameter member is rejected if another member's live range
+    /// spans it. Rejected webs are dissolved entirely, falling back to per-VReg
+    /// allocation and explicit edge copies.
+    ///
+    /// Merges the intervals and preferred registers of each kept web into its root and
+    /// clears the members' so that linear_scan allocates the web as a whole. Returns a
+    /// map from each VReg index to its root (identity for uncoalesced VRegs), which the
+    /// caller uses to copy the root's allocation to the members.
+    pub fn coalesce_block_params(
+        &self,
+        intervals: &mut [Interval],
+        preferred_registers: &mut [Option<Reg>],
+        live_in: &[BitSet<usize>],
+    ) -> Vec<usize> {
+        // Union-find with path compression
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            let mut root = x;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut cur = x;
+            while parent[cur] != root {
+                let next = parent[cur];
+                parent[cur] = root;
+                cur = next;
+            }
+            root
+        }
+        let mut parent: Vec<usize> = (0..self.num_vregs).collect();
+
+        // Which (block, position) each parameter VReg belongs to, and each block's
+        // incoming edges, for the external-entry verification below.
+        let block_order = self.block_order();
+        let mut param_block: HashMap<usize, BlockId> = HashMap::default();
+        let mut incoming: HashMap<BlockId, Vec<BranchEdge>> = HashMap::default();
+        for &block_id in &block_order {
+            for param in &self.basic_blocks[block_id.0].parameters {
+                if let Opnd::VReg { idx, .. } = param {
+                    param_block.insert(idx.0 as usize, block_id);
+                }
+            }
+            let EdgePair(edge1, edge2) = self.basic_blocks[block_id.0].edges();
+            for edge in [edge1, edge2].into_iter().flatten() {
+                incoming.entry(edge.target).or_default().push(edge);
+            }
+        }
+
+        // Union every (branch argument, block parameter) pair
+        for edges in incoming.values() {
+            for edge in edges {
+                let params = &self.basic_blocks[edge.target.0].parameters;
+                for (arg, param) in edge.args.iter().zip(params.iter()) {
+                    if let (Opnd::VReg { idx: arg_idx, .. }, Opnd::VReg { idx: param_idx, .. }) = (arg, param) {
+                        let arg_root = find(&mut parent, arg_idx.0 as usize);
+                        let param_root = find(&mut parent, param_idx.0 as usize);
+                        parent[arg_root] = param_root;
+                    }
+                }
+            }
+        }
+
+        // Group webs with more than one member
+        let mut webs: HashMap<usize, Vec<usize>> = HashMap::default();
+        for vreg in 0..self.num_vregs {
+            let root = find(&mut parent, vreg);
+            webs.entry(root).or_default().push(vreg);
+        }
+        webs.retain(|_, members| members.len() > 1);
+
+        // Verify that no external value entering the web can clobber a live member
+        let mut roots: Vec<usize> = (0..self.num_vregs).collect();
+        'web: for (&root, members) in &webs {
+            let member_set: HashSet<usize> = members.iter().copied().collect();
+            let in_web = |opnd: &Opnd| matches!(opnd, Opnd::VReg { idx, .. } if member_set.contains(&(idx.0 as usize)));
+            for &member in members {
+                if let Some(&block_id) = param_block.get(&member) {
+                    // A block parameter is redefined at every entry to its block. Entries
+                    // whose argument is in the web don't change the shared value; entries
+                    // from outside must not have any other member live into the block.
+                    let position = self.basic_blocks[block_id.0].parameters.iter()
+                        .position(|param| matches!(param, Opnd::VReg { idx, .. } if idx.0 as usize == member));
+                    let Some(position) = position else { continue 'web; };
+                    let external_entry = incoming.get(&block_id).is_none_or(|edges| edges.iter().any(|edge| {
+                        edge.args.get(position).is_none_or(|arg| !in_web(arg))
+                    }));
+                    if external_entry && members.iter().any(|&other| other != member && live_in[block_id.0].get(other)) {
+                        continue 'web;
+                    }
+                } else {
+                    // A non-parameter member is defined by a regular instruction, which
+                    // writes an external value into the shared location. No other
+                    // member's live range may span that definition.
+                    let Some(def) = intervals[member].range.start else { continue };
+                    let clobbers_live_member = members.iter().any(|&other| {
+                        other != member && intervals[other].has_bounds() && intervals[other].survives(def)
+                    });
+                    if clobbers_live_member {
+                        continue 'web;
+                    }
+                }
+            }
+            // The web is safe: allocate it as one unit under `root`.
+            for &member in members {
+                roots[member] = root;
+                if member != root {
+                    if let (Some(start), Some(end)) = (intervals[member].range.start, intervals[member].range.end) {
+                        let root_range = &mut intervals[root].range;
+                        root_range.start = Some(root_range.start.map_or(start, |s| s.min(start)));
+                        root_range.end = Some(root_range.end.map_or(end, |e| e.max(end)));
+                    }
+                    intervals[member].range = LiveRange { start: None, end: None };
+                    preferred_registers[root] = preferred_registers[root].or(preferred_registers[member]);
+                }
+            }
+        }
+
+        roots
+    }
+
     /// Resolve SSA block parameters by inserting sequentialized move instructions
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
