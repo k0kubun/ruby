@@ -808,7 +808,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::HashDup { val, state } => { gen_hash_dup(jit, asm, function, val, opnd!(val), &function.frame_state(state)) },
         &Insn::HashAref { hash, key, state } => { gen_hash_aref(jit, asm, function, opnd!(hash), opnd!(key), &function.frame_state(state)) },
         &Insn::HashAset { hash, key, val, state } => { no_output!(gen_hash_aset(jit, asm, function, opnd!(hash), opnd!(key), opnd!(val), &function.frame_state(state))) },
-        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
+        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(jit, asm, opnd!(array), opnd!(val), function.type_of(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
@@ -1402,9 +1402,55 @@ fn gen_hash_aset(jit: &mut JITState, asm: &mut Assembler, function: &Function, h
     asm_ccall!(asm, rb_hash_aset, hash, key, val);
 }
 
-fn gen_array_push(asm: &mut Assembler, array: Opnd, val: Opnd, state: &FrameState) {
+fn gen_array_push(jit: &mut JITState, asm: &mut Assembler, array: Opnd, val: Opnd, val_type: Type, state: &FrameState) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_edge = Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let join_edge = || Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+
+    let array = asm.load_mem(array);
+
+    // A mutable heap array that doesn't share its buffer and has spare capacity can
+    // append with a store and a length update, like rb_ary_push() does. A shared root
+    // keeps a refcount where the capacity normally lives, so it must go slow too.
+    asm_comment!(asm, "Array#push fast path");
+    let flags = asm.load(Opnd::mem(VALUE_BITS, array, RUBY_OFFSET_RBASIC_FLAGS));
+    let slow_flags = RARRAY_EMBED_FLAG as u64
+        | RUBY_ELTS_SHARED as u32 as u64
+        | RUBY_FL_USER12 as u32 as u64 // RARRAY_SHARED_ROOT_FLAG
+        | RUBY_FL_FREEZE as u32 as u64;
+    asm.test(flags, Opnd::UImm(slow_flags));
+    asm.jnz(jit, slow_edge.clone());
+    let len = asm.load(Opnd::mem(c_long::BITS as u8, array, RUBY_OFFSET_RARRAY_AS_HEAP_LEN));
+    let capa = asm.load(Opnd::mem(c_long::BITS as u8, array, RUBY_OFFSET_RARRAY_AS_HEAP_CAPA));
+    asm.cmp(len, capa);
+    asm.jge(jit, slow_edge);
+
+    // RB_OBJ_WRITE(ary, &ptr[len], item)
+    let ptr = asm.load(Opnd::mem(64, array, RUBY_OFFSET_RARRAY_AS_HEAP_PTR));
+    let elem_offset = asm.lshift(len, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let elem_ptr = asm.add(ptr, elem_offset);
+    asm.store(Opnd::mem(VALUE_BITS, elem_ptr, 0), val);
+    gen_write_barrier(jit, asm, array, val, val_type);
+
+    // ARY_SET_LEN(ary, len + 1)
+    let new_len = asm.add(len, Opnd::UImm(1));
+    asm.store(Opnd::mem(c_long::BITS as u8, array, RUBY_OFFSET_RARRAY_AS_HEAP_LEN), new_len);
+    asm.jmp(join_edge());
+
+    // Slow path: embedded, shared, frozen, or full arrays
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
     gen_prepare_leaf_call_with_gc(asm, state);
     asm_ccall!(asm, rb_ary_push, array, val);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(join_block);
+    let label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(label);
 }
 
 fn gen_to_new_array(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
