@@ -2024,6 +2024,13 @@ pub struct Assembler {
     /// allocator spill slot each one is saved to right after FrameSetup. Every exit path
     /// restores them from these slots. Filled in by [`Self::plan_callee_saved_saves`].
     callee_saved_saves: Vec<(Reg, usize)>,
+
+    /// The stack size whose corresponding value is known to be already stored
+    /// in the current frame's cfp->sp by an earlier store in the current basic
+    /// block. Used by codegen to skip redundant cfp->sp stores. Cleared at
+    /// block boundaries and whenever codegen changes which frame the SP/CFP
+    /// registers point at.
+    saved_sp_stack_size: Option<usize>,
 }
 
 impl Assembler
@@ -2042,6 +2049,7 @@ impl Assembler
             stack_map: None,
             allow_callee_saved: false,
             callee_saved_saves: Vec::default(),
+            saved_sp_stack_size: None,
         }
     }
 
@@ -2124,6 +2132,37 @@ impl Assembler
 
     pub fn set_current_block(&mut self, block_id: BlockId) {
         self.current_block_id = block_id;
+        // Conservatively assume the new block can be entered with a different
+        // frame memory state, e.g. join blocks with multiple predecessors.
+        self.clear_frame_write_cache();
+    }
+
+    /// Like set_current_block(), but preserves the frame write cache. Only
+    /// safe when the new block is a fresh fall-through block whose single
+    /// predecessor is the current block, like the ones split_block_jump()
+    /// creates: control falls through linearly, so frame writes recorded so
+    /// far still describe the memory state.
+    pub fn set_current_block_fall_through(&mut self, block_id: BlockId) {
+        let saved_sp_stack_size = self.saved_sp_stack_size;
+        self.set_current_block(block_id);
+        self.saved_sp_stack_size = saved_sp_stack_size;
+    }
+
+    /// Record that the current frame's cfp->sp is being stored for `stack_size`.
+    /// Returns true if an earlier store in the current block already wrote the
+    /// same value, in which case the store can be skipped.
+    pub fn note_sp_save(&mut self, stack_size: usize) -> bool {
+        if self.saved_sp_stack_size == Some(stack_size) {
+            return true;
+        }
+        self.saved_sp_stack_size = Some(stack_size);
+        false
+    }
+
+    /// Forget all frame writes recorded by note_sp_save().
+    /// Call this when the SP/CFP registers change which frame they point at.
+    pub fn clear_frame_write_cache(&mut self) {
+        self.saved_sp_stack_size = None;
     }
 
     pub fn current_block(&mut self) -> &mut BasicBlock {
