@@ -6666,6 +6666,72 @@ fn test_array_dup_non_embedded_gc_stress() {
 }
 
 #[test]
+fn test_array_push_embedded_and_heap_growth() {
+    // Pushes cross the embedded->heap boundary and grow the heap buffer,
+    // exercising both the fast path and the rb_ary_push fallback
+    assert_snapshot!(inspect("
+        def test(a, v) = a << v
+        arr = []
+        100.times { |i| test(arr, i) }
+        [arr.size, arr.first, arr.last, arr.sum]
+    "), @"[100, 0, 99, 4950]");
+}
+
+#[test]
+fn test_array_push_returns_array() {
+    assert_snapshot!(inspect("
+        def test(a, v) = a << v
+        arr = [1] * 30
+        test(arr, 2).equal?(arr)
+    "), @"true");
+}
+
+#[test]
+fn test_array_push_shared_array() {
+    // Pushing to an array whose buffer is shared (or shared root) must not
+    // corrupt the other array
+    assert_snapshot!(inspect("
+        def test(a, v) = a << v
+        test([], 0)
+        root = (0..20).to_a
+        child = root[0..-1]
+        test(child, :x)
+        test(root, :y)
+        [child.last, root.last, child.size, root.size]
+    "), @"[:x, :y, 22, 22]");
+}
+
+#[test]
+fn test_array_push_frozen() {
+    assert_snapshot!(inspect("
+        def test(a, v) = a << v
+        test([], 0)
+        arr = ([1] * 30).freeze
+        begin
+          test(arr, 2)
+        rescue FrozenError
+          :frozen
+        end
+    "), @":frozen");
+}
+
+#[test]
+fn test_array_push_write_barrier_gc_stress() {
+    // An old array referencing young pushed objects must survive GC
+    assert_snapshot!(inspect(r#"
+        def test(a, v) = a << v
+        arr = [nil] * 30
+        arr.clear
+        3.times { GC.start } # promote arr to old gen
+        GC.stress = true
+        10.times { |i| test(arr, "str#{i}") }
+        GC.stress = false
+        GC.start
+        [arr.size, arr.first, arr.last]
+    "#), @r#"[10, "str0", "str9"]"#);
+}
+
+#[test]
 fn test_array_fixnum_aref() {
     eval("
         def test(x) = [1,2,3][x]
