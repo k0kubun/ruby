@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
@@ -2147,7 +2148,38 @@ impl Assembler
         let mut free_registers: BTreeSet<usize> = (0..num_registers).collect();
         let mut active: Vec<&Interval> = Vec::new(); // vreg indices sorted by increasing end point
         let mut assignment: Vec<Option<Allocation>> = vec![None; intervals.len()];
+
+        // Spill slot pool. `slot_pool` holds (end, slot) for every slot handed out so far,
+        // ordered by the end point of the interval that occupies it, so the slot that frees
+        // up earliest is the first candidate for reuse.
+        //
+        // A spilled VReg lives in its slot for its whole live range: rewrite_instructions()
+        // rewrites the defining instruction to write straight into the slot. So a slot may be
+        // reused by another interval only once the previous occupant's range has ended, which
+        // is why the pool is keyed on the occupant's end point rather than on the position we
+        // happen to be scanning. Intervals do not arrive in start order here (a spill victim
+        // starts before the interval that evicted it), so we compare against the candidate's
+        // own start rather than the current scan position.
+        let mut slot_pool: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
         let mut num_stack_slots: usize = 0;
+        let mut alloc_stack_slot = |interval: &Interval| -> Allocation {
+            let (start, end) = (interval.range.start(), interval.range.end());
+            // The pool is ordered by end point, so if the earliest-freed slot is still busy at
+            // `start`, every other slot is too and we need a fresh one.
+            match slot_pool.peek() {
+                Some(&Reverse((slot_end, slot))) if slot_end <= start => {
+                    slot_pool.pop();
+                    slot_pool.push(Reverse((end, slot)));
+                    Allocation::Stack(slot)
+                }
+                _ => {
+                    let slot = num_stack_slots;
+                    num_stack_slots += 1;
+                    slot_pool.push(Reverse((end, slot)));
+                    Allocation::Stack(slot)
+                }
+            }
+        };
 
         // Collect vreg indices that have valid ranges, sorted by start point
         let mut sorted_intervals: Vec<Interval> = intervals.iter()
@@ -2220,13 +2252,11 @@ impl Assembler
                 let spill = active.iter().rev().copied().find(|active_interval| {
                     matches!(assignment[active_interval.id], Some(Allocation::Reg(_)))
                 });
-                let slot = Allocation::Stack(num_stack_slots);
-                num_stack_slots += 1;
 
                 if let Some(spill) = spill.filter(|spill| spill.range.end.unwrap() > interval.range.end.unwrap()) {
                     // Spill the last active interval; give its register to current
                     assignment[interval.id] = assignment[spill.id];
-                    assignment[spill.id] = Some(slot);
+                    assignment[spill.id] = Some(alloc_stack_slot(spill));
                     let spill_idx = active.iter().position(|active_interval| active_interval.id == spill.id).unwrap();
                     active.remove(spill_idx);
                     // Insert current into sorted active
@@ -2234,7 +2264,7 @@ impl Assembler
                     active.insert(insert_idx, &interval);
                 } else {
                     // Spill the current interval
-                    assignment[interval.id] = Some(slot);
+                    assignment[interval.id] = Some(alloc_stack_slot(interval));
                 }
             } else {
                 // Allocate lowest free register
