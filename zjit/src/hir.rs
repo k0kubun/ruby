@@ -6414,6 +6414,118 @@ impl Function {
         true
     }
 
+    /// Replace block parameters that receive the same value on every incoming edge with that
+    /// value, and drop the parameter from the block and from every branch that targets it.
+    ///
+    /// Ruby locals are SSA values here, so every local a block can see is a parameter of that
+    /// block, whether or not anything in the CFG actually merges two different values into it.
+    /// `ProtoBoeuf::ParkingLot#decode_from` in ruby-bench has 21 locals and 166 blocks, and 67%
+    /// of the resulting 1,860 parameters have a single distinct incoming value. Each one costs a
+    /// copy on every edge at run time and, worse, keeps the value live from wherever it was
+    /// defined all the way to the last block that passes it along, which is what drives the
+    /// register allocator to spill.
+    ///
+    /// This is the standard trivial-phi rule from Braun et al., "Simple and Efficient
+    /// Construction of Static Single Assignment Form" (CC 2013), applied after construction:
+    /// a phi that references only itself and one other value `v` is replaced by `v`. Ignoring
+    /// self-references is what lets loop-header parameters go away -- a local that the loop
+    /// never assigns is passed straight back around the latch.
+    ///
+    /// Replacing the parameter with `v` is safe because `v` is passed on every incoming edge,
+    /// so it dominates every predecessor and therefore dominates this block. Paths that arrive
+    /// over a back edge reached the block earlier through some other predecessor, so they are
+    /// covered too.
+    fn remove_trivial_phis(&mut self) {
+        // Dropping a parameter can make another block's parameter trivial, so iterate.
+        while self.remove_trivial_phis_once() {}
+    }
+
+    /// One round of [`Self::remove_trivial_phis`]. Returns whether anything was dropped.
+    fn remove_trivial_phis_once(&mut self) -> bool {
+        let rpo = self.reverse_post_order();
+
+        // Collect the arguments each edge passes, keyed by target block. Blocks with no
+        // incoming edge in this list keep their parameters: entry-block parameters are the
+        // calling convention rather than phis, and a block we never see an edge to has no
+        // values to reason from.
+        let mut incoming: Vec<Vec<Vec<InsnId>>> = vec![vec![]; self.blocks.len()];
+        for &block in &rpo {
+            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
+            let mut push = |target: BlockId, args: &Vec<InsnId>| {
+                incoming[target.0].push(args.clone());
+            };
+            match &self.insns[terminator_id.0] {
+                Insn::Jump(edge) => push(edge.target, &edge.args),
+                Insn::CondBranch { if_true, if_false, .. } => {
+                    push(if_true.target, &if_true.args);
+                    push(if_false.target, &if_false.args);
+                }
+                _ => {}
+            }
+        }
+
+        // Parameter indices to drop, per block, ascending.
+        let mut dropped: Vec<Vec<usize>> = vec![vec![]; self.blocks.len()];
+        for &block in &rpo {
+            if block == self.entries_block || self.is_entry_block(block) { continue; }
+            let edges = &incoming[block.0];
+            if edges.is_empty() { continue; }
+            let params = self.blocks[block.0].params.clone();
+            if !edges.iter().all(|args| args.len() == params.len()) {
+                // Malformed CFG; validation reports the arity mismatch separately.
+                continue;
+            }
+            let mut replacements = vec![];
+            for (idx, &param) in params.iter().enumerate() {
+                let param = self.union_find.borrow_mut().find(param);
+                let mut only = None;
+                let trivial = edges.iter().all(|args| {
+                    let arg = self.union_find.borrow_mut().find(args[idx]);
+                    if arg == param { return true; } // self-reference: carries no new value
+                    match only {
+                        None => { only = Some(arg); true }
+                        Some(seen) => seen == arg,
+                    }
+                });
+                if let (true, Some(only)) = (trivial, only) {
+                    dropped[block.0].push(idx);
+                    replacements.push((param, only));
+                }
+            }
+            for (param, only) in replacements {
+                self.make_equal_to(param, only);
+            }
+            let drop_set: HashSet<usize> = dropped[block.0].iter().copied().collect();
+            self.blocks[block.0].params = params.into_iter().enumerate()
+                .filter(|(idx, _)| !drop_set.contains(idx))
+                .map(|(_, param)| param)
+                .collect();
+        }
+
+        if dropped.iter().all(|indices| indices.is_empty()) { return false; }
+
+        // Drop the matching arguments from every branch, so each edge keeps the arity of its
+        // target block.
+        let retain_args = |edge: &mut BranchEdge, dropped: &[Vec<usize>]| {
+            let drop_set = &dropped[edge.target.0];
+            if drop_set.is_empty() { return; }
+            let mut idx = 0;
+            edge.args.retain(|_| { let keep = !drop_set.contains(&idx); idx += 1; keep });
+        };
+        for &block in &rpo {
+            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
+            match &mut self.insns[terminator_id.0] {
+                Insn::Jump(edge) => retain_args(edge, &dropped),
+                Insn::CondBranch { if_true, if_false, .. } => {
+                    retain_args(if_true, &dropped);
+                    retain_args(if_false, &dropped);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
     /// Clean up linked lists of blocks A -> B -> C into A (with B's and C's instructions).
     fn clean_cfg(&mut self) {
         // num_in_edges is invariant throughout cleaning the CFG:
@@ -6696,6 +6808,7 @@ impl Function {
             (canonicalize) => { Counter::compile_hir_canonicalize_time_ns };
             (fold_constants) => { Counter::compile_hir_fold_constants_time_ns };
             (clean_cfg) => { Counter::compile_hir_clean_cfg_time_ns };
+            (remove_trivial_phis) => { Counter::compile_hir_remove_trivial_phis_time_ns };
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
             (remove_duplicate_check_interrupts) => { Counter::compile_hir_remove_duplicate_check_interrupts_time_ns };
             (eliminate_dead_code) => { Counter::compile_hir_eliminate_dead_code_time_ns };
@@ -6745,6 +6858,7 @@ impl Function {
             run_pass!(optimize_load_store);
             run_pass!(canonicalize);
             run_pass!(fold_constants);
+            run_pass!(remove_trivial_phis);
             run_pass!(clean_cfg);
             run_pass!(remove_redundant_patch_points);
             run_pass!(remove_duplicate_check_interrupts);
