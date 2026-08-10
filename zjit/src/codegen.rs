@@ -800,6 +800,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, function, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
         Insn::GetSpecialSymbol { symbol_type, state } => gen_getspecial_symbol(asm, *symbol_type, &function.frame_state(*state)),
         Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
+        Insn::Once { body_iseq, ise, state } => gen_once(jit, asm, function, *body_iseq, *ise, &function.frame_state(*state)),
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, &function.frame_state(state))),
@@ -1266,6 +1267,30 @@ fn gen_getglobal(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
     gen_prepare_non_leaf_call(jit, asm, function, state);
 
     asm_ccall!(asm, rb_gvar_get, id.0.into())
+}
+
+/// Run the `once` body ISEQ on the first execution and return the cached result afterwards
+fn gen_once(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    body_iseq: IseqPtr,
+    ise: *const iseq_inline_storage_entry,
+    state: &FrameState,
+) -> Opnd {
+    // On the first execution, the body ISEQ runs arbitrary Ruby code: it can allocate,
+    // raise, and even escape this frame's environment (vm_once_exec() makes a Proc out of
+    // the current frame). EP escapes are handled by the NoEPEscape patch points that
+    // `invalidates_locals()` arranges for non-leaf instructions.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+
+    // vm_once_dispatch() write-barriers the cached value against CFP_ISEQ(ec->cfp), which
+    // reads the ISEQ out of the JITFrame written just above, so it names the ISEQ that owns
+    // `ise` even for inlined frames.
+    unsafe extern "C" {
+        fn rb_vm_once_dispatch(ec: EcPtr, iseq: IseqPtr, ise: *const iseq_inline_storage_entry) -> VALUE;
+    }
+    asm_ccall!(asm, rb_vm_once_dispatch, EC, VALUE::from(body_iseq).into(), Opnd::const_ptr(ise))
 }
 
 /// Intern a string

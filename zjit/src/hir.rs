@@ -1134,6 +1134,13 @@ pub enum Insn {
     GetSpecialSymbol { symbol_type: SpecialBackrefSymbol, state: InsnId },
     GetSpecialNumber { nth: u64, state: InsnId },
 
+    /// `once`: run `body_iseq` at most once and return the value cached in `ise`.
+    ///
+    /// `ise` points into the `is_entries` of the ISEQ that contains the `once`
+    /// instruction, so it stays valid for as long as that ISEQ is alive. It is not a
+    /// `VALUE`, so it needs no GC offset; `ise->once.value` is marked by ISEQ marking.
+    Once { body_iseq: IseqPtr, ise: *const iseq_inline_storage_entry, state: InsnId },
+
     /// Get a class variable `id`
     GetClassVar { id: ID, ic: *const iseq_inline_cvar_cache_entry, state: InsnId },
     /// Set a class variable `id` to `val`
@@ -1662,6 +1669,7 @@ macro_rules! for_each_operand_impl {
             Insn::GetGlobal { state, .. }
             | Insn::GetSpecialSymbol { state, .. }
             | Insn::GetSpecialNumber { state, .. }
+            | Insn::Once { state, .. }
             | Insn::ObjectAllocClass { state, .. }
             | Insn::SideExit { state, .. } => {
                 $visit_one!(*state);
@@ -1831,6 +1839,8 @@ impl Insn {
             Insn::SetLocal { .. } => effects::Any,
             Insn::GetSpecialSymbol { .. } => effects::Any,
             Insn::GetSpecialNumber { .. } => effects::Any,
+            // The `once` body can run arbitrary Ruby code on its first execution.
+            Insn::Once { .. } => effects::Any,
             Insn::GetClassVar { .. } => effects::Any,
             Insn::SetClassVar { .. } => effects::Any,
             Insn::IsBlockParamModified { .. } => effects::Empty,
@@ -2431,6 +2441,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             },
             Insn::GetSpecialSymbol { symbol_type, .. } => write!(f, "GetSpecialSymbol {symbol_type:?}"),
             Insn::GetSpecialNumber { nth, .. } => write!(f, "GetSpecialNumber {nth}"),
+            Insn::Once { body_iseq, .. } => write!(f, "Once {}", iseq_name(*body_iseq)),
             Insn::GetClassVar { id, .. } => write!(f, "GetClassVar :{}", id.contents_lossy()),
             Insn::SetClassVar { id, val, .. } => write!(f, "SetClassVar :{}, {val}", id.contents_lossy()),
             Insn::ToArray { val, .. } => write!(f, "ToArray {val}"),
@@ -3730,6 +3741,7 @@ impl Function {
             &Insn::LoadField { return_type, .. } => return_type,
             Insn::GetSpecialSymbol { .. } => types::StringExact.union(types::NilClass),
             Insn::GetSpecialNumber { .. } => types::StringExact.union(types::NilClass),
+            Insn::Once { .. } => types::BasicObject,
             Insn::GetClassVar { .. } => types::BasicObject,
             Insn::ToNewArray { .. } => types::ArrayExact,
             Insn::ToArray { .. } => types::ArrayExact,
@@ -7733,6 +7745,7 @@ impl Function {
             | Insn::GetSpecialNumber { .. }
             | Insn::GetSpecialSymbol { .. }
             | Insn::GetBlockParam { .. }
+            | Insn::Once { .. }
             | Insn::StoreField { .. } => {
                 Ok(())
             }
@@ -9054,6 +9067,14 @@ fn add_iseq_to_hir(
                     let count = get_arg(pc, 1).as_usize();
                     let values = state.stack_pop_n(count)?;
                     let insn_id = fun.push_insn(block, Insn::ToRegexp { opt, values, state: exit_id });
+                    state.stack_push(insn_id);
+                }
+                YARVINSN_once => {
+                    // `once` runs the body ISEQ the first time it is reached and caches the
+                    // result in the inline storage entry, e.g. for `/#{...}/o` literals.
+                    let body_iseq = get_arg(pc, 0).as_iseq();
+                    let ise = get_arg(pc, 1).as_ptr();
+                    let insn_id = fun.push_insn(block, Insn::Once { body_iseq, ise, state: exit_id });
                     state.stack_push(insn_id);
                 }
                 YARVINSN_newarray => {
