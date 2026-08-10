@@ -6561,6 +6561,173 @@ impl Function {
         true
     }
 
+    /// Drop the given parameter indices from each block and from every branch that targets
+    /// it, so each edge keeps the arity of its target. Indices must be ascending per block.
+    /// Returns whether anything was dropped.
+    fn drop_block_params(&mut self, dropped: &[Vec<usize>]) -> bool {
+        if dropped.iter().all(|indices| indices.is_empty()) { return false; }
+        for block in self.reverse_post_order() {
+            let drop_set: HashSet<usize> = dropped[block.0].iter().copied().collect();
+            if drop_set.is_empty() { continue; }
+            let params = std::mem::take(&mut self.blocks[block.0].params);
+            self.blocks[block.0].params = params.into_iter().enumerate()
+                .filter(|(idx, _)| !drop_set.contains(idx))
+                .map(|(_, param)| param)
+                .collect();
+        }
+        let retain_args = |edge: &mut BranchEdge, dropped: &[Vec<usize>]| {
+            let drop_set = &dropped[edge.target.0];
+            if drop_set.is_empty() { return; }
+            let mut idx = 0;
+            edge.args.retain(|_| { let keep = !drop_set.contains(&idx); idx += 1; keep });
+        };
+        for block in self.reverse_post_order() {
+            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
+            match &mut self.insns[terminator_id.0] {
+                Insn::Jump(edge) => retain_args(edge, dropped),
+                Insn::CondBranch { if_true, if_false, .. } => {
+                    retain_args(if_true, dropped);
+                    retain_args(if_false, dropped);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Replace block parameters that can only ever hold one value with that constant, and
+    /// drop the parameter from the block and from every branch that targets it.
+    ///
+    /// Ruby locals are SSA values here, so every local a block can see is a parameter of
+    /// that block. A method with many locals therefore threads all of them through every
+    /// block: `decode_from` in the protoboeuf benchmark has 21 locals and 166 blocks,
+    /// which is 1,860 parameters. Type inference already proves most of them hold a single
+    /// value -- 1,096 of those 1,860 are `NilClass`, i.e. locals that are still nil on
+    /// every path reaching the block -- but they are passed along anyway. That costs twice:
+    /// the parameters keep the values live across the whole function, so the register
+    /// allocator spills them, and each edge copies them at run time.
+    ///
+    /// Rematerializing the constant in the block instead is always cheaper, and it shortens
+    /// the live ranges of everything the parameter used to hold alive.
+    fn reduce_block_params(&mut self) {
+        // Parameter indices to drop, per block. Indices are ascending within a block.
+        let mut dropped: Vec<Vec<usize>> = vec![vec![]; self.blocks.len()];
+        for block in self.reverse_post_order() {
+            // Entry block parameters are the calling convention, not phis: codegen maps them
+            // to argument registers and `copy_param_types` types them from the ISEQ.
+            if block == self.entries_block || self.is_entry_block(block) { continue; }
+            let params = self.blocks[block.0].params.clone();
+            let mut consts = vec![];
+            for (idx, &param) in params.iter().enumerate() {
+                let Some(val) = self.type_of(param).exact_ruby_value() else { continue };
+                dropped[block.0].push(idx);
+                consts.push((param, val));
+            }
+            // Insert the constants at the top of the block so they dominate every use of the
+            // parameter they replace, which is exactly what the block itself dominates. Blocks
+            // routinely drop several parameters holding the same value (all the locals that are
+            // still nil), so materialize each distinct value once.
+            let mut materialized: HashMap<VALUE, InsnId> = HashMap::new();
+            let mut prologue = vec![];
+            for (param, val) in consts {
+                let replacement = *materialized.entry(val).or_insert_with(|| {
+                    let replacement = self.new_insn(Insn::Const { val: Const::Value(val) });
+                    self.insn_types[replacement.0] = self.infer_type(replacement);
+                    prologue.push(replacement);
+                    replacement
+                });
+                self.make_equal_to(param, replacement);
+            }
+            self.blocks[block.0].insns.splice(0..0, prologue);
+        }
+        self.drop_block_params(&dropped);
+    }
+
+    /// Replace block parameters that receive the same value on every incoming edge with that
+    /// value, and drop the parameter from the block and from every branch that targets it.
+    ///
+    /// Ruby locals are SSA values here, so every local a block can see is a parameter of that
+    /// block, whether or not anything in the CFG actually merges two different values into it.
+    /// `ProtoBoeuf::ParkingLot#decode_from` in ruby-bench has 21 locals and 166 blocks, and 67%
+    /// of the resulting 1,860 parameters have a single distinct incoming value. Each one costs a
+    /// copy on every edge at run time and, worse, keeps the value live from wherever it was
+    /// defined all the way to the last block that passes it along, which is what drives the
+    /// register allocator to spill.
+    ///
+    /// This is the standard trivial-phi rule from Braun et al., "Simple and Efficient
+    /// Construction of Static Single Assignment Form" (CC 2013), applied after construction:
+    /// a phi that references only itself and one other value `v` is replaced by `v`. Ignoring
+    /// self-references is what lets loop-header parameters go away -- a local that the loop
+    /// never assigns is passed straight back around the latch.
+    ///
+    /// Replacing the parameter with `v` is safe because `v` is passed on every incoming edge,
+    /// so it dominates every predecessor and therefore dominates this block. Paths that arrive
+    /// over a back edge reached the block earlier through some other predecessor, so they are
+    /// covered too.
+    fn remove_trivial_phis(&mut self) {
+        // Dropping a parameter can make another block's parameter trivial, so iterate.
+        while self.remove_trivial_phis_once() {}
+    }
+
+    /// One round of [`Self::remove_trivial_phis`]. Returns whether anything was dropped.
+    fn remove_trivial_phis_once(&mut self) -> bool {
+        let rpo = self.reverse_post_order();
+
+        // Collect the arguments each edge passes, keyed by target block. Blocks with no
+        // incoming edge in this list keep their parameters: entry-block parameters are the
+        // calling convention rather than phis, and a block we never see an edge to has no
+        // values to reason from.
+        let mut incoming: Vec<Vec<Vec<InsnId>>> = vec![vec![]; self.blocks.len()];
+        for &block in &rpo {
+            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
+            let mut push = |target: BlockId, args: &Vec<InsnId>| {
+                incoming[target.0].push(args.clone());
+            };
+            match &self.insns[terminator_id.0] {
+                Insn::Jump(edge) => push(edge.target, &edge.args),
+                Insn::CondBranch { if_true, if_false, .. } => {
+                    push(if_true.target, &if_true.args);
+                    push(if_false.target, &if_false.args);
+                }
+                _ => {}
+            }
+        }
+
+        // Parameter indices to drop, per block, ascending.
+        let mut dropped: Vec<Vec<usize>> = vec![vec![]; self.blocks.len()];
+        for &block in &rpo {
+            if block == self.entries_block || self.is_entry_block(block) { continue; }
+            let edges = &incoming[block.0];
+            if edges.is_empty() { continue; }
+            let params = self.blocks[block.0].params.clone();
+            if !edges.iter().all(|args| args.len() == params.len()) {
+                // Malformed CFG; validation reports the arity mismatch separately.
+                continue;
+            }
+            let mut replacements = vec![];
+            for (idx, &param) in params.iter().enumerate() {
+                let param = self.union_find.borrow_mut().find(param);
+                let mut only = None;
+                let trivial = edges.iter().all(|args| {
+                    let arg = self.union_find.borrow_mut().find(args[idx]);
+                    if arg == param { return true; } // self-reference: carries no new value
+                    match only {
+                        None => { only = Some(arg); true }
+                        Some(seen) => seen == arg,
+                    }
+                });
+                if let (true, Some(only)) = (trivial, only) {
+                    dropped[block.0].push(idx);
+                    replacements.push((param, only));
+                }
+            }
+            for (param, only) in replacements {
+                self.make_equal_to(param, only);
+            }
+        }
+        self.drop_block_params(&dropped)
+    }
+
     /// Clean up linked lists of blocks A -> B -> C into A (with B's and C's instructions).
     fn clean_cfg(&mut self) {
         // num_in_edges is invariant throughout cleaning the CFG:
@@ -6843,6 +7010,8 @@ impl Function {
             (canonicalize) => { Counter::compile_hir_canonicalize_time_ns };
             (fold_constants) => { Counter::compile_hir_fold_constants_time_ns };
             (clean_cfg) => { Counter::compile_hir_clean_cfg_time_ns };
+            (reduce_block_params) => { Counter::compile_hir_reduce_block_params_time_ns };
+            (remove_trivial_phis) => { Counter::compile_hir_remove_trivial_phis_time_ns };
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
             (remove_duplicate_check_interrupts) => { Counter::compile_hir_remove_duplicate_check_interrupts_time_ns };
             (eliminate_dead_code) => { Counter::compile_hir_eliminate_dead_code_time_ns };
@@ -6892,6 +7061,8 @@ impl Function {
             run_pass!(optimize_load_store);
             run_pass!(canonicalize);
             run_pass!(fold_constants);
+            run_pass!(remove_trivial_phis);
+            run_pass!(reduce_block_params);
             run_pass!(clean_cfg);
             run_pass!(remove_redundant_patch_points);
             run_pass!(remove_duplicate_check_interrupts);
