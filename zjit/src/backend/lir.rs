@@ -1349,6 +1349,9 @@ impl Insn {
         self.is_jump() ||
             match self {
                 Insn::CRet(_) => true,
+                // Abort traps, so control never falls through to the next instruction.
+                // It has no target, so a block ending with it has no successors.
+                Insn::Abort => true,
                 _ => false
             }
     }

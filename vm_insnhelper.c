@@ -1880,6 +1880,31 @@ rb_vm_throw(const rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_nu
     return vm_throw(ec, reg_cfp, throw_state, throwobj);
 }
 
+// Fallback for ZJIT, not used by the interpreter. Perform `throw` and unwind to
+// the enclosing vm_exec(), which handles it with vm_exec_handle_exception().
+//
+// The interpreter's THROW_EXCEPTION() and YJIT's gen_throw() return the throw
+// data out of the current native frame instead. ZJIT can't do that: a compiled
+// caller calls a compiled callee with a native call, so returning the throw data
+// would hand it to the JIT caller as if it were a normal return value. We longjmp
+// out of every JIT native frame at once instead, which is exactly what happens
+// when a C function called from ZJIT code raises. This function never returns.
+VALUE
+rb_zjit_throw(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t throw_state, VALUE throwobj)
+{
+    VALUE val = vm_throw(ec, reg_cfp, throw_state, throwobj);
+
+    // vm_throw() has set ec->tag->state. THROW_EXCEPTION() hands the throw data to
+    // vm_exec_handle_exception() as vm_exec_core()'s return value; on the longjmp path
+    // vm_exec() reads it from ec->errinfo instead, which is also how
+    // vm_exec_handle_exception() itself propagates a throw to an outer tag.
+    enum ruby_tag_type state = ec->tag->state;
+    ec->errinfo = val;
+    EC_JUMP_TAG(ec, state);
+
+    UNREACHABLE_RETURN(Qundef);
+}
+
 static inline void
 vm_expandarray(struct rb_control_frame_struct *cfp, VALUE ary, rb_num_t num, int flag)
 {

@@ -231,7 +231,6 @@ make_counters! {
         exit_patchpoint_root_box_only,
         exit_callee_side_exit,
         exit_interrupt,
-        exit_throw,
         exit_stackoverflow,
         exit_block_param_proxy_not_iseq_or_ifunc,
         exit_block_param_proxy_not_nil,
@@ -485,6 +484,10 @@ make_counters! {
     // TODO(max): Implement
     // vm_reify_stack_count,
 
+    // The number of `throw` instructions executed in JIT code, i.e. non-local
+    // control flow such as `break` from a block or `return` from a proc.
+    throw_count,
+
     // The number of times we ran a dynamic check
     guard_type_count,
     guard_shape_count,
@@ -669,7 +672,6 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         GuardSuperMethodEntry         => exit_guard_super_method_entry,
         CalleeSideExit                => exit_callee_side_exit,
         Interrupt                     => exit_interrupt,
-        Throw                         => exit_throw,
         StackOverflow                 => exit_stackoverflow,
         BlockParamProxyNotIseqOrIfunc => exit_block_param_proxy_not_iseq_or_ifunc,
         BlockParamProxyNotNil         => exit_block_param_proxy_not_nil,
