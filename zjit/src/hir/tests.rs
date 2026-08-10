@@ -6215,6 +6215,31 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
+    fn test_once() {
+      eval(r##"
+        def test(a) = /#{a}b/o
+      "##);
+      assert_snapshot!(hir_string("test"), @"
+      fn test@<compiled>:2:
+      bb1():
+        EntryPoint interpreter
+        v1:BasicObject = LoadSelf
+        v2:CPtr = LoadSP
+        v3:BasicObject = LoadField v2, :a@0x1000
+        Jump bb3(v1, v3)
+      bb2():
+        EntryPoint JIT(0)
+        v6:BasicObject = LoadArg :self@0
+        v7:BasicObject = LoadArg :a@1
+        Jump bb3(v6, v7)
+      bb3(v9:BasicObject, v10:BasicObject):
+        v14:BasicObject = Once block in test
+        CheckInterrupts
+        Return v14
+      ");
+    }
+
+    #[test]
     fn test_getspecialnumber() {
       eval("
         def test(a)
