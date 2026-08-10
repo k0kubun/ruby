@@ -8512,6 +8512,95 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_expandarray_from_nil() {
+        eval("
+            def test
+              a, b = nil
+              [a, b]
+            end
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:NilClass = Const Value(nil)
+          v3:NilClass = Const Value(nil)
+          Jump bb3(v1, v2, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:NilClass = Const Value(nil)
+          v8:NilClass = Const Value(nil)
+          Jump bb3(v6, v7, v8)
+        bb3(v10:BasicObject, v11:NilClass, v12:NilClass):
+          v16:NilClass = Const Value(nil)
+          v22:NilClass|Array = CheckArrayType v16
+          v23:CBool = HasType v22, NilClass
+          CondBranch v23, bb6(), bb7()
+        bb6():
+          v25:NilClass = Const Value(nil)
+          Jump bb9(v25, v16)
+        bb7():
+          v27:Array = RefineType v22, Array
+          v30:CInt64 = ArrayLength v27
+          v31:CInt64[2] = Const CInt64(2)
+          v32:CBool = IsGreaterEq v30, v31
+          CondBranch v32, bb10(), bb11()
+        bb10():
+          v34:CInt64[1] = Const CInt64(1)
+          v35:BasicObject = ArrayAref v27, v34
+          v36:CInt64[0] = Const CInt64(0)
+          v37:BasicObject = ArrayAref v27, v36
+          Jump bb9(v35, v37)
+        bb11():
+          v39:CInt64[1] = Const CInt64(1)
+          v40:BasicObject = ArrayEntry v27, v39
+          v41:CInt64[0] = Const CInt64(0)
+          v42:BasicObject = ArrayEntry v27, v41
+          Jump bb9(v40, v42)
+        bb9(v44:BasicObject, v45:BasicObject):
+          PatchPoint NoEPEscape(test)
+          v54:ArrayExact = NewArray v45, v44
+          CheckInterrupts
+          Return v54
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_from_new_array() {
+        eval("
+            def test(x)
+              a, b = [x, 1]
+              [a, b]
+            end
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:NilClass = Const Value(nil)
+          v5:NilClass = Const Value(nil)
+          Jump bb3(v1, v3, v4, v5)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :x@1
+          v10:NilClass = Const Value(nil)
+          v11:NilClass = Const Value(nil)
+          Jump bb3(v8, v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
+          v21:Fixnum[1] = Const Value(1)
+          v29:ArrayExact = NewArray v14, v21
+          CheckInterrupts
+          Return v29
+        ");
+    }
+
+    #[test]
     fn test_dont_eliminate_load_from_non_frozen_array() {
         eval(r##"
             S = [4,5,6]
