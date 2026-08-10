@@ -75,6 +75,10 @@ enum DistributionKind {
 pub struct DistributionSummary<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> {
     kind: DistributionKind,
     buckets: [T; N],
+    /// How many samples landed in each bucket, in the same order as `buckets`
+    counts: [NumProfiles; N],
+    /// How many samples did not fit in any bucket
+    other: NumProfiles,
     // TODO(max): Determine if we need some notion of stability
 }
 
@@ -82,7 +86,7 @@ const SKEW_THRESHOLD: f64 = 0.75;
 
 impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> DistributionSummary<T, N> {
     pub fn empty() -> Self {
-        Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
+        Self { kind: DistributionKind::Empty, buckets: [Default::default(); N], counts: [0; N], other: 0 }
     }
 
     pub fn new(dist: &Distribution<T, N>) -> Self {
@@ -113,7 +117,7 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
                 DistributionKind::Megamorphic
             }
         };
-        Self { kind, buckets: dist.buckets }
+        Self { kind, buckets: dist.buckets, counts: dist.counts, other: dist.other }
     }
 
     pub fn is_monomorphic(&self) -> bool {
@@ -143,6 +147,31 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
 
     pub fn buckets(&self) -> &[T] {
         &self.buckets
+    }
+
+    /// How many samples landed in `buckets[idx]`. 0 means the bucket is unused.
+    pub fn bucket_count(&self, idx: usize) -> NumProfiles {
+        assert!(idx < N, "index {idx} out of bounds for buckets[{N}]");
+        self.counts[idx]
+    }
+
+    /// Total number of samples this summary was built from, including the ones that did not fit
+    /// in a bucket.
+    pub fn num_seen(&self) -> u32 {
+        self.counts.iter().map(|&c| u32::from(c)).sum::<u32>() + u32::from(self.other)
+    }
+
+    /// Fraction of observed samples that landed in the buckets for which `keep` returns true.
+    /// Used to decide whether a guard chain over those buckets is worth building: samples in
+    /// other buckets, and samples that did not fit in any bucket, have to take the fallback.
+    pub fn coverage(&self, keep: impl Fn(usize, T) -> bool) -> f64 {
+        let num_seen = self.num_seen();
+        if num_seen == 0 { return 0.0; }
+        let covered: u32 = self.counts.iter().enumerate()
+            .filter(|&(idx, &count)| count > 0 && keep(idx, self.buckets[idx]))
+            .map(|(_, &count)| u32::from(count))
+            .sum();
+        (covered as f64) / (num_seen as f64)
     }
 }
 
@@ -282,5 +311,39 @@ mod distribution_tests {
         let summary = DistributionSummary::new(&dist);
         assert_eq!(summary.kind, DistributionKind::SkewedMegamorphic);
         assert_eq!(summary.buckets[0], 12);
+    }
+
+    #[test]
+    fn summary_exposes_counts_and_num_seen() {
+        let mut dist = Distribution::<usize, 2>::new();
+        dist.observe(10);
+        dist.observe(10);
+        dist.observe(11);
+        dist.observe(12); // does not fit; counted in other
+        let summary = DistributionSummary::new(&dist);
+        assert_eq!(summary.bucket_count(0), 2);
+        assert_eq!(summary.bucket_count(1), 1);
+        assert_eq!(summary.num_seen(), 4);
+    }
+
+    #[test]
+    fn coverage_counts_only_kept_buckets() {
+        let mut dist = Distribution::<usize, 2>::new();
+        dist.observe(10);
+        dist.observe(10);
+        dist.observe(11);
+        dist.observe(12); // does not fit; counted in other
+        let summary = DistributionSummary::new(&dist);
+        assert_eq!(summary.coverage(|_, _| true), 0.75);
+        assert_eq!(summary.coverage(|idx, _| idx == 0), 0.5);
+        assert_eq!(summary.coverage(|_, item| item == 11), 0.25);
+        assert_eq!(summary.coverage(|_, _| false), 0.0);
+    }
+
+    #[test]
+    fn empty_summary_has_no_coverage() {
+        let summary = DistributionSummary::<usize, 4>::empty();
+        assert_eq!(summary.num_seen(), 0);
+        assert_eq!(summary.coverage(|_, _| true), 0.0);
     }
 }
