@@ -628,6 +628,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
+        Insn::ArrayEntry { array, index, .. } => gen_array_entry(asm, opnd!(array), opnd!(index)),
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
@@ -711,6 +712,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::IsMethodCfunc { val, cd, cfunc, state } => gen_is_method_cfunc(asm, opnd!(val), cd, cfunc, &function.frame_state(state)),
         &Insn::IsBitEqual { left, right } => gen_is_bit_equal(asm, opnd!(left), opnd!(right)),
         &Insn::IsBitNotEqual { left, right } => gen_is_bit_not_equal(asm, opnd!(left), opnd!(right)),
+        &Insn::IsGreaterEq { left, right } => gen_is_greater_eq(asm, opnd!(left), opnd!(right)),
         &Insn::BoxBool { val } => gen_box_bool(asm, opnd!(val)),
         &Insn::BoxFixnum { val, state } => gen_box_fixnum(jit, asm, function, opnd!(val), &function.frame_state(state)),
         &Insn::UnboxFixnum { val } => gen_unbox_fixnum(asm, opnd!(val)),
@@ -770,6 +772,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -1366,6 +1369,12 @@ fn gen_to_new_array(jit: &mut JITState, asm: &mut Assembler, function: &Function
 fn gen_to_array(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qfalse), val)
+}
+
+/// Lowering for [`Insn::CheckArrayType`]. Not a leaf call: #to_ary can run arbitrary Ruby code.
+fn gen_check_array_type(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_check_array_type, val)
 }
 
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {
@@ -2261,6 +2270,12 @@ fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::O
     asm_ccall!(asm, rb_ary_pop, array)
 }
 
+/// Lowering for [`Insn::ArrayEntry`]. rb_ary_entry() is a leaf function that returns nil for
+/// out-of-bounds indices.
+fn gen_array_entry(asm: &mut Assembler, array: Opnd, index: Opnd) -> lir::Opnd {
+    asm_ccall!(asm, rb_ary_entry, array, index)
+}
+
 fn gen_array_length(asm: &mut Assembler, array: Opnd) -> lir::Opnd {
     let array = asm.load_mem(array);
     let flags = Opnd::mem(VALUE_BITS, array, RUBY_OFFSET_RBASIC_FLAGS);
@@ -2930,6 +2945,11 @@ fn gen_is_bit_equal(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> l
 fn gen_is_bit_not_equal(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> lir::Opnd {
     asm.cmp(left, right);
     asm.csel_ne(Opnd::Imm(1), Opnd::Imm(0))
+}
+
+fn gen_is_greater_eq(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> lir::Opnd {
+    asm.cmp(left, right);
+    asm.csel_ge(Opnd::Imm(1), Opnd::Imm(0))
 }
 
 fn gen_box_bool(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {

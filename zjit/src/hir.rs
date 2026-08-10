@@ -992,6 +992,10 @@ pub enum Insn {
 
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise.
     ToArray { val: InsnId, state: InsnId },
+    /// Convert `val` to an Array by calling `#to_ary` on it, or return `nil` if it cannot be
+    /// converted. Returns `val` itself if it is already an `Array`. Mirrors
+    /// `rb_check_array_type()`; can run arbitrary Ruby code because of `#to_ary`.
+    CheckArrayType { val: InsnId, state: InsnId },
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise. If we
     /// called `to_a`, duplicate the returned array.
     ToNewArray { val: InsnId, state: InsnId },
@@ -1012,6 +1016,9 @@ pub enum Insn {
     /// Push `val` onto `array`, where `array` is already `Array`.
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
+    /// Read `array[index]`, returning `nil` if `index` is out of bounds. `index` is a C `long`
+    /// ([`types::CInt64`]) and must not be negative. Mirrors `rb_ary_entry()`.
+    ArrayEntry { array: InsnId, index: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
@@ -1043,6 +1050,8 @@ pub enum Insn {
     IsBitEqual { left: InsnId, right: InsnId },
     /// Return C `true` if left != right
     IsBitNotEqual { left: InsnId, right: InsnId },
+    /// Return C `true` if the C `long` `left` is greater than or equal to the C `long` `right`
+    IsGreaterEq { left: InsnId, right: InsnId },
     /// Convert a C `bool` to a Ruby `Qtrue`/`Qfalse`. Same as `RBOOL` macro.
     BoxBool { val: InsnId },
     /// Convert a C `long` to a Ruby `Fixnum`. Side exit on overflow.
@@ -1439,6 +1448,7 @@ macro_rules! for_each_operand_impl {
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
             | Insn::ToArray { val, state }
+            | Insn::CheckArrayType { val, state }
             | Insn::IsMethodCfunc { val, state, .. }
             | Insn::ToNewArray { val, state }
             | Insn::SetLocal { val, state, .. }
@@ -1494,7 +1504,8 @@ macro_rules! for_each_operand_impl {
             | Insn::IntOr { left, right }
             | Insn::FixnumRShift { left, right }
             | Insn::IsBitEqual { left, right }
-            | Insn::IsBitNotEqual { left, right } => {
+            | Insn::IsBitNotEqual { left, right }
+            | Insn::IsGreaterEq { left, right } => {
                 $visit_one!(*left);
                 $visit_one!(*right);
             }
@@ -1512,7 +1523,8 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*val);
                 $visit_one!(*state);
             }
-            Insn::ArrayAref { array, index } => {
+            Insn::ArrayAref { array, index }
+            | Insn::ArrayEntry { array, index } => {
                 $visit_one!(*array);
                 $visit_one!(*index);
             }
@@ -1737,6 +1749,7 @@ impl Insn {
             Insn::ToRegexp { .. } => effects::Any,
             Insn::PutSpecialObject { .. } => effects::Any,
             Insn::ToArray { .. } => effects::Any,
+            Insn::CheckArrayType { .. } => effects::Any,
             Insn::ToNewArray { .. } => effects::Any,
             Insn::NewArray { .. } => allocates,
             Insn::NewHash { elements, .. } => {
@@ -1761,6 +1774,7 @@ impl Insn {
             Insn::ArrayExtend { .. } => effects::Any,
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
+            Insn::ArrayEntry { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
@@ -1774,6 +1788,7 @@ impl Insn {
             Insn::IsMethodCfunc { .. } => effects::Any,
             Insn::IsBitEqual { .. } => effects::Empty,
             Insn::IsBitNotEqual { .. } => effects::Empty,
+            Insn::IsGreaterEq { .. } => effects::Empty,
             Insn::BoxBool { .. } => effects::Empty,
             Insn::BoxFixnum { .. } => effects::Empty,
             Insn::UnboxFixnum { .. } => effects::Empty,
@@ -2046,6 +2061,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::ArrayAref { array, index, .. } => {
                 write!(f, "ArrayAref {array}, {index}")
             }
+            Insn::ArrayEntry { array, index, .. } => {
+                write!(f, "ArrayEntry {array}, {index}")
+            }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
             }
@@ -2161,6 +2179,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::IsMethodCfunc { val, cd, .. } => { write!(f, "IsMethodCFunc {val}, :{}", ruby_call_method_name(*cd)) }
             Insn::IsBitEqual { left, right } => write!(f, "IsBitEqual {left}, {right}"),
             Insn::IsBitNotEqual { left, right } => write!(f, "IsBitNotEqual {left}, {right}"),
+            Insn::IsGreaterEq { left, right } => write!(f, "IsGreaterEq {left}, {right}"),
             Insn::BoxBool { val } => write!(f, "BoxBool {val}"),
             Insn::BoxFixnum { val, .. } => write!(f, "BoxFixnum {val}"),
             Insn::UnboxFixnum { val } => write!(f, "UnboxFixnum {val}"),
@@ -2412,6 +2431,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GetClassVar { id, .. } => write!(f, "GetClassVar :{}", id.contents_lossy()),
             Insn::SetClassVar { id, val, .. } => write!(f, "SetClassVar :{}, {val}", id.contents_lossy()),
             Insn::ToArray { val, .. } => write!(f, "ToArray {val}"),
+            Insn::CheckArrayType { val, .. } => write!(f, "CheckArrayType {val}"),
             Insn::ToNewArray { val, .. } => write!(f, "ToNewArray {val}"),
             Insn::ArrayExtend { left, right, .. } => write!(f, "ArrayExtend {left}, {right}"),
             Insn::ArrayPush { array, val, .. } => write!(f, "ArrayPush {array}, {val}"),
@@ -3385,6 +3405,7 @@ impl Function {
             Insn::IsMethodCfunc { .. } => types::CBool,
             Insn::IsBitEqual { .. } => types::CBool,
             Insn::IsBitNotEqual { .. } => types::CBool,
+            Insn::IsGreaterEq { .. } => types::CBool,
             Insn::BoxBool { .. } => types::BoolExact,
             Insn::BoxFixnum { .. } => types::Fixnum,
             Insn::UnboxFixnum { val } => self
@@ -3404,6 +3425,7 @@ impl Function {
             Insn::NewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
+            Insn::ArrayEntry { .. } => types::BasicObject,
             Insn::ArrayPop { .. } => types::BasicObject,
             Insn::ArrayLength { .. } => types::CInt64,
             Insn::AdjustBounds { .. } => types::CInt64,
@@ -3490,6 +3512,7 @@ impl Function {
             Insn::GetClassVar { .. } => types::BasicObject,
             Insn::ToNewArray { .. } => types::ArrayExact,
             Insn::ToArray { .. } => types::ArrayExact,
+            Insn::CheckArrayType { .. } => types::Array.union(types::NilClass),
             Insn::AnyToString { .. } => types::StringExact,
             Insn::IsBlockParamModified { .. } => types::CBool,
             Insn::GetBlockParam { .. } => types::BasicObject,
@@ -4049,6 +4072,43 @@ impl Function {
         let result = self.push_insn(block, Insn::GuardType { val, guard_type, state, recompile: Some(recompile) });
         self.insn_types[result.to_usize()] = self.infer_type(result);
         result
+    }
+
+    /// Read the first `num` elements of `array` (which must be an `Array`) for `expandarray`,
+    /// filling in `nil` for elements past the end of the array, and jump to `join_block` with the
+    /// elements in the order that `expandarray` pushes them onto the stack: element `num-1` first
+    /// and element `0` last. `join_block` is expected to take `num` parameters.
+    ///
+    /// If the array is long enough, we read the elements out of it directly. Otherwise, we go
+    /// through `rb_ary_entry()`, which returns `nil` for out-of-bounds indices.
+    fn expand_array_elements(&mut self, block: BlockId, array: InsnId, num: u64, insn_idx: u32, join_block: BlockId) {
+        let long_enough_block = self.new_block(insn_idx);
+        let too_short_block = self.new_block(insn_idx);
+
+        let length = self.push_insn(block, Insn::ArrayLength { array });
+        let expected = self.push_insn(block, Insn::Const { val: Const::CInt64(num.try_into().unwrap()) });
+        let long_enough = self.push_insn(block, Insn::IsGreaterEq { left: length, right: expected });
+        self.push_insn(block, Insn::CondBranch {
+            val: long_enough,
+            if_true: BranchEdge { target: long_enough_block, args: vec![] },
+            if_false: BranchEdge { target: too_short_block, args: vec![] },
+        });
+
+        // The array has at least num elements; every read is in bounds.
+        let mut elements = vec![];
+        for i in (0..num).rev() {
+            let index = self.push_insn(long_enough_block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
+            elements.push(self.push_insn(long_enough_block, Insn::ArrayAref { array, index }));
+        }
+        self.push_insn(long_enough_block, Insn::Jump(BranchEdge { target: join_block, args: elements }));
+
+        // The array is too short; out-of-bounds reads must produce nil.
+        let mut elements = vec![];
+        for i in (0..num).rev() {
+            let index = self.push_insn(too_short_block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
+            elements.push(self.push_insn(too_short_block, Insn::ArrayEntry { array, index }));
+        }
+        self.push_insn(too_short_block, Insn::Jump(BranchEdge { target: join_block, args: elements }));
     }
 
     fn count_complex_call_features(&mut self, block: BlockId, ci_flags: c_uint, state: InsnId) {
@@ -6134,6 +6194,14 @@ impl Function {
                             _ => insn_id,
                         }
                     },
+                    &Insn::IsGreaterEq { left, right } => {
+                        let left_num = self.type_of(left).cint64_value();
+                        let right_num = self.type_of(right).cint64_value();
+                        match (left_num, right_num) {
+                            (Some(l), Some(r)) => self.new_insn(Insn::Const { val: Const::CBool(l >= r) }),
+                            _ => insn_id,
+                        }
+                    },
                     &Insn::GuardLess { left, right, state, ref reason } => {
                         let left_num = self.type_of(left).cint64_value();
                         let right_num = self.type_of(right).cint64_value();
@@ -7041,6 +7109,7 @@ impl Function {
             | Insn::GuardType { val, .. }
             | Insn::ToArray { val, .. }
             | Insn::ToNewArray { val, .. }
+            | Insn::CheckArrayType { val, .. }
             | Insn::Defined { v: val, .. }
             | Insn::ObjectAlloc { val, .. }
             | Insn::DupArrayInclude { target: val, .. }
@@ -7169,7 +7238,8 @@ impl Function {
             | Insn::ArrayLength { array, .. } => {
                 self.assert_subtype(insn_id, array, types::Array)
             }
-            Insn::ArrayAref { array, index } => {
+            Insn::ArrayAref { array, index }
+            | Insn::ArrayEntry { array, index } => {
                 self.assert_subtype(insn_id, array, types::Array)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
             }
@@ -7308,7 +7378,8 @@ impl Function {
                 }
             }
             Insn::GuardLess { left, right, .. }
-            | Insn::GuardGreaterEq { left, right, .. } => {
+            | Insn::GuardGreaterEq { left, right, .. }
+            | Insn::IsGreaterEq { left, right } => {
                 self.assert_subtype(insn_id, left, types::CInt64)?;
                 self.assert_subtype(insn_id, right, types::CInt64)
             },
@@ -10110,15 +10181,73 @@ fn add_iseq_to_hir(
                         break;  // End the block
                     }
                     let val = state.stack_pop()?;
-                    let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: None });
-                    let length = fun.push_insn(block, Insn::ArrayLength { array });
-                    let expected = fun.push_insn(block, Insn::Const { val: Const::CInt64(num as i64) });
-                    fun.push_insn(block, Insn::GuardGreaterEq { left: length, right: expected, reason: Box::new(SideExitReason::ExpandArray), state: exit_id });
-                    for i in (0..num).rev() {
-                        // We do not emit a length guard here because in-bounds is already
-                        // ensured by the expandarray length check above.
-                        let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
-                        let element = fun.push_insn(block, Insn::ArrayAref { array, index });
+                    let branch_insn_idx = exit_state.insn_idx as u32;
+
+                    // Mirror vm_expandarray() for the flag == 0 case:
+                    //
+                    //   * If the value is not a T_ARRAY, convert it with #to_ary. If that does not
+                    //     produce an array, the value is treated as the one-element array [value].
+                    //   * Targets past the end of the array get nil.
+                    //
+                    // Note that we must not side-exit for either of those cases: masgn from nil is
+                    // the preamble of every Ragel-generated parser, and exiting there would leave
+                    // the entire method interpreted.
+                    //
+                    // TODO: When the value's class is known and does not define #to_ary
+                    // (`a, b = nil` being the common case), we could skip the conversion call
+                    // entirely with a PatchPoint on #to_ary/#method_missing not being defined,
+                    // like YJIT does.
+                    let array_block = fun.new_block(branch_insn_idx);
+                    let convert_block = fun.new_block(branch_insn_idx);
+                    let not_array_block = fun.new_block(branch_insn_idx);
+                    let converted_block = fun.new_block(branch_insn_idx);
+                    // Both paths that end up with an array jump to expand_block, which takes the
+                    // array to expand as its parameter.
+                    let expand_block = fun.new_block(branch_insn_idx);
+                    let join_block = fun.new_block(insn_idx);
+
+                    let is_array = fun.push_insn(block, Insn::HasType { val, expected: types::Array });
+                    fun.push_insn(block, Insn::CondBranch {
+                        val: is_array,
+                        if_true: BranchEdge { target: array_block, args: vec![] },
+                        if_false: BranchEdge { target: convert_block, args: vec![] },
+                    });
+
+                    // Already an array; expand it as-is.
+                    let array = fun.push_insn(array_block, Insn::RefineType { val, new_type: types::Array });
+                    fun.push_insn(array_block, Insn::Jump(BranchEdge { target: expand_block, args: vec![array] }));
+
+                    // Not an array; try #to_ary. This may run arbitrary Ruby code.
+                    let converted = fun.push_insn(convert_block, Insn::CheckArrayType { val, state: exit_id });
+                    let not_array = fun.push_insn(convert_block, Insn::HasType { val: converted, expected: types::NilClass });
+                    fun.push_insn(convert_block, Insn::CondBranch {
+                        val: not_array,
+                        if_true: BranchEdge { target: not_array_block, args: vec![] },
+                        if_false: BranchEdge { target: converted_block, args: vec![] },
+                    });
+
+                    // #to_ary is not defined (or returned nil); the value is treated as the
+                    // one-element array [value], so element 0 is the value itself and the rest are
+                    // nil.
+                    let mut elements = vec![];
+                    if num > 0 {
+                        let nil = fun.push_insn(not_array_block, Insn::Const { val: Const::Value(Qnil) });
+                        elements.extend(std::iter::repeat_n(nil, (num - 1) as usize));
+                        elements.push(val);
+                    }
+                    fun.push_insn(not_array_block, Insn::Jump(BranchEdge { target: join_block, args: elements }));
+
+                    // #to_ary returned an array; expand that.
+                    let array = fun.push_insn(converted_block, Insn::RefineType { val: converted, new_type: types::Array });
+                    fun.push_insn(converted_block, Insn::Jump(BranchEdge { target: expand_block, args: vec![array] }));
+
+                    // Read the elements out of the array.
+                    let array = fun.push_insn(expand_block, Insn::Param);
+                    fun.expand_array_elements(expand_block, array, num, branch_insn_idx, join_block);
+
+                    block = join_block;
+                    for _ in 0..num {
+                        let element = fun.push_insn(join_block, Insn::Param);
                         state.stack_push(element);
                     }
                 }

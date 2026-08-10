@@ -5335,6 +5335,125 @@ fn test_expandarray_no_splat() {
 }
 
 #[test]
+fn test_expandarray_no_splat_longer_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test [3, 4, 5]
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test [3, 4, 5]"), @"[3, 4]");
+}
+
+#[test]
+fn test_expandarray_no_splat_shorter_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test [3]
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test [3]"), @"[3, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_nil() {
+    eval("
+        def test(o)
+          a, b, c = o
+          [a, b, c]
+        end
+        test nil
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test nil"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_nil_literal() {
+    eval("
+        def test
+          a, b, c = nil
+          [a, b, c]
+        end
+        test
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_not_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test 5
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test 5"), @"[5, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_to_ary() {
+    eval("
+        class C
+          def to_ary = [1, 2, 3]
+        end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test C.new
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test C.new"), @"[1, 2]");
+}
+
+#[test]
+fn test_expandarray_no_splat_array_subclass() {
+    eval("
+        class MyArray < Array; end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test MyArray.new([3, 4])
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test MyArray.new([3, 4])"), @"[3, 4]");
+}
+
+#[test]
+fn test_expandarray_no_splat_to_ary_defined_after_compile() {
+    eval("
+        class C; end
+        OBJ = C.new
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test OBJ
+        test OBJ
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    // #to_ary is looked up at run-time, so defining it after the method is compiled must be
+    // honored by the compiled code.
+    assert_snapshot!(assert_compiles("
+        before = test(OBJ) == [OBJ, nil]
+        class C
+          def to_ary = [1, 2]
+        end
+        [before, test(OBJ)]
+    "), @"[true, [1, 2]]");
+}
+
+#[test]
 fn test_expandarray_splat() {
     eval("
         def test(o)
