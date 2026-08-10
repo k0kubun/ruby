@@ -1249,6 +1249,10 @@ mod manual_defs {
     pub const VM_CALL_ZSUPER : u32 = 1 << VM_CALL_ZSUPER_bit;
     pub const VM_CALL_OPT_SEND : u32 = 1 << VM_CALL_OPT_SEND_bit;
 
+    // From internal/imemo.h - a plain #define, so bindgen doesn't pick it up. The imemo type of
+    // an object is `(flags >> RUBY_FL_USHIFT) & IMEMO_MASK`.
+    pub const IMEMO_MASK: u32 = 0x0f;
+
     // We'll need to encode a lot of Ruby struct/field offsets as constants unless we want to
     // redeclare all the Ruby C structs and write our own offsetof macro. For now, we use constants.
     pub const RUBY_OFFSET_RBASIC_FLAGS: i32 = 0; // struct RBasic, field "flags"
