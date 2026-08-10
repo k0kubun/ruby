@@ -760,6 +760,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, function, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
         Insn::GetSpecialSymbol { symbol_type, state } => gen_getspecial_symbol(asm, *symbol_type, &function.frame_state(*state)),
         Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
+        Insn::Once { body_iseq, ise, state } => gen_once(jit, asm, function, *body_iseq, *ise, &function.frame_state(*state)),
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, &function.frame_state(state))),
@@ -791,7 +792,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::IsA { val, class } => gen_is_a(jit, asm, opnd!(val), opnd!(class)),
         &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), &function.frame_state(state)),
-        &Insn::Throw { state, .. } => no_output!(gen_throw(jit, asm, function, &function.frame_state(state))),
+        &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), &function.frame_state(state))),
         &Insn::CondBranch { .. }
         | &Insn::Jump { .. } | Insn::Entries { .. } => unreachable!(),
     };
@@ -1234,6 +1235,30 @@ fn gen_getglobal(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
     gen_prepare_non_leaf_call(jit, asm, function, state);
 
     asm_ccall!(asm, rb_gvar_get, id.0.into())
+}
+
+/// Run the `once` body ISEQ on the first execution and return the cached result afterwards
+fn gen_once(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    body_iseq: IseqPtr,
+    ise: *const iseq_inline_storage_entry,
+    state: &FrameState,
+) -> Opnd {
+    // On the first execution, the body ISEQ runs arbitrary Ruby code: it can allocate,
+    // raise, and even escape this frame's environment (vm_once_exec() makes a Proc out of
+    // the current frame). EP escapes are handled by the NoEPEscape patch points that
+    // `invalidates_locals()` arranges for non-leaf instructions.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+
+    // vm_once_dispatch() write-barriers the cached value against CFP_ISEQ(ec->cfp), which
+    // reads the ISEQ out of the JITFrame written just above, so it names the ISEQ that owns
+    // `ise` even for inlined frames.
+    unsafe extern "C" {
+        fn rb_vm_once_dispatch(ec: EcPtr, iseq: IseqPtr, ise: *const iseq_inline_storage_entry) -> VALUE;
+    }
+    asm_ccall!(asm, rb_vm_once_dispatch, EC, VALUE::from(body_iseq).into(), Opnd::const_ptr(ise))
 }
 
 /// Intern a string
@@ -2731,10 +2756,34 @@ fn gen_return(asm: &mut Assembler, val: lir::Opnd) {
     asm.cret(C_RET_OPND);
 }
 
-fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
-    // TODO: Consider calling rb_vm_throw and propagating ec->tag->state to the interpreter.
-    // Also consider making it a jump on method inlining.
-    gen_side_exit(jit, asm, function, &SideExitReason::Throw, None, state);
+/// Compile the `throw` instruction, which implements non-local control flow such as
+/// `break` from a block, `return` from a proc, and `retry`.
+///
+/// rb_zjit_throw() never returns: it longjmps to the enclosing vm_exec(), which
+/// resumes at the catch table entry with vm_exec_handle_exception(). We can't return
+/// the throw data out of the native frame like YJIT does because ZJIT calls compiled
+/// callees with native calls, and the JIT caller would take it for a return value.
+///
+/// TODO: Consider compiling this as a jump when the catch frame is inlined into
+/// this compilation unit.
+fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, throw_state: u32, val: lir::Opnd, state: &FrameState) {
+    gen_incr_counter(asm, Counter::throw_count);
+
+    // rb_vm_throw() allocates with THROW_DATA_NEW() and may raise LocalJumpError, and the
+    // interpreter reads this frame's locals and stack while unwinding, so publish them the
+    // same way as any other non-leaf fallback call. The interpreter pops the thrown value
+    // before calling vm_throw(), so keep it out of the cfp->sp we publish.
+    let state = state.with_stack_size(state.stack_size() - 1);
+    gen_prepare_fallback_call(jit, asm, function, &state);
+
+    asm_comment!(asm, "throw");
+    unsafe extern "C" {
+        fn rb_zjit_throw(ec: EcPtr, cfp: CfpPtr, throw_state: usize, throwobj: VALUE) -> VALUE;
+    }
+    asm_ccall!(asm, rb_zjit_throw, EC, CFP, Opnd::UImm(throw_state.into()), val);
+
+    // rb_zjit_throw() never returns
+    asm.abort();
 }
 
 /// Compile Fixnum + Fixnum
