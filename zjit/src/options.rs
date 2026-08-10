@@ -19,7 +19,7 @@ pub enum PerfMap {
 pub const DEFAULT_MAX_VERSIONS: usize = 4;
 
 /// Default --zjit-num-profiles
-const DEFAULT_NUM_PROFILES: NumProfiles = 5;
+const DEFAULT_NUM_PROFILES: NumProfiles = 20;
 pub type NumProfiles = u16;
 
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
