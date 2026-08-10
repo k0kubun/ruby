@@ -854,6 +854,9 @@ pub enum SendFallbackReason {
     SuperNotOptimizedMethodType(MethodType),
     /// The `super` call is polymorpic.
     SuperPolymorphic,
+    /// A previous version of this ISEQ guarded the frame's method entry at this `super` and the
+    /// guard kept missing, so this version dispatches `super` dynamically instead of exiting.
+    SuperMethodEntryUnstable,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
     /// The `invokeblock` call site passes a splat, keyword, or block argument.
@@ -935,6 +938,7 @@ impl Display for SendFallbackReason {
             SuperNoProfiles => write!(f, "super: no profile data available"),
             SuperNotOptimizedMethodType(method_type) => write!(f, "super: unsupported target method type {:?}", method_type),
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
+            SuperMethodEntryUnstable => write!(f, "super: frame method entry guard kept missing"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
             InvokeBlockComplexArgs => write!(f, "InvokeBlock: splat, keyword, or block argument"),
@@ -1198,6 +1202,13 @@ pub enum Insn {
     /// Load cfp->self
     LoadSelf,
     LoadField { recv: InsnId, id: FieldName, offset: i32, return_type: Type, num_bits: u8 },
+    /// Read the method entry (or cref) that `val` designates, where `val` is the value of a
+    /// frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]`. That slot normally holds the frame's method
+    /// entry, but the VM overwrites it with an `imemo_svar` wrapping the entry the first time
+    /// the frame touches a special variable (`$~`, `$_`, a back reference, ...), so read
+    /// through the svar when there is one. This mirrors `rb_vm_frame_method_entry`, which is
+    /// what the profiler records.
+    UnwrapSvar { val: InsnId },
     /// Write `val` at an offset of `recv`.
     /// When writing a Ruby object to a Ruby object, one must use GuardNotFrozen (or equivalent) before and WriteBarrier after.
     StoreField { recv: InsnId, id: FieldName, offset: i32, val: InsnId, num_bits: u8 },
@@ -1774,6 +1785,9 @@ macro_rules! for_each_operand_impl {
             Insn::LoadField { recv, .. } => {
                 $visit_one!(*recv);
             }
+            Insn::UnwrapSvar { val } => {
+                $visit_one!(*val);
+            }
             Insn::StoreField { recv, val, .. }
             | Insn::WriteBarrier { recv, val } => {
                 $visit_one!(*recv);
@@ -1943,6 +1957,7 @@ impl Insn {
             Insn::GetEP { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::LoadSelf { .. } => Effect::read_write(abstract_heaps::Frame, abstract_heaps::Empty),
             Insn::LoadField { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
+            Insn::UnwrapSvar { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::StoreField { .. } => effects::Any,
             // TODO: Refine CheckMatch effects by flag.
             Insn::CheckMatch { .. } => effects::Any,
@@ -2569,6 +2584,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             &Insn::LoadField { recv, id, offset, return_type: _, num_bits: _ } => {
                 write!(f, "LoadField {recv}, :{id}@{:#x}", self.ptr_map.map_offset(offset))
             }
+            &Insn::UnwrapSvar { val } => write!(f, "UnwrapSvar {val}"),
             &Insn::StoreField { recv, id, offset, val, num_bits: _ } => write!(f, "StoreField {recv}, :{id}@{:#x}, {val}", self.ptr_map.map_offset(offset)),
             &Insn::WriteBarrier { recv, val } => write!(f, "WriteBarrier {recv}, {val}"),
             Insn::SetIvar { self_val, id, val, .. } => write!(f, "SetIvar {self_val}, :{}, {val}", id.contents_lossy()),
@@ -4734,6 +4750,7 @@ impl Function {
             Insn::GetEP { .. } => types::CPtr,
             Insn::LoadSelf => if self.self_is_heap_object { types::HeapBasicObject } else { types::BasicObject },
             &Insn::LoadField { return_type, .. } => return_type,
+            Insn::UnwrapSvar { .. } => types::RubyValue,
             Insn::GetSpecialSymbol { .. } => types::StringExact.union(types::NilClass),
             Insn::GetSpecialNumber { .. } => types::StringExact.union(types::NilClass),
             Insn::GetClassVar { .. } => types::BasicObject,
@@ -6547,9 +6564,15 @@ impl Function {
                             let level = get_lvar_level(local_iseq);
                             let lep = fun.get_ep(block, level);
                             // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
-                            let method_entry = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
-                            // Guard that it matches the expected CME
-                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
+                            let me_cref = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
+                            // The slot holds an imemo_svar wrapping the method entry once the
+                            // frame has touched a special variable, so read through it the same
+                            // way rb_vm_frame_method_entry (and so the profile) does.
+                            let method_entry = fun.push_insn(block, Insn::UnwrapSvar { val: me_cref });
+                            // Guard that it matches the expected CME. Recompile on a miss: the
+                            // profiled CME is not always the one the frame runs with, and exiting
+                            // on every call is far worse than dispatching super dynamically.
+                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: Some(Recompile) });
 
                             let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
                             fun.push_insn(block, Insn::GuardBitEquals {
@@ -6557,7 +6580,7 @@ impl Function {
                                 expected: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)),
                                 reason: Box::new(SideExitReason::UnhandledBlockArg),
                                 state,
-                                recompile: None,
+                                recompile: Some(Recompile),
                             });
                         }
 
@@ -6565,6 +6588,16 @@ impl Function {
                         if !blockiseq.is_null() {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
+                            continue;
+                        }
+
+                        // Specializing `super` requires guarding the frame's method entry against
+                        // one CME. When a previous version's guard kept missing and we have run
+                        // out of versions, stop guessing and dispatch `super` dynamically: staying
+                        // in JIT code costs far less than side-exiting on every call.
+                        if self.policy.no_side_exits {
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperMethodEntryUnstable);
                             continue;
                         }
 
@@ -9098,6 +9131,7 @@ impl Function {
             | Insn::LoadArg { .. }
             | Insn::PutSpecialObject { .. }
             | Insn::LoadField { .. }
+            | Insn::UnwrapSvar { .. }
             | Insn::GetConstantPath { .. }
             | Insn::IsBlockGiven { .. }
             | Insn::GetGlobal { .. }
