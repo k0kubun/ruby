@@ -7171,6 +7171,13 @@ vm_once_dispatch(rb_execution_context_t *ec, ISEQ iseq, ISE is)
     }
 }
 
+// Fallback for ZJIT, not used by the interpreter
+VALUE
+rb_vm_once_dispatch(rb_execution_context_t *ec, ISEQ iseq, ISE ise)
+{
+    return vm_once_dispatch(ec, iseq, ise);
+}
+
 static OFFSET
 vm_case_dispatch(CDHASH hash, OFFSET else_offset, VALUE key)
 {

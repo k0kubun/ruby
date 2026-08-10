@@ -9166,6 +9166,51 @@ fn test_regexp_interpolation() {
 }
 
 #[test]
+fn test_once_regexp_interpolated_only_once() {
+    eval(r##"
+        $once_count = 0
+        def test(str) = /#{($once_count += 1; "a".upcase)}b/o =~ str
+        test("Ab")
+        test("Ab")
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(
+        assert_compiles(r##"[test("Ab"), test("xxAb"), test("zz"), $once_count]"##),
+        @"[0, 2, nil, 1]"
+    );
+}
+
+#[test]
+fn test_once_caches_the_same_regexp() {
+    eval(r##"
+        def test = /#{"a"}b/o
+        test
+        test
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(assert_compiles(r##"[test.equal?(test), test.source]"##), @r#"[true, "ab"]"#);
+}
+
+#[test]
+fn test_once_reruns_body_after_raise() {
+    // vm_once_dispatch() calls vm_once_clear() when the body raises, so the next
+    // execution runs the body again.
+    eval(r##"
+        $once_calls = 0
+        def test
+          /#{($once_calls += 1; raise "boom" if $once_calls <= 2; "a")}b/o
+        rescue => e
+          e.message
+        end
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(
+        assert_compiles_allowing_exits(r##"[test, test, test.source, test.source, $once_calls]"##),
+        @r#"["boom", "boom", "ab", "ab", 3]"#
+    );
+}
+
+#[test]
 fn test_new_range_non_leaf() {
     assert_snapshot!(inspect("
         def jit_entry(v) = make_range_then_exit(v)
