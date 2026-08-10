@@ -3105,6 +3105,140 @@ fn test_invokesuper_with_prepend() {
     "#), @r#"["B", "M"]"#);
 }
 
+/// A monomorphic `super` should stay specialized: no side exits, no dynamic dispatch.
+#[test]
+fn test_invokesuper_monomorphic_does_not_exit() {
+    eval("
+        class MonoSuperA
+          def foo(x) = x + 1
+        end
+        class MonoSuperB < MonoSuperA
+          def foo(x) = super(x) * 10
+        end
+        def test = MonoSuperB.new.foo(1)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("[test, test, test]"), @"[20, 20, 20]");
+}
+
+/// The VM replaces a frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]` with an `imemo_svar` wrapping the
+/// frame's method entry as soon as the frame touches a special variable, which a regexp match
+/// does. The `super` guard has to read through the svar; otherwise it misses on every single
+/// call and the site side-exits forever.
+#[test]
+fn test_invokesuper_after_regexp_match_does_not_exit() {
+    eval(r#"
+        class SvarSuperA
+          def foo(x) = x + 1
+        end
+        class SvarSuperB < SvarSuperA
+          def foo(x)
+            x.to_s =~ /(\d+)/
+            [$1, super(x)]
+          end
+        end
+        def test = SvarSuperB.new.foo(3)
+        test
+        test
+    "#);
+    assert_snapshot!(assert_compiles("[test, test, test]"), @r#"[["3", 4], ["3", 4], ["3", 4]]"#);
+}
+
+/// A `super` inside a module body resolves through a different complemented CME for each
+/// including class, so no single CME can be guarded. The site must converge on dispatching
+/// `super` dynamically rather than side-exiting once per call.
+#[test]
+fn test_invokesuper_polymorphic_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_guard_super_method_entry;
+    // `run` keeps the calls in one ISEQ so that the second phase does not compile anything new.
+    assert_snapshot!(inspect(r#"
+        class PolySuperBase1
+          def foo(x) = [:base1, x]
+        end
+        class PolySuperBase2
+          def foo(x) = [:base2, x]
+        end
+        module PolySuperM
+          def foo(x) = super(x) << :m
+        end
+        class PolySuperA < PolySuperBase1
+          include PolySuperM
+        end
+        class PolySuperB < PolySuperBase2
+          include PolySuperM
+        end
+        def test(o) = o.foo(1)
+        def run(a, b, n) = n.times { test(a); test(b) }
+
+        $poly_super_a = PolySuperA.new
+        $poly_super_b = PolySuperB.new
+        run($poly_super_a, $poly_super_b, 200)
+        [test($poly_super_a), test($poly_super_b)]
+    "#), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+
+    // The site has converged, so exits are now bounded by the recompile budget (a handful per
+    // compiled ISEQ) rather than one per call: without the dynamic fallback, all 1000 super
+    // calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        run($poly_super_a, $poly_super_b, 500)
+        [test($poly_super_a), test($poly_super_b)]
+    "), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+    let delta = exits() - before;
+    assert!(delta < 25, "guard_super_method_entry exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// A `super` in a method that is always called with a block can never pass the specialized
+/// call's block-handler guard. The exits must stop once the site gives up and dispatches
+/// `super` dynamically.
+#[test]
+fn test_invokesuper_always_with_block_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_unhandled_block_arg;
+    assert_snapshot!(inspect(r#"
+        class BlockSuperA
+          def foo(x) = x + 1
+        end
+        class BlockSuperB < BlockSuperA
+          def foo(x) = super(x) * 10
+        end
+        def block_super_test(o) = o.foo(1) { }
+        def block_super_run(o, n) = n.times { block_super_test(o) }
+        $block_super_o = BlockSuperB.new
+        block_super_run($block_super_o, 500)
+        block_super_test($block_super_o)
+    "#), @"20");
+
+    // Exits are bounded by the recompile budget now, not one per call: without the dynamic
+    // fallback all 1000 calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        block_super_run($block_super_o, 1000)
+        block_super_test($block_super_o)
+    "), @"20");
+    let delta = exits() - before;
+    assert!(delta < 25, "unhandled_block_arg exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// Redefining the target of a specialized `super` after it is compiled must take effect.
+#[test]
+fn test_invokesuper_with_target_redefined_after_compile() {
+    assert_snapshot!(inspect(r#"
+        class RedefSuperA
+          def foo = "a1"
+        end
+        class RedefSuperB < RedefSuperA
+          def foo = ["b", super]
+        end
+        def test = RedefSuperB.new.foo
+        before = [test, test, test]
+        class RedefSuperA
+          def foo = "a2"
+        end
+        [before.last, test]
+    "#), @r#"[["b", "a1"], ["b", "a2"]]"#);
+}
+
 #[test]
 fn test_invokesuper_with_keyword_args() {
     assert_snapshot!(inspect(r#"

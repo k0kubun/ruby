@@ -824,6 +824,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::GetEP { level } => gen_get_ep(asm, level),
         Insn::LoadSelf => gen_load_self(asm),
         &Insn::LoadField { recv, id, offset, return_type: _, num_bits } => gen_load_field(asm, opnd!(recv), id, offset, num_bits),
+        &Insn::UnwrapSvar { val } => gen_unwrap_svar(asm, opnd!(val)),
         &Insn::StoreField { recv, id, offset, val, num_bits } => no_output!(gen_store_field(asm, opnd!(recv), id, offset, opnd!(val), num_bits)),
         &Insn::WriteBarrier { recv, val } => no_output!(gen_write_barrier(jit, asm, opnd!(recv), opnd!(val), function.type_of(val))),
         &Insn::IsBlockGiven { block_handler } => gen_is_block_given(asm, opnd!(block_handler)),
@@ -1469,6 +1470,24 @@ fn gen_load_field(asm: &mut Assembler, recv: Opnd, id: FieldName, offset: i32, n
     asm_comment!(asm, "Load field id={id} offset={offset}");
     let recv = asm.load_mem(recv);
     asm.load(Opnd::mem(num_bits, recv, offset))
+}
+
+/// Read the method entry (or cref) that a frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]` designates.
+/// The slot holds that entry directly until the frame touches a special variable, at which
+/// point the VM replaces it with an `imemo_svar` that wraps the entry in its second field
+/// (`cref_or_me`). Whatever the slot holds it is a T_IMEMO, so `flags` tells us which case we
+/// are in, and the second field is in bounds either way (`rb_callable_method_entry_t` and
+/// `struct rb_cref_struct` are both at least as large as `struct vm_svar`), which lets us pick
+/// between the two without branching.
+fn gen_unwrap_svar(asm: &mut Assembler, val: Opnd) -> Opnd {
+    asm_comment!(asm, "unwrap imemo_svar");
+    let val = asm.load_mem(val);
+    let flags = Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS);
+    let imemo_type = asm.and(flags, Opnd::UImm((IMEMO_MASK as u64) << RUBY_FL_USHIFT));
+    asm.cmp(imemo_type, Opnd::UImm((imemo_svar as u64) << RUBY_FL_USHIFT));
+    // struct vm_svar's cref_or_me, i.e. the VALUE right after flags
+    let unwrapped = Opnd::mem(VALUE_BITS, val, SIZEOF_VALUE_I32);
+    asm.csel_e(unwrapped, val)
 }
 
 fn gen_store_field(asm: &mut Assembler, recv: Opnd, id: FieldName, offset: i32, val: Opnd, num_bits: u8) {
