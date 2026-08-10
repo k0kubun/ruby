@@ -6567,23 +6567,23 @@ impl Function {
     fn drop_block_params(&mut self, dropped: &[Vec<usize>]) -> bool {
         if dropped.iter().all(|indices| indices.is_empty()) { return false; }
         for block in self.reverse_post_order() {
-            let drop_set: HashSet<usize> = dropped[block.0].iter().copied().collect();
+            let drop_set: HashSet<usize> = dropped[block.to_usize()].iter().copied().collect();
             if drop_set.is_empty() { continue; }
-            let params = std::mem::take(&mut self.blocks[block.0].params);
-            self.blocks[block.0].params = params.into_iter().enumerate()
+            let params = std::mem::take(&mut self.blocks[block.to_usize()].params);
+            self.blocks[block.to_usize()].params = params.into_iter().enumerate()
                 .filter(|(idx, _)| !drop_set.contains(idx))
                 .map(|(_, param)| param)
                 .collect();
         }
         let retain_args = |edge: &mut BranchEdge, dropped: &[Vec<usize>]| {
-            let drop_set = &dropped[edge.target.0];
+            let drop_set = &dropped[edge.target.to_usize()];
             if drop_set.is_empty() { return; }
             let mut idx = 0;
             edge.args.retain(|_| { let keep = !drop_set.contains(&idx); idx += 1; keep });
         };
         for block in self.reverse_post_order() {
-            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
-            match &mut self.insns[terminator_id.0] {
+            let Some(&terminator_id) = self.blocks[block.to_usize()].insns.last() else { continue };
+            match &mut self.insns[terminator_id.to_usize()] {
                 Insn::Jump(edge) => retain_args(edge, dropped),
                 Insn::CondBranch { if_true, if_false, .. } => {
                     retain_args(if_true, dropped);
@@ -6616,11 +6616,11 @@ impl Function {
             // Entry block parameters are the calling convention, not phis: codegen maps them
             // to argument registers and `copy_param_types` types them from the ISEQ.
             if block == self.entries_block || self.is_entry_block(block) { continue; }
-            let params = self.blocks[block.0].params.clone();
+            let params = self.blocks[block.to_usize()].params.clone();
             let mut consts = vec![];
             for (idx, &param) in params.iter().enumerate() {
                 let Some(val) = self.type_of(param).exact_ruby_value() else { continue };
-                dropped[block.0].push(idx);
+                dropped[block.to_usize()].push(idx);
                 consts.push((param, val));
             }
             // Insert the constants at the top of the block so they dominate every use of the
@@ -6632,13 +6632,13 @@ impl Function {
             for (param, val) in consts {
                 let replacement = *materialized.entry(val).or_insert_with(|| {
                     let replacement = self.new_insn(Insn::Const { val: Const::Value(val) });
-                    self.insn_types[replacement.0] = self.infer_type(replacement);
+                    self.insn_types[replacement.to_usize()] = self.infer_type(replacement);
                     prologue.push(replacement);
                     replacement
                 });
                 self.make_equal_to(param, replacement);
             }
-            self.blocks[block.0].insns.splice(0..0, prologue);
+            self.blocks[block.to_usize()].insns.splice(0..0, prologue);
         }
         self.drop_block_params(&dropped);
     }
@@ -6679,11 +6679,11 @@ impl Function {
         // values to reason from.
         let mut incoming: Vec<Vec<Vec<InsnId>>> = vec![vec![]; self.blocks.len()];
         for &block in &rpo {
-            let Some(&terminator_id) = self.blocks[block.0].insns.last() else { continue };
+            let Some(&terminator_id) = self.blocks[block.to_usize()].insns.last() else { continue };
             let mut push = |target: BlockId, args: &Vec<InsnId>| {
-                incoming[target.0].push(args.clone());
+                incoming[target.to_usize()].push(args.clone());
             };
-            match &self.insns[terminator_id.0] {
+            match &self.insns[terminator_id.to_usize()] {
                 Insn::Jump(edge) => push(edge.target, &edge.args),
                 Insn::CondBranch { if_true, if_false, .. } => {
                     push(if_true.target, &if_true.args);
@@ -6697,9 +6697,9 @@ impl Function {
         let mut dropped: Vec<Vec<usize>> = vec![vec![]; self.blocks.len()];
         for &block in &rpo {
             if block == self.entries_block || self.is_entry_block(block) { continue; }
-            let edges = &incoming[block.0];
+            let edges = &incoming[block.to_usize()];
             if edges.is_empty() { continue; }
-            let params = self.blocks[block.0].params.clone();
+            let params = self.blocks[block.to_usize()].params.clone();
             if !edges.iter().all(|args| args.len() == params.len()) {
                 // Malformed CFG; validation reports the arity mismatch separately.
                 continue;
@@ -6717,7 +6717,7 @@ impl Function {
                     }
                 });
                 if let (true, Some(only)) = (trivial, only) {
-                    dropped[block.0].push(idx);
+                    dropped[block.to_usize()].push(idx);
                     replacements.push((param, only));
                 }
             }
