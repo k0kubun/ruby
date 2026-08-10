@@ -1230,6 +1230,10 @@ mod manual_defs {
     // From iseq.h - via a different constant, which seems to confuse bindgen
     pub const ISEQ_TRANSLATED: usize = RUBY_FL_USER7 as usize;
 
+    // From internal/imemo.h - a plain #define, so bindgen doesn't pick it up. The imemo type of
+    // an object is `(flags >> RUBY_FL_USHIFT) & IMEMO_MASK`.
+    pub const IMEMO_MASK: u32 = 0x0f;
+
     // We'll need to encode a lot of Ruby struct/field offsets as constants unless we want to
     // redeclare all the Ruby C structs and write our own offsetof macro. For now, we use constants.
     pub const RUBY_OFFSET_RBASIC_FLAGS: i32 = 0; // struct RBasic, field "flags"
