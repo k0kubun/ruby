@@ -872,6 +872,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, function, *val, opnd!(val), *chilled, &function.frame_state(*state)),
         Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), &function.frame_state(*state)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
+        &Insn::StringCoderangeOrScan { string, cached, state } => gen_string_coderange_or_scan(jit, asm, opnd!(string), opnd!(cached), &function.frame_state(state)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -5840,6 +5841,62 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
     // Tag the byte
     let byte = asm.lshift(byte, Opnd::UImm(1));
     asm.or(byte, Opnd::UImm(1))
+}
+
+/// Compile a coderange read that scans the string when the cached coderange is UNKNOWN.
+///
+/// `cached` is the coderange bits already masked out of RBASIC flags. UNKNOWN is 0, so the
+/// already-computed case is a test and a fall-through; the scan is a cold branch that joins the
+/// fast path in a block parameter:
+///
+/// ```text
+///     test cached, cached ; jz scan_block
+///     jmp join_block(cached)
+///   scan_block:  rb_enc_str_coderange(string) ; jmp join_block(result & MASK)
+///   join_block(coderange):
+/// ```
+fn gen_string_coderange_or_scan(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    string: Opnd,
+    cached: Opnd,
+    state: &FrameState,
+) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_enc_str_coderange(str: VALUE) -> std::os::raw::c_int;
+    }
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+
+    let scan_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_edge = |val| Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![val] }));
+
+    let cached = asm.load_mem(cached);
+    asm.test(cached, cached);
+    asm.jz(jit, Target::Block(Box::new(lir::BranchEdge { target: scan_block, args: vec![] })));
+    asm.jmp(join_edge(cached));
+
+    asm.set_current_block(scan_block);
+    let scan_label = jit.get_label(asm, scan_block, hir_block_id);
+    asm.write_label(scan_label);
+    // Scanning only reads the string's bytes and caches the result in its flags: it allocates no
+    // Ruby objects, calls no Ruby code, and cannot raise. It can be slow, though, so keep it here
+    // rather than on the path where the coderange is already known.
+    gen_prepare_leaf_call_with_gc(asm, state);
+    let scanned = asm_ccall!(asm, rb_enc_str_coderange, string);
+    // The C function returns an int, so mask off whatever is in the upper half of the register.
+    // The mask is a no-op on the value itself: it is what ENC_CODERANGE() applies to the flags.
+    let scanned = asm.and(scanned.with_num_bits(64), Opnd::UImm(RUBY_ENC_CODERANGE_MASK.into()));
+    asm.jmp(join_edge(scanned));
+
+    asm.set_current_block(join_block);
+    let join_label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(join_label);
+    let param = asm.new_block_param(64);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
