@@ -18465,6 +18465,62 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_megamorphic_send_with_one_target_guards_ancestor() {
+        // Every profiled receiver class inherits the same Base#foo, so the site is megamorphic
+        // in the receiver class but has one call target. One ancestor guard covers all of them
+        // plus the subclasses the profile never saw, and NoMethodOverride keeps that true.
+        set_call_threshold(21);
+        eval("
+        class Base; def foo = 1; end
+        class D0 < Base; end
+        class D1 < Base; end
+        class D2 < Base; end
+        class D3 < Base; end
+        class D4 < Base; end
+        class D5 < Base; end
+        class D6 < Base; end
+        class D7 < Base; end
+        class D8 < Base; end
+
+        def test o
+          o.foo
+        end
+
+        OBJS = [D0.new, D1.new, D2.new, D3.new, D4.new, D5.new, D6.new, D7.new, D8.new]
+        3.times { OBJS.each { |o| test o } }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:14:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint RootBoxOnly
+          v17:CBool = HasAncestor v10, Base
+          CondBranch v17, bb5(), bb6()
+        bb5():
+          PatchPoint NoMethodOverride(Base@0x1008, foo@0x1010, cme:0x1018)
+          PatchPoint MethodRedefined(Base@0x1008, foo@0x1010, cme:0x1018)
+          v31:Fixnum[1] = Const Value(1)
+          Jump bb4(v31)
+        bb6():
+          v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
+          Jump bb4(v22)
+        bb4(v15:BasicObject):
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
     fn specialize_megamorphic_send_chains_profiled_buckets() {
         // A site that saw more receiver classes than the profile has buckets is megamorphic,
         // but the buckets still account for most of its executions, so guard them in-line and

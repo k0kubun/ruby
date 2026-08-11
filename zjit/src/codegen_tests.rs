@@ -4970,6 +4970,83 @@ fn test_megamorphic_send_chain_dispatches_and_falls_back() {
     assert_snapshot!(assert_compiles("OBJS.map { |o| test o } + [test(Unseen.new)]"), @"[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 42]");
 }
 
+/// Thirty subclasses of one class, none of which defines the method: the site is megamorphic
+/// in the receiver class but every receiver resolves the one inherited method.
+const ANCESTOR_GUARD_SETUP: &str = "
+    class Base; def foo = 1; end
+    class Other; def foo = 99; end
+    SUBS = 30.times.map { Class.new(Base) }
+    OBJS = SUBS.map(&:new)
+    def test(o) = o.foo
+    3.times { OBJS.each { |o| test o } }
+";
+
+#[test]
+fn test_ancestor_guard_dispatches_inherited_method() {
+    // A subclass the profile never saw inherits the same method, so it takes the guarded path
+    // too; an unrelated class takes the dynamic fallthrough.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles("
+        [OBJS.map { |o| test o }.uniq, test(Class.new(Base).new), test(Other.new)]
+    "), @"[[1], 1, 99]");
+}
+
+#[test]
+fn test_ancestor_guard_invalidated_by_subclass_override() {
+    // Defining the method in a subclass after the guard was compiled has to invalidate it.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = OBJS.map { |o| test o }.uniq
+        SUBS[0].class_eval { def foo = 100 }
+        [before, OBJS.map { |o| test o }.uniq.sort]
+    "), @"[[1], [1, 100]]");
+}
+
+#[test]
+fn test_ancestor_guard_invalidated_by_prepend() {
+    // So does prepending a module that defines it below the guarded class.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = OBJS.map { |o| test o }.uniq
+        SUBS[1].prepend(Module.new { def foo = 200 })
+        [before, OBJS.map { |o| test o }.uniq.sort]
+    "), @"[[1], [1, 200]]");
+}
+
+#[test]
+fn test_ancestor_guard_rejects_singleton_receiver() {
+    // A singleton method on one instance is invisible to the subclass walk, so the guard
+    // itself has to send singleton-class receivers down the dynamic fallthrough.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        o = OBJS[2]
+        def o.foo = 300
+        OBJS.map { |x| test x }.uniq.sort
+    "), @"[1, 300]");
+}
+
+#[test]
+fn test_ancestor_guard_module_defined_method() {
+    // The shared method can come from a module included into the guarded class rather than
+    // from the class itself.
+    set_call_threshold(21);
+    eval("
+        module M; def foo = 7; end
+        class ModBase; include M; end
+        MOD_SUBS = 30.times.map { Class.new(ModBase) }
+        MOD_OBJS = MOD_SUBS.map(&:new)
+        def test_mod(o) = o.foo
+        3.times { MOD_OBJS.each { |o| test_mod o } }
+    ");
+    assert_snapshot!(assert_compiles("
+        [MOD_OBJS.map { |o| test_mod o }.uniq, test_mod(Class.new(ModBase).new)]
+    "), @"[[7], 7]");
+}
+
 #[test]
 fn test_recursive_fact() {
     assert_snapshot!(inspect("

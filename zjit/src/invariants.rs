@@ -1,6 +1,6 @@
 //! Code invalidation and patching for speculative optimizations.
 
-use std::{collections::{HashMap, HashSet}, mem};
+use std::{collections::{HashMap, HashSet}, mem, sync::atomic::{AtomicBool, Ordering}};
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
@@ -79,6 +79,20 @@ pub struct Invariants {
     /// Map from CME to patch points that assume the method hasn't been redefined
     cme_patch_points: HashMap<*const rb_callable_method_entry_t, HashSet<PatchPoint>>,
 
+    /// Map from method ID to patch points that assume no class below some class
+    /// overrides that method. Keyed by method ID alone: the invalidation hook only
+    /// knows which method table changed, not which of the assumed hierarchies (if
+    /// any) the changed class sits in.
+    no_method_override_patch_points: HashMap<ID, HashSet<PatchPoint>>,
+
+    /// Memoized answers from `rb_zjit_no_method_override_below()`. Proving that nothing
+    /// overrides a method means walking every class below the one it is defined in, and the
+    /// shallow roots that matter most are asked about many times: rubocop compiles ninety
+    /// call sites that want to know whether anything overrides `Object#class`. Dropped whole
+    /// on any method table change, on class free, and on compaction, which covers every event
+    /// that can change an answer or leave a key dangling.
+    no_override_cache: HashMap<(VALUE, ID), bool>,
+
     /// Map from constant ID to patch points that assume the constant hasn't been redefined
     constant_state_patch_points: HashMap<ID, HashSet<PatchPoint>>,
 
@@ -105,6 +119,8 @@ pub struct Invariants {
 impl Invariants {
     /// Update object references in Invariants
     pub fn update_references(&mut self) {
+        // Keys are class VALUEs that compaction may have moved.
+        self.no_override_cache.clear();
         self.update_no_ep_escape_iseq_patch_points();
         self.update_cme_patch_points();
         self.update_no_singleton_class_patch_points();
@@ -128,6 +144,8 @@ impl Invariants {
     /// Forget a class when freeing it. See [Self::forget_iseq] for reasoning.
     pub fn forget_klass(&mut self, klass: VALUE) {
         self.no_singleton_class_patch_points.remove(&klass);
+        // The freed class may be cached as a key, and its address can be reused.
+        self.no_override_cache.clear();
     }
 
     /// Update ISEQ references in Invariants::no_ep_escape_iseq_patch_points
@@ -309,6 +327,84 @@ pub fn track_cme_assumption(
         side_exit_ptr,
         version,
     ));
+}
+
+/// Whether [`rb_zjit_method_lookup_changed`] has anything to do: a
+/// [`Invariant::NoMethodOverride`] patch point to invalidate, or a memoized no-override answer
+/// to drop.
+///
+/// The hook runs on every method table change, including every `def` executed while a program
+/// loads, and almost none of those have anything to invalidate. This lets it return without
+/// taking the VM lock, and unlike reading the maps it is safe to read from a ractor that
+/// doesn't hold the lock.
+static ANY_NO_METHOD_OVERRIDE_STATE: AtomicBool = AtomicBool::new(false);
+
+/// Whether no class below `klass` overrides `mid`, so `mid` resolves to the same method entry
+/// for every instance of `klass` and of its subclasses. Memoized; see
+/// [`Invariants::no_override_cache`].
+pub fn no_method_override_below(klass: VALUE, mid: ID, budget: u32) -> bool {
+    if let Some(&cached) = ZJITState::get_invariants().no_override_cache.get(&(klass, mid)) {
+        return cached;
+    }
+    let result = unsafe { crate::cruby::rb_zjit_no_method_override_below(klass, mid, budget) };
+    ZJITState::get_invariants().no_override_cache.insert((klass, mid), result);
+    ANY_NO_METHOD_OVERRIDE_STATE.store(true, Ordering::Release);
+    result
+}
+
+/// Track a patch point that assumes no class below some class overrides `mid`.
+pub fn track_no_method_override_assumption(
+    mid: ID,
+    patch_point_ptr: CodePtr,
+    side_exit_ptr: CodePtr,
+    version: IseqVersionRef,
+) {
+    let invariants = ZJITState::get_invariants();
+    invariants.no_method_override_patch_points.entry(mid).or_default().insert(PatchPoint::new(
+        patch_point_ptr,
+        side_exit_ptr,
+        version,
+    ));
+    ANY_NO_METHOD_OVERRIDE_STATE.store(true, Ordering::Release);
+}
+
+/// Called from `rb_clear_method_cache()` whenever a method table changes. `mid` is the
+/// method name whose lookup may have changed, or 0 when every name may have changed.
+///
+/// A [`Invariant::NoMethodOverride`] patch point assumes that nothing below some class
+/// defines `mid`. Any definition, undef, alias, visibility change, include, prepend, or
+/// refinement that could break that goes through `rb_clear_method_cache()` with the
+/// method name in hand, and we can't cheaply decide whether the changed class sits below
+/// the class the assumption is about, so invalidate every assumption for that name.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_method_lookup_changed(mid: ID) {
+    // If ZJIT isn't enabled, do nothing. Also skip the lock while nothing assumes
+    // anything: this runs on every method definition, including during boot.
+    if !zjit_enabled_p() || !ZJITState::has_instance() {
+        return;
+    }
+    if !ANY_NO_METHOD_OVERRIDE_STATE.load(Ordering::Acquire) {
+        return;
+    }
+
+    with_vm_lock(src_loc!(), || {
+        let invariants = ZJITState::get_invariants();
+        invariants.no_override_cache.clear();
+        let patch_points = if mid.0 == 0 {
+            mem::take(&mut invariants.no_method_override_patch_points).into_values().flatten().collect()
+        } else {
+            invariants.no_method_override_patch_points.remove(&mid).unwrap_or_default()
+        };
+        if patch_points.is_empty() {
+            return;
+        }
+
+        let name = if mid.0 == 0 { "(all methods)".to_string() } else { mid.contents_lossy().into_owned() };
+        let cb = ZJITState::get_code_block();
+        debug!("Method lookup changed: {name}");
+        compile_patch_points!(cb, patch_points, MethodLookup, "Method lookup changed: {name}");
+        cb.mark_all_executable();
+    });
 }
 
 /// Track a patch point for each constant name in a constant path assumption.
