@@ -20438,6 +20438,167 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_polymorphic_send_with_literal_block() {
+        // A polymorphic call site that passes a literal block gets the same receiver guard
+        // chain as a block-less send, with the block handler carried into every arm.
+        set_call_threshold(4);
+        eval("
+        class C
+          def each
+            yield 1
+          end
+        end
+
+        class D
+          def each
+            yield 2
+          end
+        end
+
+        def test o
+          o.each { |x| x + 1 }
+        end
+
+        test C.new; test D.new; test C.new; test D.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:15:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb5(), bb6()
+        bb5():
+          v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, each@0x1010, cme:0x1018)
+          PushInlineFrame :each, v18 (0x1040), num_args=0
+          v47:Fixnum[1] = Const Value(1)
+          v49:CPtr = GetEP 0
+          v50:CInt64 = LoadField v49, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
+          v51:CInt64[-4] = Const CInt64(-4)
+          v52:CInt64 = IntAnd v50, v51
+          v53:BasicObject = InvokeBlockIseqDirect (0x1068), v52, v47
+          CheckInterrupts
+          PopInlineFrame
+          Jump bb4(v53)
+        bb6():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D], bb7(), bb8()
+        bb7():
+          v23:ObjectSubclass[class_exact:D] = RefineType v10, ObjectSubclass[class_exact:D]
+          PatchPoint NoSingletonClass(D@0x1088)
+          PatchPoint MethodRedefined(D@0x1088, each@0x1010, cme:0x1090)
+          PushInlineFrame :each, v23 (0x10b8), num_args=0
+          v67:Fixnum[2] = Const Value(2)
+          v69:CPtr = GetEP 0
+          v70:CInt64 = LoadField v69, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
+          v71:CInt64[-4] = Const CInt64(-4)
+          v72:CInt64 = IntAnd v70, v71
+          v73:BasicObject = InvokeBlockIseqDirect (0x1068), v72, v67
+          CheckInterrupts
+          PopInlineFrame
+          Jump bb4(v73)
+        bb8():
+          v27:BasicObject = Send v10, 0x1068, :each # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v27)
+        bb4(v15:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn specialize_megamorphic_send_with_one_target_guards_ancestor() {
+        // Every profiled receiver class inherits the same Base#foo, so the site is megamorphic
+        // in the receiver class but has one call target. One ancestor guard covers all of them
+        // plus the subclasses the profile never saw, and NoMethodOverride keeps that true.
+        set_call_threshold(21);
+        eval("
+        class Base; def foo = 1; end
+        class D0 < Base; end
+        class D1 < Base; end
+        class D2 < Base; end
+        class D3 < Base; end
+        class D4 < Base; end
+        class D5 < Base; end
+        class D6 < Base; end
+        class D7 < Base; end
+        class D8 < Base; end
+
+        def test o
+          o.foo
+        end
+
+        OBJS = [D0.new, D1.new, D2.new, D3.new, D4.new, D5.new, D6.new, D7.new, D8.new]
+        3.times { OBJS.each { |o| test o } }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:14:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          CondBranchHasType v10, ObjectSubclass[class_exact:D1], bb5(), bb6()
+        bb5():
+          PatchPoint NoSingletonClass(D1@0x1008)
+          PatchPoint MethodRedefined(D1@0x1008, foo@0x1010, cme:0x1018)
+          v50:Fixnum[1] = Const Value(1)
+          Jump bb4(v50)
+        bb6():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D6], bb7(), bb8()
+        bb7():
+          PatchPoint NoSingletonClass(D6@0x1040)
+          PatchPoint MethodRedefined(D6@0x1040, foo@0x1010, cme:0x1018)
+          v53:Fixnum[1] = Const Value(1)
+          Jump bb4(v53)
+        bb8():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D7], bb9(), bb10()
+        bb9():
+          PatchPoint NoSingletonClass(D7@0x1048)
+          PatchPoint MethodRedefined(D7@0x1048, foo@0x1010, cme:0x1018)
+          v56:Fixnum[1] = Const Value(1)
+          Jump bb4(v56)
+        bb10():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D8], bb11(), bb12()
+        bb11():
+          PatchPoint NoSingletonClass(D8@0x1050)
+          PatchPoint MethodRedefined(D8@0x1050, foo@0x1010, cme:0x1018)
+          v59:Fixnum[1] = Const Value(1)
+          Jump bb4(v59)
+        bb12():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D0], bb13(), bb14()
+        bb13():
+          PatchPoint NoSingletonClass(D0@0x1058)
+          PatchPoint MethodRedefined(D0@0x1058, foo@0x1010, cme:0x1018)
+          v62:Fixnum[1] = Const Value(1)
+          Jump bb4(v62)
+        bb14():
+          v41:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v41)
+        bb4(v15:BasicObject):
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
     fn specialize_megamorphic_send_chains_profiled_buckets() {
         // A site that saw more receiver classes than the profile has buckets is megamorphic,
         // but the buckets still account for most of its executions, so guard them in-line and
