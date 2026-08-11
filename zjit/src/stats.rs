@@ -449,6 +449,10 @@ make_counters! {
     vm_write_jit_frame_count,
     vm_write_sp_count,
     vm_write_locals_count,
+    // Local slots actually written by gen_spill_locals()
+    vm_write_locals_slot_count,
+    // Local slot writes elided because the slot already held the value
+    vm_write_locals_skipped_count,
     vm_write_stack_count,
     vm_write_to_parent_iseq_local_count,
     // TODO(max): Implement
