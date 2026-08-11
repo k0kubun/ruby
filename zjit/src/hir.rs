@@ -2952,6 +2952,13 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
 /// dynamic dispatch, so require the covered share to be at least this large.
 pub const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
 
+/// Minimum share of a `yield` site's profile a block-handler family has to cover for its fast
+/// path to be worth emitting when that fast path is a single tag test on the handler, as the
+/// symbol and IFUNC arms are. Those recognize every handler of their kind rather than the ones
+/// the profile happened to sample, and they cost two instructions on the executions the other
+/// arms cover, so they pay for themselves at a far smaller share than a comparison chain.
+const TAG_TEST_COVERAGE_THRESHOLD: f64 = 0.1;
+
 /// Emit a receiver-type guard chain for a call site: one arm per profiled receiver type, which
 /// performs a [`Insn::Send`] on a receiver refined to that type, plus a fallthrough arm that
 /// performs the dynamic send. All arms jump to a join block, so a miss costs the comparisons but
@@ -9815,13 +9822,13 @@ fn add_iseq_to_hir(
                     // identity because `rb_vm_ifunc_new` allocates a fresh one per call, so this is
                     // 1.0 for a site that always yields to a C block even though the site sees a
                     // different handler object every time. The fast path below only checks the
-                    // handler tag and joins the generic fallback on a miss, so a dominant share of
-                    // IFUNC samples is enough evidence to emit it.
+                    // handler tag and joins the generic fallback on a miss, so it is worth
+                    // emitting well below the share a comparison chain would need.
                     let ifunc_coverage = block_handler_summary.as_ref().map_or(0.0, |summary| {
                         summary.coverage(|_, profiled_type| !profiled_type.is_empty() && profiled_type.is_block_ifunc())
                     });
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
-                        && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
+                        && ifunc_coverage >= TAG_TEST_COVERAGE_THRESHOLD;
 
                     // If the block handler is a known simple ISEQ block with exact arity and no
                     // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
@@ -9867,7 +9874,13 @@ fn add_iseq_to_hir(
                     let mut poly_share: Option<Counter> = None;
                     if let Some(summary) = block_handler_summary.as_ref() {
                         let is_polymorphic = summary.is_polymorphic() || summary.is_skewed_polymorphic();
-                        if block_call_inlinable(flags) && (is_polymorphic || summary.is_monomorphic()) {
+                        // The distribution's shape is not a gate here: what each arm needs is
+                        // that its own family covers enough of the profile, which the coverage
+                        // checks below decide. A site that saw more handlers than the profile
+                        // has buckets for still deserves a symbol test if enough of its yields
+                        // go to symbols, and the samples that did not fit any bucket are
+                        // counted against every arm's share anyway.
+                        if block_call_inlinable(flags) {
                             let mut saw_iseq_bucket = false;
                             for &profiled_type in summary.buckets() {
                                 if profiled_type.is_empty() {
@@ -9932,13 +9945,14 @@ fn add_iseq_to_hir(
                                     && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
                                     && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
                             });
-                            // The two fast paths are gated separately: they test different bits
-                            // of the handler and each one's comparisons are wasted on executions
-                            // the other covers.
+                            // Each fast path is gated on its own family's share: they test
+                            // different bits of the handler, and one arm's comparisons are
+                            // wasted on the executions the others cover. The chain has to clear
+                            // the higher bar because it compares each profiled block in turn.
                             if iseq_coverage < CHAIN_COVERAGE_THRESHOLD {
                                 polymorphic_iseqs.clear();
                             }
-                            if symbol_coverage < CHAIN_COVERAGE_THRESHOLD {
+                            if symbol_coverage < TAG_TEST_COVERAGE_THRESHOLD {
                                 symbol_coverage = 0.0;
                             }
                         }

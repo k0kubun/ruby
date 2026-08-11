@@ -4314,7 +4314,8 @@ mod hir_opt_tests {
         // A yield site whose profile is dominated by handlers we cannot dispatch directly
         // (here proc and symbol handlers) does not get an ISEQ dispatch chain: the ISEQ
         // candidates only cover a small share of the executions, so the chain would compare
-        // and miss on nearly every call and still perform the same generic dispatch.
+        // and miss on nearly every call and still perform the same generic dispatch. The
+        // symbol arm is still emitted, since one tag test covers every symbol the site sees.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4338,17 +4339,32 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:Fixnum[10] = Const Value(10)
-          v12:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v12:CPtr = GetEP 0
+          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v15:CInt64[255] = Const CInt64(255)
+          v16:CInt64 = IntAnd v13, v15
+          v17:CInt64[12] = Const CInt64(12)
+          v18:CBool = IsBitEqual v16, v17
+          CondBranch v18, bb6(), bb7()
+        bb6():
+          v20:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v21:BasicObject = InvokeBlockSymbol v20, v10
+          Jump bb4(v21)
+        bb7():
+          v24:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v24)
+        bb4(v14:BasicObject):
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
     #[test]
     fn test_yield_mixed_iseq_ifunc_profile_dispatches_on_iseqs() {
         // Like the above, but the non-ISEQ handler in the profile is an ifunc block
-        // (Enumerator#each yields to the enumerator's C block). The ifunc handler fails
-        // the ISEQ tag check and takes the generic fallback in-line.
+        // (Enumerator#each yields to the enumerator's C block). Both families are
+        // dispatchable, so the site gets an ifunc tag test ahead of the ISEQ chain rather
+        // than having to pick one of them.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4377,31 +4393,40 @@ mod hir_opt_tests {
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v15:CInt64[3] = Const CInt64(3)
           v16:CInt64 = IntAnd v13, v15
-          v17:CInt64[1] = Const CInt64(1)
+          v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb6(), bb5()
+          CondBranch v18, bb6(), bb7()
         bb6():
-          v20:CInt64[-4] = Const CInt64(-4)
-          v21:CInt64 = IntAnd v13, v20
-          v22:CPtr = LoadField v21, :code_iseq@0x1001
-          v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
+          v20:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v20)
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
-          Jump bb4(v26)
+          v22:CInt64[3] = Const CInt64(3)
+          v23:CInt64 = IntAnd v13, v22
+          v24:CInt64[1] = Const CInt64(1)
+          v25:CBool = IsBitEqual v23, v24
+          CondBranch v25, bb8(), bb5()
         bb8():
-          v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
-          v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
+          v27:CInt64[-4] = Const CInt64(-4)
+          v28:CInt64 = IntAnd v13, v27
+          v29:CPtr = LoadField v28, :code_iseq@0x1001
+          v30:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
+          v31:CBool = IsBitEqual v29, v30
+          CondBranch v31, bb9(), bb10()
         bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
-          Jump bb4(v31)
+          v33:BasicObject = InvokeBlockIseqDirect (0x1002), v28, v10
+          Jump bb4(v33)
         bb10():
+          v35:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
+          v36:CBool = IsBitEqual v29, v35
+          CondBranch v36, bb11(), bb12()
+        bb11():
+          v38:BasicObject = InvokeBlockIseqDirect (0x1003), v28, v10
+          Jump bb4(v38)
+        bb12():
           Jump bb5()
         bb5():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v41:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v41)
         bb4(v14:BasicObject):
           CheckInterrupts
           Return v14
