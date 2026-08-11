@@ -10602,57 +10602,71 @@ impl Insn {
     /// `Always` requires that the instruction's codegen writes the locals on *every* path
     /// through it, at run time as well as at compile time. Several `gen_*` functions emit an
     /// inline fast path that skips the spill (`gen_new_range()` only spills on the slow path
-    /// that may call `<=>`, for instance), so anything but the call sequences below, whose
-    /// spill sits on the single straight-line path from the top of the `gen_*` function, has
-    /// to be `Maybe`.
+    /// that may call `<=>`, for instance), so only the call sequences whose `gen_spill_locals()`
+    /// sits on the straight line from the top of the `gen_*` function are `Always`; anything
+    /// that reaches it from a block its codegen branched to is `Maybe`. The debug assertions in
+    /// `gen_spill_locals()` check both directions of this at compile time.
+    ///
+    /// One arm per line, each naming the `gen_*` function it follows, so that branches adding
+    /// instructions can add their arm without conflicting with each other. Instructions that
+    /// only reach `gen_prepare_leaf_call_with_gc()` do *not* spill locals and need no arm here
+    /// (that path writes the JITFrame and cfp->sp only).
+    ///
+    /// Instructions on other in-flight branches, whose arms a merge has to add here:
+    ///
+    /// ```ignore
+    /// Insn::Throw { state, .. } => Always(*state),              // gen_throw()
+    /// Insn::Once { state, .. } => Maybe(*state),                // gen_once()
+    /// Insn::CheckArrayType { state, .. } => Maybe(*state),      // gen_check_array_type()
+    /// Insn::ArrayAsetOrStore { state, .. } => Maybe(*state),    // gen_array_aset_or_store()
+    /// ```
     pub fn local_spill(&self) -> LocalSpill {
         use LocalSpill::*;
         match self {
-            // gen_prepare_fallback_call()
-            Insn::Send { state, .. }
-            | Insn::SendForward { state, .. }
-            | Insn::InvokeSuper { state, .. }
-            | Insn::InvokeSuperForward { state, .. }
-            | Insn::InvokeBlock { state, .. }
-            | Insn::InvokeBlockIfunc { state, .. }
-            | Insn::InvokeProc { state, .. }
-            // Hand-rolled frame setup that ends in gen_spill_locals()
-            | Insn::PushInlineFrame { state, .. }
-            | Insn::InvokeBlockIseqDirect { state, .. } => Always(*state),
-            Insn::SendDirect(data) => Always(data.state),
-            Insn::CCallWithFrame(data) => Always(data.state),
-            Insn::CCallVariadic(data) => Always(data.state),
-            // Everything else reaches gen_spill_locals() only on some paths through its
-            // gen_* function, so it cannot be assumed to leave every local resident.
-            Insn::Defined { state, .. }
-            | Insn::InvokeBuiltin { state, .. }
-            | Insn::CheckMatch { state, .. }
-            | Insn::NewHash { state, .. }
-            | Insn::ArrayHash { state, .. }
-            | Insn::ArrayMax { state, .. }
-            | Insn::ArrayMin { state, .. }
-            | Insn::ArrayInclude { state, .. }
-            | Insn::ArrayPackBuffer { state, .. }
-            | Insn::DupArrayInclude { state, .. }
-            | Insn::GetConstantPath { state, .. }
-            | Insn::GetConstant { state, .. }
-            | Insn::SetIvar { state, .. }
-            | Insn::GetClassVar { state, .. }
-            | Insn::SetClassVar { state, .. }
-            | Insn::GetGlobal { state, .. }
-            | Insn::SetGlobal { state, .. }
-            | Insn::PutSpecialObject { state, .. }
-            | Insn::HashAref { state, .. }
-            | Insn::HashAset { state, .. }
-            | Insn::ToNewArray { state, .. }
-            | Insn::ToArray { state, .. }
-            | Insn::ArrayExtend { state, .. }
-            | Insn::ToRegexp { state, .. }
-            | Insn::StringConcat { state, .. }
-            | Insn::StringAppend { state, .. }
-            | Insn::StringAppendCodepoint { state, .. }
-            | Insn::NewRange { state, .. }
-            | Insn::ObjectAlloc { state, .. } => Maybe(*state),
+            // Spilled on the straight line of the call sequence: gen_prepare_fallback_call()
+            Insn::Send { state, .. } => Always(*state),                   // gen_send{,_without_block}()
+            Insn::SendForward { state, .. } => Always(*state),            // gen_send_forward()
+            Insn::InvokeSuper { state, .. } => Always(*state),            // gen_invokesuper()
+            Insn::InvokeSuperForward { state, .. } => Always(*state),     // gen_invokesuperforward()
+            Insn::InvokeBlock { state, .. } => Always(*state),            // gen_invokeblock()
+            Insn::InvokeBlockIfunc { state, .. } => Always(*state),       // gen_invokeblock_ifunc()
+            Insn::InvokeProc { state, .. } => Always(*state),             // gen_invokeproc()
+            // Spilled on the straight line of a hand-rolled frame push
+            Insn::SendDirect(data) => Always(data.state),                 // gen_send_iseq_direct()
+            Insn::PushInlineFrame { state, .. } => Always(*state),        // gen_push_inline_frame()
+            Insn::InvokeBlockIseqDirect { state, .. } => Always(*state),  // gen_invoke_block_iseq_direct()
+            Insn::CCallWithFrame(data) => Always(data.state),             // gen_ccall_with_frame()
+            Insn::CCallVariadic(data) => Always(data.state),              // gen_ccall_variadic()
+            // Spilled only on some paths through the gen_* function
+            Insn::ArrayExtend { state, .. } => Maybe(*state),             // gen_array_extend()
+            Insn::ArrayHash { state, .. } => Maybe(*state),               // gen_opt_newarray_hash()
+            Insn::ArrayInclude { state, .. } => Maybe(*state),            // gen_array_include()
+            Insn::ArrayMax { state, .. } => Maybe(*state),                // gen_array_max()
+            Insn::ArrayMin { state, .. } => Maybe(*state),                // gen_array_min()
+            Insn::ArrayPackBuffer { state, .. } => Maybe(*state),         // gen_array_pack_buffer()
+            Insn::CheckMatch { state, .. } => Maybe(*state),              // gen_checkmatch()
+            Insn::Defined { state, .. } => Maybe(*state),                 // gen_defined()
+            Insn::DupArrayInclude { state, .. } => Maybe(*state),         // gen_dup_array_include()
+            Insn::GetClassVar { state, .. } => Maybe(*state),             // gen_getclassvar()
+            Insn::GetConstant { state, .. } => Maybe(*state),             // gen_getconstant()
+            Insn::GetConstantPath { state, .. } => Maybe(*state),         // gen_get_constant_path()
+            Insn::GetGlobal { state, .. } => Maybe(*state),               // gen_getglobal()
+            Insn::HashAref { state, .. } => Maybe(*state),                // gen_hash_aref()
+            Insn::HashAset { state, .. } => Maybe(*state),                // gen_hash_aset()
+            Insn::InvokeBuiltin { state, .. } => Maybe(*state),           // gen_invokebuiltin()
+            Insn::NewHash { state, .. } => Maybe(*state),                 // gen_new_hash()
+            Insn::NewRange { state, .. } => Maybe(*state),                // gen_new_range()
+            Insn::ObjectAlloc { state, .. } => Maybe(*state),             // gen_object_alloc()
+            Insn::PutSpecialObject { state, .. } => Maybe(*state),        // gen_putspecialobject()
+            Insn::SetClassVar { state, .. } => Maybe(*state),             // gen_setclassvar()
+            Insn::SetGlobal { state, .. } => Maybe(*state),               // gen_setglobal()
+            Insn::SetIvar { state, .. } => Maybe(*state),                 // gen_setivar()
+            Insn::StringAppend { state, .. } => Maybe(*state),            // gen_string_append()
+            Insn::StringAppendCodepoint { state, .. } => Maybe(*state),   // gen_string_append_codepoint()
+            Insn::StringConcat { state, .. } => Maybe(*state),            // gen_string_concat()
+            Insn::ToArray { state, .. } => Maybe(*state),                 // gen_to_array()
+            Insn::ToNewArray { state, .. } => Maybe(*state),              // gen_to_new_array()
+            Insn::ToRegexp { state, .. } => Maybe(*state),                // gen_toregexp()
             _ => No,
         }
     }
@@ -10667,15 +10681,24 @@ impl Insn {
     /// slots: it would need a reference to this frame's environment, which requires escaping the
     /// EP, and that moves the environment to the heap and invalidates
     /// [`Invariant::NoEPEscape`] for this ISEQ.
+    ///
+    /// Instructions on other in-flight branches, whose arms a merge has to add here:
+    ///
+    /// ```ignore
+    /// // vm_once_exec() makes a Proc out of this frame to run the body ISEQ
+    /// Insn::Once { .. } => true,
+    /// ```
     pub fn may_clobber_local_slots(&self) -> bool {
         match self {
             // Writes a local through the EP
-            Insn::SetLocal { .. } | Insn::GetBlockParam { .. } => true,
+            Insn::SetLocal { .. } => true,
+            Insn::GetBlockParam { .. } => true,
             // Writes an arbitrary field, which may be a local slot (e.g. the JIT entry
             // initializing an escaped environment)
             Insn::StoreField { .. } => true,
             // Moves the SP register, which renames every slot offset
-            Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => true,
+            Insn::PushInlineFrame { .. } => true,
+            Insn::PopInlineFrame { .. } => true,
             // Starts a frame; nothing before it in this function
             Insn::EntryPoint { .. } => true,
             // Calls that may pass a block whose environment is this frame
@@ -10684,8 +10707,8 @@ impl Insn {
             Insn::SendDirect(data) => data.block.is_some(),
             Insn::CCallWithFrame(data) => data.block.is_some(),
             Insn::CCallVariadic(data) => data.block.is_some(),
-            Insn::InvokeSuper { blockiseq, .. } | Insn::InvokeSuperForward { blockiseq, .. } =>
-                !blockiseq.is_null(),
+            Insn::InvokeSuper { blockiseq, .. } => !blockiseq.is_null(),
+            Insn::InvokeSuperForward { blockiseq, .. } => !blockiseq.is_null(),
             // The receiver may be a Proc made from this frame's environment
             Insn::InvokeProc { .. } => true,
             // Builtins can do anything, including writing locals of the calling frame
