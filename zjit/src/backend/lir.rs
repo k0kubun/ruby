@@ -1800,6 +1800,10 @@ impl Assembler
         &mut self.basic_blocks[self.current_block_id.0]
     }
 
+    pub fn current_block_id(&self) -> BlockId {
+        self.current_block_id
+    }
+
     /// Return basic blocks sorted by RPO index, then by block ID.
     /// TODO: Use a more advanced scheduling algorithm
     pub fn sorted_blocks(&self) -> Vec<&BasicBlock> {

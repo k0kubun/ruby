@@ -80,6 +80,7 @@ fn test_breakpoint_hir_codegen() {
         function.num_insns(),
         function.num_blocks(),
         0,
+        crate::hir::SyncedLocals::none(),
     );
     let mut asm = Assembler::new();
     asm.new_block_without_id("test");
@@ -7850,4 +7851,131 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       end
       :done
     "#), @":done");
+}
+
+// Tests for redundant local spill elimination (hir::analyze_synced_locals). Each of these
+// programs makes the JIT skip spilling locals that are already in their VM stack slots, and
+// then observes the slots from the interpreter.
+
+#[test]
+fn test_spill_elimination_rescue_reads_locals() {
+    // A rescue in this frame runs in the interpreter and reads the locals out of their slots,
+    // so every local the raising call could expose must be resident when it runs.
+    assert_snapshot!(inspect("
+        def raiser = raise('boom')
+        def test(o)
+          a = 1
+          b = 2
+          begin
+            o.send(:itself)
+            a = 3
+            b = 4
+            o.send(:raiser)
+            a = 99
+          rescue RuntimeError
+            [a, b]
+          end
+        end
+        o = Object.new
+        [test(o), test(o), test(o), test(o)]
+    "), @"[[3, 4], [3, 4], [3, 4], [3, 4]]");
+}
+
+#[test]
+fn test_spill_elimination_block_writes_caller_local() {
+    // A block that shares this frame's EP writes the caller's local slot directly, so the JIT
+    // must not assume the slot still holds what it last spilled there.
+    assert_snapshot!(inspect("
+        def twice
+          yield
+          yield
+        end
+        def test(o)
+          x = 0
+          y = 0
+          o.send(:itself)
+          twice { x += 1 }
+          o.send(:itself)
+          y = x + 1
+          o.send(:itself)
+          [x, y]
+        end
+        o = Object.new
+        [test(o), test(o), test(o), test(o)]
+    "), @"[[2, 3], [2, 3], [2, 3], [2, 3]]");
+}
+
+#[test]
+fn test_spill_elimination_binding_reads_locals() {
+    // Binding reads the locals out of the frame, which requires them to be resident at the
+    // call that creates it.
+    assert_snapshot!(inspect("
+        def test(o)
+          a = 1
+          b = 2
+          o.send(:itself)
+          a = 3
+          o.send(:itself)
+          bind = binding
+          [bind.local_variable_get(:a), bind.local_variable_get(:b)]
+        end
+        o = Object.new
+        [test(o), test(o), test(o)]
+    "), @"[[3, 2], [3, 2], [3, 2]]");
+}
+
+#[test]
+fn test_spill_elimination_loop_keeps_locals_correct() {
+    // Repeated dynamic sends in a loop: the locals that never change are spilled once, but a
+    // Binding at the end must still see every local.
+    assert_snapshot!(inspect("
+        def test(o)
+          a = 1
+          b = 2
+          c = 0
+          i = 0
+          while i < 5
+            o.send(:itself)
+            o.send(:itself)
+            c = c + a + b
+            i += 1
+          end
+          bind = binding
+          [a, b, c, i, bind.local_variable_get(:c)]
+        end
+        o = Object.new
+        [test(o), test(o), test(o)]
+    "), @"[[1, 2, 15, 5, 15], [1, 2, 15, 5, 15], [1, 2, 15, 5, 15]]");
+}
+
+#[test]
+fn test_spill_elimination_skips_unchanged_locals() {
+    crate::options::enable_zjit_stats();
+    assert_snapshot!(inspect("
+        def test(o)
+          a = 1
+          b = 2
+          c = 3
+          d = 4
+          i = 0
+          while i < 10
+            o.send(:itself)
+            o.send(:itself)
+            o.send(:itself)
+            i += 1
+          end
+          [a, b, c, d, i]
+        end
+        o = Object.new
+        test(o)
+        test(o)
+        test(o)
+    "), @"[1, 2, 3, 4, 10]");
+    let counters = crate::state::ZJITState::get_counters();
+    let skipped = counters.vm_write_locals_skipped_count;
+    let written = counters.vm_write_locals_slot_count;
+    // Only `i` changes in the loop, so the vast majority of the stores are redundant
+    assert!(skipped > written,
+        "expected most local spills to be skipped, but skipped {skipped} of {} stores",
+        skipped + written);
 }

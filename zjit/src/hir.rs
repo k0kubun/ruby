@@ -10572,6 +10572,500 @@ impl<'a> LoopInfo<'a> {
     }
 }
 
+/// Whether an instruction's codegen writes this frame's locals into their VM stack slots,
+/// i.e. whether it calls `gen_spill_locals()`. Keep in sync with codegen; the debug
+/// assertion in `gen_spill_locals()` catches instructions that are missing from here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalSpill {
+    /// Codegen never writes the frame's local slots for this instruction.
+    No,
+    /// Codegen always writes every local of this `Snapshot` into its frame slot.
+    Always(InsnId),
+    /// Codegen writes every local of this `Snapshot` into its frame slot on some
+    /// compile-time paths only; the `gen_*` function decides.
+    Maybe(InsnId),
+}
+
+impl LocalSpill {
+    /// The `Snapshot` whose locals may be spilled, if any.
+    pub fn state(&self) -> Option<InsnId> {
+        match *self {
+            LocalSpill::No => None,
+            LocalSpill::Always(state) | LocalSpill::Maybe(state) => Some(state),
+        }
+    }
+}
+
+impl Insn {
+    /// See [`LocalSpill`].
+    ///
+    /// `Always` requires that the instruction's codegen writes the locals on *every* path
+    /// through it, at run time as well as at compile time. Several `gen_*` functions emit an
+    /// inline fast path that skips the spill (`gen_new_range()` only spills on the slow path
+    /// that may call `<=>`, for instance), so anything but the call sequences below, whose
+    /// spill sits on the single straight-line path from the top of the `gen_*` function, has
+    /// to be `Maybe`.
+    pub fn local_spill(&self) -> LocalSpill {
+        use LocalSpill::*;
+        match self {
+            // gen_prepare_fallback_call()
+            Insn::Send { state, .. }
+            | Insn::SendForward { state, .. }
+            | Insn::InvokeSuper { state, .. }
+            | Insn::InvokeSuperForward { state, .. }
+            | Insn::InvokeBlock { state, .. }
+            | Insn::InvokeBlockIfunc { state, .. }
+            | Insn::InvokeProc { state, .. }
+            // Hand-rolled frame setup that ends in gen_spill_locals()
+            | Insn::PushInlineFrame { state, .. }
+            | Insn::InvokeBlockIseqDirect { state, .. } => Always(*state),
+            Insn::SendDirect(data) => Always(data.state),
+            Insn::CCallWithFrame(data) => Always(data.state),
+            Insn::CCallVariadic(data) => Always(data.state),
+            // Everything else reaches gen_spill_locals() only on some paths through its
+            // gen_* function, so it cannot be assumed to leave every local resident.
+            Insn::Defined { state, .. }
+            | Insn::InvokeBuiltin { state, .. }
+            | Insn::CheckMatch { state, .. }
+            | Insn::NewHash { state, .. }
+            | Insn::ArrayHash { state, .. }
+            | Insn::ArrayMax { state, .. }
+            | Insn::ArrayMin { state, .. }
+            | Insn::ArrayInclude { state, .. }
+            | Insn::ArrayPackBuffer { state, .. }
+            | Insn::DupArrayInclude { state, .. }
+            | Insn::GetConstantPath { state, .. }
+            | Insn::GetConstant { state, .. }
+            | Insn::SetIvar { state, .. }
+            | Insn::GetClassVar { state, .. }
+            | Insn::SetClassVar { state, .. }
+            | Insn::GetGlobal { state, .. }
+            | Insn::SetGlobal { state, .. }
+            | Insn::PutSpecialObject { state, .. }
+            | Insn::HashAref { state, .. }
+            | Insn::HashAset { state, .. }
+            | Insn::ToNewArray { state, .. }
+            | Insn::ToArray { state, .. }
+            | Insn::ArrayExtend { state, .. }
+            | Insn::ToRegexp { state, .. }
+            | Insn::StringConcat { state, .. }
+            | Insn::StringAppend { state, .. }
+            | Insn::StringAppendCodepoint { state, .. }
+            | Insn::NewRange { state, .. }
+            | Insn::ObjectAlloc { state, .. } => Maybe(*state),
+            _ => No,
+        }
+    }
+
+    /// Whether this instruction may write this frame's local slots in the VM stack with a value
+    /// the JIT does not know, invalidating the assumption that a slot still holds the value the
+    /// JIT last wrote there. This is either a write through the EP, a call that hands a block
+    /// belonging to this frame to a callee (`setlocal` with `level > 0` in the block writes our
+    /// slots directly), or a change of the `SP` register that renames the slots.
+    ///
+    /// Arbitrary Ruby code that does not receive a block from this frame cannot reach these
+    /// slots: it would need a reference to this frame's environment, which requires escaping the
+    /// EP, and that moves the environment to the heap and invalidates
+    /// [`Invariant::NoEPEscape`] for this ISEQ.
+    pub fn may_clobber_local_slots(&self) -> bool {
+        match self {
+            // Writes a local through the EP
+            Insn::SetLocal { .. } | Insn::GetBlockParam { .. } => true,
+            // Writes an arbitrary field, which may be a local slot (e.g. the JIT entry
+            // initializing an escaped environment)
+            Insn::StoreField { .. } => true,
+            // Moves the SP register, which renames every slot offset
+            Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => true,
+            // Starts a frame; nothing before it in this function
+            Insn::EntryPoint { .. } => true,
+            // Calls that may pass a block whose environment is this frame
+            Insn::Send { block: Some(_), .. } => true,
+            Insn::SendForward { .. } => true,
+            Insn::SendDirect(data) => data.block.is_some(),
+            Insn::CCallWithFrame(data) => data.block.is_some(),
+            Insn::CCallVariadic(data) => data.block.is_some(),
+            Insn::InvokeSuper { blockiseq, .. } | Insn::InvokeSuperForward { blockiseq, .. } =>
+                !blockiseq.is_null(),
+            // The receiver may be a Proc made from this frame's environment
+            Insn::InvokeProc { .. } => true,
+            // Builtins can do anything, including writing locals of the calling frame
+            Insn::InvokeBuiltin { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+/// What we know a local's VM stack slot holds at a given program point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlotValue {
+    /// The slot holds the value produced by this instruction.
+    Insn(InsnId),
+    /// The slot holds this Ruby object, whichever instruction produced it.
+    Object(VALUE),
+}
+
+/// Identity of the interpreter frame a block's locals belong to. Locals of different frames live
+/// at different VM stack offsets, so facts never flow between blocks of different frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameShape {
+    iseq: IseqPtr,
+    depth: InlineDepth,
+    num_locals: usize,
+}
+
+/// What the VM stack slots of one frame's locals hold, indexed by local index. `None` means we
+/// don't know what the slot holds.
+type SlotState = Vec<Option<SlotValue>>;
+
+/// Locals that are already resident in their VM stack slot at each instruction that spills
+/// locals. Computed by [`analyze_synced_locals`] and consumed by `gen_spill_locals()`, which
+/// skips the redundant stores.
+pub struct SyncedLocals {
+    /// Indexed by `InsnId`. `Some(mask)` for instructions that spill locals, where a set bit
+    /// means "local `idx` is already in its slot, skip the store".
+    masks: Vec<Option<BitSet<usize>>>,
+}
+
+impl SyncedLocals {
+    fn new(num_insns: usize) -> Self {
+        SyncedLocals { masks: vec![None; num_insns] }
+    }
+
+    /// No local is known to be resident, so every spill writes every local.
+    pub fn none() -> Self {
+        SyncedLocals { masks: vec![] }
+    }
+
+    /// Whether local `local_idx` of the frame is already resident in its VM stack slot just
+    /// before `insn_id` runs.
+    pub fn is_synced(&self, insn_id: InsnId, local_idx: usize) -> bool {
+        match self.masks.get(insn_id.to_usize()) {
+            Some(Some(mask)) => mask.get(local_idx),
+            _ => false,
+        }
+    }
+}
+
+/// Give up if the dataflow does not converge this quickly. It normally takes a handful of
+/// rounds; the bound only exists so that a pathological CFG cannot make us loop forever.
+const SYNCED_LOCALS_MAX_ROUNDS: usize = 100;
+
+/// Compute, for every instruction that spills locals, which locals are already resident in their
+/// VM stack slot (see [`SyncedLocals`]).
+///
+/// The property tracked is purely physical: "the VM stack slot for local `i` already holds the
+/// value that this frame state says local `i` is". Spilling such a local writes the value that
+/// is already there, so dropping the store cannot change what any reader of the slots observes:
+/// the interpreter running a rescue/ensure in this frame, `Binding`, a block that shares this
+/// EP, lazy frame materialization, and GC marking all see the same bytes either way.
+///
+/// This is a forward "must" dataflow analysis, like available expressions: a fact holds at a
+/// block only if it holds along every path into it. Facts are generated by spilling a local, by
+/// loading a local out of its slot, and at the interpreter entry point (`vm_push_frame` nils
+/// every non-parameter local, and the entry reads the parameters out of their slots). Facts are
+/// killed by rebinding a local, which needs no instruction classification because it changes the
+/// value the frame state names, and by instructions that may write the slots behind the JIT's
+/// back ([`Insn::may_clobber_local_slots`]).
+pub fn analyze_synced_locals(function: &Function) -> SyncedLocals {
+    let num_blocks = function.num_blocks();
+    let rpo: Vec<BlockId> = function.reverse_post_order().into_iter()
+        .filter(|&block_id| block_id != function.entries_block)
+        .collect();
+    let cfi = ControlFlowInfo::new(function);
+
+    // The frame each block's locals live in. Blocks we cannot make sense of get `None`; they
+    // neither skip stores nor pass facts on to their successors.
+    let mut shapes: Vec<Option<FrameShape>> = (0..num_blocks)
+        .map(|idx| block_frame_shape(function, BlockId(idx as u32)))
+        .collect();
+    // Blocks that mention no frame at all (guard chains, the interpreter entry block) are glue
+    // between blocks of one frame. Give them the frame of their neighbors so that facts flow
+    // through them; if the neighbors disagree, leave them out of the analysis.
+    for _ in 0..num_blocks {
+        let mut changed = false;
+        for &block_id in &rpo {
+            if shapes[block_id.to_usize()].is_some() { continue }
+            let from_preds = agreed_shape(&shapes, cfi.predecessors(block_id));
+            let adopted = from_preds.or_else(|| agreed_shape(&shapes, cfi.successors(block_id)));
+            if let Some(shape) = adopted {
+                shapes[block_id.to_usize()] = Some(shape);
+                changed = true;
+            }
+        }
+        if !changed { break }
+    }
+
+    // Facts at block entry and block exit. `None` means "not computed yet", which the meet
+    // treats as the optimistic top element so that facts only ever get killed as the analysis
+    // converges to a fixed point.
+    let mut block_in: Vec<Option<SlotState>> = vec![None; num_blocks];
+    let mut block_out: Vec<Option<SlotState>> = vec![None; num_blocks];
+
+    let mut rounds = 0;
+    loop {
+        let mut changed = false;
+        for &block_id in &rpo {
+            let block_idx = block_id.to_usize();
+            let Some(shape) = shapes[block_idx] else { continue };
+
+            if !function.is_entry_block(block_id) {
+                // Meet: a slot is only known to hold a value if every predecessor edge agrees.
+                let mut merged: Option<SlotState> = None;
+                for pred_id in cfi.predecessors(block_id) {
+                    for (target, args) in block_edges(function, pred_id) {
+                        if target != block_id { continue; }
+                        let incoming = if shapes[pred_id.to_usize()] != Some(shape) {
+                            // A predecessor whose locals live somewhere else, or that we could
+                            // not make sense of, tells us nothing.
+                            vec![None; shape.num_locals]
+                        } else {
+                            match &block_out[pred_id.to_usize()] {
+                                // Not computed yet: stay optimistic
+                                None => continue,
+                                Some(out) => translate_edge(function, out, args, block_id),
+                            }
+                        };
+                        merged = Some(match merged {
+                            None => incoming,
+                            Some(merged) => meet_slot_states(&merged, &incoming),
+                        });
+                    }
+                }
+                let new_in = merged.unwrap_or_else(|| vec![None; shape.num_locals]);
+                if block_in[block_idx].as_ref() != Some(&new_in) {
+                    block_in[block_idx] = Some(new_in);
+                    changed = true;
+                }
+            }
+
+            let entry_state = block_in[block_idx].clone()
+                .unwrap_or_else(|| vec![None; shape.num_locals]);
+            let out = transfer_block(function, block_id, shape, entry_state, None);
+            if block_out[block_idx].as_ref() != Some(&out) {
+                block_out[block_idx] = Some(out);
+                changed = true;
+            }
+        }
+        if !changed { break; }
+        rounds += 1;
+        if rounds > SYNCED_LOCALS_MAX_ROUNDS {
+            debug_assert!(false, "synced locals analysis did not converge");
+            return SyncedLocals::none();
+        }
+    }
+
+    // The block entry facts have converged; walk the blocks once more to record the masks for
+    // the instructions that spill locals.
+    let mut synced = SyncedLocals::new(function.num_insns());
+    for &block_id in &rpo {
+        let block_idx = block_id.to_usize();
+        let Some(shape) = shapes[block_idx] else { continue };
+        let entry_state = block_in[block_idx].clone()
+            .unwrap_or_else(|| vec![None; shape.num_locals]);
+        transfer_block(function, block_id, shape, entry_state, Some(&mut synced));
+    }
+    synced
+}
+
+/// The one frame every given block agrees on, ignoring blocks with no frame yet. `None` if they
+/// disagree or none of them has a frame.
+fn agreed_shape(shapes: &[Option<FrameShape>], blocks: impl Iterator<Item = BlockId>) -> Option<FrameShape> {
+    let mut agreed: Option<FrameShape> = None;
+    for block_id in blocks {
+        match shapes[block_id.to_usize()] {
+            None => {}
+            Some(shape) => match agreed {
+                None => agreed = Some(shape),
+                Some(known) if known == shape => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    agreed
+}
+
+/// Determine the frame whose locals a block's instructions describe. Returns `None` when the
+/// block says nothing about locals or (defensively) mentions more than one frame.
+fn block_frame_shape(function: &Function, block_id: BlockId) -> Option<FrameShape> {
+    let mut shape: Option<FrameShape> = None;
+    let note = |state: &FrameState, shape: &mut Option<FrameShape>| -> bool {
+        if state.locals.is_empty() {
+            // `without_locals()` snapshots say nothing about the frame's locals
+            return true;
+        }
+        let found = FrameShape { iseq: state.iseq, depth: state.depth, num_locals: state.locals.len() };
+        match *shape {
+            None => { *shape = Some(found); true }
+            Some(known) => known == found,
+        }
+    };
+    for &insn_id in function.block(block_id).insns() {
+        let insn = ResolvedInsnId(function.find_id(insn_id)).insn(function);
+        let spill_state = insn.local_spill().state();
+        if let Insn::Snapshot { state } = insn {
+            if !note(state, &mut shape) { return None; }
+        }
+        if let Some(state_id) = spill_state {
+            // The `Snapshot` a spill site refers to often lives in another block
+            if !note(&function.frame_state(state_id), &mut shape) { return None; }
+        }
+    }
+    shape
+}
+
+/// Return each outgoing edge of a block as (target, args). The args are not resolved through
+/// union-find; use [`Function::find_id`] before comparing them.
+fn block_edges<'a>(function: &'a Function, block_id: BlockId) -> Vec<(BlockId, &'a [InsnId])> {
+    let Some(&terminator_id) = function.block(block_id).insns().last() else { return vec![] };
+    match ResolvedInsnId(function.find_id(terminator_id)).insn(function) {
+        Insn::Jump(edge) => vec![(edge.target, edge.args.as_slice())],
+        Insn::CondBranch { if_true, if_false, .. } =>
+            vec![(if_true.target, if_true.args.as_slice()), (if_false.target, if_false.args.as_slice())],
+        _ => vec![],
+    }
+}
+
+/// Rewrite facts from a predecessor into the successor's names. A value that the edge passes as
+/// an argument is known in the successor as the matching block parameter; any other value keeps
+/// its name. This makes no assumption about the layout of a block's parameters: whatever the
+/// edge passes at position `i` is what parameter `i` holds when arriving along this edge, so a
+/// slot that holds the argument holds the parameter.
+fn translate_edge(function: &Function, out: &SlotState, args: &[InsnId], target: BlockId) -> SlotState {
+    let params: Vec<InsnId> = function.block(target).params().copied().collect();
+    out.iter().map(|slot| match *slot {
+        None => None,
+        // Object identity does not depend on which instruction produced the object
+        Some(SlotValue::Object(obj)) => Some(SlotValue::Object(obj)),
+        Some(SlotValue::Insn(insn_id)) => {
+            let renamed = args.iter()
+                .position(|&arg| function.find_id(arg) == insn_id)
+                .and_then(|idx| params.get(idx));
+            match renamed {
+                Some(&param) => Some(slot_value_of(function, param)),
+                None => Some(SlotValue::Insn(insn_id)),
+            }
+        }
+    }).collect()
+}
+
+/// Keep only the facts that both states agree on.
+fn meet_slot_states(left: &SlotState, right: &SlotState) -> SlotState {
+    left.iter().zip(right.iter())
+        .map(|(left, right)| if left == right { *left } else { None })
+        .collect()
+}
+
+/// Whether `slot` is known to hold the value of `insn_id`.
+fn slot_holds(function: &Function, slot: Option<SlotValue>, insn_id: InsnId) -> bool {
+    match slot {
+        None => false,
+        Some(SlotValue::Insn(known)) => known == function.find_id(insn_id),
+        Some(SlotValue::Object(known)) => function.type_of(insn_id).ruby_object() == Some(known),
+    }
+}
+
+/// What we know a slot holds after storing `insn_id` into it. Prefer object identity when the
+/// value is a known object so that another instruction producing the same object (another `nil`,
+/// say) also counts as resident.
+fn slot_value_of(function: &Function, insn_id: InsnId) -> SlotValue {
+    match function.type_of(insn_id).ruby_object() {
+        Some(obj) => SlotValue::Object(obj),
+        None => SlotValue::Insn(function.find_id(insn_id)),
+    }
+}
+
+/// Run the analysis over one block, returning the facts that hold at the end of it. With
+/// `synced`, also record the mask of already-resident locals for each instruction that spills.
+fn transfer_block(
+    function: &Function,
+    block_id: BlockId,
+    shape: FrameShape,
+    mut state: SlotState,
+    mut synced: Option<&mut SyncedLocals>,
+) -> SlotState {
+    for &insn_id in function.block(block_id).insns() {
+        // Read the instruction without cloning it. Its operands are not resolved through
+        // union-find, so resolve them explicitly (`find_id`) where we compare them.
+        let insn = ResolvedInsnId(function.find_id(insn_id)).insn(function);
+
+        // On entry from the interpreter every local is already in its slot: `vm_push_frame()`
+        // nils every local that is not a parameter, and the parameters were written by the
+        // caller. (The parameter loads below cover the parameters, so the nils are what needs
+        // saying here.)
+        if let Insn::EntryPoint { jit_entry_idx: None } = insn {
+            state.fill(None);
+            if shape.depth == 0 && shape.iseq == function.iseq && !iseq_ep_starts_escaped(shape.iseq) {
+                let param_size = unsafe { shape.iseq.params() }.size.to_usize();
+                for local_idx in param_size..shape.num_locals {
+                    state[local_idx] = Some(SlotValue::Object(Qnil));
+                }
+            }
+            continue;
+        }
+
+        // Reading a local out of its slot proves that the slot holds that value. This covers the
+        // interpreter entry's parameter loads and the reloads after a call taking a block.
+        if let Some(local_idx) = loaded_local_idx(function, insn, shape) {
+            state[local_idx] = Some(slot_value_of(function, insn_id));
+            continue;
+        }
+
+        let spill = insn.local_spill();
+        if let Some(state_id) = spill.state() {
+            let spilled = function.frame_state(state_id);
+            if spilled.locals.len() == shape.num_locals
+                && spilled.depth == shape.depth
+                && spilled.iseq == shape.iseq
+            {
+                let mut mask = BitSet::with_capacity(shape.num_locals.max(1));
+                for (local_idx, &local) in spilled.locals.iter().enumerate() {
+                    if slot_holds(function, state[local_idx], local) {
+                        mask.insert(local_idx);
+                    }
+                }
+                match spill {
+                    // Every local is in its slot after the spill
+                    LocalSpill::Always(_) => {
+                        for (local_idx, &local) in spilled.locals.iter().enumerate() {
+                            state[local_idx] = Some(slot_value_of(function, local));
+                        }
+                    }
+                    // The store may not have happened, so only the slots that already held the
+                    // current value are still known.
+                    LocalSpill::Maybe(_) => {
+                        for local_idx in 0..shape.num_locals {
+                            if !mask.get(local_idx) {
+                                state[local_idx] = None;
+                            }
+                        }
+                    }
+                    LocalSpill::No => unreachable!(),
+                }
+                if let Some(synced) = synced.as_mut() {
+                    synced.masks[insn_id.to_usize()] = Some(mask);
+                }
+            } else {
+                // Spilling a frame we are not tracking: assume nothing.
+                state.fill(None);
+            }
+        }
+
+        if insn.may_clobber_local_slots() {
+            state.fill(None);
+        }
+    }
+    state
+}
+
+/// If `insn` loads local `idx` of `shape`'s frame out of its VM stack slot, return `idx`.
+fn loaded_local_idx(function: &Function, insn: &Insn, shape: FrameShape) -> Option<usize> {
+    let &Insn::LoadField { recv, offset, .. } = insn else { return None };
+    if !matches!(function.find(recv), Insn::LoadSP) { return None }
+    // See get_local_from_sp() and gen_spill_locals() for the addressing
+    (0..shape.num_locals).find(|&local_idx|
+        offset == -(SIZEOF_VALUE_I32 * (local_idx_to_ep_offset(shape.iseq, local_idx) + 1)))
+}
+
 #[cfg(test)]
 mod union_find_tests {
     use super::UnionFind;

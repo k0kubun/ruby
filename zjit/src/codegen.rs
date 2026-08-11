@@ -65,11 +65,28 @@ struct JITState {
     /// and the inlined frame push write a JITFrame into the slot selected by the
     /// current frame's depth.
     jit_frame_size: usize,
+
+    /// Locals that are already resident in their VM stack slot at each instruction that
+    /// spills locals. Lets gen_spill_locals() skip redundant stores.
+    synced_locals: hir::SyncedLocals,
+
+    /// The HIR instruction being compiled, used to look up `synced_locals`.
+    current_insn: Option<InsnId>,
+
+    /// What [`hir::Insn::local_spill`] says about `current_insn`. Only used to assert that the
+    /// classification the analysis relies on matches what codegen does.
+    current_insn_spill: hir::LocalSpill,
+
+    /// The LIR block that still runs on every path through `current_insn`. Starts as the block
+    /// codegen for the instruction began in and follows the fall-through of side-exit jumps.
+    /// A [`hir::LocalSpill::Always`] instruction must spill in this block; spilling anywhere
+    /// else means the store is conditional and the analysis must not count on it.
+    straight_line_block: Option<lir::BlockId>,
 }
 
 impl JITState {
     /// Create a new JITState instance
-    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, jit_frame_size: usize) -> Self {
+    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, jit_frame_size: usize, synced_locals: hir::SyncedLocals) -> Self {
         JITState {
             version,
             opnds: vec![None; num_insns],
@@ -77,6 +94,10 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
+            synced_locals,
+            current_insn: None,
+            current_insn_spill: hir::LocalSpill::No,
+            straight_line_block: None,
         }
     }
 
@@ -121,6 +142,12 @@ impl Assembler {
             target: fall_through_target,
             args: vec![],
         };
+        // A jump to a side exit does not come back, so the fall-through still runs on every
+        // path through this instruction. A jump to another block does not: what follows runs
+        // only when the branch is not taken. See `JITState::straight_line_block`.
+        if matches!(target, Target::SideExit(..)) && jit.straight_line_block == Some(self.current_block_id()) {
+            jit.straight_line_block = Some(fall_through_target);
+        }
         emit(self, target);
         self.jmp(Target::Block(Box::new(fall_through_edge)));
 
@@ -407,7 +434,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         // frame's `cfp->jit_return` pointed at its own slot rather than a shared
         // one.
         let jit_frame_size = function.inlining_depth() + 1;
-        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), jit_frame_size);
+        let synced_locals = trace_compile_phase("synced_locals", || hir::analyze_synced_locals(function));
+        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), jit_frame_size, synced_locals);
         let mut asm = Assembler::new_with_stack_slots(jit_frame_size);
 
         // Mapping from HIR block IDs to LIR block IDs.
@@ -472,6 +500,10 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             // Compile all instructions
             for (insn_idx, &insn_id) in block.insns().enumerate() {
                 let insn = function.find(insn_id);
+                // Let gen_spill_locals() find the locals that are already in their slots
+                jit.current_insn = Some(insn_id);
+                jit.current_insn_spill = insn.local_spill();
+                jit.straight_line_block = Some(asm.current_block_id());
                 let perf_symbol = hir_perf_symbol_range_start(&mut asm, &insn);
 
                 let result = match &insn {
@@ -3168,6 +3200,13 @@ fn gen_incr_counter(asm: &mut Assembler, counter: Counter) {
     }
 }
 
+/// Generate code that adds a compile-time known amount to a counter if --zjit-stats
+fn gen_incr_counter_by(asm: &mut Assembler, counter: Counter, amount: u64) {
+    if get_option!(stats) && amount > 0 {
+        asm.incr_counter(Opnd::const_ptr(counter_ptr(counter) as *const u8), Opnd::UImm(amount));
+    }
+}
+
 /// Increment a counter for each DynamicSendReason. If the variant has
 /// a counter prefix to break down the details, increment that as well.
 fn gen_incr_send_fallback_counter(asm: &mut Assembler, reason: SendFallbackReason) {
@@ -3339,13 +3378,39 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
 }
 
 /// Spill locals onto the stack.
+///
+/// Locals that [`hir::analyze_synced_locals`] proved are already resident in their slot are
+/// skipped: the store would write the value that is already there. See that function for the
+/// invariant and why every reader of the slots (the interpreter running a rescue in this frame,
+/// `Binding`, a block sharing this EP, frame materialization, GC) still sees correct values.
 fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Avoid spilling locals that have been spilled before and not changed.
+    debug_assert!(
+        jit.current_insn_spill != hir::LocalSpill::No,
+        "gen_spill_locals() called while compiling {:?}, which hir::Insn::local_spill() says \
+         does not spill locals. Add it there, or the analysis will assume slots hold stale values.",
+        jit.current_insn,
+    );
+    debug_assert!(
+        !matches!(jit.current_insn_spill, hir::LocalSpill::Always(_))
+            || jit.straight_line_block == Some(asm.current_block_id()),
+        "{:?} is classified LocalSpill::Always, but it spills locals in a block its codegen \
+         branched to, so the store does not run on every path. Make it LocalSpill::Maybe.",
+        jit.current_insn,
+    );
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
+    let mut spilled = 0;
+    let mut skipped = 0;
     for (idx, &insn_id) in state.locals().enumerate() {
+        if jit.current_insn.is_some_and(|current| jit.synced_locals.is_synced(current, idx)) {
+            skipped += 1;
+            continue;
+        }
+        spilled += 1;
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
+    gen_incr_counter_by(asm, Counter::vm_write_locals_slot_count, spilled);
+    gen_incr_counter_by(asm, Counter::vm_write_locals_skipped_count, skipped);
 }
 
 /// Spill the virtual stack onto the stack.
