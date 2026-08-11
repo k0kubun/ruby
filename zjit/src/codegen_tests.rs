@@ -11140,6 +11140,126 @@ fn test_splat_with_ruby2_keywords_hash_is_not_forwarded() {
 }
 
 
+/// Run `program` and assert that no shape guard side-exited while it ran.
+#[track_caller]
+fn assert_no_shape_guard_exits(program: &str) -> String {
+    let before = crate::state::ZJITState::get_counters().exit_guard_shape_failure;
+    let result = inspect(program);
+    let after = crate::state::ZJITState::get_counters().exit_guard_shape_failure;
+    assert_eq!(before, after, "expected no shape guard side exits, but {} happened", after - before);
+    result
+}
+
+/// Define objects that all read `@config` through one inherited method, each with a distinct
+/// shape, so the read site sees more shapes than the profile has buckets.
+const SHAPE_CHAIN_SETUP: &str = r#"
+    class ShapeChainBase
+      def read = @config
+      def write(val) = @config = val
+    end
+
+    OBJS = (0...20).map do |i|
+      klass = Class.new(ShapeChainBase)
+      ivars = (0...i).map { |j| "@x#{j} = #{j}" }.join("; ")
+      klass.class_eval("def initialize(n); #{ivars}; @config = n; end")
+      klass.new(i)
+    end
+"#;
+
+#[test]
+fn test_getivar_shape_chain_falls_back_instead_of_exiting() {
+    // Only `num_profiles` samples are taken, so a site that sees 20 shapes profiles a handful of
+    // them and has to handle the rest at runtime. That must not be a side exit.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    assert_snapshot!(assert_no_shape_guard_exits("
+        total = 0
+        3.times { OBJS.each { |o| total += o.read } }
+        total
+    "), @"570");
+}
+
+#[test]
+fn test_getivar_shape_chain_miss_takes_the_fallback_arm() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    let before = crate::state::ZJITState::get_counters().getivar_fallback_shape_chain_miss;
+    assert_snapshot!(inspect("OBJS.map { |o| o.read }.sum"), @"190");
+    let after = crate::state::ZJITState::get_counters().getivar_fallback_shape_chain_miss;
+    assert!(after > before, "expected the generic ivar fallback arm to run, but the counter did not move");
+}
+
+#[test]
+fn test_setivar_shape_chain_falls_back_instead_of_exiting() {
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].write(i) }");
+    assert_snapshot!(assert_no_shape_guard_exits("
+        OBJS.each_with_index { |o, i| o.write(i * 2) }
+        OBJS.map { |o| o.read }.sum
+    "), @"380");
+}
+
+#[test]
+fn test_setivar_shape_chain_fallback_raises_on_frozen_receiver() {
+    // The fallback arm is a generic SetIvar, which still has to raise on a frozen receiver.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].write(i) }");
+    assert_snapshot!(assert_no_shape_guard_exits(r#"
+        frozen = OBJS.last.clone.freeze
+        begin
+          frozen.write(1)
+          "no raise"
+        rescue FrozenError
+          "raised"
+        end
+    "#), @r#""raised""#);
+}
+
+#[test]
+fn test_getivar_shape_chain_reads_ivar_defined_after_compile() {
+    // An object whose @config is still undefined reads as nil, and reading it again after the
+    // write (which moves the object to a shape the chain never saw) sees the new value.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    assert_snapshot!(assert_no_shape_guard_exits(r#"
+        obj = ShapeChainBase.new
+        before = obj.read
+        obj.write(42)
+        [before, obj.read]
+    "#), @"[nil, 42]");
+}
+
+#[test]
+fn test_ivar_shape_chain_falls_back_for_too_complex_shapes() {
+    // Objects that outgrew their class's shape variation limit store ivars in a hash table, so
+    // the shape chain cannot index them and they have to take the generic arm.
+    set_call_threshold(6);
+    eval(r#"
+        class TooComplex
+          def read = @config
+          def write(val) = @config = val
+        end
+
+        COMPLEX = (0...20).map do |i|
+          obj = TooComplex.new
+          i.times { |j| obj.instance_variable_set("@x#{i}_#{j}", j) }
+          obj.instance_variable_set(:@config, i)
+          obj
+        end
+    "#);
+    eval("5.times { |i| COMPLEX[i].read }");
+    assert_snapshot!(assert_no_shape_guard_exits("
+        COMPLEX.each_with_index { |o, i| o.write(i) }
+        COMPLEX.map { |o| o.read }.sum
+    "), @"190");
+}
+
 #[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
