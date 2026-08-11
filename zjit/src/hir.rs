@@ -2964,6 +2964,78 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
     }
 }
 
+/// Minimum share of the profiled executions of a call site that a guard chain must cover before
+/// we emit it. Each arm costs a comparison and a branch on every execution, and the arms we can
+/// emit only cover part of the profile: handlers or receiver types we cannot specialize, and
+/// samples that did not fit in the profile at all, take the fallback. A chain built out of the
+/// cold tail of the profile pays for its guards on every execution and still performs the same
+/// dynamic dispatch, so require the covered share to be at least this large.
+const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
+/// Emit a receiver-type guard chain for a call site: one arm per profiled receiver type, which
+/// performs a [`Insn::Send`] on a receiver refined to that type, plus a fallthrough arm that
+/// performs the dynamic send. All arms jump to a join block, so a miss costs the comparisons but
+/// never a side exit; that matters because the site is known to see several types and a guard
+/// would keep failing and recompiling.
+///
+/// Returns the join block, which the caller must continue emitting into, and the block parameter
+/// holding the call result.
+fn gen_send_chain(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    summary: &TypeDistributionSummary,
+    mut block: BlockId,
+    insn_idx: u32,
+    exit_state: &FrameState,
+    exit_id: InsnId,
+    recv: InsnId,
+    cd: *const rb_call_data,
+    block_handler: Option<BlockHandler>,
+    args: Vec<InsnId>,
+    opcode: u32,
+) -> (BlockId, InsnId) {
+    let join_block = fun.new_block(insn_idx);
+    let join_param = fun.push_insn(join_block, Insn::Param);
+    // Dedup by expected type so immediate/heap variants
+    // under the same Ruby class can still get separate branches.
+    let mut seen_types = Vec::with_capacity(summary.buckets().len());
+    for &profiled_type in summary.buckets() {
+        if profiled_type.is_empty() { break; }
+        let expected = Type::from_profiled_type(profiled_type);
+        if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
+            continue;
+        }
+        seen_types.push(expected);
+        let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
+        let iftrue_block = fun.new_block(insn_idx);
+        let fall_through = fun.new_block(insn_idx);
+        fun.push_insn(block, Insn::CondBranch {
+            val: has_type,
+            if_true: BranchEdge { target: iftrue_block, args: vec![] },
+            if_false: BranchEdge { target: fall_through, args: vec![] }
+        });
+        block = fall_through;
+        // Take a fresh Snapshot rather than
+        // reusing exit_id so type specialization resolves the receiver from
+        // its refined, exact type instead of the polymorphic profile that is
+        // keyed at exit_id.
+        let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+        // Keep the other operands' profile entries visible at the fresh
+        // Snapshot so the specialized send can still see argument profiles
+        // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
+        // the receiver's entry is dropped: it must resolve from its refined,
+        // exact type, and resolve_receiver_type prefers profiles over types.
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+        let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
+        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.clone(), state: snapshot, reason: Uncategorized(opcode) });
+        fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    }
+    // In the fallthrough case, do a generic interpreter send and then join.
+    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: SendPolymorphicFallback });
+    fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    (join_block, join_param)
+}
+
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn block_call_inlinable(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -3996,6 +4068,35 @@ impl Function {
                 }
                 return None;
             }
+        }
+        None
+    }
+
+    /// Return the receiver profile of a call site when it is worth guarding the profiled types
+    /// in-line, with a dynamic send as the fallthrough.
+    ///
+    /// Polymorphic profiles always qualify: every observed type has a bucket, so the chain
+    /// covers the whole profile. Megamorphic profiles qualify when the buckets still cover
+    /// most of the observed executions: such a site is only megamorphic because it saw more
+    /// types than there are buckets, which for a skewed distribution still leaves the buckets
+    /// serving nearly every call. Sending those dynamically because a handful of executions
+    /// used a rare receiver class gives up on the common case.
+    fn send_chain_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<TypeDistributionSummary> {
+        let entries = profiles.get(state)?;
+        let recv = self.chase_insn(recv);
+        for (entry_insn, entry_type_summary) in entries {
+            if self.chase_insn(*entry_insn) != recv { continue; }
+            if entry_type_summary.is_polymorphic() || entry_type_summary.is_skewed_polymorphic() {
+                return Some(entry_type_summary.clone());
+            }
+            if entry_type_summary.is_megamorphic() || entry_type_summary.is_skewed_megamorphic() {
+                // Everything that did not fit in a bucket has to take the fallthrough.
+                let covered = entry_type_summary.coverage(|_, profiled_type| !profiled_type.is_empty());
+                if covered >= CHAIN_COVERAGE_THRESHOLD {
+                    return Some(entry_type_summary.clone());
+                }
+            }
+            return None;
         }
         None
     }
@@ -9698,47 +9799,10 @@ fn add_iseq_to_hir(
                     let args = state.stack_pop_n(argc as usize)?;
                     let recv = state.stack_pop()?;
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
-                        let join_block = fun.new_block(insn_idx);
-                        let join_param = fun.push_insn(join_block, Insn::Param);
-                        // Dedup by expected type so immediate/heap variants
-                        // under the same Ruby class can still get separate branches.
-                        let mut seen_types = Vec::with_capacity(summary.buckets().len());
-                        for &profiled_type in summary.buckets() {
-                            if profiled_type.is_empty() { break; }
-                            let expected = Type::from_profiled_type(profiled_type);
-                            if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
-                                continue;
-                            }
-                            seen_types.push(expected);
-                            let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
-                            let iftrue_block = fun.new_block(insn_idx);
-                            let fall_through = fun.new_block(insn_idx);
-                            fun.push_insn(block, Insn::CondBranch {
-                                val: has_type,
-                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
-                                if_false: BranchEdge { target: fall_through, args: vec![] }
-                            });
-                            block = fall_through;
-                            // Take a fresh Snapshot rather than
-                            // reusing exit_id so type specialization resolves the receiver from
-                            // its refined, exact type instead of the polymorphic profile that is
-                            // keyed at exit_id.
-                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
-                            // Keep the other operands' profile entries visible at the fresh
-                            // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun);
-                            let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-                            let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode) });
-                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        }
-                        // In the fallthrough case, do a generic interpreter send and then join.
-                        let reason = SendPolymorphicFallback;
-                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, state: exit_id, reason });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                    if let Some(summary) = fun.send_chain_summary(&profiles, recv, exit_id) {
+                        let (join_block, join_param) = gen_send_chain(
+                            fun, &mut profiles, &summary, block, insn_idx, &exit_state, exit_id,
+                            recv, cd, None, args, opcode);
                         state.stack_push(join_param);
                         // Continue compilation from the join block at the next instruction.
                         block = join_block;
@@ -9774,8 +9838,22 @@ fn add_iseq_to_hir(
                     } else {
                         None
                     };
-                    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode) });
-                    state.stack_push(send);
+                    // Calls with a literal block get the same receiver guard chain as
+                    // block-less sends. Blocks are how Ruby iterates, so leaving these on the
+                    // dynamic send gives up on the receiver of every polymorphic
+                    // `node.each_child_node { ... }`-style call.
+                    if let Some(summary) = fun.send_chain_summary(&profiles, recv, exit_id) {
+                        let (join_block, join_param) = gen_send_chain(
+                            fun, &mut profiles, &summary, block, insn_idx, &exit_state, exit_id,
+                            recv, cd, block_handler, args, opcode);
+                        state.stack_push(join_param);
+                        // Continue compilation from the join block at the next instruction, so
+                        // the local reload below covers every arm of the chain.
+                        block = join_block;
+                    } else {
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode) });
+                        state.stack_push(send);
+                    }
 
                     if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {
                         // Reload locals that may have been modified by the blockiseq.
@@ -9905,8 +9983,18 @@ fn add_iseq_to_hir(
                         Some(summary.bucket(0).class())
                     });
 
+                    // Share of the profiled executions that yielded to an IFUNC (a block
+                    // implemented in C). IFUNC handlers are profiled by kind rather than by
+                    // identity because `rb_vm_ifunc_new` allocates a fresh one per call, so this is
+                    // 1.0 for a site that always yields to a C block even though the site sees a
+                    // different handler object every time. The fast path below only checks the
+                    // handler tag and joins the generic fallback on a miss, so a dominant share of
+                    // IFUNC samples is enough evidence to emit it.
+                    let ifunc_coverage = block_handler_summary.as_ref().map_or(0.0, |summary| {
+                        summary.coverage(|_, profiled_type| !profiled_type.is_empty() && profiled_type.is_block_ifunc())
+                    });
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
-                        && block_handler_class.is_some_and(|obj| unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 });
+                        && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
 
                     // If the block handler is a known simple ISEQ block with exact arity and no
                     // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
@@ -9943,6 +10031,20 @@ fn add_iseq_to_hir(
                                         polymorphic_iseqs.push(iseq);
                                     }
                                 }
+                            }
+                            // Buckets that are not directly dispatchable (Proc, IFUNC and symbol
+                            // handlers, blocks whose parameters don't match the yield) were skipped
+                            // above and have to take the generic fallback at run time. Only keep
+                            // the chain if the blocks in it account for most of the profile;
+                            // otherwise every execution pays for the comparisons and still ends up
+                            // in rb_vm_invokeblock.
+                            let covered = summary.coverage(|_, profiled_type| {
+                                !profiled_type.is_empty()
+                                    && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
+                                    && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
+                            });
+                            if covered < CHAIN_COVERAGE_THRESHOLD {
+                                polymorphic_iseqs.clear();
                             }
                         }
                     }

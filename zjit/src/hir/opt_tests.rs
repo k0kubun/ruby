@@ -4288,10 +4288,11 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_yield_mixed_iseq_proc_symbol_profile_dispatches_on_iseqs() {
-        // A yield site whose profile mixes ISEQ blocks with proc and symbol handlers still
-        // dispatches directly on the ISEQ candidates; the non-ISEQ handlers fail the tag
-        // check and take the generic fallback in-line.
+    fn test_yield_mixed_iseq_proc_symbol_profile_skips_cold_iseq_chain() {
+        // A yield site whose profile is dominated by handlers we cannot dispatch directly
+        // (here proc and symbol handlers) does not get an ISEQ dispatch chain: the ISEQ
+        // candidates only cover a small share of the executions, so the chain would compare
+        // and miss on nearly every call and still perform the same generic dispatch.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4299,9 +4300,7 @@ mod hir_opt_tests {
             def via_proc(l) = invoke(&l)
             def via_sym = invoke(&:itself)
             pr = proc { |x| x * 3 }
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
+            6.times { add_one; double; via_proc(pr); via_sym }
             add_one + double + via_proc(pr) + via_sym
         ");
         assert_eq!(VALUE::fixnum_from_usize(71), result);
@@ -4317,38 +4316,9 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:Fixnum[10] = Const Value(10)
-          v12:CPtr = GetEP 0
-          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v15:CInt64[3] = Const CInt64(3)
-          v16:CInt64 = IntAnd v13, v15
-          v17:CInt64[1] = Const CInt64(1)
-          v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
-          v20:CInt64[-4] = Const CInt64(-4)
-          v21:CInt64 = IntAnd v13, v20
-          v22:CPtr = LoadField v21, :code_iseq@0x1001
-          v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
-          Jump bb4(v26)
-        bb8():
-          v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
-          v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
-          Jump bb4(v31)
-        bb10():
-          Jump bb6()
-        bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
-        bb4(v14:BasicObject):
+          v12:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
           CheckInterrupts
-          Return v14
+          Return v12
         ");
     }
 
@@ -18116,6 +18086,243 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_polymorphic_send_with_literal_block() {
+        // A polymorphic call site that passes a literal block gets the same receiver guard
+        // chain as a block-less send, with the block handler carried into every arm.
+        set_call_threshold(4);
+        eval("
+        class C
+          def each
+            yield 1
+          end
+        end
+
+        class D
+          def each
+            yield 2
+          end
+        end
+
+        def test o
+          o.each { |x| x + 1 }
+        end
+
+        test C.new; test D.new; test C.new; test D.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:15:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:CBool = HasType v10, ObjectSubclass[class_exact:C]
+          CondBranch v16, bb5(), bb6()
+        bb5():
+          v19:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, each@0x1010, cme:0x1018)
+          PushInlineFrame :each, v19 (0x1040), num_args=0
+          v48:Fixnum[1] = Const Value(1)
+          v50:CPtr = GetEP 0
+          v51:CInt64 = LoadField v50, :VM_ENV_DATA_INDEX_SPECVAL@0x1068
+          v52:CInt64[-4] = Const CInt64(-4)
+          v53:CInt64 = IntAnd v51, v52
+          v54:BasicObject = InvokeBlockIseqDirect (0x1070), v53, v48
+          CheckInterrupts
+          PopInlineFrame
+          Jump bb4(v54)
+        bb6():
+          v22:CBool = HasType v10, ObjectSubclass[class_exact:D]
+          CondBranch v22, bb7(), bb8()
+        bb7():
+          v25:ObjectSubclass[class_exact:D] = RefineType v10, ObjectSubclass[class_exact:D]
+          PatchPoint NoSingletonClass(D@0x1098)
+          PatchPoint MethodRedefined(D@0x1098, each@0x1010, cme:0x10a0)
+          PushInlineFrame :each, v25 (0x10c8), num_args=0
+          v68:Fixnum[2] = Const Value(2)
+          v70:CPtr = GetEP 0
+          v71:CInt64 = LoadField v70, :VM_ENV_DATA_INDEX_SPECVAL@0x1068
+          v72:CInt64[-4] = Const CInt64(-4)
+          v73:CInt64 = IntAnd v71, v72
+          v74:BasicObject = InvokeBlockIseqDirect (0x1070), v73, v68
+          CheckInterrupts
+          PopInlineFrame
+          Jump bb4(v74)
+        bb8():
+          v28:BasicObject = Send v10, 0x1070, :each # SendFallbackReason: Send: polymorphic call site
+          Jump bb4(v28)
+        bb4(v15:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn specialize_megamorphic_send_chains_profiled_buckets() {
+        // A site that saw more receiver classes than the profile has buckets is megamorphic,
+        // but the buckets still account for most of its executions, so guard them in-line and
+        // leave only the remainder to the dynamic send. The call threshold is one above
+        // --zjit-num-profiles so that profiling covers the calls below from the first one.
+        set_call_threshold(21);
+        eval("
+        class C0; def foo = 0; end
+        class C1; def foo = 1; end
+        class C2; def foo = 2; end
+        class C3; def foo = 3; end
+        class C4; def foo = 4; end
+        class C5; def foo = 5; end
+        class C6; def foo = 6; end
+        class C7; def foo = 7; end
+        class C8; def foo = 8; end
+
+        def test o
+          o.foo
+        end
+
+        OBJS = [C0.new, C1.new, C2.new, C3.new, C4.new, C5.new, C6.new, C7.new, C8.new]
+        3.times { OBJS.each { |o| test o } }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:13:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:CBool = HasType v10, ObjectSubclass[class_exact:C1]
+          CondBranch v16, bb5(), bb6()
+        bb5():
+          PatchPoint NoSingletonClass(C1@0x1008)
+          PatchPoint MethodRedefined(C1@0x1008, foo@0x1010, cme:0x1018)
+          v73:Fixnum[1] = Const Value(1)
+          Jump bb4(v73)
+        bb6():
+          v22:CBool = HasType v10, ObjectSubclass[class_exact:C7]
+          CondBranch v22, bb7(), bb8()
+        bb7():
+          PatchPoint NoSingletonClass(C7@0x1040)
+          PatchPoint MethodRedefined(C7@0x1040, foo@0x1010, cme:0x1048)
+          v76:Fixnum[7] = Const Value(7)
+          Jump bb4(v76)
+        bb8():
+          v28:CBool = HasType v10, ObjectSubclass[class_exact:C5]
+          CondBranch v28, bb9(), bb10()
+        bb9():
+          PatchPoint NoSingletonClass(C5@0x1070)
+          PatchPoint MethodRedefined(C5@0x1070, foo@0x1010, cme:0x1078)
+          v79:Fixnum[5] = Const Value(5)
+          Jump bb4(v79)
+        bb10():
+          v34:CBool = HasType v10, ObjectSubclass[class_exact:C0]
+          CondBranch v34, bb11(), bb12()
+        bb11():
+          PatchPoint NoSingletonClass(C0@0x10a0)
+          PatchPoint MethodRedefined(C0@0x10a0, foo@0x1010, cme:0x10a8)
+          v82:Fixnum[0] = Const Value(0)
+          Jump bb4(v82)
+        bb12():
+          v40:CBool = HasType v10, ObjectSubclass[class_exact:C2]
+          CondBranch v40, bb13(), bb14()
+        bb13():
+          PatchPoint NoSingletonClass(C2@0x10d0)
+          PatchPoint MethodRedefined(C2@0x10d0, foo@0x1010, cme:0x10d8)
+          v85:Fixnum[2] = Const Value(2)
+          Jump bb4(v85)
+        bb14():
+          v46:CBool = HasType v10, ObjectSubclass[class_exact:C3]
+          CondBranch v46, bb15(), bb16()
+        bb15():
+          PatchPoint NoSingletonClass(C3@0x1100)
+          PatchPoint MethodRedefined(C3@0x1100, foo@0x1010, cme:0x1108)
+          v88:Fixnum[3] = Const Value(3)
+          Jump bb4(v88)
+        bb16():
+          v52:CBool = HasType v10, ObjectSubclass[class_exact:C4]
+          CondBranch v52, bb17(), bb18()
+        bb17():
+          PatchPoint NoSingletonClass(C4@0x1130)
+          PatchPoint MethodRedefined(C4@0x1130, foo@0x1010, cme:0x1138)
+          v91:Fixnum[4] = Const Value(4)
+          Jump bb4(v91)
+        bb18():
+          v58:CBool = HasType v10, ObjectSubclass[class_exact:C6]
+          CondBranch v58, bb19(), bb20()
+        bb19():
+          PatchPoint NoSingletonClass(C6@0x1160)
+          PatchPoint MethodRedefined(C6@0x1160, foo@0x1010, cme:0x1168)
+          v94:Fixnum[6] = Const Value(6)
+          Jump bb4(v94)
+        bb20():
+          v64:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
+          Jump bb4(v64)
+        bb4(v15:BasicObject):
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn specialize_megamorphic_send_skips_chain_when_buckets_are_cold() {
+        // A site whose profiled buckets cover only a small share of its executions keeps the
+        // plain dynamic send: guarding classes that almost never match would pay for the
+        // comparisons and then do the same dynamic send anyway. The first eight calls fill
+        // every bucket once and the rest of the profile window lands in `other`.
+        set_call_threshold(21);
+        eval("
+        class D0; def foo = 0; end
+        class D1; def foo = 1; end
+        class D2; def foo = 2; end
+        class D3; def foo = 3; end
+        class D4; def foo = 4; end
+        class D5; def foo = 5; end
+        class D6; def foo = 6; end
+        class D7; def foo = 7; end
+        class D8; def foo = 8; end
+        class D9; def foo = 9; end
+
+        def test o
+          o.foo
+        end
+
+        [D0, D1, D2, D3, D4, D5, D6, D7].each { |k| test k.new }
+        6.times { test D8.new; test D9.new }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:14:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
     fn upgrade_self_type_to_heap_after_setivar() {
         // Snapshot the overflow path only when this build naturally keeps five
         // ivars embedded and overflows on the next write.
