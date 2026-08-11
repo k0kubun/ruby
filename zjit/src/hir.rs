@@ -1144,6 +1144,11 @@ pub enum Insn {
     StringConcat { strings: Vec<InsnId>, state: InsnId },
     /// Call rb_str_getbyte with known-Fixnum index
     StringGetbyte { string: InsnId, index: InsnId },
+    /// Return the coderange of `string`, scanning the string to compute and cache it when the
+    /// cached value is [`RUBY_ENC_CODERANGE_UNKNOWN`]. `cached` is the coderange bits already
+    /// loaded out of RBASIC flags; only the UNKNOWN case reaches the scan, which is what
+    /// `String#ascii_only?` and friends do, so there is no reason to leave the JIT for it.
+    StringCoderangeOrScan { string: InsnId, cached: InsnId, state: InsnId },
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
     StringAppend { recv: InsnId, other: InsnId, state: InsnId },
     StringAppendCodepoint { recv: InsnId, other: InsnId, state: InsnId },
@@ -1705,6 +1710,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*string);
                 $visit_one!(*index);
             }
+            Insn::StringCoderangeOrScan { string, cached, state } => {
+                $visit_one!(*string);
+                $visit_one!(*cached);
+                $visit_one!(*state);
+            }
             Insn::StringSetbyteFixnum { string, index, value } => {
                 $visit_one!(*string);
                 $visit_one!(*index);
@@ -2076,6 +2086,9 @@ impl Insn {
             Insn::StringIntern { .. } => effects::Any,
             Insn::StringConcat { .. } => effects::Any,
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
+            // Scanning caches the computed coderange in the string's RBASIC flags, so later loads
+            // of those flags must not be forwarded from ones taken before this instruction.
+            Insn::StringCoderangeOrScan { .. } => effects::Any,
             Insn::StringSetbyteFixnum { .. } => effects::Any,
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
@@ -2493,6 +2506,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::StringGetbyte { string, index, .. } => {
                 write!(f, "StringGetbyte {string}, {index}")
+            }
+            Insn::StringCoderangeOrScan { string, cached, .. } => {
+                write!(f, "StringCoderangeOrScan {string}, {cached}")
             }
             Insn::StringSetbyteFixnum { string, index, value, .. } => {
                 write!(f, "StringSetbyteFixnum {string}, {index}, {value}")
@@ -5152,6 +5168,7 @@ impl Function {
             Insn::StringIntern { .. } => types::Symbol,
             Insn::StringConcat { .. } => types::StringExact,
             Insn::StringGetbyte { .. } => types::Fixnum,
+            Insn::StringCoderangeOrScan { .. } => types::CInt64,
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
@@ -9207,6 +9224,16 @@ impl Function {
                             _ => insn_id,
                         }
                     },
+                    &Insn::StringCoderangeOrScan { cached, .. } => {
+                        // A known coderange other than UNKNOWN needs no scan.
+                        match self.type_of(cached).cint64_value() {
+                            Some(coderange) if coderange != RUBY_ENC_CODERANGE_UNKNOWN.into() => {
+                                self.make_equal_to(insn_id, cached);
+                                continue;
+                            }
+                            _ => insn_id,
+                        }
+                    },
                     &Insn::ArrayAsetOrStore { array, index, length, val, .. } => {
                         match (self.type_of(index).cint64_value(), self.type_of(length).cint64_value()) {
                             // Statically in range and nonnegative: the store can't grow the array,
@@ -10701,6 +10728,10 @@ impl Function {
             Insn::StringGetbyte { string, index } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
+            },
+            Insn::StringCoderangeOrScan { string, cached, .. } => {
+                self.assert_subtype(insn_id, string, types::String)?;
+                self.assert_subtype(insn_id, cached, types::CInt64)
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;
