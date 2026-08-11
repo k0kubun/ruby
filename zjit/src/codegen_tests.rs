@@ -4931,6 +4931,21 @@ fn test_polymorphic_iseq_dispatch_same_site() {
 }
 
 #[test]
+fn test_polymorphic_send_with_literal_block_dispatches_directly() {
+    // A polymorphic call site that passes a literal block dispatches on the receiver type in
+    // the same way a block-less send does, and every arm must run the block correctly.
+    set_call_threshold(4);
+    eval("
+        class C; def each; yield 1; yield 2; end; end
+        class D; def each; yield 3; end; end
+        class Unseen; def each; yield 4; end; end
+        def test(o) = o.each { |x| x * 10 }
+        test C.new; test D.new; test C.new; test D.new
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(C.new), test(D.new), test(Unseen.new)]"), @"[20, 30, 40]");
+}
+
+#[test]
 fn test_megamorphic_send_chain_dispatches_and_falls_back() {
     // A call site that sees ten receiver classes is megamorphic: the profiled classes get
     // guarded in-line and everything else takes the dynamic send. Both the chained classes
