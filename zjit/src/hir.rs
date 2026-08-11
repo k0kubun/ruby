@@ -2964,6 +2964,78 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
     }
 }
 
+/// Minimum share of the profiled executions of a call site that a guard chain must cover before
+/// we emit it. Each arm costs a comparison and a branch on every execution, and the arms we can
+/// emit only cover part of the profile: handlers or receiver types we cannot specialize, and
+/// samples that did not fit in the profile at all, take the fallback. A chain built out of the
+/// cold tail of the profile pays for its guards on every execution and still performs the same
+/// dynamic dispatch, so require the covered share to be at least this large.
+const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
+/// Emit a receiver-type guard chain for a call site: one arm per profiled receiver type, which
+/// performs a [`Insn::Send`] on a receiver refined to that type, plus a fallthrough arm that
+/// performs the dynamic send. All arms jump to a join block, so a miss costs the comparisons but
+/// never a side exit; that matters because the site is known to see several types and a guard
+/// would keep failing and recompiling.
+///
+/// Returns the join block, which the caller must continue emitting into, and the block parameter
+/// holding the call result.
+fn gen_send_chain(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    summary: &TypeDistributionSummary,
+    mut block: BlockId,
+    insn_idx: u32,
+    exit_state: &FrameState,
+    exit_id: InsnId,
+    recv: InsnId,
+    cd: *const rb_call_data,
+    block_handler: Option<BlockHandler>,
+    args: Vec<InsnId>,
+    opcode: VmInsnType,
+) -> (BlockId, InsnId) {
+    let join_block = fun.new_block(insn_idx);
+    let join_param = fun.push_insn(join_block, Insn::Param);
+    // Dedup by expected type so immediate/heap variants
+    // under the same Ruby class can still get separate branches.
+    let mut seen_types = Vec::with_capacity(summary.buckets().len());
+    for &profiled_type in summary.buckets() {
+        if profiled_type.is_empty() { break; }
+        let expected = Type::from_profiled_type(profiled_type);
+        if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
+            continue;
+        }
+        seen_types.push(expected);
+        let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
+        let iftrue_block = fun.new_block(insn_idx);
+        let fall_through = fun.new_block(insn_idx);
+        fun.push_insn(block, Insn::CondBranch {
+            val: has_type,
+            if_true: BranchEdge { target: iftrue_block, args: vec![] },
+            if_false: BranchEdge { target: fall_through, args: vec![] }
+        });
+        block = fall_through;
+        // Take a fresh Snapshot rather than
+        // reusing exit_id so type specialization resolves the receiver from
+        // its refined, exact type instead of the polymorphic profile that is
+        // keyed at exit_id.
+        let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+        // Keep the other operands' profile entries visible at the fresh
+        // Snapshot so the specialized send can still see argument profiles
+        // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
+        // the receiver's entry is dropped: it must resolve from its refined,
+        // exact type, and resolve_receiver_type prefers profiles over types.
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+        let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
+        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.clone(), state: snapshot, reason: Uncategorized(opcode) });
+        fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    }
+    // In the fallthrough case, do a generic interpreter send and then join.
+    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: SendPolymorphicFallback });
+    fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    (join_block, join_param)
+}
+
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -9887,46 +9959,9 @@ fn add_iseq_to_hir(
                     let recv = state.stack_pop()?;
 
                     if let Some(summary) = fun.send_chain_summary(&profiles, recv, exit_id) {
-                        let join_block = fun.new_block(insn_idx);
-                        let join_param = fun.push_insn(join_block, Insn::Param);
-                        // Dedup by expected type so immediate/heap variants
-                        // under the same Ruby class can still get separate branches.
-                        let mut seen_types = Vec::with_capacity(summary.buckets().len());
-                        for &profiled_type in summary.buckets() {
-                            if profiled_type.is_empty() { break; }
-                            let expected = Type::from_profiled_type(profiled_type);
-                            if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
-                                continue;
-                            }
-                            seen_types.push(expected);
-                            let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
-                            let iftrue_block = fun.new_block(insn_idx);
-                            let fall_through = fun.new_block(insn_idx);
-                            fun.push_insn(block, Insn::CondBranch {
-                                val: has_type,
-                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
-                                if_false: BranchEdge { target: fall_through, args: vec![] }
-                            });
-                            block = fall_through;
-                            // Take a fresh Snapshot rather than
-                            // reusing exit_id so type specialization resolves the receiver from
-                            // its refined, exact type instead of the polymorphic profile that is
-                            // keyed at exit_id.
-                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
-                            // Keep the other operands' profile entries visible at the fresh
-                            // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun);
-                            let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-                            let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
-                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        }
-                        // In the fallthrough case, do a generic interpreter send and then join.
-                        let reason = SendPolymorphicFallback;
-                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, state: exit_id, reason });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                        let (join_block, join_param) = gen_send_chain(
+                            fun, &mut profiles, &summary, block, insn_idx, &exit_state, exit_id,
+                            recv, cd, None, args, opcode.into());
                         state.stack_push(join_param);
                         // Continue compilation from the join block at the next instruction.
                         block = join_block;
@@ -9962,8 +9997,22 @@ fn add_iseq_to_hir(
                     } else {
                         None
                     };
-                    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode.into()) });
-                    state.stack_push(send);
+                    // Calls with a literal block get the same receiver guard chain as
+                    // block-less sends. Blocks are how Ruby iterates, so leaving these on the
+                    // dynamic send gives up on the receiver of every polymorphic
+                    // `node.each_child_node { ... }`-style call.
+                    if let Some(summary) = fun.send_chain_summary(&profiles, recv, exit_id) {
+                        let (join_block, join_param) = gen_send_chain(
+                            fun, &mut profiles, &summary, block, insn_idx, &exit_state, exit_id,
+                            recv, cd, block_handler, args, opcode.into());
+                        state.stack_push(join_param);
+                        // Continue compilation from the join block at the next instruction, so
+                        // the local reload below covers every arm of the chain.
+                        block = join_block;
+                    } else {
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode.into()) });
+                        state.stack_push(send);
+                    }
 
                     if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {
                         // Reload locals that may have been modified by the blockiseq.
