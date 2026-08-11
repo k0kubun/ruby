@@ -2918,6 +2918,14 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
     }
 }
 
+/// Minimum share of the profiled executions of a call site that a guard chain must cover before
+/// we emit it. Each arm costs a comparison and a branch on every execution, and the arms we can
+/// emit only cover part of the profile: handlers or receiver types we cannot specialize, and
+/// samples that did not fit in the profile at all, take the fallback. A chain built out of the
+/// cold tail of the profile pays for its guards on every execution and still performs the same
+/// dynamic dispatch, so require the covered share to be at least this large.
+const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn block_call_inlinable(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -9609,8 +9617,18 @@ fn add_iseq_to_hir(
                         Some(summary.bucket(0).class())
                     });
 
+                    // Share of the profiled executions that yielded to an IFUNC (a block
+                    // implemented in C). IFUNC handlers are profiled by kind rather than by
+                    // identity because `rb_vm_ifunc_new` allocates a fresh one per call, so this is
+                    // 1.0 for a site that always yields to a C block even though the site sees a
+                    // different handler object every time. The fast path below only checks the
+                    // handler tag and joins the generic fallback on a miss, so a dominant share of
+                    // IFUNC samples is enough evidence to emit it.
+                    let ifunc_coverage = block_handler_summary.as_ref().map_or(0.0, |summary| {
+                        summary.coverage(|_, profiled_type| !profiled_type.is_empty() && profiled_type.is_block_ifunc())
+                    });
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
-                        && block_handler_class.is_some_and(|obj| unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 });
+                        && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
 
                     // If the block handler is a known simple ISEQ block with exact arity and no
                     // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
@@ -9647,6 +9665,20 @@ fn add_iseq_to_hir(
                                         polymorphic_iseqs.push(iseq);
                                     }
                                 }
+                            }
+                            // Buckets that are not directly dispatchable (Proc, IFUNC and symbol
+                            // handlers, blocks whose parameters don't match the yield) were skipped
+                            // above and have to take the generic fallback at run time. Only keep
+                            // the chain if the blocks in it account for most of the profile;
+                            // otherwise every execution pays for the comparisons and still ends up
+                            // in rb_vm_invokeblock.
+                            let covered = summary.coverage(|_, profiled_type| {
+                                !profiled_type.is_empty()
+                                    && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
+                                    && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
+                            });
+                            if covered < CHAIN_COVERAGE_THRESHOLD {
+                                polymorphic_iseqs.clear();
                             }
                         }
                     }
