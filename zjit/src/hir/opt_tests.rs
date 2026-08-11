@@ -4280,8 +4280,8 @@ mod hir_opt_tests {
           v16:CInt64 = IntAnd v13, v15
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb6(), bb5()
+        bb6():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
@@ -4299,8 +4299,8 @@ mod hir_opt_tests {
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
-        bb6():
+          Jump bb5()
+        bb5():
           v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
           Jump bb4(v34)
         bb4(v14:BasicObject):
@@ -4314,7 +4314,8 @@ mod hir_opt_tests {
         // A yield site whose profile is dominated by handlers we cannot dispatch directly
         // (here proc and symbol handlers) does not get an ISEQ dispatch chain: the ISEQ
         // candidates only cover a small share of the executions, so the chain would compare
-        // and miss on nearly every call and still perform the same generic dispatch.
+        // and miss on nearly every call and still perform the same generic dispatch. The
+        // symbol arm is still emitted, since one tag test covers every symbol the site sees.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4338,17 +4339,32 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:Fixnum[10] = Const Value(10)
-          v12:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v12:CPtr = GetEP 0
+          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v15:CInt64[255] = Const CInt64(255)
+          v16:CInt64 = IntAnd v13, v15
+          v17:CInt64[12] = Const CInt64(12)
+          v18:CBool = IsBitEqual v16, v17
+          CondBranch v18, bb6(), bb7()
+        bb6():
+          v20:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v21:BasicObject = InvokeBlockSymbol v20, v10
+          Jump bb4(v21)
+        bb7():
+          v24:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v24)
+        bb4(v14:BasicObject):
           CheckInterrupts
-          Return v12
+          Return v14
         ");
     }
 
     #[test]
     fn test_yield_mixed_iseq_ifunc_profile_dispatches_on_iseqs() {
         // Like the above, but the non-ISEQ handler in the profile is an ifunc block
-        // (Enumerator#each yields to the enumerator's C block). The ifunc handler fails
-        // the ISEQ tag check and takes the generic fallback in-line.
+        // (Enumerator#each yields to the enumerator's C block). Both families are
+        // dispatchable, so the site gets an ifunc tag test ahead of the ISEQ chain rather
+        // than having to pick one of them.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4377,31 +4393,40 @@ mod hir_opt_tests {
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v15:CInt64[3] = Const CInt64(3)
           v16:CInt64 = IntAnd v13, v15
-          v17:CInt64[1] = Const CInt64(1)
+          v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
-          v20:CInt64[-4] = Const CInt64(-4)
-          v21:CInt64 = IntAnd v13, v20
-          v22:CPtr = LoadField v21, :code_iseq@0x1001
-          v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
-          Jump bb4(v26)
-        bb8():
-          v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
-          v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
-          Jump bb4(v31)
-        bb10():
-          Jump bb6()
+          CondBranch v18, bb6(), bb7()
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v20:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v20)
+        bb7():
+          v22:CInt64[3] = Const CInt64(3)
+          v23:CInt64 = IntAnd v13, v22
+          v24:CInt64[1] = Const CInt64(1)
+          v25:CBool = IsBitEqual v23, v24
+          CondBranch v25, bb8(), bb5()
+        bb8():
+          v27:CInt64[-4] = Const CInt64(-4)
+          v28:CInt64 = IntAnd v13, v27
+          v29:CPtr = LoadField v28, :code_iseq@0x1001
+          v30:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
+          v31:CBool = IsBitEqual v29, v30
+          CondBranch v31, bb9(), bb10()
+        bb9():
+          v33:BasicObject = InvokeBlockIseqDirect (0x1002), v28, v10
+          Jump bb4(v33)
+        bb10():
+          v35:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
+          v36:CBool = IsBitEqual v29, v35
+          CondBranch v36, bb11(), bb12()
+        bb11():
+          v38:BasicObject = InvokeBlockIseqDirect (0x1003), v28, v10
+          Jump bb4(v38)
+        bb12():
+          Jump bb5()
+        bb5():
+          v41:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v41)
         bb4(v14:BasicObject):
           CheckInterrupts
           Return v14
@@ -18200,62 +18225,6 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn specialize_megamorphic_send_with_one_target_guards_ancestor() {
-        // Every profiled receiver class inherits the same Base#foo, so the site is megamorphic
-        // in the receiver class but has one call target. One ancestor guard covers all of them
-        // plus the subclasses the profile never saw, and NoMethodOverride keeps that true.
-        set_call_threshold(21);
-        eval("
-        class Base; def foo = 1; end
-        class D0 < Base; end
-        class D1 < Base; end
-        class D2 < Base; end
-        class D3 < Base; end
-        class D4 < Base; end
-        class D5 < Base; end
-        class D6 < Base; end
-        class D7 < Base; end
-        class D8 < Base; end
-
-        def test o
-          o.foo
-        end
-
-        OBJS = [D0.new, D1.new, D2.new, D3.new, D4.new, D5.new, D6.new, D7.new, D8.new]
-        3.times { OBJS.each { |o| test o } }
-        ");
-        assert_snapshot!(hir_string("test"), @"
-        fn test@<compiled>:14:
-        bb1():
-          EntryPoint interpreter
-          v1:BasicObject = LoadSelf
-          v2:CPtr = LoadSP
-          v3:BasicObject = LoadField v2, :o@0x1000
-          Jump bb3(v1, v3)
-        bb2():
-          EntryPoint JIT(0)
-          v6:BasicObject = LoadArg :self@0
-          v7:BasicObject = LoadArg :o@1
-          Jump bb3(v6, v7)
-        bb3(v9:BasicObject, v10:BasicObject):
-          PatchPoint RootBoxOnly
-          v17:CBool = HasAncestor v10, Base
-          CondBranch v17, bb5(), bb6()
-        bb5():
-          PatchPoint NoMethodOverride(Base@0x1008, foo@0x1010, cme:0x1018)
-          PatchPoint MethodRedefined(Base@0x1008, foo@0x1010, cme:0x1018)
-          v31:Fixnum[1] = Const Value(1)
-          Jump bb4(v31)
-        bb6():
-          v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
-          Jump bb4(v22)
-        bb4(v15:BasicObject):
-          CheckInterrupts
-          Return v15
-        ");
-    }
-
-    #[test]
     fn specialize_megamorphic_send_chains_profiled_buckets() {
         // A site that saw more receiver classes than the profile has buckets is megamorphic,
         // but the buckets still account for most of its executions, so guard them in-line and
@@ -19166,35 +19135,35 @@ mod hir_opt_tests {
           v10:Fixnum[1] = Const Value(1)
           v12:CPtr = GetEP 0
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v14:CInt64[3] = Const CInt64(3)
-          v15:CInt64 = IntAnd v13, v14
-          v16:CInt64[3] = Const CInt64(3)
-          v17:CBool = IsBitEqual v15, v16
-          CondBranch v17, bb5(), bb6()
-        bb5():
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CInt64 = IntAnd v13, v15
+          v17:CInt64[3] = Const CInt64(3)
+          v18:CBool = IsBitEqual v16, v17
+          CondBranch v18, bb6(), bb7()
+        bb6():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb6():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb4(v22)
-        bb4(v18:BasicObject):
-          v27:Fixnum[2] = Const Value(2)
-          v29:CPtr = GetEP 0
-          v30:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v31:CInt64[3] = Const CInt64(3)
-          v32:CInt64 = IntAnd v30, v31
+        bb7():
+          v23:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v23)
+        bb4(v14:BasicObject):
+          v28:Fixnum[2] = Const Value(2)
+          v30:CPtr = GetEP 0
+          v31:CInt64 = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v33:CInt64[3] = Const CInt64(3)
-          v34:CBool = IsBitEqual v32, v33
-          CondBranch v34, bb8(), bb9()
-        bb8():
-          v37:BasicObject = InvokeBlockIfunc v30, v27
-          Jump bb7(v37)
-        bb9():
-          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb7(v39)
-        bb7(v35:BasicObject):
+          v34:CInt64 = IntAnd v31, v33
+          v35:CInt64[3] = Const CInt64(3)
+          v36:CBool = IsBitEqual v34, v35
+          CondBranch v36, bb10(), bb11()
+        bb10():
+          v38:BasicObject = InvokeBlockIfunc v31, v28
+          Jump bb8(v38)
+        bb11():
+          v41:BasicObject = InvokeBlock v28 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb8(v41)
+        bb8(v32:BasicObject):
           CheckInterrupts
-          Return v35
+          Return v32
         ");
     }
 

@@ -1249,6 +1249,11 @@ pub enum Insn {
         args: Vec<InsnId>,
         state: InsnId,
         reason: SendFallbackReason,
+        /// Record the runtime block handler here so the site can recompile against what it
+        /// actually yields to. See [`crate::profile::rb_zjit_invokeblock_reprofile`]. Set only
+        /// when another version of the compiled ISEQ is still allowed and the site has not
+        /// given up on re-profiling.
+        reprofile: bool,
     },
     /// Optimized `invokeblock` for symbol block handlers (`&:foo`). Calls the symbol's method
     /// on the first yielded argument with the rest as arguments, like `vm_invoke_symbol_block`,
@@ -3093,7 +3098,14 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
 /// samples that did not fit in the profile at all, take the fallback. A chain built out of the
 /// cold tail of the profile pays for its guards on every execution and still performs the same
 /// dynamic dispatch, so require the covered share to be at least this large.
-const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+pub const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
+/// Minimum share of a `yield` site's profile a block-handler family has to cover for its fast
+/// path to be worth emitting when that fast path is a single tag test on the handler, as the
+/// symbol and IFUNC arms are. Those recognize every handler of their kind rather than the ones
+/// the profile happened to sample, and they cost two instructions on the executions the other
+/// arms cover, so they pay for themselves at a far smaller share than a comparison chain.
+const TAG_TEST_COVERAGE_THRESHOLD: f64 = 0.1;
 
 /// Maximum number of classes we scan below a class while proving that none of them overrides
 /// the called method. Hierarchies larger than this give up on the ancestor guard rather than
@@ -3440,6 +3452,13 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), BlockIseq
         return Err(BlockIseqReject::MayThrow);
     }
     Ok(())
+}
+
+/// [`block_call_inlinable_iseq`] without the rejection reason, for the runtime re-profiling in
+/// [`crate::profile`] deciding whether a sampled block handler is one a recompile could
+/// dispatch.
+pub fn block_iseq_dispatchable(iseq: IseqPtr, argc: usize) -> bool {
+    block_call_inlinable_iseq(iseq, argc).is_ok()
 }
 
 impl Function {
@@ -8977,6 +8996,10 @@ fn add_iseq_to_hir(
     iseq: *const rb_iseq_t,
     mode: AddIseqMode,
 ) -> Result<AddIseqResult, ParseError> {
+    // Whether the unit being compiled is allowed another version after this one. Instructions
+    // that refresh their own profile at run time only bother doing so when the recompile they
+    // would ask for can still happen (see `Insn::InvokeBlock`'s `reprofile`).
+    let can_recompile = get_or_create_iseq_payload(fun.iseq()).versions.len() + 1 < max_iseq_versions();
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
 
@@ -10513,6 +10536,13 @@ fn add_iseq_to_hir(
                     }
                     let args = state.stack_pop_n(crate::profile::num_arguments_on_stack(cd))?;
 
+                    // Every dispatch below is chosen from a profile collected before this ISEQ
+                    // was first compiled, and the generic fallback joins back into compiled code
+                    // instead of side-exiting, so nothing would ever correct a profile that has
+                    // gone stale. Have the fallback record the handlers it actually sees and ask
+                    // for a recompile once they turn out to be dispatchable.
+                    let reprofile = can_recompile && payload.profile.can_reprofile_at(exit_state.insn_idx);
+
                     // The profiled block handler distribution. All the specializations below
                     // (IFUNC, inline-ISEQ, and polymorphic ISEQ dispatch) key off this summary.
                     let block_handler_summary = payload.profile.get_operand_types(exit_state.insn_idx).and_then(|types| {
@@ -10533,13 +10563,13 @@ fn add_iseq_to_hir(
                     // identity because `rb_vm_ifunc_new` allocates a fresh one per call, so this is
                     // 1.0 for a site that always yields to a C block even though the site sees a
                     // different handler object every time. The fast path below only checks the
-                    // handler tag and joins the generic fallback on a miss, so a dominant share of
-                    // IFUNC samples is enough evidence to emit it.
+                    // handler tag and joins the generic fallback on a miss, so it is worth
+                    // emitting well below the share a comparison chain would need.
                     let ifunc_coverage = block_handler_summary.as_ref().map_or(0.0, |summary| {
                         summary.coverage(|_, profiled_type| !profiled_type.is_empty() && profiled_type.is_block_ifunc())
                     });
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
-                        && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
+                        && ifunc_coverage >= TAG_TEST_COVERAGE_THRESHOLD;
 
                     // If the block handler is a known simple ISEQ block with exact arity and no
                     // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
@@ -10585,7 +10615,13 @@ fn add_iseq_to_hir(
                     let mut poly_share: Option<Counter> = None;
                     if let Some(summary) = block_handler_summary.as_ref() {
                         let is_polymorphic = summary.is_polymorphic() || summary.is_skewed_polymorphic();
-                        if block_call_inlinable(flags) && (is_polymorphic || summary.is_monomorphic()) {
+                        // The distribution's shape is not a gate here: what each arm needs is
+                        // that its own family covers enough of the profile, which the coverage
+                        // checks below decide. A site that saw more handlers than the profile
+                        // has buckets for still deserves a symbol test if enough of its yields
+                        // go to symbols, and the samples that did not fit any bucket are
+                        // counted against every arm's share anyway.
+                        if block_call_inlinable(flags) {
                             let mut saw_iseq_bucket = false;
                             for &profiled_type in summary.buckets() {
                                 if profiled_type.is_empty() {
@@ -10650,13 +10686,14 @@ fn add_iseq_to_hir(
                                     && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
                                     && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
                             });
-                            // The two fast paths are gated separately: they test different bits
-                            // of the handler and each one's comparisons are wasted on executions
-                            // the other covers.
+                            // Each fast path is gated on its own family's share: they test
+                            // different bits of the handler, and one arm's comparisons are
+                            // wasted on the executions the others cover. The chain has to clear
+                            // the higher bar because it compares each profiled block in turn.
                             if iseq_coverage < CHAIN_COVERAGE_THRESHOLD {
                                 polymorphic_iseqs.clear();
                             }
-                            if symbol_coverage < CHAIN_COVERAGE_THRESHOLD {
+                            if symbol_coverage < TAG_TEST_COVERAGE_THRESHOLD {
                                 symbol_coverage = 0.0;
                             }
                         }
@@ -10687,11 +10724,18 @@ fn add_iseq_to_hir(
                     } else if let Some(block_iseq) = inline_iseq {
                         let level = get_lvar_level(exit_state.iseq);
                         fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, exit_id, true)
-                    } else if !polymorphic_iseqs.is_empty() || symbol_coverage > 0.0 {
+                    } else if !polymorphic_iseqs.is_empty() || symbol_coverage > 0.0 || is_ifunc {
                         // Dispatch on the runtime block handler over the profiled candidates,
                         // joining on the generic fallback for anything else. Unlike the
                         // monomorphic path above, a miss must not side-exit: the site is known to
                         // see more than one handler, so a guard would keep failing and recompiling.
+                        //
+                        // The symbol, IFUNC and ISEQ arms are emitted together rather than as
+                        // alternatives. A site that yields to both C blocks and Ruby blocks --
+                        // the `each` that iterators drive with an IFUNC and callers drive with a
+                        // literal block -- otherwise has to give up whichever family the profile
+                        // ranks second and send all of it through `rb_vm_invokeblock`, and each
+                        // arm costs one tag test on the executions the others cover.
                         let level = get_lvar_level(exit_state.iseq);
                         let ep = fun.get_ep(block, level);
                         let block_handler = fun.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
@@ -10726,7 +10770,32 @@ fn add_iseq_to_hir(
                             compare_block = miss_block;
                         }
 
+                        // IFUNC handlers next: `rb_vm_ifunc_new` hands out a fresh handler per
+                        // call, so there is no identity to compare and the tag test (0x3) is the
+                        // whole check.
+                        if is_ifunc {
+                            let tag_mask = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x3) });
+                            let tag_bits = fun.push_insn(compare_block, Insn::IntAnd { left: block_handler, right: tag_mask });
+                            let ifunc_tag = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x3) });
+                            let tag_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: tag_bits, right: ifunc_tag });
+                            let ifunc_block = fun.new_block(insn_idx);
+                            let miss_block = fun.new_block(insn_idx);
+                            fun.push_insn(compare_block, Insn::CondBranch {
+                                val: tag_matches,
+                                if_true: BranchEdge { target: ifunc_block, args: vec![] },
+                                if_false: BranchEdge { target: miss_block, args: vec![] },
+                            });
+                            let ifunc_result = fun.push_insn(ifunc_block, Insn::InvokeBlockIfunc {
+                                cd, block_handler, args: args.clone(), state: exit_id,
+                            });
+                            fun.push_insn(ifunc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
+                            compare_block = miss_block;
+                        }
+
                         if polymorphic_iseqs.is_empty() {
+                            if get_option!(stats) && is_ifunc {
+                                fun.count(compare_block, Counter::invokeblock_fallback_ifunc_miss);
+                            }
                             fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
                         } else {
                         let dispatch_block = fun.new_block(insn_idx);
@@ -10762,61 +10831,16 @@ fn add_iseq_to_hir(
                             fun.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
                             compare_block = miss_block;
                         }
+                        if get_option!(stats) && is_ifunc {
+                            fun.count(compare_block, Counter::invokeblock_fallback_ifunc_miss);
+                        }
                         fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
                         }
 
                         let fallback_result = fun.push_insn(fallback_block, Insn::InvokeBlock {
-                            cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss,
+                            cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss, reprofile,
                         });
                         fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
-
-                        // Continue compilation from the join block
-                        block = join_block;
-                        join_param
-                    } else if is_ifunc {
-                        // Load the block handler from the current frame's LEP. In inlined
-                        // code, the function ISEQ is the caller while `exit_state.iseq` is the
-                        // callee containing this `invokeblock`.
-                        let level = get_lvar_level(exit_state.iseq);
-                        let lep = fun.get_ep(block, level);
-                        let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
-
-                        // Check IFUNC tag: (block_handler & 0x3) == 0x3
-                        let tag_mask = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
-                        let tag_bits = fun.push_insn(block, Insn::IntAnd { left: block_handler, right: tag_mask });
-                        let ifunc_tag = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
-                        let is_ifunc_match = fun.push_insn(block, Insn::IsBitEqual { left: tag_bits, right: ifunc_tag });
-
-                        // Branch: on match, call InvokeBlockIfunc directly
-                        let join_block = fun.new_block(insn_idx);
-                        let join_param = fun.push_insn(join_block, Insn::Param);
-                        let ifunc_block = fun.new_block(insn_idx);
-                        let fall_through = fun.new_block(insn_idx);
-
-                        fun.push_insn(block, Insn::CondBranch {
-                            val: is_ifunc_match,
-                            if_true: BranchEdge { target: ifunc_block, args: vec![] },
-                            if_false: BranchEdge { target: fall_through, args: vec![] },
-                        });
-
-                        block = fall_through;
-
-                        let ifunc_result = fun.push_insn(ifunc_block, Insn::InvokeBlockIfunc {
-                            cd,
-                            block_handler,
-                            args: args.clone(),
-                            state: exit_id,
-                        });
-                        fun.push_insn(ifunc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
-
-                        // In the fallthrough case, use generic rb_vm_invokeblock and join
-                        if get_option!(stats) {
-                            fun.count(block, Counter::invokeblock_fallback_ifunc_miss);
-                        }
-                        let fallback_result = fun.push_insn(block, Insn::InvokeBlock {
-                            cd, args, state: exit_id, reason: InvokeBlockNotSpecialized,
-                        });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
 
                         // Continue compilation from the join block
                         block = join_block;
@@ -10857,7 +10881,7 @@ fn add_iseq_to_hir(
                                 }
                             }
                         }
-                        fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
+                        fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason, reprofile })
                     };
                     state.stack_push(result);
                 }

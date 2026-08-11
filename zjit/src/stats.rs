@@ -539,6 +539,13 @@ make_counters! {
     invokeblock_runtime_proc,
     invokeblock_runtime_none,
 
+    // Re-profiling of `yield` sites from the generic `rb_vm_invokeblock` fallback (see
+    // `rb_zjit_invokeblock_reprofile`). `sample` counts fallback executions that recorded
+    // their handler; `recompile` counts the sites whose fresh samples outvoted the stale
+    // profile and invalidated the compiled code.
+    invokeblock_reprofile_sample_count,
+    invokeblock_reprofile_recompile_count,
+
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may
     // be incremented only once, rather than once per SendDirect, if the caller
