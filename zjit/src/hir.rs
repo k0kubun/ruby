@@ -11394,6 +11394,8 @@ const SYNCED_LOCALS_MAX_ROUNDS: usize = 100;
 /// value the frame state names, and by instructions that may write the slots behind the JIT's
 /// back ([`Insn::may_clobber_local_slots`]).
 pub fn analyze_synced_locals(function: &Function) -> SyncedLocals {
+    // Measurement only, not on the deliverable branch: baseline for A/B counter runs.
+    if std::env::var_os("ZJIT_NO_SPILL_ELIM").is_some() { return SyncedLocals::none(); }
     let num_blocks = function.num_blocks();
     let rpo: Vec<BlockId> = function.reverse_post_order().into_iter()
         .filter(|&block_id| block_id != function.entries_block)
