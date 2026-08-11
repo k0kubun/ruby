@@ -660,15 +660,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
-<<<<<<< HEAD
         Insn::ArrayEntry { array, index, .. } => gen_array_entry(asm, opnd!(array), opnd!(index)),
-=======
         &Insn::ArrayArefOrNil { array, index, length } => {
             let nonneg = function.type_of(index).known_nonnegative();
             let (array, index, length) = (opnd!(array), opnd!(index), opnd!(length));
             gen_bounds_checked_or_nil(jit, asm, index, length, nonneg, |asm, index| gen_array_aref(asm, array, index))
         }
->>>>>>> zjit-mail-bounds-nil
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
@@ -684,15 +681,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, function, *val, opnd!(val), *chilled, &function.frame_state(*state)),
         Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), &function.frame_state(*state)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
-<<<<<<< HEAD
         &Insn::StringGetbyteOrNil { string, index, length } => {
             let nonneg = function.type_of(index).known_nonnegative();
             let (string, index, length) = (opnd!(string), opnd!(index), opnd!(length));
             gen_bounds_checked_or_nil(jit, asm, index, length, nonneg, |asm, index| gen_string_getbyte(asm, string, index))
         }
-=======
         &Insn::StringCoderangeOrScan { string, cached, state } => gen_string_coderange_or_scan(jit, asm, opnd!(string), opnd!(cached), &function.frame_state(state)),
->>>>>>> zjit-mail-aset-coderange
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),

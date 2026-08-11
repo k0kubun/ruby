@@ -984,7 +984,6 @@ pub enum Insn {
     StringConcat { strings: Vec<InsnId>, state: InsnId },
     /// Call rb_str_getbyte with known-Fixnum index
     StringGetbyte { string: InsnId, index: InsnId },
-<<<<<<< HEAD
     /// Read the byte at `index` from `string`, or nil when `index` is out of bounds. Unlike
     /// [`Insn::StringGetbyte`], which needs an index that was already bounds-checked with
     /// side-exiting guards, this takes the raw (possibly negative, possibly out-of-range) index
@@ -992,13 +991,11 @@ pub enum Insn {
     /// `String#getbyte`, which returns nil instead of raising, so there is no reason to leave the
     /// JIT for it.
     StringGetbyteOrNil { string: InsnId, index: InsnId, length: InsnId },
-=======
     /// Return the coderange of `string`, scanning the string to compute and cache it when the
     /// cached value is [`RUBY_ENC_CODERANGE_UNKNOWN`]. `cached` is the coderange bits already
     /// loaded out of RBASIC flags; only the UNKNOWN case reaches the scan, which is what
     /// `String#ascii_only?` and friends do, so there is no reason to leave the JIT for it.
     StringCoderangeOrScan { string: InsnId, cached: InsnId, state: InsnId },
->>>>>>> zjit-mail-aset-coderange
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
     StringAppend { recv: InsnId, other: InsnId, state: InsnId },
     StringAppendCodepoint { recv: InsnId, other: InsnId, state: InsnId },
@@ -1036,17 +1033,14 @@ pub enum Insn {
     /// Push `val` onto `array`, where `array` is already `Array`.
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
-<<<<<<< HEAD
     /// Read `array[index]`, returning `nil` if `index` is out of bounds. `index` is a C `long`
     /// ([`types::CInt64`]) and must not be negative. Mirrors `rb_ary_entry()`.
     ArrayEntry { array: InsnId, index: InsnId },
-=======
     /// Read `array[index]`, or nil when `index` is out of bounds. Same relationship to
     /// [`Insn::ArrayAref`] as [`Insn::StringGetbyteOrNil`] has to [`Insn::StringGetbyte`]:
     /// `index` is raw and `length` is the array length, and out-of-range reads produce nil
     /// instead of a side exit, matching `Array#[]`.
     ArrayArefOrNil { array: InsnId, index: InsnId, length: InsnId },
->>>>>>> zjit-mail-bounds-nil
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
     /// Store `val` into `array[index]`, growing `array` when `index` is past the end. Unlike
     /// [`Insn::ArrayAset`], which needs an index that was already bounds-checked with side-exiting
@@ -1450,17 +1444,15 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*string);
                 $visit_one!(*index);
             }
-<<<<<<< HEAD
             Insn::StringGetbyteOrNil { string, index, length } => {
                 $visit_one!(*string);
                 $visit_one!(*index);
                 $visit_one!(*length);
-=======
+            }
             Insn::StringCoderangeOrScan { string, cached, state } => {
                 $visit_one!(*string);
                 $visit_one!(*cached);
                 $visit_one!(*state);
->>>>>>> zjit-mail-aset-coderange
             }
             Insn::StringSetbyteFixnum { string, index, value } => {
                 $visit_one!(*string);
@@ -1806,13 +1798,10 @@ impl Insn {
             Insn::StringIntern { .. } => effects::Any,
             Insn::StringConcat { .. } => effects::Any,
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
-<<<<<<< HEAD
             Insn::StringGetbyteOrNil { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
-=======
             // Scanning caches the computed coderange in the string's RBASIC flags, so later loads
             // of those flags must not be forwarded from ones taken before this instruction.
             Insn::StringCoderangeOrScan { .. } => effects::Any,
->>>>>>> zjit-mail-aset-coderange
             Insn::StringSetbyteFixnum { .. } => effects::Any,
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
@@ -1845,11 +1834,8 @@ impl Insn {
             Insn::ArrayExtend { .. } => effects::Any,
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
-<<<<<<< HEAD
             Insn::ArrayEntry { ..  } => effects::Any,
-=======
             Insn::ArrayArefOrNil { ..  } => effects::Any,
->>>>>>> zjit-mail-bounds-nil
             Insn::ArrayAset { .. } => effects::Any,
             Insn::ArrayAsetOrStore { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
@@ -2136,13 +2122,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::ArrayAref { array, index, .. } => {
                 write!(f, "ArrayAref {array}, {index}")
             }
-<<<<<<< HEAD
             Insn::ArrayEntry { array, index, .. } => {
                 write!(f, "ArrayEntry {array}, {index}")
-=======
+            }
             Insn::ArrayArefOrNil { array, index, length } => {
                 write!(f, "ArrayArefOrNil {array}, {index}, {length}")
->>>>>>> zjit-mail-bounds-nil
             }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
@@ -2228,13 +2212,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::StringGetbyte { string, index, .. } => {
                 write!(f, "StringGetbyte {string}, {index}")
             }
-<<<<<<< HEAD
             Insn::StringGetbyteOrNil { string, index, length } => {
                 write!(f, "StringGetbyteOrNil {string}, {index}, {length}")
-=======
+            }
             Insn::StringCoderangeOrScan { string, cached, .. } => {
                 write!(f, "StringCoderangeOrScan {string}, {cached}")
->>>>>>> zjit-mail-aset-coderange
             }
             Insn::StringSetbyteFixnum { string, index, value, .. } => {
                 write!(f, "StringSetbyteFixnum {string}, {index}, {value}")
@@ -3509,11 +3491,8 @@ impl Function {
             Insn::StringIntern { .. } => types::Symbol,
             Insn::StringConcat { .. } => types::StringExact,
             Insn::StringGetbyte { .. } => types::Fixnum,
-<<<<<<< HEAD
             Insn::StringGetbyteOrNil { .. } => types::Fixnum.union(types::NilClass),
-=======
             Insn::StringCoderangeOrScan { .. } => types::CInt64,
->>>>>>> zjit-mail-aset-coderange
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
@@ -3522,11 +3501,8 @@ impl Function {
             Insn::NewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
-<<<<<<< HEAD
             Insn::ArrayEntry { .. } => types::BasicObject,
-=======
             Insn::ArrayArefOrNil { .. } => types::BasicObject,
->>>>>>> zjit-mail-bounds-nil
             Insn::ArrayPop { .. } => types::BasicObject,
             Insn::ArrayLength { .. } => types::CInt64,
             Insn::AdjustBounds { .. } => types::CInt64,
@@ -7566,16 +7542,14 @@ impl Function {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
             },
-<<<<<<< HEAD
             Insn::StringGetbyteOrNil { string, index, length } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::CInt64)?;
                 self.assert_subtype(insn_id, length, types::CInt64)
-=======
+            },
             Insn::StringCoderangeOrScan { string, cached, .. } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, cached, types::CInt64)
->>>>>>> zjit-mail-aset-coderange
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;

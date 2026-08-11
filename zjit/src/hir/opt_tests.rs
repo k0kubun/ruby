@@ -12607,7 +12607,6 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
           v23:CPtr = GetEP 0
           v24:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-<<<<<<< HEAD
           v25:RubyValue = UnwrapSvar v24
           v26:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v25, Value(VALUE(0x1048)) recompile
           v27:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
@@ -12623,7 +12622,6 @@ mod hir_opt_tests {
           v37:BasicObject = ArrayAref v29, v36
           CheckInterrupts
           Return v37
-=======
           v25:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v24, Value(VALUE(0x1048))
           v26:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v27:FalseClass = GuardBitEquals v26, Value(false)
@@ -12634,7 +12632,6 @@ mod hir_opt_tests {
           v32:BasicObject = ArrayArefOrNil v28, v30, v31
           CheckInterrupts
           Return v32
->>>>>>> zjit-mail-bounds-nil
         ");
     }
 
