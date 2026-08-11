@@ -12315,10 +12315,9 @@ mod hir_opt_tests {
           v34:CUInt64 = LoadField v33, :RBASIC_FLAGS@0x1040
           v35:CUInt64 = GuardNoBitsSet v34, RUBY_FL_FREEZE=CUInt64(2048)
           v37:CUInt64 = GuardNoBitsSet v35, RUBY_ELTS_SHARED=CUInt64(4096)
-          v46:CInt64[1] = Const CInt64(1)
+          v42:CInt64[1] = Const CInt64(1)
           v39:CInt64 = ArrayLength v33
-          v40:CInt64[1] = GuardLess v46, v39
-          ArrayAset v33, v40, v19
+          ArrayAsetOrStore v33, v42, v39, v19
           WriteBarrier v33, v19
           CheckInterrupts
           Return v19
@@ -12360,11 +12359,7 @@ mod hir_opt_tests {
           v42:CUInt64 = GuardNoBitsSet v40, RUBY_ELTS_SHARED=CUInt64(4096)
           v43:CInt64 = UnboxFixnum v38
           v44:CInt64 = ArrayLength v37
-          v45:CInt64 = GuardLess v43, v44
-          v46:CInt64 = AdjustBounds v45, v44
-          v47:CInt64[0] = Const CInt64(0)
-          v48:CInt64 = GuardGreaterEq v46, v47
-          ArrayAset v37, v48, v16
+          ArrayAsetOrStore v37, v43, v44, v16
           WriteBarrier v37, v16
           CheckInterrupts
           Return v16
@@ -13542,13 +13537,12 @@ mod hir_opt_tests {
           v24:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1040
           v25:CUInt64[3145728] = Const CUInt64(3145728)
           v26:CInt64 = IntAnd v24, v25
-          v27:CInt64[1048576] = Const CInt64(1048576)
-          v28:CInt64 = GuardGreaterEq v26, v27
-          v29:CInt64[1048576] = Const CInt64(1048576)
-          v30:CBool = IsBitEqual v28, v29
-          v31:BoolExact = BoxBool v30
+          v27:CInt64 = StringCoderangeOrScan v23, v26
+          v28:CInt64[1048576] = Const CInt64(1048576)
+          v29:CBool = IsBitEqual v27, v28
+          v30:BoolExact = BoxBool v29
           CheckInterrupts
-          Return v31
+          Return v30
         ");
     }
 
