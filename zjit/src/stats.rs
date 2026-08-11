@@ -463,9 +463,29 @@ make_counters! {
     invokeblock_handler_monomorphic_iseq,
     invokeblock_handler_monomorphic_ifunc,
     invokeblock_handler_monomorphic_other,
+    invokeblock_handler_monomorphic_symbol,
+    invokeblock_handler_monomorphic_proc,
     invokeblock_handler_polymorphic,
     invokeblock_handler_megamorphic,
     invokeblock_handler_no_profiles,
+
+    // Why a `yield` whose profiled block handler is an ISEQ block could not dispatch
+    // directly (see `block_call_inlinable_iseq`). Counted once per execution of a yield
+    // site that ends up on the generic `rb_vm_invokeblock` fallback.
+    invokeblock_iseq_reject_complex_call,
+    invokeblock_iseq_reject_has_opt,
+    invokeblock_iseq_reject_has_rest,
+    invokeblock_iseq_reject_has_post,
+    invokeblock_iseq_reject_has_kw,
+    invokeblock_iseq_reject_has_kwrest,
+    invokeblock_iseq_reject_has_block,
+    invokeblock_iseq_reject_forwardable,
+    invokeblock_iseq_reject_no_kwarg,
+    invokeblock_iseq_reject_arity_fewer,
+    invokeblock_iseq_reject_arity_more,
+    invokeblock_iseq_reject_autosplat,
+    invokeblock_iseq_reject_too_many_args,
+    invokeblock_iseq_reject_may_throw,
 
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may

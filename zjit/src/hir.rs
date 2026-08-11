@@ -2995,30 +2995,102 @@ fn block_call_inlinable(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
 }
 
+/// Why a `yield` to a profiled ISEQ block handler can't dispatch by inlining the block
+/// frame. Finer-grained than [`SendFallbackReason`] so `--zjit-stats` can attribute the
+/// generic `rb_vm_invokeblock` fallbacks to the specific gate that rejected them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockIseqReject {
+    /// The block takes optional parameters.
+    HasOpt,
+    /// The block takes a rest parameter (`|*a|`).
+    HasRest,
+    /// The block takes post parameters (`|*a, b|`).
+    HasPost,
+    /// The block takes keyword parameters.
+    HasKw,
+    /// The block takes a keyword rest parameter (`|**kw|`).
+    HasKwrest,
+    /// The block takes a block parameter (`|&b|`).
+    HasBlock,
+    /// The block uses `...` argument forwarding.
+    Forwardable,
+    /// The block is declared to accept no keywords or no block.
+    NoKwarg,
+    /// Fewer args than the block's required parameters; the VM would pad with nil.
+    ArityFewer,
+    /// More args than the block's parameters; the VM would truncate.
+    ArityMore,
+    /// The single yielded argument would be auto-splatted if it is an Array.
+    Autosplat,
+    /// Too many arguments to pass in C argument registers.
+    TooManyArgs,
+    /// The block contains `throw` (`break` / non-local return).
+    MayThrow,
+}
+
+impl BlockIseqReject {
+    fn fallback_reason(self) -> SendFallbackReason {
+        match self {
+            BlockIseqReject::TooManyArgs => TooManyArgsForLir,
+            _ => InvokeBlockNotSpecialized,
+        }
+    }
+
+    fn counter(self) -> Counter {
+        match self {
+            BlockIseqReject::HasOpt => Counter::invokeblock_iseq_reject_has_opt,
+            BlockIseqReject::HasRest => Counter::invokeblock_iseq_reject_has_rest,
+            BlockIseqReject::HasPost => Counter::invokeblock_iseq_reject_has_post,
+            BlockIseqReject::HasKw => Counter::invokeblock_iseq_reject_has_kw,
+            BlockIseqReject::HasKwrest => Counter::invokeblock_iseq_reject_has_kwrest,
+            BlockIseqReject::HasBlock => Counter::invokeblock_iseq_reject_has_block,
+            BlockIseqReject::Forwardable => Counter::invokeblock_iseq_reject_forwardable,
+            BlockIseqReject::NoKwarg => Counter::invokeblock_iseq_reject_no_kwarg,
+            BlockIseqReject::ArityFewer => Counter::invokeblock_iseq_reject_arity_fewer,
+            BlockIseqReject::ArityMore => Counter::invokeblock_iseq_reject_arity_more,
+            BlockIseqReject::Autosplat => Counter::invokeblock_iseq_reject_autosplat,
+            BlockIseqReject::TooManyArgs => Counter::invokeblock_iseq_reject_too_many_args,
+            BlockIseqReject::MayThrow => Counter::invokeblock_iseq_reject_may_throw,
+        }
+    }
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
 /// non-local return). Anything else falls back to the generic `invokeblock` dispatch,
 /// with the returned reason attached to the fallback instruction.
-fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
+fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), BlockIseqReject> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
-        return Err(InvokeBlockNotSpecialized);
+        // Report the specific parameter feature so stats can attribute the fallback.
+        let reject = if unsafe { rb_get_iseq_flags_has_opt(iseq) } { BlockIseqReject::HasOpt }
+            else if unsafe { rb_get_iseq_flags_has_rest(iseq) } { BlockIseqReject::HasRest }
+            else if unsafe { rb_get_iseq_flags_has_post(iseq) } { BlockIseqReject::HasPost }
+            else if unsafe { rb_get_iseq_flags_has_kw(iseq) } { BlockIseqReject::HasKw }
+            else if unsafe { rb_get_iseq_flags_has_kwrest(iseq) } { BlockIseqReject::HasKwrest }
+            else if unsafe { rb_get_iseq_flags_has_block(iseq) } { BlockIseqReject::HasBlock }
+            else if unsafe { rb_get_iseq_flags_forwardable(iseq) } { BlockIseqReject::Forwardable }
+            else { BlockIseqReject::NoKwarg };
+        return Err(reject);
     }
     let lead_num = unsafe { rb_get_iseq_body_param_lead_num(iseq) } as usize;
-    if argc != lead_num {
-        return Err(InvokeBlockNotSpecialized);
+    if argc < lead_num {
+        return Err(BlockIseqReject::ArityFewer);
+    }
+    if argc > lead_num {
+        return Err(BlockIseqReject::ArityMore);
     }
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
-        return Err(InvokeBlockNotSpecialized);
+        return Err(BlockIseqReject::Autosplat);
     }
     // The JIT-to-JIT call in gen_invoke_block_iseq_direct passes captured self plus
     // each argument in C argument registers.
     // TODO: Support passing arguments on the stack in C calls
     if 1 + argc > C_ARG_OPNDS.len() {
-        return Err(TooManyArgsForLir);
+        return Err(BlockIseqReject::TooManyArgs);
     }
     if crate::codegen::block_iseq_may_throw(iseq) {
-        return Err(InvokeBlockNotSpecialized);
+        return Err(BlockIseqReject::MayThrow);
     }
     Ok(())
 }
@@ -8328,6 +8400,10 @@ fn add_iseq_to_hir(
                                     fun.count(block, Counter::invokeblock_handler_monomorphic_iseq);
                                 } else if unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 } {
                                     fun.count(block, Counter::invokeblock_handler_monomorphic_ifunc);
+                                } else if obj.symbol_p() {
+                                    fun.count(block, Counter::invokeblock_handler_monomorphic_symbol);
+                                } else if unsafe { rb_obj_is_proc(obj).test() } {
+                                    fun.count(block, Counter::invokeblock_handler_monomorphic_proc);
                                 } else {
                                     fun.count(block, Counter::invokeblock_handler_monomorphic_other);
                                 }
@@ -9703,18 +9779,27 @@ fn add_iseq_to_hir(
                     // If the block handler is a known simple ISEQ block with exact arity and no
                     // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
                     let mut fallback_reason = InvokeBlockNotSpecialized;
+                    // The gate that rejected the profiled ISEQ block, for --zjit-stats.
+                    let mut iseq_reject: Option<BlockIseqReject> = None;
+                    let mut complex_call_reject = false;
                     let inline_iseq = if block_call_inlinable(flags) {
                         block_handler_class.and_then(|obj| {
                             if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                 let iseq = obj.as_iseq();
                                 match block_call_inlinable_iseq(iseq, args.len()) {
                                     Ok(()) => return Some(iseq),
-                                    Err(reason) => fallback_reason = reason,
+                                    Err(reject) => {
+                                        iseq_reject = Some(reject);
+                                        fallback_reason = reject.fallback_reason();
+                                    }
                                 }
                             }
                             None
                         })
-                    } else { None };
+                    } else {
+                        complex_call_reject = block_handler_class.is_some_and(|obj| unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 });
+                        None
+                    };
 
                     // For polymorphic yield sites, collect the profiled ISEQ blocks that can
                     // dispatch directly. Iterators like Integer#times are typically called with a
@@ -9764,8 +9849,9 @@ fn add_iseq_to_hir(
                             && get_lvar_level(exit_state.iseq) == 0 {
                             match block_call_inlinable_iseq(bi, args.len()) {
                                 Ok(()) => Some(bi),
-                                Err(reason) => {
-                                    fallback_reason = reason;
+                                Err(reject) => {
+                                    iseq_reject = Some(reject);
+                                    fallback_reason = reject.fallback_reason();
                                     None
                                 }
                             }
@@ -9878,6 +9964,13 @@ fn add_iseq_to_hir(
                         block = join_block;
                         join_param
                     } else {
+                        if get_option!(stats) {
+                            if let Some(reject) = iseq_reject {
+                                fun.count(block, reject.counter());
+                            } else if complex_call_reject {
+                                fun.count(block, Counter::invokeblock_iseq_reject_complex_call);
+                            }
+                        }
                         fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
                     };
                     state.stack_push(result);
