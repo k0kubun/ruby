@@ -4340,6 +4340,144 @@ fn test_string_append_broken_coderange() {
 }
 
 #[test]
+fn test_string_append_growth() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Cross the embedded->heap boundary and several capacity doublings so
+    // both the in-place fast path and the resizing fallback are exercised.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::UTF_8)
+        200.times { test(s, "0123456789") }
+        [s.bytesize, s == "0123456789" * 200]
+    "#), @"[2000, true]");
+}
+
+#[test]
+fn test_string_append_codepoint_binary() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Grow a binary buffer one byte at a time, crossing the embedded->heap boundary
+    // and several capacity doublings, with both ASCII and non-ASCII bytes.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::BINARY)
+        1000.times { |i| test(s, i % 255) }
+        [s.bytesize, s == (0...1000).map { |i| (i % 255).chr(Encoding::BINARY) }.join, s.encoding.name]
+    "#), @r#"[1000, true, "ASCII-8BIT"]"#);
+}
+
+#[test]
+fn test_string_append_codepoint_coderange() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // ASCII bytes keep the buffer 7BIT; a non-ASCII byte makes it VALID for good.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::BINARY)
+        10.times { test(s, 0x41) }
+        before = s.ascii_only?
+        test(s, 0xC3)
+        middle = [s.ascii_only?, s.valid_encoding?]
+        test(s, 0x41)
+        [before, middle, s.ascii_only?, s.bytesize]
+    "#), @"[true, [false, true], false, 12]");
+}
+
+#[test]
+fn test_string_append_codepoint_slow_paths() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Frozen receivers, out-of-range codepoints, shared buffers, and non-binary
+    // encodings all have to fall back to rb_str_concat().
+    assert_snapshot!(assert_compiles(r#"
+        results = []
+        1000.times { test(String.new(encoding: Encoding::BINARY), 0x41) }
+        results << (begin; test("abc".b.freeze, 0x41); rescue FrozenError; :frozen; end)
+        results << (begin; test(String.new(encoding: Encoding::BINARY), -1); rescue RangeError; :range; end)
+        results << (begin; test(String.new(encoding: Encoding::BINARY), 0x100); rescue RangeError; :range; end)
+        base = "y".b * 200
+        shared = base[0, 100]
+        # A plain loop, not `10.times`: a second block at `Integer#times`'s `yield i` would
+        # miss the direct block dispatch it specialized on the first one and exit once.
+        i = 0
+        while i < 10
+          test(shared, 0x42)
+          i += 1
+        end
+        results << [base == "y".b * 200, shared.bytesize]
+        utf8 = +"abc"
+        results << test(utf8, 0x3042)
+        results
+    "#), @r#"[:frozen, :range, :range, [true, 110], "abcあ"]"#);
+}
+
+#[test]
+fn test_string_append_codepoint_gc_stress() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        begin
+          GC.stress = true
+          s = "a".b
+          10.times { test(s, 0x62) }
+          [s.bytesize, s == "a" + "b" * 10]
+        ensure
+          GC.stress = false
+        end
+    "#), @"[11, true]");
+}
+
+#[test]
+fn test_string_append_gc_stress() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        begin
+          GC.stress = true
+          s = +"a"
+          10.times { test(s, "bc") }
+          [s.bytesize, s == "a" + "bc" * 10]
+        ensure
+          GC.stress = false
+        end
+    "#), @"[21, true]");
+}
+
+#[test]
+fn test_string_ascii_only_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.ascii_only?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    // A string built at runtime has an UNKNOWN coderange until something scans it, so this scans
+    // on a cold path rather than exiting.
+    assert_snapshot!(assert_compiles(r#"[test("abc#{1}"), test("é#{1}")]"#), @"[true, false]");
+}
+
+#[test]
+fn test_string_valid_encoding_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.valid_encoding?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    assert_snapshot!(assert_compiles(r#"
+        [test("abc#{1}"), test("é#{1}"), test("\xFF#{1}".b.force_encoding(Encoding::UTF_8))]
+    "#), @"[true, true, false]");
+}
+
+#[test]
 fn test_new_hash_nonempty() {
     eval(r#"
         def test
