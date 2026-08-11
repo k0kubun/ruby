@@ -860,6 +860,11 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
+        &Insn::ArrayAsetOrStore { array, index, length, val, state } => {
+            let nonneg = function.type_of(index).known_nonnegative();
+            let (array, index, length, val) = (opnd!(array), opnd!(index), opnd!(length), opnd!(val));
+            no_output!(gen_array_aset_or_store(jit, asm, function, array, index, length, val, nonneg, &function.frame_state(state)))
+        }
         Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), &function.frame_state(*state)),
         Insn::ArrayLength { array } => gen_array_length(asm, opnd!(array)),
         Insn::ObjectAlloc { val, state } => gen_object_alloc(jit, asm, function, opnd!(val), &function.frame_state(*state)),
@@ -3655,6 +3660,72 @@ fn gen_array_aset(
     let elem_offset = asm.lshift(unboxed_idx, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
     let elem_ptr = asm.add(array_ptr, elem_offset);
     asm.store(Opnd::mem(VALUE_BITS, elem_ptr, 0), val);
+}
+
+/// Compile an element write that grows the array when the index is past the end (`Array#[]=`).
+///
+/// The in-range path is the raw store [`gen_array_aset`] emits. Out-of-range indices take a cold
+/// branch that calls `rb_ary_store`, which grows the array (and raises IndexError for an index that
+/// is still negative after adjustment) instead of leaving JIT code:
+///
+/// ```text
+///     cmp index, length ; jge store_block   # index >= length: the store grows the array
+///     <adjust negative index> ; cmp index, 0 ; jl store_block
+///     <raw store> ; jmp join_block
+///   store_block:  rb_ary_store(array, index, val) ; jmp join_block
+///   join_block:
+/// ```
+///
+/// `index_nonnegative` skips the negative-index half of the check when the index type proves it.
+/// `Array#[]=` evaluates to the value that was stored either way, so nothing joins.
+fn gen_array_aset_or_store(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    array: Opnd,
+    index: Opnd,
+    length: Opnd,
+    val: Opnd,
+    index_nonnegative: bool,
+    state: &FrameState,
+) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+
+    let store_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let store_edge = || Target::Block(Box::new(lir::BranchEdge { target: store_block, args: vec![] }));
+    let join_edge = || Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+
+    let index = asm.load_mem(index);
+    let length = asm.load_mem(length);
+    asm.cmp(index, length);
+    asm.jge(jit, store_edge());
+
+    let in_range_index = if index_nonnegative {
+        index
+    } else {
+        let adjusted = gen_adjust_bounds(asm, index, length);
+        asm.cmp(adjusted, 0.into());
+        asm.jl(jit, store_edge());
+        adjusted
+    };
+    gen_array_aset(asm, array, in_range_index, val);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(store_block);
+    let store_label = jit.get_label(asm, store_block, hir_block_id);
+    asm.write_label(store_label);
+    // rb_ary_store reallocates the array and raises IndexError for an index that stays negative, so
+    // it needs the full non-leaf preparation. Emitting it here keeps it off the in-range path.
+    // It takes the unadjusted index because it does its own negative-index adjustment.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_ary_store, array, index, val);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(join_block);
+    let join_label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(join_label);
 }
 
 fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::Opnd {
