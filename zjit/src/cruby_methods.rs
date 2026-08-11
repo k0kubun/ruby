@@ -405,16 +405,14 @@ fn inline_array_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             fun.guard_not_frozen(block, recv, state);
             fun.guard_not_shared(block, recv, state);
 
-            // Bounds check: unbox Fixnum index and guard 0 <= idx < length.
+            // A write past the end of the array grows it rather than raising, and a negative index
+            // that is still out of range raises IndexError, so a bounds check that side-exits would
+            // give up on the rest of the method for something rb_ary_store handles. Ragel-generated
+            // parsers (the mail gem) push with `stack[top] = cs`, which writes at index == length
+            // on every push.
             let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
             let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: Box::new(SideExitReason::GuardLess), state });
-            let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-            use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
-
-            let _ = fun.push_insn(block, hir::Insn::ArrayAset { array: recv, index, val });
+            let _ = fun.push_insn(block, hir::Insn::ArrayAsetOrStore { array: recv, index, length, val, state });
             fun.push_insn(block, hir::Insn::WriteBarrier { recv, val });
             return Some(val);
         }

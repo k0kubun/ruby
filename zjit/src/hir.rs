@@ -1043,6 +1043,16 @@ pub enum Insn {
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
+    /// Store `val` into `array[index]`, growing `array` when `index` is past the end. Unlike
+    /// [`Insn::ArrayAset`], which needs an index that was already bounds-checked with side-exiting
+    /// guards, this takes the raw (possibly negative, possibly out-of-range) index plus the array
+    /// `length` and calls `rb_ary_store` for out-of-range indices. That matches `Array#[]=`, which
+    /// grows the array instead of raising, so there is no reason to leave the JIT for it. A
+    /// negative index that is still negative after adjustment raises IndexError, which
+    /// `rb_ary_store` does for us.
+    ///
+    /// `array` must already be known unfrozen and unshared, like [`Insn::ArrayAset`].
+    ArrayAsetOrStore { array: InsnId, index: InsnId, length: InsnId, val: InsnId, state: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
     ArrayLength { array: InsnId },
@@ -1547,6 +1557,13 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*index);
                 $visit_one!(*val);
             }
+            Insn::ArrayAsetOrStore { array, index, length, val, state } => {
+                $visit_one!(*array);
+                $visit_one!(*index);
+                $visit_one!(*length);
+                $visit_one!(*val);
+                $visit_one!(*state);
+            }
             Insn::ArrayPop { array, state } => {
                 $visit_one!(*array);
                 $visit_one!(*state);
@@ -1694,7 +1711,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. }
+            | Insn::ArrayAset { .. } | Insn::ArrayAsetOrStore { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
@@ -1787,6 +1804,7 @@ impl Insn {
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
+            Insn::ArrayAsetOrStore { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
             Insn::AdjustBounds { .. } => effects::Empty,
@@ -2071,6 +2089,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
+            }
+            Insn::ArrayAsetOrStore { array, index, length, val, .. } => {
+                write!(f, "ArrayAsetOrStore {array}, {index}, {length}, {val}")
             }
             Insn::ArrayPop { array, .. } => {
                 write!(f, "ArrayPop {array}")
@@ -3607,6 +3628,7 @@ impl Function {
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
+            | Insn::ArrayAsetOrStore { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -6680,6 +6702,15 @@ impl Function {
                             _ => insn_id,
                         }
                     },
+                    &Insn::ArrayAsetOrStore { array, index, length, val, .. } => {
+                        match (self.type_of(index).cint64_value(), self.type_of(length).cint64_value()) {
+                            // Statically in range and nonnegative: the store can't grow the array,
+                            // so drop the bounds check and the rb_ary_store fallback.
+                            (Some(index_num), Some(length_num)) if index_num >= 0 && index_num < length_num =>
+                                self.new_insn(Insn::ArrayAset { array, index, val }),
+                            _ => insn_id,
+                        }
+                    },
                     &Insn::GuardGreaterEq { left, right, state, ref reason } => {
                         let left_num = self.type_of(left).cint64_value();
                         let right_num = self.type_of(right).cint64_value();
@@ -7891,6 +7922,11 @@ impl Function {
             Insn::ArrayAset { array, index, .. } => {
                 self.assert_subtype(insn_id, array, types::ArrayExact)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
+            }
+            Insn::ArrayAsetOrStore { array, index, length, .. } => {
+                self.assert_subtype(insn_id, array, types::ArrayExact)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
+                self.assert_subtype(insn_id, length, types::CInt64)
             }
             Insn::AdjustBounds { index, length } => {
                 self.assert_subtype(insn_id, index, types::CInt64)?;
