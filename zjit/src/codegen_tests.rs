@@ -637,9 +637,10 @@ fn test_yield_polymorphic_non_iseq_handler_falls_back() {
 }
 
 #[test]
-fn test_yield_polymorphic_symbol_handler_falls_back() {
-    // A symbol handler at a polymorphic yield site fails the ISEQ tag check and takes the
-    // generic InvokeBlock fallback in-line, without a side exit or another recompile.
+fn test_yield_polymorphic_symbol_handler_dispatches_directly() {
+    // A symbol handler mixed into a polymorphic yield site fails the ISEQ tag check but is
+    // recognized by the symbol tag check ahead of it, so it calls the method on the yielded
+    // argument without a side exit or another recompile.
     set_call_threshold(2);
     eval("
         def invoke = yield(10)
@@ -654,6 +655,121 @@ fn test_yield_polymorphic_symbol_handler_falls_back() {
         eval("add_one; double; via_sym");
     }
     assert_snapshot!(assert_compiles("[add_one, double, via_sym]"), @r#"[11, 20, "10"]"#);
+}
+
+#[test]
+fn test_yield_symbol_handler_dispatches_directly() {
+    // `yield x` to a `&:foo` block calls foo on x.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def via_sym = invoke(&:to_s)
+        via_sym; via_sym
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym");
+    }
+    assert_snapshot!(assert_compiles("via_sym"), @r#""10""#);
+}
+
+#[test]
+fn test_yield_symbol_handler_extra_args_become_call_args() {
+    // `yield a, b` to a `&:foo` block calls a.foo(b): the first yielded argument is the
+    // receiver and the rest are the method's arguments.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield('abcd', 1, 2)
+        def via_sym = invoke(&:slice)
+        via_sym; via_sym
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym");
+    }
+    assert_snapshot!(assert_compiles("via_sym"), @r#""bc""#);
+}
+
+#[test]
+fn test_yield_symbol_handler_varies_per_call() {
+    // The fast path recognizes any static symbol, not only the ones the profile sampled,
+    // so a site that yields to a different symbol on each call still dispatches.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def via_sym(sym) = invoke(&sym)
+        via_sym(:to_s); via_sym(:to_s)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym(:to_s)");
+    }
+    assert_snapshot!(assert_compiles("[via_sym(:to_s), via_sym(:succ), via_sym(:abs)]"), @r#"["10", 11, 10]"#);
+}
+
+#[test]
+fn test_yield_symbol_handler_zero_args_raises() {
+    // A symbol block handler needs a receiver, so `yield` with no arguments raises
+    // ArgumentError just like the interpreter's vm_invoke_symbol_block.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield
+        def via_sym
+          invoke(&:to_s)
+        rescue ArgumentError => e
+          e.message
+        end
+        via_sym; via_sym
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym");
+    }
+    assert_snapshot!(assert_compiles("via_sym"), @r#""no receiver given""#);
+}
+
+#[test]
+fn test_yield_symbol_handler_non_public_method() {
+    // Symbol block handlers call the method publicly, so a private or protected method
+    // goes through method_missing and raises NoMethodError.
+    set_call_threshold(2);
+    eval("
+        class SymRecv
+          private def secret = 42
+        end
+        def invoke(recv) = yield(recv)
+        def via_sym
+          invoke(SymRecv.new, &:secret)
+        rescue NoMethodError => e
+          e.message
+        end
+        via_sym; via_sym
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym");
+    }
+    assert_snapshot!(assert_compiles("via_sym"), @r#""private method 'secret' called for an instance of SymRecv""#);
+}
+
+#[test]
+fn test_yield_symbol_handler_method_missing() {
+    // A symbol naming a method the receiver does not define reaches method_missing.
+    set_call_threshold(2);
+    eval("
+        class SymMissing
+          def method_missing(name, *args) = [name, args]
+          def respond_to_missing?(*) = true
+        end
+        def invoke(recv) = yield(recv, 1)
+        def via_sym = invoke(SymMissing.new, &:whatever)
+        via_sym; via_sym
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_sym");
+    }
+    assert_snapshot!(assert_compiles("via_sym"), @"[:whatever, [1]]");
 }
 
 #[test]

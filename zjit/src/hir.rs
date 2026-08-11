@@ -1175,6 +1175,16 @@ pub enum Insn {
         state: InsnId,
         reason: SendFallbackReason,
     },
+    /// Optimized `invokeblock` for symbol block handlers (`&:foo`). Calls the symbol's method
+    /// on the first yielded argument with the rest as arguments, like `vm_invoke_symbol_block`,
+    /// instead of going through `rb_vm_invokeblock`. `symbol` is the runtime block handler, which
+    /// a preceding branch established is a static symbol; `args` is never empty, since `yield`
+    /// with no arguments raises ArgumentError, which only the generic fallback implements.
+    InvokeBlockSymbol {
+        symbol: InsnId,
+        args: Vec<InsnId>,
+        state: InsnId,
+    },
     /// Optimized invokeblock for IFUNC block handlers.
     /// Calls rb_vm_yield_with_cfunc directly instead of going through rb_vm_invokeblock.
     InvokeBlockIfunc {
@@ -1583,6 +1593,11 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(args);
                 $visit_one!(*state);
             }
+            Insn::InvokeBlockSymbol { symbol, args, state } => {
+                $visit_one!(*symbol);
+                $visit_many!(args);
+                $visit_one!(*state);
+            }
             Insn::CCall { recv, args, .. } => {
                 $visit_one!(*recv);
                 $visit_many!(args);
@@ -1829,6 +1844,7 @@ impl Insn {
             Insn::InvokeSuperForward { .. } => effects::Any,
             Insn::InvokeBlock { .. } => effects::Any,
             Insn::InvokeBlockIfunc { .. } => effects::Any,
+            Insn::InvokeBlockSymbol { .. } => effects::Any,
             Insn::SendDirect(_) => effects::Any,
             // TODO (nirvdrum 2026-05-28): Revisit when PushInlineFrame is
             // actually lightweight. The frame writes here pay for the spill
@@ -2221,6 +2237,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::InvokeBlockIfunc { block_handler, args, .. } => {
                 write!(f, "InvokeBlockIfunc {block_handler}")?;
+                write_separated!(f, ", ", ", ", args);
+                Ok(())
+            }
+            Insn::InvokeBlockSymbol { symbol, args, .. } => {
+                write!(f, "InvokeBlockSymbol {symbol}")?;
                 write_separated!(f, ", ", ", ", args);
                 Ok(())
             }
@@ -3038,19 +3059,19 @@ impl BlockIseqReject {
 
     fn counter(self) -> Counter {
         match self {
-            BlockIseqReject::HasOpt => Counter::invokeblock_iseq_reject_has_opt,
-            BlockIseqReject::HasRest => Counter::invokeblock_iseq_reject_has_rest,
-            BlockIseqReject::HasPost => Counter::invokeblock_iseq_reject_has_post,
-            BlockIseqReject::HasKw => Counter::invokeblock_iseq_reject_has_kw,
-            BlockIseqReject::HasKwrest => Counter::invokeblock_iseq_reject_has_kwrest,
-            BlockIseqReject::HasBlock => Counter::invokeblock_iseq_reject_has_block,
-            BlockIseqReject::Forwardable => Counter::invokeblock_iseq_reject_forwardable,
-            BlockIseqReject::NoKwarg => Counter::invokeblock_iseq_reject_no_kwarg,
-            BlockIseqReject::ArityFewer => Counter::invokeblock_iseq_reject_arity_fewer,
-            BlockIseqReject::ArityMore => Counter::invokeblock_iseq_reject_arity_more,
-            BlockIseqReject::Autosplat => Counter::invokeblock_iseq_reject_autosplat,
-            BlockIseqReject::TooManyArgs => Counter::invokeblock_iseq_reject_too_many_args,
-            BlockIseqReject::MayThrow => Counter::invokeblock_iseq_reject_may_throw,
+            BlockIseqReject::HasOpt => Counter::invokeblock_fallback_has_opt,
+            BlockIseqReject::HasRest => Counter::invokeblock_fallback_has_rest,
+            BlockIseqReject::HasPost => Counter::invokeblock_fallback_has_post,
+            BlockIseqReject::HasKw => Counter::invokeblock_fallback_has_kw,
+            BlockIseqReject::HasKwrest => Counter::invokeblock_fallback_has_kwrest,
+            BlockIseqReject::HasBlock => Counter::invokeblock_fallback_has_block,
+            BlockIseqReject::Forwardable => Counter::invokeblock_fallback_forwardable,
+            BlockIseqReject::NoKwarg => Counter::invokeblock_fallback_no_kwarg,
+            BlockIseqReject::ArityFewer => Counter::invokeblock_fallback_arity_fewer,
+            BlockIseqReject::ArityMore => Counter::invokeblock_fallback_arity_more,
+            BlockIseqReject::Autosplat => Counter::invokeblock_fallback_autosplat,
+            BlockIseqReject::TooManyArgs => Counter::invokeblock_fallback_too_many_args,
+            BlockIseqReject::MayThrow => Counter::invokeblock_fallback_may_throw,
         }
     }
 }
@@ -3595,6 +3616,7 @@ impl Function {
             Insn::InvokeSuperForward { .. } => types::BasicObject,
             Insn::InvokeBlock { .. } => types::BasicObject,
             Insn::InvokeBlockIfunc { .. } => types::BasicObject,
+            Insn::InvokeBlockSymbol { .. } => types::BasicObject,
             Insn::InvokeProc { .. } => types::BasicObject,
             Insn::InvokeBlockIseqDirect { .. } => types::BasicObject,
             Insn::InvokeBuiltin { return_type, .. } => *return_type,
@@ -7278,6 +7300,7 @@ impl Function {
             Insn::InvokeBlock { ref args, .. }
             | Insn::InvokeBlockIseqDirect { ref args, .. }
             | Insn::InvokeBlockIfunc { ref args, .. }
+            | Insn::InvokeBlockSymbol { ref args, .. }
             | Insn::NewArray { elements: ref args, .. }
             | Insn::ArrayHash { elements: ref args, .. }
             | Insn::ArrayMin { elements: ref args, .. }
@@ -9807,33 +9830,92 @@ fn add_iseq_to_hir(
                     // leave every such shared yield site on the generic fallback. Buckets are
                     // ordered by frequency, so the hottest block is compared first below.
                     let mut polymorphic_iseqs: Vec<IseqPtr> = vec![];
+                    // Share of the profile that yielded to a symbol block handler (`&:foo`).
+                    // Such a yield calls the symbol's method on the first yielded argument
+                    // (`vm_invoke_symbol_block`), and the VM builds the call cache for it on the
+                    // stack, so every one of them pays a full uncached method lookup. Unlike the
+                    // ISEQ chain below the fast path does not need the handler's identity, only
+                    // that it *is* a static symbol, so one tag test covers every symbol the site
+                    // ever sees instead of just the ones the profile happened to sample.
+                    let mut symbol_coverage = 0.0;
+                    // Why the polymorphic chain was not emitted, for --zjit-stats.
+                    let mut poly_reject: Option<Counter> = None;
+                    let mut poly_share: Option<Counter> = None;
                     if let Some(summary) = block_handler_summary.as_ref() {
-                        if block_call_inlinable(flags) && (summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
+                        let is_polymorphic = summary.is_polymorphic() || summary.is_skewed_polymorphic();
+                        if block_call_inlinable(flags) && (is_polymorphic || summary.is_monomorphic()) {
+                            let mut saw_iseq_bucket = false;
                             for &profiled_type in summary.buckets() {
                                 if profiled_type.is_empty() {
                                     break;
                                 }
                                 let obj = profiled_type.class();
                                 if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
+                                    saw_iseq_bucket = true;
                                     let iseq = obj.as_iseq();
-                                    if !polymorphic_iseqs.contains(&iseq) && block_call_inlinable_iseq(iseq, args.len()).is_ok() {
-                                        polymorphic_iseqs.push(iseq);
+                                    if polymorphic_iseqs.contains(&iseq) { continue; }
+                                    match block_call_inlinable_iseq(iseq, args.len()) {
+                                        Ok(()) => polymorphic_iseqs.push(iseq),
+                                        Err(reject) => if iseq_reject.is_none() {
+                                            // Remember the hottest rejected block, which the
+                                            // buckets are ordered by.
+                                            iseq_reject = Some(reject);
+                                        }
                                     }
                                 }
                             }
-                            // Buckets that are not directly dispatchable (Proc, IFUNC and symbol
-                            // handlers, blocks whose parameters don't match the yield) were skipped
-                            // above and have to take the generic fallback at run time. Only keep
-                            // the chain if the blocks in it account for most of the profile;
+                            if get_option!(stats) && is_polymorphic {
+                                // Which handler family covers the largest share of a polymorphic
+                                // yield site, so we know what a wider chain would have to dispatch.
+                                let share = |f: &dyn Fn(VALUE) -> bool| summary.coverage(|_, pt| !pt.is_empty() && f(pt.class()));
+                                let symbol = share(&|obj: VALUE| obj.symbol_p());
+                                let ifunc = share(&|obj: VALUE| unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 });
+                                let iseq = share(&|obj: VALUE| unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 });
+                                let proc_ = share(&|obj: VALUE| !obj.special_const_p() && unsafe { rb_obj_is_proc(obj).test() });
+                                let mut best = (0.0, Counter::invokeblock_fallback_poly_share_other);
+                                for (v, c) in [(symbol, Counter::invokeblock_fallback_poly_share_symbol),
+                                               (ifunc, Counter::invokeblock_fallback_poly_share_ifunc),
+                                               (iseq, Counter::invokeblock_fallback_poly_share_iseq),
+                                               (proc_, Counter::invokeblock_fallback_poly_share_proc)] {
+                                    if v > best.0 { best = (v, c); }
+                                }
+                                poly_share = Some(best.1);
+                            }
+                            if is_polymorphic {
+                                poly_reject = Some(if !saw_iseq_bucket {
+                                    Counter::invokeblock_fallback_poly_non_iseq
+                                } else if polymorphic_iseqs.is_empty() {
+                                    Counter::invokeblock_fallback_poly_iseq_rejected
+                                } else {
+                                    Counter::invokeblock_fallback_poly_low_coverage
+                                });
+                            }
+                            // Buckets that are not directly dispatchable (Proc and IFUNC handlers,
+                            // dynamic symbols, blocks whose parameters don't match the yield) were
+                            // skipped above and have to take the generic fallback at run time. Only
+                            // keep the chain if the handlers in it account for most of the profile;
                             // otherwise every execution pays for the comparisons and still ends up
                             // in rb_vm_invokeblock.
-                            let covered = summary.coverage(|_, profiled_type| {
+                            // `yield` with no arguments raises ArgumentError ("no receiver
+                            // given"), which only the generic fallback implements.
+                            if !args.is_empty() {
+                                symbol_coverage = summary.coverage(|_, profiled_type| {
+                                    !profiled_type.is_empty() && profiled_type.class().static_sym_p()
+                                });
+                            }
+                            let iseq_coverage = summary.coverage(|_, profiled_type| {
                                 !profiled_type.is_empty()
                                     && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
                                     && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
                             });
-                            if covered < CHAIN_COVERAGE_THRESHOLD {
+                            // The two fast paths are gated separately: they test different bits
+                            // of the handler and each one's comparisons are wasted on executions
+                            // the other covers.
+                            if iseq_coverage < CHAIN_COVERAGE_THRESHOLD {
                                 polymorphic_iseqs.clear();
+                            }
+                            if symbol_coverage < CHAIN_COVERAGE_THRESHOLD {
+                                symbol_coverage = 0.0;
                             }
                         }
                     }
@@ -9863,26 +9945,56 @@ fn add_iseq_to_hir(
                     } else if let Some(block_iseq) = inline_iseq {
                         let level = get_lvar_level(exit_state.iseq);
                         fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, exit_id, true)
-                    } else if !polymorphic_iseqs.is_empty() {
-                        // Dispatch on the runtime block ISEQ over the profiled candidates, joining
-                        // on the generic fallback for anything else. Unlike the monomorphic path
-                        // above, a miss must not side-exit: the site is known to see multiple
-                        // blocks, so a guard would keep failing and recompiling.
+                    } else if !polymorphic_iseqs.is_empty() || symbol_coverage > 0.0 {
+                        // Dispatch on the runtime block handler over the profiled candidates,
+                        // joining on the generic fallback for anything else. Unlike the
+                        // monomorphic path above, a miss must not side-exit: the site is known to
+                        // see more than one handler, so a guard would keep failing and recompiling.
                         let level = get_lvar_level(exit_state.iseq);
                         let ep = fun.get_ep(block, level);
                         let block_handler = fun.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
 
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
-                        let dispatch_block = fun.new_block(insn_idx);
                         let fallback_block = fun.new_block(insn_idx);
 
+                        // Symbol handlers first: a static symbol block handler is the symbol
+                        // itself, an immediate whose low byte is RUBY_SYMBOL_FLAG, so one masked
+                        // compare recognizes every symbol the site can yield to. No other handler
+                        // kind can alias it: ISEQ and IFUNC handlers are tagged 0x1 / 0x3, and
+                        // Proc and dynamic-symbol handlers are heap pointers, which are aligned.
+                        let mut compare_block = block;
+                        if symbol_coverage > 0.0 {
+                            let sym_mask = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0xff) });
+                            let low_byte = fun.push_insn(compare_block, Insn::IntAnd { left: block_handler, right: sym_mask });
+                            let sym_flag = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(RUBY_SYMBOL_FLAG as i64) });
+                            let sym_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: low_byte, right: sym_flag });
+                            let symbol_block = fun.new_block(insn_idx);
+                            let miss_block = fun.new_block(insn_idx);
+                            fun.push_insn(compare_block, Insn::CondBranch {
+                                val: sym_matches,
+                                if_true: BranchEdge { target: symbol_block, args: vec![] },
+                                if_false: BranchEdge { target: miss_block, args: vec![] },
+                            });
+                            // The handler doubles as the symbol operand; re-read it as a VALUE so
+                            // the call passes a Ruby object rather than the CInt64 the tag test used.
+                            let symbol = fun.load_ep_env_field(symbol_block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::BasicObject);
+                            let symbol_result = fun.push_insn(symbol_block, Insn::InvokeBlockSymbol { symbol, args: args.clone(), state: exit_id });
+                            fun.push_insn(symbol_block, Insn::Jump(BranchEdge { target: join_block, args: vec![symbol_result] }));
+                            compare_block = miss_block;
+                        }
+
+                        if polymorphic_iseqs.is_empty() {
+                            fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+                        } else {
+                        let dispatch_block = fun.new_block(insn_idx);
+
                         // The handler must be an ISEQ block: VM_BH_ISEQ_BLOCK_P is `& 0x3 == 0x1`.
-                        let tag_mask = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
-                        let tag = fun.push_insn(block, Insn::IntAnd { left: block_handler, right: tag_mask });
-                        let iseq_tag = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x1) });
-                        let tag_matches = fun.push_insn(block, Insn::IsBitEqual { left: tag, right: iseq_tag });
-                        fun.push_insn(block, Insn::CondBranch {
+                        let tag_mask = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x3) });
+                        let tag = fun.push_insn(compare_block, Insn::IntAnd { left: block_handler, right: tag_mask });
+                        let iseq_tag = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x1) });
+                        let tag_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: tag, right: iseq_tag });
+                        fun.push_insn(compare_block, Insn::CondBranch {
                             val: tag_matches,
                             if_true: BranchEdge { target: dispatch_block, args: vec![] },
                             if_false: BranchEdge { target: fallback_block, args: vec![] },
@@ -9909,6 +10021,7 @@ fn add_iseq_to_hir(
                             compare_block = miss_block;
                         }
                         fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+                        }
 
                         let fallback_result = fun.push_insn(fallback_block, Insn::InvokeBlock {
                             cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss,
@@ -9955,6 +10068,9 @@ fn add_iseq_to_hir(
                         fun.push_insn(ifunc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
 
                         // In the fallthrough case, use generic rb_vm_invokeblock and join
+                        if get_option!(stats) {
+                            fun.count(block, Counter::invokeblock_fallback_ifunc_miss);
+                        }
                         let fallback_result = fun.push_insn(block, Insn::InvokeBlock {
                             cd, args, state: exit_id, reason: InvokeBlockNotSpecialized,
                         });
@@ -9965,10 +10081,38 @@ fn add_iseq_to_hir(
                         join_param
                     } else {
                         if get_option!(stats) {
-                            if let Some(reject) = iseq_reject {
-                                fun.count(block, reject.counter());
-                            } else if complex_call_reject {
-                                fun.count(block, Counter::invokeblock_iseq_reject_complex_call);
+                            // Attribute every generic fallback to the gate or profile shape
+                            // that kept this yield off a specialized dispatch.
+                            let counter = if complex_call_reject {
+                                Counter::invokeblock_fallback_complex_call
+                            } else if let Some(poly) = poly_reject {
+                                poly
+                            } else if let Some(reject) = iseq_reject {
+                                reject.counter()
+                            } else if let Some(summary) = block_handler_summary.as_ref() {
+                                if summary.is_monomorphic() {
+                                    let obj = summary.bucket(0).class();
+                                    if obj.symbol_p() { Counter::invokeblock_fallback_symbol }
+                                    else if unsafe { rb_obj_is_proc(obj).test() } { Counter::invokeblock_fallback_proc }
+                                    else { Counter::invokeblock_fallback_no_profile }
+                                } else if summary.is_megamorphic() || summary.is_skewed_megamorphic() {
+                                    Counter::invokeblock_fallback_megamorphic
+                                } else {
+                                    Counter::invokeblock_fallback_no_profile
+                                }
+                            } else {
+                                Counter::invokeblock_fallback_no_profile
+                            };
+                            fun.count(block, counter);
+                            // For a polymorphic site the chain skipped, also report the gate that
+                            // rejected the hottest ISEQ bucket.
+                            if poly_reject.is_some() {
+                                if let Some(reject) = iseq_reject {
+                                    fun.count(block, reject.counter());
+                                }
+                                if let Some(share) = poly_share {
+                                    fun.count(block, share);
+                                }
                             }
                         }
                         fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })

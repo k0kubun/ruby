@@ -309,6 +309,7 @@ make_counters! {
         non_variadic_cfunc_optimized_send_count,
         variadic_cfunc_optimized_send_count,
         block_iseq_direct_optimized_send_count,
+        invokeblock_symbol_optimized_send_count,
     }
 
     // Ivar fallback counters that are summed as dynamic_setivar_count
@@ -472,20 +473,43 @@ make_counters! {
     // Why a `yield` whose profiled block handler is an ISEQ block could not dispatch
     // directly (see `block_call_inlinable_iseq`). Counted once per execution of a yield
     // site that ends up on the generic `rb_vm_invokeblock` fallback.
-    invokeblock_iseq_reject_complex_call,
-    invokeblock_iseq_reject_has_opt,
-    invokeblock_iseq_reject_has_rest,
-    invokeblock_iseq_reject_has_post,
-    invokeblock_iseq_reject_has_kw,
-    invokeblock_iseq_reject_has_kwrest,
-    invokeblock_iseq_reject_has_block,
-    invokeblock_iseq_reject_forwardable,
-    invokeblock_iseq_reject_no_kwarg,
-    invokeblock_iseq_reject_arity_fewer,
-    invokeblock_iseq_reject_arity_more,
-    invokeblock_iseq_reject_autosplat,
-    invokeblock_iseq_reject_too_many_args,
-    invokeblock_iseq_reject_may_throw,
+    invokeblock_fallback_complex_call,
+    invokeblock_fallback_has_opt,
+    invokeblock_fallback_has_rest,
+    invokeblock_fallback_has_post,
+    invokeblock_fallback_has_kw,
+    invokeblock_fallback_has_kwrest,
+    invokeblock_fallback_has_block,
+    invokeblock_fallback_forwardable,
+    invokeblock_fallback_no_kwarg,
+    invokeblock_fallback_arity_fewer,
+    invokeblock_fallback_arity_more,
+    invokeblock_fallback_autosplat,
+    invokeblock_fallback_too_many_args,
+    invokeblock_fallback_may_throw,
+    invokeblock_fallback_ifunc_miss,
+    invokeblock_fallback_poly_iseq_rejected,
+    invokeblock_fallback_poly_low_coverage,
+    invokeblock_fallback_poly_share_symbol,
+    invokeblock_fallback_poly_share_ifunc,
+    invokeblock_fallback_poly_share_proc,
+    invokeblock_fallback_poly_share_iseq,
+    invokeblock_fallback_poly_share_other,
+    invokeblock_fallback_poly_non_iseq,
+    invokeblock_fallback_symbol,
+    invokeblock_fallback_proc,
+    invokeblock_fallback_megamorphic,
+    invokeblock_fallback_no_profile,
+
+    // --zjit-stats only: what the block handler at a generic `invokeblock` fallback actually
+    // was at run time. Compare against invokeblock_handler_* (what the profile predicted) to
+    // tell a gate rejection apart from an unrepresentative profile.
+    invokeblock_runtime_iseq,
+    invokeblock_runtime_ifunc,
+    invokeblock_runtime_symbol,
+    invokeblock_runtime_dsymbol,
+    invokeblock_runtime_proc,
+    invokeblock_runtime_none,
 
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may
@@ -510,6 +534,28 @@ make_counters! {
     getblockparamproxy_handler_no_profiles,
 
     total_native_stack_bytes,
+}
+
+/// Record the block handler a generic `invokeblock` fallback saw at run time. Called from JIT
+/// code only under `--zjit-stats`: comparing this against the `invokeblock_handler_*` counters,
+/// which describe the *profiled* handler, separates "the dispatch gates rejected this site"
+/// from "the profile no longer describes this site".
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_count_runtime_block_handler(cfp: CfpPtr) {
+    let handler = unsafe { rb_vm_get_untagged_block_handler(cfp) };
+    if handler.nil_p() {
+        incr_counter!(invokeblock_runtime_none);
+    } else if unsafe { rb_IMEMO_TYPE_P(handler, imemo_iseq) == 1 } {
+        incr_counter!(invokeblock_runtime_iseq);
+    } else if unsafe { rb_IMEMO_TYPE_P(handler, imemo_ifunc) == 1 } {
+        incr_counter!(invokeblock_runtime_ifunc);
+    } else if handler.static_sym_p() {
+        incr_counter!(invokeblock_runtime_symbol);
+    } else if handler.symbol_p() {
+        incr_counter!(invokeblock_runtime_dsymbol);
+    } else {
+        incr_counter!(invokeblock_runtime_proc);
+    }
 }
 
 /// Increase a counter by a specified amount
