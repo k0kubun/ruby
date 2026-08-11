@@ -267,6 +267,102 @@ rb_zjit_class_has_default_allocator(VALUE klass)
 }
 
 
+// The class an ICLASS was included into.
+VALUE
+rb_zjit_iclass_includer(VALUE iclass)
+{
+    RUBY_ASSERT(RB_TYPE_P(iclass, T_ICLASS));
+    return RCLASS_INCLUDER(iclass);
+}
+
+// The depth of `klass` in its superclass chain, as used by
+// class_search_class_ancestor() for the constant-time `is_a?` check.
+unsigned int
+rb_zjit_class_superclass_depth(VALUE klass)
+{
+    RUBY_ASSERT(RB_TYPE_P(klass, T_CLASS));
+    return (unsigned int)RCLASS_SUPERCLASS_DEPTH(klass);
+}
+
+struct zjit_override_search {
+    ID mid;
+    // Remaining number of classes we are willing to visit. Goes negative when
+    // the hierarchy below the class is too large to scan.
+    int budget;
+    bool found;
+};
+
+// True if the segment of the ancestor chain owned by `klass` (its own method
+// table plus any module included into or prepended to it) defines `mid`.
+// The segment ends at the next T_CLASS, which is `klass`'s superclass.
+static bool
+zjit_class_segment_defines_method(VALUE klass, ID mid)
+{
+    VALUE p = klass;
+    do {
+        VALUE unused;
+        struct rb_id_table *tbl = RCLASS_M_TBL(p);
+        if (tbl && rb_id_table_lookup(tbl, mid, &unused)) return true;
+        p = RCLASS_SUPER(p);
+    } while (p && !RB_TYPE_P(p, T_CLASS));
+    return false;
+}
+
+static void zjit_search_override_i(VALUE klass, VALUE data);
+
+// Walk every class below `klass` looking for a definition of `mid`. Subclass
+// lists only track T_CLASS -> T_CLASS links, so each visited class also has to
+// account for the ICLASSes include/prepend inserted directly above it.
+//
+// Singleton classes are deliberately kept out of the subclass lists, so a
+// `def obj.mid` on an instance of a class below `klass` is invisible here. The
+// generated guard makes up for that by rejecting receivers whose class is a
+// singleton class.
+static bool
+zjit_method_overridden_below(VALUE klass, struct zjit_override_search *search)
+{
+    rb_class_foreach_subclass(klass, zjit_search_override_i, (VALUE)search);
+    return search->found || search->budget < 0;
+}
+
+static void
+zjit_search_override_i(VALUE klass, VALUE data)
+{
+    struct zjit_override_search *search = (struct zjit_override_search *)data;
+    if (search->found || search->budget < 0) return;
+    search->budget--;
+    if (search->budget < 0) return;
+    // Refinement ICLASSes are reachable from a module's subclass list, but a
+    // T_CLASS's list only ever holds T_CLASS entries.
+    if (!RB_TYPE_P(klass, T_CLASS)) {
+        search->found = true;
+        return;
+    }
+    if (zjit_class_segment_defines_method(klass, search->mid)) {
+        search->found = true;
+        return;
+    }
+    zjit_method_overridden_below(klass, search);
+}
+
+// True when no class below `klass` overrides `mid`, so `mid` resolves to the
+// same method entry for every instance of `klass` and of its subclasses.
+// Conservatively returns false when the hierarchy is larger than `budget`
+// classes or when we cannot enumerate part of it.
+bool
+rb_zjit_no_method_override_below(VALUE klass, ID mid, unsigned int budget)
+{
+    if (!RB_TYPE_P(klass, T_CLASS)) return false;
+    if (RCLASS_SINGLETON_P(klass)) return false;
+
+    bool result;
+    RB_VM_LOCKING() {
+        struct zjit_override_search search = { .mid = mid, .budget = (int)budget, .found = false };
+        result = !zjit_method_overridden_below(klass, &search);
+    }
+    return result;
+}
+
 VALUE rb_vm_untag_block_handler(VALUE block_handler);
 VALUE rb_vm_get_untagged_block_handler(rb_control_frame_t *reg_cfp);
 

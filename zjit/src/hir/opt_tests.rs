@@ -19223,6 +19223,93 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_megamorphic_send_with_one_target_guards_ancestor() {
+        // Every profiled receiver class inherits the same Base#foo, so the site is megamorphic
+        // in the receiver class but has one call target. One ancestor guard covers all of them
+        // plus the subclasses the profile never saw, and NoMethodOverride keeps that true.
+        set_call_threshold(21);
+        eval("
+        class Base; def foo = 1; end
+        class D0 < Base; end
+        class D1 < Base; end
+        class D2 < Base; end
+        class D3 < Base; end
+        class D4 < Base; end
+        class D5 < Base; end
+        class D6 < Base; end
+        class D7 < Base; end
+        class D8 < Base; end
+
+        def test o
+          o.foo
+        end
+
+        OBJS = [D0.new, D1.new, D2.new, D3.new, D4.new, D5.new, D6.new, D7.new, D8.new]
+        3.times { OBJS.each { |o| test o } }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:14:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:CBool = HasType v10, ObjectSubclass[class_exact:D1]
+          CondBranch v16, bb5(), bb6()
+        bb5():
+          PatchPoint NoSingletonClass(D1@0x1008)
+          PatchPoint MethodRedefined(D1@0x1008, foo@0x1010, cme:0x1018)
+          v55:Fixnum[1] = Const Value(1)
+          Jump bb4(v55)
+        bb6():
+          v22:CBool = HasType v10, ObjectSubclass[class_exact:D6]
+          CondBranch v22, bb7(), bb8()
+        bb7():
+          PatchPoint NoSingletonClass(D6@0x1040)
+          PatchPoint MethodRedefined(D6@0x1040, foo@0x1010, cme:0x1018)
+          v58:Fixnum[1] = Const Value(1)
+          Jump bb4(v58)
+        bb8():
+          v28:CBool = HasType v10, ObjectSubclass[class_exact:D7]
+          CondBranch v28, bb9(), bb10()
+        bb9():
+          PatchPoint NoSingletonClass(D7@0x1048)
+          PatchPoint MethodRedefined(D7@0x1048, foo@0x1010, cme:0x1018)
+          v61:Fixnum[1] = Const Value(1)
+          Jump bb4(v61)
+        bb10():
+          v34:CBool = HasType v10, ObjectSubclass[class_exact:D8]
+          CondBranch v34, bb11(), bb12()
+        bb11():
+          PatchPoint NoSingletonClass(D8@0x1050)
+          PatchPoint MethodRedefined(D8@0x1050, foo@0x1010, cme:0x1018)
+          v64:Fixnum[1] = Const Value(1)
+          Jump bb4(v64)
+        bb12():
+          v40:CBool = HasType v10, ObjectSubclass[class_exact:D0]
+          CondBranch v40, bb13(), bb14()
+        bb13():
+          PatchPoint NoSingletonClass(D0@0x1058)
+          PatchPoint MethodRedefined(D0@0x1058, foo@0x1010, cme:0x1018)
+          v67:Fixnum[1] = Const Value(1)
+          Jump bb4(v67)
+        bb14():
+          v46:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic call site
+          Jump bb4(v46)
+        bb4(v15:BasicObject):
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
     fn specialize_megamorphic_send_chains_profiled_buckets() {
         // A site that saw more receiver classes than the profile has buckets is megamorphic,
         // but the buckets still account for most of its executions, so guard them in-line and

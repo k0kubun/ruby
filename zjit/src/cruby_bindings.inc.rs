@@ -2116,6 +2116,8 @@ pub struct rb_zjit_runtime_offsets {
 pub const ROBJECT_OFFSET_AS_HEAP_FIELDS: jit_bindgen_constants = 16;
 pub const ROBJECT_OFFSET_AS_ARY: jit_bindgen_constants = 16;
 pub const RCLASS_OFFSET_PRIME_FIELDS_OBJ: jit_bindgen_constants = 40;
+pub const RCLASS_OFFSET_PRIME_SUPERCLASSES: jit_bindgen_constants = 96;
+pub const RCLASS_OFFSET_PRIME_SUPERCLASS_DEPTH: jit_bindgen_constants = 136;
 pub const TDATA_OFFSET_FIELDS_OBJ: jit_bindgen_constants = 16;
 pub const RUBY_OFFSET_RHASH_IFNONE: jit_bindgen_constants = 16;
 pub const RUBY_OFFSET_RHASH_AR_HINT: jit_bindgen_constants = 24;
@@ -2473,6 +2475,13 @@ unsafe extern "C" {
     pub fn rb_zjit_class_initialized_p(klass: VALUE) -> bool;
     pub fn rb_zjit_class_get_alloc_func(klass: VALUE) -> rb_alloc_func_t;
     pub fn rb_zjit_class_has_default_allocator(klass: VALUE) -> bool;
+    pub fn rb_zjit_iclass_includer(iclass: VALUE) -> VALUE;
+    pub fn rb_zjit_class_superclass_depth(klass: VALUE) -> ::std::os::raw::c_uint;
+    pub fn rb_zjit_no_method_override_below(
+        klass: VALUE,
+        mid: ID,
+        budget: ::std::os::raw::c_uint,
+    ) -> bool;
     pub fn rb_vm_untag_block_handler(block_handler: VALUE) -> VALUE;
     pub fn rb_vm_get_untagged_block_handler(reg_cfp: *mut rb_control_frame_t) -> VALUE;
     pub fn rb_iseq_encoded_size(iseq: *const rb_iseq_t) -> ::std::os::raw::c_uint;
