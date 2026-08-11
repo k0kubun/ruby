@@ -387,16 +387,14 @@ fn inline_array_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             fun.guard_not_frozen(block, recv, state);
             fun.guard_not_shared(block, recv, state);
 
-            // Bounds check: unbox Fixnum index and guard 0 <= idx < length.
+            // A write past the end of the array grows it rather than raising, and a negative index
+            // that is still out of range raises IndexError, so a bounds check that side-exits would
+            // give up on the rest of the method for something rb_ary_store handles. Ragel-generated
+            // parsers (the mail gem) push with `stack[top] = cs`, which writes at index == length
+            // on every push.
             let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
             let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: Box::new(SideExitReason::GuardLess), state });
-            let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-            use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
-
-            let _ = fun.push_insn(block, hir::Insn::ArrayAset { array: recv, index, val });
+            let _ = fun.push_insn(block, hir::Insn::ArrayAsetOrStore { array: recv, index, length, val, state });
             fun.push_insn(block, hir::Insn::WriteBarrier { recv, val });
             return Some(val);
         }
@@ -518,23 +516,22 @@ fn inline_string_empty_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir
     Some(result)
 }
 
-// Load self's cached coderange (flags & MASK), guarding it's been computed
-// (UNKNOWN is 0, so side-exit there and let the builtin scan the string).
-fn guard_string_coderange(fun: &mut hir::Function, block: hir::BlockId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
-    use crate::hir::SideExitReason;
+// Load self's cached coderange (flags & MASK). UNKNOWN is 0, which means the string has not been
+// scanned yet; scan it on a cold path instead of side-exiting, because a string built at runtime
+// (which is what the mail gem asks `ascii_only?` about) always starts out UNKNOWN.
+fn string_coderange(fun: &mut hir::Function, block: hir::BlockId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[recv] = args else { return None; };
     if !fun.likely_a(recv, types::String, state) { return None; }
     let recv = fun.coerce_to(block, recv, types::String, state);
     let flags = fun.load_rbasic_flags(block, recv);
     let mask = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CUInt64(RUBY_ENC_CODERANGE_MASK.into()) });
-    let cr = fun.push_insn(block, hir::Insn::IntAnd { left: flags, right: mask });
-    let min_known = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_7BIT.into()) });
-    Some(fun.push_insn(block, hir::Insn::GuardGreaterEq { left: cr, right: min_known, reason: Box::new(SideExitReason::GuardGreaterEq), state }))
+    let cached = fun.push_insn(block, hir::Insn::IntAnd { left: flags, right: mask });
+    Some(fun.push_insn(block, hir::Insn::StringCoderangeOrScan { string: recv, cached, state }))
 }
 
 // Inlines String#ascii_only? (rb_str_is_ascii_only_p): coderange == 7BIT.
 fn inline_string_ascii_only_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
-    let cr = guard_string_coderange(fun, block, args, state)?;
+    let cr = string_coderange(fun, block, args, state)?;
     let seven_bit = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_7BIT.into()) });
     let is_7bit = fun.push_insn(block, hir::Insn::IsBitEqual { left: cr, right: seven_bit });
     Some(fun.push_insn(block, hir::Insn::BoxBool { val: is_7bit }))
@@ -542,7 +539,7 @@ fn inline_string_ascii_only_p(fun: &mut hir::Function, block: hir::BlockId, _rec
 
 // Inlines String#valid_encoding? (rb_str_valid_encoding_p): coderange != BROKEN.
 fn inline_string_valid_encoding_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
-    let cr = guard_string_coderange(fun, block, args, state)?;
+    let cr = string_coderange(fun, block, args, state)?;
     let broken = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(RUBY_ENC_CODERANGE_BROKEN.into()) });
     let is_valid = fun.push_insn(block, hir::Insn::IsBitNotEqual { left: cr, right: broken });
     Some(fun.push_insn(block, hir::Insn::BoxBool { val: is_valid }))

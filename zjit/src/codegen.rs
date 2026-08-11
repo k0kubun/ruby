@@ -669,6 +669,11 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
+        &Insn::ArrayAsetOrStore { array, index, length, val, state } => {
+            let nonneg = function.type_of(index).known_nonnegative();
+            let (array, index, length, val) = (opnd!(array), opnd!(index), opnd!(length), opnd!(val));
+            no_output!(gen_array_aset_or_store(jit, asm, function, array, index, length, val, nonneg, &function.frame_state(state)))
+        }
         Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), &function.frame_state(*state)),
         Insn::ArrayLength { array } => gen_array_length(asm, opnd!(array)),
         Insn::ObjectAlloc { val, state } => gen_object_alloc(jit, asm, function, opnd!(val), &function.frame_state(*state)),
@@ -681,6 +686,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             let (string, index, length) = (opnd!(string), opnd!(index), opnd!(length));
             gen_bounds_checked_or_nil(jit, asm, index, length, nonneg, |asm, index| gen_string_getbyte(asm, string, index))
         }
+        &Insn::StringCoderangeOrScan { string, cached, state } => gen_string_coderange_or_scan(jit, asm, opnd!(string), opnd!(cached), &function.frame_state(state)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -2386,6 +2392,72 @@ fn gen_array_aset(
     let elem_offset = asm.lshift(unboxed_idx, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
     let elem_ptr = asm.add(array_ptr, elem_offset);
     asm.store(Opnd::mem(VALUE_BITS, elem_ptr, 0), val);
+}
+
+/// Compile an element write that grows the array when the index is past the end (`Array#[]=`).
+///
+/// The in-range path is the raw store [`gen_array_aset`] emits. Out-of-range indices take a cold
+/// branch that calls `rb_ary_store`, which grows the array (and raises IndexError for an index that
+/// is still negative after adjustment) instead of leaving JIT code:
+///
+/// ```text
+///     cmp index, length ; jge store_block   # index >= length: the store grows the array
+///     <adjust negative index> ; cmp index, 0 ; jl store_block
+///     <raw store> ; jmp join_block
+///   store_block:  rb_ary_store(array, index, val) ; jmp join_block
+///   join_block:
+/// ```
+///
+/// `index_nonnegative` skips the negative-index half of the check when the index type proves it.
+/// `Array#[]=` evaluates to the value that was stored either way, so nothing joins.
+fn gen_array_aset_or_store(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    array: Opnd,
+    index: Opnd,
+    length: Opnd,
+    val: Opnd,
+    index_nonnegative: bool,
+    state: &FrameState,
+) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+
+    let store_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let store_edge = || Target::Block(Box::new(lir::BranchEdge { target: store_block, args: vec![] }));
+    let join_edge = || Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+
+    let index = asm.load_mem(index);
+    let length = asm.load_mem(length);
+    asm.cmp(index, length);
+    asm.jge(jit, store_edge());
+
+    let in_range_index = if index_nonnegative {
+        index
+    } else {
+        let adjusted = gen_adjust_bounds(asm, index, length);
+        asm.cmp(adjusted, 0.into());
+        asm.jl(jit, store_edge());
+        adjusted
+    };
+    gen_array_aset(asm, array, in_range_index, val);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(store_block);
+    let store_label = jit.get_label(asm, store_block, hir_block_id);
+    asm.write_label(store_label);
+    // rb_ary_store reallocates the array and raises IndexError for an index that stays negative, so
+    // it needs the full non-leaf preparation. Emitting it here keeps it off the in-range path.
+    // It takes the unadjusted index because it does its own negative-index adjustment.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_ary_store, array, index, val);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(join_block);
+    let join_label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(join_label);
 }
 
 fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::Opnd {
@@ -4299,6 +4371,62 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
     // Tag the byte
     let byte = asm.lshift(byte, Opnd::UImm(1));
     asm.or(byte, Opnd::UImm(1))
+}
+
+/// Compile a coderange read that scans the string when the cached coderange is UNKNOWN.
+///
+/// `cached` is the coderange bits already masked out of RBASIC flags. UNKNOWN is 0, so the
+/// already-computed case is a test and a fall-through; the scan is a cold branch that joins the
+/// fast path in a block parameter:
+///
+/// ```text
+///     test cached, cached ; jz scan_block
+///     jmp join_block(cached)
+///   scan_block:  rb_enc_str_coderange(string) ; jmp join_block(result & MASK)
+///   join_block(coderange):
+/// ```
+fn gen_string_coderange_or_scan(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    string: Opnd,
+    cached: Opnd,
+    state: &FrameState,
+) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_enc_str_coderange(str: VALUE) -> std::os::raw::c_int;
+    }
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+
+    let scan_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_edge = |val| Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![val] }));
+
+    let cached = asm.load_mem(cached);
+    asm.test(cached, cached);
+    asm.jz(jit, Target::Block(Box::new(lir::BranchEdge { target: scan_block, args: vec![] })));
+    asm.jmp(join_edge(cached));
+
+    asm.set_current_block(scan_block);
+    let scan_label = jit.get_label(asm, scan_block, hir_block_id);
+    asm.write_label(scan_label);
+    // Scanning only reads the string's bytes and caches the result in its flags: it allocates no
+    // Ruby objects, calls no Ruby code, and cannot raise. It can be slow, though, so keep it here
+    // rather than on the path where the coderange is already known.
+    gen_prepare_leaf_call_with_gc(asm, state);
+    let scanned = asm_ccall!(asm, rb_enc_str_coderange, string);
+    // The C function returns an int, so mask off whatever is in the upper half of the register.
+    // The mask is a no-op on the value itself: it is what ENC_CODERANGE() applies to the flags.
+    let scanned = asm.and(scanned.with_num_bits(64), Opnd::UImm(RUBY_ENC_CODERANGE_MASK.into()));
+    asm.jmp(join_edge(scanned));
+
+    asm.set_current_block(join_block);
+    let join_label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(join_label);
+    let param = asm.new_block_param(64);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
