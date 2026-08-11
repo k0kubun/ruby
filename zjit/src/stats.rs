@@ -175,6 +175,8 @@ make_counters! {
         compile_hir_canonicalize_time_ns,
         compile_hir_fold_constants_time_ns,
         compile_hir_clean_cfg_time_ns,
+        compile_hir_reduce_block_params_time_ns,
+        compile_hir_remove_trivial_phis_time_ns,
         compile_hir_remove_redundant_patch_points_time_ns,
         compile_hir_remove_duplicate_check_interrupts_time_ns,
         compile_hir_eliminate_dead_code_time_ns,
@@ -228,7 +230,6 @@ make_counters! {
         exit_patchpoint_root_box_only,
         exit_callee_side_exit,
         exit_interrupt,
-        exit_throw,
         exit_stackoverflow,
         exit_block_param_proxy_not_iseq_or_ifunc,
         exit_block_param_proxy_not_nil,
@@ -290,6 +291,7 @@ make_counters! {
         send_fallback_super_fallback_no_profile,
         send_fallback_super_not_optimized_method_type,
         send_fallback_super_polymorphic,
+        send_fallback_super_method_entry_unstable,
         send_fallback_super_target_not_found,
         send_fallback_super_target_complex_args_pass,
         send_fallback_cannot_send_direct,
@@ -456,6 +458,10 @@ make_counters! {
     vm_write_to_parent_iseq_local_count,
     // TODO(max): Implement
     // vm_reify_stack_count,
+
+    // The number of `throw` instructions executed in JIT code, i.e. non-local
+    // control flow such as `break` from a block or `return` from a proc.
+    throw_count,
 
     // The number of times we ran a dynamic check
     guard_type_count,
@@ -626,7 +632,6 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         GuardSuperMethodEntry         => exit_guard_super_method_entry,
         CalleeSideExit                => exit_callee_side_exit,
         Interrupt                     => exit_interrupt,
-        Throw                         => exit_throw,
         StackOverflow                 => exit_stackoverflow,
         BlockParamProxyNotIseqOrIfunc => exit_block_param_proxy_not_iseq_or_ifunc,
         BlockParamProxyNotNil         => exit_block_param_proxy_not_nil,
@@ -710,6 +715,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SuperNoProfiles                           => send_fallback_super_fallback_no_profile,
         SuperNotOptimizedMethodType(_)            => send_fallback_super_not_optimized_method_type,
         SuperPolymorphic                          => send_fallback_super_polymorphic,
+        SuperMethodEntryUnstable                  => send_fallback_super_method_entry_unstable,
         SuperTargetNotFound                       => send_fallback_super_target_not_found,
         SuperTargetComplexArgsPass                => send_fallback_super_target_complex_args_pass,
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,

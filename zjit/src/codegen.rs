@@ -660,6 +660,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
+        Insn::ArrayEntry { array, index, .. } => gen_array_entry(asm, opnd!(array), opnd!(index)),
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
@@ -743,6 +744,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::IsMethodCfunc { val, cd, cfunc, state } => gen_is_method_cfunc(asm, opnd!(val), cd, cfunc, &function.frame_state(state)),
         &Insn::IsBitEqual { left, right } => gen_is_bit_equal(asm, opnd!(left), opnd!(right)),
         &Insn::IsBitNotEqual { left, right } => gen_is_bit_not_equal(asm, opnd!(left), opnd!(right)),
+        &Insn::IsGreaterEq { left, right } => gen_is_greater_eq(asm, opnd!(left), opnd!(right)),
         &Insn::BoxBool { val } => gen_box_bool(asm, opnd!(val)),
         &Insn::BoxFixnum { val, state } => gen_box_fixnum(jit, asm, function, opnd!(val), &function.frame_state(state)),
         &Insn::UnboxFixnum { val } => gen_unbox_fixnum(asm, opnd!(val)),
@@ -790,6 +792,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, function, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
         Insn::GetSpecialSymbol { symbol_type, state } => gen_getspecial_symbol(asm, *symbol_type, &function.frame_state(*state)),
         Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
+        Insn::Once { body_iseq, ise, state } => gen_once(jit, asm, function, *body_iseq, *ise, &function.frame_state(*state)),
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, &function.frame_state(state))),
@@ -801,6 +804,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -809,6 +813,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::GetEP { level } => gen_get_ep(asm, level),
         Insn::LoadSelf => gen_load_self(asm),
         &Insn::LoadField { recv, id, offset, return_type: _, num_bits } => gen_load_field(asm, opnd!(recv), id, offset, num_bits),
+        &Insn::UnwrapSvar { val } => gen_unwrap_svar(asm, opnd!(val)),
         &Insn::StoreField { recv, id, offset, val, num_bits } => no_output!(gen_store_field(asm, opnd!(recv), id, offset, opnd!(val), num_bits)),
         &Insn::WriteBarrier { recv, val } => no_output!(gen_write_barrier(jit, asm, opnd!(recv), opnd!(val), function.type_of(val))),
         &Insn::IsBlockGiven { block_handler } => gen_is_block_given(asm, opnd!(block_handler)),
@@ -819,7 +824,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::IsA { val, class } => gen_is_a(jit, asm, opnd!(val), opnd!(class)),
         &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), &function.frame_state(state)),
-        &Insn::Throw { state, .. } => no_output!(gen_throw(jit, asm, function, &function.frame_state(state))),
+        &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), &function.frame_state(state))),
         &Insn::CondBranch { .. }
         | &Insn::Jump { .. } | Insn::Entries { .. } => unreachable!(),
     };
@@ -1264,6 +1269,30 @@ fn gen_getglobal(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
     asm_ccall!(asm, rb_gvar_get, id.0.into())
 }
 
+/// Run the `once` body ISEQ on the first execution and return the cached result afterwards
+fn gen_once(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    body_iseq: IseqPtr,
+    ise: *const iseq_inline_storage_entry,
+    state: &FrameState,
+) -> Opnd {
+    // On the first execution, the body ISEQ runs arbitrary Ruby code: it can allocate,
+    // raise, and even escape this frame's environment (vm_once_exec() makes a Proc out of
+    // the current frame). EP escapes are handled by the NoEPEscape patch points that
+    // `invalidates_locals()` arranges for non-leaf instructions.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+
+    // vm_once_dispatch() write-barriers the cached value against CFP_ISEQ(ec->cfp), which
+    // reads the ISEQ out of the JITFrame written just above, so it names the ISEQ that owns
+    // `ise` even for inlined frames.
+    unsafe extern "C" {
+        fn rb_vm_once_dispatch(ec: EcPtr, iseq: IseqPtr, ise: *const iseq_inline_storage_entry) -> VALUE;
+    }
+    asm_ccall!(asm, rb_vm_once_dispatch, EC, VALUE::from(body_iseq).into(), Opnd::const_ptr(ise))
+}
+
 /// Intern a string
 fn gen_intern(asm: &mut Assembler, val: Opnd, state: &FrameState) -> Opnd {
     gen_prepare_leaf_call_with_gc(asm, state);
@@ -1375,6 +1404,12 @@ fn gen_to_array(jit: &mut JITState, asm: &mut Assembler, function: &Function, va
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qfalse), val)
 }
 
+/// Lowering for [`Insn::CheckArrayType`]. Not a leaf call: #to_ary can run arbitrary Ruby code.
+fn gen_check_array_type(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_check_array_type, val)
+}
+
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {
     asm_ccall!(asm, rb_zjit_defined_ivar, self_val, id.0.into(), Opnd::Value(pushval))
 }
@@ -1419,6 +1454,24 @@ fn gen_load_field(asm: &mut Assembler, recv: Opnd, id: FieldName, offset: i32, n
     asm_comment!(asm, "Load field id={id} offset={offset}");
     let recv = asm.load_mem(recv);
     asm.load(Opnd::mem(num_bits, recv, offset))
+}
+
+/// Read the method entry (or cref) that a frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]` designates.
+/// The slot holds that entry directly until the frame touches a special variable, at which
+/// point the VM replaces it with an `imemo_svar` that wraps the entry in its second field
+/// (`cref_or_me`). Whatever the slot holds it is a T_IMEMO, so `flags` tells us which case we
+/// are in, and the second field is in bounds either way (`rb_callable_method_entry_t` and
+/// `struct rb_cref_struct` are both at least as large as `struct vm_svar`), which lets us pick
+/// between the two without branching.
+fn gen_unwrap_svar(asm: &mut Assembler, val: Opnd) -> Opnd {
+    asm_comment!(asm, "unwrap imemo_svar");
+    let val = asm.load_mem(val);
+    let flags = Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS);
+    let imemo_type = asm.and(flags, Opnd::UImm((IMEMO_MASK as u64) << RUBY_FL_USHIFT));
+    asm.cmp(imemo_type, Opnd::UImm((imemo_svar as u64) << RUBY_FL_USHIFT));
+    // struct vm_svar's cref_or_me, i.e. the VALUE right after flags
+    let unwrapped = Opnd::mem(VALUE_BITS, val, SIZEOF_VALUE_I32);
+    asm.csel_e(unwrapped, val)
 }
 
 fn gen_store_field(asm: &mut Assembler, recv: Opnd, id: FieldName, offset: i32, val: Opnd, num_bits: u8) {
@@ -2268,6 +2321,12 @@ fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::O
     asm_ccall!(asm, rb_ary_pop, array)
 }
 
+/// Lowering for [`Insn::ArrayEntry`]. rb_ary_entry() is a leaf function that returns nil for
+/// out-of-bounds indices.
+fn gen_array_entry(asm: &mut Assembler, array: Opnd, index: Opnd) -> lir::Opnd {
+    asm_ccall!(asm, rb_ary_entry, array, index)
+}
+
 fn gen_array_length(asm: &mut Assembler, array: Opnd) -> lir::Opnd {
     let array = asm.load_mem(array);
     let flags = Opnd::mem(VALUE_BITS, array, RUBY_OFFSET_RBASIC_FLAGS);
@@ -2729,10 +2788,34 @@ fn gen_return(asm: &mut Assembler, val: lir::Opnd) {
     asm.cret(C_RET_OPND);
 }
 
-fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
-    // TODO: Consider calling rb_vm_throw and propagating ec->tag->state to the interpreter.
-    // Also consider making it a jump on method inlining.
-    gen_side_exit(jit, asm, function, &SideExitReason::Throw, None, state);
+/// Compile the `throw` instruction, which implements non-local control flow such as
+/// `break` from a block, `return` from a proc, and `retry`.
+///
+/// rb_zjit_throw() never returns: it longjmps to the enclosing vm_exec(), which
+/// resumes at the catch table entry with vm_exec_handle_exception(). We can't return
+/// the throw data out of the native frame like YJIT does because ZJIT calls compiled
+/// callees with native calls, and the JIT caller would take it for a return value.
+///
+/// TODO: Consider compiling this as a jump when the catch frame is inlined into
+/// this compilation unit.
+fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, throw_state: u32, val: lir::Opnd, state: &FrameState) {
+    gen_incr_counter(asm, Counter::throw_count);
+
+    // rb_vm_throw() allocates with THROW_DATA_NEW() and may raise LocalJumpError, and the
+    // interpreter reads this frame's locals and stack while unwinding, so publish them the
+    // same way as any other non-leaf fallback call. The interpreter pops the thrown value
+    // before calling vm_throw(), so keep it out of the cfp->sp we publish.
+    let state = state.with_stack_size(state.stack_size() - 1);
+    gen_prepare_fallback_call(jit, asm, function, &state);
+
+    asm_comment!(asm, "throw");
+    unsafe extern "C" {
+        fn rb_zjit_throw(ec: EcPtr, cfp: CfpPtr, throw_state: usize, throwobj: VALUE) -> VALUE;
+    }
+    asm_ccall!(asm, rb_zjit_throw, EC, CFP, Opnd::UImm(throw_state.into()), val);
+
+    // rb_zjit_throw() never returns
+    asm.abort();
 }
 
 /// Compile Fixnum + Fixnum
@@ -2913,6 +2996,11 @@ fn gen_is_bit_equal(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> l
 fn gen_is_bit_not_equal(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> lir::Opnd {
     asm.cmp(left, right);
     asm.csel_ne(Opnd::Imm(1), Opnd::Imm(0))
+}
+
+fn gen_is_greater_eq(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> lir::Opnd {
+    asm.cmp(left, right);
+    asm.csel_ge(Opnd::Imm(1), Opnd::Imm(0))
 }
 
 fn gen_box_bool(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {

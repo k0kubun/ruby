@@ -5796,14 +5796,39 @@ pub(crate) mod hir_build_tests {
           v11:NilClass = Const Value(nil)
           Jump bb3(v8, v9, v10, v11)
         bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
-          v22:ArrayExact = GuardType v14, ArrayExact
-          v23:CInt64 = ArrayLength v22
-          v24:CInt64[2] = Const CInt64(2)
-          v25:CInt64 = GuardGreaterEq v23, v24
-          v26:CInt64[1] = Const CInt64(1)
-          v27:BasicObject = ArrayAref v22, v26
-          v28:CInt64[0] = Const CInt64(0)
-          v29:BasicObject = ArrayAref v22, v28
+          v22:CBool = HasType v14, Array
+          CondBranch v22, bb4(), bb5()
+        bb4():
+          v24:Array = RefineType v14, Array
+          Jump bb8(v24)
+        bb5():
+          v26:NilClass|Array = CheckArrayType v14
+          v27:CBool = HasType v26, NilClass
+          CondBranch v27, bb6(), bb7()
+        bb6():
+          v29:NilClass = Const Value(nil)
+          Jump bb9(v29, v14)
+        bb7():
+          v31:Array = RefineType v26, Array
+          Jump bb8(v31)
+        bb8(v33:Array):
+          v34:CInt64 = ArrayLength v33
+          v35:CInt64[2] = Const CInt64(2)
+          v36:CBool = IsGreaterEq v34, v35
+          CondBranch v36, bb10(), bb11()
+        bb10():
+          v38:CInt64[1] = Const CInt64(1)
+          v39:BasicObject = ArrayAref v33, v38
+          v40:CInt64[0] = Const CInt64(0)
+          v41:BasicObject = ArrayAref v33, v40
+          Jump bb9(v39, v41)
+        bb11():
+          v43:CInt64[1] = Const CInt64(1)
+          v44:BasicObject = ArrayEntry v33, v43
+          v45:CInt64[0] = Const CInt64(0)
+          v46:BasicObject = ArrayEntry v33, v45
+          Jump bb9(v44, v46)
+        bb9(v48:BasicObject, v49:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v14
@@ -6207,6 +6232,31 @@ pub(crate) mod hir_build_tests {
         let hir = hir_string("test");
         assert!(hir.contains("BreakPoint"));
         assert!(hir.contains("Return v"));
+    }
+
+    #[test]
+    fn test_once() {
+      eval(r##"
+        def test(a) = /#{a}b/o
+      "##);
+      assert_snapshot!(hir_string("test"), @"
+      fn test@<compiled>:2:
+      bb1():
+        EntryPoint interpreter
+        v1:BasicObject = LoadSelf
+        v2:CPtr = LoadSP
+        v3:BasicObject = LoadField v2, :a@0x1000
+        Jump bb3(v1, v3)
+      bb2():
+        EntryPoint JIT(0)
+        v6:BasicObject = LoadArg :self@0
+        v7:BasicObject = LoadArg :a@1
+        Jump bb3(v6, v7)
+      bb3(v9:BasicObject, v10:BasicObject):
+        v14:BasicObject = Once block in test
+        CheckInterrupts
+        Return v14
+      ");
     }
 
     #[test]

@@ -1165,7 +1165,7 @@ impl Assembler {
             let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
             let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
 
-            asm.stack_state.num_spill_slots = num_stack_slots;
+            let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&assignments);
             let stack_slot_count = asm.stack_state.stack_slot_count();
             if stack_slot_count > Self::MAX_FRAME_STACK_SLOTS {
@@ -1205,8 +1205,8 @@ impl Assembler {
             });
 
             trace_compile_phase("resolve_ssa", || {
-                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS);
-                asm.resolve_ssa(&intervals, &assignments);
+                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS, parcopy_temp);
+                asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
             });
 
             Ok(())

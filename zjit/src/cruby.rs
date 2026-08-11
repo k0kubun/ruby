@@ -128,6 +128,9 @@ unsafe extern "C" {
 
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
     pub fn rb_ary_new_from_args(n: c_long, ...) -> VALUE;
+    /// Convert `obj` to an Array by calling `#to_ary`, or return nil if it can't be converted.
+    /// Returns `obj` itself if it is already a T_ARRAY. Can run arbitrary Ruby code.
+    pub fn rb_check_array_type(obj: VALUE) -> VALUE;
     pub fn rb_str_setbyte(str: VALUE, index: VALUE, value: VALUE) -> VALUE;
     pub fn rb_str_getbyte(str: VALUE, index: VALUE) -> VALUE;
     pub fn rb_vm_splat_array(flag: VALUE, ary: VALUE) -> VALUE;
@@ -1201,6 +1204,10 @@ mod manual_defs {
 
     // From iseq.h - via a different constant, which seems to confuse bindgen
     pub const ISEQ_TRANSLATED: usize = RUBY_FL_USER7 as usize;
+
+    // From internal/imemo.h - a plain #define, so bindgen doesn't pick it up. The imemo type of
+    // an object is `(flags >> RUBY_FL_USHIFT) & IMEMO_MASK`.
+    pub const IMEMO_MASK: u32 = 0x0f;
 
     // We'll need to encode a lot of Ruby struct/field offsets as constants unless we want to
     // redeclare all the Ruby C structs and write our own offsetof macro. For now, we use constants.

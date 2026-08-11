@@ -799,6 +799,216 @@ fn test_yield_non_local_return() {
     assert_snapshot!(assert_compiles_allowing_exits("test"), @"42");
 }
 
+// `throw` is compiled with a call to rb_zjit_throw(), which longjmps to the enclosing
+// vm_exec(). The frame that catches the throw resumes in the interpreter, so these tests
+// tolerate the exception_handler exit that entry generates.
+
+#[test]
+fn test_throw_break_with_value_from_each() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x * 10 if x == 3 }
+        test([1, 2, 3, 4])
+        test([1, 2, 3, 4])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3, 4])"), @"30");
+}
+
+#[test]
+fn test_throw_no_break_returns_receiver() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x if x == 99 }
+        test([1, 2])
+        test([1, 2])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2])"), @"[1, 2]");
+}
+
+#[test]
+fn test_throw_break_across_jit_to_jit_call() {
+    // `outer` and `inner` are both compiled and `inner` is called with a native
+    // JIT-to-JIT call, so the throw has to unwind past a JIT caller.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def outer = inner { break 7 }
+        def test = outer
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"7");
+}
+
+#[test]
+fn test_throw_break_three_frames_deep() {
+    set_call_threshold(2);
+    eval("
+        def innermost(a) = a.each { |x| break x if x.even? }
+        def middle(a) = innermost(a)
+        def test(a) = middle(a)
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"2");
+}
+
+#[test]
+fn test_throw_break_value_used_by_caller() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          v = a.each { |x| break x + 100 if x > 1 }
+          v.to_s
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @r#""102""#);
+}
+
+#[test]
+fn test_throw_break_search_loop() {
+    // The `find { }`-shaped search that shows up in rubocop and OptionParser.
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each_with_index { |x, i| break i if x == :b }
+        test([:a, :b, :c])
+        test([:a, :b, :c])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([:a, :b, :c])"), @"1");
+}
+
+#[test]
+fn test_throw_break_runs_ensure() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          log = []
+          r = a.each do |x|
+            begin
+              break x if x == 2
+            ensure
+              log << x
+            end
+          end
+          [r, log]
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
+}
+
+#[test]
+fn test_throw_return_from_proc() {
+    set_call_threshold(2);
+    eval("
+        def test
+          p = proc { return 5 }
+          p.call
+          99
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"5");
+}
+
+#[test]
+fn test_throw_return_from_lambda() {
+    // `return` in a lambda throws TAG_RETURN with the lambda's own frame as the
+    // catch frame, unlike `return` from a proc.
+    set_call_threshold(2);
+    eval("
+        def test
+          l = lambda { return 5 }
+          l.call + 1
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"6");
+}
+
+#[test]
+fn test_throw_orphan_break_raises_local_jump_error() {
+    set_call_threshold(2);
+    eval("
+        def test
+          pr = proc { break 1 }
+          begin
+            pr.call
+          rescue LocalJumpError => e
+            e.class
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"LocalJumpError");
+}
+
+#[test]
+fn test_throw_retry_in_rescue() {
+    set_call_threshold(2);
+    eval("
+        def test
+          tries = 0
+          begin
+            tries += 1
+            raise 'boom' if tries < 3
+            tries
+          rescue
+            retry
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"3");
+}
+
+#[test]
+fn test_throw_next_with_ensure() {
+    // `next` inside begin/ensure compiles to throw TAG_NEXT rather than leave.
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          a.map do |x|
+            begin
+              next x * 2
+            ensure
+              nil
+            end
+          end
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, 4, 6]");
+}
+
+#[test]
+fn test_throw_break_inner_loop_repeatedly() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          sum = 0
+          a.each do |x|
+            a.each do |y|
+              break if y > 2
+              sum += x * y
+            end
+          end
+          sum
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"18");
+}
+
 #[test]
 fn test_yield_autosplat() {
     // {|a, b|} auto-splats a single Array arg for yield (falls back).
@@ -2290,6 +2500,140 @@ fn test_invokesuper_with_prepend() {
 
         test  # should call M#foo, not A#foo
     "#), @r#"["B", "M"]"#);
+}
+
+/// A monomorphic `super` should stay specialized: no side exits, no dynamic dispatch.
+#[test]
+fn test_invokesuper_monomorphic_does_not_exit() {
+    eval("
+        class MonoSuperA
+          def foo(x) = x + 1
+        end
+        class MonoSuperB < MonoSuperA
+          def foo(x) = super(x) * 10
+        end
+        def test = MonoSuperB.new.foo(1)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("[test, test, test]"), @"[20, 20, 20]");
+}
+
+/// The VM replaces a frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]` with an `imemo_svar` wrapping the
+/// frame's method entry as soon as the frame touches a special variable, which a regexp match
+/// does. The `super` guard has to read through the svar; otherwise it misses on every single
+/// call and the site side-exits forever.
+#[test]
+fn test_invokesuper_after_regexp_match_does_not_exit() {
+    eval(r#"
+        class SvarSuperA
+          def foo(x) = x + 1
+        end
+        class SvarSuperB < SvarSuperA
+          def foo(x)
+            x.to_s =~ /(\d+)/
+            [$1, super(x)]
+          end
+        end
+        def test = SvarSuperB.new.foo(3)
+        test
+        test
+    "#);
+    assert_snapshot!(assert_compiles("[test, test, test]"), @r#"[["3", 4], ["3", 4], ["3", 4]]"#);
+}
+
+/// A `super` inside a module body resolves through a different complemented CME for each
+/// including class, so no single CME can be guarded. The site must converge on dispatching
+/// `super` dynamically rather than side-exiting once per call.
+#[test]
+fn test_invokesuper_polymorphic_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_guard_super_method_entry;
+    // `run` keeps the calls in one ISEQ so that the second phase does not compile anything new.
+    assert_snapshot!(inspect(r#"
+        class PolySuperBase1
+          def foo(x) = [:base1, x]
+        end
+        class PolySuperBase2
+          def foo(x) = [:base2, x]
+        end
+        module PolySuperM
+          def foo(x) = super(x) << :m
+        end
+        class PolySuperA < PolySuperBase1
+          include PolySuperM
+        end
+        class PolySuperB < PolySuperBase2
+          include PolySuperM
+        end
+        def test(o) = o.foo(1)
+        def run(a, b, n) = n.times { test(a); test(b) }
+
+        $poly_super_a = PolySuperA.new
+        $poly_super_b = PolySuperB.new
+        run($poly_super_a, $poly_super_b, 200)
+        [test($poly_super_a), test($poly_super_b)]
+    "#), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+
+    // The site has converged, so exits are now bounded by the recompile budget (a handful per
+    // compiled ISEQ) rather than one per call: without the dynamic fallback, all 1000 super
+    // calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        run($poly_super_a, $poly_super_b, 500)
+        [test($poly_super_a), test($poly_super_b)]
+    "), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+    let delta = exits() - before;
+    assert!(delta < 25, "guard_super_method_entry exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// A `super` in a method that is always called with a block can never pass the specialized
+/// call's block-handler guard. The exits must stop once the site gives up and dispatches
+/// `super` dynamically.
+#[test]
+fn test_invokesuper_always_with_block_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_unhandled_block_arg;
+    assert_snapshot!(inspect(r#"
+        class BlockSuperA
+          def foo(x) = x + 1
+        end
+        class BlockSuperB < BlockSuperA
+          def foo(x) = super(x) * 10
+        end
+        def block_super_test(o) = o.foo(1) { }
+        def block_super_run(o, n) = n.times { block_super_test(o) }
+        $block_super_o = BlockSuperB.new
+        block_super_run($block_super_o, 500)
+        block_super_test($block_super_o)
+    "#), @"20");
+
+    // Exits are bounded by the recompile budget now, not one per call: without the dynamic
+    // fallback all 1000 calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        block_super_run($block_super_o, 1000)
+        block_super_test($block_super_o)
+    "), @"20");
+    let delta = exits() - before;
+    assert!(delta < 25, "unhandled_block_arg exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// Redefining the target of a specialized `super` after it is compiled must take effect.
+#[test]
+fn test_invokesuper_with_target_redefined_after_compile() {
+    assert_snapshot!(inspect(r#"
+        class RedefSuperA
+          def foo = "a1"
+        end
+        class RedefSuperB < RedefSuperA
+          def foo = ["b", super]
+        end
+        def test = RedefSuperB.new.foo
+        before = [test, test, test]
+        class RedefSuperA
+          def foo = "a2"
+        end
+        [before.last, test]
+    "#), @r#"[["b", "a1"], ["b", "a2"]]"#);
 }
 
 #[test]
@@ -5126,6 +5470,125 @@ fn test_expandarray_no_splat() {
 }
 
 #[test]
+fn test_expandarray_no_splat_longer_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test [3, 4, 5]
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test [3, 4, 5]"), @"[3, 4]");
+}
+
+#[test]
+fn test_expandarray_no_splat_shorter_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test [3]
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test [3]"), @"[3, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_nil() {
+    eval("
+        def test(o)
+          a, b, c = o
+          [a, b, c]
+        end
+        test nil
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test nil"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_nil_literal() {
+    eval("
+        def test
+          a, b, c = nil
+          [a, b, c]
+        end
+        test
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_not_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test 5
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test 5"), @"[5, nil]");
+}
+
+#[test]
+fn test_expandarray_no_splat_to_ary() {
+    eval("
+        class C
+          def to_ary = [1, 2, 3]
+        end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test C.new
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test C.new"), @"[1, 2]");
+}
+
+#[test]
+fn test_expandarray_no_splat_array_subclass() {
+    eval("
+        class MyArray < Array; end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test MyArray.new([3, 4])
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test MyArray.new([3, 4])"), @"[3, 4]");
+}
+
+#[test]
+fn test_expandarray_no_splat_to_ary_defined_after_compile() {
+    eval("
+        class C; end
+        OBJ = C.new
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test OBJ
+        test OBJ
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    // #to_ary is looked up at run-time, so defining it after the method is compiled must be
+    // honored by the compiled code.
+    assert_snapshot!(assert_compiles("
+        before = test(OBJ) == [OBJ, nil]
+        class C
+          def to_ary = [1, 2]
+        end
+        [before, test(OBJ)]
+    "), @"[true, [1, 2]]");
+}
+
+#[test]
 fn test_expandarray_splat() {
     eval("
         def test(o)
@@ -6179,6 +6642,51 @@ fn test_regexp_interpolation() {
     "##);
     assert_contains_opcode("test", YARVINSN_toregexp);
     assert_snapshot!(assert_compiles(r##"test"##), @"/123/");
+}
+
+#[test]
+fn test_once_regexp_interpolated_only_once() {
+    eval(r##"
+        $once_count = 0
+        def test(str) = /#{($once_count += 1; "a".upcase)}b/o =~ str
+        test("Ab")
+        test("Ab")
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(
+        assert_compiles(r##"[test("Ab"), test("xxAb"), test("zz"), $once_count]"##),
+        @"[0, 2, nil, 1]"
+    );
+}
+
+#[test]
+fn test_once_caches_the_same_regexp() {
+    eval(r##"
+        def test = /#{"a"}b/o
+        test
+        test
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(assert_compiles(r##"[test.equal?(test), test.source]"##), @r#"[true, "ab"]"#);
+}
+
+#[test]
+fn test_once_reruns_body_after_raise() {
+    // vm_once_dispatch() calls vm_once_clear() when the body raises, so the next
+    // execution runs the body again.
+    eval(r##"
+        $once_calls = 0
+        def test
+          /#{($once_calls += 1; raise "boom" if $once_calls <= 2; "a")}b/o
+        rescue => e
+          e.message
+        end
+    "##);
+    assert_contains_opcode("test", YARVINSN_once);
+    assert_snapshot!(
+        assert_compiles_allowing_exits(r##"[test, test, test.source, test.source, $once_calls]"##),
+        @r#"["boom", "boom", "ab", "ab", 3]"#
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
@@ -1320,6 +1321,9 @@ impl Insn {
         self.is_jump() ||
             match self {
                 Insn::CRet(_) => true,
+                // Abort traps, so control never falls through to the next instruction.
+                // It has no target, so a block ending with it has no successors.
+                Insn::Abort => true,
                 _ => false
             }
     }
@@ -2151,7 +2155,38 @@ impl Assembler
         let mut free_registers: BTreeSet<usize> = (0..num_registers).collect();
         let mut active: Vec<&Interval> = Vec::new(); // vreg indices sorted by increasing end point
         let mut assignment: Vec<Option<Allocation>> = vec![None; intervals.len()];
+
+        // Spill slot pool. `slot_pool` holds (end, slot) for every slot handed out so far,
+        // ordered by the end point of the interval that occupies it, so the slot that frees
+        // up earliest is the first candidate for reuse.
+        //
+        // A spilled VReg lives in its slot for its whole live range: rewrite_instructions()
+        // rewrites the defining instruction to write straight into the slot. So a slot may be
+        // reused by another interval only once the previous occupant's range has ended, which
+        // is why the pool is keyed on the occupant's end point rather than on the position we
+        // happen to be scanning. Intervals do not arrive in start order here (a spill victim
+        // starts before the interval that evicted it), so we compare against the candidate's
+        // own start rather than the current scan position.
+        let mut slot_pool: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
         let mut num_stack_slots: usize = 0;
+        let mut alloc_stack_slot = |interval: &Interval| -> Allocation {
+            let (start, end) = (interval.range.start(), interval.range.end());
+            // The pool is ordered by end point, so if the earliest-freed slot is still busy at
+            // `start`, every other slot is too and we need a fresh one.
+            match slot_pool.peek() {
+                Some(&Reverse((slot_end, slot))) if slot_end <= start => {
+                    slot_pool.pop();
+                    slot_pool.push(Reverse((end, slot)));
+                    Allocation::Stack(slot)
+                }
+                _ => {
+                    let slot = num_stack_slots;
+                    num_stack_slots += 1;
+                    slot_pool.push(Reverse((end, slot)));
+                    Allocation::Stack(slot)
+                }
+            }
+        };
 
         // Collect vreg indices that have valid ranges, sorted by start point
         let mut sorted_intervals: Vec<Interval> = intervals.iter()
@@ -2224,13 +2259,11 @@ impl Assembler
                 let spill = active.iter().rev().copied().find(|active_interval| {
                     matches!(assignment[active_interval.id], Some(Allocation::Reg(_)))
                 });
-                let slot = Allocation::Stack(num_stack_slots);
-                num_stack_slots += 1;
 
                 if let Some(spill) = spill.filter(|spill| spill.range.end.unwrap() > interval.range.end.unwrap()) {
                     // Spill the last active interval; give its register to current
                     assignment[interval.id] = assignment[spill.id];
-                    assignment[spill.id] = Some(slot);
+                    assignment[spill.id] = Some(alloc_stack_slot(spill));
                     let spill_idx = active.iter().position(|active_interval| active_interval.id == spill.id).unwrap();
                     active.remove(spill_idx);
                     // Insert current into sorted active
@@ -2238,7 +2271,7 @@ impl Assembler
                     active.insert(insert_idx, &interval);
                 } else {
                     // Spill the current interval
-                    assignment[interval.id] = Some(slot);
+                    assignment[interval.id] = Some(alloc_stack_slot(interval));
                 }
             } else {
                 // Allocate lowest free register
@@ -2254,12 +2287,41 @@ impl Assembler
         (assignment, num_stack_slots)
     }
 
+    /// Record how many stack slots the register allocator spilled, plus the extra slot
+    /// [`Self::resolve_ssa`] needs to break register copy cycles, and return the operand
+    /// naming that scratch location.
+    ///
+    /// Sequentializing a parallel copy needs one scratch location to break copy cycles.
+    /// That value has to survive several of the emitted moves, so it cannot live in a
+    /// backend scratch register: the splitting pass that runs after `resolve_ssa` reuses
+    /// those same registers to lower memory-to-memory moves, and would clobber the
+    /// half-rotated cycle. A stack slot has no such conflict.
+    ///
+    /// A parallel copy can only contain a memory operand when the allocator spilled, so
+    /// functions with no spills keep using the cheaper scratch register and pay nothing.
+    pub(super) fn reserve_spill_slots(&mut self, num_spilled: usize) -> Opnd {
+        if num_spilled == 0 {
+            self.stack_state.num_spill_slots = 0;
+            return Opnd::Reg(crate::backend::current::SCRATCH_REG);
+        }
+        // Take the slot just past the allocator's own, and count it in the frame.
+        let stack_idx: StackIdx = num_spilled.try_into().expect("spill slot index should fit in StackIdx");
+        self.stack_state.num_spill_slots = num_spilled + 1;
+        Opnd::Mem(Mem {
+            base: MemBase::Stack { stack_idx, num_bits: 64 },
+            disp: 0,
+            num_bits: 64,
+        })
+    }
+
     /// Resolve SSA block parameters by inserting sequentialized move instructions
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
-    pub fn resolve_ssa(&mut self, _intervals: &[Interval], assignments: &[Option<Allocation>]) {
+    ///
+    /// `parcopy_temp` is the scratch location used to break copy cycles. See
+    /// [`Self::reserve_spill_slots`].
+    pub fn resolve_ssa(&mut self, _intervals: &[Interval], assignments: &[Option<Allocation>], parcopy_temp: Opnd) {
         use crate::backend::parcopy;
-        use crate::backend::current::SCRATCH_REG;
 
         // Count predecessors for each block
         let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
@@ -2305,7 +2367,7 @@ impl Assembler
                 // parcopy algorithm can detect physical register conflicts.
                 debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                     "parcopy must operate on physical registers, not VRegs");
-                let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+                let sequentialized = parcopy::sequentialize_register(&reg_copies, parcopy_temp);
                 let moves: Vec<Insn> = sequentialized
                     .iter()
                     .map(|copy| match copy.source {
@@ -2396,7 +2458,7 @@ impl Assembler
 
             debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                 "parcopy must operate on physical registers, not VRegs");
-            let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+            let sequentialized = parcopy::sequentialize_register(&reg_copies, parcopy_temp);
             let moves: Vec<Insn> = sequentialized
                 .iter()
                 .map(|copy| match copy.source {
@@ -2440,11 +2502,16 @@ impl Assembler
     /// Handle caller-saved registers around CCall instructions.
     /// For each CCall, push live caller-saved registers, set up arguments
     /// in C calling convention registers, and pop saved registers after.
+    ///
+    /// `parcopy_temp` is the scratch location used to break cycles when sequentializing
+    /// the moves that place arguments in the argument registers. See
+    /// [`Self::reserve_spill_slots`].
     pub fn handle_caller_saved_regs(
         &mut self,
         intervals: &[Interval],
         assignments: &[Option<Allocation>],
         regs: &[Reg],
+        parcopy_temp: Opnd,
     ) {
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, ALLOC_REGS};
@@ -2574,7 +2641,7 @@ impl Assembler
 
                     debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                         "parcopy must operate on physical registers, not VRegs");
-                    let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+                    let sequentialized = parcopy::sequentialize_register(&reg_copies, parcopy_temp);
 
                     for copy in sequentialized {
                         new_insns.push(match copy.source {
@@ -4745,9 +4812,10 @@ mod tests {
         asm.number_instructions(16);
         let intervals = asm.build_intervals(live_in);
         let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, _) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
 
-        asm.resolve_ssa(&intervals, &assignments);
+        asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
 
         use crate::backend::current::ALLOC_REGS;
         let regs = &ALLOC_REGS[..5];
@@ -4791,7 +4859,8 @@ mod tests {
         asm.number_instructions(16);
         let intervals = asm.build_intervals(live_in);
         let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, _) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
 
         // Entry block b1 has parameters [v0, v1].
         // With 5 registers: v0 -> Reg(0) = regs[0], arrival = C_ARG_OPNDS[0] = regs[0] -> self-move, filtered
@@ -4799,7 +4868,7 @@ mod tests {
         // Before resolve_ssa, b1 has: [Label, Jmp] = 2 insns
         assert_eq!(asm.basic_blocks[b1.0].insns.len(), 2);
 
-        asm.resolve_ssa(&intervals, &assignments);
+        asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
 
         // After resolve_ssa, b1 should still have the same number of insns
         // (plus any edge moves, but no entry param moves since they're all self-moves).
@@ -4838,9 +4907,10 @@ mod tests {
         asm.number_instructions(0);
         let intervals = asm.build_intervals(live_in);
         let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, _) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), 5, &preferred_registers);
+        let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
 
-        asm.resolve_ssa(&intervals, &assignments);
+        asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
 
         assert!(matches!(asm.basic_blocks[block.0].insns[1], Insn::Abort));
     }
@@ -4897,7 +4967,8 @@ mod tests {
         let intervals = asm.build_intervals(live_in);
         let num_regs = 5;
         let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, _) = asm.linear_scan(intervals.clone(), num_regs, &preferred_registers);
+        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), num_regs, &preferred_registers);
+        let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
 
         assert_eq!(asm.basic_blocks.len(), 3);
 
@@ -4906,7 +4977,7 @@ mod tests {
         let v4_alloc = assignments[v4.vreg_idx()].unwrap();
         assert_ne!(v1_alloc, v4_alloc, "Test setup: v1 and v4 should have different allocations");
 
-        asm.resolve_ssa(&intervals, &assignments);
+        asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
 
         // A new interstitial block should have been created for the critical edge b1->b3
         // b1->b3 is critical because b1 has 2 successors and b3 has 2 predecessors
@@ -5002,7 +5073,7 @@ mod tests {
         let num_regs = 2;
         let preferred_registers = asm.preferred_register_assignments(&intervals);
         let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), num_regs, &preferred_registers);
-        asm.stack_state.num_spill_slots = num_stack_slots;
+        let parcopy_temp = asm.reserve_spill_slots(num_stack_slots);
 
         let regs = &ALLOC_REGS[..num_regs];
 
@@ -5014,8 +5085,8 @@ mod tests {
             "v1 should be in a register");
 
         // Run the pipeline: handle_caller_saved_regs then resolve_ssa
-        asm.handle_caller_saved_regs(&intervals, &assignments, regs);
-        asm.resolve_ssa(&intervals, &assignments);
+        asm.handle_caller_saved_regs(&intervals, &assignments, regs, parcopy_temp);
+        asm.resolve_ssa(&intervals, &assignments, parcopy_temp);
 
         let insns = &asm.basic_blocks[b1.0].insns;
 
