@@ -4280,8 +4280,8 @@ mod hir_opt_tests {
           v16:CInt64 = IntAnd v13, v15
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb6(), bb5()
+        bb6():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
@@ -4299,8 +4299,8 @@ mod hir_opt_tests {
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
-        bb6():
+          Jump bb5()
+        bb5():
           v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
           Jump bb4(v34)
         bb4(v14:BasicObject):
@@ -4409,8 +4409,8 @@ mod hir_opt_tests {
           v16:CInt64 = IntAnd v13, v15
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v16, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb6(), bb5()
+        bb6():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
@@ -4428,8 +4428,8 @@ mod hir_opt_tests {
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
-        bb6():
+          Jump bb5()
+        bb5():
           v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
           Jump bb4(v34)
         bb4(v14:BasicObject):

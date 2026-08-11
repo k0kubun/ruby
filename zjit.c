@@ -300,6 +300,25 @@ rb_zjit_class_has_default_allocator(VALUE klass)
 VALUE rb_vm_untag_block_handler(VALUE block_handler);
 VALUE rb_vm_get_untagged_block_handler(rb_control_frame_t *reg_cfp);
 
+// Invoke a symbol block handler (`&:foo`) with the `argc` arguments a `yield` passed.
+// Mirrors vm_invoke_symbol_block() + vm_call_symbol(): the first yielded argument is the
+// receiver, the rest are the method's arguments, the method is looked up with public
+// visibility (rb_funcallv_public resolves refinements and routes a missing, private or
+// protected method through method_missing the same way vm_call_symbol does), and unlike
+// vm_call_symbol the lookup goes through the global call cache instead of building a call
+// cache on the stack for every yield.
+//
+// ZJIT only emits this after guarding that the block handler is a static symbol and that
+// the yield passed at least one argument, so there is no "no receiver given" case and
+// SYM2ID always names an existing ID.
+VALUE
+rb_zjit_invokeblock_symbol(VALUE symbol, int argc, const VALUE *argv)
+{
+    RUBY_ASSERT(RB_STATIC_SYM_P(symbol));
+    RUBY_ASSERT(argc >= 1);
+    return rb_funcallv_public(argv[0], SYM2ID(symbol), argc - 1, argv + 1);
+}
+
 // Primitives used by zjit.rb. Don't put other functions below, which wouldn't use them.
 VALUE rb_zjit_enable(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_assert_compiles(rb_execution_context_t *ec, VALUE self);

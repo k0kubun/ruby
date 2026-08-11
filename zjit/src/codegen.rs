@@ -718,6 +718,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::InvokeSuperForward { cd, blockiseq, state, reason, .. } => gen_invokesuperforward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::InvokeBlock { cd, state, reason, .. } => gen_invokeblock(jit, asm, function, cd, &function.frame_state(state), reason),
         Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
+        &Insn::InvokeBlockSymbol { symbol, ref args, state } => gen_invokeblock_symbol(jit, asm, function, opnd!(symbol), opnds!(args), &function.frame_state(state)),
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, &function.frame_state(*state), unsafe { &**bf }, *leaf, opnds!(args)),
         Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), &function.frame_state(*state)),
@@ -1955,6 +1956,13 @@ fn gen_invokeblock(
 
     gen_prepare_fallback_call(jit, asm, function, state);
 
+    if get_option!(stats) {
+        // Record what the handler actually is here, so --zjit-stats can tell a gate rejection
+        // apart from a profile that no longer describes the site.
+        use crate::stats::rb_zjit_count_runtime_block_handler;
+        asm_ccall!(asm, rb_zjit_count_runtime_block_handler, CFP);
+    }
+
     asm_comment!(asm, "call invokeblock");
     unsafe extern "C" {
         fn rb_vm_invokeblock(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
@@ -1999,6 +2007,32 @@ fn gen_invokeblock_ifunc(
         ) -> VALUE;
     }
     asm_ccall!(asm, rb_vm_yield_with_cfunc, EC, captured, (args.len() as i64).into(), argv_ptr)
+}
+
+/// Compile `invokeblock` for a symbol block handler (`&:foo`). Calls `mid` on the first
+/// yielded argument with the rest as arguments, which is what the VM's
+/// `vm_invoke_symbol_block` does, without going through `rb_vm_invokeblock`'s block-handler
+/// dispatch and its uncached `vm_call_symbol` method lookup. The HIR guard ahead of this
+/// instruction established that the runtime block handler is exactly this symbol.
+fn gen_invokeblock_symbol(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    symbol: Opnd,
+    args: Vec<Opnd>,
+    state: &FrameState,
+) -> lir::Opnd {
+    gen_incr_counter(asm, Counter::invokeblock_symbol_optimized_send_count);
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+
+    // Pass the yielded arguments as an argv the helper can index: argv[0] is the receiver.
+    let argv_ptr = gen_push_opnds(jit, asm, &args);
+
+    asm_comment!(asm, "call rb_zjit_invokeblock_symbol");
+    unsafe extern "C" {
+        fn rb_zjit_invokeblock_symbol(symbol: VALUE, argc: std::os::raw::c_int, argv: *const VALUE) -> VALUE;
+    }
+    asm_ccall!(asm, rb_zjit_invokeblock_symbol, symbol, (args.len() as i64).into(), argv_ptr)
 }
 
 fn gen_invokeproc(

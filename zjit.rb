@@ -109,6 +109,8 @@ class << RubyVM::ZJIT
     print_counters_with_prefix(prefix: 'getivar_fallback_', prompt: 'getivar fallback reasons', buf:, stats:, limit: 5)
     print_counters_with_prefix(prefix: 'definedivar_fallback_', prompt: 'definedivar fallback reasons', buf:, stats:, limit: 5)
     print_counters_with_prefix(prefix: 'invokeblock_handler_', prompt: 'invokeblock handler', buf:, stats:, limit: 10)
+    print_counters_with_prefix(prefix: 'invokeblock_fallback_', prompt: 'invokeblock fallback reasons', buf:, stats:, limit: 22)
+    print_counters_with_prefix(prefix: 'invokeblock_runtime_', prompt: 'invokeblock fallback handlers seen at run time', buf:, stats:, limit: 8)
     print_counters_with_prefix(prefix: 'getblockparamproxy_handler_', prompt: 'getblockparamproxy handler', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'inline_reject_', prompt: 'HIR-level inlining rejection reasons', buf:, stats:, limit: 10)
 
