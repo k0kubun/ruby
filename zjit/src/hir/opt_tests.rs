@@ -8106,8 +8106,15 @@ mod hir_opt_tests {
           StoreField v14, :shape_id@0x1000, v21
           Jump bb4()
         bb6():
-          v24:CShape[0x1004] = GuardBitEquals v15, CShape(0x1004) recompile
+          v24:CShape[0x1004] = Const CShape(0x1004)
+          v25:CBool = IsBitEqual v15, v24
+          CondBranch v25, bb7(), bb8()
+        bb7():
           StoreField v14, :@a@0x1005, v10
+          Jump bb4()
+        bb8():
+          IvarReprofile v14
+          SetIvar v14, :@a, v10
           Jump bb4()
         bb4():
           CheckInterrupts
@@ -10048,9 +10055,16 @@ mod hir_opt_tests {
           v17:BasicObject = LoadField v6, :@foo@0x1002
           Jump bb4(v17)
         bb6():
-          v19:CShape[0x1003] = GuardBitEquals v12, CShape(0x1003) recompile
-          v21:BasicObject = LoadField v6, :@foo@0x1004
-          Jump bb4(v21)
+          v19:CShape[0x1003] = Const CShape(0x1003)
+          v20:CBool = IsBitEqual v12, v19
+          CondBranch v20, bb7(), bb8()
+        bb7():
+          v25:BasicObject = LoadField v6, :@foo@0x1004
+          Jump bb4(v25)
+        bb8():
+          IvarReprofile v6
+          v23:BasicObject = GetIvar v6, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
           CheckInterrupts
           Return v13
@@ -10406,8 +10420,15 @@ mod hir_opt_tests {
           StoreField v6, :@foo@0x1002, v10
           Jump bb4()
         bb6():
-          v22:CShape[0x1003] = GuardBitEquals v15, CShape(0x1003) recompile
+          v22:CShape[0x1003] = Const CShape(0x1003)
+          v23:CBool = IsBitEqual v15, v22
+          CondBranch v23, bb7(), bb8()
+        bb7():
           StoreField v6, :@foo@0x1004, v10
+          Jump bb4()
+        bb8():
+          IvarReprofile v6
+          SetIvar v6, :@foo, v10
           Jump bb4()
         bb4():
           CheckInterrupts
@@ -10805,17 +10826,24 @@ mod hir_opt_tests {
           v17:BasicObject = LoadField v11, :@foo@0x1002
           Jump bb4(v17)
         bb6():
-          v19:CShape[0x1003] = GuardBitEquals v12, CShape(0x1003) recompile
-          v21:IMemo = LoadField v11, :fields_obj@0x1004
-          v22:BasicObject = LoadField v21, :@foo@0x1004
-          Jump bb4(v22)
+          v19:CShape[0x1003] = Const CShape(0x1003)
+          v20:CBool = IsBitEqual v12, v19
+          CondBranch v20, bb7(), bb8()
+        bb7():
+          v25:IMemo = LoadField v11, :fields_obj@0x1004
+          v26:BasicObject = LoadField v25, :@foo@0x1004
+          Jump bb4(v26)
+        bb8():
+          IvarReprofile v11
+          v23:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
-          v25:Fixnum[1] = Const Value(1)
+          v29:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v36:Fixnum = GuardType v13, Fixnum recompile
-          v37:Fixnum = FixnumAdd v36, v25
+          v40:Fixnum = GuardType v13, Fixnum recompile
+          v41:Fixnum = FixnumAdd v40, v29
           CheckInterrupts
-          Return v37
+          Return v41
         ");
     }
 
@@ -10873,16 +10901,23 @@ mod hir_opt_tests {
           v18:BasicObject = LoadField v17, :@foo@0x1002
           Jump bb4(v18)
         bb6():
-          v20:CShape[0x1003] = GuardBitEquals v12, CShape(0x1003) recompile
-          v22:BasicObject = LoadField v11, :@foo@0x1004
-          Jump bb4(v22)
+          v20:CShape[0x1003] = Const CShape(0x1003)
+          v21:CBool = IsBitEqual v12, v20
+          CondBranch v21, bb7(), bb8()
+        bb7():
+          v26:BasicObject = LoadField v11, :@foo@0x1004
+          Jump bb4(v26)
+        bb8():
+          IvarReprofile v11
+          v24:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v24)
         bb4(v13:BasicObject):
-          v25:Fixnum[1] = Const Value(1)
+          v29:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v36:Fixnum = GuardType v13, Fixnum recompile
-          v37:Fixnum = FixnumAdd v36, v25
+          v40:Fixnum = GuardType v13, Fixnum recompile
+          v41:Fixnum = FixnumAdd v40, v29
           CheckInterrupts
-          Return v37
+          Return v41
         ");
     }
 
@@ -10931,16 +10966,23 @@ mod hir_opt_tests {
           v17:BasicObject = LoadField v11, :@foo@0x1002
           Jump bb4(v17)
         bb6():
-          v19:CShape[0x1003] = GuardBitEquals v12, CShape(0x1003) recompile
-          v21:BasicObject = LoadField v11, :@foo@0x1002
-          Jump bb4(v21)
+          v19:CShape[0x1003] = Const CShape(0x1003)
+          v20:CBool = IsBitEqual v12, v19
+          CondBranch v20, bb7(), bb8()
+        bb7():
+          v25:BasicObject = LoadField v11, :@foo@0x1002
+          Jump bb4(v25)
+        bb8():
+          IvarReprofile v11
+          v23:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
-          v24:Fixnum[1] = Const Value(1)
+          v28:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v35:Fixnum = GuardType v13, Fixnum recompile
-          v36:Fixnum = FixnumAdd v35, v24
+          v39:Fixnum = GuardType v13, Fixnum recompile
+          v40:Fixnum = FixnumAdd v39, v28
           CheckInterrupts
-          Return v36
+          Return v40
         ");
     }
 
@@ -10988,10 +11030,17 @@ mod hir_opt_tests {
           v18:BasicObject = LoadField v17, :@a@0x1002
           Jump bb4(v18)
         bb6():
-          v20:CShape[0x1003] = GuardBitEquals v12, CShape(0x1003) recompile
-          v22:IMemo = LoadField v11, :fields_obj@0x1004
-          v23:BasicObject = LoadField v22, :@a@0x1002
-          Jump bb4(v23)
+          v20:CShape[0x1003] = Const CShape(0x1003)
+          v21:CBool = IsBitEqual v12, v20
+          CondBranch v21, bb7(), bb8()
+        bb7():
+          v26:IMemo = LoadField v11, :fields_obj@0x1004
+          v27:BasicObject = LoadField v26, :@a@0x1002
+          Jump bb4(v27)
+        bb8():
+          IvarReprofile v11
+          v24:BasicObject = GetIvar v11, :@a
+          Jump bb4(v24)
         bb4(v13:BasicObject):
           CheckInterrupts
           Return v13
@@ -17292,7 +17341,7 @@ mod hir_opt_tests {
          StoreField v11, :formatted@0x1004, v17
          Jump bb3(v9, v10, v13, v15)
        bb3(v20:BasicObject, v21:BasicObject, v22:BasicObject, v23:BasicObject):
-         v82:NilClass = Const Value(nil)
+         v86:NilClass = Const Value(nil)
          SetLocal :formatted, l0, EP@3, v21
          PatchPoint SingleRactorMode
          v47:HeapBasicObject = GuardType v20, HeapBasicObject
@@ -17305,23 +17354,30 @@ mod hir_opt_tests {
          WriteBarrier v47, v21
          Jump bb6()
        bb8():
-         v55:CShape[0x1008] = GuardBitEquals v48, CShape(0x1008) recompile
+         v55:CShape[0x1008] = Const CShape(0x1008)
+         v56:CBool = IsBitEqual v48, v55
+         CondBranch v56, bb9(), bb10()
+       bb9():
          StoreField v47, :@formatted@0x1007, v21
          WriteBarrier v47, v21
-         v59:CShape[0x1006] = Const CShape(0x1006)
-         StoreField v47, :shape_id@0x1005, v59
+         v63:CShape[0x1006] = Const CShape(0x1006)
+         StoreField v47, :shape_id@0x1005, v63
+         Jump bb6()
+       bb10():
+         IvarReprofile v47
+         SetIvar v47, :@formatted, v21
          Jump bb6()
        bb6():
-         v65:ClassSubclass[VMFrozenCore] = Const Value(VALUE(0x1010))
+         v69:ClassSubclass[VMFrozenCore] = Const Value(VALUE(0x1010))
          PatchPoint MethodRedefined(Class@0x1018, lambda@0x1020, cme:0x1028)
-         v81:BasicObject = CCallWithFrame v65, :RubyVM::FrozenCore.lambda@0x1050, block=0x1058
-         v68:CPtr = GetEP 0
-         v69:BasicObject = LoadField v68, :a@0x1001
-         v70:BasicObject = LoadField v68, :_b@0x1002
-         v71:BasicObject = LoadField v68, :_c@0x1003
-         v72:BasicObject = LoadField v68, :formatted@0x1004
+         v85:BasicObject = CCallWithFrame v69, :RubyVM::FrozenCore.lambda@0x1050, block=0x1058
+         v72:CPtr = GetEP 0
+         v73:BasicObject = LoadField v72, :a@0x1001
+         v74:BasicObject = LoadField v72, :_b@0x1002
+         v75:BasicObject = LoadField v72, :_c@0x1003
+         v76:BasicObject = LoadField v72, :formatted@0x1004
          CheckInterrupts
-         Return v81
+         Return v85
        ");
     }
 
@@ -20113,15 +20169,15 @@ mod hir_opt_tests {
           v5:HeapBasicObject = LoadArg :self@0
           Jump bb3(v5)
         bb3(v8:HeapBasicObject):
-          v99:NilClass = Const Value(nil)
+          v103:NilClass = Const Value(nil)
           v13:Fixnum[0] = Const Value(0)
           Jump bb6(v8, v13)
         bb6(v18:HeapBasicObject, v19:Fixnum):
           v23:Fixnum[10] = Const Value(10)
           PatchPoint MethodRedefined(Integer@0x1000, <@0x1008, cme:0x1010)
-          v94:BoolExact = FixnumLt v19, v23
+          v98:BoolExact = FixnumLt v19, v23
           CheckInterrupts
-          v29:CBool = Test v94
+          v29:CBool = Test v98
           CondBranch v29, bb4(), bb7()
         bb4():
           PatchPoint SingleRactorMode
@@ -20133,27 +20189,34 @@ mod hir_opt_tests {
           v51:BasicObject = LoadField v18, :@levar@0x103a
           Jump bb8(v51)
         bb10():
-          v53:CShape[0x103b] = GuardBitEquals v46, CShape(0x103b) recompile
-          v55:NilClass = Const Value(nil)
-          Jump bb8(v55)
-        bb8(v47:BasicObject):
-          v58:CBool = Test v47
-          CondBranch v58, bb5(v18), bb12()
+          v53:CShape[0x103b] = Const CShape(0x103b)
+          v54:CBool = IsBitEqual v46, v53
+          CondBranch v54, bb11(), bb12()
+        bb11():
+          v59:NilClass = Const Value(nil)
+          Jump bb8(v59)
         bb12():
+          IvarReprofile v18
+          v57:BasicObject = GetIvar v18, :@levar
+          Jump bb8(v57)
+        bb8(v47:BasicObject):
+          v62:CBool = Test v47
+          CondBranch v62, bb5(v18), bb13()
+        bb13():
           PatchPoint NoEPEscape(set_value_loop)
           PatchPoint SingleRactorMode
-          v68:CShape = LoadField v18, :shape_id@0x1038
-          v69:CShape[0x103b] = GuardBitEquals v68, CShape(0x103b) recompile
+          v72:CShape = LoadField v18, :shape_id@0x1038
+          v73:CShape[0x103b] = GuardBitEquals v72, CShape(0x103b) recompile
           StoreField v18, :@levar@0x103a, v19
-          v72:CShape[0x1039] = Const CShape(0x1039)
-          StoreField v18, :shape_id@0x1038, v72
+          v76:CShape[0x1039] = Const CShape(0x1039)
+          StoreField v18, :shape_id@0x1038, v76
           Jump bb5(v18)
-        bb5(v76:HeapBasicObject):
+        bb5(v80:HeapBasicObject):
           PatchPoint NoEPEscape(set_value_loop)
-          v84:Fixnum[1] = Const Value(1)
+          v88:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1000, +@0x103c, cme:0x1040)
-          v98:Fixnum = FixnumAdd v19, v84
-          Jump bb6(v76, v98)
+          v102:Fixnum = FixnumAdd v19, v88
+          Jump bb6(v80, v102)
         bb7():
           v34:NilClass = Const Value(nil)
           CheckInterrupts

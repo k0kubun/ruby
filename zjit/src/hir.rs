@@ -8094,15 +8094,21 @@ impl Function {
         self.push_insn(block, Insn::IvarReprofile { self_val: self_param, state });
     }
 
+    ///
+    /// `covers_profile` says whether `profiles` accounts for every shape the profile recorded.
+    /// When it is false, we already know at compile time that some receivers cannot match any
+    /// guard, so a guard whose only miss target is a side exit would exit by construction.
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
+        covers_profile: bool,
         mut block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
         exit_id: InsnId,
         no_profile_reason: SideExitReason,
-        fallback_counter: Counter,
+        no_profile_counter: Counter,
+        chain_miss_counter: Counter,
         has_result: bool,
         profile_shape: impl Fn(T) -> ShapeId,
         mut emit_optimized: impl FnMut(&mut Function, BlockId, T) -> Option<InsnId>,
@@ -8111,7 +8117,9 @@ impl Function {
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
             if self.policy.no_side_exits {
-                self.count(block, fallback_counter);
+                self.count(block, no_profile_counter);
+                // The fallback path samples the shapes arriving here, which is the evidence
+                // rb_zjit_ivar_reprofile weighs when deciding to earn a respecialization.
                 self.emit_ivar_reprofile(block, self_param, exit_id);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
@@ -8122,7 +8130,10 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        // A monomorphic guard is the one shape guard whose failure is worth an exit: the site has
+        // only ever seen one shape, so a miss means the profile is stale or too narrow, and the
+        // recompile it triggers can widen the site into a shape chain.
+        if profiles.len() == 1 && covers_profile && !self.policy.no_side_exits {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -8144,22 +8155,19 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
-                    // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
-                    let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
-                    let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
-                    let fallback_block = self.new_block(insn_idx);
-                    self.push_insn(block, branch(matches, optimized_block, fallback_block));
-                    self.count(fallback_block, fallback_counter);
-                    self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
-                    let fallback_result = emit_fallback(self, fallback_block);
-                    self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
-                } else {
-                    // If the policy allows exits, exit to the interpreter if the shape doesn't match.
-                    self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile));
-                    // TODO(max): Don't make a new block in this case
-                    self.push_insn(block, Insn::Jump(edge(optimized_block)));
-                }
+                // The last arm falls through to a cold block that does the access generically
+                // instead of side-exiting. A receiver that misses every arm of a shape chain is
+                // not news the profiler can act on: the site is already known to be
+                // shape-polymorphic, so recompiling would rebuild the same chain out of the same
+                // buckets and exit again on the next miss.
+                let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
+                let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
+                let fallback_block = self.new_block(insn_idx);
+                self.push_insn(block, branch(matches, optimized_block, fallback_block));
+                self.count(fallback_block, chain_miss_counter);
+                self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
+                let fallback_result = emit_fallback(self, fallback_block);
+                self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
             } else {
                 // If this is not the last profiled shape, let the guard jump to the next block.
                 let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
@@ -8179,6 +8187,7 @@ impl Function {
     fn dispatch_getivar(
         &mut self,
         profiled_types: &[ProfiledType],
+        covers_profile: bool,
         block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -8188,12 +8197,14 @@ impl Function {
     ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
+            covers_profile,
             block,
             insn_idx,
             self_param,
             exit_id,
             SideExitReason::NoProfileGetIvar,
             Counter::getivar_fallback_no_side_exits,
+            Counter::getivar_fallback_shape_chain_miss,
             true,
             |profiled_type| profiled_type.shape(),
             |fun, block, profiled_type| Some(fun.load_ivar(block, self_param, profiled_type, id)),
@@ -8208,6 +8219,7 @@ impl Function {
         &mut self,
         specs: &[SetIvarSpec],
         unoptimized_reason: Option<Counter>,
+        covers_profile: bool,
         block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -8225,12 +8237,14 @@ impl Function {
         }
         let (block, result) = self.dispatch_ivar(
             specs,
+            covers_profile && unoptimized_reason.is_none(),
             block,
             insn_idx,
             self_param,
             exit_id,
             SideExitReason::NoProfileSetIvar,
             Counter::setivar_fallback_no_side_exits,
+            Counter::setivar_fallback_shape_chain_miss,
             false,
             |spec| spec.profiled_type.shape(),
             |fun, block, spec| {
@@ -10507,6 +10521,11 @@ fn add_iseq_to_hir(
                         // Let the fallthrough GetIvar handle these.
                         && !profiled_type.shape().is_complex()
                     }).collect::<Vec<_>>();
+                    // Whether every shape the profile recorded gets an arm. Filtered-out buckets
+                    // and buckets we never saw (megamorphic overflow) both mean some receivers
+                    // reach this site without a matching arm.
+                    let covers_profile = profiled_types.len() == summary.buckets().iter().filter(|t| !t.is_empty()).count()
+                        && !summary.is_megamorphic() && !summary.is_skewed_megamorphic();
                     // We might have two objects of class A and B with the same shape; de-duplicate
                     // profiled types by shape. This is just an optimization to reduce code size.
                     let mut profiled_types_unique_shapes = Vec::with_capacity(profiled_types.len());
@@ -10518,6 +10537,7 @@ fn add_iseq_to_hir(
                     }
                     let Some((new_block, result)) = fun.dispatch_getivar(
                         &profiled_types_unique_shapes,
+                        covers_profile,
                         block,
                         insn_idx,
                         self_param,
@@ -10571,9 +10591,13 @@ fn add_iseq_to_hir(
                     if !specs.is_empty() || unoptimized_reason.is_none() {
                         self_param = fun.guard_heap(block, self_param, exit_id);
                     }
+                    // Megamorphic profiles saw more shapes than there are buckets, so the specs
+                    // cannot account for every receiver that reaches this site.
+                    let covers_profile = !summary.is_megamorphic() && !summary.is_skewed_megamorphic();
                     let Some(new_block) = fun.dispatch_setivar(
                         &specs,
                         unoptimized_reason,
+                        covers_profile,
                         block,
                         insn_idx,
                         self_param,
