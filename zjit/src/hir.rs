@@ -3082,6 +3082,14 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
     }
 }
 
+/// Minimum share of the profiled executions of a call site that a guard chain must cover before
+/// we emit it. Each arm costs a comparison and a branch on every execution, and the arms we can
+/// emit only cover part of the profile: handlers or receiver types we cannot specialize, and
+/// samples that did not fit in the profile at all, take the fallback. A chain built out of the
+/// cold tail of the profile pays for its guards on every execution and still performs the same
+/// dynamic dispatch, so require the covered share to be at least this large.
+const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -4329,6 +4337,35 @@ impl Function {
                 }
                 return None;
             }
+        }
+        None
+    }
+
+    /// Return the receiver profile of a call site when it is worth guarding the profiled types
+    /// in-line, with a dynamic send as the fallthrough.
+    ///
+    /// Polymorphic profiles always qualify: every observed type has a bucket, so the chain
+    /// covers the whole profile. Megamorphic profiles qualify when the buckets still cover
+    /// most of the observed executions: such a site is only megamorphic because it saw more
+    /// types than there are buckets, which for a skewed distribution still leaves the buckets
+    /// serving nearly every call. Sending those dynamically because a handful of executions
+    /// used a rare receiver class gives up on the common case.
+    fn send_chain_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<TypeDistributionSummary> {
+        let entries = profiles.get(state)?;
+        let recv = self.chase_insn(recv);
+        for (entry_insn, entry_type_summary) in entries {
+            if self.chase_insn(*entry_insn) != recv { continue; }
+            if entry_type_summary.is_polymorphic() || entry_type_summary.is_skewed_polymorphic() {
+                return Some(entry_type_summary.clone());
+            }
+            if entry_type_summary.is_megamorphic() || entry_type_summary.is_skewed_megamorphic() {
+                // Everything that did not fit in a bucket has to take the fallthrough.
+                let covered = entry_type_summary.coverage(|_, profiled_type| !profiled_type.is_empty());
+                if covered >= CHAIN_COVERAGE_THRESHOLD {
+                    return Some(entry_type_summary.clone());
+                }
+            }
+            return None;
         }
         None
     }
@@ -10134,7 +10171,7 @@ fn add_iseq_to_hir(
                     let recv = state.stack_pop()?;
                     let caller_splat_length = fun.monomorphic_caller_splat_length(call_info, exit_id);
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    if let Some(summary) = fun.send_chain_summary(&profiles, recv, exit_id) {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         // Dedup by expected type so immediate/heap variants
