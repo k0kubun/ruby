@@ -446,7 +446,7 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
 
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let obj = profiler.peek_at_block_handler();
-    let ty = ProfiledType::object(obj);
+    let ty = ProfiledType::block_handler(obj);
     VALUE::from(profiler.iseq).write_barrier(ty.class());
     let insn_idx = profiler.insn_idx;
     profile.block_handlers_mut().entry(insn_idx)
@@ -493,6 +493,10 @@ impl Flags {
     const IS_STRUCT_EMBEDDED: u32 = 1 << 3;
     /// Set if the ProfiledType is used for profiling specific objects, not just classes/shapes
     const IS_OBJECT_PROFILING: u32 = 1 << 4;
+    /// Block handler is an IFUNC (a block implemented in C)
+    const IS_BLOCK_IFUNC: u32 = 1 << 5;
+    /// Block handler is a Proc
+    const IS_BLOCK_PROC: u32 = 1 << 6;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -502,6 +506,8 @@ impl Flags {
     pub fn is_t_object(self) -> bool { (self.0 & Self::IS_T_OBJECT) != 0 }
     pub fn is_struct_embedded(self) -> bool { (self.0 & Self::IS_STRUCT_EMBEDDED) != 0 }
     pub fn is_object_profiling(self) -> bool { (self.0 & Self::IS_OBJECT_PROFILING) != 0 }
+    pub fn is_block_ifunc(self) -> bool { (self.0 & Self::IS_BLOCK_IFUNC) != 0 }
+    pub fn is_block_proc(self) -> bool { (self.0 & Self::IS_BLOCK_PROC) != 0 }
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -515,11 +521,28 @@ impl Flags {
 /// * NilClass == Nil
 /// * TrueClass == True
 /// * FalseClass == False
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct ProfiledType {
     class: VALUE,
     shape: ShapeId,
     flags: Flags,
+}
+
+impl PartialEq for ProfiledType {
+    fn eq(&self, other: &Self) -> bool {
+        // IFUNC and Proc block handlers are allocated per call (`rb_vm_ifunc_new`) or per block
+        // capture (`rb_vm_make_proc`), so their object identity says nothing about the call site:
+        // a `yield` that always runs the same C block sees a different IFUNC every time. Treat all
+        // IFUNC handlers as one profiled type and all Proc handlers as another so such sites look
+        // monomorphic instead of filling up the distribution with garbage.
+        if self.flags.is_block_ifunc() || other.flags.is_block_ifunc() {
+            return self.flags.is_block_ifunc() && other.flags.is_block_ifunc();
+        }
+        if self.flags.is_block_proc() || other.flags.is_block_proc() {
+            return self.flags.is_block_proc() && other.flags.is_block_proc();
+        }
+        self.class == other.class && self.shape == other.shape && self.flags == other.flags
+    }
 }
 
 impl Default for ProfiledType {
@@ -534,6 +557,21 @@ impl ProfiledType {
         let mut flags = Flags::none();
         flags.0 |= Flags::IS_OBJECT_PROFILING;
         Self { class: obj, shape: INVALID_SHAPE_ID, flags }
+    }
+
+    /// Profile an untagged block handler (see `rb_vm_untag_block_handler`). ISEQ block handlers
+    /// and symbols are recorded by identity because those objects are stable for a given block,
+    /// while IFUNC and Proc handlers are only recorded by kind (see [`PartialEq`] above).
+    fn block_handler(obj: VALUE) -> Self {
+        let mut ty = Self::object(obj);
+        if !obj.special_const_p() {
+            if unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 } {
+                ty.flags.0 |= Flags::IS_BLOCK_IFUNC;
+            } else if unsafe { rb_obj_is_proc(obj).test() } {
+                ty.flags.0 |= Flags::IS_BLOCK_PROC;
+            }
+        }
+        ty
     }
 
     /// Profile the class and shape of the given object
@@ -577,6 +615,11 @@ impl ProfiledType {
 
     pub fn flags(&self) -> Flags {
         self.flags
+    }
+
+    /// True if this profiled a block handler that is an IFUNC (a block implemented in C).
+    pub fn is_block_ifunc(&self) -> bool {
+        self.flags.is_block_ifunc()
     }
 
     pub fn is_fixnum(&self) -> bool {
