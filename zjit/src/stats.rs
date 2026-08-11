@@ -221,6 +221,7 @@ make_counters! {
         exit_guard_super_method_entry,
         exit_patchpoint_bop_redefined,
         exit_patchpoint_method_redefined,
+        exit_patchpoint_no_method_override,
         exit_patchpoint_stable_constant_names,
         exit_patchpoint_no_tracepoint,
         exit_patchpoint_no_newobj_hook,
@@ -262,6 +263,7 @@ make_counters! {
         send_fallback_send_bop_redefined,
         send_fallback_send_operands_not_fixnum,
         send_fallback_send_polymorphic_fallback,
+        send_fallback_send_ancestor_guard_fallback,
         send_fallback_send_direct_keyword_mismatch,
         send_fallback_send_direct_keyword_count_mismatch,
         send_fallback_send_direct_missing_keyword,
@@ -463,6 +465,20 @@ make_counters! {
     guard_type_count,
     guard_shape_count,
 
+    // Executions that reached a send through an ancestor guard, i.e. a call site that is
+    // megamorphic in the receiver class but resolves one shared method.
+    send_ancestor_guard_count,
+    // Executions that reached the ancestor guard's dynamic fallthrough because the receiver
+    // did not inherit from the guarded class.
+    send_ancestor_guard_fallback_count,
+    // Compile-time count of call sites that got an ancestor guard.
+    send_ancestor_guard_sites,
+    // Compile-time counts of megamorphic call sites that could not use an ancestor guard.
+    send_ancestor_guard_reject_cme_differs,
+    send_ancestor_guard_reject_immediate,
+    send_ancestor_guard_reject_not_a_class,
+    send_ancestor_guard_reject_overridden,
+
     load_field_count,
     store_field_count,
 
@@ -648,6 +664,8 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
                                       => exit_patchpoint_bop_redefined,
         PatchPoint(Invariant::MethodRedefined { .. })
                                       => exit_patchpoint_method_redefined,
+        PatchPoint(Invariant::NoMethodOverride { .. })
+                                      => exit_patchpoint_no_method_override,
         PatchPoint(Invariant::StableConstantNames { .. })
                                       => exit_patchpoint_stable_constant_names,
         PatchPoint(Invariant::NoTracePoint)
@@ -687,6 +705,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SendBopRedefined                          => send_fallback_send_bop_redefined,
         SendOperandsNotFixnum                     => send_fallback_send_operands_not_fixnum,
         SendPolymorphicFallback                   => send_fallback_send_polymorphic_fallback,
+        SendAncestorGuardFallback                 => send_fallback_send_ancestor_guard_fallback,
         SendDirectKeywordMismatch                 => send_fallback_send_direct_keyword_mismatch,
         SendDirectKeywordCountMismatch            => send_fallback_send_direct_keyword_count_mismatch,
         SendDirectMissingKeyword                  => send_fallback_send_direct_missing_keyword,

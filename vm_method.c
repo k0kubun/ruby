@@ -592,6 +592,11 @@ clear_iclass_method_cache_by_id_for_refinements(VALUE klass, VALUE d)
 void
 rb_clear_method_cache(VALUE klass_or_module, ID mid)
 {
+    // Every method table mutation funnels through here, so this is where ZJIT
+    // learns that a method name it assumed unoverridden may now be overridden
+    // somewhere in a class hierarchy it dispatches over.
+    rb_zjit_method_lookup_changed(mid);
+
     if (RB_TYPE_P(klass_or_module, T_MODULE)) {
         VALUE module = klass_or_module; // alias
 
@@ -627,6 +632,10 @@ invalidate_ccs_in_iclass_cc_tbl(VALUE value, void *data)
 void
 rb_invalidate_method_caches(struct rb_id_table *cm_tbl, VALUE cc_tbl)
 {
+    // Wholesale invalidation with no method name to key on: drop every ZJIT
+    // no-override assumption.
+    rb_zjit_method_lookup_changed(0);
+
     if (cm_tbl) {
         rb_id_table_foreach_values(cm_tbl, invalidate_method_entry_in_iclass_callable_m_tbl, NULL);
     }

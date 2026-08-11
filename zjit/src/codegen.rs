@@ -13,7 +13,7 @@ use crate::backend::current::ALLOC_REGS;
 use crate::invariants::{
     track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_no_trace_point_assumption,
     track_single_ractor_assumption, track_stable_constant_names_assumption, track_no_singleton_class_assumption,
-    track_root_box_assumption, track_no_newobj_hook_assumption
+    track_root_box_assumption, track_no_newobj_hook_assumption, track_no_method_override_assumption
 };
 use crate::gc::append_gc_offsets;
 use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
@@ -736,6 +736,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             let val_type = function.type_of(*val);
             gen_has_type(jit, asm, opnd!(val), val_type, *expected)
         }
+        &Insn::HasAncestor { val, class } => {
+            let val_type = function.type_of(val);
+            gen_has_ancestor(jit, asm, opnd!(val), val_type, class)
+        }
         &Insn::GuardType { val, guard_type, state, recompile } => {
             let val_type = function.type_of(val);
             gen_guard_type(jit, asm, function, opnd!(val), val_type, guard_type, recompile, &function.frame_state(state))
@@ -1010,6 +1014,9 @@ pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invari
             }
             Invariant::MethodRedefined { klass: _, method: _, cme } => {
                 track_cme_assumption(cme, code_ptr, side_exit_ptr, version);
+            }
+            Invariant::NoMethodOverride { klass: _, method, cme: _ } => {
+                track_no_method_override_assumption(method, code_ptr, side_exit_ptr, version);
             }
             Invariant::StableConstantNames { idlist } => {
                 track_stable_constant_names_assumption(idlist, code_ptr, side_exit_ptr, version);
@@ -3089,6 +3096,74 @@ fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_typ
     } else {
         unimplemented!("unsupported type: {ty}");
     }
+}
+
+/// Compile `val.is_a?(class)` for a statically known class, inline.
+///
+/// This is `class_search_class_ancestor()` from object.c: a class caches the array of its
+/// superclasses, so checking whether `class` (at a fixed depth) sits at that depth in the
+/// receiver class's array answers the question in constant time, whatever the depth.
+///
+/// Two cases answer false without consulting the ancestry, which the callers rely on:
+/// immediates (their class is one of a handful of built-ins, never a user class rooting an
+/// ancestor-dispatched call site) and objects with a singleton class (whose method lookup
+/// starts below the class we would dispatch from). Both take the caller's fallthrough arm,
+/// which performs a full dynamic send, so answering false is always safe.
+fn gen_has_ancestor(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_type: Type, class: VALUE) -> lir::Opnd {
+    asm_comment!(asm, "is_a? {}", get_class_name(class));
+    let depth = unsafe { rb_zjit_class_superclass_depth(class) };
+    let class_offset: i32 = (depth as i32) * (SIZEOF_VALUE_I32);
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_edge = |v| Target::Block(Box::new(lir::BranchEdge {
+        target: result_block,
+        args: vec![v],
+    }));
+
+    // If val isn't in a register, load it to use it as the base of Opnd::mem later.
+    let val = asm.load_mem(val);
+
+    if !val_type.is_subtype(types::HeapBasicObject) {
+        asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
+        asm.jnz(jit, result_edge(Opnd::Imm(0)));
+
+        asm.cmp(val, Qfalse.into());
+        asm.je(jit, result_edge(Opnd::Imm(0)));
+    }
+
+    let klass = asm.load(Opnd::mem(64, val, RUBY_OFFSET_RBASIC_KLASS));
+
+    // Exact match: the superclass array only holds proper superclasses.
+    asm.cmp(klass, Opnd::Value(class));
+    asm.je(jit, result_edge(Opnd::Imm(1)));
+
+    // A singleton class inherits from the class we are about to check against, but its own
+    // method table is not part of the hierarchy we proved nothing overrides in.
+    let flags = asm.load(Opnd::mem(VALUE_BITS, klass, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(flags, Opnd::UImm(RUBY_FL_SINGLETON as u64));
+    asm.jnz(jit, result_edge(Opnd::Imm(0)));
+
+    // A shallower class can't have `class` among its proper superclasses, and its array is
+    // too short to index at `depth`.
+    let recv_depth = asm.load(Opnd::mem(16, klass, RCLASS_OFFSET_PRIME_SUPERCLASS_DEPTH));
+    asm.cmp(recv_depth, Opnd::UImm(depth as u64));
+    asm.jbe(jit, result_edge(Opnd::Imm(0)));
+
+    let superclasses = asm.load(Opnd::mem(64, klass, RCLASS_OFFSET_PRIME_SUPERCLASSES));
+    let ancestor = asm.load(Opnd::mem(64, superclasses, class_offset));
+    asm.cmp(ancestor, Opnd::Value(class));
+    let result = asm.csel_e(Opnd::UImm(1), Opnd::Imm(0));
+    asm.jmp(result_edge(result));
+
+    // Result block -- receives the value via block parameter (phi node)
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 /// Compile a type check with a side exit
