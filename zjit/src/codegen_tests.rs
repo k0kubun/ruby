@@ -4349,6 +4349,7 @@ fn test_array_fixnum_aref_negative_index() {
     assert_snapshot!(assert_compiles("test(-1)"), @"3");
 }
 
+// Out-of-range reads are nil in Ruby, so they must stay in JIT code rather than side-exit.
 #[test]
 fn test_array_fixnum_aref_out_of_bounds_positive() {
     eval("
@@ -4356,7 +4357,7 @@ fn test_array_fixnum_aref_out_of_bounds_positive() {
         test(10)
     ");
     assert_contains_opcode("test", YARVINSN_opt_aref);
-    assert_snapshot!(assert_compiles_allowing_exits("test(10)"), @"nil");
+    assert_snapshot!(assert_compiles("test(10)"), @"nil");
 }
 
 #[test]
@@ -4366,7 +4367,106 @@ fn test_array_fixnum_aref_out_of_bounds_negative() {
         test(-10)
     ");
     assert_contains_opcode("test", YARVINSN_opt_aref);
-    assert_snapshot!(assert_compiles_allowing_exits("test(-10)"), @"nil");
+    assert_snapshot!(assert_compiles("test(-10)"), @"nil");
+}
+
+#[test]
+fn test_array_fixnum_aref_out_of_bounds_empty_array() {
+    eval("
+        def test(arr, x) = arr[x]
+        test([1,2,3], 0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_aref);
+    assert_snapshot!(assert_compiles("[test([], 0), test([], -1), test([], 1)]"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_array_fixnum_aref_boundary_indices() {
+    eval("
+        def test(arr, x) = arr[x]
+        test([1,2,3], 0)
+    ");
+    assert_snapshot!(assert_compiles("[-4, -3, -1, 0, 2, 3, 4].map { |i| test([1,2,3], i) }"),
+        @"[nil, 1, 3, 1, 3, nil, nil]");
+}
+
+// Walking an Array until it returns nil must not leave JIT code at the boundary.
+#[test]
+fn test_array_fixnum_aref_walk_past_end() {
+    eval("
+        def test(arr)
+          i = 0
+          out = []
+          while (v = arr[i])
+            out << v
+            i += 1
+          end
+          out
+        end
+        test([1,2,3])
+    ");
+    assert_snapshot!(assert_compiles("[test([1,2,3]), test([])]"), @"[[1, 2, 3], []]");
+}
+
+#[test]
+fn test_string_getbyte() {
+    eval(r#"
+        def test(s, i) = s.getbyte(i)
+        test("abc", 0)
+    "#);
+    assert_snapshot!(assert_compiles(r#"[test("abc", 0), test("abc", 2), test("abc", -1)]"#), @"[97, 99, 99]");
+}
+
+// getbyte returns nil rather than raising for out-of-range indices, so it must not side-exit.
+#[test]
+fn test_string_getbyte_out_of_bounds() {
+    eval(r#"
+        def test(s, i) = s.getbyte(i)
+        test("abc", 0)
+    "#);
+    assert_snapshot!(assert_compiles(r#"[test("abc", 3), test("abc", 4), test("abc", -4), test("abc", -100)]"#),
+        @"[nil, nil, nil, nil]");
+}
+
+#[test]
+fn test_string_getbyte_out_of_bounds_empty_string() {
+    eval(r#"
+        def test(s, i) = s.getbyte(i)
+        test("abc", 0)
+    "#);
+    assert_snapshot!(assert_compiles(r#"[test("", 0), test("", -1), test("", 1)]"#), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_string_getbyte_frozen_and_shared() {
+    eval(r#"
+        def test(s, i) = s.getbyte(i)
+        test("abc", 0)
+    "#);
+    assert_snapshot!(assert_compiles(r#"
+        frozen = "abc".freeze
+        shared = ("x" * 30)[27..]
+        [test(frozen, 2), test(frozen, 3), test(shared, 2), test(shared, 3)]
+    "#), @"[99, nil, 120, nil]");
+}
+
+// A byte scan that runs off the end of the string is the Ragel-generated parser pattern from the
+// mail and parser gems: it used to side-exit once per call, at the last byte.
+#[test]
+fn test_string_getbyte_scan_past_end() {
+    eval(r#"
+        def test(s)
+          i = 0
+          out = []
+          while (b = s.getbyte(i))
+            out << b
+            i += 1
+          end
+          out
+        end
+        test("ab")
+    "#);
+    assert_snapshot!(assert_compiles(r#"[test("abc"), test("")]"#), @"[[97, 98, 99], []]");
 }
 
 #[test]
