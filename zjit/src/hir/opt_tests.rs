@@ -4402,10 +4402,11 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_yield_mixed_iseq_proc_symbol_profile_dispatches_on_iseqs() {
-        // A yield site whose profile mixes ISEQ blocks with proc and symbol handlers still
-        // dispatches directly on the ISEQ candidates; the non-ISEQ handlers fail the tag
-        // check and take the generic fallback in-line.
+    fn test_yield_mixed_iseq_proc_symbol_profile_skips_cold_iseq_chain() {
+        // A yield site whose profile is dominated by handlers we cannot dispatch directly
+        // (here proc and symbol handlers) does not get an ISEQ dispatch chain: the ISEQ
+        // candidates only cover a small share of the executions, so the chain would compare
+        // and miss on nearly every call and still perform the same generic dispatch.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4413,9 +4414,7 @@ mod hir_opt_tests {
             def via_proc(l) = invoke(&l)
             def via_sym = invoke(&:itself)
             pr = proc { |x| x * 3 }
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
+            6.times { add_one; double; via_proc(pr); via_sym }
             add_one + double + via_proc(pr) + via_sym
         ");
         assert_eq!(VALUE::fixnum_from_usize(71), result);
@@ -4431,38 +4430,9 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:Fixnum[10] = Const Value(10)
-          v12:CPtr = GetEP 0
-          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v14:CInt64[3] = Const CInt64(3)
-          v15:CInt64 = IntAnd v13, v14
-          v17:CInt64[1] = Const CInt64(1)
-          v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
-          v20:CInt64[-4] = Const CInt64(-4)
-          v21:CInt64 = IntAnd v13, v20
-          v22:CPtr = LoadField v21, :code_iseq@0x1001
-          v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
-          Jump bb4(v26)
-        bb8():
-          v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
-          v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
-          Jump bb4(v31)
-        bb10():
-          Jump bb6()
-        bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
-        bb4(v16:BasicObject):
+          v12:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
           CheckInterrupts
-          Return v16
+          Return v12
         ");
     }
 
