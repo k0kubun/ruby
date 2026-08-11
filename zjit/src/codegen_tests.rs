@@ -4931,6 +4931,31 @@ fn test_polymorphic_iseq_dispatch_same_site() {
 }
 
 #[test]
+fn test_megamorphic_send_chain_dispatches_and_falls_back() {
+    // A call site that sees ten receiver classes is megamorphic: the profiled classes get
+    // guarded in-line and everything else takes the dynamic send. Both the chained classes
+    // and a class the profile never saw must return the right value.
+    set_call_threshold(21);
+    eval("
+        class C0; def foo = 0; end
+        class C1; def foo = 1; end
+        class C2; def foo = 2; end
+        class C3; def foo = 3; end
+        class C4; def foo = 4; end
+        class C5; def foo = 5; end
+        class C6; def foo = 6; end
+        class C7; def foo = 7; end
+        class C8; def foo = 8; end
+        class C9; def foo = 9; end
+        class Unseen; def foo = 42; end
+        def test(o) = o.foo
+        OBJS = [C0.new, C1.new, C2.new, C3.new, C4.new, C5.new, C6.new, C7.new, C8.new, C9.new]
+        3.times { OBJS.each { |o| test o } }
+    ");
+    assert_snapshot!(assert_compiles("OBJS.map { |o| test o } + [test(Unseen.new)]"), @"[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 42]");
+}
+
+#[test]
 fn test_recursive_fact() {
     assert_snapshot!(inspect("
         def fact(n)
