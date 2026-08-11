@@ -9799,8 +9799,7 @@ fn add_iseq_to_hir(
                     // instead of side-exiting, so nothing would ever correct a profile that has
                     // gone stale. Have the fallback record the handlers it actually sees and ask
                     // for a recompile once they turn out to be dispatchable.
-                    let reprofile = can_recompile
-                        && payload.profile.arm_reprofile_at(exit_state.insn_idx, args.len());
+                    let reprofile = can_recompile && payload.profile.can_reprofile_at(exit_state.insn_idx);
 
                     // The profiled block handler distribution. All the specializations below
                     // (IFUNC, inline-ISEQ, and polymorphic ISEQ dispatch) key off this summary.

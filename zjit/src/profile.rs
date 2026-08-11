@@ -253,10 +253,27 @@ struct Reprofile {
     budget: u8,
 }
 
+/// What [`IseqProfile::observe_fallback_block_handler`] wants the caller to do next.
+#[derive(PartialEq, Eq, Debug)]
+enum Reprofiled {
+    /// Recorded, or ignored because the site has stopped re-profiling. Nothing to do.
+    Sampled,
+    /// This site has no window yet. Open one under the VM lock and start over.
+    NeedsWindow,
+    /// The window closed on handlers a recompile could dispatch and has been folded into the
+    /// instruction's profile. Invalidate the compiled code so it reads the new profile.
+    Recompile,
+}
+
 /// True if recompiling a `yield` site that passes `argc` arguments against `window` would give
 /// most of those samples a dispatch of their own. Mirrors the families `iseq_to_hir` can emit a
 /// fast path for, so a window of Procs, of blocks whose parameters do not match the yield, or
 /// of nothing in particular is not worth bouncing the compiled code over.
+///
+/// Every family is held to the chain's coverage bar here, including the two the compiler will
+/// emit a tag test for at a smaller share: a recompile is only worth its cost when most of
+/// what the fallback is seeing stops going through `rb_vm_invokeblock`, whereas adding an arm
+/// to a site that is being compiled anyway is worth it for a fraction of the executions.
 fn window_is_dispatchable(window: &TypeDistribution, argc: usize) -> bool {
     use crate::hir::CHAIN_COVERAGE_THRESHOLD;
     let summary = TypeDistributionSummary::new(window);
@@ -292,12 +309,13 @@ fn window_is_dispatchable(window: &TypeDistribution, argc: usize) -> bool {
 /// next one is twice as long, so a site whose handlers are genuinely chaotic converges on
 /// sampling almost none of its fallbacks rather than on recompiling.
 ///
-/// Sampling deliberately runs without the VM lock: a window that decides nothing has to be
-/// able to open another one, so this call stays live on the fallback path indefinitely and
-/// taking the lock per yield would cost more than the dispatch it is trying to fix. What it
-/// writes is profile data — the entry it updates is created at compile time, so no collection
-/// grows here, and a Ractor racing on the same site can only miscount buckets. The VM lock is
-/// taken only for the invalidation that a decided window asks for.
+/// Sampling deliberately runs without the VM lock after the first fallback: a window that
+/// decides nothing has to be able to open another one, so this call stays live on the fallback
+/// path indefinitely and taking the lock per yield would cost more than the dispatch it is
+/// trying to fix. What it writes is profile data into a window this site already owns, so no
+/// collection grows here and a Ractor racing on the same site can only miscount buckets. The
+/// lock is taken to create that window, and again for the invalidation a decided window asks
+/// for.
 ///
 /// `version` is the compiled unit this call lives in, not the ISEQ that owns the instruction:
 /// an inlined callee has no compiled code of its own, so it is the outer function that has to
@@ -305,31 +323,39 @@ fn window_is_dispatchable(window: &TypeDistribution, argc: usize) -> bool {
 /// reaching the fallback until they return, and testing the version they came from is what
 /// stops those from sampling into the next version's window.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_invokeblock_reprofile(cfp: CfpPtr, version: *mut IseqVersion, frame_iseq: VALUE, insn_idx: u32) {
+pub extern "C" fn rb_zjit_invokeblock_reprofile(cfp: CfpPtr, version: *mut IseqVersion, frame_iseq: VALUE, insn_idx: u32, argc: u32) {
     if unsafe { (*version).is_invalidated() } {
         return;
     }
     let insn_idx = insn_idx as YarvInsnIdx;
     let iseq = frame_iseq.as_iseq();
     let handler = unsafe { rb_vm_get_untagged_block_handler(cfp) };
-    if !get_or_create_iseq_payload(iseq).profile.observe_fallback_block_handler(iseq, insn_idx, handler) {
-        return;
-    }
-
-    // Invalidate the running version so it recompiles and reads the adopted profile. It is the
-    // last one: a new version only appears once this one has been invalidated, and the check
-    // above returned early in that case.
-    incr_counter_by(Counter::invokeblock_reprofile_recompile_count, 1);
-    let compiled_iseq = VALUE::from(unsafe { (*version).iseq });
-    with_vm_lock(src_loc!(), || {
-        let compiled_iseq = compiled_iseq.as_iseq();
-        let payload = get_or_create_iseq_payload(compiled_iseq);
-        if let Some(version) = payload.versions.last_mut() {
-            let cb = crate::state::ZJITState::get_code_block();
-            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
-            cb.mark_all_executable();
+    match get_or_create_iseq_payload(iseq).profile.observe_fallback_block_handler(iseq, insn_idx, handler) {
+        Reprofiled::Sampled => {}
+        Reprofiled::NeedsWindow => {
+            // First time this site has fallen back. Yield sites that never do should not pay
+            // for a window, so it is created here rather than at compile time.
+            with_vm_lock(src_loc!(), || {
+                get_or_create_iseq_payload(iseq).profile.open_reprofile_window(insn_idx, argc as usize);
+            });
         }
-    });
+        Reprofiled::Recompile => {
+            // Invalidate the running version so it recompiles and reads the adopted profile. It
+            // is the last one: a new version only appears once this one has been invalidated,
+            // and the check above returned early in that case.
+            incr_counter_by(Counter::invokeblock_reprofile_recompile_count, 1);
+            let compiled_iseq = VALUE::from(unsafe { (*version).iseq });
+            with_vm_lock(src_loc!(), || {
+                let compiled_iseq = compiled_iseq.as_iseq();
+                let payload = get_or_create_iseq_payload(compiled_iseq);
+                if let Some(version) = payload.versions.last_mut() {
+                    let cb = crate::state::ZJITState::get_code_block();
+                    crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
+                    cb.mark_all_executable();
+                }
+            });
+        }
+    }
 }
 
 fn profile_getblockparamproxy(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -579,8 +605,8 @@ pub struct IseqProfile {
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
 
-    /// Re-profiling windows for `yield` sites, keyed by instruction index. Only sites whose
-    /// compiled code carries the re-profiling call have an entry here.
+    /// Re-profiling windows for `yield` sites, keyed by instruction index. Only sites that
+    /// have actually taken their compiled fallback have an entry here.
     reprofiles: HashMap<YarvInsnIdx, Reprofile>,
 }
 
@@ -594,11 +620,17 @@ impl IseqProfile {
         }
     }
 
-    /// Arm the `yield` site at `insn_idx` for re-profiling from JIT code and report whether it
-    /// is worth emitting the [`rb_zjit_invokeblock_reprofile`] call on its fallback path.
-    /// Creating the window here rather than on first use is what lets the runtime path run
-    /// without the VM lock: it only ever updates an entry that already exists.
-    pub fn arm_reprofile_at(&mut self, insn_idx: YarvInsnIdx, argc: usize) -> bool {
+    /// True if the `yield` site at `insn_idx` is still re-profiling itself, i.e. it is worth
+    /// emitting the [`rb_zjit_invokeblock_reprofile`] call on its fallback path. A site that
+    /// has never fallen back has no window yet and gets the benefit of the doubt.
+    pub fn can_reprofile_at(&self, insn_idx: YarvInsnIdx) -> bool {
+        self.reprofiles.get(&insn_idx).map_or(true, |reprofile| reprofile.budget > 0)
+    }
+
+    /// Open the re-profiling window for the `yield` site at `insn_idx`. Called under the VM
+    /// lock the first time the site's compiled fallback runs, which is what lets every later
+    /// sample update the window without the lock.
+    fn open_reprofile_window(&mut self, insn_idx: YarvInsnIdx, argc: usize) {
         // Size the first window so its samples cannot be outvoted by the profile they are
         // being folded into: the compile-time gates read bucket shares, so a site that yielded
         // to a C block `num_profiles` times while the program booted only stops looking like a
@@ -608,28 +640,27 @@ impl IseqProfile {
             .map_or(0, |distribution| TypeDistributionSummary::new(distribution).num_seen());
         let window_size = NumProfiles::try_from(already_seen).unwrap_or(NumProfiles::MAX)
             .max(get_option!(num_profiles)).max(1);
-        let reprofile = self.reprofiles.entry(insn_idx).or_insert_with(|| Reprofile {
+        self.reprofiles.entry(insn_idx).or_insert_with(|| Reprofile {
             window: TypeDistribution::new(),
             samples_remaining: window_size,
             window_size,
             argc: u8::try_from(argc).unwrap_or(u8::MAX),
             budget: MAX_REPROFILE_RECOMPILES,
         });
-        reprofile.budget > 0
     }
 
-    /// Record a block handler the JIT fallback was handed. Returns true when the window closed
-    /// on handlers a recompile could dispatch, in which case the window has been folded into
-    /// the instruction's profile and the caller should invalidate the compiled code.
+    /// Record a block handler the JIT fallback was handed, and tell the caller what to do next.
+    /// [`Reprofiled::Recompile`] means the window closed on handlers a recompile could dispatch
+    /// and has been folded into the instruction's profile.
     ///
     /// The window is merged rather than substituted: it only sees the executions the current
     /// dispatch could not handle, so on its own it would argue for dropping a fast path that is
     /// working. Merging leaves both families in the profile, and the compiler emits an arm for
     /// each of them.
-    fn observe_fallback_block_handler(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, handler: VALUE) -> bool {
-        let Some(reprofile) = self.reprofiles.get_mut(&insn_idx) else { return false };
+    fn observe_fallback_block_handler(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, handler: VALUE) -> Reprofiled {
+        let Some(reprofile) = self.reprofiles.get_mut(&insn_idx) else { return Reprofiled::NeedsWindow };
         if reprofile.budget == 0 {
-            return false;
+            return Reprofiled::Sampled;
         }
         incr_counter_by(Counter::invokeblock_reprofile_sample_count, 1);
         let ty = ProfiledType::block_handler(handler);
@@ -638,7 +669,7 @@ impl IseqProfile {
 
         reprofile.samples_remaining = reprofile.samples_remaining.saturating_sub(1);
         if reprofile.samples_remaining > 0 {
-            return false;
+            return Reprofiled::Sampled;
         }
 
         let decided = window_is_dispatchable(&reprofile.window, reprofile.argc.into());
@@ -652,7 +683,7 @@ impl IseqProfile {
                 reprofile.budget = 0;
             }
             reprofile.samples_remaining = reprofile.window_size;
-            return false;
+            return Reprofiled::Sampled;
         }
         reprofile.budget -= 1;
         reprofile.samples_remaining = reprofile.window_size;
@@ -663,7 +694,7 @@ impl IseqProfile {
         } else {
             entry.opnd_types[0].merge(&window);
         }
-        true
+        Reprofiled::Recompile
     }
 
     /// Get or create a mutable profile entry for the given instruction index.

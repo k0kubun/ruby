@@ -667,7 +667,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         },
         &Insn::InvokeSuper { cd, blockiseq, state, reason, .. } => gen_invokesuper(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::InvokeSuperForward { cd, blockiseq, state, reason, .. } => gen_invokesuperforward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
-        &Insn::InvokeBlock { cd, state, reason, reprofile, .. } => gen_invokeblock(jit, asm, function, cd, &function.frame_state(state), reason, reprofile),
+        Insn::InvokeBlock { cd, state, reason, reprofile, args } => gen_invokeblock(jit, asm, function, *cd, &function.frame_state(*state), *reason, *reprofile, args.len()),
         Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
         &Insn::InvokeBlockSymbol { symbol, ref args, state } => gen_invokeblock_symbol(jit, asm, function, opnd!(symbol), opnds!(args), &function.frame_state(state)),
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
@@ -1850,6 +1850,7 @@ fn gen_invokeblock(
     state: &FrameState,
     reason: SendFallbackReason,
     reprofile: bool,
+    argc: usize,
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
     gen_trace_send_fallback(asm, &reason);
@@ -1866,7 +1867,8 @@ fn gen_invokeblock(
             CFP,
             Opnd::const_ptr(jit.version.as_ptr()),
             Opnd::Value(VALUE::from(state.iseq)),
-            Opnd::UImm(state.insn_idx() as u64));
+            Opnd::UImm(state.insn_idx() as u64),
+            Opnd::UImm(argc as u64));
     }
 
     if get_option!(stats) {
