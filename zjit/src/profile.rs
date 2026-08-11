@@ -599,7 +599,15 @@ impl IseqProfile {
     /// Creating the window here rather than on first use is what lets the runtime path run
     /// without the VM lock: it only ever updates an entry that already exists.
     pub fn arm_reprofile_at(&mut self, insn_idx: YarvInsnIdx, argc: usize) -> bool {
-        let window_size = get_option!(num_profiles).max(1);
+        // Size the first window so its samples cannot be outvoted by the profile they are
+        // being folded into: the compile-time gates read bucket shares, so a site that yielded
+        // to a C block `num_profiles` times while the program booted only stops looking like a
+        // pure IFUNC site once at least that many other handlers have landed on top.
+        let already_seen = self.entry(insn_idx)
+            .and_then(|entry| entry.opnd_types.first())
+            .map_or(0, |distribution| TypeDistributionSummary::new(distribution).num_seen());
+        let window_size = NumProfiles::try_from(already_seen).unwrap_or(NumProfiles::MAX)
+            .max(get_option!(num_profiles)).max(1);
         let reprofile = self.reprofiles.entry(insn_idx).or_insert_with(|| Reprofile {
             window: TypeDistribution::new(),
             samples_remaining: window_size,
@@ -611,12 +619,13 @@ impl IseqProfile {
     }
 
     /// Record a block handler the JIT fallback was handed. Returns true when the window closed
-    /// on handlers a recompile could dispatch, in which case the window has replaced the
-    /// instruction's profile and the caller should invalidate the compiled code.
+    /// on handlers a recompile could dispatch, in which case the window has been folded into
+    /// the instruction's profile and the caller should invalidate the compiled code.
     ///
-    /// The window replaces the profile rather than being merged into it: what the fallback sees
-    /// is exactly what the current dispatch cannot handle, and the counts it is competing with
-    /// were recorded before the ISEQ was ever compiled.
+    /// The window is merged rather than substituted: it only sees the executions the current
+    /// dispatch could not handle, so on its own it would argue for dropping a fast path that is
+    /// working. Merging leaves both families in the profile, and the compiler emits an arm for
+    /// each of them.
     fn observe_fallback_block_handler(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, handler: VALUE) -> bool {
         let Some(reprofile) = self.reprofiles.get_mut(&insn_idx) else { return false };
         if reprofile.budget == 0 {
@@ -649,8 +658,11 @@ impl IseqProfile {
         reprofile.samples_remaining = reprofile.window_size;
 
         let entry = self.entry_mut(insn_idx);
-        entry.opnd_types.clear();
-        entry.opnd_types.push(window);
+        if entry.opnd_types.is_empty() {
+            entry.opnd_types.push(window);
+        } else {
+            entry.opnd_types[0].merge(&window);
+        }
         true
     }
 

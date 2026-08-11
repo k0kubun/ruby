@@ -9969,11 +9969,18 @@ fn add_iseq_to_hir(
                     } else if let Some(block_iseq) = inline_iseq {
                         let level = get_lvar_level(exit_state.iseq);
                         fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, exit_id, true)
-                    } else if !polymorphic_iseqs.is_empty() || symbol_coverage > 0.0 {
+                    } else if !polymorphic_iseqs.is_empty() || symbol_coverage > 0.0 || is_ifunc {
                         // Dispatch on the runtime block handler over the profiled candidates,
                         // joining on the generic fallback for anything else. Unlike the
                         // monomorphic path above, a miss must not side-exit: the site is known to
                         // see more than one handler, so a guard would keep failing and recompiling.
+                        //
+                        // The symbol, IFUNC and ISEQ arms are emitted together rather than as
+                        // alternatives. A site that yields to both C blocks and Ruby blocks --
+                        // the `each` that iterators drive with an IFUNC and callers drive with a
+                        // literal block -- otherwise has to give up whichever family the profile
+                        // ranks second and send all of it through `rb_vm_invokeblock`, and each
+                        // arm costs one tag test on the executions the others cover.
                         let level = get_lvar_level(exit_state.iseq);
                         let ep = fun.get_ep(block, level);
                         let block_handler = fun.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
@@ -10008,7 +10015,32 @@ fn add_iseq_to_hir(
                             compare_block = miss_block;
                         }
 
+                        // IFUNC handlers next: `rb_vm_ifunc_new` hands out a fresh handler per
+                        // call, so there is no identity to compare and the tag test (0x3) is the
+                        // whole check.
+                        if is_ifunc {
+                            let tag_mask = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x3) });
+                            let tag_bits = fun.push_insn(compare_block, Insn::IntAnd { left: block_handler, right: tag_mask });
+                            let ifunc_tag = fun.push_insn(compare_block, Insn::Const { val: Const::CInt64(0x3) });
+                            let tag_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: tag_bits, right: ifunc_tag });
+                            let ifunc_block = fun.new_block(insn_idx);
+                            let miss_block = fun.new_block(insn_idx);
+                            fun.push_insn(compare_block, Insn::CondBranch {
+                                val: tag_matches,
+                                if_true: BranchEdge { target: ifunc_block, args: vec![] },
+                                if_false: BranchEdge { target: miss_block, args: vec![] },
+                            });
+                            let ifunc_result = fun.push_insn(ifunc_block, Insn::InvokeBlockIfunc {
+                                cd, block_handler, args: args.clone(), state: exit_id,
+                            });
+                            fun.push_insn(ifunc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
+                            compare_block = miss_block;
+                        }
+
                         if polymorphic_iseqs.is_empty() {
+                            if get_option!(stats) && is_ifunc {
+                                fun.count(compare_block, Counter::invokeblock_fallback_ifunc_miss);
+                            }
                             fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
                         } else {
                         let dispatch_block = fun.new_block(insn_idx);
@@ -10044,6 +10076,9 @@ fn add_iseq_to_hir(
                             fun.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
                             compare_block = miss_block;
                         }
+                        if get_option!(stats) && is_ifunc {
+                            fun.count(compare_block, Counter::invokeblock_fallback_ifunc_miss);
+                        }
                         fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
                         }
 
@@ -10051,54 +10086,6 @@ fn add_iseq_to_hir(
                             cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss, reprofile,
                         });
                         fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
-
-                        // Continue compilation from the join block
-                        block = join_block;
-                        join_param
-                    } else if is_ifunc {
-                        // Load the block handler from the current frame's LEP. In inlined
-                        // code, the function ISEQ is the caller while `exit_state.iseq` is the
-                        // callee containing this `invokeblock`.
-                        let level = get_lvar_level(exit_state.iseq);
-                        let lep = fun.get_ep(block, level);
-                        let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
-
-                        // Check IFUNC tag: (block_handler & 0x3) == 0x3
-                        let tag_mask = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
-                        let tag_bits = fun.push_insn(block, Insn::IntAnd { left: block_handler, right: tag_mask });
-                        let ifunc_tag = fun.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
-                        let is_ifunc_match = fun.push_insn(block, Insn::IsBitEqual { left: tag_bits, right: ifunc_tag });
-
-                        // Branch: on match, call InvokeBlockIfunc directly
-                        let join_block = fun.new_block(insn_idx);
-                        let join_param = fun.push_insn(join_block, Insn::Param);
-                        let ifunc_block = fun.new_block(insn_idx);
-                        let fall_through = fun.new_block(insn_idx);
-
-                        fun.push_insn(block, Insn::CondBranch {
-                            val: is_ifunc_match,
-                            if_true: BranchEdge { target: ifunc_block, args: vec![] },
-                            if_false: BranchEdge { target: fall_through, args: vec![] },
-                        });
-
-                        block = fall_through;
-
-                        let ifunc_result = fun.push_insn(ifunc_block, Insn::InvokeBlockIfunc {
-                            cd,
-                            block_handler,
-                            args: args.clone(),
-                            state: exit_id,
-                        });
-                        fun.push_insn(ifunc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
-
-                        // In the fallthrough case, use generic rb_vm_invokeblock and join
-                        if get_option!(stats) {
-                            fun.count(block, Counter::invokeblock_fallback_ifunc_miss);
-                        }
-                        let fallback_result = fun.push_insn(block, Insn::InvokeBlock {
-                            cd, args, state: exit_id, reason: InvokeBlockNotSpecialized, reprofile,
-                        });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
 
                         // Continue compilation from the join block
                         block = join_block;

@@ -34,6 +34,29 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         self.other = self.other.saturating_add(1);
     }
 
+    /// Fold another distribution's observations into this one. Items that no longer fit are
+    /// counted in `other`, same as observing them one at a time.
+    pub fn merge(&mut self, other: &Self) {
+        for (&bucket, &count) in other.buckets.iter().zip(other.counts.iter()) {
+            if count == 0 { continue; }
+            self.observe_n(bucket, count);
+        }
+        self.other = self.other.saturating_add(other.other);
+    }
+
+    /// Observe `count` occurrences of `item` at once.
+    fn observe_n(&mut self, item: T, count: NumProfiles) {
+        for (bucket, bucket_count) in self.buckets.iter_mut().zip(self.counts.iter_mut()) {
+            if *bucket == item || *bucket_count == 0 {
+                *bucket = item;
+                *bucket_count = bucket_count.saturating_add(count);
+                self.bubble_up();
+                return;
+            }
+        }
+        self.other = self.other.saturating_add(count);
+    }
+
     /// Keep the highest counted bucket at index 0
     fn bubble_up(&mut self) {
         if N == 0 { return; }

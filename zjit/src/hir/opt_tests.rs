@@ -19110,35 +19110,35 @@ mod hir_opt_tests {
           v10:Fixnum[1] = Const Value(1)
           v12:CPtr = GetEP 0
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v14:CInt64[3] = Const CInt64(3)
-          v15:CInt64 = IntAnd v13, v14
-          v16:CInt64[3] = Const CInt64(3)
-          v17:CBool = IsBitEqual v15, v16
-          CondBranch v17, bb5(), bb6()
-        bb5():
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CInt64 = IntAnd v13, v15
+          v17:CInt64[3] = Const CInt64(3)
+          v18:CBool = IsBitEqual v16, v17
+          CondBranch v18, bb6(), bb7()
+        bb6():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb6():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb4(v22)
-        bb4(v18:BasicObject):
-          v27:Fixnum[2] = Const Value(2)
-          v29:CPtr = GetEP 0
-          v30:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v31:CInt64[3] = Const CInt64(3)
-          v32:CInt64 = IntAnd v30, v31
+        bb7():
+          v23:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v23)
+        bb4(v14:BasicObject):
+          v28:Fixnum[2] = Const Value(2)
+          v30:CPtr = GetEP 0
+          v31:CInt64 = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v33:CInt64[3] = Const CInt64(3)
-          v34:CBool = IsBitEqual v32, v33
-          CondBranch v34, bb8(), bb9()
-        bb8():
-          v37:BasicObject = InvokeBlockIfunc v30, v27
-          Jump bb7(v37)
-        bb9():
-          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb7(v39)
-        bb7(v35:BasicObject):
+          v34:CInt64 = IntAnd v31, v33
+          v35:CInt64[3] = Const CInt64(3)
+          v36:CBool = IsBitEqual v34, v35
+          CondBranch v36, bb10(), bb11()
+        bb10():
+          v38:BasicObject = InvokeBlockIfunc v31, v28
+          Jump bb8(v38)
+        bb11():
+          v41:BasicObject = InvokeBlock v28 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb8(v41)
+        bb8(v32:BasicObject):
           CheckInterrupts
-          Return v35
+          Return v32
         ");
     }
 
