@@ -35,6 +35,11 @@ enum jit_bindgen_constants {
     // Field offset for prime classext's fields_obj from a class pointer
     RCLASS_OFFSET_PRIME_FIELDS_OBJ = offsetof(struct RClass_and_rb_classext_t, classext.fields_obj),
 
+    // Field offsets for the prime classext's cached superclass array, used by the
+    // constant-time ancestor check in class_search_class_ancestor().
+    RCLASS_OFFSET_PRIME_SUPERCLASSES = offsetof(struct RClass_and_rb_classext_t, classext.superclasses),
+    RCLASS_OFFSET_PRIME_SUPERCLASS_DEPTH = offsetof(struct RClass_and_rb_classext_t, classext.superclass_depth),
+
     // Field offset for fields_obj in T_DATA
     TDATA_OFFSET_FIELDS_OBJ = offsetof(struct RTypedData, fields_obj),
 
