@@ -6624,6 +6624,119 @@ fn test_invokeblock_ifunc_kwarg() {
     assert_snapshot!(assert_compiles("test"), @"[[1, {a: 2}]]");
 }
 
+/// True if a fresh HIR build of `iseq` dispatches at least one `yield` straight into a block
+/// ISEQ. Read after a workload to tell whether the site's profile now describes it well enough
+/// to compile a direct dispatch, which is what the re-profiling below is supposed to achieve.
+fn yield_dispatches_directly(iseq: IseqPtr) -> bool {
+    let function = crate::cruby::with_rubyvm(|| iseq_to_hir(iseq)).unwrap();
+    (0..function.num_insns()).any(|idx| {
+        matches!(function.find(crate::hir::InsnId::from(idx)),
+                 Insn::InvokeBlockIseqDirect { .. } | Insn::InvokeBlockSymbol { .. })
+    })
+}
+
+/// A `yield` site compiled from a profile of IFUNC handlers, then switched to Ruby blocks.
+/// This is the rubocop pattern: the site yields to C blocks while the program loads and to
+/// Ruby blocks once it is working. The generic fallback records what it actually sees and
+/// recompiles, so the site converges on a direct ISEQ dispatch instead of calling
+/// `rb_vm_invokeblock` for the rest of the process.
+#[test]
+fn test_invokeblock_reprofiles_ifunc_site_that_switches_to_iseq_blocks() {
+    set_call_threshold(2);
+    // The inliner would fold `each` into the literal-block caller and dispatch the yield from
+    // the block it baked in, which is not the path under test.
+    set_inline_threshold(0);
+    eval("
+        class ReprofileIfunc
+          include Enumerable
+          def each
+            yield 1
+            yield 2
+            self
+          end
+        end
+        LIST = ReprofileIfunc.new
+        30.times { LIST.to_a }
+
+        SUM = []
+        300.times { SUM << 0; LIST.each { |x| SUM[-1] += x } }
+        raise 'wrong result' unless SUM.uniq == [3]
+    ");
+
+    let counters = crate::state::ZJITState::get_counters();
+    assert!(counters.invokeblock_reprofile_recompile_count > 0,
+        "expected the yield site to re-profile itself and ask for a recompile");
+    assert!(yield_dispatches_directly(get_instance_method_iseq("ReprofileIfunc", "each")),
+        "expected the refreshed profile to compile a direct block dispatch");
+}
+
+/// A `yield` site trained on a handler the compiler cannot dispatch (a Proc), then switched to
+/// a literal block for good. Nothing about the generic fallback side-exits, so without
+/// re-profiling the site would keep calling `rb_vm_invokeblock` for every later yield.
+#[test]
+fn test_invokeblock_reprofiles_site_that_switches_blocks() {
+    set_call_threshold(2);
+    // The inliner would fold `each_twice` into the literal-block caller and dispatch the yield
+    // from the block it baked in, which is not the path under test.
+    set_inline_threshold(0);
+    assert_snapshot!(inspect("
+        def each_twice
+          yield 1
+          yield 2
+        end
+        def train(block)
+          n = 0
+          each_twice(&block)
+          n
+        end
+        def steady
+          n = 0
+          each_twice { |x| n += x * 10 }
+          n
+        end
+        block = proc { |x| x }
+        30.times { train(block) }
+        300.times { steady }
+        steady
+    "), @"30");
+    let recompiles = crate::state::ZJITState::get_counters().invokeblock_reprofile_recompile_count;
+    assert!(recompiles > 0, "expected the yield site to re-profile itself and ask for a recompile");
+    assert!(yield_dispatches_directly(get_method_iseq("self", "each_twice")),
+        "expected the refreshed profile to compile a direct block dispatch");
+}
+
+/// A `yield` site that alternates between two blocks on every call. It must not recompile
+/// itself over and over: each site can adopt a refreshed profile only a bounded number of
+/// times, so the site settles on whatever dispatch the last one supports.
+#[test]
+fn test_invokeblock_alternating_blocks_do_not_storm_recompiles() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def each_twice
+          yield 1
+          yield 2
+        end
+        def alternate(i)
+          n = 0
+          if i.even?
+            each_twice { |x| n += x }
+          else
+            each_twice { |x| n += x * 10 }
+          end
+          n
+        end
+        1000.times { |i| alternate(i) }
+        [alternate(0), alternate(1)]
+    "), @"[3, 30]");
+    // `each_twice` has two yield sites with a bounded adoption budget each, so 1000
+    // alternating calls can buy only a handful of recompiles however the handlers oscillate.
+    let recompiles = crate::state::ZJITState::get_counters().invokeblock_reprofile_recompile_count;
+    assert!(recompiles <= 4, "expected a bounded number of recompiles, got {recompiles}");
+    let payload = get_or_create_iseq_payload(get_method_iseq("self", "each_twice"));
+    assert!(payload.versions.len() <= max_iseq_versions(),
+        "expected the yield site's ISEQ to stay within the version cap");
+}
+
 #[test]
 fn test_ccall_variadic_with_multiple_args() {
     eval("

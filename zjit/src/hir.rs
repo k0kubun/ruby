@@ -1174,6 +1174,11 @@ pub enum Insn {
         args: Vec<InsnId>,
         state: InsnId,
         reason: SendFallbackReason,
+        /// Record the runtime block handler here so the site can recompile against what it
+        /// actually yields to. See [`crate::profile::rb_zjit_invokeblock_reprofile`]. Set only
+        /// when another version of the compiled ISEQ is still allowed and the site has not
+        /// given up on re-profiling.
+        reprofile: bool,
     },
     /// Optimized `invokeblock` for symbol block handlers (`&:foo`). Calls the symbol's method
     /// on the first yielded argument with the rest as arguments, like `vm_invoke_symbol_block`,
@@ -2945,7 +2950,7 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
 /// samples that did not fit in the profile at all, take the fallback. A chain built out of the
 /// cold tail of the profile pays for its guards on every execution and still performs the same
 /// dynamic dispatch, so require the covered share to be at least this large.
-const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+pub const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
 
 /// Emit a receiver-type guard chain for a call site: one arm per profiled receiver type, which
 /// performs a [`Insn::Send`] on a receiver refined to that type, plus a fallthrough arm that
@@ -3114,6 +3119,13 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), BlockIseq
         return Err(BlockIseqReject::MayThrow);
     }
     Ok(())
+}
+
+/// [`block_call_inlinable_iseq`] without the rejection reason, for the runtime re-profiling in
+/// [`crate::profile`] deciding whether a sampled block handler is one a recompile could
+/// dispatch.
+pub fn block_iseq_dispatchable(iseq: IseqPtr, argc: usize) -> bool {
+    block_call_inlinable_iseq(iseq, argc).is_ok()
 }
 
 impl Function {
@@ -8253,6 +8265,10 @@ fn add_iseq_to_hir(
     iseq: *const rb_iseq_t,
     mode: AddIseqMode,
 ) -> Result<AddIseqResult, ParseError> {
+    // Whether the unit being compiled is allowed another version after this one. Instructions
+    // that refresh their own profile at run time only bother doing so when the recompile they
+    // would ask for can still happen (see `Insn::InvokeBlock`'s `reprofile`).
+    let can_recompile = get_or_create_iseq_payload(fun.iseq()).versions.len() + 1 < max_iseq_versions();
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
 
@@ -9771,6 +9787,14 @@ fn add_iseq_to_hir(
                     }
                     let args = state.stack_pop_n(crate::profile::num_arguments_on_stack(cd))?;
 
+                    // Every dispatch below is chosen from a profile collected before this ISEQ
+                    // was first compiled, and the generic fallback joins back into compiled code
+                    // instead of side-exiting, so nothing would ever correct a profile that has
+                    // gone stale. Have the fallback record the handlers it actually sees and ask
+                    // for a recompile once they turn out to be dispatchable.
+                    let reprofile = can_recompile
+                        && payload.profile.arm_reprofile_at(exit_state.insn_idx, args.len());
+
                     // The profiled block handler distribution. All the specializations below
                     // (IFUNC, inline-ISEQ, and polymorphic ISEQ dispatch) key off this summary.
                     let block_handler_summary = payload.profile.get_operand_types(exit_state.insn_idx).and_then(|types| {
@@ -10024,7 +10048,7 @@ fn add_iseq_to_hir(
                         }
 
                         let fallback_result = fun.push_insn(fallback_block, Insn::InvokeBlock {
-                            cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss,
+                            cd, args, state: exit_id, reason: InvokeBlockPolymorphicMiss, reprofile,
                         });
                         fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
 
@@ -10072,7 +10096,7 @@ fn add_iseq_to_hir(
                             fun.count(block, Counter::invokeblock_fallback_ifunc_miss);
                         }
                         let fallback_result = fun.push_insn(block, Insn::InvokeBlock {
-                            cd, args, state: exit_id, reason: InvokeBlockNotSpecialized,
+                            cd, args, state: exit_id, reason: InvokeBlockNotSpecialized, reprofile,
                         });
                         fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
 
@@ -10115,7 +10139,7 @@ fn add_iseq_to_hir(
                                 }
                             }
                         }
-                        fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
+                        fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason, reprofile })
                     };
                     state.stack_push(result);
                 }
