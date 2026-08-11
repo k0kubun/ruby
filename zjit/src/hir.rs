@@ -11488,6 +11488,7 @@ impl Insn {
             Insn::InvokeBlock { state, .. } => Always(*state),            // gen_invokeblock()
             Insn::InvokeBlockIfunc { state, .. } => Always(*state),       // gen_invokeblock_ifunc()
             Insn::InvokeProc { state, .. } => Always(*state),             // gen_invokeproc()
+            Insn::InvokeBlockSymbol { state, .. } => Always(*state),      // gen_invokeblock_symbol(): gen_prepare_non_leaf_call on the straight line
             // Spilled on the straight line of a hand-rolled frame push
             Insn::SendDirect(data) => Always(data.state),                 // gen_send_iseq_direct()
             Insn::PushInlineFrame { state, .. } => Always(*state),        // gen_push_inline_frame()
