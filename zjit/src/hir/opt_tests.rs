@@ -15563,13 +15563,14 @@ mod hir_opt_tests {
           v64:CUInt64 = LoadField v35, :RBASIC_FLAGS@0x1040
           v65:CUInt64[3145728] = Const CUInt64(3145728)
           v66:CInt64 = IntAnd v64, v65
-          v67:CInt64[1048576] = Const CInt64(1048576)
-          v68:CInt64 = GuardGreaterEq v66, v67
+          v67:CInt64 = StringCoderangeOrScan v35, v66
           PatchPoint NoEPEscape(test)
+          PatchPoint NoSingletonClass(String@0x1008)
           PatchPoint MethodRedefined(String@0x1008, <<@0x1041, cme:0x1048)
           v41:String = GuardType v13, String
+          v42:CUInt64 = LoadField v35, :RBASIC_FLAGS@0x1040
           v43:CUInt64 = LoadField v41, :RBASIC_FLAGS@0x1040
-          v44:StringExact = StringAppend v35, v41, recv_flags: v64, other_flags: v43
+          v44:StringExact = StringAppend v35, v41, recv_flags: v42, other_flags: v43
           CheckInterrupts
           Return v35
         ");
@@ -15756,13 +15757,12 @@ mod hir_opt_tests {
           v44:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1040
           v45:CUInt64[3145728] = Const CUInt64(3145728)
           v46:CInt64 = IntAnd v44, v45
-          v47:CInt64[1048576] = Const CInt64(1048576)
-          v48:CInt64 = GuardGreaterEq v46, v47
-          v49:CInt64[1048576] = Const CInt64(1048576)
-          v50:CBool = IsBitEqual v48, v49
-          v51:BoolExact = BoxBool v50
+          v47:CInt64 = StringCoderangeOrScan v23, v46
+          v48:CInt64[1048576] = Const CInt64(1048576)
+          v49:CBool = IsBitEqual v47, v48
+          v50:BoolExact = BoxBool v49
           CheckInterrupts
-          Return v51
+          Return v50
         ");
     }
 
