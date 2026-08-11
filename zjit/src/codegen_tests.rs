@@ -6118,6 +6118,30 @@ fn test_string_append_gc_stress() {
 }
 
 #[test]
+fn test_string_ascii_only_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.ascii_only?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    // A string built at runtime has an UNKNOWN coderange until something scans it, so this scans
+    // on a cold path rather than exiting.
+    assert_snapshot!(assert_compiles(r#"[test("abc#{1}"), test("é#{1}")]"#), @"[true, false]");
+}
+
+#[test]
+fn test_string_valid_encoding_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.valid_encoding?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    assert_snapshot!(assert_compiles(r#"
+        [test("abc#{1}"), test("é#{1}"), test("\xFF#{1}".b.force_encoding(Encoding::UTF_8))]
+    "#), @"[true, true, false]");
+}
+
+#[test]
 fn test_new_hash_nonempty() {
     eval(r#"
         def test
