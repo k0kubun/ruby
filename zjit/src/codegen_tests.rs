@@ -716,6 +716,161 @@ fn test_yield_cold_iseq_candidates_skip_dispatch_chain() {
 }
 
 #[test]
+fn test_yield_forwarded_proc_dispatches_directly() {
+    // A yield site reached by forwarding a Proc sees a different handler object every call, but
+    // the block ISEQ inside the Proc is stable, so the site dispatches directly on it.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def forward(b) = invoke(&b)
+        def run(n) = forward(proc { |x| x + n })
+        run(1); run(1)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("run(1)");
+    }
+    assert_snapshot!(assert_compiles("[run(1), run(2)]"), @"[11, 12]");
+}
+
+#[test]
+fn test_yield_forwarded_proc_reads_captured_locals() {
+    // The captured pointer for a Proc handler lives inside the Proc, not in the yielding frame,
+    // so the block must still see the environment it closed over -- here two frames up, through
+    // two levels of `&blk` forwarding.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def forward(b) = invoke(&b)
+        def forward2(b) = forward(b)
+        def run(n)
+          offset = n * 100
+          forward2(proc { |x| x + offset })
+        end
+        run(1); run(1)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("run(1)");
+    }
+    assert_snapshot!(assert_compiles("[run(1), run(3)]"), @"[110, 310]");
+}
+
+#[test]
+fn test_yield_forwarded_proc_self_is_captured_self() {
+    // The frame pushed for a Proc handler takes its self from the Proc's captured block, which is
+    // the self of whoever created the block -- not the receiver that is yielding.
+    set_call_threshold(2);
+    eval("
+        class Yielder
+          def run(b) = invoke(&b)
+          def invoke = yield(2)
+        end
+        class C
+          def initialize(v) = @v = v
+          def go(y) = y.run(proc { |x| @v * x })
+        end
+        Y = Yielder.new
+        C.new(21).go(Y); C.new(21).go(Y)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("C.new(21).go(Y)");
+    }
+    assert_snapshot!(assert_compiles("C.new(21).go(Y)"), @"42");
+}
+
+#[test]
+fn test_yield_forwarded_lambda_falls_back() {
+    // A lambda Proc yields with `arg_setup_method` argument semantics and a lambda frame flag, so
+    // it must not take the direct dispatch: too many arguments still has to raise ArgumentError
+    // rather than being silently truncated the way a block would be.
+    set_call_threshold(2);
+    eval("
+        def invoke2 = yield(10, 20)
+        def forward(b) = invoke2(&b)
+        LAM = ->(x) { x * 2 }
+        PR = proc { |x| x * 3 }
+        def call_it(b) = (forward(b) rescue $!.class)
+        call_it(PR); call_it(PR)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("call_it(PR)");
+    }
+    assert_snapshot!(assert_compiles("[call_it(PR), call_it(LAM)]"), @"[30, ArgumentError]");
+}
+
+#[test]
+fn test_yield_forwarded_proc_guard_miss_falls_back() {
+    // A Proc holding a block ISEQ the chain did not profile misses every guard and joins the
+    // generic fallback in-line, without a side exit or a recompile.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def forward(b) = invoke(&b)
+        PR = proc { |x| x + 1 }
+        OTHER = proc { |x| x * 5 }
+        forward(PR); forward(PR)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("forward(PR)");
+    }
+    assert_snapshot!(assert_compiles("[forward(PR), forward(OTHER), forward(:to_s.to_proc)]"), @r#"[11, 50, "10"]"#);
+}
+
+#[test]
+fn test_yield_forwarded_proc_break_is_orphan() {
+    // `break` in a Proc whose creating frame has already returned is an orphan break, and the
+    // guard chain must not turn that LocalJumpError into a silent return.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def forward(b) = invoke(&b)
+        PR = proc { |x| x + 1 }
+        BREAKER = proc { |x| break x * 2 }
+        def call_it(b) = (forward(b) rescue $!.class)
+        call_it(PR); call_it(PR)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("call_it(PR)");
+    }
+    assert_snapshot!(assert_compiles_allowing_exits("[call_it(PR), call_it(BREAKER)]"), @"[11, LocalJumpError]");
+}
+
+#[test]
+fn test_yield_forwarded_symbol_proc_falls_back() {
+    // `&:foo` becomes a symbol-backed Proc, which `vm_invoke_proc_block` re-dispatches into a
+    // method call instead of pushing a block frame, so it must stay on the generic fallback.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def forward(b) = invoke(&b)
+        SYM_PROC = :to_s.to_proc
+        forward(SYM_PROC); forward(SYM_PROC)
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("forward(SYM_PROC)");
+    }
+    assert_snapshot!(assert_compiles("forward(SYM_PROC)"), @r#""10""#);
+}
+
+#[test]
+fn test_proc_call_is_not_a_yield() {
+    // Proc#call goes through opt_call, not invokeblock, and must be unaffected.
+    set_call_threshold(2);
+    eval("
+        PR = proc { |x| x + 1 }
+        def run(b) = b.call(10)
+        run(PR); run(PR)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("run(PR)"), @"11");
+}
+
+#[test]
 fn test_yield_megamorphic_mixed_block_handlers() {
     // A yield site that sees ISEQ, proc, symbol, and ifunc handlers mixed together goes
     // megamorphic (each to_enum call profiles a distinct ifunc), so it compiles to the

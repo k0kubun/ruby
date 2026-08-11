@@ -168,6 +168,11 @@ unsafe extern "C" {
         arity: c_int,
     );
     pub fn rb_vm_objtostring(reg_cfp: CfpPtr, recv: VALUE, cd: *const rb_call_data) -> VALUE;
+
+    // Constants for recognizing a Proc object without calling into C. See jit.c.
+    pub fn rb_jit_proc_data_type_ptr() -> *const c_void;
+    pub fn rb_jit_rtypeddata_type_offset() -> c_int;
+    pub fn rb_jit_rtypeddata_data_offset() -> c_int;
 }
 
 // Renames

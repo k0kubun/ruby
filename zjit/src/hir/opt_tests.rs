@@ -4345,6 +4345,77 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_yield_forwarded_proc_dispatches_on_block_iseq() {
+        // A yield site reached by forwarding Procs cannot compare the handler itself, since a
+        // fresh Proc is allocated per capture. It proves the handler is a plain Proc holding an
+        // ISEQ block, then dispatches on that block ISEQ with the Proc's own captured block.
+        let result = eval("
+            def invoke = yield(10)
+            def forward(b) = invoke(&b)
+            def run(n) = forward(proc { |x| x + n })
+            8.times { run(1) }
+            run(5)
+        ");
+        assert_eq!(VALUE::fixnum_from_usize(15), result);
+        assert_snapshot!(hir_string("invoke"), @"
+        fn invoke@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          v10:Fixnum[10] = Const Value(10)
+          v12:CPtr = GetEP 0
+          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v15:CInt64[7] = Const CInt64(7)
+          v16:CInt64 = IntAnd v13, v15
+          v17:CInt64[0] = Const CInt64(0)
+          v18:CBool = IsBitEqual v16, v17
+          CondBranch v18, bb6(), bb5()
+        bb6():
+          v20:CInt64[0] = Const CInt64(0)
+          v21:CBool = IsBitNotEqual v13, v20
+          CondBranch v21, bb7(), bb5()
+        bb7():
+          v23:CPtr = LoadField v13, :rtypeddata_type@0x1001
+          v24:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
+          v25:CBool = IsBitEqual v23, v24
+          CondBranch v25, bb8(), bb5()
+        bb8():
+          v27:CPtr = LoadField v13, :rtypeddata_data@0x1003
+          v28:CUInt32 = LoadField v27, :block_type@0x1001
+          v29:CUInt32[0] = Const CUInt32(0)
+          v30:CBool = IsBitEqual v28, v29
+          CondBranch v30, bb9(), bb5()
+        bb9():
+          v32:CUInt8 = LoadField v27, :proc_flags@0x1003
+          v33:CUInt8[0] = Const CUInt8(0)
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb10(), bb5()
+        bb10():
+          v36:CPtr = LoadField v27, :code_iseq@0x1004
+          v37:CPtr[CPtr(0x1005)] = Const CPtr(0x1005)
+          v38:CBool = IsBitEqual v36, v37
+          CondBranch v38, bb11(), bb12()
+        bb11():
+          v40:BasicObject = InvokeBlockIseqDirect (0x1005), v27, v10
+          Jump bb4(v40)
+        bb12():
+          Jump bb5()
+        bb5():
+          v43:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: proc dispatch miss
+          Jump bb4(v43)
+        bb4(v14:BasicObject):
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
     fn test_yield_mixed_iseq_ifunc_profile_dispatches_on_iseqs() {
         // Like the above, but the non-ISEQ handler in the profile is an ifunc block
         // (Enumerator#each yields to the enumerator's C block). The ifunc handler fails

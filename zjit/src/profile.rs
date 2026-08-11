@@ -273,6 +273,10 @@ impl Flags {
     const IS_BLOCK_IFUNC: u32 = 1 << 5;
     /// Block handler is a Proc
     const IS_BLOCK_PROC: u32 = 1 << 6;
+    /// Block handler is a Proc that forwards to an ISEQ block with the same semantics a bare
+    /// ISEQ block handler would have, and `class` is that block ISEQ. See
+    /// [`ProfiledType::forwarded_block_iseq`].
+    const IS_BLOCK_PROC_ISEQ: u32 = 1 << 7;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -284,6 +288,7 @@ impl Flags {
     pub fn is_object_profiling(self) -> bool { (self.0 & Self::IS_OBJECT_PROFILING) != 0 }
     pub fn is_block_ifunc(self) -> bool { (self.0 & Self::IS_BLOCK_IFUNC) != 0 }
     pub fn is_block_proc(self) -> bool { (self.0 & Self::IS_BLOCK_PROC) != 0 }
+    pub fn is_block_proc_iseq(self) -> bool { (self.0 & Self::IS_BLOCK_PROC_ISEQ) != 0 }
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -315,7 +320,17 @@ impl PartialEq for ProfiledType {
             return self.flags.is_block_ifunc() && other.flags.is_block_ifunc();
         }
         if self.flags.is_block_proc() || other.flags.is_block_proc() {
-            return self.flags.is_block_proc() && other.flags.is_block_proc();
+            if !(self.flags.is_block_proc() && other.flags.is_block_proc()) {
+                return false;
+            }
+            // A Proc that just forwards an ISEQ block is the exception to the rule above: the Proc
+            // is fresh every call, but the block ISEQ inside it is stable and is what a yield site
+            // dispatches on, so those are compared by that ISEQ. Procs we cannot dispatch on
+            // (lambdas, symbol/ifunc/proc-wrapping procs) stay lumped together by kind.
+            if self.flags.is_block_proc_iseq() != other.flags.is_block_proc_iseq() {
+                return false;
+            }
+            return !self.flags.is_block_proc_iseq() || self.class == other.class;
         }
         self.class == other.class && self.shape == other.shape && self.flags == other.flags
     }
@@ -325,6 +340,38 @@ impl Default for ProfiledType {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// If `procval` is a Proc that a `yield` invokes exactly the way it invokes a bare ISEQ block
+/// handler, return its block ISEQ as a `VALUE`.
+///
+/// `vm_invoke_proc_block` does not simply unwrap the Proc: it overwrites the `is_lambda = false`
+/// that `vm_invokeblock_i` passes in with the Proc's own `is_lambda`, follows chains of Procs
+/// wrapping Procs, and re-dispatches on the Proc's block type, so the Proc may end up in
+/// `vm_invoke_ifunc_block` or `vm_invoke_symbol_block` instead of pushing a frame at all. Only a
+/// plain non-lambda Proc holding a `block_type_iseq` block reaches `vm_invoke_iseq_block` with the
+/// same `arg_setup_block` semantics and the same frame flags as a bare handler.
+///
+/// Every other `rb_proc_t` flag is required to be clear as well, so that the JIT can guard all of
+/// them with one compare against the whole bitfield: `is_refined` changes the pushed frame's cref,
+/// and `is_from_method` / `is_isolated` are rare enough that falling back costs nothing. Requiring
+/// the whole byte to be zero also keeps the guard conservative if a flag is ever added.
+fn forwarded_block_iseq(procval: VALUE) -> Option<VALUE> {
+    let proc_ptr = unsafe { rb_jit_get_proc_ptr(procval) };
+    if proc_ptr.is_null() {
+        return None;
+    }
+    let flag_bits = unsafe { *proc_ptr.cast::<u8>().byte_add(std::mem::offset_of!(rb_proc_t, _bitfield_1)) };
+    if flag_bits != 0 {
+        return None;
+    }
+    let block = unsafe { &(*proc_ptr).block };
+    if block.type_ != block_type_iseq {
+        return None;
+    }
+    let captured = unsafe { block.as_.captured.as_ref() };
+    let iseq = unsafe { *captured.code.iseq.as_ref() };
+    if iseq.is_null() { None } else { Some(VALUE(iseq as usize)) }
 }
 
 impl ProfiledType {
@@ -337,7 +384,9 @@ impl ProfiledType {
 
     /// Profile an untagged block handler (see `rb_vm_untag_block_handler`). ISEQ block handlers
     /// and symbols are recorded by identity because those objects are stable for a given block,
-    /// while IFUNC and Proc handlers are only recorded by kind (see [`PartialEq`] above).
+    /// while IFUNC handlers and Procs we cannot see through are only recorded by kind (see
+    /// [`PartialEq`] above). A Proc that forwards an ISEQ block records that block ISEQ, which is
+    /// stable even though the Proc itself is not.
     fn block_handler(obj: VALUE) -> Self {
         let mut ty = Self::object(obj);
         if !obj.special_const_p() {
@@ -345,9 +394,38 @@ impl ProfiledType {
                 ty.flags.0 |= Flags::IS_BLOCK_IFUNC;
             } else if unsafe { rb_obj_is_proc(obj).test() } {
                 ty.flags.0 |= Flags::IS_BLOCK_PROC;
+                if let Some(block_iseq) = forwarded_block_iseq(obj) {
+                    ty.class = block_iseq;
+                    ty.flags.0 |= Flags::IS_BLOCK_PROC_ISEQ;
+                }
             }
         }
         ty
+    }
+
+    /// The block ISEQ of a Proc block handler that a `yield` can dispatch exactly like a bare
+    /// ISEQ block handler, if this profiled such a Proc.
+    pub fn forwarded_block_iseq(&self) -> Option<IseqPtr> {
+        if self.flags.is_block_proc_iseq() { Some(self.class.as_iseq()) } else { None }
+    }
+
+    /// True if this profiled a Proc block handler.
+    pub fn is_block_proc(&self) -> bool {
+        self.flags.is_block_proc()
+    }
+
+    /// The block ISEQ of a *bare* ISEQ block handler, if this profiled one. Proc handlers whose
+    /// `class` is a block ISEQ are deliberately excluded: they are not tagged ISEQ handlers at
+    /// run time, so the tag-and-compare dispatch for bare handlers would always miss on them.
+    pub fn bare_block_iseq(&self) -> Option<IseqPtr> {
+        if self.flags.is_block_proc() || self.is_empty() {
+            return None;
+        }
+        if unsafe { rb_IMEMO_TYPE_P(self.class, imemo_iseq) == 1 } {
+            Some(self.class.as_iseq())
+        } else {
+            None
+        }
     }
 
     /// Profile the class and shape of the given object

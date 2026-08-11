@@ -609,6 +609,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Const { val: Const::Value(val) } => gen_const_value(val),
         &Insn::Const { val: Const::CPtr(val) } => gen_const_cptr(val),
         &Insn::Const { val: Const::CInt64(val) } => gen_const_long(val),
+        &Insn::Const { val: Const::CUInt8(val) } => gen_const_uint8(val),
         &Insn::Const { val: Const::CUInt16(val) } => gen_const_uint16(val),
         &Insn::Const { val: Const::CUInt32(val) } => gen_const_uint32(val),
         &Insn::Const { val: Const::CUInt64(val) } => Opnd::UImm(val),
@@ -1455,6 +1456,10 @@ fn gen_const_cptr(val: *const u8) -> lir::Opnd {
 
 fn gen_const_long(val: i64) -> lir::Opnd {
     Opnd::Imm(val)
+}
+
+fn gen_const_uint8(val: u8) -> lir::Opnd {
+    Opnd::UImm(val as u64)
 }
 
 fn gen_const_uint16(val: u16) -> lir::Opnd {

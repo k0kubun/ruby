@@ -295,6 +295,7 @@ make_counters! {
         send_fallback_cannot_send_direct,
         send_fallback_invokeblock_not_specialized,
         send_fallback_invokeblock_polymorphic_miss,
+        send_fallback_invokeblock_proc_miss,
         send_fallback_sendforward_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
@@ -462,6 +463,7 @@ make_counters! {
 
     invokeblock_handler_monomorphic_iseq,
     invokeblock_handler_monomorphic_ifunc,
+    invokeblock_handler_monomorphic_proc_iseq,
     invokeblock_handler_monomorphic_other,
     invokeblock_handler_polymorphic,
     invokeblock_handler_megamorphic,
@@ -710,6 +712,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SuperTargetComplexArgsPass                => send_fallback_super_target_complex_args_pass,
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
+        InvokeBlockProcMiss                       => send_fallback_invokeblock_proc_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,

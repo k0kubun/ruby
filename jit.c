@@ -229,6 +229,29 @@ rb_jit_get_proc_ptr(VALUE procv)
     return proc;
 }
 
+// A JIT that wants to recognize a Proc block handler cannot call rb_obj_is_proc: the
+// three accessors below let it inline the check as a single load and compare.
+// RTYPEDDATA(obj)->type holds the rb_data_type_t pointer with the "embedded" bit in bit 0,
+// and `proc` is not RUBY_TYPED_EMBEDDABLE, so an exact match against &ruby_proc_data_type
+// proves both that the object is a Proc and that its rb_proc_t hangs off `data`.
+const void *
+rb_jit_proc_data_type_ptr(void)
+{
+    return (const void *)&ruby_proc_data_type;
+}
+
+int
+rb_jit_rtypeddata_type_offset(void)
+{
+    return (int)offsetof(struct RTypedData, type);
+}
+
+int
+rb_jit_rtypeddata_data_offset(void)
+{
+    return (int)offsetof(struct RTypedData, data);
+}
+
 VALUE
 rb_optimized_call(VALUE recv, rb_execution_context_t *ec, int argc, VALUE *argv, int kw_splat, VALUE block_handler)
 {
