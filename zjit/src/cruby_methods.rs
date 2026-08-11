@@ -368,12 +368,9 @@ fn inline_array_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             let index = fun.coerce_to(block, index, types::Fixnum, state);
             let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
             let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: Box::new(SideExitReason::GuardLess), state });
-            let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-            use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
-            let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
+            // Out-of-range reads are nil in Ruby, not an error, so branch to nil instead of
+            // guarding the index and side-exiting.
+            let result = fun.push_insn(block, hir::Insn::ArrayArefOrNil { array: recv, index, length });
             return Some(result);
         }
     }
@@ -479,16 +476,11 @@ fn inline_string_getbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir
         let index = fun.coerce_to(block, index, types::Fixnum, state);
         let unboxed_index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
         let len = fun.load_string_length(block, recv);
-        // TODO(max): Find a way to mark these guards as not needed for correctness... as in, once
-        // the data dependency is gone (say, the StringGetbyte is elided), they can also be elided.
-        //
-        // This is unlike most other guards.
-        let unboxed_index = fun.push_insn(block, hir::Insn::GuardLess { left: unboxed_index, right: len, reason: Box::new(SideExitReason::GuardLess), state });
-        let unboxed_index = fun.push_insn(block, hir::Insn::AdjustBounds { index: unboxed_index, length: len });
-        let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-        use crate::hir::SideExitReason;
-        let _ = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: unboxed_index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
-        let result = fun.push_insn(block, hir::Insn::StringGetbyte { string: recv, index: unboxed_index });
+        // `getbyte` returns nil for an out-of-range index rather than raising, so branch to nil
+        // instead of guarding the index and side-exiting. Ragel-generated parsers (the mail and
+        // parser gems) read one byte past the end at the end of every parse, which used to abandon
+        // the rest of the method to the interpreter once per call.
+        let result = fun.push_insn(block, hir::Insn::StringGetbyteOrNil { string: recv, index: unboxed_index, length: len });
         return Some(result);
     }
     None

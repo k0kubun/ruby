@@ -628,6 +628,11 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
+        &Insn::ArrayArefOrNil { array, index, length } => {
+            let nonneg = function.type_of(index).known_nonnegative();
+            let (array, index, length) = (opnd!(array), opnd!(index), opnd!(length));
+            gen_bounds_checked_or_nil(jit, asm, index, length, nonneg, |asm, index| gen_array_aref(asm, array, index))
+        }
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
@@ -638,6 +643,11 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, function, *val, opnd!(val), *chilled, &function.frame_state(*state)),
         Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), &function.frame_state(*state)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
+        &Insn::StringGetbyteOrNil { string, index, length } => {
+            let nonneg = function.type_of(index).known_nonnegative();
+            let (string, index, length) = (opnd!(string), opnd!(index), opnd!(length));
+            gen_bounds_checked_or_nil(jit, asm, index, length, nonneg, |asm, index| gen_string_getbyte(asm, string, index))
+        }
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -2201,6 +2211,68 @@ fn gen_adjust_bounds(asm: &mut Assembler, index: Opnd, length: Opnd) -> lir::Opn
     let adjusted = asm.add(index, length);
     asm.test(index, index);
     asm.csel_l(adjusted, index)
+}
+
+/// Compile an element read whose out-of-range answer is nil (`String#getbyte`, `Array#[]`).
+///
+/// Emits the bounds test the guards used to emit, but branches to a nil-producing block instead of
+/// a side exit, and joins both paths in a block parameter:
+///
+/// ```text
+///     cmp index, length ; jge nil_block   # index >= length
+///     <adjust negative index> ; cmp index, 0 ; jl nil_block
+///     <read element> ; jmp join_block(element)
+///   nil_block:  jmp join_block(Qnil)
+///   join_block(result):
+/// ```
+///
+/// `index_nonnegative` skips the negative-index half of the check when the index type proves it.
+/// `gen_read` is handed the adjusted, in-range index.
+fn gen_bounds_checked_or_nil(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    index: Opnd,
+    length: Opnd,
+    index_nonnegative: bool,
+    gen_read: impl FnOnce(&mut Assembler, Opnd) -> lir::Opnd,
+) -> lir::Opnd {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+
+    // The nil path is cold, so keep it in its own block rather than passing Qnil along the guard
+    // edges, which would put a mov on the in-range path.
+    let nil_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let nil_edge = || Target::Block(Box::new(lir::BranchEdge { target: nil_block, args: vec![] }));
+    let join_edge = |val| Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![val] }));
+
+    let index = asm.load_mem(index);
+    let length = asm.load_mem(length);
+    asm.cmp(index, length);
+    asm.jge(jit, nil_edge());
+
+    let index = if index_nonnegative {
+        index
+    } else {
+        let adjusted = gen_adjust_bounds(asm, index, length);
+        asm.cmp(adjusted, 0.into());
+        asm.jl(jit, nil_edge());
+        adjusted
+    };
+    let result = gen_read(asm, index);
+    asm.jmp(join_edge(result));
+
+    asm.set_current_block(nil_block);
+    let nil_label = jit.get_label(asm, nil_block, hir_block_id);
+    asm.write_label(nil_label);
+    asm.jmp(join_edge(Qnil.into()));
+
+    asm.set_current_block(join_block);
+    let join_label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(join_label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 /// Compile array access (`array[index]`)
