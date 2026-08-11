@@ -14119,12 +14119,11 @@ mod hir_opt_tests {
           v44:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1040
           v45:CUInt64[3145728] = Const CUInt64(3145728)
           v46:CInt64 = IntAnd v44, v45
-          v47:CInt64[1048576] = Const CInt64(1048576)
-          v48:CInt64 = GuardGreaterEq v46, v47
-          v49:CInt64[1048576] = Const CInt64(1048576)
-          v50:CBool = IsBitEqual v48, v49
-          v51:BoolExact = BoxBool v50
-          Return v51
+          v47:CInt64 = StringCoderangeOrScan v23, v46
+          v48:CInt64[1048576] = Const CInt64(1048576)
+          v49:CBool = IsBitEqual v47, v48
+          v50:BoolExact = BoxBool v49
+          Return v50
         ");
     }
 
