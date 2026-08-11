@@ -10936,6 +10936,8 @@ impl Insn {
             Insn::InvokeBlock { state, .. } => Always(*state),            // gen_invokeblock()
             Insn::InvokeBlockIfunc { state, .. } => Always(*state),       // gen_invokeblock_ifunc()
             Insn::InvokeProc { state, .. } => Always(*state),             // gen_invokeproc()
+            Insn::ArrayAsetOrStore { state, .. } => Maybe(*state),        // gen_array_aset_or_store()
+            Insn::CheckArrayType { state, .. } => Maybe(*state),          // gen_check_array_type()
             // Spilled on the straight line of a hand-rolled frame push
             Insn::SendDirect(data) => Always(data.state),                 // gen_send_iseq_direct()
             Insn::PushInlineFrame { state, .. } => Always(*state),        // gen_push_inline_frame()

@@ -12615,23 +12615,9 @@ mod hir_opt_tests {
           v30:Fixnum = GuardType v10, Fixnum
           v31:CInt64 = UnboxFixnum v30
           v32:CInt64 = ArrayLength v29
-          v33:CInt64 = GuardLess v31, v32
-          v34:CInt64 = AdjustBounds v33, v32
-          v35:CInt64[0] = Const CInt64(0)
-          v36:CInt64 = GuardGreaterEq v34, v35
-          v37:BasicObject = ArrayAref v29, v36
+          v33:BasicObject = ArrayArefOrNil v29, v31, v32
           CheckInterrupts
-          Return v37
-          v25:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v24, Value(VALUE(0x1048))
-          v26:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v27:FalseClass = GuardBitEquals v26, Value(false)
-          v28:Array = GuardType v9, Array
-          v29:Fixnum = GuardType v10, Fixnum
-          v30:CInt64 = UnboxFixnum v29
-          v31:CInt64 = ArrayLength v28
-          v32:BasicObject = ArrayArefOrNil v28, v30, v31
-          CheckInterrupts
-          Return v32
+          Return v33
         ");
     }
 
