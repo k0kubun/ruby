@@ -65,6 +65,12 @@ struct JITState {
     /// and the inlined frame push write a JITFrame into the slot selected by the
     /// current frame's depth.
     jit_frame_size: usize,
+
+    /// The locals already written to their EP slots, as the (ISEQ, depth) of the frame
+    /// they belong to and the [`InsnId`] spilled into each local slot. Lets a later
+    /// spill of the same values in the same basic block skip the stores. Cleared at
+    /// every basic block start.
+    spilled_locals: Option<(IseqPtr, usize, Vec<InsnId>)>,
 }
 
 impl JITState {
@@ -77,7 +83,14 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
+            spilled_locals: None,
         }
+    }
+
+    /// Forget what we know about the frame's VM stack slots. Called at every basic
+    /// block boundary, where the predecessors' state is unknown.
+    fn reset_frame_caches(&mut self) {
+        self.spilled_locals = None;
     }
 
     /// Retrieve the output of a given instruction that has been compiled
@@ -437,6 +450,9 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             // Write a label to jump to the basic block
             let label = jit.get_label(&mut asm, lir_block_id, block_id);
             asm.write_label(label);
+
+            // Whatever the predecessors cached about the frame doesn't carry into this block.
+            jit.reset_frame_caches();
 
             let block = function.block(block_id);
             asm_comment!(
@@ -819,7 +835,7 @@ fn gen_get_ep(asm: &mut Assembler, level: u32) -> Opnd {
     ep_opnd
 }
 
-fn gen_defined(jit: &JITState, asm: &mut Assembler, function: &Function, op_type: defined_type, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
+fn gen_defined(jit: &mut JITState, asm: &mut Assembler, function: &Function, op_type: defined_type, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
     match op_type as defined_type {
         DEFINED_YIELD => {
             // `lep_level` was precomputed at HIR construction so we can materialize the local EP
@@ -923,7 +939,7 @@ fn gen_guard_greater_eq(jit: &mut JITState, asm: &mut Assembler, function: &Func
     left
 }
 
-fn gen_get_constant_path(jit: &JITState, asm: &mut Assembler, function: &Function, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
+fn gen_get_constant_path(jit: &mut JITState, asm: &mut Assembler, function: &Function, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
     unsafe extern "C" {
         fn rb_vm_opt_getconstant_path(ec: EcPtr, cfp: CfpPtr, ic: *const iseq_inline_constant_cache) -> VALUE;
     }
@@ -951,7 +967,7 @@ fn gen_fixnum_bit_check(asm: &mut Assembler, val: Opnd, index: u8) -> Opnd {
     asm.csel_z(Qtrue.into(), Qfalse.into())
 }
 
-fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
+fn gen_invokebuiltin(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
     // +2 for ec, self
     assert!(bf.argc + 2 <= C_ARG_OPNDS.len() as i32,
             "gen_invokebuiltin should not be called for builtin function {} with too many arguments: {}",
@@ -1263,7 +1279,7 @@ fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, function: &Function, r
 }
 
 /// Emit a special object lookup
-fn gen_putspecialobject(jit: &JITState, asm: &mut Assembler, function: &Function, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
+fn gen_putspecialobject(jit: &mut JITState, asm: &mut Assembler, function: &Function, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
     // rb_vm_get_special_object for CBASE/CONST_BASE can call rb_singleton_class,
     // which allocates (may trigger GC) and can raise TypeError on non-class
     // receivers (e.g. `123.instance_eval { Const = 1 }`). Treat as non-leaf so
@@ -1357,7 +1373,7 @@ fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE)
     asm_ccall!(asm, rb_zjit_defined_ivar, self_val, id.0.into(), Opnd::Value(pushval))
 }
 
-fn gen_checkmatch(jit: &JITState, asm: &mut Assembler, function: &Function, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
+fn gen_checkmatch(jit: &mut JITState, asm: &mut Assembler, function: &Function, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
     // rb_vm_check_match is not leaf unless flag is VM_CHECKMATCH_TYPE_WHEN.
     // See also: leafness_of_checkmatch() and check_match()
     if flag != VM_CHECKMATCH_TYPE_WHEN {
@@ -2267,7 +2283,7 @@ fn gen_array_ptr(asm: &mut Assembler, array: Opnd) -> lir::Opnd {
 
 /// Compile opt_newarray_hash - create a hash from array elements
 fn gen_opt_newarray_hash(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2295,7 +2311,7 @@ fn gen_opt_newarray_hash(
 
 /// Compile ArrayMax - find the maximum element among array elements
 fn gen_array_max(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2322,7 +2338,7 @@ fn gen_array_max(
 
 /// Find the minimum element among array elements
 fn gen_array_min(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2348,7 +2364,7 @@ fn gen_array_min(
 }
 
 fn gen_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2376,7 +2392,7 @@ fn gen_array_include(
 }
 
 fn gen_array_pack_buffer(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2409,7 +2425,7 @@ fn gen_array_pack_buffer(
 }
 
 fn gen_dup_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     ary: VALUE,
@@ -2619,7 +2635,7 @@ fn gen_new_range_fixnum(
         })
 }
 
-fn gen_object_alloc(jit: &JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
+fn gen_object_alloc(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
     // Allocating an object from an unknown class is non-leaf; see doc for `ObjectAlloc`.
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_obj_alloc, val)
@@ -3354,13 +3370,28 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
 }
 
 /// Spill locals onto the stack.
-fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Avoid spilling locals that have been spilled before and not changed.
+fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
-    for (idx, &insn_id) in state.locals().enumerate() {
+
+    // Skip the stores whose slots already hold the very same values. HIR gives a local a
+    // fresh InsnId whenever anything could have changed it -- a call that can write it
+    // through the EP chain drops the locals from the frame state -- so matching InsnIds
+    // mean the slot the previous spill wrote is still current.
+    let locals: Vec<InsnId> = state.locals().copied().collect();
+    // Frame states for different frames can map to different slots, so only reuse the
+    // record when it belongs to the frame we're spilling now.
+    let spilled = match jit.spilled_locals.take() {
+        Some((iseq, depth, spilled)) if iseq == state.iseq && depth == state.depth => Some(spilled),
+        _ => None,
+    };
+    for (idx, &insn_id) in locals.iter().enumerate() {
+        if spilled.as_ref().and_then(|spilled| spilled.get(idx)) == Some(&insn_id) {
+            continue;
+        }
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
+    jit.spilled_locals = Some((state.iseq, state.depth, locals));
 }
 
 /// Spill the virtual stack onto the stack.
@@ -3389,7 +3420,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
 /// Direct JIT-to-JIT calls keep cfp->sp lazy, so this must publish SP before
 /// writing stack slots. Otherwise spilling the stack can overwrite frame
 /// metadata below the real VM-stack base.
-fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
+fn gen_prepare_fallback_call(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, state.stack_size());
     gen_spill_locals(jit, asm, state);
@@ -3430,7 +3461,7 @@ fn inline_frame_stack_gap(iseq: IseqPtr) -> usize {
 
 /// Prepare for calling a C function that may call an arbitrary method.
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
-fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
+fn gen_prepare_non_leaf_call(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots

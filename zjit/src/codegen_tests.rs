@@ -5790,6 +5790,56 @@ fn test_shared_patch_site_invalidated_twice() {
     "), @"[1, 99]");
 }
 
+// A run of calls in one basic block spills the frame's locals only once, so a Binding
+// materialized by a later callee must still see the values from the first spill.
+#[test]
+fn test_binding_sees_locals_spilled_by_an_earlier_call() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          y = 2
+          [].each { }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), b.local_variable_get(:y), x + y]
+        end
+        test; test
+        test
+    "), @"[1, 2, 3]");
+}
+
+// Same, but a local is reassigned between the calls, so its slot has to be rewritten.
+#[test]
+fn test_binding_sees_locals_reassigned_between_calls() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [].each { }
+          x = 5
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[5, 5]");
+}
+
+// Same, but the local is written by a block through the EP chain during a call.
+#[test]
+fn test_binding_sees_locals_written_through_the_ep_chain() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [1].each { x = 7 }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[7, 7]");
+}
+
 // Same idea for the patch points a constant lookup emits, which also share a site.
 #[test]
 fn test_shared_patch_site_for_constant_invalidated_twice() {
