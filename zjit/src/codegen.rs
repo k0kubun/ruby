@@ -66,6 +66,12 @@ struct JITState {
     /// current frame's depth.
     jit_frame_size: usize,
 
+    /// `VM_CFP_TO_CAPTURED_BLOCK(cfp)`, which only depends on the CFP register, kept
+    /// around so that a run of sends with a block in one basic block computes it once.
+    /// Holds the `Assembler::cfp_generation()` it was computed at: a write to the CFP
+    /// register (a direct JIT-to-JIT call, for instance) makes it stale.
+    block_handler_specval: Option<(u64, Opnd)>,
+
     /// The locals already written to their EP slots, as the (ISEQ, depth) of the frame
     /// they belong to and the [`InsnId`] spilled into each local slot. Lets a later
     /// spill of the same values in the same basic block skip the stores. Cleared at
@@ -83,13 +89,15 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
+            block_handler_specval: None,
             spilled_locals: None,
         }
     }
 
-    /// Forget what we know about the frame's VM stack slots. Called at every basic
-    /// block boundary, where the predecessors' state is unknown.
+    /// Forget what we know about the frame's registers and VM stack slots. Called at
+    /// every basic block boundary, where the predecessors' state is unknown.
     fn reset_frame_caches(&mut self) {
+        self.block_handler_specval = None;
         self.spilled_locals = None;
     }
 
@@ -1087,7 +1095,7 @@ fn gen_ccall_with_frame(
     let recv = gen_materialize_value(asm, recv);
 
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
-        gen_block_handler_specval(asm, block_iseq)
+        gen_block_handler_specval(jit, asm, block_iseq)
     } else {
         VM_BLOCK_HANDLER_NONE.into()
     };
@@ -1141,10 +1149,19 @@ fn gen_materialize_value(asm: &mut Assembler, opnd: Opnd) -> Opnd {
 // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
 // VM_CFP_TO_CAPTURED_BLOCK then turns &cfp->self into a block handler.
 // rb_captured_block->code.iseq aliases with cfp->block_code.
-fn gen_block_handler_specval(asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Opnd {
+fn gen_block_handler_specval(jit: &mut JITState, asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Opnd {
     asm.store(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), VALUE::from(blockiseq).into());
+    // The handler is just `&cfp->self | 1`, the same value for every block this frame
+    // passes, so reuse it until something writes the CFP register.
+    if let Some((generation, specval)) = jit.block_handler_specval {
+        if generation == asm.cfp_generation() {
+            return specval;
+        }
+    }
     let cfp_self_addr = asm.lea(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_SELF));
-    asm.or(cfp_self_addr, Opnd::Imm(1))
+    let specval = asm.or(cfp_self_addr, Opnd::Imm(1));
+    jit.block_handler_specval = Some((asm.cfp_generation(), specval));
+    specval
 }
 
 /// Generate code for a variadic C function call
@@ -1185,7 +1202,7 @@ fn gen_ccall_variadic(
     let recv = gen_materialize_value(asm, recv);
 
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
-        gen_block_handler_specval(asm, blockiseq)
+        gen_block_handler_specval(jit, asm, blockiseq)
     } else {
         VM_BLOCK_HANDLER_NONE.into()
     };
@@ -1625,7 +1642,7 @@ fn gen_push_inline_frame(
     // The HIR specialization guards ensure we will only reach here for literal blocks,
     // not &block forwarding, &:foo, etc. These are rejected in `type_specialize` by
     // `unspecializable_call_type`.
-    let block_handler = blockiseq.map(|b| gen_block_handler_specval(asm, b));
+    let block_handler = blockiseq.map(|b| gen_block_handler_specval(jit, asm, b));
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
@@ -1765,7 +1782,7 @@ fn gen_send_iseq_direct(
     // The HIR specialization guards ensure we will only reach here for literal blocks,
     // not &block forwarding, &:foo, etc. Thise are rejected in `type_specialize` by
     // `unspecializable_call_type`.
-    let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
+    let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(jit, asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 

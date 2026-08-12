@@ -5840,6 +5840,23 @@ fn test_binding_sees_locals_written_through_the_ep_chain() {
     "), @"[7, 7]");
 }
 
+// Consecutive calls reuse the block handler derived from CFP, but each has to install
+// its own block ISEQ in cfp->block_code.
+#[test]
+fn test_consecutive_calls_pass_their_own_blocks() {
+    assert_snapshot!(inspect("
+        def test
+          result = []
+          [1, 2].each { |v| result << v }
+          [3].each { |v| result << v * 10 }
+          [4].each { |v| result << v + 100 }
+          result
+        end
+        test; test
+        test
+    "), @"[1, 2, 30, 104]");
+}
+
 // Same idea for the patch points a constant lookup emits, which also share a site.
 #[test]
 fn test_shared_patch_site_for_constant_invalidated_twice() {

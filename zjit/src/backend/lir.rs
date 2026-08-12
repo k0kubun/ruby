@@ -1808,6 +1808,9 @@ pub struct Assembler {
     /// is in a saved register or an allocator spill slot.
     stack_map: Option<StackMap>,
 
+    /// Bumped every time an instruction writes the CFP register. Codegen uses this
+    /// to tell whether a value it derived from CFP earlier is still valid.
+    cfp_generation: u64,
 }
 
 impl Assembler
@@ -1824,6 +1827,7 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
             stack_map: None,
+            cfp_generation: 0,
         }
     }
 
@@ -2139,7 +2143,20 @@ impl Assembler
 
         self.idx += 1;
 
+        // Track writes to the CFP register so that codegen can cache values derived
+        // from it (see JITState::block_handler_specval).
+        if let Some(&out) = insn.out_opnd() {
+            if Self::has_reg(out, crate::backend::current::CFP.unwrap_reg()) {
+                self.cfp_generation += 1;
+            }
+        }
+
         self.current_block().push_insn(insn);
+    }
+
+    /// A counter that changes whenever the CFP register is written.
+    pub fn cfp_generation(&self) -> u64 {
+        self.cfp_generation
     }
 
 
