@@ -7676,8 +7676,7 @@ mod hir_opt_tests {
         bb3(v11:BasicObject, v12:BasicObject):
           v31:NilClass = Const Value(nil)
           v17:ArrayExact = NewArray
-          v23:ArrayExact = ToArray v17
-          v25:BasicObject = Send v12, :call, v23 # SendFallbackReason: Complex argument passing
+          v25:BasicObject = Send v12, :call, v17 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v25
         ");
@@ -15105,8 +15104,7 @@ mod hir_opt_tests {
         bb3(v8:BasicObject):
           v70:NilClass = Const Value(nil)
           v13:ArrayExact = NewArray
-          v19:ArrayExact = ToArray v13
-          v49:CInt64 = ArrayLength v19
+          v49:CInt64 = ArrayLength v13
           v50:CInt64[0] = GuardBitEquals v49, CInt64(0) recompile
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v52:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
@@ -15117,11 +15115,9 @@ mod hir_opt_tests {
           v25:StringExact[VALUE(0x1088)] = Const Value(VALUE(0x1088))
           v26:StringExact = StringCopy v25
           PatchPoint NoEPEscape(test)
-          v31:ArrayExact = ToArray v13
-          v33:BasicObject = Send v26, :display, v31 # SendFallbackReason: Complex argument passing
+          v33:BasicObject = Send v26, :display, v13 # SendFallbackReason: Complex argument passing
           PatchPoint NoEPEscape(test)
-          v41:ArrayExact = ToArray v13
-          v43:BasicObject = Send v52, :itself, v41 # SendFallbackReason: Complex argument passing
+          v43:BasicObject = Send v52, :itself, v13 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v43
         ");
@@ -15155,7 +15151,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter caller_splat_profile_monomorphic
           v32:CInt64 = ArrayLength v21
@@ -15205,7 +15201,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v24:CInt64 = ArrayLength v16
           v25:CInt64[1] = GuardBitEquals v24, CInt64(1) recompile
           v26:CInt64 = CCall v16, :rb_jit_ruby2_keywords_splat_p@0x1001
@@ -15257,7 +15253,7 @@ mod hir_opt_tests {
           v9:BasicObject = LoadArg :args@2
           Jump bb3(v7, v8, v9)
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:ArrayExact = ToArray v13
+          v19:ArrayExact = GuardType v13, ArrayExact recompile
           v22:CBool = HasType v12, ObjectSubclass[class_exact:CallerSplatA]
           CondBranch v22, bb5(), bb6()
         bb5():
@@ -15324,7 +15320,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v24:CInt64 = ArrayLength v16
           v25:CInt64[0] = GuardBitEquals v24, CInt64(0) recompile
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
@@ -15360,7 +15356,7 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
           v15:Fixnum[1] = Const Value(1)
-          v18:ArrayExact = ToArray v10
+          v18:ArrayExact = GuardType v10, ArrayExact recompile
           v26:CInt64 = ArrayLength v18
           v27:CInt64[2] = GuardBitEquals v26, CInt64(2) recompile
           v28:CInt64 = CCall v18, :rb_jit_ruby2_keywords_splat_p@0x1001
@@ -15401,7 +15397,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v24:CInt64 = ArrayLength v16
           v25:CInt64[7] = GuardBitEquals v24, CInt64(7) recompile
           v26:CInt64 = CCall v16, :rb_jit_ruby2_keywords_splat_p@0x1001
@@ -15457,7 +15453,7 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
           v15:Fixnum[1] = Const Value(1)
-          v18:ArrayExact = ToArray v10
+          v18:ArrayExact = GuardType v10, ArrayExact recompile
           v26:CInt64 = ArrayLength v18
           v27:CInt64[3] = GuardBitEquals v26, CInt64(3) recompile
           v28:CInt64 = CCall v18, :rb_jit_ruby2_keywords_splat_p@0x1001
@@ -15509,7 +15505,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           v24:HashExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
           IncrCounter zjit_insn_count
@@ -15545,7 +15541,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v26:CInt64 = ArrayLength v16
           v27:CInt64[3] = GuardBitEquals v26, CInt64(3) recompile
           v28:CInt64 = CCall v16, :rb_jit_ruby2_keywords_splat_p@0x1001
@@ -15604,7 +15600,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter caller_splat_profile_monomorphic
           IncrCounter send_direct_fallback_context_send
@@ -15645,7 +15641,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter caller_splat_profile_polymorphic
           IncrCounter complex_arg_pass_caller_splat
@@ -15702,7 +15698,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter caller_splat_profile_skewed_polymorphic
           IncrCounter complex_arg_pass_caller_splat
@@ -15745,7 +15741,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v21:ArrayExact = ToArray v12
+          v21:ArrayExact = GuardType v12, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter caller_splat_profile_polymorphic
           IncrCounter complex_arg_pass_caller_splat
@@ -15788,7 +15784,7 @@ mod hir_opt_tests {
           PatchPoint NoEPEscape(test)
           v23:NilClass = Const Value(nil)
           v26:StaticSymbol[:value] = Const Value(VALUE(0x1008))
-          v30:ArrayExact = ToArray v12
+          v30:ArrayExact = GuardType v12, ArrayExact recompile
           v43:CInt64 = ArrayLength v30
           v44:CInt64[1] = GuardBitEquals v43, CInt64(1) recompile
           v45:CInt64 = CCall v30, :rb_jit_ruby2_keywords_splat_p@0x1010
@@ -17496,7 +17492,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v18:BasicObject = Send v9, :forwardable, v16 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v18
@@ -18721,7 +18717,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :x@1
           Jump bb3(v6, v7)
         bb3(v9:HeapBasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v18:BasicObject = InvokeSuper v9, 0x1008, v16 # SendFallbackReason: super: complex argument passing to `super` call
           CheckInterrupts
           Return v18

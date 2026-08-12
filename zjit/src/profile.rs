@@ -111,6 +111,7 @@ fn profile_insn_sample(
             profile_operands_below_top(profiler, profile, argc + 2);
             profile_forwarded_callinfo(profiler, profile);
         }
+        YARVINSN_splatarray => profile_operands(profiler, profile, 1),
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
         _ => return false,
     }
