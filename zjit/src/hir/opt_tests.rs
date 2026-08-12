@@ -20926,7 +20926,7 @@ mod hir_opt_tests {
           v8:BasicObject = LoadArg :x@1
           Jump bb3(v7, v8)
         bb3(v11:HeapBasicObject, v12:BasicObject):
-          v74:NilClass = Const Value(nil)
+          v76:NilClass = Const Value(nil)
           v17:Fixnum[1] = Const Value(1)
           PatchPoint SingleRactorMode
           v21:CShape = LoadField v11, :shape_id@0x1001
@@ -20942,32 +20942,34 @@ mod hir_opt_tests {
           CondBranch v29, bb7(), bb8()
         bb7():
           StoreField v11, :@a@0x1003, v17
-          v35:CShape[0x1002] = Const CShape(0x1002)
-          StoreField v11, :shape_id@0x1001, v35
+          v36:CShape[0x1002] = Const CShape(0x1002)
+          StoreField v11, :shape_id@0x1001, v36
           Jump bb4()
         bb8():
+          IvarReprofile v11
           SetIvar v11, :@a, v17
           Jump bb4()
         bb4():
           PatchPoint NoEPEscape(f)
-          v44:Fixnum[1] = Const Value(1)
+          v45:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v72:Fixnum = GuardType v12, Fixnum recompile
-          v73:Fixnum = FixnumAdd v72, v44
+          v74:Fixnum = GuardType v12, Fixnum recompile
+          v75:Fixnum = FixnumAdd v74, v45
           PatchPoint SingleRactorMode
-          v55:CShape = LoadField v11, :shape_id@0x1001
-          v56:CShape[0x1002] = Const CShape(0x1002)
-          v57:CBool = IsBitEqual v55, v56
-          CondBranch v57, bb10(), bb11()
+          v56:CShape = LoadField v11, :shape_id@0x1001
+          v57:CShape[0x1002] = Const CShape(0x1002)
+          v58:CBool = IsBitEqual v56, v57
+          CondBranch v58, bb10(), bb11()
         bb10():
-          StoreField v11, :@a@0x1003, v73
+          StoreField v11, :@a@0x1003, v75
           Jump bb9()
         bb11():
-          SetIvar v11, :@a, v73
+          IvarReprofile v11
+          SetIvar v11, :@a, v75
           Jump bb9()
         bb9():
           CheckInterrupts
-          Return v73
+          Return v75
 
         fn f@<compiled>:4:
         bb1():
@@ -20982,7 +20984,7 @@ mod hir_opt_tests {
           v8:BasicObject = LoadArg :x@1
           Jump bb3(v7, v8)
         bb3(v11:HeapBasicObject, v12:BasicObject):
-          v90:NilClass = Const Value(nil)
+          v92:NilClass = Const Value(nil)
           v17:Fixnum[1] = Const Value(1)
           PatchPoint SingleRactorMode
           v21:CShape = LoadField v11, :shape_id@0x1001
@@ -20998,49 +21000,51 @@ mod hir_opt_tests {
           CondBranch v29, bb7(), bb8()
         bb7():
           StoreField v11, :@a@0x1003, v17
-          v35:CShape[0x1002] = Const CShape(0x1002)
-          StoreField v11, :shape_id@0x1001, v35
+          v36:CShape[0x1002] = Const CShape(0x1002)
+          StoreField v11, :shape_id@0x1001, v36
           Jump bb4()
         bb8():
+          IvarReprofile v11
           SetIvar v11, :@a, v17
           Jump bb4()
         bb4():
           PatchPoint NoEPEscape(f)
-          v44:Fixnum[1] = Const Value(1)
-          v48:CBool = HasType v12, Fixnum
-          CondBranch v48, bb10(), bb11()
+          v45:Fixnum[1] = Const Value(1)
+          v49:CBool = HasType v12, Fixnum
+          CondBranch v49, bb10(), bb11()
         bb10():
-          v51:Fixnum = RefineType v12, Fixnum
+          v52:Fixnum = RefineType v12, Fixnum
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v86:Fixnum = FixnumAdd v51, v44
-          Jump bb9(v86)
+          v88:Fixnum = FixnumAdd v52, v45
+          Jump bb9(v88)
         bb11():
-          v54:CBool = HasType v12, Flonum
-          CondBranch v54, bb12(), bb13()
+          v55:CBool = HasType v12, Flonum
+          CondBranch v55, bb12(), bb13()
         bb12():
-          v57:Flonum = RefineType v12, Flonum
+          v58:Flonum = RefineType v12, Flonum
           PatchPoint MethodRedefined(Float@0x1040, +@0x1010, cme:0x1048)
-          v89:Float = FloatAdd v57, v44
-          Jump bb9(v89)
+          v91:Float = FloatAdd v58, v45
+          Jump bb9(v91)
         bb13():
-          v60:BasicObject = Send v12, :+, v44 # SendFallbackReason: Send: polymorphic call site
-          Jump bb9(v60)
-        bb9(v47:BasicObject):
+          v61:BasicObject = Send v12, :+, v45 # SendFallbackReason: Send: polymorphic call site
+          Jump bb9(v61)
+        bb9(v48:BasicObject):
           PatchPoint SingleRactorMode
-          v69:CShape = LoadField v11, :shape_id@0x1001
-          v70:CShape[0x1002] = Const CShape(0x1002)
-          v71:CBool = IsBitEqual v69, v70
-          CondBranch v71, bb15(), bb16()
+          v70:CShape = LoadField v11, :shape_id@0x1001
+          v71:CShape[0x1002] = Const CShape(0x1002)
+          v72:CBool = IsBitEqual v70, v71
+          CondBranch v72, bb15(), bb16()
         bb15():
-          StoreField v11, :@a@0x1003, v47
-          WriteBarrier v11, v47
+          StoreField v11, :@a@0x1003, v48
+          WriteBarrier v11, v48
           Jump bb14()
         bb16():
-          SetIvar v11, :@a, v47
+          IvarReprofile v11
+          SetIvar v11, :@a, v48
           Jump bb14()
         bb14():
           CheckInterrupts
-          Return v47
+          Return v48
         ");
     }
 
