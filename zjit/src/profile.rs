@@ -102,6 +102,7 @@ fn profile_insn_sample(
             profile_operands(profiler, profile, argc + 1);
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
         }
+        YARVINSN_splatarray => profile_operands(profiler, profile, 1),
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
         _ => return false,
     }
