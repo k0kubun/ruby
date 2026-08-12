@@ -1229,12 +1229,19 @@ pub enum Insn {
     SendDirect(Box<SendDirectData>),
 
     /// Push a lighter weight frame used for inlined methods.
+    ///
+    /// When `captured` is `Some`, this pushes a *block* frame for an inlined block ISEQ
+    /// instead of a method frame: `cme` is null, the frame type is `VM_FRAME_MAGIC_BLOCK`,
+    /// and the specval is `VM_GUARDED_PREV_EP(captured->ep)`. `recv` is then the block's
+    /// self, which is `captured->self`.
     PushInlineFrame {
         iseq: IseqPtr,
         cme: *const rb_callable_method_entry_t,
         recv: InsnId,
         num_args: u16,
         blockiseq: Option<IseqPtr>,
+        /// Guarded `struct rb_captured_block *` when this frame is an inlined block.
+        captured: Option<InsnId>,
         state: InsnId,
     },
 
@@ -1257,8 +1264,14 @@ pub enum Insn {
 
     /// Set up frame. Remember the address as the JIT entry for the insn_idx in `jit_entry_insns()[jit_entry_idx]`.
     EntryPoint { jit_entry_idx: Option<usize> },
-    /// Control flow instructions
-    Return { val: InsnId },
+    /// Control flow instructions.
+    ///
+    /// `pop_inlined_frames` is the number of inlined callee frames that are still on
+    /// the CFP stack when this returns, on top of the compiled function's own frame.
+    /// It is zero for an ordinary `leave` and non-zero only for a non-local `return`
+    /// out of an inlined block, which returns from the compiled function while the
+    /// inlined frames between it and the block are still pushed.
+    Return { val: InsnId, pop_inlined_frames: u32 },
     /// Non-local control flow. See the throw YARV instruction
     Throw { throw_state: u32, val: InsnId, state: InsnId },
 
@@ -1446,7 +1459,7 @@ macro_rules! for_each_operand_impl {
             Insn::RefineType { val, .. }
             | Insn::HasType { val, .. }
             | Insn::HasAncestor { val, .. }
-            | Insn::Return { val }
+            | Insn::Return { val, .. }
             | Insn::Test { val }
             | Insn::BoxBool { val } => {
                 $visit_one!(*val);
@@ -1575,8 +1588,11 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(args);
                 $visit_one!(*state);
             }
-            Insn::PushInlineFrame { recv, state, .. } => {
+            Insn::PushInlineFrame { recv, captured, state, .. } => {
                 $visit_one!(*recv);
+                if let Some(captured) = captured {
+                    $visit_one!(*captured);
+                }
                 $visit_one!(*state);
             }
             // SendDirect/CCallWithFrame/CCallVariadic carry their operands behind a Box,
@@ -2199,9 +2215,14 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 write_separated!(f, ", ", ", ", args);
                 Ok(())
             }
-            Insn::PushInlineFrame { recv, iseq, cme, num_args, .. } => {
+            Insn::PushInlineFrame { recv, iseq, cme, num_args, captured: None, .. } => {
                 let method_name = unsafe { (**cme).called_id };
                 write!(f, "PushInlineFrame :{method_name}, {recv} ({:?})", self.ptr_map.map_ptr(*iseq))?;
+                write!(f, ", num_args={num_args}")?;
+                Ok(())
+            }
+            Insn::PushInlineFrame { recv, iseq, num_args, captured: Some(captured), .. } => {
+                write!(f, "PushInlineBlockFrame ({:?}), {recv}, {captured}", self.ptr_map.map_ptr(*iseq))?;
                 write!(f, ", num_args={num_args}")?;
                 Ok(())
             }
@@ -2277,7 +2298,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             &Insn::EntryPoint { jit_entry_idx: Some(idx) } => write!(f, "EntryPoint JIT({idx})"),
             &Insn::EntryPoint { jit_entry_idx: None } => write!(f, "EntryPoint interpreter"),
-            Insn::Return { val } => { write!(f, "Return {val}") }
+            Insn::Return { val, pop_inlined_frames: 0 } => { write!(f, "Return {val}") }
+            Insn::Return { val, pop_inlined_frames } => { write!(f, "Return {val} (pop {pop_inlined_frames} inlined frames)") }
             Insn::FixnumAdd  { left, right, .. } => { write!(f, "FixnumAdd {left}, {right}") },
             Insn::FixnumSub  { left, right, .. } => { write!(f, "FixnumSub {left}, {right}") },
             Insn::FixnumMult { left, right, .. } => { write!(f, "FixnumMult {left}, {right}") },
@@ -3287,6 +3309,10 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     Ok(())
 }
 
+unsafe extern "C" {
+    fn rb_jit_iseq_has_ensure_catch_entry(iseq: IseqPtr) -> bool;
+}
+
 /// True if every `throw` in the ISEQ is a plain non-local `return` (`TAG_RETURN` with no
 /// extra flags), and there is at least one of them.
 fn block_iseq_throws_only_return(iseq: IseqPtr) -> bool {
@@ -3309,6 +3335,161 @@ fn block_iseq_throws_only_return(iseq: IseqPtr) -> bool {
     }
 
     saw_throw
+}
+
+/// True if a `yield` to `block_iseq` can be compiled by inlining the block's body into the
+/// yielding frame *and* rewriting the block's non-local `return` into a plain return of the
+/// compiled function.
+///
+/// This only pays off, and is only sound, in a narrow shape:
+///
+/// * The block must be a literal block of `owner_iseq`, the frame ZJIT is compiling, so that
+///   `return` inside it unwinds to exactly the frame the compiled function returns from. The
+///   caller establishes that; here we only check `owner_iseq` is a method, because a `return`
+///   inside a block nested in another block escapes to the enclosing *method*, not to the
+///   block frame we would be returning from.
+/// * Every `throw` must be `TAG_RETURN`. `break`, `retry`, and `redo` unwind to frames we
+///   would still have to find at runtime.
+/// * None of the frames the `return` unwinds through may have an `ensure`.
+///   `vm_exec_handle_exception` runs their CATCH_TYPE_ENSURE entries while unwinding; a
+///   plain return cannot. `yield_iseq` is the frame containing the `yield` (an inlined
+///   callee) and `owner_iseq` is where the unwinding stops. Only `ensure` matters: a
+///   `TAG_RETURN` unwind consults no other catch type.
+fn block_return_inlinable(block_iseq: IseqPtr, yield_iseq: IseqPtr, owner_iseq: IseqPtr) -> bool {
+    if unsafe { rb_get_iseq_body_type(owner_iseq) } != ISEQ_TYPE_METHOD {
+        return false;
+    }
+    if !block_iseq_throws_only_return(block_iseq) {
+        return false;
+    }
+    for iseq in [block_iseq, yield_iseq, owner_iseq] {
+        if unsafe { rb_jit_iseq_has_ensure_catch_entry(iseq) } {
+            return false;
+        }
+    }
+    // The inlined body is emitted into the caller, so apply the same eligibility and size
+    // limits the method inliner uses.
+    if !Function::can_inline(block_iseq) {
+        return false;
+    }
+    let threshold = get_option!(inline_threshold);
+    if threshold == 0 || unsafe { get_iseq_encoded_size(block_iseq) } as usize > threshold {
+        return false;
+    }
+    true
+}
+
+/// Emit an inlined copy of `block_iseq`'s body in place of a `yield` to it, and return the
+/// SSA value holding the block's result. `block` is advanced to the continuation the inlined
+/// body returns to, the way the polymorphic dispatch below advances it to a join block.
+///
+/// This mirrors [`Function::inline_methods`] for a block frame instead of a method frame:
+/// the callee body's entry params are aliased to this frame's values, a real block frame is
+/// pushed so side exits and frame walks see a well-formed CFP chain, and the body's `leave`
+/// paths jump to the continuation, which pops the frame back off.
+///
+/// Returns `None` without touching `fun` if the block body fails to translate.
+fn inline_block_at_yield(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    block: &mut BlockId,
+    block_iseq: IseqPtr,
+    args: &[InsnId],
+    exit_id: InsnId,
+    exit_state: &FrameState,
+    insn_idx: u32,
+) -> Option<InsnId> {
+    // The block frame sits one level below the frame that yields to it.
+    let block_depth = exit_state.depth + 1;
+
+    // Snapshot the HIR length so a failed translation can be rolled back. Nothing is added
+    // to `block` until the translation succeeds, so only the append-only tables need it.
+    let pre_insns_len = fun.insns.len();
+    let pre_insn_types_len = fun.insn_types.len();
+    let pre_blocks_len = fun.blocks.len();
+
+    let continuation = fun.new_block(insn_idx);
+    // The caller state the inlined body's side exits restore: this frame stopped at the
+    // `invokeblock`, with the arguments popped off its stack.
+    let caller_stack_size = exit_state.stack().len() - args.len();
+    let post_yield_caller = fun.new_insn(Insn::Snapshot {
+        state: Box::new(exit_state.with_stack_size(caller_stack_size)),
+    });
+
+    let mode = AddIseqMode::Inlined {
+        return_block: continuation,
+        caller: post_yield_caller,
+        depth: block_depth,
+        // block_call_inlinable_iseq() checked the block takes the simple callee-setup path,
+        // so it has no optionals and only one opt-table entry.
+        jit_entry_idx: 0,
+        blockiseq: None,
+        block_return_pops: Some(block_depth as u32),
+    };
+    let add_result = match add_iseq_to_hir(fun, block_iseq, mode) {
+        Ok(result) => result,
+        Err(_) => {
+            fun.insns.truncate(pre_insns_len);
+            fun.insn_types.truncate(pre_insn_types_len);
+            fun.blocks.truncate(pre_blocks_len);
+            incr_counter!(inline_reject_compile_failure);
+            return None;
+        }
+    };
+    fun.num_instructions += fun.insns.len() - pre_insns_len;
+    incr_counter!(inline_block_count);
+
+    // Read the block handler out of this frame's EP, as the guard-free dispatch in
+    // push_invoke_block_iseq_direct() does: PushInlineFrame wrote this exact block into the
+    // frame's EP from a compile-time constant, so neither the tag nor the ISEQ identity
+    // needs a guard. captured->self is the block's self, and codegen reads captured->ep for
+    // the new frame's specval.
+    let ep = fun.get_ep(*block, 0);
+    let block_handler = fun.load_ep_env_field(*block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
+    let untag_mask = fun.push_insn(*block, Insn::Const { val: Const::CInt64(!0x3) });
+    let captured = fun.push_insn(*block, Insn::IntAnd { left: block_handler, right: untag_mask });
+    let block_self = fun.load_field(*block, captured, FieldName::SelfParam, 0, types::BasicObject);
+
+    // Map the body entry's params ([self, local0, local1, ...]) onto our values. The block
+    // is gated to `rb_simple_iseq_p` with exact arity, so the leading locals are exactly the
+    // arguments and the rest are non-parameter locals that start out nil.
+    let body_entry = add_result.body_entry_block.expect("inlined compilation always produces a body entry block");
+    let body_params: Vec<InsnId> = fun.blocks[body_entry.to_usize()].params.clone();
+    if let Some(&self_param) = body_params.first() {
+        fun.make_equal_to(self_param, block_self);
+    }
+    for (idx, &param_id) in body_params.iter().skip(1).enumerate() {
+        if let Some(&arg) = args.get(idx) {
+            fun.make_equal_to(param_id, arg);
+        } else {
+            let nil = fun.push_insn(*block, Insn::Const { val: Const::Value(Qnil) });
+            fun.make_equal_to(param_id, nil);
+        }
+    }
+    // The params are aliased rather than passed as branch arguments, so the Jump below
+    // passes none. Clear them to keep validation happy.
+    fun.blocks[body_entry.to_usize()].params.clear();
+
+    fun.push_insn_id(*block, post_yield_caller);
+    fun.push_insn(*block, Insn::PushInlineFrame {
+        iseq: block_iseq,
+        cme: std::ptr::null(),
+        recv: block_self,
+        num_args: args.len().try_into().expect("checked in HIR"),
+        blockiseq: None,
+        captured: Some(captured),
+        state: exit_id,
+    });
+    fun.push_insn(*block, Insn::Jump(BranchEdge { target: body_entry, args: vec![] }));
+
+    // Every `leave` in the block body jumps here with its value; a `return` skips this and
+    // returns from the compiled function instead.
+    let return_val = fun.push_insn(continuation, Insn::Param);
+    fun.push_insn(continuation, Insn::PopInlineFrame { iseq: block_iseq, argc: args.len(), state: exit_id });
+
+    profiles.append(&add_result.profiles);
+    *block = continuation;
+    Some(return_val)
 }
 
 impl Function {
@@ -5958,6 +6139,7 @@ impl Function {
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
                     blockiseq,
+                    block_return_pops: None,
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -6097,7 +6279,7 @@ impl Function {
 
                 // Insert PushLightweightFrame and jump to callee body entry.
                 self.push_insn(block, Insn::PushInlineFrame {
-                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, state,
+                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, captured: None, state,
                 });
                 self.count(block, Counter::inline_iseq_optimized_send_count);
                 self.push_insn(block, Insn::Jump(BranchEdge {
@@ -7893,7 +8075,7 @@ impl Function {
             | Insn::SetGlobal { val, .. }
             | Insn::SetLocal { val, .. }
             | Insn::SetClassVar { val, .. }
-            | Insn::Return { val }
+            | Insn::Return { val, .. }
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
             | Insn::ToArray { val, .. }
@@ -8866,6 +9048,11 @@ enum AddIseqMode {
         jit_entry_idx: usize,
         /// The literal block the caller passed to this frame, if any.
         blockiseq: Option<IseqPtr>,
+        /// Set when this inlined frame is a block ISEQ whose lexical owner is the
+        /// compiled function's own frame, so a `return` inside it returns from the
+        /// compiled function. The value is the number of inlined frames that are on
+        /// the CFP stack when it runs, this block's own frame included.
+        block_return_pops: Option<u32>,
     },
 }
 
@@ -10190,13 +10377,26 @@ fn add_iseq_to_hir(
                     fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     let val = state.stack_pop()?;
                     match mode {
-                        AddIseqMode::Standalone => fun.push_insn(block, Insn::Return { val }),
+                        AddIseqMode::Standalone => fun.push_insn(block, Insn::Return { val, pop_inlined_frames: 0 }),
                         AddIseqMode::Inlined { return_block, .. } => { fun.push_insn(block, Insn::Jump(BranchEdge { target: return_block, args: vec![val] })) }
                     };
                     break;  // Don't enqueue the next block as a successor
                 }
                 YARVINSN_throw => {
-                    fun.push_insn(block, Insn::Throw { throw_state: get_arg(pc, 0).as_u32(), val: state.stack_pop()?, state: exit_id });
+                    let throw_state = get_arg(pc, 0).as_u32();
+                    let val = state.stack_pop()?;
+                    // A `return` inside a block we inlined out of the compiled function's own
+                    // frame needs no throw at all: the frame it unwinds to is the frame we are
+                    // about to return from, and inline_block_iseq() checked that nothing between
+                    // the two has an `ensure` to run. Return the value directly, discarding the
+                    // inlined frames still on the CFP stack.
+                    if let AddIseqMode::Inlined { block_return_pops: Some(pops), .. } = mode {
+                        if throw_state == RUBY_TAG_RETURN as u32 {
+                            fun.push_insn(block, Insn::Return { val, pop_inlined_frames: pops });
+                            break;  // Don't enqueue the next block as a successor
+                        }
+                    }
+                    fun.push_insn(block, Insn::Throw { throw_state, val, state: exit_id });
                     break;  // Don't enqueue the next block as a successor
                 }
 
@@ -10541,7 +10741,24 @@ fn add_iseq_to_hir(
                         } else { None }
                     } else { None };
 
-                    let result = if let Some(block_iseq) = inlined_known_block {
+                    // A `yield` to a block that does a non-local `return` is the worst case for
+                    // the JIT-to-JIT dispatch below: the callee always ends in a `throw` that
+                    // unwinds every native frame back to the interpreter. When the block is a
+                    // literal of the frame we are inlined into (so `return` unwinds to exactly
+                    // the frame the compiled function returns from), inline the block's body
+                    // here instead; add_iseq_to_hir turns its `throw` into a plain `Return`.
+                    let inlined_block_result = match (inlined_known_block, mode) {
+                        (Some(bi), AddIseqMode::Inlined { depth: 1, .. })
+                            if block_return_inlinable(bi, iseq, fun.iseq()) =>
+                        {
+                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &args, exit_id, &exit_state, insn_idx)
+                        }
+                        _ => None,
+                    };
+
+                    let result = if let Some(result) = inlined_block_result {
+                        result
+                    } else if let Some(block_iseq) = inlined_known_block {
                         fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, exit_id)
                     } else if !direct_iseqs.is_empty() {
                         let level = get_lvar_level(exit_state.iseq);
@@ -11461,7 +11678,7 @@ mod rpo_tests {
         let entries = function.entries_block;
         let entry = function.entry_block;
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
-        function.push_insn(entry, Insn::Return { val });
+        function.push_insn(entry, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_eq!(function.reverse_post_order(), vec![entries, entry]);
     }
@@ -11474,7 +11691,7 @@ mod rpo_tests {
         let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(exit, Insn::Const { val: Const::Value(Qnil) });
-        function.push_insn(exit, Insn::Return { val });
+        function.push_insn(exit, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_eq!(function.reverse_post_order(), vec![entries, entry, exit]);
     }
@@ -11494,7 +11711,7 @@ mod rpo_tests {
             if_false: BranchEdge { target: exit, args: vec![] }
         });
         let val = function.push_insn(exit, Insn::Const { val: Const::Value(Qnil) });
-        function.push_insn(exit, Insn::Return { val });
+        function.push_insn(exit, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_eq!(function.reverse_post_order(), vec![entries, entry, side, exit]);
     }
@@ -11514,7 +11731,7 @@ mod rpo_tests {
             if_false: BranchEdge { target: side, args: vec![] },
         });
         let val = function.push_insn(exit, Insn::Const { val: Const::Value(Qnil) });
-        function.push_insn(exit, Insn::Return { val });
+        function.push_insn(exit, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_eq!(function.reverse_post_order(), vec![entries, entry, side, exit]);
     }
@@ -11558,7 +11775,7 @@ mod validation_tests {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
-        let insn_id = function.push_insn(entry, Insn::Return { val });
+        let insn_id = function.push_insn(entry, Insn::Return { val, pop_inlined_frames: 0 });
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Unreachable);
         function.seal_entries();
@@ -11631,7 +11848,7 @@ mod validation_tests {
         let entry = function.entry_block;
         let const_ = function.push_insn(function.entry_block, Insn::Const{val: Const::CBool(true)});
         // Ret is a non-output instruction.
-        let ret = function.push_insn(function.entry_block, Insn::Return { val: const_ });
+        let ret = function.push_insn(function.entry_block, Insn::Return { val: const_, pop_inlined_frames: 0 });
         let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: ret, state: InsnId(0) });
         function.push_insn(function.entry_block, Insn::Unreachable);
         function.seal_entries();
@@ -11655,7 +11872,7 @@ mod validation_tests {
         });
         let val2 = function.push_insn(exit, Insn::ArrayDup { val: v0, state: v0 });
         let const_ = function.push_insn(exit, Insn::Const{val: Const::CBool(true)});
-        function.push_insn(exit, Insn::Return { val: const_ });
+        function.push_insn(exit, Insn::Return { val: const_, pop_inlined_frames: 0 });
 
         function.seal_entries();
         crate::cruby::with_rubyvm(|| {
@@ -11681,7 +11898,7 @@ mod validation_tests {
         });
         let _val = function.push_insn(exit, Insn::ArrayDup { val: v0, state: v0 });
         let const_ = function.push_insn(exit, Insn::Const{val: Const::CBool(true)});
-        function.push_insn(exit, Insn::Return { val: const_ });
+        function.push_insn(exit, Insn::Return { val: const_, pop_inlined_frames: 0 });
         function.seal_entries();
         crate::cruby::with_rubyvm(|| {
             function.infer_types();
@@ -11697,7 +11914,7 @@ mod validation_tests {
         function.push_insn(function.entry_block, Insn::Jump(BranchEdge { target: block, args: vec![] }));
         let val = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn_id(block, val);
-        function.push_insn(block, Insn::Return { val });
+        function.push_insn(block, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(block, val));
     }
@@ -11710,7 +11927,7 @@ mod validation_tests {
         let val0 = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
         let val1 = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
         function.make_equal_to(val1, val0);
-        function.push_insn(block, Insn::Return { val: val0 });
+        function.push_insn(block, Insn::Return { val: val0, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(block, val0));
     }
@@ -11724,7 +11941,7 @@ mod validation_tests {
         let exit = function.new_block(0);
         function.push_insn(block, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         function.push_insn_id(exit, val);
-        function.push_insn(exit, Insn::Return { val });
+        function.push_insn(exit, Insn::Return { val, pop_inlined_frames: 0 });
         function.seal_entries();
         assert_matches_err(function.validate(), ValidationError::DuplicateInstruction(exit, val));
     }
@@ -11748,7 +11965,7 @@ mod validation_tests {
         let recv = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.load_field(entry, recv, FieldName::as_heap, ROBJECT_OFFSET_AS_HEAP_FIELDS, types::CPtr);
         let ivar = function.load_field(entry, recv, FieldName::Id(ID(1)), ROBJECT_OFFSET_AS_ARY, types::BasicObject);
-        function.push_insn(entry, Insn::Return { val: ivar });
+        function.push_insn(entry, Insn::Return { val: ivar, pop_inlined_frames: 0 });
         function.seal_entries();
 
         function.infer_types();
@@ -11771,7 +11988,7 @@ mod validation_tests {
         let recv = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.load_field(entry, recv, FieldName::as_heap, ROBJECT_OFFSET_AS_HEAP_FIELDS, types::BasicObject);
         let ivar = function.load_field(entry, recv, FieldName::Id(ID(1)), ROBJECT_OFFSET_AS_ARY, types::Array);
-        function.push_insn(entry, Insn::Return { val: ivar });
+        function.push_insn(entry, Insn::Return { val: ivar, pop_inlined_frames: 0 });
         function.seal_entries();
 
         function.infer_types();
