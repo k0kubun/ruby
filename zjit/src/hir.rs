@@ -855,6 +855,10 @@ pub enum SendFallbackReason {
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
     /// profiled ISEQ candidate, so the site dispatched through the generic fallback.
     InvokeBlockPolymorphicMiss,
+    /// A one-argument `yield` to a block that takes several parameters auto-splats. The
+    /// yielded value was not an Array of exactly that many elements, so the site dispatched
+    /// through the generic fallback instead of the expanded direct call.
+    InvokeBlockAutosplatMiss,
     /// The `sendforward` instruction (argument forwarding `...`) is not yet optimized in
     /// `type_specialize`.
     SendForwardNotSpecialized,
@@ -906,6 +910,7 @@ impl Display for SendFallbackReason {
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
+            InvokeBlockAutosplatMiss => write!(f, "InvokeBlock: auto-splat expansion miss"),
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
             InvokeSuperForwardNotSpecialized => write!(f, "InvokeSuperForward: not yet specialized"),
             SingleRactorModeRequired => write!(f, "Single-ractor mode required"),
@@ -3330,6 +3335,68 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     Ok(())
 }
 
+/// The number of values a lone `yield`ed argument is auto-splatted into when `iseq` is the
+/// block, or `None` when a one-argument `yield` reaches the block's parameters unchanged.
+///
+/// This mirrors the `arg_setup_block` case of `setup_parameters_complex()`: a block given a
+/// single argument destructures it with `rb_check_array_type` when it takes more than one
+/// positional parameter. `ambiguous_param0` is how `|x|` opts *out* of that and receives the
+/// array whole; `|x,|` clears it to opt back in.
+///
+/// Restricted to `rb_simple_iseq_p` ISEQs -- no optional, rest, post, keyword, kwrest, or
+/// block parameter -- so `lead_num` is both the minimum and the maximum arity and the
+/// expansion is exactly `lead_num` elements with no nil-filling or truncation to model.
+fn block_autosplat_arity(iseq: IseqPtr) -> Option<usize> {
+    if !unsafe { rb_simple_iseq_p(iseq) } {
+        return None;
+    }
+    if unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
+        return None;
+    }
+    let lead_num = unsafe { rb_get_iseq_body_param_lead_num(iseq) } as usize;
+    // `lead_num == 1` is the `|x,|` shape, which auto-splats and then truncates to one
+    // element. Expanding it would have to model the truncation, and it is rare; skip it.
+    if lead_num < 2 {
+        return None;
+    }
+    Some(lead_num)
+}
+
+/// How many values to auto-splat a lone `yield`ed argument into at this site, or `None` to
+/// leave the argument alone.
+///
+/// Only reports an arity when the expansion is what lets the site take one of the two
+/// single-ISEQ direct dispatches. The polymorphic, IFUNC, and generic paths hand `args`
+/// straight to `rb_vm_invokeblock()` along with this site's call data, which still says one
+/// argument, so those must keep seeing the unexpanded argument.
+fn autosplat_direct_dispatch_arity(
+    mode: AddIseqMode,
+    flags: u32,
+    yield_iseq: IseqPtr,
+    block_handler_class: Option<VALUE>,
+    argc: usize,
+) -> Option<usize> {
+    if argc != 1 || !can_direct_invoke_block(flags) {
+        return None;
+    }
+    // Mirror the priority of the dispatch selection: a literal block of the frame we are
+    // inlined into wins over the profiled one, because dispatching to it needs no guard.
+    let inlined_literal = match mode {
+        AddIseqMode::Inlined { blockiseq: Some(bi), .. } if get_lvar_level(yield_iseq) == 0 => Some(bi),
+        _ => None,
+    };
+    let profiled = block_handler_class.and_then(|obj| {
+        if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } { Some(obj.as_iseq()) } else { None }
+    });
+    for candidate in [inlined_literal, profiled].into_iter().flatten() {
+        let Some(splat_num) = block_autosplat_arity(candidate) else { continue };
+        if can_direct_invoke_block_iseq(candidate, splat_num).is_ok() {
+            return Some(splat_num);
+        }
+    }
+    None
+}
+
 unsafe extern "C" {
     fn rb_jit_iseq_has_ensure_catch_entry(iseq: IseqPtr) -> bool;
 }
@@ -3416,6 +3483,7 @@ fn inline_block_at_yield(
     block: &mut BlockId,
     block_iseq: IseqPtr,
     args: &[InsnId],
+    caller_argc: usize,
     exit_id: InsnId,
     exit_state: &FrameState,
     insn_idx: u32,
@@ -3431,8 +3499,9 @@ fn inline_block_at_yield(
 
     let continuation = fun.new_block(insn_idx);
     // The caller state the inlined body's side exits restore: this frame stopped at the
-    // `invokeblock`, with the arguments popped off its stack.
-    let caller_stack_size = exit_state.stack().len() - args.len();
+    // `invokeblock`, with the arguments popped off its stack. That is `caller_argc` values,
+    // which is not `args.len()` when a lone yielded Array was auto-splatted into `args`.
+    let caller_stack_size = exit_state.stack().len() - caller_argc;
     let post_yield_caller = fun.new_insn(Insn::Snapshot {
         state: Box::new(exit_state.with_stack_size(caller_stack_size)),
     });
@@ -3619,6 +3688,11 @@ impl Function {
     }
 
     /// Dispatch `yield` to the profiled ISEQ blocks.
+    ///
+    /// `state` describes the caller frame the callee is pushed on top of, so its stack must
+    /// end in `args`. `guard_state` is what the guards side-exit to, which is the
+    /// interpreter's own state at this `invokeblock`; the two differ when a lone yielded
+    /// Array was auto-splatted into `args`.
     fn dispatch_invoke_block_iseqs(
         &mut self,
         iseqs: &[IseqPtr],
@@ -3628,6 +3702,7 @@ impl Function {
         cd: *const rb_call_data,
         args: Vec<InsnId>,
         state: InsnId,
+        guard_state: InsnId,
     ) -> (BlockId, InsnId) {
         assert!(!iseqs.is_empty());
         let ep = self.get_ep(block, level);
@@ -3641,13 +3716,13 @@ impl Function {
         // No need for new HIR blocks.
         if iseqs.len() == 1 && !self.policy.no_side_exits {
             let block_iseq = iseqs[0];
-            self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile) });
+            self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state: guard_state, recompile: Some(Recompile) });
             let captured = self.untag_block_handler(block, block_handler);
 
             // Guard captured->code.iseq is the profiled block iseq. Compare the raw imemo pointer:
             // type inference (from_value) can't type an iseq imemo, so guard it as a CPtr identity.
             let captured_iseq = self.load_captured_code_iseq(block, captured);
-            self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::CPtr(block_iseq as *const u8), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state, recompile: Some(Recompile) });
+            self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::CPtr(block_iseq as *const u8), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state: guard_state, recompile: Some(Recompile) });
 
             let result = self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state });
             return (block, result);
@@ -10688,6 +10763,78 @@ fn add_iseq_to_hir(
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
                         && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
 
+                    // A one-argument `yield` to a block that takes several parameters
+                    // auto-splats: setup_parameters_complex()'s arg_setup_block case
+                    // destructures the value with rb_check_array_type() into the block's
+                    // parameters. The direct ISEQ dispatches below pass arguments in registers
+                    // with none of that setup, so they only accept an exact arity match, which
+                    // leaves the very common `pairs.each { |a, b| ... }` shape on the generic
+                    // path. Do the destructuring here instead, so the direct dispatch sees the
+                    // arity it wants.
+                    //
+                    // The check must be a branch, not a guard. A yielded value that is not an
+                    // Array of exactly this length is perfectly legal -- it is nil-filled or
+                    // truncated -- so a guard would side-exit on every call at a site that sees
+                    // one, and recompiling would only speculate the same way again. The miss
+                    // joins the generic `invokeblock`, which handles every shape.
+                    let caller_argc = args.len();
+                    let mut args = args;
+                    let mut autosplat_join: Option<(BlockId, InsnId)> = None;
+                    let mut call_state = exit_id;
+                    if let Some(splat_num) = autosplat_direct_dispatch_arity(mode, flags, exit_state.iseq, block_handler_class, args.len()) {
+                        let arg0 = args[0];
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        let length_block = fun.new_block(insn_idx);
+                        let expand_block = fun.new_block(insn_idx);
+                        let fallback_block = fun.new_block(insn_idx);
+
+                        // Array subclasses and to_ary-able objects take the fallback. Both are
+                        // rare at a hot yield site and modelling them here would cost a call.
+                        let is_array = fun.push_insn(block, Insn::HasType { val: arg0, expected: types::ArrayExact });
+                        fun.push_insn(block, Insn::CondBranch {
+                            val: is_array,
+                            if_true: BranchEdge { target: length_block, args: vec![] },
+                            if_false: BranchEdge { target: fallback_block, args: vec![] },
+                        });
+
+                        let array = fun.push_insn(length_block, Insn::RefineType { val: arg0, new_type: types::ArrayExact });
+                        let length = fun.push_insn(length_block, Insn::ArrayLength { array });
+                        let expected_length = fun.push_insn(length_block, Insn::Const { val: Const::CInt64(splat_num as i64) });
+                        let length_matches = fun.push_insn(length_block, Insn::IsBitEqual { left: length, right: expected_length });
+                        fun.push_insn(length_block, Insn::CondBranch {
+                            val: length_matches,
+                            if_true: BranchEdge { target: expand_block, args: vec![] },
+                            if_false: BranchEdge { target: fallback_block, args: vec![] },
+                        });
+
+                        let fallback_result = fun.push_insn(fallback_block, Insn::InvokeBlock {
+                            cd, args: args.clone(), state: exit_id, reason: InvokeBlockAutosplatMiss,
+                        });
+                        fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
+
+                        args = (0..splat_num).map(|idx| {
+                            let index = fun.push_insn(expand_block, Insn::Const { val: Const::CInt64(idx as i64) });
+                            fun.push_insn(expand_block, Insn::ArrayAref { array, index })
+                        }).collect();
+                        // The frame the callee is pushed on top of. The dispatches below derive
+                        // the caller's saved SP from `state.stack().len() - args.len()`, so the
+                        // stack has to end in the expanded arguments even though the interpreter
+                        // only ever had the one Array there. Guards keep side-exiting to
+                        // `exit_id`, which still describes the interpreter's own stack. This is
+                        // the same split prepare_direct_send_args() makes for reordered kwargs.
+                        let expanded_state = fun.frame_state(exit_id).with_replaced_args(&args, caller_argc);
+                        call_state = fun.push_insn(expand_block, Insn::Snapshot { state: Box::new(expanded_state) });
+                        // Continue the dispatch selection below in the expanded arm. It is
+                        // guaranteed to pick one of the two single-ISEQ direct dispatches:
+                        // autosplat_direct_dispatch_arity() only returns an arity that makes
+                        // one of them eligible, and both key off this same `args.len()`.
+                        block = expand_block;
+                        autosplat_join = Some((join_block, join_param));
+                    }
+
+                    // If the block handler is a known simple ISEQ block with exact arity and no
+                    // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
                     // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
                     let mut fallback_reason = InvokeBlockNotSpecialized;
                     // The first entry of buckets is the most common type, so it will be inserted to direct_iseqs first too.
@@ -10757,7 +10904,7 @@ fn add_iseq_to_hir(
                         (Some(bi), AddIseqMode::Inlined { depth: 1, .. })
                             if block_return_inlinable(bi, iseq, fun.iseq()) =>
                         {
-                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &args, exit_id, &exit_state, insn_idx)
+                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &args, caller_argc, call_state, &exit_state, insn_idx)
                         }
                         _ => None,
                     };
@@ -10765,10 +10912,10 @@ fn add_iseq_to_hir(
                     let result = if let Some(result) = inlined_block_result {
                         result
                     } else if let Some(block_iseq) = inlined_known_block {
-                        fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, exit_id)
+                        fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, call_state)
                     } else if !direct_iseqs.is_empty() {
                         let level = get_lvar_level(exit_state.iseq);
-                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, exit_id);
+                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, call_state, exit_id);
                         // Continue compilation from the block the dispatch ended in
                         block = continue_block;
                         result
@@ -10819,6 +10966,15 @@ fn add_iseq_to_hir(
                         join_param
                     } else {
                         fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
+                    };
+                    // Rejoin the arm that did not auto-splat. A non-local `return` out of an
+                    // inlined block never gets here: Insn::Return terminates its own block.
+                    let result = if let Some((join_block, join_param)) = autosplat_join {
+                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+                        block = join_block;
+                        join_param
+                    } else {
+                        result
                     };
                     state.stack_push(result);
                 }
