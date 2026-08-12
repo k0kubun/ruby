@@ -748,6 +748,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::GuardBitEquals { val, expected, ref reason, state, recompile } => gen_guard_bit_equals(jit, asm, function, opnd!(val), expected, **reason, recompile, &function.frame_state(state)),
         &Insn::GuardAnyBitSet { val, mask, ref reason, state, recompile, .. } => gen_guard_any_bit_set(jit, asm, function, opnd!(val), mask, **reason, recompile, &function.frame_state(state)),
         &Insn::GuardNoBitsSet { val, mask, ref reason, state, .. } => gen_guard_no_bits_set(jit, asm, function, opnd!(val), mask, **reason, &function.frame_state(state)),
+        &Insn::GuardNotRuby2KeywordsHash { val, state, recompile } => {
+            let val_type = function.type_of(val);
+            gen_guard_not_ruby2_keywords_hash(jit, asm, function, opnd!(val), val_type, recompile, &function.frame_state(state))
+        }
         &Insn::GuardLess { left, right, ref reason, state } => gen_guard_less(jit, asm, function, opnd!(left), opnd!(right), **reason, &function.frame_state(state)),
         &Insn::GuardGreaterEq { left, right, state, .. } => gen_guard_greater_eq(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state)),
         Insn::PatchPoint { invariant, state } => no_output!(gen_patch_point(jit, asm, function, invariant, &function.frame_state(*state))),
@@ -930,6 +934,56 @@ fn gen_getblockparam(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     asm.store(flags, modified);
 
     asm.load(Opnd::mem(VALUE_BITS, ep, offset))
+}
+
+/// Side-exit if `val` is a Hash flagged with RHASH_PASS_AS_KEYWORDS. When such a hash is the
+/// last element of a splatted array, CALLER_SETUP_ARG turns it into keywords (duplicating it,
+/// or dropping it entirely when empty), so a call site that expanded the splat into positional
+/// arguments has to bail out.
+fn gen_guard_not_ruby2_keywords_hash(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    val: Opnd,
+    val_type: Type,
+    recompile: Option<Recompile>,
+    state: &FrameState,
+) -> Opnd {
+    // Only a T_HASH can carry the flag, so skip the check when the type rules one out.
+    if !val_type.could_be(types::Hash) {
+        return val;
+    }
+    asm_comment!(asm, "guard splat argument is not a ruby2_keywords hash");
+    let out = asm.load_mem(val);
+
+    // Create a result block that all the "not a flagged hash" paths converge to
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_edge = Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+
+    if !val_type.is_subtype(types::HeapBasicObject) {
+        // Immediates and Qfalse have no object header to read
+        asm.test(out, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
+        asm.jnz(jit, result_edge.clone());
+        asm.cmp(out, Qfalse.into());
+        asm.je(jit, result_edge.clone());
+    }
+
+    let flags = asm.load(Opnd::mem(VALUE_BITS, out, RUBY_OFFSET_RBASIC_FLAGS));
+    let builtin_type = asm.and(flags, Opnd::UImm(RUBY_T_MASK as u64));
+    asm.cmp(builtin_type, Opnd::UImm(RUBY_T_HASH as u64));
+    asm.jne(jit, result_edge.clone());
+
+    asm.test(flags, Opnd::UImm(RHASH_PASS_AS_KEYWORDS as u64));
+    asm.jnz(jit, side_exit_with_recompile(jit, function, state, SideExitReason::SplatLastRuby2Keywords, recompile));
+    asm.jmp(result_edge);
+
+    // Join block
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    out
 }
 
 fn gen_guard_less(jit: &mut JITState, asm: &mut Assembler, function: &Function, left: Opnd, right: Opnd, reason: SideExitReason, state: &FrameState) -> Opnd {
