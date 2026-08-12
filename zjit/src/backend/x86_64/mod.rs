@@ -450,8 +450,12 @@ impl Assembler {
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.linearize_instructions();
 
+        // The side exit of the patch point that sits at the current write position, if any.
+        // See split_patch_point() for why consecutive patch points can share a patch site.
+        let mut prev_patch_label: Option<Label> = None;
         for insn in linearized_insns.iter() {
             let mut insn = insn.clone();
+            let keeps_patch_site = matches!(insn, Insn::Comment(_) | Insn::PatchPoint(..));
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
@@ -664,11 +668,20 @@ impl Assembler {
                     asm.store(dest, src);
                 }
                 &mut Insn::PatchPoint(ref data) => {
-                    split_patch_point(asm, &data.target, data.invariant, data.version);
+                    let label = match data.target {
+                        Target::Label(label) => Some(label),
+                        _ => None,
+                    };
+                    let merge = label.is_some() && label == prev_patch_label;
+                    split_patch_point(asm, &data.target, data.invariant, data.version, merge);
+                    prev_patch_label = label;
                 }
                 _ => {
                     asm.push_insn(insn);
                 }
+            }
+            if !keeps_patch_site {
+                prev_patch_label = None;
             }
         }
 

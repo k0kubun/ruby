@@ -5768,6 +5768,50 @@ fn test_bop_redefined_with_adjacent_patch_points() {
     "), @"[15, :+, 100]");
 }
 
+// Consecutive patch points that guard the same side exit share one patch site,
+// so a single site can be invalidated by more than one invariant. Bust both
+// invariants of a C call (NoSingletonClass and MethodRedefined) without running
+// the method in between, which patches the same address twice.
+#[test]
+fn test_shared_patch_site_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        obj = []
+        def obj.reverse_each = nil
+        Array.class_eval { def reverse_each; yield 99; end }
+        [before, test]
+    "), @"[1, 99]");
+}
+
+// Same idea for the patch points a constant lookup emits, which also share a site.
+#[test]
+fn test_shared_patch_site_for_constant_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        tp = TracePoint.new(:line) { }
+        tp.enable
+        Object.send(:remove_const, :CONST_ARRAY)
+        CONST_ARRAY = [2]
+        after = test
+        tp.disable
+        [before, after]
+    "), @"[1, 2]");
+}
+
 #[test]
 fn test_method_redefined_with_top_self() {
     assert_snapshot!(inspect(r#"

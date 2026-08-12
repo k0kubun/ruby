@@ -982,13 +982,22 @@ fn gen_patch_point(jit: &mut JITState, asm: &mut Assembler, function: &Function,
 
 /// This is used by scratch_split to lower PatchPoint into PatchPointPad and PosMarker.
 /// It's called at scratch_split so that we can use the Label after side-exit deduplication in compile_exits.
-pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invariant, version: IseqVersionRef) {
+///
+/// `merge_with_previous` is set when the immediately preceding instruction was also a
+/// PatchPoint jumping to the same side exit, with no code emitted in between. Such patch
+/// points can share a single patch site: whichever invariant is invalidated first writes
+/// the very same jump, so they don't need `jmp_ptr_bytes()` of room between them. This
+/// saves the padding that would otherwise separate the several patch points a single
+/// instruction emits (e.g. NoSingletonClass + MethodRedefined for one send).
+pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invariant, version: IseqVersionRef, merge_with_previous: bool) {
     let Target::Label(exit_label) = *target else {
         unreachable!("PatchPoint's target should have been lowered to Target::Label by compile_exits: {target:?}");
     };
 
     // Fill nop instructions if the last patch point is too close.
-    asm.patch_point_pad();
+    if !merge_with_previous {
+        asm.patch_point_pad();
+    }
 
     // Remember the current address as a patch point
     asm.pos_marker(move |code_ptr, cb| {
