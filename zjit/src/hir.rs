@@ -3269,10 +3269,46 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
         return Err(InvokeBlockNotSpecialized);
     }
-    if crate::codegen::block_iseq_may_throw(iseq) {
+    // The JIT-to-JIT call in gen_invoke_block_iseq_direct passes captured self plus
+    // each argument in C argument registers.
+    // TODO: Support passing arguments on the stack in C calls
+    if 1 + argc > C_ARG_OPNDS.len() {
+        return Err(TooManyArgsForLir);
+    }
+    // `break` out of a directly-invoked block frame does not unwind correctly:
+    // vm_throw_start() matches the block owner's `cfp->pc` against the CATCH_TYPE_BREAK
+    // entry's `cont`, and the PC the owner's frame reports after this dispatch does not
+    // match, so the break is reported as an orphan ("break from proc-closure").
+    // A plain non-local `return` is looked up by frame type and EP instead of by PC, so
+    // blocks that only throw TAG_RETURN -- what this dispatch is for -- are fine.
+    if crate::codegen::block_iseq_may_throw(iseq) && !block_iseq_throws_only_return(iseq) {
         return Err(InvokeBlockNotSpecialized);
     }
     Ok(())
+}
+
+/// True if every `throw` in the ISEQ is a plain non-local `return` (`TAG_RETURN` with no
+/// extra flags), and there is at least one of them.
+fn block_iseq_throws_only_return(iseq: IseqPtr) -> bool {
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+    let mut saw_throw = false;
+
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+
+        if opcode == YARVINSN_throw {
+            if unsafe { *rb_iseq_pc_at_idx(iseq, insn_idx + 1) }.as_u32() != RUBY_TAG_RETURN as u32 {
+                return false;
+            }
+            saw_throw = true;
+        }
+
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+
+    saw_throw
 }
 
 impl Function {
