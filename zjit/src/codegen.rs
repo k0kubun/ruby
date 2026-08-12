@@ -4193,8 +4193,28 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
 }
 
 fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
-    // rb_str_setbyte is not leaf, but we guard types and index ranges in HIR
-    asm_ccall!(asm, rb_str_setbyte, string, index, value)
+    // HIR guards that the index is in bounds, the value is a Fixnum, and none of the
+    // RSTRING_DEPENDANT_MASK flags are set, so we can write the byte in place like the
+    // fast path of rb_str_setbyte.
+    asm_comment!(asm, "clear cached coderange");
+    // Conservatively reset the coderange to unknown, like rb_str_setbyte does for
+    // embedded strings. Only touch the low 32 bits of the word at offset 0; the
+    // upper half holds the shape ID.
+    let string = asm.load_mem(string);
+    let flags = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RBASIC_FLAGS));
+    let flags = asm.and(flags, Opnd::UImm(!(RUBY_ENC_CODERANGE_MASK as u64)));
+    asm.store(Opnd::mem(32, string, RUBY_OFFSET_RBASIC_FLAGS), flags.with_num_bits(32));
+
+    asm_comment!(asm, "write the byte in place");
+    // byte = FIX2LONG(value) & 0xff
+    let byte = asm.rshift(value, Opnd::UImm(1));
+    let byte = asm.and(byte, Opnd::UImm(0xff));
+    let string_ptr = get_string_ptr(asm, string);
+    let string_ptr = asm.add(string_ptr, index);
+    asm.store(Opnd::mem(8, string_ptr, 0), byte.with_num_bits(8));
+    // String#setbyte returns the value argument, but the return value is replaced with
+    // the `value` operand in HIR, so this output is unused.
+    value
 }
 
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {

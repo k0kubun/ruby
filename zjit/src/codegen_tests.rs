@@ -6474,6 +6474,98 @@ fn test_string_bytesize_multibyte() {
 }
 
 #[test]
+fn test_string_setbyte_in_place() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        r = test(s, 1, 97)
+        [s, r]
+    "), @r#"["hallo", 97]"#);
+}
+
+#[test]
+fn test_string_setbyte_negative_index() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        test(s, -1, 33)
+        s
+    "), @r#""hell!""#);
+}
+
+#[test]
+fn test_string_setbyte_wraps_value() {
+    // rb_str_setbyte takes value & 0xff, including for negative values
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        test(s, 0, 0x141)
+        test(s, 1, -190)
+        s
+    "), @r#""ABllo""#);
+}
+
+#[test]
+fn test_string_setbyte_out_of_bounds() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        begin
+          test('hi'.dup, 5, 65)
+        rescue IndexError
+          :index_error
+        end
+    "), @":index_error");
+}
+
+#[test]
+fn test_string_setbyte_frozen() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        begin
+          test('frozen'.freeze, 0, 65)
+        rescue FrozenError
+          :frozen_error
+        end
+    "), @":frozen_error");
+}
+
+#[test]
+fn test_string_setbyte_shared_string() {
+    // Dup of a long heap string shares its buffer; setbyte must unshare it
+    // without mutating the original.
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        long = 'x' * 5000
+        s = long.dup
+        test(s, 0, 65)
+        [s[0, 3], long[0, 3]]
+    "), @r#"["Axx", "xxx"]"#);
+}
+
+#[test]
+fn test_string_setbyte_clears_coderange() {
+    // Writing a byte must invalidate the cached coderange so that
+    // valid_encoding? and ascii_only? rescan the string.
+    assert_snapshot!(inspect(r#"
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = "aé".dup
+        s.valid_encoding?
+        test(s, 1, 0xff)
+        a = "abc".dup
+        a.ascii_only?
+        test(a, 0, 0xff)
+        [s.valid_encoding?, a.ascii_only?]
+    "#), @"[false, false]");
+}
+
+#[test]
 fn test_nil_value_nil_opt_with_guard() {
     eval("
         def test(val) = val.nil?
