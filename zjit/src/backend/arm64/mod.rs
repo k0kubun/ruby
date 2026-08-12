@@ -1910,7 +1910,7 @@ mod tests {
         let value = asm.load(Opnd::mem(VALUE_BITS, NATIVE_STACK_PTR, 0));
         asm.write_label(start.clone());
         asm.cmp(value, 0.into());
-        asm.jg(forward.clone());
+        asm.push_insn(Insn::Jg(forward.clone()));
         asm.push_insn(Insn::Jl(start.clone()));
         asm.write_label(forward);
 

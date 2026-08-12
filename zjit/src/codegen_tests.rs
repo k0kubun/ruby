@@ -4136,6 +4136,39 @@ fn test_string_append_broken_coderange() {
 }
 
 #[test]
+fn test_string_append_growth() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Cross the embedded->heap boundary and several capacity doublings so
+    // both the in-place fast path and the resizing fallback are exercised.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::UTF_8)
+        200.times { test(s, "0123456789") }
+        [s.bytesize, s == "0123456789" * 200]
+    "#), @"[2000, true]");
+}
+
+#[test]
+fn test_string_append_gc_stress() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        begin
+          GC.stress = true
+          s = +"a"
+          10.times { test(s, "bc") }
+          [s.bytesize, s == "a" + "bc" * 10]
+        ensure
+          GC.stress = false
+        end
+    "#), @"[21, true]");
+}
+
+#[test]
 fn test_new_hash_nonempty() {
     eval(r#"
         def test

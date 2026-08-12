@@ -165,8 +165,10 @@ macro_rules! define_split_jumps {
 }
 
 define_split_jumps! {
+    jb => Jb,
     jbe => Jbe,
     je => Je,
+    jg => Jg,
     jge => Jge,
     jl => Jl,
     jne => Jne,
@@ -4221,7 +4223,8 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     gen_prepare_non_leaf_call(jit, asm, function, state);
 
     // Test if string encodings differ. If different, use rb_str_buf_append. If the same,
-    // use rb_jit_str_simple_append, which calls rb_str_cat.
+    // inline the append when the receiver is a plain mutable heap string with enough
+    // capacity, and otherwise call rb_jit_str_simple_append, which calls rb_str_cat.
     asm_comment!(asm, "<< on strings");
 
     // Take receiver's object flags XOR arg's flags. If any
@@ -4229,38 +4232,85 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     // the encodings don't match.
     let string_reg = asm.load_mem(string);
     let val_reg = asm.load_mem(val);
+    let string_flags = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RBASIC_FLAGS));
     let flags_xor = asm.xor(
-        Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RBASIC_FLAGS),
+        string_flags,
         Opnd::mem(VALUE_BITS, val_reg, RUBY_OFFSET_RBASIC_FLAGS)
     );
     asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
 
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
+    let simple_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let simple_edge = || Target::Block(Box::new(lir::BranchEdge { target: simple_block, args: vec![] }));
     let mismatch_block = asm.new_block(hir_block_id, false, rpo_idx);
     let mismatch_edge = Target::Block(Box::new(lir::BranchEdge { target: mismatch_block, args: vec![] }));
     let result_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let result_edge = Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+    let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
     asm.jnz(jit, mismatch_edge);
 
-    // If encodings match, call the simple append function
+    // The receiver must be a bare mutable heap string to append in place:
+    // no sharing in either direction, not frozen or chilled or temporarily
+    // locked, and owning its buffer so that as.heap.aux.capa is valid.
+    const STR_APPEND_REJECT_MASK: u64 = (RUBY_FL_FREEZE as u64) | STR_SHARED | STR_CHILLED
+        | STR_PRECOMPUTED_HASH | STR_SHARED_ROOT | STR_BORROWED | STR_TMPLOCK
+        | (RSTRING_FSTR as u64) | STR_NOFREE | STR_FAKESTR;
+    let masked_flags = asm.and(string_flags, Opnd::UImm(STR_APPEND_REJECT_MASK | RSTRING_NOEMBED as u64));
+    asm.cmp(masked_flags, Opnd::UImm(RSTRING_NOEMBED as u64));
+    asm.jne(jit, simple_edge());
+
+    // Only inline for the 3 preserved ASCII-compatible encodings (see
+    // rb_str_encindex_fastpath), which all have a single-byte terminator.
+    // Encoding indexes above US-ASCII take the fallback call.
+    let enc_bits = asm.and(string_flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.cmp(enc_bits, Opnd::UImm((RUBY_ENCINDEX_US_ASCII as u64) << (RUBY_ENCODING_SHIFT as u64)));
+    asm.jg(jit, simple_edge());
+
+    // Check that the appended bytes fit in the existing capacity. The unsigned
+    // comparison also sends a (practically impossible) overflowing total length
+    // to the fallback, which raises.
+    let string_len = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_LEN));
+    let val_len = asm.load(Opnd::mem(VALUE_BITS, val_reg, RUBY_OFFSET_RSTRING_LEN));
+    let total_len = asm.add(string_len, val_len);
+    let capa = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_AS_HEAP_AUX_CAPA));
+    asm.cmp(capa, total_len);
+    asm.jb(jit, simple_edge());
+
+    // memcpy(str->as.heap.ptr + str->len, RSTRING_PTR(val), val->len)
+    let string_ptr = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_AS_HEAP_PTR));
+    let dst = asm.add(string_ptr, string_len);
+    let src = get_string_ptr(asm, val_reg);
+    asm_ccall!(asm, memcpy, dst, src, val_len);
+
+    // STR_SET_LEN + TERM_FILL, and clear the coderange like rb_str_modify()
+    asm.store(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_LEN), total_len);
+    let term_ptr = asm.add(string_ptr, total_len);
+    asm.store(Opnd::mem(8, term_ptr, 0), Opnd::UImm(0));
+    let new_flags = asm.and(string_flags, Opnd::UImm(!(RUBY_ENC_CODERANGE_MASK as u64)));
+    asm.store(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RBASIC_FLAGS), new_flags);
+    asm.jmp(result_edge());
+
+    // If the receiver can't be appended in place, call the simple append function
+    asm.set_current_block(simple_block);
+    let label = jit.get_label(asm, simple_block, hir_block_id);
+    asm.write_label(label);
     asm_ccall!(asm, rb_jit_str_simple_append, string, val);
-    asm.jmp(result_edge.clone());
+    asm.jmp(result_edge());
 
     // If encodings are different, use a slower encoding-aware concatenate
     asm.set_current_block(mismatch_block);
     let label = jit.get_label(asm, mismatch_block, hir_block_id);
     asm.write_label(label);
     asm_ccall!(asm, rb_str_buf_append, string, val);
-    asm.jmp(result_edge);
+    asm.jmp(result_edge());
 
     // Join block
     asm.set_current_block(result_block);
     let label = jit.get_label(asm, result_block, hir_block_id);
     asm.write_label(label);
 
-    // Either append function returns the receiver
+    // Every path returns the receiver
     string
 }
 
