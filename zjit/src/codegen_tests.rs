@@ -967,7 +967,124 @@ fn test_yield_non_local_return() {
         test
         test
     ");
-    assert_snapshot!(assert_compiles_allowing_exits("test"), @"42");
+    // The block's body is inlined into `test` and its `return` becomes a plain return, so
+    // this compiles with no throw and no side exit at all.
+    assert_snapshot!(assert_compiles("test"), @"42");
+}
+
+#[test]
+fn test_inline_block_non_local_return_with_args() {
+    set_call_threshold(2);
+    eval("
+        def inner(a, b) = yield(a, b)
+        def test(a, b)
+          inner(a, b) { |x, y| return x + y }
+          99
+        end
+        test(1, 2)
+        test(1, 2)
+    ");
+    assert_snapshot!(assert_compiles("test(3, 4)"), @"7");
+}
+
+#[test]
+fn test_inline_block_conditional_non_local_return() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test(x)
+          y = inner { return :early if x }
+          [y, :late]
+        end
+        test(true)
+        test(false)
+    ");
+    assert_snapshot!(assert_compiles("test(true)"), @":early");
+    assert_snapshot!(assert_compiles("test(false)"), @"[nil, :late]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_caller() {
+    // An `ensure` in the frame the `return` unwinds to must still run, so this block is
+    // not inlined and falls back to the throw.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { return 1 }
+        ensure
+          $ran = true
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_block() {
+    // Likewise for an `ensure` inside the block itself.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { begin; return 1; ensure; $ran = true; end }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_from_nested_block_owner() {
+    // `return` inside a block nested in another block escapes to the enclosing method, not
+    // to the block frame ZJIT would be returning from, so the outer block is not eligible.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          [1, 2].each do
+            inner { return :deep }
+          end
+          :shallow
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @":deep");
+}
+
+#[test]
+fn test_inline_block_non_local_return_keeps_frames_walkable() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { return caller_locations(0, 3).map(&:label) }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#"["block in Object#test", "Object#inner", "Object#test"]"#);
+}
+
+#[test]
+fn test_inline_block_raise_unwinds_through_inlined_frames() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { raise 'boom' }
+        rescue => e
+          e.message
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#""boom""#);
 }
 
 #[test]
