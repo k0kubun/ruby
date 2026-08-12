@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -1181,6 +1181,10 @@ pub enum Insn {
     //NewObject?
     /// Get an instance variable `id` from `self_val`, using the inline cache `ic` if present
     GetIvar { self_val: InsnId, id: ID, ic: *const iseq_inline_iv_cache_entry, state: InsnId },
+    /// Record the shape of a receiver that reached a frozen ivar dispatch's fallback path, so
+    /// the site can earn a recompile that specializes it. See
+    /// [`crate::profile::rb_zjit_ivar_reprofile`].
+    IvarReprofile { self_val: InsnId, state: InsnId },
     /// Set `self_val`'s instance variable `id` to `val`, using the inline cache `ic` if present
     SetIvar { self_val: InsnId, id: ID, val: InsnId, ic: *const iseq_inline_iv_cache_entry, state: InsnId },
     /// Check whether an instance variable exists on `self_val`
@@ -1720,7 +1724,8 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*recv);
                 $visit_many!(args);
             }
-            Insn::GetIvar { self_val, state, .. }
+            Insn::IvarReprofile { self_val, state }
+            | Insn::GetIvar { self_val, state, .. }
             | Insn::DefinedIvar { self_val, state, .. } => {
                 $visit_one!(*self_val);
                 $visit_one!(*state);
@@ -1795,7 +1800,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. }
+            | Insn::ArrayAset { .. } | Insn::IvarReprofile { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
@@ -1914,6 +1919,7 @@ impl Insn {
             Insn::GetGlobal { .. } => effects::Any,
             Insn::SetGlobal { .. } => effects::Any,
             Insn::GetIvar { .. } => effects::Any,
+            Insn::IvarReprofile { .. } => effects::Any,
             Insn::SetIvar { .. } => effects::Any,
             Insn::DefinedIvar { .. } => effects::Any,
             Insn::LoadPC { .. } => Effect::read_write(abstract_heaps::PC, abstract_heaps::Empty),
@@ -2509,6 +2515,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::DefinedIvar { self_val, id, .. } => write!(f, "DefinedIvar {self_val}, :{}", id.contents_lossy()),
             Insn::GetIvar { self_val, id, .. } => write!(f, "GetIvar {self_val}, :{}", id.contents_lossy()),
+            Insn::IvarReprofile { self_val, .. } => write!(f, "IvarReprofile {self_val}"),
             Insn::CheckMatch { target, pattern, flag, .. } => {
                 const TYPE_MASK: u32 = 0x03;
                 const ARRAY_FLAG: u32 = 0x04;
@@ -2926,7 +2933,7 @@ impl CompilePolicy {
             let payload = get_or_create_iseq_payload(iseq);
             payload.versions.iter().any(
                 |v| unsafe { v.as_ref() }.is_invalidated()
-            ) && payload.versions.len() + 1 >= max_iseq_versions()
+            ) && payload.versions.len() + 1 >= payload.version_limit()
         };
         Self { no_side_exits }
     }
@@ -4619,6 +4626,7 @@ impl Function {
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
+            | Insn::IvarReprofile { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -7554,7 +7562,7 @@ impl Function {
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
         let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if payload.versions.len() + 1 >= payload.version_limit() {
             return;
         }
         for block in self.reverse_post_order() {
@@ -9034,6 +9042,7 @@ impl Function {
         match *self.find_ref(insn_id) {
             // Instructions with no InsnId operands (except state) or nothing to assert
             Insn::Const { .. }
+            | Insn::IvarReprofile { .. }
             | Insn::Comment { .. }
             | Insn::Param
             | Insn::LoadArg { .. }
@@ -9400,6 +9409,20 @@ impl Function {
 
     /// Dispatch an ivar access to profiled shapes. Callbacks generate the optimized access and
     /// generic fallback, optionally returning a value to pass through the join block.
+    /// Emit a call that records the shape of a receiver reaching a frozen ivar dispatch's
+    /// fallback, unless the ISEQ has already spent its respecialization budget (in which case
+    /// no recompile can follow and the call would just be overhead on a hot path).
+    fn emit_ivar_reprofile(&mut self, block: BlockId, self_param: InsnId, state: InsnId) {
+        if self.iseq.is_null() {
+            return;
+        }
+        let payload = get_or_create_iseq_payload(self.iseq);
+        if payload.ivar_respecializations >= crate::payload::MAX_IVAR_RESPECIALIZATIONS {
+            return;
+        }
+        self.push_insn(block, Insn::IvarReprofile { self_val: self_param, state });
+    }
+
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
@@ -9418,6 +9441,7 @@ impl Function {
         if profiles.is_empty() {
             if self.policy.no_side_exits {
                 self.count(block, fallback_counter);
+                self.emit_ivar_reprofile(block, self_param, exit_id);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
                 return Some((block, result));
@@ -9456,6 +9480,7 @@ impl Function {
                     let fallback_block = self.new_block(insn_idx);
                     self.push_insn(block, branch(matches, optimized_block, fallback_block));
                     self.count(fallback_block, fallback_counter);
+                    self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
                     let fallback_result = emit_fallback(self, fallback_block);
                     self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
                 } else {
