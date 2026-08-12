@@ -34,7 +34,18 @@ pub struct IseqPayload {
     /// `BasicObject`) when the owner is unknown.
     /// See [`crate::cruby::iseq_self_is_heap_object`].
     pub self_is_heap_object: bool,
+    /// Extra compiled versions this ISEQ has been granted on top of `--zjit-max-versions`
+    /// so that a frozen ivar dispatch can pick up a shape its profile never saw. Only
+    /// [`crate::profile::rb_zjit_ivar_reprofile`] grants these, and only against evidence
+    /// from the fallback path. Capped at [`MAX_IVAR_RESPECIALIZATIONS`].
+    pub ivar_respecializations: u8,
 }
+
+/// How many extra versions a single ISEQ may earn for ivar shape respecialization.
+/// Each one strictly adds a shape to a dispatch that was previously falling back, so the
+/// process terminates on its own; the cap bounds code growth for an ISEQ whose receivers
+/// keep changing shape.
+pub const MAX_IVAR_RESPECIALIZATIONS: u8 = 2;
 
 impl IseqPayload {
     fn new() -> Self {
@@ -46,8 +57,10 @@ impl IseqPayload {
             exception_dispatch: None,
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
+            ivar_respecializations: 0,
         }
     }
+
     /// Every compiled version of this ISEQ, ordinary entries and exception
     /// handler entries alike. GC callbacks must visit all of them.
     pub fn all_versions(&self) -> impl Iterator<Item = &IseqVersionRef> {
@@ -57,6 +70,12 @@ impl IseqPayload {
     /// Mutable counterpart of [`IseqPayload::all_versions`]
     pub fn all_versions_mut(&mut self) -> impl Iterator<Item = &mut IseqVersionRef> {
         self.versions.iter_mut().chain(self.exception_versions.iter_mut())
+    }
+
+    /// Number of versions this ISEQ may compile, including any it earned by proving from
+    /// its ivar fallback path that a recompile would specialize a shape it is missing.
+    pub fn version_limit(&self) -> usize {
+        crate::codegen::max_iseq_versions() + self.ivar_respecializations as usize
     }
 }
 

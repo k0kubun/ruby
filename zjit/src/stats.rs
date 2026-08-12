@@ -157,6 +157,8 @@ make_counters! {
         compiled_iseq_count,
         failed_iseq_count,
         jit_frame_heap_bytes,
+        failed_jit_frame_bytes,
+        ivar_respecialize_count,
         skipped_native_stack_full,
 
         // Exception handler entries (body->jit_exception) that were compiled as
