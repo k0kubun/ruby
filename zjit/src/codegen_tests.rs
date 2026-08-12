@@ -1012,6 +1012,162 @@ fn test_yield_non_local_return() {
     assert_snapshot!(assert_compiles("test"), @"42");
 }
 
+/// A lone yielded Array is destructured into a multi-parameter block, and the direct dispatch
+/// takes it. Without the expansion the arity mismatch leaves this on the generic `invokeblock`
+/// and the block's `return` throws, which `assert_compiles` catches as a side exit.
+#[test]
+fn test_block_autosplat_direct_dispatch() {
+    set_call_threshold(2);
+    eval("
+        def test(pairs)
+          pairs.each { |a, b| return a + b if a > 0 }
+          -1
+        end
+        test([[1, 2]])
+        test([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("test([[3, 4]])"), @"7");
+}
+
+/// The auto-splat expansion joins the generic `invokeblock` rather than side-exiting, so a
+/// site that sees an Array of the wrong length, a non-Array, or nil still gets the
+/// interpreter's nil-filling and truncation, and keeps running compiled code.
+#[test]
+fn test_block_autosplat_length_mismatch_joins_fallback() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a, b| out << [a, b] }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    // exact length, too long, too short, empty, non-Array, nil
+    assert_snapshot!(assert_compiles("each_of([[1, 2], [3, 4, 5], [6], [], 7, nil]).inspect"),
+        @r#""[[1, 2], [3, 4], [6, nil], [nil, nil], [7, nil], [nil, nil]]""#);
+}
+
+/// An Array subclass and a `to_ary` duck both take the fallback arm, where the interpreter's
+/// `rb_check_array_type` destructures them the same way it always has.
+#[test]
+fn test_block_autosplat_non_exact_array_joins_fallback() {
+    set_call_threshold(2);
+    eval("
+        class AutosplatSub < Array; end
+        class AutosplatDuck; def to_ary = [:d1, :d2]; end
+        def each_of(vals)
+          out = []
+          vals.each { |a, b| out << [a, b] }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([AutosplatSub.new([1, 2]), AutosplatDuck.new]).inspect"),
+        @r#""[[1, 2], [:d1, :d2]]""#);
+}
+
+/// The profiled-monomorphic dispatch guards the block ISEQ *after* the expansion has replaced
+/// the one yielded Array with its elements. That guard has to side-exit to the interpreter's
+/// own stack, which still holds just the Array, not to the expanded one.
+#[test]
+fn test_block_autosplat_iseq_guard_failure_restores_caller_stack() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          i = 0
+          while i < vals.size
+            yield vals[i]
+            i += 1
+          end
+          nil
+        end
+        def run(vals, which)
+          out = []
+          if which == 0
+            each_of(vals) { |a, b| out << [a, b, :first] }
+          else
+            each_of(vals) { |a, b| out << [a, b, :second] }
+          end
+          out
+        end
+        # Warm up only the first block so the yield site profiles it as monomorphic.
+        4.times { run([[1, 2]], 0) }
+    ");
+    // Switching to the second block makes the ISEQ guard fail after the expansion.
+    assert_snapshot!(assert_compiles_allowing_exits("run([[1, 2], [3], 4], 1).inspect"),
+        @r#""[[1, 2, :second], [3, nil, :second], [4, nil, :second]]""#);
+}
+
+/// A single plain parameter does not auto-splat: `ambiguous_param0` is set and the block
+/// receives the Array whole. The expansion must not fire.
+#[test]
+fn test_block_single_param_does_not_autosplat() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a| out << a }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([[1, 2], 3]).inspect"), @r#""[[1, 2], 3]""#);
+}
+
+/// Blocks with optional, rest, or post parameters are not `rb_simple_iseq_p`, so they must
+/// not take the expansion: their auto-splat nil-fills and packs in ways it does not model.
+#[test]
+fn test_block_autosplat_skips_non_simple_params() {
+    set_call_threshold(2);
+    eval("
+        def each_opt(vals)
+          out = []
+          vals.each { |a, b = :dflt| out << [a, b] }
+          out
+        end
+        def each_rest(vals)
+          out = []
+          vals.each { |a, *r| out << [a, r] }
+          out
+        end
+        def each_post(vals)
+          out = []
+          vals.each { |a, *m, z| out << [a, m, z] }
+          out
+        end
+        2.times do
+          each_opt([[1, 2]])
+          each_rest([[1, 2]])
+          each_post([[1, 2, 3]])
+        end
+    ");
+    assert_snapshot!(assert_compiles("each_opt([[1, 2], [3]]).inspect"), @r#""[[1, 2], [3, :dflt]]""#);
+    assert_snapshot!(assert_compiles("each_rest([[1, 2, 3]]).inspect"), @r#""[[1, [2, 3]]]""#);
+    assert_snapshot!(assert_compiles("each_post([[1, 2, 3, 4]]).inspect"), @r#""[[1, [2, 3], 4]]""#);
+}
+
+/// Nested destructuring (`|a, (b, c)|`) has an extra `expandarray` in the block body but the
+/// outer arity is still simple, so the expansion applies and the body does the rest.
+#[test]
+fn test_block_autosplat_nested_destructuring() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a, (b, c)| out << [a, b, c] }
+          out
+        end
+        each_of([[1, [2, 3]]])
+        each_of([[1, [2, 3]]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([[1, [2, 3]], [4, [5, 6]]]).inspect"),
+        @r#""[[1, 2, 3], [4, 5, 6]]""#);
+}
+
 #[test]
 fn test_inline_block_non_local_return_with_args() {
     set_call_threshold(2);
