@@ -749,6 +749,13 @@ rb_gc_impl_zjit_new_obj_fastpath(void *objspace_ptr, size_t alloc_size, VALUE fl
 #endif
 }
 
+bool
+rb_gc_impl_zjit_writebarrier_fastpath(void *objspace_ptr, struct rb_gc_zjit_fastpath *fastpath)
+{
+    /* MMTk's write barrier state is not decidable from object flags. */
+    return false;
+}
+
 void
 rb_gc_impl_init(void)
 {

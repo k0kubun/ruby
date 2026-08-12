@@ -96,6 +96,7 @@ fn main() {
         .allowlist_type("rb_gc_zjit_fastpath")
         .allowlist_type("rb_gc_zjit_fastpath_data")
         .allowlist_type("rb_gc_zjit_default_new_obj_fastpath")
+        .allowlist_type("rb_gc_zjit_default_writebarrier_fastpath")
         .allowlist_type("rb_gc_zjit_mmtk_new_obj_fastpath")
         .allowlist_var("RB_GC_ZJIT_FASTPATH_.*")
 
