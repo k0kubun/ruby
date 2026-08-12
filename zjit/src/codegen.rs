@@ -465,8 +465,9 @@ fn retarget_exception_entry_guards(cb: &mut CodeBlock, iseq: IseqPtr, insn_idx: 
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
 pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
-    let version_count = get_or_create_iseq_payload(iseq).version_count_for(*version);
-    if !unsafe { version.as_ref() }.is_invalidated() && version_count < max_iseq_versions() {
+    let payload = get_or_create_iseq_payload(iseq);
+    let version_count = payload.version_count_for(*version);
+    if !unsafe { version.as_ref() }.is_invalidated() && version_count < payload.version_limit() {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
 
@@ -628,7 +629,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         _ => {},
     }
     // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    if payload.versions.len() >= payload.version_limit() {
         return Err(CompileError::IseqVersionLimitReached);
     }
 
@@ -1225,6 +1226,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, &function.frame_state(*state))
         }
         &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, &function.frame_state(state)),
+        Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), &function.frame_state(*state))),
         Insn::SetGlobal { id, val, state } => no_output!(gen_setglobal(jit, asm, function, *id, opnd!(val), &function.frame_state(*state))),
         Insn::GetGlobal { id, state } => gen_getglobal(jit, asm, function, *id, &function.frame_state(*state)),
         &Insn::IsBlockParamModified { flags } => gen_is_block_param_modified(asm, opnd!(flags)),
@@ -1722,6 +1724,19 @@ fn gen_getivar_generic(asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_
         let iseq = Opnd::Value(state.iseq.into());
         asm_ccall!(asm, rb_vm_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic))
     }
+}
+
+/// Record the shape of a receiver that reached a frozen ivar dispatch's fallback path so the
+/// site can earn a recompile that specializes it. See [`crate::profile::rb_zjit_ivar_reprofile`].
+fn gen_ivar_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, state: &FrameState) {
+    asm_comment!(asm, "reprofile ivar shape");
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    use crate::profile::rb_zjit_ivar_reprofile;
+    asm_ccall!(asm, rb_zjit_ivar_reprofile,
+        Opnd::const_ptr(jit.version.as_ptr()),
+        Opnd::Value(VALUE::from(state.iseq)),
+        Opnd::UImm(state.insn_idx() as u64),
+        recv);
 }
 
 /// Emit the inline half of an ivar shape table lookup: hash the receiver's shape
@@ -4389,7 +4404,8 @@ fn compile_iseq(iseq: IseqPtr, exception_entries: Option<&[ExceptionEntrySpec]>)
         trace_compile_phase("optimize", || function.optimize());
     }
     function.dump_hir();
-    let non_final_version = get_or_create_iseq_payload(iseq).versions.len() + 1 < max_iseq_versions();
+    let payload = get_or_create_iseq_payload(iseq);
+    let non_final_version = payload.versions.len() + 1 < payload.version_limit();
     if exception_entries.is_none() && non_final_version {
         reset_profiles_remaining(iseq);
     }
@@ -4601,7 +4617,7 @@ c_callable! {
         {
             let payload = get_or_create_iseq_payload(compiled_iseq);
             let version_count = payload.version_count_for(compiled_version);
-            if unsafe { compiled_version.as_ref() }.is_invalidated() || version_count >= max_iseq_versions() {
+            if unsafe { compiled_version.as_ref() }.is_invalidated() || version_count >= payload.version_limit() {
                 return;
             }
 
