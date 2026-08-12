@@ -5158,8 +5158,9 @@ mod hir_opt_tests {
           v37:Fixnum[60] = Const Value(60)
           v39:Fixnum[70] = Const Value(70)
           v41:Fixnum[80] = Const Value(80)
-          v43:BasicObject = Send v52, :target, v27, v29, v31, v33, v35, v37, v39, v41 # SendFallbackReason: Too many arguments for LIR
-          v45:ArrayExact = NewArray v53, v56, v43
+          PatchPoint MethodRedefined(Object@0x1000, target@0x1008, cme:0x1010)
+          v59:BasicObject = SendDirect v52, 0x0, :target (0x1038), jit_entry_idx=7, v27, v29, v31, v33, v35, v37, v39, v41
+          v45:ArrayExact = NewArray v53, v56, v59
           CheckInterrupts
           Return v45
         ");

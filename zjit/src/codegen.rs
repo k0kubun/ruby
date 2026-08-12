@@ -1784,15 +1784,6 @@ fn gen_send_iseq_direct(
         asm.store(Opnd::mem(64, SP, bits_offset as i32), unspecified_bits.into());
     }
 
-    asm_comment!(asm, "switch to new SP register");
-    let sp_offset = (state.stack().len() + local_size - args.len() + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
-    let new_sp = asm.add(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
-
-    asm_comment!(asm, "switch to new CFP");
-    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp); // will be published at `ec->cfp` after callee's entrypoint
-
     let params = unsafe { iseq.params() };
 
     // For &block, the JIT entrypoint expects the block_handler as an argument
@@ -1818,6 +1809,29 @@ fn gen_send_iseq_direct(
             c_args.push(specval);
         }
     }
+
+    // The JIT entry only reads C_ARG_OPNDS.len() values from C argument registers. Anything
+    // past that goes into the callee's local slots on the VM stack, which the callee entry
+    // reads back from its EP. c_args[0] is self, so c_args[i] fills local slot i - 1;
+    // jit_entry_passes_args_on_stack() made sure that mapping holds. This has to run before
+    // SP is switched to the callee frame because the offsets are from the caller's SP.
+    if c_args.len() > C_ARG_OPNDS.len() {
+        asm_comment!(asm, "write arguments that don't fit in registers to callee frame");
+        for (c_arg_idx, &arg) in c_args.iter().enumerate().skip(C_ARG_OPNDS.len()) {
+            let local_offset = (state.stack().len() - args.len() + c_arg_idx - 1) * SIZEOF_VALUE;
+            asm.store(Opnd::mem(64, SP, local_offset as i32), arg);
+        }
+        c_args.truncate(C_ARG_OPNDS.len());
+    }
+
+    asm_comment!(asm, "switch to new SP register");
+    let sp_offset = (state.stack().len() + local_size - args.len() + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
+    let new_sp = asm.add(SP, sp_offset.into());
+    asm.mov(SP, new_sp);
+
+    asm_comment!(asm, "switch to new CFP");
+    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, new_cfp); // will be published at `ec->cfp` after callee's entrypoint
 
     // Make a method call. The target address will be rewritten once compiled.
     let iseq_call = IseqCall::new(iseq, jit_entry_idx, args.len().try_into().expect("checked in HIR"));
@@ -3862,8 +3876,9 @@ fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodeP
     // interpreter with this callee frame. Direct JIT-to-JIT calls pass arguments
     // in C argument registers, so spill the packed argument locals first. The
     // fallback path will reshape these around any optional positional gaps.
-    let argc = iseq_call.argc.to_usize();
-    assert!(argc < C_ARG_OPNDS.len(), "SendDirect must fit receiver plus arguments in C argument registers");
+    // Arguments past the C argument registers were written into the callee's local slots by
+    // gen_send_iseq_direct(), so they are already where the fallback path expects them.
+    let argc = iseq_call.argc.to_usize().min(C_ARG_OPNDS.len() - 1);
     let local_size = unsafe { get_iseq_body_local_table_size(iseq_call.iseq.get()) }.to_usize();
     for arg_idx in 0..argc {
         asm.store(

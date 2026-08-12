@@ -2715,8 +2715,10 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     let send_argc = send_positional_argc + kw_total_num as usize;
     let c_argc = 1 + send_argc + block_arg; // +1 for self
 
-    // TODO: Support passing arguments on the stack in C calls
-    if c_argc > C_ARG_OPNDS.len() {
+    // asm.ccall() can only pass C_ARG_OPNDS.len() values in registers. Arguments past that
+    // are written into the callee's local slots on the VM stack instead, which only works
+    // when argument order matches local order.
+    if c_argc > C_ARG_OPNDS.len() && !jit_entry_passes_args_on_stack(iseq, passed_opt_num) {
         function.set_dynamic_send_reason(send_insn, TooManyArgsForLir);
         return false;
     }
@@ -7986,6 +7988,44 @@ fn num_locals(iseq: *const rb_iseq_t) -> usize {
     (unsafe { get_iseq_body_local_table_size(iseq) }).to_usize()
 }
 
+/// The callee local slot each JIT-to-JIT call argument fills, in argument order.
+/// Index 0 is `self`, which has no local slot and is reported as `None`; the rest
+/// mirror the local walk in [`compile_jit_entry_state`].
+fn jit_entry_arg_locals(iseq: IseqPtr, passed_opt_num: usize) -> Vec<Option<usize>> {
+    let params = unsafe { iseq.params() };
+    let param_size = params.size.to_usize();
+    let opt_num: usize = params.opt_num.try_into().expect("iseq param opt_num >= 0");
+    let lead_num: usize = params.lead_num.try_into().expect("iseq param lead_num >= 0");
+    let kw_bits_idx: Option<usize> = if unsafe { rb_get_iseq_flags_has_kw(iseq) } {
+        let keyword = unsafe { rb_get_iseq_body_param_keyword(iseq) };
+        if keyword.is_null() { None } else { Some(unsafe { (*keyword).bits_start } as usize) }
+    } else {
+        None
+    };
+
+    let mut arg_locals = vec![None];
+    for local_idx in 0..num_locals(iseq) {
+        if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) { continue; }
+        if Some(local_idx) == kw_bits_idx { continue; }
+        if local_idx >= param_size { continue; }
+        arg_locals.push(Some(local_idx));
+    }
+    arg_locals
+}
+
+/// Whether a JIT-to-JIT call to this entry may pass arguments that don't fit in the C
+/// argument registers through the callee's local slots on the VM stack.
+///
+/// The caller writes them, the callee entry reads them back, and [`gen_function_stub`]
+/// leaves them alone, all addressing the slot by argument index. That only lines up when
+/// argument order matches local order, i.e. there is no gap for unfilled optionals or for
+/// the keyword bits local in the middle of the parameters.
+pub fn jit_entry_passes_args_on_stack(iseq: IseqPtr, passed_opt_num: usize) -> bool {
+    jit_entry_arg_locals(iseq, passed_opt_num).iter().enumerate()
+        .skip(1) // self has no local slot
+        .all(|(arg_idx, &local_idx)| local_idx == Some(arg_idx - 1))
+}
+
 /// Number of declared keyword parameters on the callee, or zero if the
 /// callee does not accept any keywords.
 fn callee_kw_num(iseq: *const rb_iseq_t) -> usize {
@@ -10417,6 +10457,10 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         None
     };
 
+    // Arguments past the C argument registers are passed through the callee's local slots
+    // on the VM stack. See `jit_entry_passes_args_on_stack`.
+    let args_on_stack = jit_entry_passes_args_on_stack(iseq, passed_opt_num);
+
     let mut arg_idx: u32 = 0;
     // For `def` methods on classes that can only produce heap (non-immediate)
     // instances, `self` is a HeapBasicObject. See `iseq_self_is_heap_object`.
@@ -10448,7 +10492,17 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
             )
         } else if local_idx < param_size {
             let id = unsafe { rb_zjit_local_id(iseq, local_idx.try_into().unwrap()) };
-            let local = fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject });
+            let local = if args_on_stack && arg_idx as usize >= C_ARG_OPNDS.len() {
+                // The caller ran out of C argument registers and wrote this argument into
+                // our local slot instead. See gen_send_iseq_direct().
+                let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
+                let ep_offset_u32 = u32::try_from(ep_offset)
+                    .unwrap_or_else(|_| panic!("Could not convert ep_offset {ep_offset} to u32"));
+                let ep = *ep.get_or_insert_with(|| fun.get_ep(jit_entry_block, 0));
+                fun.get_local_from_ep(jit_entry_block, iseq, ep, ep_offset_u32, 0, types::BasicObject)
+            } else {
+                fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject })
+            };
             arg_idx += 1;
             local
         } else {
