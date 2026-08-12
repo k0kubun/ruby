@@ -2145,13 +2145,24 @@ impl Assembler
 
         // Track writes to the CFP register so that codegen can cache values derived
         // from it (see JITState::block_handler_specval).
-        if let Some(&out) = insn.out_opnd() {
-            if Self::has_reg(out, crate::backend::current::CFP.unwrap_reg()) {
-                self.cfp_generation += 1;
-            }
+        if Self::writes_cfp_reg(&insn) {
+            self.cfp_generation += 1;
         }
 
         self.current_block().push_insn(insn);
+    }
+
+    /// True if `insn` writes the CFP register. `Insn::Mov` and `Insn::LoadInto` write
+    /// their destination without exposing it through `out_opnd()`, and moving CFP into
+    /// an inlined frame (gen_push_inline_frame) uses exactly that form, so they have to
+    /// be checked separately. `Opnd::Mem` destinations write memory, not the register.
+    fn writes_cfp_reg(insn: &Insn) -> bool {
+        let cfp_reg = crate::backend::current::CFP.unwrap_reg();
+        match insn {
+            Insn::Mov { dest, .. } | Insn::LoadInto { dest, .. } =>
+                matches!(dest, Opnd::Reg(reg) if *reg == cfp_reg),
+            _ => insn.out_opnd().is_some_and(|&out| Self::has_reg(out, cfp_reg)),
+        }
     }
 
     /// A counter that changes whenever the CFP register is written.
