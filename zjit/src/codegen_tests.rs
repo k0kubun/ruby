@@ -7234,6 +7234,50 @@ fn test_max_iseq_versions() {
 }
 
 #[test]
+fn test_ivar_respecialization_beyond_max_versions() {
+    let max_versions = max_iseq_versions();
+    // Burn every version on constant invalidation so `read` compiles its last version with
+    // `no_side_exits`, freezing a shape dispatch built from a profile that has only seen A.
+    eval(&format!("
+        TEST = -1
+        class Base
+          def read = @v + TEST
+        end
+        class A < Base; def initialize = @v = 1; end
+        class B < Base; def initialize = (@w = 0; @v = 2); end
+
+        a = A.new
+        i = 0
+        while i < {max_versions} + 1
+          a.read; a.read
+          Object.send(:remove_const, :TEST)
+          TEST = i
+          i += 1
+        end
+    "));
+    let iseq = get_instance_method_iseq("Base", "read");
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), max_versions);
+
+    // Now feed it a shape the frozen dispatch has no arm for, at a different ivar index. The
+    // fallback path samples it and earns the ISEQ an extra version, so it exceeds the plain
+    // version limit but stays within the respecialization budget.
+    eval("
+        b = B.new
+        i = 0
+        while i < 2000
+          b.read
+          i += 1
+        end
+    ");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(payload.ivar_respecializations >= 1, "expected an ivar respecialization");
+    assert!(payload.ivar_respecializations <= crate::payload::MAX_IVAR_RESPECIALIZATIONS);
+    assert!(payload.versions.len() > max_versions);
+    assert!(payload.versions.len() <= max_versions + crate::payload::MAX_IVAR_RESPECIALIZATIONS as usize);
+    assert_snapshot!(assert_compiles_allowing_exits("[A.new.read, B.new.read]"), @"[5, 6]");
+}
+
+#[test]
 fn test_optional_arguments_side_exit() {
     assert_snapshot!(inspect("
         def test(a = (def foo = nil)) = a
