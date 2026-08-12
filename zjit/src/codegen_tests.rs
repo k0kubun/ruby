@@ -2227,6 +2227,62 @@ fn test_send_ruby2_keywords_to_positional_hash_fallback() {
 }
 
 #[test]
+fn test_send_splat_expanded_to_positional_args() {
+    eval("
+        def target(a, b) = a - b
+        def entry(args) = target(*args)
+        entry([1, 2])
+    ");
+    assert_snapshot!(assert_compiles("entry([10, 3])"), @"7");
+}
+
+#[test]
+fn test_send_splat_expanded_with_leading_positional_arg() {
+    eval("
+        def target(a, b, c) = [a, b, c]
+        def entry(args) = target(1, *args)
+        entry([2, 3])
+    ");
+    assert_snapshot!(assert_compiles("entry([4, 5])"), @"[1, 4, 5]");
+}
+
+#[test]
+fn test_send_splat_expanded_into_rest_parameter() {
+    eval("
+        def target(*args) = args
+        def entry(args) = target(*args)
+        entry([1, 2])
+    ");
+    assert_snapshot!(assert_compiles("entry([3, 4])"), @"[3, 4]");
+}
+
+#[test]
+fn test_send_splat_with_changed_length_side_exits() {
+    eval("
+        def target(*args) = args.sum
+        def entry(args) = target(*args)
+        entry([1, 2])
+        entry([1, 2])
+    ");
+    // The guarded length no longer matches, so the call falls back to the interpreter.
+    assert_snapshot!(inspect("entry([1, 2, 3])"), @"6");
+}
+
+#[test]
+fn test_send_splat_of_ruby2_keywords_hash_side_exits() {
+    // `forward` is not itself ruby2_keywords, so it speculates on the splat, but the array it
+    // receives ends in a flagged Hash that the interpreter turns back into keywords.
+    eval("
+        def target(k: 0) = k
+        def forward(args) = target(*args)
+        ruby2_keywords def outer(*args) = forward(args)
+        outer(k: 1)
+        outer(k: 1)
+    ");
+    assert_snapshot!(inspect("outer(k: 2)"), @"2");
+}
+
+#[test]
 fn test_send_rest_arguments_with_block_literal() {
     eval("
         def test(*args) = yield args.length
