@@ -2944,9 +2944,6 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallb
     if 1 + argc > C_ARG_OPNDS.len() {
         return Err(TooManyArgsForLir);
     }
-    if crate::codegen::block_iseq_may_throw(iseq) {
-        return Err(InvokeBlockNotSpecialized);
-    }
     Ok(())
 }
 
