@@ -4284,7 +4284,7 @@ pub(crate) mod hir_build_tests {
           v15:NilClass = Const Value(nil)
           Jump bb3(v10, v11, v12, v13, v14, v15)
         bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v29:ArrayExact = ToArray v19
+          v29:ArrayExact = GuardType v19, ArrayExact recompile
           PatchPoint NoEPEscape(test)
           v36:CPtr = GetEP 0
           v37:CUInt64 = LoadField v36, :VM_ENV_DATA_INDEX_FLAGS@0x1004
@@ -4426,7 +4426,7 @@ pub(crate) mod hir_build_tests {
           v15:NilClass = Const Value(nil)
           Jump bb3(v10, v11, v12, v13, v14, v15)
         bb3(v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject, v21:BasicObject, v22:NilClass):
-          v29:ArrayExact = ToArray v19
+          v29:ArrayExact = GuardType v19, ArrayExact recompile
           PatchPoint NoEPEscape(test)
           v36:CPtr = GetEP 0
           v37:CUInt64 = LoadField v36, :VM_ENV_DATA_INDEX_FLAGS@0x1004
