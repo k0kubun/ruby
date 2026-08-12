@@ -7922,6 +7922,29 @@ struct BytecodeInfo {
     jump_targets: Vec<u32>,
 }
 
+/// The largest `opt_case_dispatch` hash we are willing to turn into an inline
+/// binary search. Bigger `case`/`when` statements keep the `===` chain.
+const MAX_CASE_DISPATCH_ENTRIES: usize = 512;
+
+/// Read the `(key, jump offset)` pairs out of an `opt_case_dispatch` hash, sorted by key.
+/// Returns None unless every key is a Fixnum, which is what lets us compile the dispatch
+/// as an integer comparison tree guarded by a single `Integer#===` redefinition check.
+fn cdhash_fixnum_entries(cdhash: VALUE) -> Option<Vec<(i64, i64)>> {
+    let mut buf = vec![0 as std::os::raw::c_long; MAX_CASE_DISPATCH_ENTRIES * 2];
+    let size = unsafe {
+        rb_zjit_cdhash_fixnum_entries(cdhash, buf.as_mut_ptr(), MAX_CASE_DISPATCH_ENTRIES as std::os::raw::c_long)
+    };
+    if size <= 0 {
+        return None;
+    }
+    let mut entries: Vec<(i64, i64)> = buf[..(size as usize) * 2]
+        .chunks_exact(2)
+        .map(|pair| (pair[0] as i64, pair[1] as i64))
+        .collect();
+    entries.sort_unstable_by_key(|&(key, _)| key);
+    Some(entries)
+}
+
 fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeInfo {
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     let mut insn_idx = 0;
@@ -7951,6 +7974,16 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
             YARVINSN_opt_new => {
                 let offset = get_arg(pc, 1).as_i64();
                 jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+            }
+            YARVINSN_opt_case_dispatch => {
+                // The `when` bodies are already jump targets of the `===` chain that
+                // follows, but the else offset is only reachable by fallthrough there.
+                if let Some(entries) = cdhash_fixnum_entries(get_arg(pc, 0)) {
+                    for (_, offset) in entries {
+                        jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+                    }
+                    jump_targets.insert(insn_idx_at_offset(insn_idx, get_arg(pc, 1).as_i64()));
+                }
             }
             YARVINSN_leave | YARVINSN_opt_invokebuiltin_delegate_leave => {
                 if insn_idx < iseq_size {
@@ -8930,10 +8963,77 @@ fn add_iseq_to_hir(
                     queue.push_back((state.clone(), target, target_idx, local_inval));
                 }
                 YARVINSN_opt_case_dispatch => {
-                    // TODO: Some keys are visible at compile time, so in the future we can
-                    // compile jump targets for certain cases
-                    // Pop the key from the stack and fallback to the === branches for now
-                    state.stack_pop()?;
+                    let key = state.stack_pop()?;
+                    // The interpreter jumps straight out of `opt_case_dispatch` on a hit, so
+                    // the `===` chain that follows is dead code there and never gets profiled.
+                    // Compiling the chain therefore means an unprofiled `Integer#===` cfunc
+                    // call per `when` clause tested. Compile the hash lookup instead, as a
+                    // binary search over the (Fixnum) keys.
+                    // The chain calls `Integer#===` on each `when` literal, so the lookup only
+                    // agrees with it while that stays the stock implementation.
+                    let unredefined = unsafe { rb_BASIC_OP_UNREDEFINED_P(BOP_EQQ, INTEGER_REDEFINED_OP_FLAG) };
+                    let Some(entries) = unredefined.then(|| cdhash_fixnum_entries(get_arg(pc, 0))).flatten() else {
+                        // Fall through to the `===` chain.
+                        continue;
+                    };
+                    fun.push_insn(block, Insn::PatchPoint {
+                        invariant: Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQQ },
+                        state: exit_id,
+                    });
+                    // Only Fixnum keys can match an all-Fixnum dispatch hash. Anything else
+                    // falls through to the `===` chain, which handles every type correctly.
+                    let is_fixnum = fun.push_insn(block, Insn::HasType { val: key, expected: types::Fixnum });
+                    let chain_block = fun.new_block(insn_idx);
+                    let dispatch_block = fun.new_block(insn_idx);
+                    fun.push_insn(block, Insn::CondBranch {
+                        val: is_fixnum,
+                        if_true: BranchEdge { target: dispatch_block, args: vec![] },
+                        if_false: BranchEdge { target: chain_block, args: vec![] },
+                    });
+                    let key_fixnum = fun.push_insn(dispatch_block, Insn::RefineType { val: key, new_type: types::Fixnum });
+                    let mut state = state.clone();
+                    state.replace(key, key_fixnum);
+                    let else_idx = insn_idx_at_offset(insn_idx, get_arg(pc, 1).as_i64());
+                    let else_block = insn_idx_to_block[&else_idx];
+                    // Emit a comparison tree over the sorted keys. Each leaf range is scanned
+                    // linearly; anything bigger splits on a pivot key.
+                    let mut work = vec![(0usize, entries.len(), dispatch_block)];
+                    while let Some((lo, hi, mut cur)) = work.pop() {
+                        if hi - lo > 3 {
+                            let mid = lo + (hi - lo) / 2;
+                            let pivot = fun.push_insn(cur, Insn::Const { val: Const::Value(VALUE::fixnum_from_isize(entries[mid].0 as isize)) });
+                            let less = fun.push_insn(cur, Insn::FixnumLt { left: key_fixnum, right: pivot });
+                            let less_c = fun.push_insn(cur, Insn::Test { val: less });
+                            let lo_block = fun.new_block(insn_idx);
+                            let hi_block = fun.new_block(insn_idx);
+                            fun.push_insn(cur, Insn::CondBranch {
+                                val: less_c,
+                                if_true: BranchEdge { target: lo_block, args: vec![] },
+                                if_false: BranchEdge { target: hi_block, args: vec![] },
+                            });
+                            work.push((lo, mid, lo_block));
+                            work.push((mid, hi, hi_block));
+                            continue;
+                        }
+                        for &(key_value, offset) in &entries[lo..hi] {
+                            let target_idx = insn_idx_at_offset(insn_idx, offset);
+                            let target = insn_idx_to_block[&target_idx];
+                            let expected = fun.push_insn(cur, Insn::Const { val: Const::Value(VALUE::fixnum_from_isize(key_value as isize)) });
+                            let matches = fun.push_insn(cur, Insn::IsBitEqual { left: key_fixnum, right: expected });
+                            let next = fun.new_block(insn_idx);
+                            fun.push_insn(cur, Insn::CondBranch {
+                                val: matches,
+                                if_true: BranchEdge { target, args: state.as_args(self_param) },
+                                if_false: BranchEdge { target: next, args: vec![] },
+                            });
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                            cur = next;
+                        }
+                        fun.push_insn(cur, Insn::Jump(BranchEdge { target: else_block, args: state.as_args(self_param) }));
+                        queue.push_back((state.clone(), else_block, else_idx, local_inval));
+                    }
+                    // Keep compiling the `===` chain for non-Fixnum keys.
+                    block = chain_block;
                 }
                 YARVINSN_opt_new => {
                     let cd: *const rb_call_data = get_arg(pc, 0).as_ptr();
