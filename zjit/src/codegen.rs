@@ -3316,7 +3316,12 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     // an extra register for asm.lea(), but you'll need to manage the SP offset like YJIT does.
     gen_incr_counter(asm, Counter::vm_write_sp_count);
     asm_comment!(asm, "save SP to CFP: {}", stack_size);
-    let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
+    // When the offset is 0, cfp->sp is just the SP register: skip the lea.
+    let sp_addr = if stack_size == 0 {
+        SP
+    } else {
+        asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32))
+    };
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
 }
