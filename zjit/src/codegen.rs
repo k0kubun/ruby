@@ -4298,33 +4298,58 @@ const STR_APPEND_REJECT_MASK: u64 = (RUBY_FL_FREEZE as u64) | STR_SHARED | STR_C
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
 
-    // Test if string encodings differ. If different, use rb_str_buf_append. If the same,
-    // inline the append when the receiver is a plain mutable heap string with enough
-    // capacity, and otherwise call rb_jit_str_simple_append, which calls rb_str_cat.
+    // Inline the append when the receiver is a plain mutable heap string with enough
+    // capacity and the bytes can be copied over as they are. Fall back to
+    // rb_jit_str_simple_append (which calls rb_str_cat) when the receiver needs to be
+    // resized or has any special state, and to rb_str_buf_append when the encodings
+    // need to be reconciled.
     asm_comment!(asm, "<< on strings");
 
-    // Take receiver's object flags XOR arg's flags. If any
-    // string-encoding flags are different between the two,
-    // the encodings don't match.
     let string_reg = asm.load_mem(string);
     let val_reg = asm.load_mem(val);
     let string_flags = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RBASIC_FLAGS));
-    let flags_xor = asm.xor(
-        string_flags,
-        Opnd::mem(VALUE_BITS, val_reg, RUBY_OFFSET_RBASIC_FLAGS)
-    );
-    asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    let val_flags = asm.load(Opnd::mem(VALUE_BITS, val_reg, RUBY_OFFSET_RBASIC_FLAGS));
 
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
+    let copy_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let copy_edge = || Target::Block(Box::new(lir::BranchEdge { target: copy_block, args: vec![] }));
     let simple_block = asm.new_block(hir_block_id, false, rpo_idx);
     let simple_edge = || Target::Block(Box::new(lir::BranchEdge { target: simple_block, args: vec![] }));
     let mismatch_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let mismatch_edge = Target::Block(Box::new(lir::BranchEdge { target: mismatch_block, args: vec![] }));
+    let mismatch_edge = || Target::Block(Box::new(lir::BranchEdge { target: mismatch_block, args: vec![] }));
     let result_block = asm.new_block(hir_block_id, false, rpo_idx);
     let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
-    asm.jnz(jit, mismatch_edge);
+    // Only copy bytes for the 3 preserved ASCII-compatible encodings (see
+    // rb_str_encindex_fastpath), which all have a single-byte terminator.
+    // Receivers with an encoding index above US-ASCII need rb_str_buf_append.
+    let enc_bits = asm.and(string_flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.cmp(enc_bits, Opnd::UImm((RUBY_ENCINDEX_US_ASCII as u64) << (RUBY_ENCODING_SHIFT as u64)));
+    asm.jg(jit, mismatch_edge());
+
+    // A 7-bit argument is appendable to any ASCII-compatible receiver without
+    // touching its encoding: rb_enc_cr_str_buf_cat keeps the receiver's encoding
+    // index whenever the appended coderange is 7-bit, and rb_str_buf_append has the
+    // same shortcut. This is what erubi-style templates hit, where the buffer comes
+    // from String.new (ASCII-8BIT) and every fragment appended to it is UTF-8.
+    let val_cr = asm.and(val_flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    asm.cmp(val_cr, Opnd::UImm(RUBY_ENC_CODERANGE_7BIT as u64));
+    asm.je(jit, copy_edge());
+
+    // Otherwise the bytes only carry over when both strings have the same encoding.
+    // Take receiver's object flags XOR arg's flags. If any string-encoding flags are
+    // different between the two, the encodings don't match.
+    let flags_xor = asm.xor(string_flags, val_flags);
+    asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.jnz(jit, mismatch_edge());
+    asm.jmp(copy_edge());
+
+    // The bytes of the argument can be copied into the receiver as they are, keeping
+    // the receiver's encoding.
+    asm.set_current_block(copy_block);
+    let label = jit.get_label(asm, copy_block, hir_block_id);
+    asm.write_label(label);
 
     // The receiver must be a bare mutable heap string to append in place:
     // no sharing in either direction, not frozen or chilled or temporarily
@@ -4332,13 +4357,6 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     let masked_flags = asm.and(string_flags, Opnd::UImm(STR_APPEND_REJECT_MASK | RSTRING_NOEMBED as u64));
     asm.cmp(masked_flags, Opnd::UImm(RSTRING_NOEMBED as u64));
     asm.jne(jit, simple_edge());
-
-    // Only inline for the 3 preserved ASCII-compatible encodings (see
-    // rb_str_encindex_fastpath), which all have a single-byte terminator.
-    // Encoding indexes above US-ASCII take the fallback call.
-    let enc_bits = asm.and(string_flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
-    asm.cmp(enc_bits, Opnd::UImm((RUBY_ENCINDEX_US_ASCII as u64) << (RUBY_ENCODING_SHIFT as u64)));
-    asm.jg(jit, simple_edge());
 
     // Check that the appended bytes fit in the existing capacity. The unsigned
     // comparison also sends a (practically impossible) overflowing total length
@@ -4371,7 +4389,7 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     asm_ccall!(asm, rb_jit_str_simple_append, string, val);
     asm.jmp(result_edge());
 
-    // If encodings are different, use a slower encoding-aware concatenate
+    // If the bytes can't be copied as they are, use a slower encoding-aware concatenate
     asm.set_current_block(mismatch_block);
     let label = jit.get_label(asm, mismatch_block, hir_block_id);
     asm.write_label(label);

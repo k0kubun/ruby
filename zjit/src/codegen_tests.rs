@@ -4177,6 +4177,40 @@ fn test_string_append_encoding_mismatch() {
 }
 
 #[test]
+fn test_string_append_ascii_only_arg() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // A 7-bit argument copies over without changing the BINARY receiver's
+    // encoding, which is the shape erubi-style templates build: the buffer
+    // comes from String.new and every fragment appended to it is UTF-8.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new
+        test(s, "abc")
+        test(s, "déf".b)
+        test(s, "ghi")
+        [s.bytesize, s.encoding.name, s.valid_encoding?, s == "abcd\xC3\xA9fghi".b]
+    "#), @r#"[10, "ASCII-8BIT", true, true]"#);
+}
+
+#[test]
+fn test_string_append_ascii_only_arg_to_non_ascii_receiver() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // The receiver keeps its own encoding even though it holds non-ASCII bytes,
+    // because appending 7-bit bytes can't invalidate it.
+    assert_snapshot!(assert_compiles(r#"
+        s = +"héllo"
+        test(s, "abc".b)
+        test(s, "def".dup.force_encoding(Encoding::US_ASCII))
+        [s, s.encoding.name, s.valid_encoding?]
+    "#), @r#"["hélloabcdef", "UTF-8", true]"#);
+}
+
+#[test]
 fn test_string_append_incompatible_encoding() {
     eval(r#"
         def test(s, x) = s << x
