@@ -5182,6 +5182,81 @@ fn test_setinstancevariable() {
     "), @"1");
 }
 
+// The inlined write barrier may only skip rb_gc_writebarrier() when the GC has
+// nothing to remember. Writing a freshly allocated (young) object into an old one
+// is exactly the case it must not skip: GC.verify_internal_consistency() rb_bug()s
+// on an old object that points at an unremembered young object, and the minor GC
+// would sweep the value out from under the receiver.
+#[test]
+fn test_setinstancevariable_write_barrier_old_to_young() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def initialize = @a = nil
+          def set(value) = @a = value
+          def get = @a
+        end
+
+        obj = C.new
+        obj.set(nil)
+        obj.set(nil)
+        # Promote obj to the old generation, then point it at a young object that
+        # nothing else references.
+        4.times { GC.start }
+        obj.set("young".dup)
+        GC.verify_internal_consistency
+        GC.start(full_mark: false)
+        GC.verify_internal_consistency
+        obj.get
+    "#), @r#""young""#);
+}
+
+// Same, with the value written through an inlined write barrier while the GC is
+// allocating and collecting constantly.
+#[test]
+fn test_setinstancevariable_write_barrier_gc_stress() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def initialize = @a = nil
+          def set(value) = @a = value
+          def get = @a
+        end
+
+        objs = 10.times.map { C.new }
+        objs.each { |o| o.set(nil) }
+        4.times { GC.start }
+        begin
+          GC.stress = true
+          objs.each_with_index { |o, i| o.set([i].dup) }
+        ensure
+          GC.stress = false
+        end
+        GC.verify_internal_consistency
+        GC.start
+        objs.map(&:get)
+    "#), @"[[0], [1], [2], [3], [4], [5], [6], [7], [8], [9]]");
+}
+
+// A Ractor-shareable receiver needs bookkeeping that object flags cannot decide,
+// so the inlined barrier has to fall back to the C function for it.
+#[test]
+fn test_setinstancevariable_write_barrier_shareable_receiver() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def self.set(value) = @a = value
+          def self.get = @a
+        end
+
+        C.set(nil)
+        C.set(nil)
+        4.times { GC.start }
+        C.set("young".dup)
+        GC.verify_internal_consistency
+        GC.start(full_mark: false)
+        GC.verify_internal_consistency
+        C.get
+    "#), @r#""young""#);
+}
+
 #[test]
 fn test_polymorphic_setinstancevariable_with_shape_transitions() {
     set_call_threshold(3);

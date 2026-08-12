@@ -89,6 +89,15 @@ GC_IMPL_FN VALUE rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE k
  * generated instruction sequence; see zjit/src/gc_fastpath.rs.
  */
 GC_IMPL_FN bool rb_gc_impl_zjit_new_obj_fastpath(void *objspace_ptr, size_t alloc_size, VALUE flags, VALUE klass, struct rb_gc_zjit_fastpath *fastpath);
+/* This is an (optional) function that allows the GC implementation to return
+ * metadata for ZJIT's inlined write barrier. Returns `true` if ZJIT can inline
+ * a fast path for rb_gc_impl_writebarrier(), `false` if every write to a heap
+ * object must call it.
+ *
+ * The GC fills `fastpath` with GC-specific metadata; ZJIT owns the generated
+ * instruction sequence, see zjit/src/codegen/gc_fastpath.rs.
+ */
+GC_IMPL_FN bool rb_gc_impl_zjit_writebarrier_fastpath(void *objspace_ptr, struct rb_gc_zjit_fastpath *fastpath);
 GC_IMPL_FN size_t rb_gc_impl_obj_slot_size(VALUE obj);
 GC_IMPL_FN size_t rb_gc_impl_size_slot_size(void *objspace_ptr, size_t size);
 GC_IMPL_FN bool rb_gc_impl_size_allocatable_p(size_t size);
