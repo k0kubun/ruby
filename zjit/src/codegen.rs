@@ -4273,6 +4273,13 @@ fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, val
     value
 }
 
+/// Flags that make a string ineligible for an in-place append: it is shared in either
+/// direction, frozen or chilled or temporarily locked, or doesn't own its buffer (so
+/// as.heap.aux.capa isn't a capacity).
+const STR_APPEND_REJECT_MASK: u64 = (RUBY_FL_FREEZE as u64) | STR_SHARED | STR_CHILLED
+    | STR_PRECOMPUTED_HASH | STR_SHARED_ROOT | STR_BORROWED | STR_TMPLOCK
+    | (RSTRING_FSTR as u64) | STR_NOFREE | STR_FAKESTR;
+
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
 
@@ -4307,9 +4314,6 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
     // The receiver must be a bare mutable heap string to append in place:
     // no sharing in either direction, not frozen or chilled or temporarily
     // locked, and owning its buffer so that as.heap.aux.capa is valid.
-    const STR_APPEND_REJECT_MASK: u64 = (RUBY_FL_FREEZE as u64) | STR_SHARED | STR_CHILLED
-        | STR_PRECOMPUTED_HASH | STR_SHARED_ROOT | STR_BORROWED | STR_TMPLOCK
-        | (RSTRING_FSTR as u64) | STR_NOFREE | STR_FAKESTR;
     let masked_flags = asm.and(string_flags, Opnd::UImm(STR_APPEND_REJECT_MASK | RSTRING_NOEMBED as u64));
     asm.cmp(masked_flags, Opnd::UImm(RSTRING_NOEMBED as u64));
     asm.jne(jit, simple_edge());
@@ -4369,8 +4373,83 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
 }
 
 fn gen_string_append_codepoint(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {
+    // Appending single bytes to a binary buffer with `buf << byte` is the inner loop of
+    // hand-written binary encoders, so inline the fast path of rb_jit_str_concat_codepoint():
+    // a bare mutable ASCII-8BIT heap string with spare capacity just gets one byte written.
+    // That path neither allocates nor raises nor runs Ruby code, so the interpreter frame is
+    // only made consistent on the fallback edge.
+    asm_comment!(asm, "<< with a codepoint");
+
+    let string_reg = asm.load(string);
+    let string_flags = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RBASIC_FLAGS));
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let fallback_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let fallback_edge = || Target::Block(Box::new(lir::BranchEdge { target: fallback_block, args: vec![] }));
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+
+    // The receiver must be a bare mutable ASCII-8BIT heap string to append in place: no
+    // sharing in either direction, not frozen or chilled or temporarily locked, and owning
+    // its buffer so that as.heap.aux.capa is valid. Requiring the encoding bits to be zero
+    // matches the ENCODING_GET_INLINED(str) == rb_ascii8bit_encindex() check in the C
+    // function, which also keeps the terminator one byte wide.
+    let masked_flags = asm.and(string_flags, Opnd::UImm(
+        STR_APPEND_REJECT_MASK | RSTRING_NOEMBED as u64 | RUBY_ENCODING_MASK as u64));
+    asm.cmp(masked_flags, Opnd::UImm(RSTRING_NOEMBED as u64));
+    asm.jne(jit, fallback_edge());
+
+    // Only 0 <= codepoint < 0xff takes the fast path in the C function.
+    let byte = asm.rshift(val, Opnd::UImm(1));
+    asm.cmp(byte, Opnd::UImm(0xff));
+    asm.jge(jit, fallback_edge());
+    asm.cmp(byte, Opnd::UImm(0));
+    asm.jl(jit, fallback_edge());
+
+    // The byte plus its terminator must fit in the existing capacity.
+    let string_len = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_LEN));
+    let new_len = asm.add(string_len, Opnd::UImm(1));
+    let capa = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_AS_HEAP_AUX_CAPA));
+    asm.cmp(capa, new_len);
+    asm.jb(jit, fallback_edge());
+
+    // sptr[len] = byte; STR_SET_LEN(str, len + 1); TERM_FILL(sptr + len + 1, 1)
+    let string_ptr = asm.load(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_AS_HEAP_PTR));
+    let dst = asm.add(string_ptr, string_len);
+    asm.store(Opnd::mem(8, dst, 0), byte.with_num_bits(8));
+    asm.store(Opnd::mem(VALUE_BITS, string_reg, RUBY_OFFSET_RSTRING_LEN), new_len);
+    asm.store(Opnd::mem(8, dst, 1), Opnd::UImm(0));
+
+    // Fix up the code range. A binary string is never BROKEN, so appending a non-ASCII byte
+    // always leaves it exactly VALID. Appending an ASCII byte cannot change the code range
+    // at all: 7BIT stays 7BIT, VALID stays VALID, and UNKNOWN may always stay UNKNOWN.
+    let valid_flags = asm.and(string_flags, Opnd::UImm(!(RUBY_ENC_CODERANGE_MASK as u64)));
+    let valid_flags = asm.or(valid_flags, Opnd::UImm(RUBY_ENC_CODERANGE_VALID as u64));
+    asm.cmp(byte, Opnd::UImm(0x80));
+    let new_flags = asm.csel_ge(valid_flags, string_flags);
+    // Only touch the low 32 bits of the word at offset 0; the upper half holds the shape ID.
+    asm.store(Opnd::mem(32, string_reg, RUBY_OFFSET_RBASIC_FLAGS), new_flags.with_num_bits(32));
+    asm.jmp(result_edge());
+
+    // Anything else goes through the C function, which grows the buffer or raises.
+    asm.set_current_block(fallback_block);
+    let label = jit.get_label(asm, fallback_block, hir_block_id);
+    asm.write_label(label);
     gen_prepare_non_leaf_call(jit, asm, function, state);
-    asm_ccall!(asm, rb_jit_str_concat_codepoint, string, val)
+    asm_ccall!(asm, rb_jit_str_concat_codepoint, string, val);
+    asm.jmp(result_edge());
+
+    // Join block
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    // The locals were only spilled on the fallback edge, so the next spill can't reuse
+    // what gen_prepare_non_leaf_call() recorded above.
+    jit.spilled_locals = None;
+
+    // String#<< returns the receiver
+    string
 }
 
 /// Generate a JIT entry that just increments exit_compilation_failure and exits
