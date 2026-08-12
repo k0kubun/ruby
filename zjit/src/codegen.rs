@@ -1066,6 +1066,10 @@ fn gen_ccall_with_frame(
     gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     gen_spill_locals(jit, asm, state);
 
+    // The receiver is used twice: as the callee frame's self and as the first C argument.
+    // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
+    let recv = gen_materialize_value(asm, recv);
+
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
         gen_block_handler_specval(asm, block_iseq)
     } else {
@@ -1106,6 +1110,16 @@ fn gen_ccall(asm: &mut Assembler, cfunc: *const u8, name: ID, owner: VALUE, recv
     cfunc_args.extend(args);
     asm.count_call_to_with(|| if owner == Qnil { name.contents_lossy().to_string() } else { qualified_method_name(owner, name) });
     asm.ccall(cfunc, cfunc_args)
+}
+
+/// Load a heap-object constant into a register so that multiple uses share one
+/// materialization. Non-heap operands are returned as is: they're either already
+/// in a register or cheap enough to re-encode at every use.
+fn gen_materialize_value(asm: &mut Assembler, opnd: Opnd) -> Opnd {
+    match opnd {
+        Opnd::Value(val) if !val.special_const_p() => asm.load(opnd),
+        _ => opnd,
+    }
 }
 
 // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
@@ -1149,6 +1163,10 @@ fn gen_ccall_variadic(
     // stack slots above cfp->sp, so only spill the stack below them.
     gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     gen_spill_locals(jit, asm, state);
+
+    // The receiver is used twice: as the callee frame's self and as the third C argument.
+    // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
+    let recv = gen_materialize_value(asm, recv);
 
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
         gen_block_handler_specval(asm, blockiseq)
