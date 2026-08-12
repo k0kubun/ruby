@@ -390,7 +390,12 @@ impl Assembler {
             // case. If the values aren't heap objects then we'll treat them as
             // if they were just unsigned integer.
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
-            let is_jump = insn.is_jump();
+            // A PatchPoint's only operands are the side-exit stack and locals. Lowering
+            // Opnd::Value there materializes the constant into a register on the fast
+            // path even though only the (cold) exit code reads it. compile_exit_save_state()
+            // handles Opnd::Value with a scratch register, just like it does for the side
+            // exits of jump instructions, so leave them alone.
+            let is_jump = insn.is_jump() || matches!(insn, Insn::PatchPoint(..));
 
             insn.for_each_operand_mut(|opnd| {
                 if let Opnd::Value(value) = opnd {
