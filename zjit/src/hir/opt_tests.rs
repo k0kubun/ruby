@@ -2832,7 +2832,7 @@ mod hir_opt_tests {
         let comment = function.push_comment(block, "diagnostic".to_string());
         let dead_const = function.push_insn(block, Insn::Const { val: Const::CBool(false) });
         let return_val = function.push_insn(block, Insn::Const { val: Const::CBool(true) });
-        function.push_insn(block, Insn::Return { val: return_val });
+        function.push_insn(block, Insn::Return { val: return_val, pop_inlined_frames: 0 });
         function.seal_entries();
 
         function.eliminate_dead_code();
@@ -4366,6 +4366,46 @@ mod hir_opt_tests {
           CheckInterrupts
           PopInlineFrame
           Return v45
+        ");
+    }
+
+    #[test]
+    fn test_inlined_yield_to_block_with_non_local_return_inlines_the_block() {
+        // The block is a literal of `test`, so its `return` unwinds to exactly the frame
+        // `test` returns from. The block body is inlined into the guard-free yield site and
+        // the `throw` becomes a plain `Return` that discards the two inlined frames.
+        let result = eval("
+            def foo = yield
+            def test
+              foo { return 1 }
+              99
+            end
+            test
+            test
+        ");
+        assert_eq!(VALUE::fixnum_from_usize(1), result);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
+          v22:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          PushInlineFrame :foo, v22 (0x1038), num_args=0
+          v39:CPtr = GetEP 0
+          v40:CInt64 = LoadField v39, :VM_ENV_DATA_INDEX_SPECVAL@0x1058
+          v41:CInt64[-4] = Const CInt64(-4)
+          v42:CInt64 = IntAnd v40, v41
+          v43:BasicObject = LoadField v42, :self@0x1059
+          PushInlineBlockFrame (0x1060), v43, v42, num_args=0
+          v36:Fixnum[1] = Const Value(1)
+          Return v36 (pop 2 inlined frames)
         ");
     }
 
