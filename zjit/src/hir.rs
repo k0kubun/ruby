@@ -1287,6 +1287,13 @@ pub enum Insn {
     FloatSub  { recv: InsnId, other: InsnId, state: InsnId },
     FloatMul  { recv: InsnId, other: InsnId, state: InsnId },
     FloatDiv  { recv: InsnId, other: InsnId, state: InsnId },
+    /// Float comparison: delegates to rb_float_lt/le/gt/ge. Unlike the arithmetic
+    /// instructions above these are leaf and allocation-free (they return Qtrue/Qfalse),
+    /// so they need neither a FrameState nor GC preparation.
+    FloatLt   { left: InsnId, right: InsnId },
+    FloatLe   { left: InsnId, right: InsnId },
+    FloatGt   { left: InsnId, right: InsnId },
+    FloatGe   { left: InsnId, right: InsnId },
     /// Float#to_i: truncate float to integer via rb_jit_flo_to_i
     FloatToInt { recv: InsnId, state: InsnId },
 
@@ -1506,6 +1513,10 @@ macro_rules! for_each_operand_impl {
             | Insn::FixnumLe { left, right }
             | Insn::FixnumGt { left, right }
             | Insn::FixnumGe { left, right }
+            | Insn::FloatLt { left, right }
+            | Insn::FloatLe { left, right }
+            | Insn::FloatGt { left, right }
+            | Insn::FloatGe { left, right }
             | Insn::FixnumEq { left, right }
             | Insn::FixnumNeq { left, right }
             | Insn::FixnumAnd { left, right }
@@ -1900,6 +1911,10 @@ impl Insn {
             Insn::FloatMul { .. } => effects::Any,
             Insn::FloatDiv { .. } => effects::Any,
             Insn::FloatToInt { .. } => effects::Any,
+            Insn::FloatLt { .. } => effects::Empty,
+            Insn::FloatLe { .. } => effects::Empty,
+            Insn::FloatGt { .. } => effects::Empty,
+            Insn::FloatGe { .. } => effects::Empty,
             Insn::FixnumEq { .. } => effects::Empty,
             Insn::FixnumNeq { .. } => effects::Empty,
             Insn::FixnumLt { .. } => effects::Empty,
@@ -2300,6 +2315,10 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FloatMul   { recv, other, .. } => { write!(f, "FloatMul {recv}, {other}") },
             Insn::FloatDiv   { recv, other, .. } => { write!(f, "FloatDiv {recv}, {other}") },
             Insn::FloatToInt { recv, .. } => { write!(f, "FloatToInt {recv}") },
+            Insn::FloatLt    { left, right } => { write!(f, "FloatLt {left}, {right}") },
+            Insn::FloatLe    { left, right } => { write!(f, "FloatLe {left}, {right}") },
+            Insn::FloatGt    { left, right } => { write!(f, "FloatGt {left}, {right}") },
+            Insn::FloatGe    { left, right } => { write!(f, "FloatGe {left}, {right}") },
             Insn::FixnumEq   { left, right, .. } => { write!(f, "FixnumEq {left}, {right}") },
             Insn::FixnumNeq  { left, right, .. } => { write!(f, "FixnumNeq {left}, {right}") },
             Insn::FixnumLt   { left, right, .. } => { write!(f, "FixnumLt {left}, {right}") },
@@ -3672,6 +3691,10 @@ impl Function {
             Insn::FloatMul   { .. } => types::Float,
             Insn::FloatDiv   { .. } => types::Float,
             Insn::FloatToInt { .. } => types::Integer,
+            Insn::FloatLt    { .. } => types::BoolExact,
+            Insn::FloatLe    { .. } => types::BoolExact,
+            Insn::FloatGt    { .. } => types::BoolExact,
+            Insn::FloatGe    { .. } => types::BoolExact,
             Insn::FixnumEq   { .. } => types::BoolExact,
             Insn::FixnumNeq  { .. } => types::BoolExact,
             Insn::FixnumLt   { .. } => types::BoolExact,
@@ -7725,6 +7748,15 @@ impl Function {
                 self.assert_subtype(insn_id, recv, types::Flonum)?;
                 // other can be Flonum or Fixnum (rb_float_plus etc. handle both)
                 self.assert_subtype(insn_id, other, types::Flonum.union(types::Fixnum))
+            }
+            Insn::FloatLt { left, right }
+            | Insn::FloatLe { left, right }
+            | Insn::FloatGt { left, right }
+            | Insn::FloatGe { left, right }
+            => {
+                self.assert_subtype(insn_id, left, types::Flonum)?;
+                // right can be Flonum or Fixnum (rb_float_lt etc. handle both)
+                self.assert_subtype(insn_id, right, types::Flonum.union(types::Fixnum))
             }
             Insn::FloatToInt { recv, .. } => {
                 self.assert_subtype(insn_id, recv, types::Flonum)

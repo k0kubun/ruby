@@ -1692,8 +1692,8 @@ rb_float_gt(VALUE x, VALUE y)
  *
  */
 
-static VALUE
-flo_ge(VALUE x, VALUE y)
+VALUE
+rb_float_ge(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -1728,8 +1728,8 @@ flo_ge(VALUE x, VALUE y)
  *  <tt>Float::NAN < Float::NAN</tt> returns an implementation-dependent value.
  */
 
-static VALUE
-flo_lt(VALUE x, VALUE y)
+VALUE
+rb_float_lt(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -1766,8 +1766,8 @@ flo_lt(VALUE x, VALUE y)
  *
  */
 
-static VALUE
-flo_le(VALUE x, VALUE y)
+VALUE
+rb_float_le(VALUE x, VALUE y)
 {
     double a, b;
 
@@ -6780,9 +6780,9 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "===", flo_eq, 1);
     rb_define_method(rb_cFloat, "<=>", flo_cmp, 1);
     rb_define_method(rb_cFloat, ">",  rb_float_gt, 1);
-    rb_define_method(rb_cFloat, ">=", flo_ge, 1);
-    rb_define_method(rb_cFloat, "<",  flo_lt, 1);
-    rb_define_method(rb_cFloat, "<=", flo_le, 1);
+    rb_define_method(rb_cFloat, ">=", rb_float_ge, 1);
+    rb_define_method(rb_cFloat, "<",  rb_float_lt, 1);
+    rb_define_method(rb_cFloat, "<=", rb_float_le, 1);
     rb_define_method(rb_cFloat, "eql?", flo_eql, 1);
     rb_define_method(rb_cFloat, "hash", flo_hash, 0);
 
