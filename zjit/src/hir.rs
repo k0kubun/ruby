@@ -10499,7 +10499,12 @@ fn add_iseq_to_hir(
                     // different block per call site, so requiring a monomorphic profile would
                     // leave every such shared yield site on the generic fallback. Buckets are
                     // ordered by frequency, so the hottest block is compared first below.
-                    let mut polymorphic_iseqs: Vec<IseqPtr> = vec![];
+                    // Each candidate carries the arity to auto-splat the lone yielded argument
+                    // into, or None when it takes the arguments as they are. Unlike the
+                    // single-ISEQ dispatches above, a candidate that needs the expansion can be
+                    // mixed in freely here: the expansion's miss joins this site's own generic
+                    // fallback, which still holds the unexpanded argument.
+                    let mut polymorphic_iseqs: Vec<(IseqPtr, Option<usize>)> = vec![];
                     if let Some(summary) = block_handler_summary.as_ref() {
                         if block_call_inlinable(flags) && (summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
                             for &profiled_type in summary.buckets() {
@@ -10509,8 +10514,17 @@ fn add_iseq_to_hir(
                                 let obj = profiled_type.class();
                                 if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                     let iseq = obj.as_iseq();
-                                    if !polymorphic_iseqs.contains(&iseq) && block_call_inlinable_iseq(iseq, args.len()).is_ok() {
-                                        polymorphic_iseqs.push(iseq);
+                                    if polymorphic_iseqs.iter().any(|&(seen, _)| seen == iseq) {
+                                        continue;
+                                    }
+                                    if block_call_inlinable_iseq(iseq, args.len()).is_ok() {
+                                        polymorphic_iseqs.push((iseq, None));
+                                    } else if args.len() == 1 {
+                                        if let Some(splat_num) = block_autosplat_arity(iseq) {
+                                            if block_call_inlinable_iseq(iseq, splat_num).is_ok() {
+                                                polymorphic_iseqs.push((iseq, Some(splat_num)));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -10589,7 +10603,7 @@ fn add_iseq_to_hir(
                         let captured_iseq = fun.load_captured_code_iseq(dispatch_block, captured);
 
                         let mut compare_block = dispatch_block;
-                        for &block_iseq in &polymorphic_iseqs {
+                        for &(block_iseq, splat_num) in &polymorphic_iseqs {
                             let expected = fun.push_insn(compare_block, Insn::Const { val: Const::CPtr(block_iseq as *const u8) });
                             let iseq_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
                             let direct_block = fun.new_block(insn_idx);
@@ -10599,7 +10613,44 @@ fn add_iseq_to_hir(
                                 if_true: BranchEdge { target: direct_block, args: vec![] },
                                 if_false: BranchEdge { target: miss_block, args: vec![] },
                             });
-                            let direct_result = fun.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: args.clone(), state: exit_id });
+                            // This candidate takes several parameters from the one yielded
+                            // value, so destructure it the way arg_setup_block would. Anything
+                            // that is not an Array of exactly that length joins the generic
+                            // fallback below, which handles every shape.
+                            let (direct_block, call_args, call_state) = match splat_num {
+                                None => (direct_block, args.clone(), exit_id),
+                                Some(splat_num) => {
+                                    let arg0 = args[0];
+                                    let length_block = fun.new_block(insn_idx);
+                                    let expand_block = fun.new_block(insn_idx);
+                                    let is_array = fun.push_insn(direct_block, Insn::HasType { val: arg0, expected: types::ArrayExact });
+                                    fun.push_insn(direct_block, Insn::CondBranch {
+                                        val: is_array,
+                                        if_true: BranchEdge { target: length_block, args: vec![] },
+                                        if_false: BranchEdge { target: fallback_block, args: vec![] },
+                                    });
+                                    let array = fun.push_insn(length_block, Insn::RefineType { val: arg0, new_type: types::ArrayExact });
+                                    let length = fun.push_insn(length_block, Insn::ArrayLength { array });
+                                    let expected_length = fun.push_insn(length_block, Insn::Const { val: Const::CInt64(splat_num as i64) });
+                                    let length_matches = fun.push_insn(length_block, Insn::IsBitEqual { left: length, right: expected_length });
+                                    fun.push_insn(length_block, Insn::CondBranch {
+                                        val: length_matches,
+                                        if_true: BranchEdge { target: expand_block, args: vec![] },
+                                        if_false: BranchEdge { target: fallback_block, args: vec![] },
+                                    });
+                                    let expanded: Vec<InsnId> = (0..splat_num).map(|idx| {
+                                        let index = fun.push_insn(expand_block, Insn::Const { val: Const::CInt64(idx as i64) });
+                                        fun.push_insn(expand_block, Insn::ArrayAref { array, index })
+                                    }).collect();
+                                    // See the single-ISEQ expansion above: the dispatch reads the
+                                    // caller's saved SP off this state, so its stack has to end
+                                    // in the expanded arguments.
+                                    let expanded_state = fun.frame_state(exit_id).with_replaced_args(&expanded, caller_argc);
+                                    let expanded_state = fun.push_insn(expand_block, Insn::Snapshot { state: Box::new(expanded_state) });
+                                    (expand_block, expanded, expanded_state)
+                                }
+                            };
+                            let direct_result = fun.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: call_args, state: call_state });
                             fun.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
                             compare_block = miss_block;
                         }
