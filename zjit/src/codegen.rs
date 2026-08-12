@@ -3356,9 +3356,9 @@ pub(crate) fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
     false
 }
 
-/// True if the block ISEQ contains a `throw` opcode (break, non-local return). ZJIT can't
-/// compile `throw`, so inlining such a block's frame would side-exit + deopt on every call.
-/// These blocks fall back to `vm_yield`, which handles the non-local exit in C.
+/// True if the block ISEQ contains a `throw` opcode (break, non-local return).
+/// `block_call_inlinable_iseq` uses this to keep blocks that can `break` on the generic
+/// `vm_yield` dispatch, which handles the non-local exit in C.
 /// (`next`/`redo` lower to `leave`/`jump`, not `throw`, so they stay inlinable.)
 pub(crate) fn block_iseq_may_throw(iseq: IseqPtr) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
