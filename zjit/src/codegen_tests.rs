@@ -6955,6 +6955,48 @@ fn test_opt_case_dispatch() {
 }
 
 #[test]
+fn test_opt_case_dispatch_fixnum() {
+    eval("
+        def test(x)
+          case x
+          when -3 then :a
+          when 0, 1 then :b
+          when 5 then :c
+          else :d
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(
+        assert_compiles("[-4, -3, 0, 1, 2, 5, 1.0, :x, nil].map { |x| test(x) }"),
+        @"[:d, :a, :b, :b, :d, :c, :b, :d, :d]"
+    );
+}
+
+#[test]
+fn test_opt_case_dispatch_fixnum_redefined() {
+    eval("
+        def test(x)
+          case x
+          when 0 then :a
+          when 1 then :b
+          else :c
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        [test(0), test(1), test(2)].tap {
+          class Integer
+            def ===(other) = true
+          end
+        } + [test(0), test(1), test(2)] + 100.times.map { test(2) }.uniq
+    "), @"[:a, :b, :c, :a, :a, :a, :a]");
+}
+
+#[test]
 fn test_checkmatch_case() {
     eval(r#"
         def test(o)
