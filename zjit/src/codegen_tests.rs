@@ -1276,6 +1276,22 @@ fn test_block_autosplat_nested_destructuring() {
         @r#""[[1, 2, 3], [4, 5, 6]]""#);
 }
 
+/// The real-world shape the larger threshold is for: `Array#each` is 41 instructions, so the
+/// ordinary threshold leaves `ary.each { return ... }` throwing on every call.
+#[test]
+fn test_inline_array_each_to_erase_block_non_local_return() {
+    set_call_threshold(2);
+    eval("
+        def test(ary)
+          ary.each { |x| return x * 2 if x > 2 }
+          -1
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles("test([1, 5, 3])"), @"10");
+}
+
 #[test]
 fn test_inline_block_non_local_return_with_args() {
     set_call_threshold(2);

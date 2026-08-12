@@ -3399,6 +3399,27 @@ unsafe extern "C" {
     fn rb_jit_iseq_has_ensure_catch_entry(iseq: IseqPtr) -> bool;
 }
 
+/// How much bigger a callee may be when inlining it is what lets [`inline_block_at_yield`]
+/// erase a block's non-local `return`. Multiplies `--zjit-inline-threshold`, so tuning that
+/// option down (or to 0, which disables inlining) still applies here. The default 30 * 3 = 90
+/// clears the iterators this shape shows up with: the Ruby-level `Array#each` needs 45.
+const BLOCK_RETURN_INLINE_THRESHOLD_FACTOR: usize = 3;
+
+/// True if the ISEQ contains an `invokeblock`, i.e. a `yield`.
+fn iseq_contains_invokeblock(iseq: IseqPtr) -> bool {
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+        if opcode == YARVINSN_invokeblock {
+            return true;
+        }
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+    false
+}
+
 /// True if every `throw` in the ISEQ is a plain non-local `return` (`TAG_RETURN` with no
 /// extra flags), and there is at least one of them.
 fn block_iseq_throws_only_return(iseq: IseqPtr) -> bool {
@@ -6470,9 +6491,33 @@ impl Function {
         true
     }
 
+    /// True if inlining `callee_iseq` is what stands between a `yield` inside it and
+    /// [`inline_block_at_yield`], which turns the literal block's non-local `return` into
+    /// a plain return of this function.
+    ///
+    /// [`inline_block_at_yield`] only fires when the yielding frame is itself inlined into
+    /// the frame the `return` escapes to, so an iterator that stays out of line leaves the
+    /// block on the JIT-to-JIT dispatch whose only exit is `throw TAG_RETURN`. That throw
+    /// longjmps out of every native JIT frame, and every frame between the catch frame and
+    /// the interpreter's `vm_exec` runs interpreted from there on -- far more expensive than
+    /// the extra code an oversized iterator costs us. `ary.each { ... return x ... }` is the
+    /// common shape: `Array#each` is 41 instructions, well past the ordinary threshold.
+    ///
+    /// This only relaxes the *size* limit. Every soundness condition still has to hold at the
+    /// yield site itself, which [`block_return_inlinable`] rechecks there.
+    fn inlining_unlocks_block_return(&self, callee_iseq: IseqPtr, blockiseq: Option<IseqPtr>) -> bool {
+        let Some(blockiseq) = blockiseq else { return false };
+        // Only worth the extra size if the callee actually yields to the block.
+        if !iseq_contains_invokeblock(callee_iseq) {
+            return false;
+        }
+        block_return_inlinable(blockiseq, callee_iseq, self.iseq())
+    }
+
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
-    /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t) -> bool {
+    /// function based on heuristics. `blockiseq` is the literal block the call site passes,
+    /// if any.
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -6507,7 +6552,14 @@ impl Function {
             }
         }
 
-        // Check callee bytecode size against threshold.
+        // Check callee bytecode size against threshold. An iterator whose inlining is the
+        // only thing keeping a block's non-local `return` on the throw path gets a larger
+        // budget, because leaving it out of line costs an interpreted unwind per call.
+        let threshold = if self.inlining_unlocks_block_return(callee_iseq, blockiseq) {
+            threshold.saturating_mul(BLOCK_RETURN_INLINE_THRESHOLD_FACTOR)
+        } else {
+            threshold
+        };
         let callee_size = unsafe { get_iseq_encoded_size(callee_iseq) } as usize;
         if callee_size > threshold {
             incr_counter!(inline_reject_too_large);
@@ -6589,7 +6641,7 @@ impl Function {
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
-                if !self.should_inline(iseq, cme) || !Self::can_inline(iseq) {
+                if !self.should_inline(iseq, cme, blockiseq) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
