@@ -556,6 +556,7 @@ splatarray
 (VALUE ary)
 (VALUE obj)
 // attr bool leaf = false; /* has rb_check_array_type() */
+// attr bool zjit_profile = true;
 {
     obj = vm_splat_array(flag, ary);
 }
