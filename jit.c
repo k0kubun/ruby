@@ -316,6 +316,21 @@ rb_get_iseq_body_type(const rb_iseq_t *iseq)
     return ISEQ_BODY(iseq)->type;
 }
 
+// True if the ISEQ has an `ensure` catch table entry. Unwinding a throw through a
+// frame runs its CATCH_TYPE_ENSURE entries (see vm_exec_handle_exception), so ZJIT
+// uses this to tell whether it can skip unwinding a frame altogether.
+bool
+rb_jit_iseq_has_ensure_catch_entry(const rb_iseq_t *iseq)
+{
+    const struct iseq_catch_table *ct = iseq->body->catch_table;
+    if (ct == NULL) return false;
+    for (unsigned int i = 0; i < ct->size; i++) {
+        const struct iseq_catch_table_entry *entry = UNALIGNED_MEMBER_PTR(ct, entries[i]);
+        if (entry->type == CATCH_TYPE_ENSURE) return true;
+    }
+    return false;
+}
+
 bool
 rb_get_iseq_flags_has_lead(const rb_iseq_t *iseq)
 {
