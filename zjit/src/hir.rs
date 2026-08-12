@@ -2971,6 +2971,15 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallb
     if 1 + argc > C_ARG_OPNDS.len() {
         return Err(TooManyArgsForLir);
     }
+    // `break` out of a directly-invoked block frame does not unwind correctly:
+    // vm_throw_start() matches the block owner's `cfp->pc` against the CATCH_TYPE_BREAK
+    // entry's `cont`, and the PC the owner's frame reports after this dispatch does not
+    // match, so the break is reported as an orphan ("break from proc-closure").
+    // A plain non-local `return` is looked up by frame type and EP instead of by PC, so
+    // blocks that only throw TAG_RETURN -- what this dispatch was relaxed for -- are fine.
+    if crate::codegen::block_iseq_may_throw(iseq) && !block_iseq_throws_only_return(iseq) {
+        return Err(InvokeBlockNotSpecialized);
+    }
     Ok(())
 }
 
