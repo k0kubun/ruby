@@ -653,6 +653,8 @@ pub enum SideExitReason {
     SplatKwNotNilOrHash,
     SplatKwPolymorphic,
     SplatKwNotProfiled,
+    SplatLengthChanged,
+    SplatLastRuby2Keywords,
     DirectiveInduced,
     SendWhileTracing,
     NoProfileSend,
@@ -1360,6 +1362,10 @@ pub enum Insn {
     GuardAnyBitSet { val: InsnId, mask: Const, mask_name: Option<ID>, reason: Box<SideExitReason>, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if (val & mask) != 0
     GuardNoBitsSet { val: InsnId, mask: Const, mask_name: Option<ID>, reason: Box<SideExitReason>, state: InsnId },
+    /// Side-exit if val is a Hash flagged with RHASH_PASS_AS_KEYWORDS. Such a hash makes the
+    /// interpreter reinterpret the last splatted argument as keywords, which the expanded
+    /// positional argument list can't reproduce. See CALLER_SETUP_ARG in vm_insnhelper.c.
+    GuardNotRuby2KeywordsHash { val: InsnId, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if left is not greater than or equal to right (both operands are C long).
     GuardGreaterEq { left: InsnId, right: InsnId, reason: Box<SideExitReason>, state: InsnId },
     /// Side-exit if left is not less than right (both operands are C long).
@@ -1509,6 +1515,7 @@ macro_rules! for_each_operand_impl {
             | Insn::GuardBitEquals { val, state, .. }
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
+            | Insn::GuardNotRuby2KeywordsHash { val, state, .. }
             | Insn::ToArray { val, state }
             | Insn::IsMethodCfunc { val, state, .. }
             | Insn::ToNewArray { val, state }
@@ -1969,6 +1976,8 @@ impl Insn {
             Insn::GuardBitEquals { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardAnyBitSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardNoBitsSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
+            // Reads the object header of a heap object to check its type and flags.
+            Insn::GuardNotRuby2KeywordsHash { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Control),
             Insn::GuardGreaterEq { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardLess { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::PatchPoint { .. } => Effect::read_write(abstract_heaps::PatchPoint, abstract_heaps::Control),
@@ -2387,6 +2396,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             },
             Insn::GuardNoBitsSet { val, mask, mask_name: Some(name), .. } => { write!(f, "GuardNoBitsSet {val}, {name}={}", mask.print(self.ptr_map)) },
             Insn::GuardNoBitsSet { val, mask, .. } => { write!(f, "GuardNoBitsSet {val}, {}", mask.print(self.ptr_map)) },
+            Insn::GuardNotRuby2KeywordsHash { val, recompile, .. } => {
+                write!(f, "GuardNotRuby2KeywordsHash {val}")?;
+                if recompile.is_some() {
+                    write!(f, " recompile")?;
+                }
+                return Ok(())
+            },
             Insn::GuardLess { left, right, .. } => write!(f, "GuardLess {left}, {right}"),
             Insn::GuardGreaterEq { left, right, .. } => write!(f, "GuardGreaterEq {left}, {right}"),
             &Insn::GetBlockParam { level, ep_offset, state, .. } => {
@@ -4434,6 +4450,7 @@ impl Function {
             Insn::GuardBitEquals { val, expected, .. } => self.type_of(*val).intersection(Type::from_const(*expected)),
             Insn::GuardAnyBitSet { val, .. } => self.type_of(*val),
             Insn::GuardNoBitsSet { val, .. } => self.type_of(*val),
+            Insn::GuardNotRuby2KeywordsHash { val, .. } => self.type_of(*val),
             Insn::GuardLess { left, .. } => self.type_of(*left),
             Insn::GuardGreaterEq { left, .. } => self.type_of(*left),
             Insn::FixnumAdd  { .. } => types::Fixnum,
@@ -4666,7 +4683,8 @@ impl Function {
             Insn::GuardType { val, .. }
             | Insn::GuardBitEquals { val, .. }
             | Insn::GuardAnyBitSet { val, .. }
-            | Insn::GuardNoBitsSet { val, .. } => self.chase_insn(val),
+            | Insn::GuardNoBitsSet { val, .. }
+            | Insn::GuardNotRuby2KeywordsHash { val, .. } => self.chase_insn(val),
             | Insn::RefineType { val, .. } => self.chase_insn(val),
             _ => id,
         }
@@ -5191,6 +5209,60 @@ impl Function {
         if 0 != ci_flags & VM_CALL_FORWARDING     { self.count(block, complex_arg_pass_caller_forwarding); }
     }
 
+    /// Try to turn `foo(a, *b)` into `foo(a, b[0], ..., b[n-1])` using the splat length the
+    /// Try to turn `foo(a, *b)` into `foo(a, b[0], ..., b[n-1])` using the splat length the
+    /// interpreter observed at this call site. Returns the new argument list, with guards
+    /// emitted into `block`, or None when there is no usable profile.
+    ///
+    /// The caller keeps `state` (the pre-send Snapshot, which still has the splat array on the
+    /// stack) as the deopt target, so a failing guard just re-runs the splat send in the
+    /// interpreter.
+    fn try_expand_splat_args(&mut self, block: BlockId, args: &[InsnId], state: InsnId) -> Option<Vec<InsnId>> {
+        let &splat = args.last()?;
+        let frame_state = self.frame_state(state);
+        // A ruby2_keywords method forwarding its rest array is the one place a flagged Hash
+        // shows up regularly. Expanding there would guard, fail, and side-exit on every call,
+        // so leave those call sites on the dynamic path instead.
+        if 0 != unsafe { frame_state.iseq.params() }.flags.ruby2_keywords() {
+            return None;
+        }
+        let summary = get_or_create_iseq_payload(frame_state.iseq).profile.get_splat_length_summary(frame_state.insn_idx)?;
+        // Only speculate on a length that has never varied. A guard failure exits to the
+        // interpreter, so a call site with several lengths is better off dispatching dynamically.
+        if !summary.is_monomorphic() {
+            return None;
+        }
+        // `None` means a non-Array was splatted (`to_a` conversion), which we don't handle.
+        let length = (*summary.buckets().first()?)?;
+        let length: usize = length.try_into().ok()?;
+        // Bound how much code a single call site can grow.
+        if length > MAX_SPLAT_EXPANSION {
+            return None;
+        }
+
+        let array = self.coerce_to(block, splat, types::ArrayExact, state);
+        let array_length = self.push_insn(block, Insn::ArrayLength { array });
+        self.push_insn(block, Insn::GuardBitEquals {
+            val: array_length,
+            expected: Const::CInt64(length as i64),
+            reason: Box::new(SideExitReason::SplatLengthChanged),
+            state,
+            recompile: Some(Recompile),
+        });
+
+        let mut expanded = args[..args.len() - 1].to_vec();
+        for i in 0..length {
+            let index = self.push_insn(block, Insn::Const { val: Const::CInt64(i as i64) });
+            expanded.push(self.push_insn(block, Insn::ArrayAref { array, index }));
+        }
+        // A ruby2_keywords-flagged Hash in the last position makes the interpreter treat it as
+        // keywords instead of a positional argument, so guard that it isn't one.
+        if let Some(&last) = expanded.last() {
+            self.push_insn(block, Insn::GuardNotRuby2KeywordsHash { val: last, state, recompile: Some(Recompile) });
+        }
+        Some(expanded)
+    }
+
     fn count_caller_splat_profile(&mut self, block: BlockId, state: InsnId) {
         let (iseq, insn_idx) = {
             let frame_state = self.frame_state_ref(state);
@@ -5571,7 +5643,25 @@ impl Function {
                         // If the call site info indicates that the `Function` has overly complex arguments, then do not optimize into a `SendDirect`.
                         // Optimized methods(`VM_METHOD_TYPE_OPTIMIZED`) and C methods handle their own argument constraints (e.g., kw_splat for Proc call).
                         // Mask out ARGS_BLOCKARG only if we've already handled the nil block arg case above.
-                        let flags_for_check = if stripped_nil_block { flags & !VM_CALL_ARGS_BLOCKARG } else { flags };
+                        let mut flags_for_check = if stripped_nil_block { flags & !VM_CALL_ARGS_BLOCKARG } else { flags };
+
+                        // `foo(*args)`: if the splat array has always had the same length here, guard
+                        // that length and read the elements out so the call can be a direct send.
+                        // Only ISEQ callees benefit: the other method types read the argument count
+                        // from the call info rather than from the HIR argument list.
+                        const SPLAT_EXPANSION_BLOCKERS: u32 = VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG
+                            | VM_CALL_FORWARDING | VM_CALL_TAILCALL | VM_CALL_OPT_SEND | VM_CALL_SUPER | VM_CALL_ZSUPER;
+                        if flags_for_check & VM_CALL_ARGS_SPLAT != 0
+                            && flags_for_check & SPLAT_EXPANSION_BLOCKERS == 0
+                            && matches!(def_type, VM_METHOD_TYPE_ISEQ | VM_METHOD_TYPE_BMETHOD)
+                        {
+                            if let Some(expanded) = self.try_expand_splat_args(block, &args, state) {
+                                let new_state = self.frame_state(send_frame_state).with_replaced_args(&expanded, args.len());
+                                send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                                args = expanded;
+                                flags_for_check &= !VM_CALL_ARGS_SPLAT;
+                            }
+                        }
                         if def_type != VM_METHOD_TYPE_OPTIMIZED && def_type != VM_METHOD_TYPE_CFUNC && unspecializable_call_type(flags_for_check) {
                             self.count_complex_call_features(block, flags, state);
                             self.set_dynamic_send_reason(insn_id, ComplexArgPass);
@@ -7453,6 +7543,7 @@ impl Function {
                     | Insn::GuardBitEquals { val:  src, .. }
                     | Insn::GuardAnyBitSet { val:  src, .. }
                     | Insn::GuardNoBitsSet { val:  src, .. }
+                    | Insn::GuardNotRuby2KeywordsHash { val: src, .. }
                     | Insn::GuardGreaterEq { left: src, .. }
                     | Insn::GuardLess      { left: src, .. } => {
                         rewrite_map.insert(*src, canonical_id);
@@ -8588,6 +8679,7 @@ impl Function {
             | Insn::Return { val, .. }
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
+            | Insn::GuardNotRuby2KeywordsHash { val, .. }
             | Insn::ToArray { val, .. }
             | Insn::ToNewArray { val, .. }
             | Insn::Defined { v: val, .. }
@@ -9426,6 +9518,17 @@ fn callee_kw_bits_local_idx(iseq: *const rb_iseq_t) -> Option<usize> {
     Some(unsafe { (*keyword).bits_start } as usize)
 }
 
+/// True if `splatarray`'s operand has only ever been an Array at this bytecode index, so the
+/// conversion can be replaced with a type guard.
+fn splat_operand_is_array(payload: &crate::payload::IseqPayload, insn_idx: YarvInsnIdx) -> bool {
+    let Some(summary) = payload.profile.get_operand_types(insn_idx)
+        .and_then(|types| types.first())
+        .map(TypeDistributionSummary::new) else { return false };
+    summary.is_monomorphic()
+        && summary.buckets().first()
+            .is_some_and(|&profiled| Type::from_profiled_type(profiled).is_subtype(types::ArrayExact))
+}
+
 /// If we can't handle the type of send (yet), bail out.
 fn unhandled_call_type(flags: u32) -> Result<(), CallType> {
     if (flags & VM_CALL_TAILCALL) != 0 { return Err(CallType::Tailcall); }
@@ -9580,6 +9683,10 @@ fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
 
 /// The index of the self parameter in the HIR function
 pub const SELF_PARAM_IDX: usize = 0;
+
+/// The most elements a `foo(*args)` call site will read out of the splat array inline. Each
+/// element costs an array load plus a stack write, so long splats stay on the dynamic path.
+const MAX_SPLAT_EXPANSION: usize = 16;
 
 /// Controls how an ISEQ's bytecode is added to HIR.
 #[derive(Clone, Copy)]
@@ -10040,6 +10147,10 @@ fn add_iseq_to_hir(
                     let val = state.stack_pop()?;
                     let obj = if result_must_be_mutable {
                         fun.push_insn(block, Insn::ToNewArray { val, state: exit_id })
+                    } else if splat_operand_is_array(payload, exit_state.insn_idx) {
+                        // `splatarray false` hands back its operand untouched when it is already
+                        // an Array (see vm_splat_array), so a type guard replaces the call.
+                        fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: Some(Recompile) })
                     } else {
                         fun.push_insn(block, Insn::ToArray { val, state: exit_id })
                     };

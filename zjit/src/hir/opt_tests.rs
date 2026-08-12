@@ -7462,8 +7462,7 @@ mod hir_opt_tests {
           Jump bb3(v7, v8, v9)
         bb3(v11:BasicObject, v12:BasicObject, v13:NilClass):
           v17:ArrayExact = NewArray
-          v23:ArrayExact = ToArray v17
-          v25:BasicObject = Send v12, :call, v23 # SendFallbackReason: Complex argument passing
+          v25:BasicObject = Send v12, :call, v17 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v25
         ");
@@ -14776,23 +14775,27 @@ mod hir_opt_tests {
           Jump bb3(v5, v6)
         bb3(v8:BasicObject, v9:NilClass):
           v13:ArrayExact = NewArray
-          v19:ArrayExact = ToArray v13
-          v21:BasicObject = Send v8, :foo, v19 # SendFallbackReason: Complex argument passing
-          v25:StringExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v49:CInt64 = ArrayLength v13
+          v50:CInt64[0] = GuardBitEquals v49, CInt64(0) recompile
+          PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
+          v53:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          PushInlineFrame :foo, v53 (0x1038), num_args=0
+          PatchPoint MethodRedefined(Object@0x1000, itself@0x1060, cme:0x1068)
+          CheckInterrupts
+          PopInlineFrame
+          v25:StringExact[VALUE(0x1090)] = Const Value(VALUE(0x1090))
           v26:StringExact = StringCopy v25
           PatchPoint NoEPEscape(test)
-          v31:ArrayExact = ToArray v13
-          v33:BasicObject = Send v26, :display, v31 # SendFallbackReason: Complex argument passing
+          v33:BasicObject = Send v26, :display, v13 # SendFallbackReason: Complex argument passing
           PatchPoint NoEPEscape(test)
-          v41:ArrayExact = ToArray v13
-          v43:BasicObject = Send v8, :itself, v41 # SendFallbackReason: Complex argument passing
+          v43:BasicObject = Send v53, :itself, v13 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v43
         ");
     }
 
     #[test]
-    fn dont_specialize_call_to_iseq_with_monomorphic_caller_splat() {
+    fn specialize_call_to_iseq_with_monomorphic_caller_splat() {
         enable_zjit_stats();
         eval("
             def foo(*args) = args
@@ -14818,14 +14821,24 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v20:ArrayExact = ToArray v11
+          v20:ArrayExact = GuardType v11, ArrayExact recompile
           IncrCounter zjit_insn_count
-          IncrCounter complex_arg_pass_caller_splat
-          IncrCounter caller_splat_profile_monomorphic
-          v23:BasicObject = Send v10, :foo, v20 # SendFallbackReason: Complex argument passing
+          v30:CInt64 = ArrayLength v20
+          v31:CInt64[1] = GuardBitEquals v30, CInt64(1) recompile
+          v32:CInt64[0] = Const CInt64(0)
+          v33:BasicObject = ArrayAref v20, v32
+          v34:BasicObject = GuardNotRuby2KeywordsHash v33 recompile
+          v36:ArrayExact = NewArray v34
+          PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
+          v39:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :foo, v39 (0x1040), num_args=1
+          IncrCounter inline_iseq_optimized_send_count
+          IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v23
+          PopInlineFrame
+          IncrCounter zjit_insn_count
+          Return v36
         ");
     }
 
@@ -14858,7 +14871,7 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          v20:ArrayExact = ToArray v11
+          v20:ArrayExact = GuardType v11, ArrayExact recompile
           IncrCounter zjit_insn_count
           IncrCounter complex_arg_pass_caller_splat
           IncrCounter caller_splat_profile_polymorphic
@@ -17627,7 +17640,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :x@1
           Jump bb3(v6, v7)
         bb3(v9:HeapBasicObject, v10:BasicObject):
-          v16:ArrayExact = ToArray v10
+          v16:ArrayExact = GuardType v10, ArrayExact recompile
           v18:BasicObject = InvokeSuper v9, 0x1008, v16 # SendFallbackReason: super: complex argument passing to `super` call
           CheckInterrupts
           Return v18
