@@ -1171,11 +1171,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block, block_arg,
             )
         }
-        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, forwarded, state, .. } => {
+        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, forwarded, captured, state } => {
             let forwarded = forwarded.as_ref().map(|forwarded| {
                 (forwarded.ci, forwarded.args.iter().map(|&arg| opnd!(arg)).collect::<Vec<_>>())
             });
-            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, forwarded))
+            let captured = captured.map(|captured| opnd!(captured));
+            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, forwarded, captured))
         },
         Insn::PopInlineFrame { iseq, argc, state } => {
             no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
@@ -1189,7 +1190,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), &function.frame_state(*state)),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, jit_entry_idx)),
         &Insn::ExceptionEntryPoint { insn_idx, stack_size } => no_output!(gen_exception_entry_point(jit, asm, insn_idx, stack_size)),
-        Insn::Return { val } => no_output!(gen_return(asm, opnd!(val))),
+        &Insn::Return { val, pop_inlined_frames } => no_output!(gen_return(asm, opnd!(val), pop_inlined_frames)),
         Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumMult { left, right, state } => gen_fixnum_mult(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
@@ -2340,6 +2341,7 @@ fn gen_push_inline_frame(
     state: &FrameState,
     blockiseq: Option<IseqPtr>,
     forwarded: Option<(*const rb_callinfo, Vec<Opnd>)>,
+    captured: Option<Opnd>,
 ) {
     // A `def foo(...)` callee keeps the caller's arguments in the frame instead of binding them
     // to parameters, so the frame is `argc` slots taller than the local table, exactly as
@@ -2358,7 +2360,9 @@ fn gen_push_inline_frame(
 
     // Save cfp->pc and cfp->sp for the caller frame.
     // Cannot use gen_prepare_non_leaf_call because we need special SP math.
-    let stack_size = state.stack().len() - num_args.to_usize() - 1; // -1 for receiver
+    // A block frame has no receiver slot on the caller's stack, only its arguments.
+    let recv_slots = usize::from(captured.is_none());
+    let stack_size = state.stack().len() - num_args.to_usize() - recv_slots;
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, stack_size);
 
@@ -2370,9 +2374,14 @@ fn gen_push_inline_frame(
     // `unspecializable_call_type`.
     let block_handler = blockiseq.map(|b| gen_block_handler_specval(asm, b));
 
-    let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
+    let callee_is_bmethod = !cme.is_null() && VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
-    let (frame_type, specval) = if callee_is_bmethod {
+    let (frame_type, specval) = if let Some(captured) = captured {
+        // Inlined block frame, mirroring gen_invoke_block_iseq_direct()'s frame push:
+        // specval = VM_GUARDED_PREV_EP(captured->ep) = captured->ep | 0x01
+        let captured_ep = asm.load(Opnd::mem(64, captured, SIZEOF_VALUE_I32));
+        (VM_FRAME_MAGIC_BLOCK, asm.or(captured_ep, Opnd::Imm(0x1)))
+    } else if callee_is_bmethod {
         // Extract EP from the Proc instance
         let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
         let proc = unsafe { rb_jit_get_proc_ptr(procv) };
@@ -3548,12 +3557,18 @@ fn gen_frame_entry_point(jit: &JITState, asm: &mut Assembler, pc: *const VALUE) 
     asm.mov(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
 }
 
-/// Compile code that exits from JIT code with a return value
-fn gen_return(asm: &mut Assembler, val: lir::Opnd) {
-    // Pop the current frame (ec->cfp++)
+/// Compile code that exits from JIT code with a return value.
+///
+/// `pop_inlined_frames` counts inlined callee frames that are still pushed on top of
+/// this function's own frame, which happens for a non-local `return` out of an inlined
+/// block. They are discarded together with our frame in a single `cfp` adjustment; the
+/// SP register does not need restoring because nothing reads it after the return.
+fn gen_return(asm: &mut Assembler, val: lir::Opnd, pop_inlined_frames: u32) {
+    // Pop the current frame (ec->cfp++), plus any inlined frames above it
     // Note: the return PC is already in the previous CFP
     asm_comment!(asm, "pop stack frame");
-    let incr_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    let frames_to_pop = (pop_inlined_frames as usize + 1) * RUBY_SIZEOF_CONTROL_FRAME;
+    let incr_cfp = asm.add(CFP, frames_to_pop.into());
     asm.mov(CFP, incr_cfp);
     asm.mov(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
 
