@@ -1807,6 +1807,7 @@ pub struct Assembler {
     /// consumes this through Insn::CCall, after it knows whether each live VReg
     /// is in a saved register or an allocator spill slot.
     stack_map: Option<StackMap>,
+
 }
 
 impl Assembler
@@ -2140,6 +2141,7 @@ impl Assembler
 
         self.current_block().push_insn(insn);
     }
+
 
     /// Create a new label instance that we can jump to
     pub fn new_label(&mut self, name: &str) -> Target
@@ -2770,7 +2772,17 @@ impl Assembler
                             new_ids.push(None);
                         }
                     } else {
-                        if call_result_live {
+                        // The pops write only the survivor registers, so they leave the result
+                        // where it is unless C_RET or the output register is itself restored.
+                        // Only then does the result have to detour through the scratch register.
+                        let restored = |opnd: Opnd| match opnd {
+                            Opnd::Reg(reg) => survivor_regs.iter().any(|&survivor| matches!(survivor, Opnd::Reg(other) if other.reg_no == reg.reg_no)),
+                            _ => false,
+                        };
+                        let needs_scratch = call_result_live
+                            && (restored(C_RET_OPND) || restored(Self::rewritten_opnd(out, intervals, alloc_regs)));
+
+                        if needs_scratch {
                             // Save CCall result to scratch immediately, before pops
                             // can clobber either C_RET or the output register.
                             new_insns.push(Insn::Mov { dest: Opnd::Reg(SCRATCH_REG), src: C_RET_OPND });
@@ -2788,9 +2800,10 @@ impl Assembler
                         }
 
                         if call_result_live {
-                            // Move result from scratch to output AFTER all pops.
+                            // Move result to output AFTER all pops.
                             let out = Self::rewritten_opnd(out, intervals, alloc_regs);
-                            new_insns.push(Insn::Mov { dest: out, src: Opnd::Reg(SCRATCH_REG) });
+                            let src = if needs_scratch { Opnd::Reg(SCRATCH_REG) } else { C_RET_OPND };
+                            new_insns.push(Insn::Mov { dest: out, src });
                             new_ids.push(None);
                         }
                     }
