@@ -6292,6 +6292,25 @@ fn test_consecutive_calls_pass_their_own_blocks() {
     "), @"[1, 2, 30, 104]");
 }
 
+// The cached block handler belongs to the frame it was computed in. Pushing an inlined
+// frame moves the CFP register with a plain `mov`, so the cache has to be dropped there:
+// otherwise the inlined callee's send would pass the *caller's* captured block and run
+// the wrong block ISEQ.
+#[test]
+fn test_inlined_frame_does_not_reuse_the_callers_block_handler() {
+    with_inlining(|| {
+        assert_snapshot!(inspect("
+            def callee(a) = a.map { |v| v + 1000 }
+            def test(a)
+              outer = a.map { |v| v }
+              [outer, callee(a)]
+            end
+            test([1]); test([1])
+            test([1, 2])
+        "), @"[[1, 2], [1001, 1002]]");
+    });
+}
+
 // Same idea for the patch points a constant lookup emits, which also share a site.
 #[test]
 fn test_shared_patch_site_for_constant_invalidated_twice() {
