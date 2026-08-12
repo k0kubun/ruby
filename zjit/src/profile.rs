@@ -211,6 +211,114 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
     entry.opnd_types[0].observe(ty);
 }
 
+/// Samples an ivar site's fallback path has to see before it decides whether the shapes
+/// arriving there are worth a recompile. Small enough that a site which was frozen on the
+/// wrong shape recovers almost immediately, large enough that a brief detour through an
+/// unusual receiver does not spend a version.
+const IVAR_REPROFILE_WINDOW: u32 = 64;
+
+/// Result of [`IseqProfile::observe_ivar_fallback`].
+#[derive(PartialEq, Eq, Debug)]
+enum IvarReprofiled {
+    /// Recorded. Nothing to do.
+    Sampled,
+    /// The window closed on a shape the compiled dispatch does not have an arm for.
+    /// The shape is now in the instruction's profile; recompile to pick it up.
+    Recompile,
+}
+
+impl IseqProfile {
+    /// Record the shape of a receiver that reached an ivar site's fallback path, and report
+    /// whether a recompile would now give that receiver an arm of its own.
+    ///
+    /// The window is kept in the instruction's own profile entry, so a site that falls back
+    /// rarely costs one distribution slot and nothing else.
+    fn observe_ivar_fallback(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, recv: VALUE) -> IvarReprofiled {
+        let entry = self.entry_mut(insn_idx);
+        if entry.opnd_types.is_empty() {
+            entry.opnd_types.resize(1, TypeDistribution::new());
+        }
+        let ty = ProfiledType::new(recv);
+        if !entry.opnd_types[0].each_item().any(|seen| seen.shape() == ty.shape()) {
+            // A shape the profile the compiled dispatch was built from has never seen. Fold it
+            // in so a recompile can give it an arm, and remember that this window found one.
+            // The distribution keeps the class alive for as long as the profile does.
+            VALUE::from(iseq).write_barrier(ty.class());
+            entry.opnd_types[0].observe(ty);
+            entry.ivar_fallback_new_shape = true;
+        }
+        entry.ivar_fallback_samples = entry.ivar_fallback_samples.saturating_add(1);
+        if entry.ivar_fallback_samples < IVAR_REPROFILE_WINDOW {
+            return IvarReprofiled::Sampled;
+        }
+        entry.ivar_fallback_samples = 0;
+        if std::mem::take(&mut entry.ivar_fallback_new_shape) {
+            IvarReprofiled::Recompile
+        } else {
+            // Everything this window saw is already in the profile, so the fallback is being
+            // taken for a reason a recompile cannot fix (a too-complex shape, or an arm the
+            // dispatch dropped). Keep sampling in case that changes, but do not spend a version.
+            IvarReprofiled::Sampled
+        }
+    }
+}
+
+/// Called from JIT code on the fallback path of an ivar site that was compiled on the final
+/// version, where [`crate::hir::CompilePolicy::no_side_exits`] turned the site's shape guard
+/// into a branch with a C-call fallback.
+///
+/// That dispatch is built from a profile the interpreter collected before the ISEQ was first
+/// compiled, and nothing refreshes it: once compiled, the instruction only runs in the
+/// interpreter on a side exit, and the exit-free fallback is not one. A site whose receiver
+/// changed shape after boot therefore calls `rb_vm_getinstancevariable` for the rest of the
+/// process even though the new shape is perfectly specializable.
+///
+/// Sample what the fallback is actually handed. Once a window's worth of samples names a
+/// shape the dispatch has no arm for, the shape is already in the instruction's profile, so
+/// grant the ISEQ one extra version and invalidate the compiled unit to spend it. Each such
+/// version strictly adds an arm to a dispatch that was falling back, and
+/// [`crate::payload::MAX_IVAR_RESPECIALIZATIONS`] bounds how many an ISEQ may earn.
+///
+/// `version` is the compiled unit this call lives in, not the ISEQ owning the instruction: an
+/// inlined callee has no code of its own, so the outer function is what gets invalidated.
+/// Testing it also disarms frames still running the invalidated code.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersion, frame_iseq: VALUE, insn_idx: u32, recv: VALUE) {
+    if unsafe { (*version).is_invalidated() } {
+        return;
+    }
+    // Immediates have no shape to specialize and would poison the profile with a bucket the
+    // dispatch can never use.
+    if recv.special_const_p() {
+        return;
+    }
+    let insn_idx = insn_idx as YarvInsnIdx;
+    let frame_iseq = frame_iseq.as_iseq();
+    let reprofiled = with_time_stat(profile_time_ns, || {
+        get_or_create_iseq_payload(frame_iseq).profile.observe_ivar_fallback(frame_iseq, insn_idx, recv)
+    });
+    if reprofiled == IvarReprofiled::Sampled {
+        return;
+    }
+    // Read the compiled unit's ISEQ out before taking the lock: `version` points into the
+    // payload, and holding a reference to it across the lock's unwind boundary is not allowed.
+    let compiled_iseq = VALUE::from(unsafe { (*version).iseq });
+    with_vm_lock(src_loc!(), || {
+        let compiled_iseq = compiled_iseq.as_iseq();
+        let payload = get_or_create_iseq_payload(compiled_iseq);
+        if payload.ivar_respecializations >= crate::payload::MAX_IVAR_RESPECIALIZATIONS {
+            return;
+        }
+        payload.ivar_respecializations += 1;
+        crate::stats::incr_counter!(ivar_respecialize_count);
+        if let Some(version) = payload.versions.last_mut() {
+            let cb = crate::state::ZJITState::get_code_block();
+            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
+            cb.mark_all_executable();
+        }
+    });
+}
+
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let obj = profiler.peek_at_block_handler();
     let ty = ProfiledType::object(obj);
@@ -413,6 +521,11 @@ pub struct ProfileEntry {
     opnd_types: Vec<TypeDistribution>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
+    /// Receivers seen on this ivar site's fallback path in the current re-profiling window.
+    /// See [`rb_zjit_ivar_reprofile`].
+    ivar_fallback_samples: u32,
+    /// Whether the current re-profiling window has seen a shape the profile did not have.
+    ivar_fallback_new_shape: bool,
 }
 
 impl ProfileEntry {
@@ -460,6 +573,8 @@ impl IseqProfile {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
+                    ivar_fallback_samples: 0,
+                    ivar_fallback_new_shape: false,
                 });
                 &mut self.entries[i]
             }
