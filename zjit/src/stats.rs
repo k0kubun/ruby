@@ -255,6 +255,8 @@ make_counters! {
         exit_caller_splat_ruby2_keywords,
         exit_send_forward_callinfo_changed,
         exit_send_forward_block_given,
+        exit_splat_length_changed,
+        exit_splat_last_ruby2_keywords,
         exit_directive_induced,
         exit_send_while_tracing,
         exit_invokeblock_not_ifunc,
@@ -791,6 +793,8 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         CallerSplatRuby2Keywords      => exit_caller_splat_ruby2_keywords,
         SendForwardCallInfoChanged    => exit_send_forward_callinfo_changed,
         SendForwardBlockGiven         => exit_send_forward_block_given,
+        SplatLengthChanged            => exit_splat_length_changed,
+        SplatLastRuby2Keywords        => exit_splat_last_ruby2_keywords,
         DirectiveInduced              => exit_directive_induced,
         PatchPoint(Invariant::BOPRedefined { .. })
                                       => exit_patchpoint_bop_redefined,
