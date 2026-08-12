@@ -484,6 +484,9 @@ make_counters! {
     // already exceeds the budget before scanning for its SendDirects.
     inline_method_count,
     empty_inline_frame_count,
+    // The number of blocks whose body was inlined into the frame that yields to them,
+    // turning the block's non-local `return` into a plain return of the compiled function.
+    inline_block_count,
     inline_reject_too_large,
     inline_reject_complex_params,
     inline_reject_ep_escapes,
