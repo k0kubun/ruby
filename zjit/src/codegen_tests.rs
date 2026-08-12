@@ -916,6 +916,36 @@ fn test_block_autosplat_non_exact_array_joins_fallback() {
         @r#""[[1, 2], [:d1, :d2]]""#);
 }
 
+/// One shared yield site seeing blocks of several arities: candidates that need the expansion
+/// sit alongside ones that do not, and each expansion's miss joins this site's own generic
+/// fallback, which still holds the unexpanded argument.
+#[test]
+fn test_block_autosplat_polymorphic_mixed_arities() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          i = 0
+          while i < vals.size
+            yield vals[i]
+            i += 1
+          end
+          nil
+        end
+        def one(vals)   out = []; each_of(vals) { |a| out << a }; out end
+        def two(vals)   out = []; each_of(vals) { |a, b| out << [a, b] }; out end
+        def three(vals) out = []; each_of(vals) { |a, b, c| out << [a, b, c] }; out end
+        def rest(vals)  out = []; each_of(vals) { |a, *r| out << [a, r] }; out end
+        # Interleave every block through the one yield site so it goes polymorphic.
+        4.times { one([[1, 2]]); two([[1, 2]]); three([[1, 2, 3]]); rest([[1, 2]]) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("two([[1, 2], [3], 4]).inspect"),
+        @r#""[[1, 2], [3, nil], [4, nil]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("three([[1, 2, 3], [4, 5]]).inspect"),
+        @r#""[[1, 2, 3], [4, 5, nil]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("one([[1, 2]]).inspect"), @r#""[[1, 2]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("rest([[1, 2, 3]]).inspect"), @r#""[[1, [2, 3]]]""#);
+}
+
 /// The profiled-monomorphic dispatch guards the block ISEQ *after* the expansion has replaced
 /// the one yielded Array with its elements. That guard has to side-exit to the interpreter's
 /// own stack, which still holds just the Array, not to the expanded one.
