@@ -271,6 +271,10 @@ pub fn init() -> Annotations {
     annotate!(rb_cFloat, "-", inline_float_minus);
     annotate!(rb_cFloat, "*", inline_float_mul);
     annotate!(rb_cFloat, "/", inline_float_div);
+    annotate!(rb_cFloat, "<", inline_float_lt);
+    annotate!(rb_cFloat, "<=", inline_float_le);
+    annotate!(rb_cFloat, ">", inline_float_gt);
+    annotate!(rb_cFloat, ">=", inline_float_ge);
     annotate!(rb_cFloat, "to_i", inline_float_to_i);
     annotate!(rb_cFloat, "to_int", inline_float_to_i);
     annotate!(rb_cString, "to_s", inline_string_to_s, types::StringExact);
@@ -690,6 +694,47 @@ fn inline_float_mul(fun: &mut hir::Function, block: hir::BlockId, recv: hir::Ins
 fn inline_float_div(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_float_op(fun, block, &|recv, other| hir::Insn::FloatDiv { recv, other, state }, BOP_DIV, recv, other, state)
+}
+
+/// Specialize a Float comparison (`<`, `<=`, `>`, `>=`) into a leaf C call.
+///
+/// The default Send path calls the cfunc with a full control frame pushed. Comparisons
+/// are leaf and allocation-free once we know the receiver is a Flonum and the argument is
+/// a Flonum or a Fixnum (rb_float_lt and friends handle both without coercion), so we can
+/// drop the frame entirely.
+fn try_inline_float_cmp(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(hir::InsnId, hir::InsnId) -> hir::Insn, bop: u32, recv: hir::InsnId, other: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {
+    if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, FLOAT_REDEFINED_OP_FLAG) } {
+        return None;
+    }
+    if fun.likely_a(recv, types::Flonum, state)
+        && (fun.likely_a(other, types::Flonum, state) || fun.likely_a(other, types::Fixnum, state))
+    {
+        let left = coerce_float_op_operand(fun, block, recv, types::Flonum, state);
+        let other_type = if fun.likely_a(other, types::Flonum, state) { types::Flonum } else { types::Fixnum };
+        let right = coerce_float_op_operand(fun, block, other, other_type, state);
+        return Some(fun.push_insn(block, f(left, right)));
+    }
+    None
+}
+
+fn inline_float_lt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    try_inline_float_cmp(fun, block, &|left, right| hir::Insn::FloatLt { left, right }, BOP_LT, recv, other, state)
+}
+
+fn inline_float_le(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    try_inline_float_cmp(fun, block, &|left, right| hir::Insn::FloatLe { left, right }, BOP_LE, recv, other, state)
+}
+
+fn inline_float_gt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    try_inline_float_cmp(fun, block, &|left, right| hir::Insn::FloatGt { left, right }, BOP_GT, recv, other, state)
+}
+
+fn inline_float_ge(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    try_inline_float_cmp(fun, block, &|left, right| hir::Insn::FloatGe { left, right }, BOP_GE, recv, other, state)
 }
 
 fn inline_float_to_i(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {

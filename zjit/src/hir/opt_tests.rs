@@ -19398,6 +19398,68 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_float_lt_inline() {
+        eval(r#"
+            def test(a, b) = a < b
+            test(1.0, 2.0)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          v4:BasicObject = LoadField v2, :b@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :a@1
+          v9:BasicObject = LoadArg :b@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Float@0x1008, <@0x1010, cme:0x1018)
+          v28:Flonum = GuardType v12, Flonum recompile
+          v29:Flonum = GuardType v13, Flonum recompile
+          v30:BoolExact = FloatLt v28, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_float_ge_inline_with_fixnum_arg() {
+        eval(r#"
+            def test(a, b) = a >= b
+            test(1.0, 2)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          v4:BasicObject = LoadField v2, :b@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :a@1
+          v9:BasicObject = LoadArg :b@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Float@0x1008, >=@0x1010, cme:0x1018)
+          v28:Flonum = GuardType v12, Flonum recompile
+          v29:Fixnum = GuardType v13, Fixnum recompile
+          v30:BoolExact = FloatGe v28, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
     fn test_float_mul_inline() {
         eval(r#"
             def test(a, b) = a * b
