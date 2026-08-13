@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -2804,7 +2804,7 @@ impl CompilePolicy {
             let payload = get_or_create_iseq_payload(iseq);
             payload.versions.iter().any(
                 |v| unsafe { v.as_ref() }.is_invalidated()
-            ) && payload.versions.len() + 1 >= max_iseq_versions()
+            ) && payload.versions.len() + 1 >= payload.version_limit()
         };
         Self { no_side_exits }
     }
@@ -6278,7 +6278,7 @@ impl Function {
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
         let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if payload.versions.len() + 1 >= payload.version_limit() {
             return;
         }
         for block in self.reverse_post_order() {

@@ -25,7 +25,17 @@ pub struct IseqPayload {
     /// `BasicObject`) when the owner is unknown.
     /// See [`crate::cruby::iseq_self_is_heap_object`].
     pub self_is_heap_object: bool,
+    /// Number of extra versions granted because a PatchPoint invalidation would
+    /// otherwise have left this ISEQ permanently side-exiting. See
+    /// [`crate::codegen::invalidate_iseq_version`].
+    pub invalidation_recompiles: u8,
 }
+
+/// Upper bound on the extra versions [`IseqPayload::invalidation_recompiles`] can grant.
+/// Invalidation is an external event (a constant or method was redefined), not a
+/// mis-speculation, so it should not consume the respecialization budget. We still cap
+/// the total so that an ISEQ whose assumptions keep getting busted cannot recompile forever.
+pub const MAX_INVALIDATION_RECOMPILES: u8 = 8;
 
 impl IseqPayload {
     fn new() -> Self {
@@ -34,7 +44,15 @@ impl IseqPayload {
             versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
+            invalidation_recompiles: 0,
         }
+    }
+
+    /// Number of versions this ISEQ may compile, including any granted because a
+    /// PatchPoint invalidation left a version permanently exiting.
+    pub fn version_limit(&self) -> usize {
+        crate::codegen::max_iseq_versions()
+            + self.invalidation_recompiles as usize
     }
 
     /// Profile counts are used for compilation policy.
