@@ -2190,6 +2190,39 @@ fn test_send_nil_block_arg() {
 }
 
 #[test]
+fn test_attr_reader_two_shapes_per_class_in_polymorphic_arm() {
+    // A polymorphic call site branches on the receiver's class, so one arm can be entered by
+    // objects of that class with different shapes. Each shape the profile saw gets its own ivar
+    // load; the rest still have to read correctly through the C fallback.
+    assert_snapshot!(inspect("
+        class C
+          attr_reader :foo
+          def early = (@foo = 1; @bar = 2)
+          def late  = (@bar = 3; @foo = 4)
+          def third = (@baz = 5; @qux = 6; @foo = 7)
+        end
+        class D
+          attr_reader :foo
+          def initialize = @foo = :d
+        end
+        objs = []
+        200.times do |i|
+          c = C.new
+          case i % 3
+          when 0 then c.early
+          when 1 then c.late
+          else c.third
+          end
+          objs << c
+          objs << D.new
+        end
+        def read(o) = o.foo
+        out = objs.map { |o| read(o) }
+        [out.tally.sort_by(&:to_s), read(C.new)]
+    "), @"[[[1, 67], [4, 67], [7, 66], [:d, 200]], nil]");
+}
+
+#[test]
 fn test_send_mixed_nil_and_non_nil_block_arg() {
     // A `&block` forwarding site that sees both nil and non-nil blocks is split on nil, so the
     // no-block calls become direct sends. Both branches must still produce the right answer.

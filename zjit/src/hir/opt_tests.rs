@@ -11010,11 +11010,18 @@ mod hir_opt_tests {
           v36:CBool = IsBitEqual v33, v35
           CondBranch v36, bb8(), bb9()
         bb8():
-          v40:BasicObject = LoadField v19, :@foo@0x1042
-          Jump bb7(v40)
-        bb9():
-          v38:BasicObject = GetIvar v19, :@foo
+          v38:BasicObject = LoadField v19, :@foo@0x1042
           Jump bb7(v38)
+        bb9():
+          v40:CShape[0x1043] = Const CShape(0x1043)
+          v41:CBool = IsBitEqual v33, v40
+          CondBranch v41, bb10(), bb11()
+        bb10():
+          v45:BasicObject = LoadField v19, :@foo@0x1044
+          Jump bb7(v45)
+        bb11():
+          v43:BasicObject = GetIvar v19, :@foo
+          Jump bb7(v43)
         bb7(v34:BasicObject):
           Jump bb4(v34)
         bb6():

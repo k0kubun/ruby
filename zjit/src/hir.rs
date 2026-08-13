@@ -4976,6 +4976,32 @@ impl Function {
         }
     }
 
+    /// Every profiled type recorded for `recv` at `state` that shares `profiled_type`'s class,
+    /// most frequent first and de-duplicated by shape. A polymorphic dispatch arm branches on the
+    /// class alone, so its profile can hold several shapes for that class; an ivar dispatch wants
+    /// an arm for each of them rather than sending all but one to the C fallback. Shapes an ivar
+    /// dispatch cannot index (too-complex, immediates) are dropped, and `profiled_type` itself is
+    /// always first so callers keep the type they already validated.
+    fn profiled_shape_variants(&self, recv: InsnId, state: InsnId, profiled_type: ProfiledType) -> Vec<ProfiledType> {
+        let mut variants = vec![profiled_type];
+        let Some(profiles) = self.profiles.as_ref() else { return variants };
+        let Some(entries) = profiles.get(state) else { return variants };
+        let expected = Type::from_profiled_type(profiled_type);
+        let recv = self.chase_insn(recv);
+        for (entry_insn, summary) in entries {
+            if self.chase_insn(*entry_insn) != recv { continue; }
+            for &other in summary.buckets() {
+                if other.is_empty() { continue; }
+                if other.flags().is_immediate() || other.shape().is_complex() { continue; }
+                if !Type::from_profiled_type(other).bit_equal(expected) { continue; }
+                if variants.iter().any(|kept| kept.shape() == other.shape()) { continue; }
+                variants.push(other);
+            }
+            break;
+        }
+        variants
+    }
+
     fn count_complex_call_features(&mut self, block: BlockId, ci_flags: c_uint, state: InsnId) {
         use Counter::*;
         if 0 != ci_flags & VM_CALL_ARGS_SPLAT {
@@ -5582,7 +5608,8 @@ impl Function {
                                     && !profiled_type.flags().is_immediate();
                                 let replacement = if branch_on_shape {
                                     let insn_idx = self.frame_state_insn_idx(state) as u32;
-                                    let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
+                                    let shapes = self.profiled_shape_variants(recv, state, profiled_type);
+                                    let (join_block, result) = self.dispatch_getivar(&shapes, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
                                         .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
                                     block = join_block;
                                     result
@@ -5596,7 +5623,8 @@ impl Function {
                                         // time.
                                         Err(Counter::getivar_fallback_no_side_exits) => {
                                             let insn_idx = self.frame_state_insn_idx(state) as u32;
-                                            let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
+                                            let shapes = self.profiled_shape_variants(recv, state, profiled_type);
+                                            let (join_block, result) = self.dispatch_getivar(&shapes, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
                                                 .expect("dispatch_getivar only side-exits without a profiled shape");
                                             block = join_block;
                                             result
@@ -9648,6 +9676,10 @@ struct AddIseqResult {
 ///
 /// Returns the block to continue compiling in and the joined result, or `None` when the receiver
 /// is not polymorphic, in which case the caller should emit a single `Send`.
+/// A sibling shape needs at least this fraction (1/N) of a dispatch arm's samples to earn an arm
+/// of its own. See the filter in [`emit_polymorphic_send`].
+const ARM_SHAPE_MIN_SHARE: u32 = 4;
+
 fn emit_polymorphic_send(
     fun: &mut Function,
     profiles: &mut ProfileOracle,
@@ -9700,7 +9732,30 @@ fn emit_polymorphic_send(
         // side-exiting out of a version that never promised the shape. Dropping it instead would
         // leave the branch with only the refined class, and a class without a shape turns every
         // ivar read on it into an rb_ivar_get call.
-        let recv_profile = profiled_type.as_polymorphic_arm();
+        // Hand over *every* bucket for this class, not just the one that named the arm. The arm
+        // is entered by any receiver of the class, so a sibling bucket's shape is just as likely
+        // to show up as this one's, and an ivar dispatch that only knows one of them sends the
+        // rest to rb_ivar_get.
+        // Ivar dispatch inside the arm can specialize each of these shapes, and every one it
+        // does not know sends its receivers to rb_ivar_get. Rare shapes are not worth an arm
+        // though: the arms live in the caller and share its inline budget, so a dispatch that
+        // grows for a shape almost nobody has can push a hot callee out of the budget and cost
+        // more in dynamic sends than it saves in ivar reads.
+        let class_samples: u32 = summary.buckets().iter().enumerate()
+            .filter(|(_, other)| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
+            .map(|(idx, _)| u32::from(summary.bucket_count(idx)))
+            .sum();
+        let recv_profile: Vec<ProfiledType> = summary.buckets().iter().enumerate()
+            .filter(|(idx, other)| {
+                !other.is_empty()
+                    && Type::from_profiled_type(**other).bit_equal(expected)
+                    // The bucket that named the arm always earns its place; a sibling has to
+                    // carry a real share of the class's traffic.
+                    && (**other == profiled_type
+                        || u32::from(summary.bucket_count(*idx)) * ARM_SHAPE_MIN_SHARE >= class_samples)
+            })
+            .map(|(_, other)| other.as_polymorphic_arm())
+            .collect();
         let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
         let iftrue_block = fun.new_block(insn_idx);
         let fall_through = fun.new_block(insn_idx);
@@ -9718,9 +9773,9 @@ fn emit_polymorphic_send(
         // index to be inlined). The receiver's polymorphic entry is replaced by the single
         // profiled type this branch selects, so specializations that need the shape (attr_reader
         // ivar loads) can still use it.
-        profiles.copy_entries_except(exit_id, snapshot, recv, fun, Some(TypeDistributionSummary::monomorphic(recv_profile)));
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun, Some(TypeDistributionSummary::monomorphic_variants(&recv_profile)));
         let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-        fun.record_profiled_type(refined_recv, recv_profile);
+        fun.record_profiled_type(refined_recv, recv_profile[0]);
         let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.to_vec(), state: snapshot, reason: Uncategorized(opcode.into()) });
         fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
     }
