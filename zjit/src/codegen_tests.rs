@@ -795,7 +795,334 @@ fn test_yield_non_local_return() {
         test
         test
     ");
-    assert_snapshot!(assert_compiles_allowing_exits("test"), @"42");
+    // The block's body is inlined into `test` and its `return` becomes a plain return, so
+    // this compiles with no throw and no side exit at all.
+    assert_snapshot!(assert_compiles("test"), @"42");
+}
+
+#[test]
+fn test_inline_block_non_local_return_with_args() {
+    set_call_threshold(2);
+    eval("
+        def inner(a, b) = yield(a, b)
+        def test(a, b)
+          inner(a, b) { |x, y| return x + y }
+          99
+        end
+        test(1, 2)
+        test(1, 2)
+    ");
+    assert_snapshot!(assert_compiles("test(3, 4)"), @"7");
+}
+
+#[test]
+fn test_inline_block_conditional_non_local_return() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test(x)
+          y = inner { return :early if x }
+          [y, :late]
+        end
+        test(true)
+        test(false)
+    ");
+    assert_snapshot!(assert_compiles("test(true)"), @":early");
+    assert_snapshot!(assert_compiles("test(false)"), @"[nil, :late]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_caller() {
+    // An `ensure` in the frame the `return` unwinds to must still run, so this block is
+    // not inlined and falls back to the throw.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { return 1 }
+        ensure
+          $ran = true
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_block() {
+    // Likewise for an `ensure` inside the block itself.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { begin; return 1; ensure; $ran = true; end }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_from_nested_block_owner() {
+    // `return` inside a block nested in another block escapes to the enclosing method, not
+    // to the block frame ZJIT would be returning from, so the outer block is not eligible.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          [1, 2].each do
+            inner { return :deep }
+          end
+          :shallow
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @":deep");
+}
+
+#[test]
+fn test_inline_block_non_local_return_keeps_frames_walkable() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { return caller_locations(0, 3).map(&:label) }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#"["block in Object#test", "Object#inner", "Object#test"]"#);
+}
+
+#[test]
+fn test_inline_block_raise_unwinds_through_inlined_frames() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { raise 'boom' }
+        rescue => e
+          e.message
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#""boom""#);
+}
+
+// `throw` is compiled with a call to rb_zjit_throw(), which longjmps to the enclosing
+// vm_exec(). The frame that catches the throw resumes in the interpreter, so these tests
+// tolerate the exception_handler exit that entry generates.
+
+#[test]
+fn test_throw_break_with_value_from_each() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x * 10 if x == 3 }
+        test([1, 2, 3, 4])
+        test([1, 2, 3, 4])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3, 4])"), @"30");
+}
+
+#[test]
+fn test_throw_no_break_returns_receiver() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x if x == 99 }
+        test([1, 2])
+        test([1, 2])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2])"), @"[1, 2]");
+}
+
+#[test]
+fn test_throw_break_across_jit_to_jit_call() {
+    // `outer` and `inner` are both compiled and `inner` is called with a native
+    // JIT-to-JIT call, so the throw has to unwind past a JIT caller.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def outer = inner { break 7 }
+        def test = outer
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"7");
+}
+
+#[test]
+fn test_throw_break_three_frames_deep() {
+    set_call_threshold(2);
+    eval("
+        def innermost(a) = a.each { |x| break x if x.even? }
+        def middle(a) = innermost(a)
+        def test(a) = middle(a)
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"2");
+}
+
+#[test]
+fn test_throw_break_value_used_by_caller() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          v = a.each { |x| break x + 100 if x > 1 }
+          v.to_s
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @r#""102""#);
+}
+
+#[test]
+fn test_throw_break_search_loop() {
+    // The `find { }`-shaped search that shows up in rubocop and OptionParser.
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each_with_index { |x, i| break i if x == :b }
+        test([:a, :b, :c])
+        test([:a, :b, :c])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([:a, :b, :c])"), @"1");
+}
+
+#[test]
+fn test_throw_break_runs_ensure() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          log = []
+          r = a.each do |x|
+            begin
+              break x if x == 2
+            ensure
+              log << x
+            end
+          end
+          [r, log]
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
+}
+
+#[test]
+fn test_throw_return_from_proc() {
+    set_call_threshold(2);
+    eval("
+        def test
+          p = proc { return 5 }
+          p.call
+          99
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"5");
+}
+
+#[test]
+fn test_throw_return_from_lambda() {
+    // `return` in a lambda throws TAG_RETURN with the lambda's own frame as the
+    // catch frame, unlike `return` from a proc.
+    set_call_threshold(2);
+    eval("
+        def test
+          l = lambda { return 5 }
+          l.call + 1
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"6");
+}
+
+#[test]
+fn test_throw_orphan_break_raises_local_jump_error() {
+    set_call_threshold(2);
+    eval("
+        def test
+          pr = proc { break 1 }
+          begin
+            pr.call
+          rescue LocalJumpError => e
+            e.class
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"LocalJumpError");
+}
+
+#[test]
+fn test_throw_retry_in_rescue() {
+    set_call_threshold(2);
+    eval("
+        def test
+          tries = 0
+          begin
+            tries += 1
+            raise 'boom' if tries < 3
+            tries
+          rescue
+            retry
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"3");
+}
+
+#[test]
+fn test_throw_next_with_ensure() {
+    // `next` inside begin/ensure compiles to throw TAG_NEXT rather than leave.
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          a.map do |x|
+            begin
+              next x * 2
+            ensure
+              nil
+            end
+          end
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, 4, 6]");
+}
+
+#[test]
+fn test_throw_break_inner_loop_repeatedly() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          sum = 0
+          a.each do |x|
+            a.each do |y|
+              break if y > 2
+              sum += x * y
+            end
+          end
+          sum
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"18");
 }
 
 #[test]
