@@ -4097,22 +4097,17 @@ impl Function {
         self.count(block, counter);
     }
 
+    /// Return true if `self_val` is a known frozen object of a type whose `bop` is still the
+    /// basic operation, i.e. if `rewrite_if_frozen` would elide the call.
+    fn can_rewrite_if_frozen(&self, self_val: InsnId, klass: u32, bop: u32) -> bool {
+        (unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, klass) })
+            && self.type_of(self_val).ruby_object().is_some_and(|obj| obj.is_frozen())
+    }
+
     fn rewrite_if_frozen(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, klass: u32, bop: u32, state: InsnId) {
-        if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, klass) } {
-            // If the basic operation is already redefined, we cannot optimize it.
-            self.set_dynamic_send_reason(orig_insn_id, SendBopRedefined);
-            self.push_insn_id(block, orig_insn_id);
-            return;
-        }
-        let self_type = self.type_of(self_val);
-        if let Some(obj) = self_type.ruby_object() {
-            if obj.is_frozen() {
-                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass, bop }, state });
-                self.make_equal_to(orig_insn_id, self_val);
-                return;
-            }
-        }
-        self.push_insn_id(block, orig_insn_id);
+        debug_assert!(self.can_rewrite_if_frozen(self_val, klass, bop));
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass, bop }, state });
+        self.make_equal_to(orig_insn_id, self_val);
     }
 
     pub fn try_inline_object_alloc(&mut self, block: BlockId, recv: InsnId, state: InsnId) -> Option<InsnId> {
@@ -4130,24 +4125,28 @@ impl Function {
         None
     }
 
-    fn try_rewrite_freeze(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
-        if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+    /// Return the (redefinition flag, BOP) pair to elide a no-argument `freeze` call on
+    /// `self_val`, if the receiver is a known frozen object of a supported type.
+    fn freeze_rewrite_bop(&self, self_val: InsnId) -> Option<(u32, u32)> {
+        let klass = if self.is_a(self_val, types::StringExact) {
+            STRING_REDEFINED_OP_FLAG
         } else if self.is_a(self_val, types::ArrayExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+            ARRAY_REDEFINED_OP_FLAG
         } else if self.is_a(self_val, types::HashExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, HASH_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+            HASH_REDEFINED_OP_FLAG
         } else {
-            self.push_insn_id(block, orig_insn_id);
-        }
+            return None;
+        };
+        self.can_rewrite_if_frozen(self_val, klass, BOP_FREEZE).then_some((klass, BOP_FREEZE))
     }
 
-    fn try_rewrite_uminus(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
-        if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS, state);
-        } else {
-            self.push_insn_id(block, orig_insn_id);
+    /// Same as `freeze_rewrite_bop`, but for a no-argument `-@` call.
+    fn uminus_rewrite_bop(&self, self_val: InsnId) -> Option<(u32, u32)> {
+        if !self.is_a(self_val, types::StringExact) {
+            return None;
         }
+        self.can_rewrite_if_frozen(self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS)
+            .then_some((STRING_REDEFINED_OP_FLAG, BOP_UMINUS))
     }
 
     pub fn load_rbasic_flags(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -4302,10 +4301,23 @@ impl Function {
             for insn_id in old_insns {
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
-                    &Insn::Send { recv, block: None, ref args, state, cd, .. } if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty() =>
-                        self.try_rewrite_freeze(block, insn_id, recv, state),
-                    &Insn::Send { recv, block: None, ref args, state, cd, .. } if ruby_call_method_id(cd) == ID!(minusat) && args.is_empty() =>
-                        self.try_rewrite_uminus(block, insn_id, recv, state),
+                    // Elide `freeze`/`-@` on an object that is already known to be frozen. If the
+                    // receiver is not a known frozen object, fall through to the generic Send
+                    // specialization below instead of giving up on the call site: `String#-@`,
+                    // `Integer#-@`, `Object#freeze` etc. are ordinary methods that can be
+                    // specialized like any other.
+                    &Insn::Send { recv, block: None, ref args, state, cd, .. }
+                        if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty()
+                            && self.freeze_rewrite_bop(recv).is_some() => {
+                        let (klass, bop) = self.freeze_rewrite_bop(recv).unwrap();
+                        self.rewrite_if_frozen(block, insn_id, recv, klass, bop, state);
+                    }
+                    &Insn::Send { recv, block: None, ref args, state, cd, .. }
+                        if ruby_call_method_id(cd) == ID!(minusat) && args.is_empty()
+                            && self.uminus_rewrite_bop(recv).is_some() => {
+                        let (klass, bop) = self.uminus_rewrite_bop(recv).unwrap();
+                        self.rewrite_if_frozen(block, insn_id, recv, klass, bop, state);
+                    }
                     &Insn::Send { mut recv, cd, state, block: send_block, .. } => {
                         let mut has_block = send_block.is_some();
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {

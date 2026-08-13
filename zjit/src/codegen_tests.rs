@@ -7952,3 +7952,30 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       :done
     "#), @":done");
 }
+
+#[test]
+fn test_uminus_on_unfrozen_string_is_a_call() {
+    eval("
+        def entry(s) = -s
+        20.times { entry(+'ab') }
+    ");
+    assert_snapshot!(assert_compiles("entry(+'ab')"), @r#""ab""#);
+}
+
+#[test]
+fn test_freeze_on_unfrozen_array_is_a_call() {
+    eval("
+        def entry(a) = a.freeze
+        20.times { entry([1]) }
+    ");
+    assert_snapshot!(assert_compiles("entry([1]).frozen?"), @"true");
+}
+
+#[test]
+fn test_uminus_on_integer_is_a_call() {
+    eval("
+        def entry(n) = -n
+        20.times { entry(3) }
+    ");
+    assert_snapshot!(assert_compiles("entry(3)"), @"-3");
+}
