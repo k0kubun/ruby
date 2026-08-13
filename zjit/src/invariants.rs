@@ -4,7 +4,7 @@ use std::{collections::{HashMap, HashSet}, mem, sync::atomic::{AtomicBool, Order
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
-use crate::codegen::invalidate_iseq_version;
+use crate::codegen::{InvalidationCause, invalidate_iseq_version};
 use crate::cruby::{rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
@@ -27,7 +27,7 @@ macro_rules! compile_patch_points {
                 let mut version = patch_point.version;
                 let iseq = unsafe { version.as_ref() }.iseq;
                 if !iseq.is_null() {
-                    invalidate_iseq_version($cb, iseq, &mut version);
+                    invalidate_iseq_version($cb, iseq, &mut version, InvalidationCause::PatchPoint);
                     // Remember NoSingletonClass busts on the payload
                     if is_no_singleton_class!($cause) {
                         let payload = get_or_create_iseq_payload(iseq);
