@@ -1,6 +1,6 @@
 //! Runtime state of ZJIT.
 
-use crate::codegen::{gen_entry_trampoline, gen_exception_mismatch_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
+use crate::codegen::{gen_entry_trampoline, gen_exception_handler_counter, gen_exception_miss_trampoline, gen_exception_mismatch_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
 use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
@@ -69,6 +69,9 @@ pub struct ZJITState {
     /// Trampoline to side-exit from an exception handler entry whose PC guard failed
     exception_mismatch_trampoline: CodePtr,
 
+    /// Tail of every exception handler dispatch chain: compiles an entry for the
+    /// continuation that missed, or returns to the interpreter
+    exception_miss_trampoline: CodePtr,
 
     /// Trampoline to call function_stub_hit
     function_stub_hit_trampoline: CodePtr,
@@ -163,9 +166,10 @@ impl ZJITState {
             exit_trampoline,
             materialize_exit_trampoline,
             materialize_exit_trampoline_with_counter: materialize_exit_trampoline,
-            // Replaced below: the trampoline reads counter pointers, so it can
-            // only be generated once ZJIT_STATE is initialized.
+            // Replaced below: these trampolines read counter pointers, so they
+            // can only be generated once ZJIT_STATE is initialized.
             exception_mismatch_trampoline: exit_trampoline,
+            exception_miss_trampoline: exit_trampoline,
             function_stub_hit_trampoline,
             full_frame_cfunc_counter_pointers: HashMap::new(),
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
@@ -176,11 +180,17 @@ impl ZJITState {
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
-        // Generated after ZJIT_STATE is initialized because it increments a counter.
+        // Generated after ZJIT_STATE is initialized because they increment counters.
         {
             let cb = ZJITState::get_code_block();
             let code_ptr = gen_exception_mismatch_trampoline(cb, exit_trampoline).unwrap();
             ZJITState::get_instance().exception_mismatch_trampoline = code_ptr;
+
+            // The bail path is the same code the pre-dispatch stub used: count an
+            // exception handler exit and let the interpreter run the frame.
+            let bail_ptr = gen_exception_handler_counter(cb).unwrap();
+            let code_ptr = gen_exception_miss_trampoline(cb, bail_ptr).unwrap();
+            ZJITState::get_instance().exception_miss_trampoline = code_ptr;
         }
 
         // With --zjit-stats, use a different trampoline on function stub exits
@@ -321,6 +331,10 @@ impl ZJITState {
         ZJITState::get_instance().exception_mismatch_trampoline
     }
 
+    /// Return a code pointer to the tail of every exception handler dispatch chain
+    pub fn get_exception_miss_trampoline() -> CodePtr {
+        ZJITState::get_instance().exception_miss_trampoline
+    }
 
     /// Return a code pointer to the materialize_exit trampoline
     pub fn get_materialize_exit_trampoline() -> CodePtr {
