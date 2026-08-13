@@ -818,6 +818,9 @@ pub enum SendFallbackReason {
     InvokeSuperForwardNotSpecialized,
     /// The single-ractor-mode assumption could not be made.
     SingleRactorModeRequired,
+    /// A `send`/`__send__` call site whose method-name argument did not match any of the
+    /// names the profiler observed there.
+    SendUnprofiledMethodName,
     /// Initial fallback reason for every instruction, which should be mutated to
     /// a more actionable reason when an attempt to specialize the instruction fails.
     Uncategorized(VmInsnType),
@@ -866,6 +869,7 @@ impl Display for SendFallbackReason {
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
             InvokeSuperForwardNotSpecialized => write!(f, "InvokeSuperForward: not yet specialized"),
             SingleRactorModeRequired => write!(f, "Single-ractor mode required"),
+            SendUnprofiledMethodName => write!(f, "send: method name not seen while profiling"),
             Uncategorized(insn) => write!(f, "Uncategorized({})", insn_name(insn.to_usize())),
         }
     }
@@ -2821,6 +2825,29 @@ struct SetIvarSpec {
     next_shape: ShapeId,
 }
 
+/// How a shape dispatch reacts to a receiver whose shape is not one of the profiled ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeMiss {
+    /// Guard on the profiled shape and side-exit, so the ISEQ can be recompiled around the
+    /// shape it actually sees. Only valid where the profiled shape is a real prediction for
+    /// this program point.
+    SideExit,
+    /// Branch on the profiled shape and let the generic C helper handle everything else. Costs
+    /// a compare and a branch on the fast path, but never leaves JIT code. The miss is worth
+    /// recording so that a later version of the ISEQ can add the shape.
+    CallFallback,
+    /// Same, but the miss must not be recorded. Recording it makes the ISEQ re-profile, which
+    /// throws away the type profile the dispatch arms were built from — a bad trade when the
+    /// profiled shape was never a prediction for this program point in the first place.
+    CallFallbackWithoutReprofile,
+}
+
+impl ShapeMiss {
+    fn calls_fallback(self) -> bool {
+        !matches!(self, ShapeMiss::SideExit)
+    }
+}
+
 impl CompilePolicy {
     fn new(iseq: *const rb_iseq_t) -> Self {
         // When a previous version was invalidated and we've reached the version
@@ -2893,6 +2920,10 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// For `Send` instructions on a `send`/`__send__` call site that HIR build has already
+    /// guarded to one method name, the ID of that method. `type_specialize` uses it (and
+    /// drops the leading method-name argument) to resolve the call like a direct call.
+    send_mid_overrides: HashMap<InsnId, ID>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3295,6 +3326,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            send_mid_overrides: HashMap::new(),
         }
     }
 
@@ -4491,22 +4523,17 @@ impl Function {
         self.count(block, counter);
     }
 
+    /// Return true if `self_val` is a known frozen object of a type whose `bop` is still the
+    /// basic operation, i.e. if `rewrite_if_frozen` would elide the call.
+    fn can_rewrite_if_frozen(&self, self_val: InsnId, klass: u32, bop: u32) -> bool {
+        (unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, klass) })
+            && self.type_of(self_val).ruby_object().is_some_and(|obj| obj.is_frozen())
+    }
+
     fn rewrite_if_frozen(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, klass: u32, bop: u32, state: InsnId) {
-        if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, klass) } {
-            // If the basic operation is already redefined, we cannot optimize it.
-            self.set_dynamic_send_reason(orig_insn_id, SendBopRedefined);
-            self.push_insn_id(block, orig_insn_id);
-            return;
-        }
-        let self_type = self.type_of(self_val);
-        if let Some(obj) = self_type.ruby_object() {
-            if obj.is_frozen() {
-                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass, bop }, state });
-                self.make_equal_to(orig_insn_id, self_val);
-                return;
-            }
-        }
-        self.push_insn_id(block, orig_insn_id);
+        debug_assert!(self.can_rewrite_if_frozen(self_val, klass, bop));
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass, bop }, state });
+        self.make_equal_to(orig_insn_id, self_val);
     }
 
     pub fn try_inline_object_alloc(&mut self, block: BlockId, recv: InsnId, state: InsnId) -> Option<InsnId> {
@@ -4524,24 +4551,28 @@ impl Function {
         None
     }
 
-    fn try_rewrite_freeze(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
-        if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+    /// Return the (redefinition flag, BOP) pair to elide a no-argument `freeze` call on
+    /// `self_val`, if the receiver is a known frozen object of a supported type.
+    fn freeze_rewrite_bop(&self, self_val: InsnId) -> Option<(u32, u32)> {
+        let klass = if self.is_a(self_val, types::StringExact) {
+            STRING_REDEFINED_OP_FLAG
         } else if self.is_a(self_val, types::ArrayExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, ARRAY_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+            ARRAY_REDEFINED_OP_FLAG
         } else if self.is_a(self_val, types::HashExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, HASH_REDEFINED_OP_FLAG, BOP_FREEZE, state);
+            HASH_REDEFINED_OP_FLAG
         } else {
-            self.push_insn_id(block, orig_insn_id);
-        }
+            return None;
+        };
+        self.can_rewrite_if_frozen(self_val, klass, BOP_FREEZE).then_some((klass, BOP_FREEZE))
     }
 
-    fn try_rewrite_uminus(&mut self, block: BlockId, orig_insn_id: InsnId, self_val: InsnId, state: InsnId) {
-        if self.is_a(self_val, types::StringExact) {
-            self.rewrite_if_frozen(block, orig_insn_id, self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS, state);
-        } else {
-            self.push_insn_id(block, orig_insn_id);
+    /// Same as `freeze_rewrite_bop`, but for a no-argument `-@` call.
+    fn uminus_rewrite_bop(&self, self_val: InsnId) -> Option<(u32, u32)> {
+        if !self.is_a(self_val, types::StringExact) {
+            return None;
         }
+        self.can_rewrite_if_frozen(self_val, STRING_REDEFINED_OP_FLAG, BOP_UMINUS)
+            .then_some((STRING_REDEFINED_OP_FLAG, BOP_UMINUS))
     }
 
     pub fn load_rbasic_flags(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -4698,16 +4729,32 @@ impl Function {
     /// opens the door for inlining.
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
-        for block in self.reverse_post_order() {
-            let old_insns = std::mem::take(&mut self.blocks[block.to_usize()].insns);
-            assert!(self.blocks[block.to_usize()].insns.is_empty());
+        for entry_block in self.reverse_post_order() {
+            let old_insns = std::mem::take(&mut self.blocks[entry_block.to_usize()].insns);
+            assert!(self.blocks[entry_block.to_usize()].insns.is_empty());
+            // Rewriting an instruction into a branch splits the block: everything after it,
+            // including the original terminator, is emitted into the join block instead.
+            let mut block = entry_block;
             for insn_id in old_insns {
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
-                    &Insn::Send { recv, block: None, ref args, state, cd, .. } if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty() =>
-                        self.try_rewrite_freeze(block, insn_id, recv, state),
-                    &Insn::Send { recv, block: None, ref args, state, cd, .. } if ruby_call_method_id(cd) == ID!(minusat) && args.is_empty() =>
-                        self.try_rewrite_uminus(block, insn_id, recv, state),
+                    // Elide `freeze`/`-@` on an object that is already known to be frozen. If the
+                    // receiver is not a known frozen object, fall through to the generic Send
+                    // specialization below instead of giving up on the call site: `String#-@`,
+                    // `Integer#-@`, `Object#freeze` etc. are ordinary methods that can be
+                    // specialized like any other.
+                    &Insn::Send { recv, block: None, ref args, state, cd, .. }
+                        if ruby_call_method_id(cd) == ID!(freeze) && args.is_empty()
+                            && self.freeze_rewrite_bop(recv).is_some() => {
+                        let (klass, bop) = self.freeze_rewrite_bop(recv).unwrap();
+                        self.rewrite_if_frozen(block, insn_id, recv, klass, bop, state);
+                    }
+                    &Insn::Send { recv, block: None, ref args, state, cd, .. }
+                        if ruby_call_method_id(cd) == ID!(minusat) && args.is_empty()
+                            && self.uminus_rewrite_bop(recv).is_some() => {
+                        let (klass, bop) = self.uminus_rewrite_bop(recv).unwrap();
+                        self.rewrite_if_frozen(block, insn_id, recv, klass, bop, state);
+                    }
                     &Insn::Send { mut recv, cd, state, block: send_block, .. } => {
                         let mut has_block = send_block.is_some();
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
@@ -4733,9 +4780,35 @@ impl Function {
                         };
                         let ci = unsafe { (*cd).ci }; // info about the call site
 
-                        let flags = unsafe { rb_vm_ci_flag(ci) };
+                        let mut flags = unsafe { rb_vm_ci_flag(ci) };
+                        let mut mid = unsafe { vm_ci_mid(ci) };
 
-                        let mid = unsafe { vm_ci_mid(ci) };
+                        // A `send`/`__send__` call site that HIR build guarded to one method name
+                        // is compiled as a call to that method: the name argument is dropped and,
+                        // like the interpreter's vm_call_opt_send, private and protected methods
+                        // are callable. Only plain positional call sites get an override (see
+                        // send_method_names), so every other property of `ci` — the keyword
+                        // table, the splat and block-arg flags — is unchanged by the rewrite and
+                        // stays valid for the resolved call.
+                        let mut send_mid_override = self.send_mid_overrides.get(&insn_id).copied();
+                        if let Some(target_mid) = send_mid_override {
+                            // Only rewrite while `send` really is BasicObject#send. If it has
+                            // been replaced, call it like any other method.
+                            let send_cme = unsafe { rb_callable_method_entry(klass, mid) };
+                            let is_opt_send = !send_cme.is_null()
+                                && unsafe { get_cme_def_type(send_cme) } == VM_METHOD_TYPE_OPTIMIZED
+                                && unsafe { get_cme_def_body_optimized_type(send_cme) } == OPTIMIZED_METHOD_TYPE_SEND;
+                            if is_opt_send {
+                                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: send_cme }, state });
+                                mid = target_mid;
+                                flags |= VM_CALL_FCALL;
+                            } else {
+                                send_mid_override = None;
+                            }
+                        }
+                        let flags = flags;
+                        let mid = mid;
+
                         // Do method lookup
                         let mut cme = unsafe { rb_callable_method_entry(klass, mid) };
                         if cme.is_null() {
@@ -4773,6 +4846,15 @@ impl Function {
                             Insn::Send { args, .. } => args.to_vec(),
                             _ => panic!("Expected Send instruction"),
                         };
+                        if send_mid_override.is_some() {
+                            // Drop the method-name argument, as vm_call_opt_send does. The
+                            // pre-send `state` is kept for guards so that a side exit re-runs
+                            // `send` in the interpreter with the name still on the stack;
+                            // `send_frame_state` describes the callee frame without it.
+                            args.remove(0);
+                            let new_state = self.frame_state(state).with_replaced_args(&args, args.len() + 1);
+                            send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                        }
                         let mut stripped_nil_block = false;
                         if send_block == Some(BlockHandler::BlockArg) && def_type == VM_METHOD_TYPE_ISEQ {
                             // The block arg is the last element in args
@@ -4938,10 +5020,24 @@ impl Function {
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
 
-                                let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point (see the attr_writer case below), so branch on its shape
+                                // rather than guarding: a receiver of the right class but a
+                                // different shape takes rb_ivar_get instead of side-exiting and
+                                // recompiling the ISEQ around a shape the arm never promised.
+                                let replacement = if profiled_type.flags().is_polymorphic_arm()
+                                    && !profiled_type.shape().is_complex() && !profiled_type.flags().is_immediate() {
+                                    let insn_idx = self.frame_state_insn_idx(state) as u32;
+                                    let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, ShapeMiss::CallFallbackWithoutReprofile)
+                                        .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
+                                    block = join_block;
+                                    result
+                                } else {
+                                    self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                    })
+                                };
                                 self.make_equal_to(insn_id, replacement);
                             } else {
                                 // No shape information, just static class information
@@ -4962,15 +5058,39 @@ impl Function {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
-                                // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
-                                // operand other than CFP self. Support it with a reprofile strategy that
-                                // profiles the receiver operand even after the send insn has finished profiling.
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
-                                let recompile = None;
-                                self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point: the arm's type test only pins the class, and the shape is
+                                // whatever the profiler happened to see for that class at the
+                                // unrefined call site. Guarding it with a side exit measurably
+                                // pushes the call site megamorphic. Branch on the shape instead and
+                                // let rb_ivar_set handle every other shape, which also gives the
+                                // final version of an ISEQ a fast path it is otherwise denied.
+                                let shape_miss = if profiled_type.flags().is_polymorphic_arm() {
+                                    ShapeMiss::CallFallbackWithoutReprofile
+                                } else {
+                                    ShapeMiss::SideExit
+                                };
+                                match self.prepare_optimized_setivar(id, profiled_type) {
+                                    Ok(spec) if shape_miss.calls_fallback() || self.policy.no_side_exits => {
+                                        let insn_idx = self.frame_state_insn_idx(state) as u32;
+                                        block = self.dispatch_setivar(&[spec], None, block, insn_idx, recv, id, std::ptr::null(), val, state, shape_miss)
+                                            .expect("dispatch_setivar with a spec never side-exits unconditionally");
+                                    }
+                                    Ok(spec) => {
+                                        // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
+                                        // operand other than CFP self. Support it with a reprofile strategy that
+                                        // profiles the receiver operand even after the send insn has finished profiling.
+                                        let recv = self.guard_heap(block, recv, state);
+                                        let shape = self.load_shape(block, recv);
+                                        self.guard_shape(block, shape, profiled_type.shape(), state, None);
+                                        self.emit_optimized_setivar(block, recv, id, val, spec);
+                                    }
+                                    Err(counter) => {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
+                                    }
+                                }
                             } else {
                                 // No shape information, just static class information
                                 self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
@@ -5078,10 +5198,10 @@ impl Function {
                                 recv_class: VALUE,
                                 profiled_type: Option<ProfiledType>,
                                 cme: *const rb_callable_method_entry_struct,
+                                method_id: ID,
+                                argc: u32,
                             ) -> Result<(), ()> {
                                 let call_info = unsafe { (*cd).ci };
-                                let argc = unsafe { vm_ci_argc(call_info) };
-                                let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
                                 let ci_flags = unsafe { vm_ci_flag(call_info) };
                                 // When seeing &block argument, fall back to dynamic dispatch for now
@@ -5271,11 +5391,12 @@ impl Function {
                                         fun.set_dynamic_send_reason(send_insn_id, SendCfuncArrayVariadic);
                                         Err(())
                                     }
-                                    _ => unreachable!("unknown cfunc kind: argc={argc}")
+                                    _ => unreachable!("unknown cfunc kind: cfunc_argc={cfunc_argc}")
                                 }
                             }
 
-                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme).is_ok() {
+                            let ccall_argc = if send_mid_override.is_some() { args.len() as u32 } else { unsafe { vm_ci_argc(ci) } };
+                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme, mid, ccall_argc).is_ok() {
                                 continue;
                             }
 
@@ -6203,19 +6324,6 @@ impl Function {
             }
             self.push_insn(block, Insn::StoreField { recv: self_val, id: FieldName::shape_id, offset: shape_id_offset, val: shape_id, num_bits: types::CShape.num_bits() });
         }
-    }
-
-    fn try_emit_optimized_setivar(&mut self, block: BlockId, self_val: InsnId, id: ID, val: InsnId, profiled_type: ProfiledType, state: InsnId, recompile: Option<Recompile>) -> Result<(), Counter> {
-        if self.policy.no_side_exits {
-            // On the final version, don't add a shape guard without a fallback.
-            return Err(Counter::setivar_fallback_no_side_exits);
-        }
-        let spec = self.prepare_optimized_setivar(id, profiled_type)?;
-        let self_val = self.guard_heap(block, self_val, state);
-        let shape = self.load_shape(block, self_val);
-        self.guard_shape(block, shape, profiled_type.shape(), state, recompile);
-        self.emit_optimized_setivar(block, self_val, id, val, spec);
-        Ok(())
     }
 
     fn gen_patch_points_for_optimized_ccall(&mut self, block: BlockId, recv_class: VALUE, method_id: ID, cme: *const rb_callable_method_entry_struct, state: InsnId) {
@@ -8117,15 +8225,23 @@ impl Function {
         no_profile_reason: SideExitReason,
         fallback_counter: Counter,
         has_result: bool,
+        shape_miss: ShapeMiss,
         profile_shape: impl Fn(T) -> ShapeId,
         mut emit_optimized: impl FnMut(&mut Function, BlockId, T) -> Option<InsnId>,
         mut emit_fallback: impl FnMut(&mut Function, BlockId) -> Option<InsnId>,
     ) -> Option<(BlockId, Option<InsnId>)> {
+        // The final version of an ISEQ may not speculate at all, whatever the caller asked for.
+        let shape_miss = match shape_miss {
+            ShapeMiss::SideExit if self.policy.no_side_exits => ShapeMiss::CallFallback,
+            shape_miss => shape_miss,
+        };
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
-            if self.policy.no_side_exits {
+            if shape_miss.calls_fallback() {
                 self.count(block, fallback_counter);
-                self.emit_ivar_reprofile(block, self_param, exit_id);
+                if shape_miss == ShapeMiss::CallFallback {
+                    self.emit_ivar_reprofile(block, self_param, exit_id);
+                }
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
                 return Some((block, result));
@@ -8135,7 +8251,7 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        if profiles.len() == 1 && !shape_miss.calls_fallback() {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -8157,18 +8273,20 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
-                    // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
+                if shape_miss.calls_fallback() {
+                    // Without a side exit available, make a fallback block and jump to it if the shape doesn't match.
                     let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
                     let fallback_block = self.new_block(insn_idx);
                     self.push_insn(block, branch(matches, optimized_block, fallback_block));
                     self.count(fallback_block, fallback_counter);
-                    self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
+                    if shape_miss == ShapeMiss::CallFallback {
+                        self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
+                    }
                     let fallback_result = emit_fallback(self, fallback_block);
                     self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
                 } else {
-                    // If the policy allows exits, exit to the interpreter if the shape doesn't match.
+                    // Otherwise exit to the interpreter if the shape doesn't match.
                     self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile));
                     // TODO(max): Don't make a new block in this case
                     self.push_insn(block, Insn::Jump(edge(optimized_block)));
@@ -8198,6 +8316,7 @@ impl Function {
         id: ID,
         ic: *const iseq_inline_iv_cache_entry,
         exit_id: InsnId,
+        shape_miss: ShapeMiss,
     ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
@@ -8208,6 +8327,7 @@ impl Function {
             SideExitReason::NoProfileGetIvar,
             Counter::getivar_fallback_no_side_exits,
             true,
+            shape_miss,
             |profiled_type| profiled_type.shape(),
             |fun, block, profiled_type| Some(fun.load_ivar(block, self_param, profiled_type, id)),
             |fun, block| Some(fun.push_insn(block, Insn::GetIvar { self_val: self_param, id, ic, state: exit_id })),
@@ -8228,6 +8348,7 @@ impl Function {
         ic: *const iseq_inline_iv_cache_entry,
         val: InsnId,
         exit_id: InsnId,
+        shape_miss: ShapeMiss,
     ) -> Option<BlockId> {
         if specs.is_empty() {
             if let Some(counter) = unoptimized_reason {
@@ -8245,6 +8366,7 @@ impl Function {
             SideExitReason::NoProfileSetIvar,
             Counter::setivar_fallback_no_side_exits,
             false,
+            shape_miss,
             |spec| spec.profiled_type.shape(),
             |fun, block, spec| {
                 fun.emit_optimized_setivar(block, self_param, id, val, spec);
@@ -8754,6 +8876,12 @@ impl ProfileOracle {
         self.types.get(&state).map(|v| v.as_slice())
     }
 
+    /// Record `summary` as the profile of `insn` at the `dst` Snapshot. Used by polymorphic
+    /// dispatch to give each refined arm a monomorphic view of the receiver.
+    fn add_entry(&mut self, dst: InsnId, insn: InsnId, summary: TypeDistributionSummary) {
+        self.types.entry(dst).or_default().push((insn, summary));
+    }
+
     /// Map the interpreter-recorded types of the stack onto the HIR operands on our compile-time virtual stack.
     fn profile_stack(&mut self, snapshot: InsnId, state: &FrameState) {
         let iseq_insn_idx = state.insn_idx;
@@ -8806,6 +8934,43 @@ impl ProfileOracle {
             self.types.insert(dst, filtered);
         }
     }
+
+    /// Copy every profile entry recorded for the `src` Snapshot to the `dst` Snapshot. Used by
+    /// `send` method-name dispatch, where each arm gets a fresh Snapshot but sees exactly the
+    /// same receiver and arguments as the original call site.
+    fn copy_entries(&mut self, src: InsnId, dst: InsnId) {
+        if let Some(entries) = self.types.get(&src).cloned() {
+            self.types.entry(dst).or_default().extend(entries);
+        }
+    }
+}
+
+/// Return the method names to build a `send`/`__send__` method-name dispatch on, most frequent
+/// first. Empty when this is not a specializable `send` call site or the profile is unusable.
+fn send_method_names(profile: &crate::profile::IseqProfile, cd: *const rb_call_data, insn_idx: YarvInsnIdx, argc: usize) -> Vec<VALUE> {
+    if argc == 0 {
+        return vec![];
+    }
+    let ci = unsafe { (*cd).ci };
+    let mid = unsafe { vm_ci_mid(ci) };
+    if mid != ID!(send) && mid != ID!(__send__) {
+        return vec![];
+    }
+    // Keep this in sync with profile_send_method_name: anything else is rejected downstream.
+    let flags = unsafe { vm_ci_flag(ci) };
+    if flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0 {
+        return vec![];
+    }
+    let Some(summary) = profile.get_send_method_names(insn_idx) else { return vec![] };
+    // A megamorphic name distribution means the profiler ran out of buckets, so the arms we
+    // could build would not cover the call site. Leave it as a dynamic send.
+    if summary.is_megamorphic() || summary.is_skewed_megamorphic() {
+        return vec![];
+    }
+    summary.buckets().iter()
+        .take_while(|profiled_type| !profiled_type.is_empty())
+        .map(|profiled_type| profiled_type.class())
+        .collect()
 }
 
 fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
@@ -10342,7 +10507,43 @@ fn add_iseq_to_hir(
                     let args = state.stack_pop_n(argc as usize)?;
                     let recv = state.stack_pop()?;
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    // `recv.send(:name, ...)` chooses its callee from the first argument, so the
+                    // call site's method ID (`send`) tells the optimizer nothing. Branch on the
+                    // method names the profiler saw and let each arm resolve as a call to that
+                    // method; anything unseen falls through to the ordinary dynamic send.
+                    let send_names = send_method_names(&payload.profile, cd, exit_state.insn_idx, args.len());
+                    if !send_names.is_empty() {
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        for name in send_names {
+                            let expected = fun.push_insn(block, Insn::Const { val: Const::Value(name) });
+                            let is_name = fun.push_insn(block, Insn::IsBitEqual { left: args[0], right: expected });
+                            let iftrue_block = fun.new_block(insn_idx);
+                            let fall_through = fun.new_block(insn_idx);
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: is_name,
+                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
+                                if_false: BranchEdge { target: fall_through, args: vec![] }
+                            });
+                            block = fall_through;
+                            // Each arm needs its own Snapshot so that the recorded method name
+                            // only applies to that arm. The operand profiles still apply, so
+                            // carry them over.
+                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+                            profiles.copy_entries(exit_id, snapshot);
+                            // Keep the full argument list (including the method name) so that a
+                            // send that turns out not to be specializable still lowers to a
+                            // correct dynamic `send`. type_specialize drops the name argument
+                            // when, and only when, it resolves the call.
+                            let send = fun.push_insn(iftrue_block, Insn::Send { recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
+                            fun.send_mid_overrides.insert(send, unsafe { rb_sym2id(name) });
+                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                        }
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, state: exit_id, reason: SendUnprofiledMethodName });
+                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                        state.stack_push(join_param);
+                        block = join_block;
+                    } else if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         // Dedup by expected type so immediate/heap variants
@@ -10355,6 +10556,13 @@ fn add_iseq_to_hir(
                                 continue;
                             }
                             seen_types.push(expected);
+                            // This arm is only guarded on `expected`, which carries the class but
+                            // not the shape. Only treat the bucket's shape as representative when
+                            // every observation that lands in this arm agreed on it; otherwise a
+                            // shape guard here would keep side-exiting.
+                            let unique_shape_for_type = summary.buckets().iter()
+                                .filter(|other| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
+                                .all(|other| *other == profiled_type);
                             let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
                             let iftrue_block = fun.new_block(insn_idx);
                             let fall_through = fun.new_block(insn_idx);
@@ -10371,10 +10579,18 @@ fn add_iseq_to_hir(
                             let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
                             // Keep the other operands' profile entries visible at the fresh
                             // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
+                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). The
+                            // receiver's polymorphic entry is dropped: it must resolve from this
+                            // arm's type, and resolve_receiver_type prefers profiles over types.
                             profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                            // Re-add the receiver as a monomorphic profile of just this arm's
+                            // bucket. Type::from_profiled_type only carries the class, so without
+                            // this the arm resolves as StaticallyKnown and loses the shape,
+                            // forcing attr_reader sends into a full rb_ivar_get C call instead of
+                            // a shape-guarded field load.
+                            if unique_shape_for_type {
+                                profiles.add_entry(snapshot, recv, TypeDistributionSummary::monomorphic(profiled_type.as_polymorphic_arm()));
+                            }
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
                             let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
                             fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
@@ -10918,6 +11134,7 @@ fn add_iseq_to_hir(
                         id,
                         ic,
                         exit_id,
+                        ShapeMiss::SideExit,
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
@@ -10975,6 +11192,7 @@ fn add_iseq_to_hir(
                         ic,
                         val,
                         exit_id,
+                        ShapeMiss::SideExit,
                     ) else {
                         // Side-exiting unconditionally; end the block.
                         break;
