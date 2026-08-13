@@ -122,13 +122,17 @@ unsafe extern "C" {
         ci: *const rb_callinfo,
     ) -> *const rb_callable_method_entry_t;
 
+    // libc memcpy, for inlined string appends. The regions never overlap:
+    // the destination starts past the end of the source string's bytes.
+    pub fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
     pub fn rb_float_new(d: f64) -> VALUE;
 
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
+    pub fn rb_zjit_cdhash_fixnum_entries(cdhash: VALUE, buf: *mut c_long, capacity: c_long) -> c_long;
     pub fn rb_ary_new_from_args(n: c_long, ...) -> VALUE;
-    pub fn rb_str_setbyte(str: VALUE, index: VALUE, value: VALUE) -> VALUE;
     pub fn rb_str_getbyte(str: VALUE, index: VALUE) -> VALUE;
     pub fn rb_vm_splat_array(flag: VALUE, ary: VALUE) -> VALUE;
     pub fn rb_jit_fix_div_fix(x: VALUE, y: VALUE) -> VALUE;
@@ -1236,6 +1240,20 @@ mod manual_defs {
 
     pub const RUBY_OFFSET_RSTRING_AS_HEAP_PTR: i32 = 24; // struct RString, subfield "as.heap.ptr"
     pub const RUBY_OFFSET_RSTRING_AS_ARY: i32 = 24; // struct RString, subfield "as.embed.ary"
+    pub const RUBY_OFFSET_RSTRING_AS_HEAP_AUX_CAPA: i32 = 32; // struct RString, subfield "as.heap.aux.capa"
+
+    // Private RString flags from string.c and internal/string.h.
+    // RSTRING_NOEMBED (FL_USER1) and RSTRING_FSTR (FL_USER17) come from bindgen.
+    // ruby_fl_type is i32, so cast through u32 to avoid sign-extending
+    // RUBY_FL_USER19 (bit 31) into the upper half.
+    pub const STR_SHARED: u64 = RUBY_FL_USER0 as u32 as u64;
+    pub const STR_CHILLED: u64 = RUBY_FL_USER2 as u32 as u64;
+    pub const STR_PRECOMPUTED_HASH: u64 = RUBY_FL_USER4 as u32 as u64;
+    pub const STR_SHARED_ROOT: u64 = RUBY_FL_USER5 as u32 as u64;
+    pub const STR_BORROWED: u64 = RUBY_FL_USER6 as u32 as u64;
+    pub const STR_TMPLOCK: u64 = RUBY_FL_USER7 as u32 as u64;
+    pub const STR_NOFREE: u64 = RUBY_FL_USER18 as u32 as u64;
+    pub const STR_FAKESTR: u64 = RUBY_FL_USER19 as u32 as u64;
 
     // Constants from rb_control_frame_t vm_core.h
     pub const RUBY_OFFSET_CFP_PC: i32 = 0;
@@ -1731,6 +1749,7 @@ pub(crate) mod ids {
         name: rb_ivar_get_at_no_ractor_check
         name: RUBY_FL_FREEZE
         name: RUBY_ELTS_SHARED
+        name: RSTRING_DEPENDANT_MASK
         name: RubyVM
         name: ZJIT
         name: induce_side_exit_bang       content: b"induce_side_exit!"

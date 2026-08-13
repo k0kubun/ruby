@@ -728,6 +728,65 @@ fn test_yield_with_too_many_args_for_lir() {
 }
 
 #[test]
+fn test_send_direct_passes_extra_args_on_the_stack() {
+    // `self` + eight positional args don't fit in C argument registers on x86_64, so the
+    // last ones travel through the callee's local slots on the VM stack instead.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, f, g, h) = [a, b, c, d, e, f, g, h]
+        def test = target(1, 2, 3, 4, 5, 6, 7, 8)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6, 7, 8]");
+}
+
+#[test]
+fn test_send_direct_passes_extra_kwargs_on_the_stack() {
+    // Keyword arguments are reordered into the callee's parameter order before they are
+    // split between registers and the callee's local slots.
+    set_call_threshold(2);
+    eval("
+        def target(a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0) = [a, b, c, d, e, f, g]
+        def test = target(g: 7, b: 2, f: 6, a: 1)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 0, 0, 0, 6, 7]");
+}
+
+#[test]
+fn test_send_direct_with_extra_args_on_the_stack_side_exits() {
+    // A callee that side-exits after reading its stack-passed arguments must still see
+    // them, both in JIT code and once the interpreter takes over its frame.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, f, g, h)
+          $exit = true
+          [a, b, c, d, e, f, g, h]
+        end
+        def test = target(1, 2, 3, 4, 5, 6, 7, 8)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6, 7, 8]");
+}
+
+#[test]
+fn test_send_direct_with_extra_args_on_the_stack_and_block_param() {
+    // The synthesized block-handler argument is the last one, so it is the one that ends
+    // up in a local slot here.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, &blk) = [a, b, c, d, e, blk.call]
+        def test = target(1, 2, 3, 4, 5) { 6 }
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6]");
+}
+
+#[test]
 fn test_yield_inline_invocation_live_stack_below_args() {
     // A live value sits on the stack below the yield args; the no-receiver-slot SP math
     // must preserve it so `x +` sees the right operand.
@@ -903,7 +962,520 @@ fn test_yield_non_local_return() {
         test
         test
     ");
-    assert_snapshot!(assert_compiles_allowing_exits("test"), @"42");
+    // The block's body is inlined into `test` and its `return` becomes a plain return, so
+    // this compiles with no throw and no side exit at all.
+    assert_snapshot!(assert_compiles("test"), @"42");
+}
+
+/// A lone yielded Array is destructured into a multi-parameter block, and the direct dispatch
+/// takes it. Without the expansion the arity mismatch leaves this on the generic `invokeblock`
+/// and the block's `return` throws, which `assert_compiles` catches as a side exit.
+#[test]
+fn test_block_autosplat_direct_dispatch() {
+    set_call_threshold(2);
+    eval("
+        def test(pairs)
+          pairs.each { |a, b| return a + b if a > 0 }
+          -1
+        end
+        test([[1, 2]])
+        test([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("test([[3, 4]])"), @"7");
+}
+
+/// The auto-splat expansion joins the generic `invokeblock` rather than side-exiting, so a
+/// site that sees an Array of the wrong length, a non-Array, or nil still gets the
+/// interpreter's nil-filling and truncation, and keeps running compiled code.
+#[test]
+fn test_block_autosplat_length_mismatch_joins_fallback() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a, b| out << [a, b] }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    // exact length, too long, too short, empty, non-Array, nil
+    assert_snapshot!(assert_compiles("each_of([[1, 2], [3, 4, 5], [6], [], 7, nil]).inspect"),
+        @r#""[[1, 2], [3, 4], [6, nil], [nil, nil], [7, nil], [nil, nil]]""#);
+}
+
+/// An Array subclass and a `to_ary` duck both take the fallback arm, where the interpreter's
+/// `rb_check_array_type` destructures them the same way it always has.
+#[test]
+fn test_block_autosplat_non_exact_array_joins_fallback() {
+    set_call_threshold(2);
+    eval("
+        class AutosplatSub < Array; end
+        class AutosplatDuck; def to_ary = [:d1, :d2]; end
+        def each_of(vals)
+          out = []
+          vals.each { |a, b| out << [a, b] }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([AutosplatSub.new([1, 2]), AutosplatDuck.new]).inspect"),
+        @r#""[[1, 2], [:d1, :d2]]""#);
+}
+
+/// One shared yield site seeing blocks of several arities: candidates that need the expansion
+/// sit alongside ones that do not, and each expansion's miss joins this site's own generic
+/// fallback, which still holds the unexpanded argument.
+#[test]
+fn test_block_autosplat_polymorphic_mixed_arities() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          i = 0
+          while i < vals.size
+            yield vals[i]
+            i += 1
+          end
+          nil
+        end
+        def one(vals)   out = []; each_of(vals) { |a| out << a }; out end
+        def two(vals)   out = []; each_of(vals) { |a, b| out << [a, b] }; out end
+        def three(vals) out = []; each_of(vals) { |a, b, c| out << [a, b, c] }; out end
+        def rest(vals)  out = []; each_of(vals) { |a, *r| out << [a, r] }; out end
+        # Interleave every block through the one yield site so it goes polymorphic.
+        4.times { one([[1, 2]]); two([[1, 2]]); three([[1, 2, 3]]); rest([[1, 2]]) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("two([[1, 2], [3], 4]).inspect"),
+        @r#""[[1, 2], [3, nil], [4, nil]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("three([[1, 2, 3], [4, 5]]).inspect"),
+        @r#""[[1, 2, 3], [4, 5, nil]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("one([[1, 2]]).inspect"), @r#""[[1, 2]]""#);
+    assert_snapshot!(assert_compiles_allowing_exits("rest([[1, 2, 3]]).inspect"), @r#""[[1, [2, 3]]]""#);
+}
+
+/// The profiled-monomorphic dispatch guards the block ISEQ *after* the expansion has replaced
+/// the one yielded Array with its elements. That guard has to side-exit to the interpreter's
+/// own stack, which still holds just the Array, not to the expanded one.
+#[test]
+fn test_block_autosplat_iseq_guard_failure_restores_caller_stack() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          i = 0
+          while i < vals.size
+            yield vals[i]
+            i += 1
+          end
+          nil
+        end
+        def run(vals, which)
+          out = []
+          if which == 0
+            each_of(vals) { |a, b| out << [a, b, :first] }
+          else
+            each_of(vals) { |a, b| out << [a, b, :second] }
+          end
+          out
+        end
+        # Warm up only the first block so the yield site profiles it as monomorphic.
+        4.times { run([[1, 2]], 0) }
+    ");
+    // Switching to the second block makes the ISEQ guard fail after the expansion.
+    assert_snapshot!(assert_compiles_allowing_exits("run([[1, 2], [3], 4], 1).inspect"),
+        @r#""[[1, 2, :second], [3, nil, :second], [4, nil, :second]]""#);
+}
+
+/// A single plain parameter does not auto-splat: `ambiguous_param0` is set and the block
+/// receives the Array whole. The expansion must not fire.
+#[test]
+fn test_block_single_param_does_not_autosplat() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a| out << a }
+          out
+        end
+        each_of([[1, 2]])
+        each_of([[1, 2]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([[1, 2], 3]).inspect"), @r#""[[1, 2], 3]""#);
+}
+
+/// Blocks with optional, rest, or post parameters are not `rb_simple_iseq_p`, so they must
+/// not take the expansion: their auto-splat nil-fills and packs in ways it does not model.
+#[test]
+fn test_block_autosplat_skips_non_simple_params() {
+    set_call_threshold(2);
+    eval("
+        def each_opt(vals)
+          out = []
+          vals.each { |a, b = :dflt| out << [a, b] }
+          out
+        end
+        def each_rest(vals)
+          out = []
+          vals.each { |a, *r| out << [a, r] }
+          out
+        end
+        def each_post(vals)
+          out = []
+          vals.each { |a, *m, z| out << [a, m, z] }
+          out
+        end
+        2.times do
+          each_opt([[1, 2]])
+          each_rest([[1, 2]])
+          each_post([[1, 2, 3]])
+        end
+    ");
+    assert_snapshot!(assert_compiles("each_opt([[1, 2], [3]]).inspect"), @r#""[[1, 2], [3, :dflt]]""#);
+    assert_snapshot!(assert_compiles("each_rest([[1, 2, 3]]).inspect"), @r#""[[1, [2, 3]]]""#);
+    assert_snapshot!(assert_compiles("each_post([[1, 2, 3, 4]]).inspect"), @r#""[[1, [2, 3], 4]]""#);
+}
+
+/// Nested destructuring (`|a, (b, c)|`) has an extra `expandarray` in the block body but the
+/// outer arity is still simple, so the expansion applies and the body does the rest.
+#[test]
+fn test_block_autosplat_nested_destructuring() {
+    set_call_threshold(2);
+    eval("
+        def each_of(vals)
+          out = []
+          vals.each { |a, (b, c)| out << [a, b, c] }
+          out
+        end
+        each_of([[1, [2, 3]]])
+        each_of([[1, [2, 3]]])
+    ");
+    assert_snapshot!(assert_compiles("each_of([[1, [2, 3]], [4, [5, 6]]]).inspect"),
+        @r#""[[1, 2, 3], [4, 5, 6]]""#);
+}
+
+#[test]
+fn test_inline_block_non_local_return_with_args() {
+    set_call_threshold(2);
+    eval("
+        def inner(a, b) = yield(a, b)
+        def test(a, b)
+          inner(a, b) { |x, y| return x + y }
+          99
+        end
+        test(1, 2)
+        test(1, 2)
+    ");
+    assert_snapshot!(assert_compiles("test(3, 4)"), @"7");
+}
+
+#[test]
+fn test_inline_block_conditional_non_local_return() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test(x)
+          y = inner { return :early if x }
+          [y, :late]
+        end
+        test(true)
+        test(false)
+    ");
+    assert_snapshot!(assert_compiles("test(true)"), @":early");
+    assert_snapshot!(assert_compiles("test(false)"), @"[nil, :late]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_caller() {
+    // An `ensure` in the frame the `return` unwinds to must still run, so this block is
+    // not inlined and falls back to the throw.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { return 1 }
+        ensure
+          $ran = true
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_runs_ensure_in_block() {
+    // Likewise for an `ensure` inside the block itself.
+    set_call_threshold(2);
+    eval("
+        $ran = false
+        def inner = yield
+        def test
+          inner { begin; return 1; ensure; $ran = true; end }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test, $ran]"), @"[1, true]");
+}
+
+#[test]
+fn test_inline_block_non_local_return_from_nested_block_owner() {
+    // `return` inside a block nested in another block escapes to the enclosing method, not
+    // to the block frame ZJIT would be returning from, so the outer block is not eligible.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          [1, 2].each do
+            inner { return :deep }
+          end
+          :shallow
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @":deep");
+}
+
+#[test]
+fn test_inline_block_non_local_return_keeps_frames_walkable() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { return caller_locations(0, 3).map(&:label) }
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#"["block in Object#test", "Object#inner", "Object#test"]"#);
+}
+
+#[test]
+fn test_inline_block_raise_unwinds_through_inlined_frames() {
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def test
+          inner { raise 'boom' }
+        rescue => e
+          e.message
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#""boom""#);
+}
+
+// `throw` is compiled with a call to rb_zjit_throw(), which longjmps to the enclosing
+// vm_exec(). The frame that catches the throw resumes in the interpreter, so these tests
+// tolerate the exception_handler exit that entry generates.
+
+#[test]
+fn test_throw_break_with_value_from_each() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x * 10 if x == 3 }
+        test([1, 2, 3, 4])
+        test([1, 2, 3, 4])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3, 4])"), @"30");
+}
+
+#[test]
+fn test_throw_no_break_returns_receiver() {
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each { |x| break x if x == 99 }
+        test([1, 2])
+        test([1, 2])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2])"), @"[1, 2]");
+}
+
+#[test]
+fn test_throw_break_across_jit_to_jit_call() {
+    // `outer` and `inner` are both compiled and `inner` is called with a native
+    // JIT-to-JIT call, so the throw has to unwind past a JIT caller.
+    set_call_threshold(2);
+    eval("
+        def inner = yield
+        def outer = inner { break 7 }
+        def test = outer
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"7");
+}
+
+#[test]
+fn test_throw_break_three_frames_deep() {
+    set_call_threshold(2);
+    eval("
+        def innermost(a) = a.each { |x| break x if x.even? }
+        def middle(a) = innermost(a)
+        def test(a) = middle(a)
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"2");
+}
+
+#[test]
+fn test_throw_break_value_used_by_caller() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          v = a.each { |x| break x + 100 if x > 1 }
+          v.to_s
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @r#""102""#);
+}
+
+#[test]
+fn test_throw_break_search_loop() {
+    // The `find { }`-shaped search that shows up in rubocop and OptionParser.
+    set_call_threshold(2);
+    eval("
+        def test(a) = a.each_with_index { |x, i| break i if x == :b }
+        test([:a, :b, :c])
+        test([:a, :b, :c])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([:a, :b, :c])"), @"1");
+}
+
+#[test]
+fn test_throw_break_runs_ensure() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          log = []
+          r = a.each do |x|
+            begin
+              break x if x == 2
+            ensure
+              log << x
+            end
+          end
+          [r, log]
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
+}
+
+#[test]
+fn test_throw_return_from_proc() {
+    set_call_threshold(2);
+    eval("
+        def test
+          p = proc { return 5 }
+          p.call
+          99
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"5");
+}
+
+#[test]
+fn test_throw_return_from_lambda() {
+    // `return` in a lambda throws TAG_RETURN with the lambda's own frame as the
+    // catch frame, unlike `return` from a proc.
+    set_call_threshold(2);
+    eval("
+        def test
+          l = lambda { return 5 }
+          l.call + 1
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"6");
+}
+
+#[test]
+fn test_throw_orphan_break_raises_local_jump_error() {
+    set_call_threshold(2);
+    eval("
+        def test
+          pr = proc { break 1 }
+          begin
+            pr.call
+          rescue LocalJumpError => e
+            e.class
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"LocalJumpError");
+}
+
+#[test]
+fn test_throw_retry_in_rescue() {
+    set_call_threshold(2);
+    eval("
+        def test
+          tries = 0
+          begin
+            tries += 1
+            raise 'boom' if tries < 3
+            tries
+          rescue
+            retry
+          end
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"3");
+}
+
+#[test]
+fn test_throw_next_with_ensure() {
+    // `next` inside begin/ensure compiles to throw TAG_NEXT rather than leave.
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          a.map do |x|
+            begin
+              next x * 2
+            ensure
+              nil
+            end
+          end
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, 4, 6]");
+}
+
+#[test]
+fn test_throw_break_inner_loop_repeatedly() {
+    set_call_threshold(2);
+    eval("
+        def test(a)
+          sum = 0
+          a.each do |x|
+            a.each do |y|
+              break if y > 2
+              sum += x * y
+            end
+          end
+          sum
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"18");
 }
 
 #[test]
@@ -1406,6 +1978,62 @@ fn test_send_ruby2_keywords_to_positional_hash_fallback() {
         entry
     ");
     assert_snapshot!(assert_compiles("entry"), @"1");
+}
+
+#[test]
+fn test_send_splat_expanded_to_positional_args() {
+    eval("
+        def target(a, b) = a - b
+        def entry(args) = target(*args)
+        entry([1, 2])
+    ");
+    assert_snapshot!(assert_compiles("entry([10, 3])"), @"7");
+}
+
+#[test]
+fn test_send_splat_expanded_with_leading_positional_arg() {
+    eval("
+        def target(a, b, c) = [a, b, c]
+        def entry(args) = target(1, *args)
+        entry([2, 3])
+    ");
+    assert_snapshot!(assert_compiles("entry([4, 5])"), @"[1, 4, 5]");
+}
+
+#[test]
+fn test_send_splat_expanded_into_rest_parameter() {
+    eval("
+        def target(*args) = args
+        def entry(args) = target(*args)
+        entry([1, 2])
+    ");
+    assert_snapshot!(assert_compiles("entry([3, 4])"), @"[3, 4]");
+}
+
+#[test]
+fn test_send_splat_with_changed_length_side_exits() {
+    eval("
+        def target(*args) = args.sum
+        def entry(args) = target(*args)
+        entry([1, 2])
+        entry([1, 2])
+    ");
+    // The guarded length no longer matches, so the call falls back to the interpreter.
+    assert_snapshot!(inspect("entry([1, 2, 3])"), @"6");
+}
+
+#[test]
+fn test_send_splat_of_ruby2_keywords_hash_side_exits() {
+    // `forward` is not itself ruby2_keywords, so it speculates on the splat, but the array it
+    // receives ends in a flagged Hash that the interpreter turns back into keywords.
+    eval("
+        def target(k: 0) = k
+        def forward(args) = target(*args)
+        ruby2_keywords def outer(*args) = forward(args)
+        outer(k: 1)
+        outer(k: 1)
+    ");
+    assert_snapshot!(inspect("outer(k: 2)"), @"2");
 }
 
 #[test]
@@ -3987,6 +4615,40 @@ fn test_string_append_encoding_mismatch() {
 }
 
 #[test]
+fn test_string_append_ascii_only_arg() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // A 7-bit argument copies over without changing the BINARY receiver's
+    // encoding, which is the shape erubi-style templates build: the buffer
+    // comes from String.new and every fragment appended to it is UTF-8.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new
+        test(s, "abc")
+        test(s, "déf".b)
+        test(s, "ghi")
+        [s.bytesize, s.encoding.name, s.valid_encoding?, s == "abcd\xC3\xA9fghi".b]
+    "#), @r#"[10, "ASCII-8BIT", true, true]"#);
+}
+
+#[test]
+fn test_string_append_ascii_only_arg_to_non_ascii_receiver() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // The receiver keeps its own encoding even though it holds non-ASCII bytes,
+    // because appending 7-bit bytes can't invalidate it.
+    assert_snapshot!(assert_compiles(r#"
+        s = +"héllo"
+        test(s, "abc".b)
+        test(s, "def".dup.force_encoding(Encoding::US_ASCII))
+        [s, s.encoding.name, s.valid_encoding?]
+    "#), @r#"["hélloabcdef", "UTF-8", true]"#);
+}
+
+#[test]
 fn test_string_append_incompatible_encoding() {
     eval(r#"
         def test(s, x) = s << x
@@ -4015,6 +4677,114 @@ fn test_string_append_broken_coderange() {
         test(s, "\xFF".dup.force_encoding(Encoding::UTF_8))
         [s.bytesize, s.valid_encoding?]
     "#), @"[4, false]");
+}
+
+#[test]
+fn test_string_append_growth() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Cross the embedded->heap boundary and several capacity doublings so
+    // both the in-place fast path and the resizing fallback are exercised.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::UTF_8)
+        200.times { test(s, "0123456789") }
+        [s.bytesize, s == "0123456789" * 200]
+    "#), @"[2000, true]");
+}
+
+#[test]
+fn test_string_append_codepoint_binary() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Grow a binary buffer one byte at a time, crossing the embedded->heap boundary
+    // and several capacity doublings, with both ASCII and non-ASCII bytes.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::BINARY)
+        1000.times { |i| test(s, i % 255) }
+        [s.bytesize, s == (0...1000).map { |i| (i % 255).chr(Encoding::BINARY) }.join, s.encoding.name]
+    "#), @r#"[1000, true, "ASCII-8BIT"]"#);
+}
+
+#[test]
+fn test_string_append_codepoint_coderange() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // ASCII bytes keep the buffer 7BIT; a non-ASCII byte makes it VALID for good.
+    assert_snapshot!(assert_compiles(r#"
+        s = String.new(encoding: Encoding::BINARY)
+        10.times { test(s, 0x41) }
+        before = s.ascii_only?
+        test(s, 0xC3)
+        middle = [s.ascii_only?, s.valid_encoding?]
+        test(s, 0x41)
+        [before, middle, s.ascii_only?, s.bytesize]
+    "#), @"[true, [false, true], false, 12]");
+}
+
+#[test]
+fn test_string_append_codepoint_slow_paths() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    // Frozen receivers, out-of-range codepoints, shared buffers, and non-binary
+    // encodings all have to fall back to rb_str_concat().
+    assert_snapshot!(assert_compiles(r#"
+        results = []
+        1000.times { test(String.new(encoding: Encoding::BINARY), 0x41) }
+        results << (begin; test("abc".b.freeze, 0x41); rescue FrozenError; :frozen; end)
+        results << (begin; test(String.new(encoding: Encoding::BINARY), -1); rescue RangeError; :range; end)
+        results << (begin; test(String.new(encoding: Encoding::BINARY), 0x100); rescue RangeError; :range; end)
+        base = "y".b * 200
+        shared = base[0, 100]
+        10.times { test(shared, 0x42) }
+        results << [base == "y".b * 200, shared.bytesize]
+        utf8 = +"abc"
+        results << test(utf8, 0x3042)
+        results
+    "#), @r#"[:frozen, :range, :range, [true, 110], "abcあ"]"#);
+}
+
+#[test]
+fn test_string_append_codepoint_gc_stress() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        begin
+          GC.stress = true
+          s = "a".b
+          10.times { test(s, 0x62) }
+          [s.bytesize, s == "a" + "b" * 10]
+        ensure
+          GC.stress = false
+        end
+    "#), @"[11, true]");
+}
+
+#[test]
+fn test_string_append_gc_stress() {
+    eval(r#"
+        def test(s, x) = s << x
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        begin
+          GC.stress = true
+          s = +"a"
+          10.times { test(s, "bc") }
+          [s.bytesize, s == "a" + "bc" * 10]
+        ensure
+          GC.stress = false
+        end
+    "#), @"[21, true]");
 }
 
 #[test]
@@ -5064,6 +5834,81 @@ fn test_setinstancevariable() {
     "), @"1");
 }
 
+// The inlined write barrier may only skip rb_gc_writebarrier() when the GC has
+// nothing to remember. Writing a freshly allocated (young) object into an old one
+// is exactly the case it must not skip: GC.verify_internal_consistency() rb_bug()s
+// on an old object that points at an unremembered young object, and the minor GC
+// would sweep the value out from under the receiver.
+#[test]
+fn test_setinstancevariable_write_barrier_old_to_young() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def initialize = @a = nil
+          def set(value) = @a = value
+          def get = @a
+        end
+
+        obj = C.new
+        obj.set(nil)
+        obj.set(nil)
+        # Promote obj to the old generation, then point it at a young object that
+        # nothing else references.
+        4.times { GC.start }
+        obj.set("young".dup)
+        GC.verify_internal_consistency
+        GC.start(full_mark: false)
+        GC.verify_internal_consistency
+        obj.get
+    "#), @r#""young""#);
+}
+
+// Same, with the value written through an inlined write barrier while the GC is
+// allocating and collecting constantly.
+#[test]
+fn test_setinstancevariable_write_barrier_gc_stress() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def initialize = @a = nil
+          def set(value) = @a = value
+          def get = @a
+        end
+
+        objs = 10.times.map { C.new }
+        objs.each { |o| o.set(nil) }
+        4.times { GC.start }
+        begin
+          GC.stress = true
+          objs.each_with_index { |o, i| o.set([i].dup) }
+        ensure
+          GC.stress = false
+        end
+        GC.verify_internal_consistency
+        GC.start
+        objs.map(&:get)
+    "#), @"[[0], [1], [2], [3], [4], [5], [6], [7], [8], [9]]");
+}
+
+// A Ractor-shareable receiver needs bookkeeping that object flags cannot decide,
+// so the inlined barrier has to fall back to the C function for it.
+#[test]
+fn test_setinstancevariable_write_barrier_shareable_receiver() {
+    assert_snapshot!(inspect(r#"
+        class C
+          def self.set(value) = @a = value
+          def self.get = @a
+        end
+
+        C.set(nil)
+        C.set(nil)
+        4.times { GC.start }
+        C.set("young".dup)
+        GC.verify_internal_consistency
+        GC.start(full_mark: false)
+        GC.verify_internal_consistency
+        C.get
+    "#), @r#""young""#);
+}
+
 #[test]
 fn test_polymorphic_setinstancevariable_with_shape_transitions() {
     set_call_threshold(3);
@@ -5977,6 +6822,136 @@ fn test_bop_redefined_with_adjacent_patch_points() {
     "), @"[15, :+, 100]");
 }
 
+// Consecutive patch points that guard the same side exit share one patch site,
+// so a single site can be invalidated by more than one invariant. Bust both
+// invariants of a C call (NoSingletonClass and MethodRedefined) without running
+// the method in between, which patches the same address twice.
+#[test]
+fn test_shared_patch_site_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        obj = []
+        def obj.reverse_each = nil
+        Array.class_eval { def reverse_each; yield 99; end }
+        [before, test]
+    "), @"[1, 99]");
+}
+
+// A run of calls in one basic block spills the frame's locals only once, so a Binding
+// materialized by a later callee must still see the values from the first spill.
+#[test]
+fn test_binding_sees_locals_spilled_by_an_earlier_call() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          y = 2
+          [].each { }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), b.local_variable_get(:y), x + y]
+        end
+        test; test
+        test
+    "), @"[1, 2, 3]");
+}
+
+// Same, but a local is reassigned between the calls, so its slot has to be rewritten.
+#[test]
+fn test_binding_sees_locals_reassigned_between_calls() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [].each { }
+          x = 5
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[5, 5]");
+}
+
+// Same, but the local is written by a block through the EP chain during a call.
+#[test]
+fn test_binding_sees_locals_written_through_the_ep_chain() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [1].each { x = 7 }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[7, 7]");
+}
+
+// Consecutive calls reuse the block handler derived from CFP, but each has to install
+// its own block ISEQ in cfp->block_code.
+#[test]
+fn test_consecutive_calls_pass_their_own_blocks() {
+    assert_snapshot!(inspect("
+        def test
+          result = []
+          [1, 2].each { |v| result << v }
+          [3].each { |v| result << v * 10 }
+          [4].each { |v| result << v + 100 }
+          result
+        end
+        test; test
+        test
+    "), @"[1, 2, 30, 104]");
+}
+
+// The cached block handler belongs to the frame it was computed in. Pushing an inlined
+// frame moves the CFP register with a plain `mov`, so the cache has to be dropped there:
+// otherwise the inlined callee's send would pass the *caller's* captured block and run
+// the wrong block ISEQ.
+#[test]
+fn test_inlined_frame_does_not_reuse_the_callers_block_handler() {
+    with_inlining(|| {
+        assert_snapshot!(inspect("
+            def callee(a) = a.map { |v| v + 1000 }
+            def test(a)
+              outer = a.map { |v| v }
+              [outer, callee(a)]
+            end
+            test([1]); test([1])
+            test([1, 2])
+        "), @"[[1, 2], [1001, 1002]]");
+    });
+}
+
+// Same idea for the patch points a constant lookup emits, which also share a site.
+#[test]
+fn test_shared_patch_site_for_constant_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        tp = TracePoint.new(:line) { }
+        tp.enable
+        Object.send(:remove_const, :CONST_ARRAY)
+        CONST_ARRAY = [2]
+        after = test
+        tp.disable
+        [before, after]
+    "), @"[1, 2]");
+}
+
 #[test]
 fn test_method_redefined_with_top_self() {
     assert_snapshot!(inspect(r#"
@@ -6167,6 +7142,98 @@ fn test_string_bytesize_multibyte() {
         test("💎")
         test("💎")
     "#), @"4");
+}
+
+#[test]
+fn test_string_setbyte_in_place() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        r = test(s, 1, 97)
+        [s, r]
+    "), @r#"["hallo", 97]"#);
+}
+
+#[test]
+fn test_string_setbyte_negative_index() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        test(s, -1, 33)
+        s
+    "), @r#""hell!""#);
+}
+
+#[test]
+fn test_string_setbyte_wraps_value() {
+    // rb_str_setbyte takes value & 0xff, including for negative values
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = 'hello'.dup
+        test(s, 0, 0x141)
+        test(s, 1, -190)
+        s
+    "), @r#""ABllo""#);
+}
+
+#[test]
+fn test_string_setbyte_out_of_bounds() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        begin
+          test('hi'.dup, 5, 65)
+        rescue IndexError
+          :index_error
+        end
+    "), @":index_error");
+}
+
+#[test]
+fn test_string_setbyte_frozen() {
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        begin
+          test('frozen'.freeze, 0, 65)
+        rescue FrozenError
+          :frozen_error
+        end
+    "), @":frozen_error");
+}
+
+#[test]
+fn test_string_setbyte_shared_string() {
+    // Dup of a long heap string shares its buffer; setbyte must unshare it
+    // without mutating the original.
+    assert_snapshot!(inspect("
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        long = 'x' * 5000
+        s = long.dup
+        test(s, 0, 65)
+        [s[0, 3], long[0, 3]]
+    "), @r#"["Axx", "xxx"]"#);
+}
+
+#[test]
+fn test_string_setbyte_clears_coderange() {
+    // Writing a byte must invalidate the cached coderange so that
+    // valid_encoding? and ascii_only? rescan the string.
+    assert_snapshot!(inspect(r#"
+        def test(s, i, v) = s.setbyte(i, v)
+        test('foo'.dup, 0, 98)
+        s = "aé".dup
+        s.valid_encoding?
+        test(s, 1, 0xff)
+        a = "abc".dup
+        a.ascii_only?
+        test(a, 0, 0xff)
+        [s.valid_encoding?, a.ascii_only?]
+    "#), @"[false, false]");
 }
 
 #[test]
@@ -6448,6 +7515,48 @@ fn test_opt_case_dispatch() {
     ");
     assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
     assert_snapshot!(assert_compiles("[test(:foo), test(1)]"), @"[true, false]");
+}
+
+#[test]
+fn test_opt_case_dispatch_fixnum() {
+    eval("
+        def test(x)
+          case x
+          when -3 then :a
+          when 0, 1 then :b
+          when 5 then :c
+          else :d
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(
+        assert_compiles("[-4, -3, 0, 1, 2, 5, 1.0, :x, nil].map { |x| test(x) }"),
+        @"[:d, :a, :b, :b, :d, :c, :b, :d, :d]"
+    );
+}
+
+#[test]
+fn test_opt_case_dispatch_fixnum_redefined() {
+    eval("
+        def test(x)
+          case x
+          when 0 then :a
+          when 1 then :b
+          else :c
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        [test(0), test(1), test(2)].tap {
+          class Integer
+            def ===(other) = true
+          end
+        } + [test(0), test(1), test(2)] + 100.times.map { test(2) }.uniq
+    "), @"[:a, :b, :c, :a, :a, :a, :a]");
 }
 
 #[test]
@@ -6870,6 +7979,50 @@ fn test_max_iseq_versions() {
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+#[test]
+fn test_ivar_respecialization_beyond_max_versions() {
+    let max_versions = max_iseq_versions();
+    // Burn every version on constant invalidation so `read` compiles its last version with
+    // `no_side_exits`, freezing a shape dispatch built from a profile that has only seen A.
+    eval(&format!("
+        TEST = -1
+        class Base
+          def read = @v + TEST
+        end
+        class A < Base; def initialize = @v = 1; end
+        class B < Base; def initialize = (@w = 0; @v = 2); end
+
+        a = A.new
+        i = 0
+        while i < {max_versions} + 1
+          a.read; a.read
+          Object.send(:remove_const, :TEST)
+          TEST = i
+          i += 1
+        end
+    "));
+    let iseq = get_instance_method_iseq("Base", "read");
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), max_versions);
+
+    // Now feed it a shape the frozen dispatch has no arm for, at a different ivar index. The
+    // fallback path samples it and earns the ISEQ an extra version, so it exceeds the plain
+    // version limit but stays within the respecialization budget.
+    eval("
+        b = B.new
+        i = 0
+        while i < 2000
+          b.read
+          i += 1
+        end
+    ");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(payload.ivar_respecializations >= 1, "expected an ivar respecialization");
+    assert!(payload.ivar_respecializations <= crate::payload::MAX_IVAR_RESPECIALIZATIONS);
+    assert!(payload.versions.len() > max_versions);
+    assert!(payload.versions.len() <= max_versions + crate::payload::MAX_IVAR_RESPECIALIZATIONS as usize);
+    assert_snapshot!(assert_compiles_allowing_exits("[A.new.read, B.new.read]"), @"[5, 6]");
 }
 
 #[test]

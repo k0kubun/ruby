@@ -390,7 +390,12 @@ impl Assembler {
             // case. If the values aren't heap objects then we'll treat them as
             // if they were just unsigned integer.
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
-            let is_jump = insn.is_jump();
+            // A PatchPoint's only operands are the side-exit stack and locals. Lowering
+            // Opnd::Value there materializes the constant into a register on the fast
+            // path even though only the (cold) exit code reads it. compile_exit_save_state()
+            // handles Opnd::Value with a scratch register, just like it does for the side
+            // exits of jump instructions, so leave them alone.
+            let is_jump = insn.is_jump() || matches!(insn, Insn::PatchPoint(..));
 
             insn.for_each_operand_mut(|opnd| {
                 if let Opnd::Value(value) = opnd {
@@ -741,9 +746,13 @@ impl Assembler {
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.linearize_instructions();
 
+        // The side exit of the patch point that sits at the current write position, if any.
+        // See split_patch_point() for why consecutive patch points can share a patch site.
+        let mut prev_patch_label: Option<Label> = None;
         // Process each linearized instruction
         for (idx, insn) in linearized_insns.iter().enumerate() {
             let mut insn = insn.clone();
+            let keeps_patch_site = matches!(insn, Insn::Comment(_) | Insn::PatchPoint(..));
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
@@ -891,11 +900,20 @@ impl Assembler {
                     }
                 }
                 &mut Insn::PatchPoint(ref data) => {
-                    split_patch_point(asm, &data.target, data.invariant, data.version);
+                    let label = match data.target {
+                        Target::Label(label) => Some(label),
+                        _ => None,
+                    };
+                    let merge = label.is_some() && label == prev_patch_label;
+                    split_patch_point(asm, &data.target, data.invariant, data.version, merge);
+                    prev_patch_label = label;
                 }
                 _ => {
                     asm.push_insn(insn);
                 }
+            }
+            if !keeps_patch_site {
+                prev_patch_label = None;
             }
         }
 
@@ -1920,7 +1938,7 @@ mod tests {
         let value = asm.load(Opnd::mem(VALUE_BITS, NATIVE_STACK_PTR, 0));
         asm.write_label(start.clone());
         asm.cmp(value, 0.into());
-        asm.jg(forward.clone());
+        asm.push_insn(Insn::Jg(forward.clone()));
         asm.push_insn(Insn::Jl(start.clone()));
         asm.write_label(forward);
 

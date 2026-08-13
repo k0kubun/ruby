@@ -96,6 +96,7 @@ fn main() {
         .allowlist_type("rb_gc_zjit_fastpath")
         .allowlist_type("rb_gc_zjit_fastpath_data")
         .allowlist_type("rb_gc_zjit_default_new_obj_fastpath")
+        .allowlist_type("rb_gc_zjit_default_writebarrier_fastpath")
         .allowlist_type("rb_gc_zjit_mmtk_new_obj_fastpath")
         .allowlist_var("RB_GC_ZJIT_FASTPATH_.*")
 
@@ -226,6 +227,10 @@ fn main() {
         .allowlist_function("rb_float_minus")
         .allowlist_function("rb_float_mul")
         .allowlist_function("rb_float_div")
+        .allowlist_function("rb_float_lt")
+        .allowlist_function("rb_float_le")
+        .allowlist_function("rb_float_gt")
+        .allowlist_function("rb_float_ge")
         .allowlist_function("rb_flo_to_i")
         .allowlist_type("ruby_rstring_private_flags")
         .allowlist_function("rb_ec_str_resurrect")

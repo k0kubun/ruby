@@ -145,6 +145,7 @@ class << RubyVM::ZJIT
       :compiled_iseq_count,
       :compiled_side_exit_count,
       :failed_iseq_count,
+      :ivar_respecialize_count,
 
       :compile_time_ns,
       :compile_side_exit_time_ns,
@@ -179,6 +180,8 @@ class << RubyVM::ZJIT
 
       :load_field_count,
       :store_field_count,
+
+      :throw_count,
 
       :side_exit_size,
       :code_region_bytes,

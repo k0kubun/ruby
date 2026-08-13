@@ -1616,6 +1616,7 @@ pub struct rb_call_data {
     pub cc: *const rb_callcache,
 }
 pub const RSTRING_CHILLED: ruby_rstring_private_flags = 16384;
+pub const RSTRING_DEPENDANT_MASK: ruby_rstring_private_flags = 1074288640;
 pub type ruby_rstring_private_flags = u32;
 pub const RHASH_PASS_AS_KEYWORDS: ruby_rhash_flags = 8192;
 pub const RHASH_PROC_DEFAULT: ruby_rhash_flags = 16384;
@@ -1894,7 +1895,7 @@ pub const YARVINSN_zjit_opt_empty_p: ruby_vminsn_type = 255;
 pub const YARVINSN_zjit_opt_succ: ruby_vminsn_type = 256;
 pub const YARVINSN_zjit_opt_not: ruby_vminsn_type = 257;
 pub const YARVINSN_zjit_opt_regexpmatch2: ruby_vminsn_type = 258;
-pub const VM_INSTRUCTION_SIZE: ruby_vminsn_type = 259;
+pub const VM_INSTRUCTION_SIZE: ruby_vminsn_type = 260;
 pub type ruby_vminsn_type = u32;
 pub type rb_iseq_callback = ::std::option::Option<
     unsafe extern "C" fn(arg1: *const rb_iseq_t, arg2: *mut ::std::os::raw::c_void),
@@ -2036,6 +2037,13 @@ pub struct rb_gc_zjit_default_new_obj_fastpath {
     pub total_allocated_objects_offset: usize,
     pub flags: VALUE,
     pub klass: VALUE,
+}
+#[repr(C)]
+pub struct rb_gc_zjit_default_writebarrier_fastpath {
+    pub incremental_marking_count: *const ::std::os::raw::c_void,
+    pub incremental_marking_count_num_bits: usize,
+    pub recv_slowpath_flags: VALUE,
+    pub promoted_flag: VALUE,
 }
 #[repr(C)]
 pub struct rb_gc_zjit_mmtk_new_obj_fastpath {
@@ -2271,6 +2279,10 @@ unsafe extern "C" {
     pub fn rb_float_minus(x: VALUE, y: VALUE) -> VALUE;
     pub fn rb_float_mul(x: VALUE, y: VALUE) -> VALUE;
     pub fn rb_float_div(x: VALUE, y: VALUE) -> VALUE;
+    pub fn rb_float_lt(x: VALUE, y: VALUE) -> VALUE;
+    pub fn rb_float_le(x: VALUE, y: VALUE) -> VALUE;
+    pub fn rb_float_gt(x: VALUE, y: VALUE) -> VALUE;
+    pub fn rb_float_ge(x: VALUE, y: VALUE) -> VALUE;
     pub fn rb_flo_to_i(num: VALUE) -> VALUE;
     pub fn rb_fix_aref(fix: VALUE, idx: VALUE) -> VALUE;
     pub fn rb_vm_insn_addr2opcode(addr: *const ::std::os::raw::c_void) -> ::std::os::raw::c_int;

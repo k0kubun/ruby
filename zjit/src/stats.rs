@@ -156,6 +156,7 @@ make_counters! {
     default {
         compiled_iseq_count,
         failed_iseq_count,
+        ivar_respecialize_count,
         skipped_native_stack_full,
 
         // Exception handler entries (body->jit_exception) that were compiled as
@@ -223,6 +224,7 @@ make_counters! {
         exit_expandarray_failure,
         exit_guard_not_frozen_failure,
         exit_guard_not_shared_failure,
+        exit_guard_not_dependant_failure,
         exit_guard_less_failure,
         exit_guard_greater_eq_failure,
         exit_guard_super_method_entry,
@@ -237,7 +239,6 @@ make_counters! {
         exit_patchpoint_root_box_only,
         exit_callee_side_exit,
         exit_interrupt,
-        exit_throw,
         exit_stackoverflow,
         exit_block_param_proxy_not_iseq_or_ifunc,
         exit_block_param_proxy_not_nil,
@@ -254,6 +255,8 @@ make_counters! {
         exit_splatkw_not_nil_or_hash,
         exit_splatkw_polymorphic,
         exit_splatkw_not_profiled,
+        exit_splat_length_changed,
+        exit_splat_last_ruby2_keywords,
         exit_directive_induced,
         exit_send_while_tracing,
         exit_invokeblock_not_ifunc,
@@ -303,6 +306,7 @@ make_counters! {
         send_fallback_cannot_send_direct,
         send_fallback_invokeblock_not_specialized,
         send_fallback_invokeblock_polymorphic_miss,
+        send_fallback_invokeblock_autosplat_miss,
         send_fallback_sendforward_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
@@ -461,6 +465,10 @@ make_counters! {
     // TODO(max): Implement
     // vm_reify_stack_count,
 
+    // The number of `throw` instructions executed in JIT code, i.e. non-local
+    // control flow such as `break` from a block or `return` from a proc.
+    throw_count,
+
     // The number of times we ran a dynamic check
     guard_type_count,
     guard_shape_count,
@@ -481,6 +489,9 @@ make_counters! {
     // already exceeds the budget before scanning for its SendDirects.
     inline_method_count,
     empty_inline_frame_count,
+    // The number of blocks whose body was inlined into the frame that yields to them,
+    // turning the block's non-local `return` into a plain return of the compiled function.
+    inline_block_count,
     inline_reject_too_large,
     inline_reject_complex_params,
     inline_reject_ep_escapes,
@@ -626,12 +637,12 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         ExpandArray                   => exit_expandarray_failure,
         GuardNotFrozen                => exit_guard_not_frozen_failure,
         GuardNotShared                => exit_guard_not_shared_failure,
+        GuardNotDependant             => exit_guard_not_dependant_failure,
         GuardLess                     => exit_guard_less_failure,
         GuardGreaterEq                => exit_guard_greater_eq_failure,
         GuardSuperMethodEntry         => exit_guard_super_method_entry,
         CalleeSideExit                => exit_callee_side_exit,
         Interrupt                     => exit_interrupt,
-        Throw                         => exit_throw,
         StackOverflow                 => exit_stackoverflow,
         BlockParamProxyNotIseqOrIfunc => exit_block_param_proxy_not_iseq_or_ifunc,
         BlockParamProxyNotNil         => exit_block_param_proxy_not_nil,
@@ -645,6 +656,8 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         SplatKwNotNilOrHash           => exit_splatkw_not_nil_or_hash,
         SplatKwPolymorphic            => exit_splatkw_polymorphic,
         SplatKwNotProfiled            => exit_splatkw_not_profiled,
+        SplatLengthChanged            => exit_splat_length_changed,
+        SplatLastRuby2Keywords        => exit_splat_last_ruby2_keywords,
         DirectiveInduced              => exit_directive_induced,
         PatchPoint(Invariant::BOPRedefined { .. })
                                       => exit_patchpoint_bop_redefined,
@@ -718,6 +731,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SuperTargetComplexArgsPass                => send_fallback_super_target_complex_args_pass,
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
+        InvokeBlockAutosplatMiss                  => send_fallback_invokeblock_autosplat_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,
