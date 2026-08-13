@@ -640,13 +640,53 @@ static inline VALUE
 jit_exec_exception(rb_execution_context_t *ec)
 {
     rb_jit_func_t func = jit_compile_exception(ec);
-    if (func) {
-        // Call the JIT code
-        return func(ec, ec->cfp);
-    }
-    else {
+    if (!func) {
         return Qundef;
     }
+
+#if USE_ZJIT
+    void *zjit_entry = rb_zjit_entry;
+    if (zjit_entry) {
+        do {
+            // ZJIT code expects the entry trampoline to set up its register
+            // conventions (CFP, EC, SP), just like jit_exec() does.
+            rb_control_frame_t *const entry_cfp = ec->cfp;
+
+            // Unlike jit_exec(), it's NOT safe to return a non-Qundef value from a
+            // non-FINISH frame here: vm_exec_loop() would stop running the frames
+            // below this one. ZJIT's `leave` pops the frame and returns the value,
+            // so when the entry frame isn't a FINISH frame, push the value onto the
+            // caller's stack. See [jit_compile_exception] and YJIT's
+            // gen_leave_exception().
+            bool finished = VM_FRAME_FINISHED_P(entry_cfp);
+
+            VALUE result = ((rb_zjit_func_t)zjit_entry)(ec, entry_cfp, func);
+            if (UNDEF_P(result) || finished) {
+                return result;
+            }
+
+            // JIT code returned from the entry frame, so ec->cfp is now its caller,
+            // and it resumes right after its send with the value we push here. Every
+            // ZJIT frame runs in a native frame of its own, and unwinding threw those
+            // away, so the caller cannot be resumed by returning into it the way YJIT
+            // does. It can be re-entered at its resume PC though: that is the same
+            // shape as a catch-table continuation, so give it a JIT entry too instead
+            // of leaving the rest of the frame to the interpreter.
+            *ec->cfp->sp++ = result;
+
+            // A non-FINISH frame is always called from a Ruby frame, but stay
+            // defensive: jit_compile_exception() reads the frame's ISEQ.
+            if (!VM_FRAME_RUBYFRAME_P(ec->cfp) || CFP_ISEQ(ec->cfp) == NULL) {
+                return Qundef;
+            }
+        } while ((func = jit_compile_exception(ec)) != NULL);
+
+        return Qundef;
+    }
+#endif
+
+    // Call the JIT code
+    return func(ec, ec->cfp);
 }
 #else
 # define jit_compile_exception(ec) ((rb_jit_func_t)0)
@@ -3040,9 +3080,12 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                 }
                 else {
                     /* TAG_BREAK */
+                    // Materialize before pushing the value: zjit_materialize_frames()
+                    // writes the frame's stack map into the slots below cfp->sp, so
+                    // pushing first would make it overwrite the value we just pushed.
+                    rb_zjit_materialize_frames(ec, cfp);
                     *cfp->sp++ = THROW_DATA_VAL(err);
                     ec->errinfo = Qnil;
-                    rb_zjit_materialize_frames(ec, cfp);
                     return Qundef;
                 }
             }
