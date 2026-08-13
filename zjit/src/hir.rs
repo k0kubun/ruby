@@ -2756,7 +2756,7 @@ impl CompilePolicy {
             let payload = get_or_create_iseq_payload(iseq);
             payload.versions.iter().any(
                 |v| unsafe { v.as_ref() }.is_invalidated()
-            ) && payload.versions.len() + 1 >= max_iseq_versions()
+            ) && payload.versions.len() + 1 >= payload.version_limit()
         };
         Self { no_side_exits }
     }
