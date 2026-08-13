@@ -153,7 +153,12 @@ impl Assembler {
 
         while let Some((_index, mut insn)) = iterator.next(asm) {
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
-            let is_jump = insn.is_jump();
+            // A PatchPoint's only operands are the side-exit stack and locals. Lowering
+            // Opnd::Value there materializes the constant into a register on the fast
+            // path even though only the (cold) exit code reads it. compile_exit_save_state()
+            // handles Opnd::Value with a scratch register, just like it does for the side
+            // exits of jump instructions, so leave them alone.
+            let is_jump = insn.is_jump() || matches!(insn, Insn::PatchPoint(..));
 
             if !is_jump {
                 insn.for_each_operand_mut(|opnd| {
@@ -458,8 +463,12 @@ impl Assembler {
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.linearize_instructions();
 
+        // The side exit of the patch point that sits at the current write position, if any.
+        // See split_patch_point() for why consecutive patch points can share a patch site.
+        let mut prev_patch_label: Option<Label> = None;
         for insn in linearized_insns.iter() {
             let mut insn = insn.clone();
+            let keeps_patch_site = matches!(insn, Insn::Comment(_) | Insn::PatchPoint(..));
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
@@ -679,11 +688,20 @@ impl Assembler {
                     asm.push_insn(insn);
                 }
                 &mut Insn::PatchPoint(ref data) => {
-                    split_patch_point(asm, &data.target, data.invariant, data.version);
+                    let label = match data.target {
+                        Target::Label(label) => Some(label),
+                        _ => None,
+                    };
+                    let merge = label.is_some() && label == prev_patch_label;
+                    split_patch_point(asm, &data.target, data.invariant, data.version, merge);
+                    prev_patch_label = label;
                 }
                 _ => {
                     asm.push_insn(insn);
                 }
+            }
+            if !keeps_patch_site {
+                prev_patch_label = None;
             }
         }
 

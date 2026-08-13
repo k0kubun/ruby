@@ -65,6 +65,18 @@ struct JITState {
     /// and the inlined frame push write a JITFrame into the slot selected by the
     /// current frame's depth.
     jit_frame_size: usize,
+
+    /// `VM_CFP_TO_CAPTURED_BLOCK(cfp)`, which only depends on the CFP register, kept
+    /// around so that a run of sends with a block in one basic block computes it once.
+    /// Holds the `Assembler::cfp_generation()` it was computed at: a write to the CFP
+    /// register (a direct JIT-to-JIT call, for instance) makes it stale.
+    block_handler_specval: Option<(u64, Opnd)>,
+
+    /// The locals already written to their EP slots, as the (ISEQ, depth) of the frame
+    /// they belong to and the [`InsnId`] spilled into each local slot. Lets a later
+    /// spill of the same values in the same basic block skip the stores. Cleared at
+    /// every basic block start.
+    spilled_locals: Option<(IseqPtr, usize, Vec<InsnId>)>,
 }
 
 impl JITState {
@@ -77,7 +89,16 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
+            block_handler_specval: None,
+            spilled_locals: None,
         }
+    }
+
+    /// Forget what we know about the frame's registers and VM stack slots. Called at
+    /// every basic block boundary, where the predecessors' state is unknown.
+    fn reset_frame_caches(&mut self) {
+        self.block_handler_specval = None;
+        self.spilled_locals = None;
     }
 
     /// Retrieve the output of a given instruction that has been compiled
@@ -439,6 +460,9 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             // Write a label to jump to the basic block
             let label = jit.get_label(&mut asm, lir_block_id, block_id);
             asm.write_label(label);
+
+            // Whatever the predecessors cached about the frame doesn't carry into this block.
+            jit.reset_frame_caches();
 
             let block = function.block(block_id);
             asm_comment!(
@@ -826,7 +850,7 @@ fn gen_get_ep(asm: &mut Assembler, level: u32) -> Opnd {
     ep_opnd
 }
 
-fn gen_defined(jit: &JITState, asm: &mut Assembler, function: &Function, op_type: defined_type, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
+fn gen_defined(jit: &mut JITState, asm: &mut Assembler, function: &Function, op_type: defined_type, obj: VALUE, pushval: VALUE, tested_value: Opnd, lep_level: u32, state: &FrameState) -> Opnd {
     match op_type as defined_type {
         DEFINED_YIELD => {
             // `lep_level` was precomputed at HIR construction so we can materialize the local EP
@@ -930,7 +954,7 @@ fn gen_guard_greater_eq(jit: &mut JITState, asm: &mut Assembler, function: &Func
     left
 }
 
-fn gen_get_constant_path(jit: &JITState, asm: &mut Assembler, function: &Function, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
+fn gen_get_constant_path(jit: &mut JITState, asm: &mut Assembler, function: &Function, ic: *const iseq_inline_constant_cache, state: &FrameState) -> Opnd {
     unsafe extern "C" {
         fn rb_vm_opt_getconstant_path(ec: EcPtr, cfp: CfpPtr, ic: *const iseq_inline_constant_cache) -> VALUE;
     }
@@ -958,7 +982,7 @@ fn gen_fixnum_bit_check(asm: &mut Assembler, val: Opnd, index: u8) -> Opnd {
     asm.csel_z(Qtrue.into(), Qfalse.into())
 }
 
-fn gen_invokebuiltin(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
+fn gen_invokebuiltin(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState, bf: &rb_builtin_function, leaf: bool, args: Vec<Opnd>) -> lir::Opnd {
     if leaf {
         gen_prepare_leaf_call_with_gc(asm, state);
     } else {
@@ -984,13 +1008,22 @@ fn gen_patch_point(jit: &mut JITState, asm: &mut Assembler, function: &Function,
 
 /// This is used by scratch_split to lower PatchPoint into PatchPointPad and PosMarker.
 /// It's called at scratch_split so that we can use the Label after side-exit deduplication in compile_exits.
-pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invariant, version: IseqVersionRef) {
+///
+/// `merge_with_previous` is set when the immediately preceding instruction was also a
+/// PatchPoint jumping to the same side exit, with no code emitted in between. Such patch
+/// points can share a single patch site: whichever invariant is invalidated first writes
+/// the very same jump, so they don't need `jmp_ptr_bytes()` of room between them. This
+/// saves the padding that would otherwise separate the several patch points a single
+/// instruction emits (e.g. NoSingletonClass + MethodRedefined for one send).
+pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invariant, version: IseqVersionRef, merge_with_previous: bool) {
     let Target::Label(exit_label) = *target else {
         unreachable!("PatchPoint's target should have been lowered to Target::Label by compile_exits: {target:?}");
     };
 
     // Fill nop instructions if the last patch point is too close.
-    asm.patch_point_pad();
+    if !merge_with_previous {
+        asm.patch_point_pad();
+    }
 
     // Remember the current address as a patch point
     asm.pos_marker(move |code_ptr, cb| {
@@ -1053,16 +1086,18 @@ fn gen_ccall_with_frame(
     // to account for the receiver and arguments (and block arguments if any)
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
-    gen_spill_stack(jit, asm, function, state);
+    // The receiver and arguments are above the saved cfp->sp: the frame env
+    // written by gen_push_frame() overwrites their slots and nothing reads VM
+    // stack slots above cfp->sp, so only spill the stack below them.
+    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     gen_spill_locals(jit, asm, state);
 
+    // The receiver is used twice: as the callee frame's self and as the first C argument.
+    // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
+    let recv = gen_materialize_value(asm, recv);
+
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
-        // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
-        // VM_CFP_TO_CAPTURED_BLOCK then turns &cfp->self into a block handler.
-        // rb_captured_block->code.iseq aliases with cfp->block_code.
-        asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), VALUE::from(block_iseq).into());
-        let cfp_self_addr = asm.lea(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF));
-        asm.or(cfp_self_addr, Opnd::Imm(1))
+        gen_block_handler_specval(jit, asm, block_iseq)
     } else {
         VM_BLOCK_HANDLER_NONE.into()
     };
@@ -1076,15 +1111,12 @@ fn gen_ccall_with_frame(
         write_block_code: false,
     });
 
-    asm_comment!(asm, "switch to new SP register");
-    let sp_offset = (caller_stack_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
-    let new_sp = asm.add(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
-
-    asm_comment!(asm, "switch to new CFP");
-    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
-    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    // Unlike JIT-to-JIT calls, the C function doesn't use the SP and CFP registers,
+    // so we can leave them pointing at the caller frame and only update ec->cfp
+    // for the duration of the call.
+    asm_comment!(asm, "set ec->cfp to the callee CFP");
+    let callee_cfp = asm.lea(Opnd::mem(64, CFP, -(RUBY_SIZEOF_CONTROL_FRAME as i32)));
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), callee_cfp);
 
     let mut cfunc_args = vec![recv];
     cfunc_args.extend(args);
@@ -1092,13 +1124,7 @@ fn gen_ccall_with_frame(
     let result = asm.ccall(cfunc, cfunc_args);
 
     asm_comment!(asm, "pop C frame");
-    let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
-
-    asm_comment!(asm, "restore SP register for the caller");
-    let new_sp = asm.sub(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
 
     result
 }
@@ -1112,13 +1138,32 @@ fn gen_ccall(asm: &mut Assembler, cfunc: *const u8, name: ID, owner: VALUE, recv
     asm.ccall(cfunc, cfunc_args)
 }
 
+/// Load a heap-object constant into a register so that multiple uses share one
+/// materialization. Non-heap operands are returned as is: they're either already
+/// in a register or cheap enough to re-encode at every use.
+fn gen_materialize_value(asm: &mut Assembler, opnd: Opnd) -> Opnd {
+    match opnd {
+        Opnd::Value(val) if !val.special_const_p() => asm.load(opnd),
+        _ => opnd,
+    }
+}
+
 // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
 // VM_CFP_TO_CAPTURED_BLOCK then turns &cfp->self into a block handler.
 // rb_captured_block->code.iseq aliases with cfp->block_code.
-fn gen_block_handler_specval(asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Opnd {
+fn gen_block_handler_specval(jit: &mut JITState, asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Opnd {
     asm.store(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), VALUE::from(blockiseq).into());
+    // The handler is just `&cfp->self | 1`, the same value for every block this frame
+    // passes, so reuse it until something writes the CFP register.
+    if let Some((generation, specval)) = jit.block_handler_specval {
+        if generation == asm.cfp_generation() {
+            return specval;
+        }
+    }
     let cfp_self_addr = asm.lea(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_SELF));
-    asm.or(cfp_self_addr, Opnd::Imm(1))
+    let specval = asm.or(cfp_self_addr, Opnd::Imm(1));
+    jit.block_handler_specval = Some((asm.cfp_generation(), specval));
+    specval
 }
 
 /// Generate code for a variadic C function call
@@ -1148,11 +1193,18 @@ fn gen_ccall_variadic(
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, caller_stack_size);
-    gen_spill_stack(jit, asm, function, state);
+    // The receiver and arguments are above the saved cfp->sp: the frame env
+    // written by gen_push_frame() overwrites their slots and nothing reads VM
+    // stack slots above cfp->sp, so only spill the stack below them.
+    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     gen_spill_locals(jit, asm, state);
 
+    // The receiver is used twice: as the callee frame's self and as the third C argument.
+    // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
+    let recv = gen_materialize_value(asm, recv);
+
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
-        gen_block_handler_specval(asm, blockiseq)
+        gen_block_handler_specval(jit, asm, blockiseq)
     } else {
         VM_BLOCK_HANDLER_NONE.into()
     };
@@ -1166,28 +1218,19 @@ fn gen_ccall_variadic(
         write_block_code: false,
     });
 
-    asm_comment!(asm, "switch to new SP register");
-    let sp_offset = (caller_stack_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
-    let new_sp = asm.add(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
-
-    asm_comment!(asm, "switch to new CFP");
-    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
-    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    // Unlike JIT-to-JIT calls, the C function doesn't use the SP and CFP registers,
+    // so we can leave them pointing at the caller frame and only update ec->cfp
+    // for the duration of the call.
+    asm_comment!(asm, "set ec->cfp to the callee CFP");
+    let callee_cfp = asm.lea(Opnd::mem(64, CFP, -(RUBY_SIZEOF_CONTROL_FRAME as i32)));
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), callee_cfp);
 
     let argv_ptr = gen_push_opnds(jit, asm, &args);
     asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
     let result = asm.ccall(cfunc, vec![args.len().into(), argv_ptr, recv]);
 
     asm_comment!(asm, "pop C frame");
-    let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
-
-    asm_comment!(asm, "restore SP register for the caller");
-    let new_sp = asm.sub(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
 
     result
 }
@@ -1255,7 +1298,7 @@ fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, function: &Function, r
 }
 
 /// Emit a special object lookup
-fn gen_putspecialobject(jit: &JITState, asm: &mut Assembler, function: &Function, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
+fn gen_putspecialobject(jit: &mut JITState, asm: &mut Assembler, function: &Function, value_type: SpecialObjectType, state: &FrameState) -> Opnd {
     // rb_vm_get_special_object for CBASE/CONST_BASE can call rb_singleton_class,
     // which allocates (may trigger GC) and can raise TypeError on non-class
     // receivers (e.g. `123.instance_eval { Const = 1 }`). Treat as non-leaf so
@@ -1349,7 +1392,7 @@ fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE)
     asm_ccall!(asm, rb_zjit_defined_ivar, self_val, id.0.into(), Opnd::Value(pushval))
 }
 
-fn gen_checkmatch(jit: &JITState, asm: &mut Assembler, function: &Function, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
+fn gen_checkmatch(jit: &mut JITState, asm: &mut Assembler, function: &Function, target: Opnd, pattern: Opnd, flag: u32, state: &FrameState) -> lir::Opnd {
     // rb_vm_check_match is not leaf unless flag is VM_CHECKMATCH_TYPE_WHEN.
     // See also: leafness_of_checkmatch() and check_match()
     if flag != VM_CHECKMATCH_TYPE_WHEN {
@@ -1618,7 +1661,7 @@ fn gen_push_inline_frame(
     // The HIR specialization guards ensure we will only reach here for literal blocks,
     // not &block forwarding, &:foo, etc. These are rejected in `type_specialize` by
     // `unspecializable_call_type`.
-    let block_handler = blockiseq.map(|b| gen_block_handler_specval(asm, b));
+    let block_handler = blockiseq.map(|b| gen_block_handler_specval(jit, asm, b));
 
     let callee_is_bmethod = !cme.is_null() && VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
@@ -1763,7 +1806,7 @@ fn gen_send_iseq_direct(
     // The HIR specialization guards ensure we will only reach here for literal blocks,
     // not &block forwarding, &:foo, etc. Thise are rejected in `type_specialize` by
     // `unspecializable_call_type`.
-    let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
+    let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(jit, asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
@@ -2281,7 +2324,7 @@ fn gen_array_ptr(asm: &mut Assembler, array: Opnd) -> lir::Opnd {
 
 /// Compile opt_newarray_hash - create a hash from array elements
 fn gen_opt_newarray_hash(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2309,7 +2352,7 @@ fn gen_opt_newarray_hash(
 
 /// Compile ArrayMax - find the maximum element among array elements
 fn gen_array_max(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2336,7 +2379,7 @@ fn gen_array_max(
 
 /// Find the minimum element among array elements
 fn gen_array_min(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2362,7 +2405,7 @@ fn gen_array_min(
 }
 
 fn gen_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2390,7 +2433,7 @@ fn gen_array_include(
 }
 
 fn gen_array_pack_buffer(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     elements: Vec<Opnd>,
@@ -2423,7 +2466,7 @@ fn gen_array_pack_buffer(
 }
 
 fn gen_dup_array_include(
-    jit: &JITState,
+    jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
     ary: VALUE,
@@ -2633,7 +2676,7 @@ fn gen_new_range_fixnum(
         })
 }
 
-fn gen_object_alloc(jit: &JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
+fn gen_object_alloc(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, state: &FrameState) -> lir::Opnd {
     // Allocating an object from an unknown class is non-leaf; see doc for `ObjectAlloc`.
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_obj_alloc, val)
@@ -3387,19 +3430,39 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     // an extra register for asm.lea(), but you'll need to manage the SP offset like YJIT does.
     gen_incr_counter(asm, Counter::vm_write_sp_count);
     asm_comment!(asm, "save SP to CFP: {}", stack_size);
-    let sp_addr = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
+    // When the offset is 0, cfp->sp is just the SP register: skip the lea.
+    let sp_addr = if stack_size == 0 {
+        SP
+    } else {
+        asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32))
+    };
     let cfp_sp = Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP);
     asm.mov(cfp_sp, sp_addr);
 }
 
 /// Spill locals onto the stack.
-fn gen_spill_locals(jit: &JITState, asm: &mut Assembler, state: &FrameState) {
-    // TODO: Avoid spilling locals that have been spilled before and not changed.
+fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
-    for (idx, &insn_id) in state.locals().enumerate() {
+
+    // Skip the stores whose slots already hold the very same values. HIR gives a local a
+    // fresh InsnId whenever anything could have changed it -- a call that can write it
+    // through the EP chain drops the locals from the frame state -- so matching InsnIds
+    // mean the slot the previous spill wrote is still current.
+    let locals: Vec<InsnId> = state.locals().copied().collect();
+    // Frame states for different frames can map to different slots, so only reuse the
+    // record when it belongs to the frame we're spilling now.
+    let spilled = match jit.spilled_locals.take() {
+        Some((iseq, depth, spilled)) if iseq == state.iseq && depth == state.depth => Some(spilled),
+        _ => None,
+    };
+    for (idx, &insn_id) in locals.iter().enumerate() {
+        if spilled.as_ref().and_then(|spilled| spilled.get(idx)) == Some(&insn_id) {
+            continue;
+        }
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
+    jit.spilled_locals = Some((state.iseq, state.depth, locals));
 }
 
 /// Spill the virtual stack onto the stack.
@@ -3428,7 +3491,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
 /// Direct JIT-to-JIT calls keep cfp->sp lazy, so this must publish SP before
 /// writing stack slots. Otherwise spilling the stack can overwrite frame
 /// metadata below the real VM-stack base.
-fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
+fn gen_prepare_fallback_call(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, state.stack_size());
     gen_spill_locals(jit, asm, state);
@@ -3469,7 +3532,7 @@ fn inline_frame_stack_gap(iseq: IseqPtr) -> usize {
 
 /// Prepare for calling a C function that may call an arbitrary method.
 /// Use gen_prepare_leaf_call_with_gc() if the method is leaf but allocates objects.
-fn gen_prepare_non_leaf_call(jit: &JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
+fn gen_prepare_non_leaf_call(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState) {
     // TODO: Lazily materialize caller frames when needed
     // Save PC for backtraces and allocation tracing
     // and SP to avoid marking uninitialized stack slots

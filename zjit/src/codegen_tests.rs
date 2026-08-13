@@ -6338,6 +6338,136 @@ fn test_bop_redefined_with_adjacent_patch_points() {
     "), @"[15, :+, 100]");
 }
 
+// Consecutive patch points that guard the same side exit share one patch site,
+// so a single site can be invalidated by more than one invariant. Bust both
+// invariants of a C call (NoSingletonClass and MethodRedefined) without running
+// the method in between, which patches the same address twice.
+#[test]
+fn test_shared_patch_site_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        obj = []
+        def obj.reverse_each = nil
+        Array.class_eval { def reverse_each; yield 99; end }
+        [before, test]
+    "), @"[1, 99]");
+}
+
+// A run of calls in one basic block spills the frame's locals only once, so a Binding
+// materialized by a later callee must still see the values from the first spill.
+#[test]
+fn test_binding_sees_locals_spilled_by_an_earlier_call() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          y = 2
+          [].each { }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), b.local_variable_get(:y), x + y]
+        end
+        test; test
+        test
+    "), @"[1, 2, 3]");
+}
+
+// Same, but a local is reassigned between the calls, so its slot has to be rewritten.
+#[test]
+fn test_binding_sees_locals_reassigned_between_calls() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [].each { }
+          x = 5
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[5, 5]");
+}
+
+// Same, but the local is written by a block through the EP chain during a call.
+#[test]
+fn test_binding_sees_locals_written_through_the_ep_chain() {
+    assert_snapshot!(inspect("
+        def test
+          x = 1
+          [1].each { x = 7 }
+          [].each { }
+          b = [1].map { binding }.first
+          [b.local_variable_get(:x), x]
+        end
+        test; test
+        test
+    "), @"[7, 7]");
+}
+
+// Consecutive calls reuse the block handler derived from CFP, but each has to install
+// its own block ISEQ in cfp->block_code.
+#[test]
+fn test_consecutive_calls_pass_their_own_blocks() {
+    assert_snapshot!(inspect("
+        def test
+          result = []
+          [1, 2].each { |v| result << v }
+          [3].each { |v| result << v * 10 }
+          [4].each { |v| result << v + 100 }
+          result
+        end
+        test; test
+        test
+    "), @"[1, 2, 30, 104]");
+}
+
+// The cached block handler belongs to the frame it was computed in. Pushing an inlined
+// frame moves the CFP register with a plain `mov`, so the cache has to be dropped there:
+// otherwise the inlined callee's send would pass the *caller's* captured block and run
+// the wrong block ISEQ.
+#[test]
+fn test_inlined_frame_does_not_reuse_the_callers_block_handler() {
+    with_inlining(|| {
+        assert_snapshot!(inspect("
+            def callee(a) = a.map { |v| v + 1000 }
+            def test(a)
+              outer = a.map { |v| v }
+              [outer, callee(a)]
+            end
+            test([1]); test([1])
+            test([1, 2])
+        "), @"[[1, 2], [1001, 1002]]");
+    });
+}
+
+// Same idea for the patch points a constant lookup emits, which also share a site.
+#[test]
+fn test_shared_patch_site_for_constant_invalidated_twice() {
+    assert_snapshot!(inspect("
+        CONST_ARRAY = [1]
+        def test
+          result = nil
+          CONST_ARRAY.reverse_each { |x| result = x }
+          result
+        end
+        test; test
+        before = test
+        tp = TracePoint.new(:line) { }
+        tp.enable
+        Object.send(:remove_const, :CONST_ARRAY)
+        CONST_ARRAY = [2]
+        after = test
+        tp.disable
+        [before, after]
+    "), @"[1, 2]");
+}
+
 #[test]
 fn test_method_redefined_with_top_self() {
     assert_snapshot!(inspect(r#"
