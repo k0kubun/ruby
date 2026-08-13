@@ -9916,6 +9916,7 @@ fn test_ivar_cache_reads_survive_gc_stress() {
 }
 
 
+
 #[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
