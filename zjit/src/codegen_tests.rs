@@ -676,6 +676,46 @@ fn test_yield_polymorphic_ifunc_handler_falls_back() {
 }
 
 #[test]
+fn test_yield_repeated_ifunc_handlers_dispatch_directly() {
+    // Every Enumerator call allocates a fresh ifunc, so profiling block handlers by object
+    // identity used to make a yield site that only ever yields to C blocks look megamorphic.
+    // Handlers are profiled by kind instead, so the site stays monomorphic and takes the
+    // ifunc fast path while still returning the right result.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def via_enum = to_enum(:invoke).to_a
+        via_enum; via_enum
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_enum");
+    }
+    assert_snapshot!(assert_compiles("via_enum"), @"[10]");
+}
+
+#[test]
+fn test_yield_cold_iseq_candidates_skip_dispatch_chain() {
+    // A yield site whose executions are dominated by proc handlers must not build an ISEQ
+    // dispatch chain out of the cold ISEQ blocks in its profile: the chain would miss on
+    // nearly every call. Results must stay correct for every handler either way.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def add_one = invoke { |x| x + 1 }
+        def via_proc(l) = invoke(&l)
+        PROCS = [proc { |x| x * 3 }, proc { |x| x * 4 }]
+        add_one; via_proc(PROCS[0])
+        add_one; via_proc(PROCS[0])
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_proc(PROCS[0]); via_proc(PROCS[1])");
+    }
+    assert_snapshot!(assert_compiles("[add_one, via_proc(PROCS[0]), via_proc(PROCS[1])]"), @"[11, 30, 40]");
+}
+
+#[test]
 fn test_yield_megamorphic_mixed_block_handlers() {
     // A yield site that sees ISEQ, proc, symbol, and ifunc handlers mixed together goes
     // megamorphic (each to_enum call profiles a distinct ifunc), so it compiles to the
@@ -5773,6 +5813,123 @@ fn test_polymorphic_iseq_dispatch_same_site() {
 }
 
 #[test]
+fn test_polymorphic_send_with_literal_block_dispatches_directly() {
+    // A polymorphic call site that passes a literal block dispatches on the receiver type in
+    // the same way a block-less send does, and every arm must run the block correctly.
+    set_call_threshold(4);
+    eval("
+        class C; def each; yield 1; yield 2; end; end
+        class D; def each; yield 3; end; end
+        class Unseen; def each; yield 4; end; end
+        def test(o) = o.each { |x| x * 10 }
+        test C.new; test D.new; test C.new; test D.new
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(C.new), test(D.new), test(Unseen.new)]"), @"[20, 30, 40]");
+}
+
+#[test]
+fn test_megamorphic_send_chain_dispatches_and_falls_back() {
+    // A call site that sees ten receiver classes is megamorphic: the profiled classes get
+    // guarded in-line and everything else takes the dynamic send. Both the chained classes
+    // and a class the profile never saw must return the right value.
+    set_call_threshold(21);
+    eval("
+        class C0; def foo = 0; end
+        class C1; def foo = 1; end
+        class C2; def foo = 2; end
+        class C3; def foo = 3; end
+        class C4; def foo = 4; end
+        class C5; def foo = 5; end
+        class C6; def foo = 6; end
+        class C7; def foo = 7; end
+        class C8; def foo = 8; end
+        class C9; def foo = 9; end
+        class Unseen; def foo = 42; end
+        def test(o) = o.foo
+        OBJS = [C0.new, C1.new, C2.new, C3.new, C4.new, C5.new, C6.new, C7.new, C8.new, C9.new]
+        3.times { OBJS.each { |o| test o } }
+    ");
+    assert_snapshot!(assert_compiles("OBJS.map { |o| test o } + [test(Unseen.new)]"), @"[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 42]");
+}
+
+/// Thirty subclasses of one class, none of which defines the method: the site is megamorphic
+/// in the receiver class but every receiver resolves the one inherited method.
+const ANCESTOR_GUARD_SETUP: &str = "
+    class Base; def foo = 1; end
+    class Other; def foo = 99; end
+    SUBS = 30.times.map { Class.new(Base) }
+    OBJS = SUBS.map(&:new)
+    def test(o) = o.foo
+    3.times { OBJS.each { |o| test o } }
+";
+
+#[test]
+fn test_ancestor_guard_dispatches_inherited_method() {
+    // A subclass the profile never saw inherits the same method, so it takes the guarded path
+    // too; an unrelated class takes the dynamic fallthrough.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles("
+        [OBJS.map { |o| test o }.uniq, test(Class.new(Base).new), test(Other.new)]
+    "), @"[[1], 1, 99]");
+}
+
+#[test]
+fn test_ancestor_guard_invalidated_by_subclass_override() {
+    // Defining the method in a subclass after the guard was compiled has to invalidate it.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = OBJS.map { |o| test o }.uniq
+        SUBS[0].class_eval { def foo = 100 }
+        [before, OBJS.map { |o| test o }.uniq.sort]
+    "), @"[[1], [1, 100]]");
+}
+
+#[test]
+fn test_ancestor_guard_invalidated_by_prepend() {
+    // So does prepending a module that defines it below the guarded class.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = OBJS.map { |o| test o }.uniq
+        SUBS[1].prepend(Module.new { def foo = 200 })
+        [before, OBJS.map { |o| test o }.uniq.sort]
+    "), @"[[1], [1, 200]]");
+}
+
+#[test]
+fn test_ancestor_guard_rejects_singleton_receiver() {
+    // A singleton method on one instance is invisible to the subclass walk, so the guard
+    // itself has to send singleton-class receivers down the dynamic fallthrough.
+    set_call_threshold(21);
+    eval(ANCESTOR_GUARD_SETUP);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        o = OBJS[2]
+        def o.foo = 300
+        OBJS.map { |x| test x }.uniq.sort
+    "), @"[1, 300]");
+}
+
+#[test]
+fn test_ancestor_guard_module_defined_method() {
+    // The shared method can come from a module included into the guarded class rather than
+    // from the class itself.
+    set_call_threshold(21);
+    eval("
+        module M; def foo = 7; end
+        class ModBase; include M; end
+        MOD_SUBS = 30.times.map { Class.new(ModBase) }
+        MOD_OBJS = MOD_SUBS.map(&:new)
+        def test_mod(o) = o.foo
+        3.times { MOD_OBJS.each { |o| test_mod o } }
+    ");
+    assert_snapshot!(assert_compiles("
+        [MOD_OBJS.map { |o| test_mod o }.uniq, test_mod(Class.new(ModBase).new)]
+    "), @"[[7], 7]");
+}
+
+#[test]
 fn test_recursive_fact() {
     assert_snapshot!(inspect("
         def fact(n)
@@ -9401,7 +9558,9 @@ fn test_attr_writer_in_polymorphic_arm() {
         def entry
           (1..6).map { |i| o = (i.even? ? ArmWriterA : ArmWriterB).new(i); arm_set(o, i); o.x }
         end
-        5.times { entry }
+        # Enough iterations for the site to see both classes within one profiling window and
+        # settle on the branch chain; --zjit-num-profiles is 20.
+        30.times { entry }
     ");
     assert_snapshot!(assert_compiles("entry"), @"[1, 2, 3, 4, 5, 6]");
 }

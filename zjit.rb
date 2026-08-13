@@ -111,6 +111,7 @@ class << RubyVM::ZJIT
     print_counters_with_prefix(prefix: 'invokeblock_handler_', prompt: 'invokeblock handler', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'getblockparamproxy_handler_', prompt: 'getblockparamproxy handler', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'inline_reject_', prompt: 'HIR-level inlining rejection reasons', buf:, stats:, limit: 10)
+    print_counters_with_prefix(prefix: 'send_ancestor_guard_reject_', prompt: 'ancestor guard rejection reasons', buf:, stats:, limit: 10)
 
     # Show most popular unsupported call features. Because each call can
     # use multiple complex features, a decrease in this number does not
@@ -174,6 +175,10 @@ class << RubyVM::ZJIT
       :vm_write_locals_count,
       :vm_write_stack_count,
       :vm_write_to_parent_iseq_local_count,
+
+      :send_ancestor_guard_count,
+      :send_ancestor_guard_fallback_count,
+      :send_ancestor_guard_sites,
 
       :guard_type_count,
       :guard_type_exit_ratio,

@@ -180,6 +180,17 @@ pub enum Invariant {
         /// The callable method entry that we want to track
         cme: *const rb_callable_method_entry_t,
     },
+    /// No class below `klass` overrides `method`, so `method` resolves to the same
+    /// callable method entry for every instance of `klass` and of its subclasses.
+    /// Invalidated by any method table change for `method`, anywhere.
+    NoMethodOverride {
+        /// The class rooting the hierarchy we assume nothing overrides `method` in
+        klass: VALUE,
+        /// The method ID whose lookup we want to assume unchanged below `klass`
+        method: ID,
+        /// The callable method entry every receiver below `klass` resolves to
+        cme: *const rb_callable_method_entry_t,
+    },
     /// A list of constant expression path segments that must have not been written to for the
     /// following code to be valid.
     StableConstantNames {
@@ -312,6 +323,15 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
             Invariant::MethodRedefined { klass, method, cme } => {
                 let class_name = get_class_name(klass);
                 write!(f, "MethodRedefined({class_name}@{:p}, {}@{:p}, cme:{:p})",
+                    self.ptr_map.map_ptr(klass.as_ptr::<VALUE>()),
+                    method.contents_lossy(),
+                    self.ptr_map.map_id(method.0),
+                    self.ptr_map.map_ptr(cme)
+                )
+            }
+            Invariant::NoMethodOverride { klass, method, cme } => {
+                let class_name = get_class_name(klass);
+                write!(f, "NoMethodOverride({class_name}@{:p}, {}@{:p}, cme:{:p})",
                     self.ptr_map.map_ptr(klass.as_ptr::<VALUE>()),
                     method.contents_lossy(),
                     self.ptr_map.map_id(method.0),
@@ -754,6 +774,7 @@ pub enum SendFallbackReason {
     SendBopRedefined,
     SendOperandsNotFixnum,
     SendPolymorphicFallback,
+    SendAncestorGuardFallback,
     SendDirectKeywordMismatch,
     SendDirectKeywordCountMismatch,
     SendDirectMissingKeyword,
@@ -835,6 +856,7 @@ impl Display for SendFallbackReason {
             SendBopRedefined => write!(f, "Send: basic operation was redefined"),
             SendOperandsNotFixnum => write!(f, "Send: operands are not fixnums"),
             SendPolymorphicFallback => write!(f, "Send: polymorphic fallback"),
+            SendAncestorGuardFallback => write!(f, "Send: ancestor guard fallback"),
             SendDirectKeywordMismatch => write!(f, "SendDirect: keyword mismatch"),
             SendDirectKeywordCountMismatch => write!(f, "SendDirect: keyword count mismatch"),
             SendDirectMissingKeyword => write!(f, "SendDirect: missing keyword"),
@@ -1323,6 +1345,11 @@ pub enum Insn {
     RefineType { val: InsnId, new_type: Type },
     /// Return CBool[true] if val has type Type and CBool[false] otherwise.
     HasType { val: InsnId, expected: Type },
+    /// Return CBool[true] if val is a heap object whose class is `class` or a
+    /// subclass of it, and CBool[false] otherwise. Conservatively false for
+    /// immediates and for objects with a singleton class, both of which the
+    /// generated code rejects without looking at the ancestry.
+    HasAncestor { val: InsnId, class: VALUE },
 
     /// Side-exit if val doesn't have the expected type.
     GuardType { val: InsnId, guard_type: Type, state: InsnId, recompile: Option<Recompile> },
@@ -1470,6 +1497,7 @@ macro_rules! for_each_operand_impl {
             }
             Insn::RefineType { val, .. }
             | Insn::HasType { val, .. }
+            | Insn::HasAncestor { val, .. }
             | Insn::Return { val, .. }
             | Insn::Test { val }
             | Insn::BoxBool { val } => {
@@ -1981,6 +2009,7 @@ impl Insn {
                     if expected.is_subtype(types::Immediate) { abstract_heaps::Empty } else { abstract_heaps::Memory },
                     abstract_heaps::Empty
                 ),
+            Insn::HasAncestor { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::Entries { .. } => effects::Any,
             Insn::BreakPoint | Insn::Unreachable => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
         }
@@ -2371,6 +2400,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             },
             Insn::RefineType { val, new_type, .. } => { write!(f, "RefineType {val}, {}", new_type.print(self.ptr_map)) },
             Insn::HasType { val, expected, .. } => { write!(f, "HasType {val}, {}", expected.print(self.ptr_map)) },
+            Insn::HasAncestor { val, class } => { write!(f, "HasAncestor {val}, {}", get_class_name(*class)) },
             Insn::GuardBitEquals { val, expected, recompile, .. } => {
                 write!(f, "GuardBitEquals {val}, {}", expected.print(self.ptr_map))?;
                 if recompile.is_some() {
@@ -2948,6 +2978,11 @@ pub struct Function {
     /// JIT code has no profile of its own. When it is inlined, its `self` is the caller's guarded
     /// receiver, and this map is the only place its shape survives.
     guarded_profiled_types: HashMap<InsnId, ProfiledType>,
+    /// Sends that sit behind a [`Insn::HasAncestor`] guard, mapped to the class that guard
+    /// checked. `type_specialize` dispatches these on the method resolved from that class
+    /// instead of on the receiver's exact class. Keyed by the `Send`'s own instruction ID;
+    /// IDs are never reused, so a stale entry can only ever be read back by the same send.
+    ancestor_dispatch: HashMap<InsnId, VALUE>,
     /// Rough estimate for the number of (actually executable) instructions in the function. Does
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
@@ -3071,6 +3106,192 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
         }
         _ => None,
     }
+}
+
+/// Minimum share of the profiled executions of a call site that a guard chain must cover before
+/// we emit it. Each arm costs a comparison and a branch on every execution, and the arms we can
+/// emit only cover part of the profile: handlers or receiver types we cannot specialize, and
+/// samples that did not fit in the profile at all, take the fallback. A chain built out of the
+/// cold tail of the profile pays for its guards on every execution and still performs the same
+/// dynamic dispatch, so require the covered share to be at least this large.
+const CHAIN_COVERAGE_THRESHOLD: f64 = 0.5;
+
+/// Maximum number of classes we scan below a class while proving that none of them overrides
+/// the called method. Hierarchies larger than this give up on the ancestor guard rather than
+/// spend unbounded compile time on the proof.
+///
+/// It has to be large enough to cover the whole process: the most valuable roots are the
+/// shallow ones. `Object#class`, `Object#is_a?` and `Object#respond_to?` are the methods
+/// rubocop's megamorphic sites resolve most often, and proving them unoverridden means walking
+/// every class the process has loaded (~3,200 for rubocop).
+const ANCESTOR_GUARD_MAX_SUBCLASSES: u32 = 100_000;
+
+/// A call site that is megamorphic in the receiver's class but monomorphic in the method it
+/// resolves to: every profiled receiver class inherits one shared method entry.
+#[derive(Clone, Copy)]
+struct AncestorDispatch {
+    /// Class that roots the hierarchy the shared method entry is visible from. Guarding that
+    /// the receiver is an instance of this class or of a subclass is enough to know which
+    /// method the call resolves to.
+    klass: VALUE,
+}
+
+/// How to dispatch a call site whose receiver profile has more than one class in it.
+enum SendChainPlan {
+    /// Guard that the receiver inherits from one class and call the method it resolves there.
+    Ancestor(AncestorDispatch),
+    /// Guard each profiled receiver class in turn.
+    Classes(TypeDistributionSummary),
+}
+
+/// Decide whether a megamorphic call site can dispatch on the method it resolves to rather than
+/// on the receiver's class.
+///
+/// A site over 100 AST node classes that all inherit one `Node#send_type?` is megamorphic in the
+/// receiver class but has a single call target. A class chain can only ever cover the classes
+/// that fit in the profile, and pays a comparison per arm to reach the same method; guarding
+/// "the receiver inherits from `Node`" covers every subclass, including ones the profile never
+/// saw, in one check.
+///
+/// The guard alone doesn't pin the target down: a subclass could override the method. So we also
+/// prove at compile time that no class below the defining class defines the method, and register
+/// that as an invariant ([`Invariant::NoMethodOverride`]) so a later definition invalidates the
+/// code.
+fn ancestor_dispatch_target(summary: &TypeDistributionSummary, cd: *const rb_call_data) -> Option<AncestorDispatch> {
+    // The guard reads the prime classext of the receiver's class.
+    if invariants::non_root_box_created() {
+        incr_counter!(send_ancestor_guard_reject_not_a_class);
+        return None;
+    }
+    let ci = unsafe { (*cd).ci };
+    let mid = unsafe { vm_ci_mid(ci) };
+
+    // Every bucket has to resolve the method to the same entry. That is the evidence that the
+    // site is really dispatching one method: if the buckets disagree, an ancestor guard would
+    // send some of them to the wrong place, and we would need the class chain anyway.
+    let mut shared_cme: Option<*const rb_callable_method_entry_t> = None;
+    for &profiled_type in summary.buckets() {
+        if profiled_type.is_empty() { break; }
+        // The guard below only looks at the class of heap objects; an immediate receiver takes
+        // the fallthrough no matter what, so a profile with immediates in it wants a class chain.
+        if profiled_type.flags().is_immediate() {
+            incr_counter!(send_ancestor_guard_reject_immediate);
+            return None;
+        }
+        let cme = unsafe { rb_callable_method_entry(profiled_type.class(), mid) };
+        if cme.is_null() { return None; }
+        match shared_cme {
+            None => shared_cme = Some(cme),
+            Some(seen) if seen == cme => {}
+            Some(_) => {
+                incr_counter!(send_ancestor_guard_reject_cme_differs);
+                return None;
+            }
+        }
+    }
+    let cme = shared_cme?;
+
+    // Root the hierarchy at the class the method is visible from. For a method defined in a
+    // class that is the defining class itself; for one defined in a module it is the ICLASS the
+    // include created, whose includer is the class that gained the method.
+    let defined_class = unsafe { (*cme).defined_class };
+    if defined_class == VALUE(0) || defined_class.special_const_p() {
+        incr_counter!(send_ancestor_guard_reject_not_a_class);
+        return None;
+    }
+    let klass = match defined_class.builtin_type() {
+        RUBY_T_CLASS => defined_class,
+        RUBY_T_ICLASS => {
+            let includer = unsafe { rb_zjit_iclass_includer(defined_class) };
+            if includer == VALUE(0) || includer.special_const_p() || includer.builtin_type() != RUBY_T_CLASS {
+                incr_counter!(send_ancestor_guard_reject_not_a_class);
+                return None;
+            }
+            includer
+        }
+        _ => {
+            incr_counter!(send_ancestor_guard_reject_not_a_class);
+            return None;
+        }
+    };
+
+    // The lookup from the root has to land on the same entry, both because the generated call
+    // targets it and because `type_specialize` re-resolves from the root.
+    if unsafe { rb_callable_method_entry(klass, mid) } != cme {
+        incr_counter!(send_ancestor_guard_reject_cme_differs);
+        return None;
+    }
+
+    // The guard reads the cached superclass array, which is only filled in for classes whose
+    // ancestry is fully built and whose depth didn't saturate.
+    // RCLASS_MAX_SUPERCLASS_DEPTH: past it the depth saturates and stops identifying a slot
+    // in the array, which is what the guard indexes.
+    let depth = unsafe { rb_zjit_class_superclass_depth(klass) };
+    if depth >= u16::MAX as std::os::raw::c_uint {
+        incr_counter!(send_ancestor_guard_reject_not_a_class);
+        return None;
+    }
+
+    // Finally, the part that makes the guard sufficient: nothing below the root may define the
+    // method today. `Invariant::NoMethodOverride` keeps it that way.
+    if !invariants::no_method_override_below(klass, mid, ANCESTOR_GUARD_MAX_SUBCLASSES) {
+        incr_counter!(send_ancestor_guard_reject_overridden);
+        return None;
+    }
+
+    incr_counter!(send_ancestor_guard_sites);
+    Some(AncestorDispatch { klass })
+}
+
+/// Emit the single-arm guard chain for an [`AncestorDispatch`]: one `is_a?`-style check with a
+/// [`Insn::Send`] that `type_specialize` will resolve statically, and the dynamic send as the
+/// fallthrough for receivers that don't inherit the method.
+///
+/// Returns the join block, which the caller must continue emitting into, and the block parameter
+/// holding the call result.
+fn gen_send_ancestor_chain(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    dispatch: &AncestorDispatch,
+    block: BlockId,
+    insn_idx: u32,
+    exit_state: &FrameState,
+    exit_id: InsnId,
+    recv: InsnId,
+    cd: *const rb_call_data,
+    block_handler: Option<BlockHandler>,
+    args: Vec<InsnId>,
+    opcode: u32,
+) -> (BlockId, InsnId) {
+    let join_block = fun.new_block(insn_idx);
+    let join_param = fun.push_insn(join_block, Insn::Param);
+
+    // gen_has_ancestor reads the prime classext of the receiver's class.
+    fun.assume_root_box(block, exit_id);
+    let has_ancestor = fun.push_insn(block, Insn::HasAncestor { val: recv, class: dispatch.klass });
+    let iftrue_block = fun.new_block(insn_idx);
+    let fall_through = fun.new_block(insn_idx);
+    fun.push_insn(block, Insn::CondBranch {
+        val: has_ancestor,
+        if_true: BranchEdge { target: iftrue_block, args: vec![] },
+        if_false: BranchEdge { target: fall_through, args: vec![] },
+    });
+
+    // Take a fresh Snapshot so the specialized send doesn't resolve the receiver from the
+    // megamorphic profile that is keyed at exit_id, and copy the other operands' profile
+    // entries over so argument-driven specializations still see them.
+    let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+    profiles.copy_entries_except(exit_id, snapshot, recv, fun, None);
+    let send = fun.push_insn(iftrue_block, Insn::Send { recv, cd, block: block_handler, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
+    fun.record_ancestor_dispatch(send, dispatch.klass);
+    fun.count(iftrue_block, Counter::send_ancestor_guard_count);
+    fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+
+    fun.count(fall_through, Counter::send_ancestor_guard_fallback_count);
+    let fallback = fun.push_insn(fall_through, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: SendAncestorGuardFallback });
+    fun.push_insn(fall_through, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+
+    (join_block, join_param)
 }
 
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
@@ -3376,6 +3597,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             guarded_profiled_types: HashMap::default(),
+            ancestor_dispatch: HashMap::default(),
             num_instructions: 0,
             exception_entry: None,
             send_mid_overrides: HashMap::new(),
@@ -3675,6 +3897,57 @@ impl Function {
         false
     }
 
+    /// Emit the patch points that keep `cme` the right target for a specialized send.
+    ///
+    /// `ancestor_class` is set when the receiver was guarded to inherit from a class rather
+    /// than to be an exact class. Then the target only stays right as long as nothing below
+    /// that class defines the method, which is a separate assumption from the method not being
+    /// redefined where it is defined.
+    fn assume_cme_for_send(
+        &mut self,
+        block: BlockId,
+        klass: VALUE,
+        mid: ID,
+        cme: *const rb_callable_method_entry_t,
+        state: InsnId,
+        ancestor_class: Option<VALUE>,
+    ) {
+        if let Some(ancestor_class) = ancestor_class {
+            self.push_insn(block, Insn::PatchPoint {
+                invariant: Invariant::NoMethodOverride { klass: ancestor_class, method: mid, cme },
+                state,
+            });
+        }
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+    }
+
+    /// [`Function::assume_no_singleton_classes`] for a specialized send.
+    ///
+    /// A send behind an ancestor guard needs no such assumption: the guard rejects any receiver
+    /// whose class is a singleton class, so the receivers that reach the specialized call are
+    /// exactly the ones whose lookup the [`Invariant::NoMethodOverride`] assumption covers. The
+    /// assumption would not even be the right one, since it is about instances of `klass` while
+    /// the receivers here are instances of its subclasses.
+    fn assume_no_singleton_classes_for_send(&mut self, block: BlockId, klass: VALUE, state: InsnId, ancestor_class: Option<VALUE>) -> bool {
+        if ancestor_class.is_some() {
+            return true;
+        }
+        self.assume_no_singleton_classes(block, klass, state)
+    }
+
+    /// Remember that `send` sits behind a [`Insn::HasAncestor`] guard for `klass`, so
+    /// `type_specialize` can dispatch it on the method `klass` resolves rather than on the
+    /// receiver's exact class.
+    fn record_ancestor_dispatch(&mut self, send: InsnId, klass: VALUE) {
+        self.ancestor_dispatch.insert(send, klass);
+    }
+
+    /// The class a send's receiver was guarded to inherit from, if any. See
+    /// [`Function::record_ancestor_dispatch`].
+    fn ancestor_dispatch_class(&self, send: InsnId) -> Option<VALUE> {
+        self.ancestor_dispatch.get(&send).copied()
+    }
+
     pub fn count(&mut self, block: BlockId, counter: Counter) {
         if get_option!(stats) {
             self.push_insn(block, Insn::IncrCounter(counter));
@@ -3861,6 +4134,7 @@ impl Function {
             &Insn::HasType { val, expected } if self.is_a(val, expected) => Type::from_cbool(true),
             &Insn::HasType { val, expected } if !self.type_of(val).could_be(expected) => Type::from_cbool(false),
             Insn::HasType { .. } => types::CBool,
+            Insn::HasAncestor { .. } => types::CBool,
             Insn::GuardBitEquals { val, expected, .. } => self.type_of(*val).intersection(Type::from_const(*expected)),
             Insn::GuardAnyBitSet { val, .. } => self.type_of(*val),
             Insn::GuardNoBitsSet { val, .. } => self.type_of(*val),
@@ -4413,6 +4687,43 @@ impl Function {
         None
     }
 
+    /// Return the receiver profile of a call site when it is worth guarding the profiled types
+    /// in-line, with a dynamic send as the fallthrough.
+    ///
+    /// Polymorphic profiles always qualify: every observed type has a bucket, so the chain
+    /// covers the whole profile. Megamorphic profiles qualify when the buckets still cover
+    /// most of the observed executions: such a site is only megamorphic because it saw more
+    /// types than there are buckets, which for a skewed distribution still leaves the buckets
+    /// serving nearly every call. Sending those dynamically because a handful of executions
+    /// used a rare receiver class gives up on the common case.
+    fn send_chain_plan(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId, cd: *const rb_call_data) -> Option<SendChainPlan> {
+        let entries = profiles.get(state)?;
+        let recv = self.chase_insn(recv);
+        for (entry_insn, entry_type_summary) in entries {
+            if self.chase_insn(*entry_insn) != recv { continue; }
+            if entry_type_summary.is_polymorphic() || entry_type_summary.is_skewed_polymorphic() {
+                return Some(SendChainPlan::Classes(entry_type_summary.clone()));
+            }
+            if entry_type_summary.is_megamorphic() || entry_type_summary.is_skewed_megamorphic() {
+                // Prefer one guard over the method the site really dispatches, when there is
+                // one: it covers subclasses the profile never saw, which is most of what a
+                // megamorphic site sees. Try it even below the coverage threshold, since the
+                // sites with the least bucket coverage are exactly the ones a class chain
+                // helps least.
+                if let Some(dispatch) = ancestor_dispatch_target(entry_type_summary, cd) {
+                    return Some(SendChainPlan::Ancestor(dispatch));
+                }
+                // Everything that did not fit in a bucket has to take the fallthrough.
+                let covered = entry_type_summary.coverage(|_, profiled_type| !profiled_type.is_empty());
+                if covered >= CHAIN_COVERAGE_THRESHOLD {
+                    return Some(SendChainPlan::Classes(entry_type_summary.clone()));
+                }
+            }
+            return None;
+        }
+        None
+    }
+
     fn monomorphic_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<ProfiledType> {
         let Some(entries) = profiles.get(state) else {
             return None;
@@ -4862,7 +5173,14 @@ impl Function {
                     }
                     &Insn::Send { mut recv, cd, state, block: send_block, .. } => {
                         let mut has_block = send_block.is_some();
-                        let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
+                        // A send behind an ancestor guard resolves its target from the class the
+                        // guard checked instead of from the receiver profile: the guard plus the
+                        // NoMethodOverride invariant emitted below make that lookup the one every
+                        // receiver reaching this arm performs.
+                        let ancestor_class = self.ancestor_dispatch_class(insn_id);
+                        let (klass, profiled_type) = if let Some(ancestor_class) = ancestor_class {
+                            (ancestor_class, None)
+                        } else { match self.resolve_receiver_type(recv, self.type_of(recv), state) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
                             ReceiverTypeResolution::Monomorphic { profiled_type }
                             | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
@@ -4882,7 +5200,7 @@ impl Function {
                                 self.push_insn_id(block, insn_id);
                                 continue;
                             }
-                        };
+                        } };
                         let ci = unsafe { (*cd).ci }; // info about the call site
 
                         let mut flags = unsafe { rb_vm_ci_flag(ci) };
@@ -5047,13 +5365,13 @@ impl Function {
                             };
 
                             // Check singleton class assumption first, before emitting other patchpoints
-                            if !self.assume_no_singleton_classes(block, klass, state) {
+                            if !self.assume_no_singleton_classes_for_send(block, klass, state, ancestor_class) {
                                 self.set_dynamic_send_reason(insn_id, SingletonClassSeen);
                                 self.push_insn_id(block, insn_id); continue;
                             }
 
                             // Add PatchPoint for method redefinition
-                            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                            self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
 
                             // Add GuardType for profiled receiver
                             if let Some(profiled_type) = profiled_type {
@@ -5094,11 +5412,11 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             }
                             // Check singleton class assumption first, before emitting other patchpoints
-                            if !self.assume_no_singleton_classes(block, klass, state) {
+                            if !self.assume_no_singleton_classes_for_send(block, klass, state, ancestor_class) {
                                 self.set_dynamic_send_reason(insn_id, SingletonClassSeen);
                                 self.push_insn_id(block, insn_id); continue;
                             }
-                            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                            self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
 
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_profiled_type(block, recv, profiled_type, state);
@@ -5114,12 +5432,12 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             }
                             // Check singleton class assumption first, before emitting other patchpoints
-                            if !self.assume_no_singleton_classes(block, klass, state) {
+                            if !self.assume_no_singleton_classes_for_send(block, klass, state, ancestor_class) {
                                 self.set_dynamic_send_reason(insn_id, SingletonClassSeen);
                                 self.push_insn_id(block, insn_id); continue;
                             }
 
-                            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                            self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
 
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
@@ -5182,7 +5500,7 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             }
 
-                            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                            self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_profiled_type(block, recv, profiled_type, state);
@@ -5233,11 +5551,11 @@ impl Function {
                                         self.push_insn_id(block, insn_id); continue;
                                     }
                                     // Check singleton class assumption first, before emitting other patchpoints
-                                    if !self.assume_no_singleton_classes(block, klass, state) {
+                                    if !self.assume_no_singleton_classes_for_send(block, klass, state, ancestor_class) {
                                         self.set_dynamic_send_reason(insn_id, SingletonClassSeen);
                                         self.push_insn_id(block, insn_id); continue;
                                     }
-                                    self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                                    self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
                                     if let Some(profiled_type) = profiled_type {
                                         recv = self.guard_profiled_type(block, recv, profiled_type, state);
                                     }
@@ -5270,11 +5588,11 @@ impl Function {
                                         self.push_insn_id(block, insn_id); continue;
                                     };
                                     // Check singleton class assumption first, before emitting other patchpoints
-                                    if !self.assume_no_singleton_classes(block, klass, state) {
+                                    if !self.assume_no_singleton_classes_for_send(block, klass, state, ancestor_class) {
                                         self.set_dynamic_send_reason(insn_id, SingletonClassSeen);
                                         self.push_insn_id(block, insn_id); continue;
                                     }
-                                    self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+                                    self.assume_cme_for_send(block, klass, mid, cme, state, ancestor_class);
                                     if let Some(profiled_type) = profiled_type {
                                         recv = self.guard_profiled_type(block, recv, profiled_type, state);
                                     }
@@ -8319,6 +8637,7 @@ impl Function {
             }
             Insn::RefineType { .. } => Ok(()),
             Insn::HasType { val, .. } => self.assert_subtype(insn_id, val, types::BasicObject),
+            Insn::HasAncestor { val, .. } => self.assert_subtype(insn_id, val, types::BasicObject),
             Insn::IsBlockParamModified { flags } => self.assert_subtype(insn_id, flags, types::CUInt64),
             // Frame instructions have no output to validate; their operands
             // are validated by the recv+args group (PushLightweightFrame)
@@ -9223,14 +9542,18 @@ fn emit_polymorphic_send(
     // out to be wrong. `branch_monomorphic` asks for a branch instead: callers use it where the
     // alternative is a dynamic send anyway, so a missed branch is no worse than not specializing,
     // whereas a failed guard is much worse.
-    let summary = if branch_monomorphic {
-        let summary = fun.profile_summary(profiles, recv, exit_id);
-        if !(summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
-            return None;
-        }
-        summary
-    } else {
-        fun.polymorphic_summary(profiles, recv, exit_id)?
+    let plan = match branch_monomorphic.then(|| fun.profile_summary(profiles, recv, exit_id)) {
+        Some(summary) if summary.is_monomorphic() => SendChainPlan::Classes(summary),
+        _ => fun.send_chain_plan(profiles, recv, exit_id, cd)?,
+    };
+    let summary = match plan {
+        // A site whose profiled classes all inherit one method entry dispatches on that method
+        // instead: one ancestor check covers every subclass, including ones the profile never saw.
+        SendChainPlan::Ancestor(dispatch) => return Some(gen_send_ancestor_chain(
+            fun, profiles, &dispatch, block, insn_idx, exit_state, exit_id,
+            recv, cd, block_handler, args.to_vec(), opcode,
+        )),
+        SendChainPlan::Classes(summary) => summary,
     };
     let join_block = fun.new_block(insn_idx);
     let join_param = fun.push_insn(join_block, Insn::Param);
@@ -10881,9 +11204,12 @@ fn add_iseq_to_hir(
                     // common no-block case still gets a direct send.
                     let split_nil_block_arg = blockiseq.is_null() && block_arg_can_be_nil
                         && block_arg_summary.as_ref().is_some_and(|summary| !summary.is_monomorphic());
-                    // Literal-block sends are left alone: they need reload_locals_modified_by_block
-                    // after the call, which the join-block structure would complicate.
-                    let dispatch_on_recv = blockiseq.is_null() && block_arg_can_be_nil;
+                    // Calls with a literal block get the same receiver chain as block-less sends.
+                    // Blocks are how Ruby iterates, so leaving these on the dynamic send gives up
+                    // on the receiver of every polymorphic `node.each_child_node { ... }`-style
+                    // call. The chain continues from its join block, so the
+                    // reload_locals_modified_by_block below still covers every arm.
+                    let dispatch_on_recv = block_arg_can_be_nil;
                     if split_nil_block_arg {
                         let block_arg_insn = *args.last().unwrap();
                         let join_block = fun.new_block(insn_idx);
@@ -11057,8 +11383,18 @@ fn add_iseq_to_hir(
                         Some(summary.bucket(0).class())
                     });
 
+                    // Share of the profiled executions that yielded to an IFUNC (a block
+                    // implemented in C). IFUNC handlers are profiled by kind rather than by
+                    // identity because `rb_vm_ifunc_new` allocates a fresh one per call, so this is
+                    // 1.0 for a site that always yields to a C block even though the site sees a
+                    // different handler object every time. The fast path below only checks the
+                    // handler tag and joins the generic fallback on a miss, so a dominant share of
+                    // IFUNC samples is enough evidence to emit it.
+                    let ifunc_coverage = block_handler_summary.as_ref().map_or(0.0, |summary| {
+                        summary.coverage(|_, profiled_type| !profiled_type.is_empty() && profiled_type.is_block_ifunc())
+                    });
                     let is_ifunc = (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)) == 0
-                        && block_handler_class.is_some_and(|obj| unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 });
+                        && ifunc_coverage >= CHAIN_COVERAGE_THRESHOLD;
 
                     // A one-argument `yield` to a block that takes several parameters
                     // auto-splats: setup_parameters_complex()'s arg_setup_block case
@@ -11179,6 +11515,20 @@ fn add_iseq_to_hir(
                                         }
                                     }
                                 }
+                            }
+                            // Buckets that are not directly dispatchable (Proc, IFUNC and symbol
+                            // handlers, blocks whose parameters don't match the yield) were skipped
+                            // above and have to take the generic fallback at run time. Only keep
+                            // the chain if the blocks in it account for most of the profile;
+                            // otherwise every execution pays for the comparisons and still ends up
+                            // in rb_vm_invokeblock.
+                            let covered = summary.coverage(|_, profiled_type| {
+                                !profiled_type.is_empty()
+                                    && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
+                                    && polymorphic_iseqs.iter().any(|&(seen, _)| seen == profiled_type.class().as_iseq())
+                            });
+                            if covered < CHAIN_COVERAGE_THRESHOLD {
+                                polymorphic_iseqs.clear();
                             }
                         }
                     }
