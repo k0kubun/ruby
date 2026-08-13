@@ -253,6 +253,18 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
     })
 }
 
+/// Why an ISEQ version is being retired, which decides whether it may exceed
+/// `--zjit-max-versions`. See [`invalidate_iseq_version`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationCause {
+    /// A PatchPoint's invariant was broken and the patch point has already been rewritten
+    /// into a jump to a side exit, so this version is now dead code.
+    PatchPoint,
+    /// Enough profiles were collected to compile a better-specialized version. The existing
+    /// code is still correct, so there is nothing to recover from if we decline.
+    Respecialize,
+}
+
 /// Invalidate an ISEQ version and allow it to be recompiled on the next call.
 /// Both PatchPoint invalidation and exit-profiling recompilation go through this
 /// function, serving as the central point for all invalidation/recompile decisions.
@@ -811,6 +823,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::ToHash { val, state } => { gen_to_hash(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -1415,6 +1428,16 @@ fn gen_to_new_array(jit: &mut JITState, asm: &mut Assembler, function: &Function
 fn gen_to_array(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qfalse), val)
+}
+
+fn gen_to_hash(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_zjit_splatkw(hash: VALUE) -> VALUE;
+    }
+
+    // rb_to_hash_type() can call #to_hash, which runs arbitrary Ruby code and can raise.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_zjit_splatkw, val)
 }
 
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {

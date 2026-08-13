@@ -1020,6 +1020,10 @@ pub enum Insn {
     /// Put special object (VMCORE, CBASE, etc.) based on value_type
     PutSpecialObject { value_type: SpecialObjectType, state: InsnId },
 
+    /// The generic form of the `splatkw` YARV instruction: pass `nil` through, and otherwise
+    /// convert `val` to a Hash with `to_hash`. Used when the profile does not let us pick one
+    /// of the two shapes up front.
+    ToHash { val: InsnId, state: InsnId },
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise.
     ToArray { val: InsnId, state: InsnId },
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise. If we
@@ -1465,6 +1469,7 @@ macro_rules! for_each_operand_impl {
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
             | Insn::ToArray { val, state }
+            | Insn::ToHash { val, state }
             | Insn::IsMethodCfunc { val, state, .. }
             | Insn::ToNewArray { val, state }
             | Insn::SetLocal { val, state, .. }
@@ -1762,6 +1767,7 @@ impl Insn {
             Insn::ToRegexp { .. } => effects::Any,
             Insn::PutSpecialObject { .. } => effects::Any,
             Insn::ToArray { .. } => effects::Any,
+            Insn::ToHash { .. } => effects::Any,
             Insn::ToNewArray { .. } => effects::Any,
             Insn::NewArray { .. } => allocates,
             Insn::NewHash { elements, .. } => {
@@ -2434,6 +2440,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GetClassVar { id, .. } => write!(f, "GetClassVar :{}", id.contents_lossy()),
             Insn::SetClassVar { id, val, .. } => write!(f, "SetClassVar :{}, {val}", id.contents_lossy()),
             Insn::ToArray { val, .. } => write!(f, "ToArray {val}"),
+            Insn::ToHash { val, .. } => write!(f, "ToHash {val}"),
             Insn::ToNewArray { val, .. } => write!(f, "ToNewArray {val}"),
             Insn::ArrayExtend { left, right, .. } => write!(f, "ArrayExtend {left}, {right}"),
             Insn::ArrayPush { array, val, .. } => write!(f, "ArrayPush {array}, {val}"),
@@ -3733,6 +3740,7 @@ impl Function {
             Insn::GetClassVar { .. } => types::BasicObject,
             Insn::ToNewArray { .. } => types::ArrayExact,
             Insn::ToArray { .. } => types::ArrayExact,
+            Insn::ToHash { .. } => types::HashExact.union(types::NilClass),
             Insn::AnyToString { .. } => types::StringExact,
             Insn::IsBlockParamModified { .. } => types::CBool,
             Insn::GetBlockParam { .. } => types::BasicObject,
@@ -7755,6 +7763,7 @@ impl Function {
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
             | Insn::ToArray { val, .. }
+            | Insn::ToHash { val, .. }
             | Insn::ToNewArray { val, .. }
             | Insn::Defined { v: val, .. }
             | Insn::ObjectAlloc { val, .. }
@@ -9176,22 +9185,20 @@ fn add_iseq_to_hir(
                     let summary = payload.profile.get_operand_types(exit_state.insn_idx)
                         .and_then(|types| types.first())
                         .map(|dist| TypeDistributionSummary::new(dist));
-                    let Some(summary) = summary else {
-                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::SplatKwNotProfiled), recompile: None });
-                        break;  // End the block
-                    };
-                    if !summary.is_monomorphic() {
-                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::SplatKwPolymorphic), recompile: None });
-                        break;  // End the block
-                    }
-                    let ty = Type::from_profiled_type(summary.bucket(0));
-                    let obj = if ty.is_subtype(types::NilClass) {
-                        fun.push_insn(block, Insn::GuardType { val: hash, guard_type: types::NilClass, state: exit_id, recompile: None })
-                    } else if ty.is_subtype(types::HashExact) {
-                        fun.push_insn(block, Insn::GuardType { val: hash, guard_type: types::HashExact, state: exit_id, recompile: None })
-                    } else {
-                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::SplatKwNotNilOrHash), recompile: None });
-                        break;  // End the block
+                    // Guard for one shape only when the profile says the site sticks to it.
+                    // Otherwise fall back to the generic conversion rather than side-exiting:
+                    // a side exit here ends the block, so everything after a `**opts` call in
+                    // the method would go uncompiled. `**opts` alternating between nil and a
+                    // Hash is common in Rails code, so that costs a lot of coverage.
+                    let monomorphic_ty = summary.as_ref()
+                        .filter(|summary| summary.is_monomorphic())
+                        .map(|summary| Type::from_profiled_type(summary.bucket(0)));
+                    let obj = match monomorphic_ty {
+                        Some(ty) if ty.is_subtype(types::NilClass) =>
+                            fun.push_insn(block, Insn::GuardType { val: hash, guard_type: types::NilClass, state: exit_id, recompile: None }),
+                        Some(ty) if ty.is_subtype(types::HashExact) =>
+                            fun.push_insn(block, Insn::GuardType { val: hash, guard_type: types::HashExact, state: exit_id, recompile: None }),
+                        _ => fun.push_insn(block, Insn::ToHash { val: hash, state: exit_id }),
                     };
                     state.stack_push(obj);
                     state.stack_push(block_val);

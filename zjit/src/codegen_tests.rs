@@ -7234,6 +7234,29 @@ fn test_max_iseq_versions() {
 }
 
 #[test]
+fn test_splatkw_polymorphic_uses_generic_conversion() {
+    // A `**kw` site that sees both nil and a Hash has no single shape to guard, so it
+    // compiles to the generic conversion instead of a side exit that would end the block.
+    assert_snapshot!(inspect("
+        def kw(**kw) = kw
+        def test(h) = [kw(**h), :after]
+        test({a: 1}); test(nil)
+        [test(nil), test({b: 2})]
+    "), @"[[{}, :after], [{b: 2}, :after]]");
+}
+
+#[test]
+fn test_splatkw_polymorphic_calls_to_hash() {
+    assert_snapshot!(inspect("
+        class ToHash; def to_hash = {c: 3}; end
+        def kw(**kw) = kw
+        def test(h) = kw(**h)
+        test({a: 1}); test(nil)
+        [test(ToHash.new), (begin; test(1); rescue TypeError; :type_error; end)]
+    "), @"[{c: 3}, :type_error]");
+}
+
+#[test]
 fn test_optional_arguments_side_exit() {
     assert_snapshot!(inspect("
         def test(a = (def foo = nil)) = a
