@@ -164,6 +164,7 @@ make_counters! {
         block_respecialize_declined_count,
         block_respecialize_giveup_count,
         skipped_native_stack_full,
+        invalidation_recompiles_granted,
 
         // ISEQ payloads (profiles + version lists) ZJIT has allocated, and the
         // subset whose ISEQ the GC has since freed. ZJIT does not free the
