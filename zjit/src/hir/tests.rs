@@ -2989,7 +2989,10 @@ pub(crate) mod hir_build_tests {
           v67:BasicObject = LoadField v36, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
           Jump bb6(v67, v21)
         bb6(v34:BasicObject, v35:BasicObject):
-          SideExit SplatKwNotProfiled
+          v70:NilClass|HashExact = ToHash v20
+          v72:BasicObject = Send v17, &block, :foo, v18, v29, v70, v34 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v72
         ");
     }
 
@@ -4553,7 +4556,7 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
-    fn test_splatkw_unprofiled_side_exits() {
+    fn test_splatkw_unprofiled_converts_generically() {
         eval("
             def foo(**kw, &b) = kw
             def test(**kw, &b) = foo(**kw, &b)
@@ -4618,7 +4621,10 @@ pub(crate) mod hir_build_tests {
           v52:BasicObject = LoadField v21, :VM_ENV_DATA_INDEX_SPECVAL@0x1004
           Jump bb6(v52, v13)
         bb6(v19:BasicObject, v20:BasicObject):
-          SideExit SplatKwNotProfiled
+          v55:NilClass|HashExact = ToHash v12
+          v57:BasicObject = Send v11, &block, :foo, v55, v19 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v57
         ");
     }
 
@@ -4853,7 +4859,7 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
-    fn test_splatkw_polymorphic_side_exits() {
+    fn test_splatkw_polymorphic_converts_generically() {
         set_call_threshold(3);
         eval("
             def foo(a, ...) = a
@@ -4929,12 +4935,15 @@ pub(crate) mod hir_build_tests {
           v67:BasicObject = LoadField v36, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
           Jump bb6(v67, v21)
         bb6(v34:BasicObject, v35:BasicObject):
-          SideExit SplatKwPolymorphic
+          v70:NilClass|HashExact = ToHash v20
+          v72:BasicObject = Send v17, &block, :foo, v18, v29, v70, v34 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v72
         ");
     }
 
     #[test]
-    fn test_splatkw_with_non_hash_side_exits() {
+    fn test_splatkw_with_non_hash_converts_generically() {
         eval("
             def foo(a:) = a
             def test(obj, &block) = foo(**obj, &block)
@@ -5002,7 +5011,10 @@ pub(crate) mod hir_build_tests {
           v52:BasicObject = LoadField v21, :VM_ENV_DATA_INDEX_SPECVAL@0x1004
           Jump bb6(v52, v13)
         bb6(v19:BasicObject, v20:BasicObject):
-          SideExit SplatKwNotNilOrHash
+          v55:NilClass|HashExact = ToHash v12
+          v57:BasicObject = Send v11, &block, :foo, v55, v19 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v57
         ");
     }
 
