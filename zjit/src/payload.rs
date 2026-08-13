@@ -47,7 +47,17 @@ pub struct IseqPayload {
     ///
     /// [`ivar_reprofile_giveup`]: IseqPayload::ivar_reprofile_giveup
     pub block_reprofile_giveup: bool,
+    /// Number of extra versions granted because a PatchPoint invalidation would
+    /// otherwise have left this ISEQ permanently side-exiting. See
+    /// [`crate::codegen::invalidate_iseq_version`].
+    pub invalidation_recompiles: u8,
 }
+
+/// Upper bound on the extra versions [`IseqPayload::invalidation_recompiles`] can grant.
+/// Invalidation is an external event (a constant or method was redefined), not a
+/// mis-speculation, so it should not consume the respecialization budget. We still cap
+/// the total so that an ISEQ whose assumptions keep getting busted cannot recompile forever.
+pub const MAX_INVALIDATION_RECOMPILES: u8 = 8;
 
 /// How many extra versions a single ISEQ may earn for ivar shape respecialization.
 /// Each one strictly adds a shape to a dispatch that was previously falling back, so the
@@ -76,15 +86,18 @@ impl IseqPayload {
             ivar_reprofile_giveup: false,
             block_respecializations: 0,
             block_reprofile_giveup: false,
+            invalidation_recompiles: 0,
         }
     }
 
     /// Number of versions this ISEQ may compile, including any it earned by proving from
-    /// its ivar fallback path that a recompile would specialize a shape it is missing.
+    /// its ivar fallback path that a recompile would specialize a shape it is missing, and
+    /// any granted because a PatchPoint invalidation left a version permanently exiting.
     pub fn version_limit(&self) -> usize {
         crate::codegen::max_iseq_versions()
             + self.ivar_respecializations as usize
             + self.block_respecializations as usize
+            + self.invalidation_recompiles as usize
     }
 
     /// Profile counts are used for compilation policy.
