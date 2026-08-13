@@ -2750,6 +2750,29 @@ struct SetIvarSpec {
     next_shape: ShapeId,
 }
 
+/// How a shape dispatch reacts to a receiver whose shape is not one of the profiled ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeMiss {
+    /// Guard on the profiled shape and side-exit, so the ISEQ can be recompiled around the
+    /// shape it actually sees. Only valid where the profiled shape is a real prediction for
+    /// this program point.
+    SideExit,
+    /// Branch on the profiled shape and let the generic C helper handle everything else. Costs
+    /// a compare and a branch on the fast path, but never leaves JIT code. The miss is worth
+    /// recording so that a later version of the ISEQ can add the shape.
+    CallFallback,
+    /// Same, but the miss must not be recorded. Recording it makes the ISEQ re-profile, which
+    /// throws away the type profile the dispatch arms were built from — a bad trade when the
+    /// profiled shape was never a prediction for this program point in the first place.
+    CallFallbackWithoutReprofile,
+}
+
+impl ShapeMiss {
+    fn calls_fallback(self) -> bool {
+        !matches!(self, ShapeMiss::SideExit)
+    }
+}
+
 impl CompilePolicy {
     fn new(iseq: *const rb_iseq_t) -> Self {
         // When a previous version was invalidated and we've reached the version
@@ -4304,9 +4327,12 @@ impl Function {
     /// opens the door for inlining.
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
-        for block in self.reverse_post_order() {
-            let old_insns = std::mem::take(&mut self.blocks[block.to_usize()].insns);
-            assert!(self.blocks[block.to_usize()].insns.is_empty());
+        for entry_block in self.reverse_post_order() {
+            let old_insns = std::mem::take(&mut self.blocks[entry_block.to_usize()].insns);
+            assert!(self.blocks[entry_block.to_usize()].insns.is_empty());
+            // Rewriting an instruction into a branch splits the block: everything after it,
+            // including the original terminator, is emitted into the join block instead.
+            let mut block = entry_block;
             for insn_id in old_insns {
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
@@ -4574,10 +4600,24 @@ impl Function {
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
 
-                                let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point (see the attr_writer case below), so branch on its shape
+                                // rather than guarding: a receiver of the right class but a
+                                // different shape takes rb_ivar_get instead of side-exiting and
+                                // recompiling the ISEQ around a shape the arm never promised.
+                                let replacement = if profiled_type.flags().is_polymorphic_arm()
+                                    && !profiled_type.shape().is_complex() && !profiled_type.flags().is_immediate() {
+                                    let insn_idx = self.frame_state_insn_idx(state) as u32;
+                                    let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, ShapeMiss::CallFallbackWithoutReprofile)
+                                        .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
+                                    block = join_block;
+                                    result
+                                } else {
+                                    self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                    })
+                                };
                                 self.make_equal_to(insn_id, replacement);
                             } else {
                                 // No shape information, just static class information
@@ -4588,12 +4628,6 @@ impl Function {
                                 self.make_equal_to(insn_id, getivar);
                             }
                         } else if let (false, VM_METHOD_TYPE_ATTRSET, &[val]) = (has_block, def_type, args.as_slice()) {
-                            // A polymorphic-arm profile pins the shape the profiler saw at the
-                            // *original*, unrefined call site. attr_writer speculation adds a
-                            // shape transition keyed on that shape and invalidates the whole ISEQ
-                            // when it misses, which throws away the polymorphic profile that the
-                            // arms were built from. Only ivar reads speculate on an arm's shape.
-                            let profiled_type = profiled_type.filter(|t| !t.flags().is_polymorphic_arm());
                             // Check if we're accessing ivars of a Class or Module object as they require single-ractor mode.
                             // We omit gen_prepare_non_leaf_call on gen_getivar, so it's unsafe to raise for multi-ractor mode.
                             if klass.is_metaclass() && !self.assume_single_ractor_mode(block, state) {
@@ -4604,15 +4638,39 @@ impl Function {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
-                                // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
-                                // operand other than CFP self. Support it with a reprofile strategy that
-                                // profiles the receiver operand even after the send insn has finished profiling.
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
-                                let recompile = None;
-                                self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point: the arm's type test only pins the class, and the shape is
+                                // whatever the profiler happened to see for that class at the
+                                // unrefined call site. Guarding it with a side exit measurably
+                                // pushes the call site megamorphic. Branch on the shape instead and
+                                // let rb_ivar_set handle every other shape, which also gives the
+                                // final version of an ISEQ a fast path it is otherwise denied.
+                                let shape_miss = if profiled_type.flags().is_polymorphic_arm() {
+                                    ShapeMiss::CallFallbackWithoutReprofile
+                                } else {
+                                    ShapeMiss::SideExit
+                                };
+                                match self.prepare_optimized_setivar(id, profiled_type) {
+                                    Ok(spec) if shape_miss.calls_fallback() || self.policy.no_side_exits => {
+                                        let insn_idx = self.frame_state_insn_idx(state) as u32;
+                                        block = self.dispatch_setivar(&[spec], None, block, insn_idx, recv, id, std::ptr::null(), val, state, shape_miss)
+                                            .expect("dispatch_setivar with a spec never side-exits unconditionally");
+                                    }
+                                    Ok(spec) => {
+                                        // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
+                                        // operand other than CFP self. Support it with a reprofile strategy that
+                                        // profiles the receiver operand even after the send insn has finished profiling.
+                                        let recv = self.guard_heap(block, recv, state);
+                                        let shape = self.load_shape(block, recv);
+                                        self.guard_shape(block, shape, profiled_type.shape(), state, None);
+                                        self.emit_optimized_setivar(block, recv, id, val, spec);
+                                    }
+                                    Err(counter) => {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
+                                    }
+                                }
                             } else {
                                 // No shape information, just static class information
                                 self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
@@ -5845,19 +5903,6 @@ impl Function {
             }
             self.push_insn(block, Insn::StoreField { recv: self_val, id: FieldName::shape_id, offset: shape_id_offset, val: shape_id, num_bits: types::CShape.num_bits() });
         }
-    }
-
-    fn try_emit_optimized_setivar(&mut self, block: BlockId, self_val: InsnId, id: ID, val: InsnId, profiled_type: ProfiledType, state: InsnId, recompile: Option<Recompile>) -> Result<(), Counter> {
-        if self.policy.no_side_exits {
-            // On the final version, don't add a shape guard without a fallback.
-            return Err(Counter::setivar_fallback_no_side_exits);
-        }
-        let spec = self.prepare_optimized_setivar(id, profiled_type)?;
-        let self_val = self.guard_heap(block, self_val, state);
-        let shape = self.load_shape(block, self_val);
-        self.guard_shape(block, shape, profiled_type.shape(), state, recompile);
-        self.emit_optimized_setivar(block, self_val, id, val, spec);
-        Ok(())
     }
 
     fn gen_patch_points_for_optimized_ccall(&mut self, block: BlockId, recv_class: VALUE, method_id: ID, cme: *const rb_callable_method_entry_struct, state: InsnId) {
@@ -7733,13 +7778,19 @@ impl Function {
         no_profile_reason: SideExitReason,
         fallback_counter: Counter,
         has_result: bool,
+        shape_miss: ShapeMiss,
         profile_shape: impl Fn(T) -> ShapeId,
         mut emit_optimized: impl FnMut(&mut Function, BlockId, T) -> Option<InsnId>,
         mut emit_fallback: impl FnMut(&mut Function, BlockId) -> Option<InsnId>,
     ) -> Option<(BlockId, Option<InsnId>)> {
+        // The final version of an ISEQ may not speculate at all, whatever the caller asked for.
+        let shape_miss = match shape_miss {
+            ShapeMiss::SideExit if self.policy.no_side_exits => ShapeMiss::CallFallback,
+            shape_miss => shape_miss,
+        };
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
-            if self.policy.no_side_exits {
+            if shape_miss.calls_fallback() {
                 self.count(block, fallback_counter);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
@@ -7750,7 +7801,7 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        if profiles.len() == 1 && !shape_miss.calls_fallback() {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -7772,8 +7823,8 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
-                    // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
+                if shape_miss.calls_fallback() {
+                    // Without a side exit available, make a fallback block and jump to it if the shape doesn't match.
                     let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
                     let fallback_block = self.new_block(insn_idx);
@@ -7782,7 +7833,7 @@ impl Function {
                     let fallback_result = emit_fallback(self, fallback_block);
                     self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
                 } else {
-                    // If the policy allows exits, exit to the interpreter if the shape doesn't match.
+                    // Otherwise exit to the interpreter if the shape doesn't match.
                     self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile));
                     // TODO(max): Don't make a new block in this case
                     self.push_insn(block, Insn::Jump(edge(optimized_block)));
@@ -7812,6 +7863,7 @@ impl Function {
         id: ID,
         ic: *const iseq_inline_iv_cache_entry,
         exit_id: InsnId,
+        shape_miss: ShapeMiss,
     ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
@@ -7822,6 +7874,7 @@ impl Function {
             SideExitReason::NoProfileGetIvar,
             Counter::getivar_fallback_no_side_exits,
             true,
+            shape_miss,
             |profiled_type| profiled_type.shape(),
             |fun, block, profiled_type| Some(fun.load_ivar(block, self_param, profiled_type, id)),
             |fun, block| Some(fun.push_insn(block, Insn::GetIvar { self_val: self_param, id, ic, state: exit_id })),
@@ -7842,6 +7895,7 @@ impl Function {
         ic: *const iseq_inline_iv_cache_entry,
         val: InsnId,
         exit_id: InsnId,
+        shape_miss: ShapeMiss,
     ) -> Option<BlockId> {
         if specs.is_empty() {
             if let Some(counter) = unoptimized_reason {
@@ -7859,6 +7913,7 @@ impl Function {
             SideExitReason::NoProfileSetIvar,
             Counter::setivar_fallback_no_side_exits,
             false,
+            shape_miss,
             |spec| spec.profiled_type.shape(),
             |fun, block, spec| {
                 fun.emit_optimized_setivar(block, self_param, id, val, spec);
@@ -10304,6 +10359,7 @@ fn add_iseq_to_hir(
                         id,
                         ic,
                         exit_id,
+                        ShapeMiss::SideExit,
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
@@ -10361,6 +10417,7 @@ fn add_iseq_to_hir(
                         ic,
                         val,
                         exit_id,
+                        ShapeMiss::SideExit,
                     ) else {
                         // Side-exiting unconditionally; end the block.
                         break;

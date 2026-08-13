@@ -7981,6 +7981,108 @@ fn test_uminus_on_integer_is_a_call() {
 }
 
 #[test]
+fn test_attr_writer_in_polymorphic_arm() {
+    // Each arm of a polymorphic dispatch branches on the profiled shape and calls
+    // rb_ivar_set only when it does not match, so a shape transition still runs inline.
+    eval("
+        class ArmWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class ArmWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def arm_set(o, v) = o.x = v
+        def entry
+          (1..6).map { |i| o = (i.even? ? ArmWriterA : ArmWriterB).new(i); arm_set(o, i); o.x }
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[1, 2, 3, 4, 5, 6]");
+}
+
+#[test]
+fn test_attr_writer_shape_miss_calls_the_fallback() {
+    // A receiver carrying an extra ivar has a shape the branch does not match; it must
+    // take the rb_ivar_set fallback rather than side-exiting.
+    eval("
+        class MissWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class MissWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def miss_set(o, v) = o.x = v
+        def entry(o)
+          miss_set(o, 42)
+          miss_set(MissWriterB.new(2), 1)
+          o.instance_variable_get(:@x)
+        end
+        def odd_shaped
+          o = MissWriterA.new(1)
+          o.instance_variable_set(:@extra, 1)
+          o
+        end
+        5.times { entry(MissWriterA.new(1)); odd_shaped }
+    ");
+    assert_snapshot!(assert_compiles("[entry(MissWriterA.new(1)), entry(odd_shaped)]"), @"[42, 42]");
+}
+
+#[test]
+fn test_attr_writer_on_frozen_receiver_raises() {
+    eval("
+        class FrozenWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class FrozenWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def frozen_set(o, v) = o.x = v
+        def entry(freeze)
+          o = FrozenWriterA.new(1)
+          o.freeze if freeze
+          frozen_set(o, 1)
+          frozen_set(FrozenWriterB.new(2), 1)
+          :written
+        rescue FrozenError
+          :frozen
+        end
+        5.times { entry(false) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[entry(false), entry(true)]"), @"[:written, :frozen]");
+}
+
+#[test]
+fn test_attr_writer_on_too_complex_shape() {
+    eval("
+        class ComplexWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class ComplexWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def complex_set(o, v) = o.x = v
+        COMPLEX_RECEIVER = ComplexWriterA.new(0)
+        2000.times { |i| COMPLEX_RECEIVER.instance_variable_set(:\"@c#{i}\", i) }
+        def entry
+          complex_set(ComplexWriterB.new(1), 1)
+          complex_set(COMPLEX_RECEIVER, 7)
+          COMPLEX_RECEIVER.x
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"7");
+}
+
+#[test]
+fn test_attr_writer_survives_gc_stress() {
+    // The inlined store has to run the write barrier, otherwise a heap value written
+    // through it is collected out from under the object.
+    eval("
+        class StressWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class StressWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def stress_set(o, v) = o.x = v
+        def entry
+          a = StressWriterA.new(1)
+          b = StressWriterB.new(2)
+          stress_set(a, [1, 2, 3])
+          stress_set(b, 'four')
+          [a.x, b.x]
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        GC.stress = true
+        result = entry
+        GC.stress = false
+        result
+    "), @r#"[[1, 2, 3], "four"]"#);
+}
+
+#[test]
 fn test_send_with_profiled_method_name() {
     eval("
         class SendProfiled
