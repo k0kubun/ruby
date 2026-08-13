@@ -4717,7 +4717,7 @@ impl Function {
     }
 
     /// Validate and normalize SendDirect arguments without emitting HIR.
-    fn build_send_direct_args(&self, args: &[InsnId], ci: *const rb_callinfo, iseq: IseqPtr, has_block: bool) -> Result<SendDirectCall, SendDirectFailure> {
+    fn build_send_direct_args(&self, args: &[InsnId], ci: *const rb_callinfo, iseq: IseqPtr, has_block: bool, rest_prepacked: bool) -> Result<SendDirectCall, SendDirectFailure> {
         can_direct_send(iseq, ci, args, has_block)?;
         // A forwardable callee takes the caller's arguments verbatim: no reordering, no
         // synthesized keyword Hash, no rest packing. `gen_send_iseq_direct` copies them into
@@ -4732,8 +4732,13 @@ impl Function {
         let args = args.iter().copied().map(SendDirectArg::Existing).collect();
         let (args, kw_bits) = Self::plan_send_direct_keyword_arguments(args, ci, iseq)
             .map_err(SendDirectFailure::new)?;
-        let (args, jit_entry_idx) = Self::plan_send_direct_rest_parameter(args, iseq)
-            .map_err(SendDirectFailure::new)?;
+        // try_forward_splat_to_rest already put the rest Array where the callee expects it.
+        let (args, jit_entry_idx) = if rest_prepacked {
+            (args, 0)
+        } else {
+            Self::plan_send_direct_rest_parameter(args, iseq)
+                .map_err(SendDirectFailure::new)?
+        };
 
         Ok(SendDirectCall {
             args,
@@ -5224,7 +5229,88 @@ impl Function {
         if 0 != ci_flags & VM_CALL_FORWARDING     { self.count(block, complex_arg_pass_caller_forwarding); }
     }
 
-    /// Try to turn `foo(a, *b)` into `foo(a, b[0], ..., b[n-1])` using the splat length the
+    /// Try to turn `foo(a, *b)` into a direct call by handing `b` straight to `foo`'s rest
+    /// parameter, for the case where the splat lands exactly on that parameter:
+    ///
+    ///     def foo(x, *rest) = ...
+    ///     foo(a, *b)                 # rest is b's elements, in order, and nothing else
+    ///
+    /// `setup_parameters_complex` flattens the splat onto the stack and then packs the same
+    /// elements straight back into a fresh Array for `rest`, so the whole round trip is
+    /// `rest = b.dup` no matter how long `b` is. That is what makes this worth doing separately
+    /// from [`Self::try_expand_splat_args`]: expanding needs a length to bake in, so a call site
+    /// whose splat length varies -- a filter pipeline forwarding `*args` through two frames, say
+    /// -- can never take it, while forwarding does not care.
+    ///
+    /// Returns arguments already in `SendDirect` shape (`[leads..., rest array]`), so the caller
+    /// must skip the repacking [`Self::setup_rest_parameter`] would otherwise do.
+    fn try_forward_splat_to_rest(&mut self, block: BlockId, args: &[InsnId], iseq: IseqPtr, state: InsnId) -> Option<Vec<InsnId>> {
+        let &splat = args.last()?;
+        let params = unsafe { iseq.params() };
+        // Only the shape where the splat *is* the rest parameter: any optional, post, or keyword
+        // parameter would take some of the splatted elements for itself, which needs the length.
+        if params.flags.has_rest() == 0
+            || params.opt_num != 0
+            || params.post_num != 0
+            || callee_kw_num(iseq) != 0
+            || params.flags.has_kw() != 0
+            || params.flags.has_kwrest() != 0
+            || params.flags.has_block() != 0
+            || params.flags.forwardable() != 0
+            || params.flags.ruby2_keywords() != 0
+        {
+            return None;
+        }
+        // The caller's own positional arguments have to at least fill the leading parameters;
+        // otherwise the splat's first elements are consumed by them and the split depends on the
+        // length again. Anything the caller passes past the leads belongs to the rest parameter,
+        // ahead of the splatted elements.
+        let lead_num = params.lead_num as usize;
+        let positional_argc = args.len() - 1;
+        if positional_argc < lead_num {
+            return None;
+        }
+        // Bound the code a single call site grows by, the way the expansion path does.
+        if positional_argc - lead_num > MAX_SPLAT_EXPANSION {
+            return None;
+        }
+        // The Array guard below has no recompile behind it, so a call site that splats something
+        // else -- an Array subclass, or a `to_a` conversion -- would side-exit on every call
+        // instead of taking the dynamic send it takes today. Only rewrite what was profiled as an
+        // Array. The expansion path gets this from its length profile, which is only recorded for
+        // Arrays.
+        if !self.likely_a(splat, types::ArrayExact, state) {
+            return None;
+        }
+
+        let array = self.coerce_to(block, splat, types::ArrayExact, state);
+        // A ruby2_keywords-flagged Hash last in the splat makes CALLER_SETUP_ARG reinterpret it
+        // as keywords rather than leave it in the rest array. The expansion path guards the
+        // element it read out; here the element has to be read just for the guard, and reading
+        // past the end of an empty array is nil, which the guard passes.
+        let length = self.push_insn(block, Insn::ArrayLength { array });
+        let last_index = self.push_insn(block, Insn::Const { val: Const::CInt64(-1) });
+        let last_index = self.push_insn(block, Insn::AdjustBounds { index: last_index, length });
+        let last = self.push_insn(block, Insn::ArrayArefOrNil { array, index: last_index, length });
+        self.push_insn(block, Insn::GuardNotRuby2KeywordsHash { val: last, state, recompile: Some(Recompile) });
+
+        // The rest parameter is a fresh Array the callee may mutate, and the splat operand is
+        // whatever expression produced it, so it has to be copied. Positional arguments past the
+        // leading parameters go in front of the splatted elements, which is what the interpreter's
+        // flatten-then-repack does.
+        let extras = &args[lead_num..args.len() - 1];
+        let rest = if extras.is_empty() {
+            self.push_insn(block, Insn::ArrayDup { val: array, state })
+        } else {
+            let rest = self.push_insn(block, Insn::NewArray { elements: extras.to_vec(), state });
+            self.push_insn(block, Insn::ArrayExtend { left: rest, right: array, state });
+            rest
+        };
+        let mut forwarded = args[..lead_num].to_vec();
+        forwarded.push(rest);
+        Some(forwarded)
+    }
+
     /// Try to turn `foo(a, *b)` into `foo(a, b[0], ..., b[n-1])` using the splat length the
     /// interpreter observed at this call site. Returns the new argument list, with guards
     /// emitted into `block`, or None when there is no usable profile.
@@ -5666,14 +5752,30 @@ impl Function {
                         // from the call info rather than from the HIR argument list.
                         const SPLAT_EXPANSION_BLOCKERS: u32 = VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG
                             | VM_CALL_FORWARDING | VM_CALL_TAILCALL | VM_CALL_OPT_SEND | VM_CALL_SUPER | VM_CALL_ZSUPER;
+                        // Set when the splat was handed straight to the callee's rest parameter,
+                        // which leaves `args` already in SendDirect shape.
+                        let mut rest_prepacked = false;
                         if flags_for_check & VM_CALL_ARGS_SPLAT != 0
                             && flags_for_check & SPLAT_EXPANSION_BLOCKERS == 0
                             && matches!(def_type, VM_METHOD_TYPE_ISEQ | VM_METHOD_TYPE_BMETHOD)
                         {
-                            if let Some(expanded) = self.try_expand_splat_args(block, &args, state) {
-                                let new_state = self.frame_state(send_frame_state).with_replaced_args(&expanded, args.len());
+                            // Expanding is the better shape when the length is predictable: the
+                            // callee's parameters get the elements in registers with no Array to
+                            // allocate. Forwarding is the fallback for a varying length.
+                            let rewritten = self.try_expand_splat_args(block, &args, state)
+                                .or_else(|| {
+                                    // Only the ISEQ path below consumes prepacked arguments; a
+                                    // bmethod dispatches through the proc's own parameter setup.
+                                    if def_type != VM_METHOD_TYPE_ISEQ { return None; }
+                                    let callee_iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+                                    let forwarded = self.try_forward_splat_to_rest(block, &args, callee_iseq, state);
+                                    rest_prepacked = forwarded.is_some();
+                                    forwarded
+                                });
+                            if let Some(rewritten) = rewritten {
+                                let new_state = self.frame_state(send_frame_state).with_replaced_args(&rewritten, args.len());
                                 send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
-                                args = expanded;
+                                args = rewritten;
                                 flags_for_check &= !VM_CALL_ARGS_SPLAT;
                             }
                         }
@@ -5688,7 +5790,7 @@ impl Function {
                             // Only specialize positional-positional calls
                             // TODO(max): Handle other kinds of parameter passing
                             let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
-                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block)
+                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block, rest_prepacked)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -5725,7 +5827,7 @@ impl Function {
                             let capture = unsafe { proc_block.as_.captured.as_ref() };
                             let iseq = unsafe { *capture.code.iseq.as_ref() };
 
-                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block)
+                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block, rest_prepacked)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -6281,7 +6383,7 @@ impl Function {
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
                             // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
-                            let Ok(call) = self.build_send_direct_args(&args, ci, super_iseq, false)
+                            let Ok(call) = self.build_send_direct_args(&args, ci, super_iseq, false, false)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
