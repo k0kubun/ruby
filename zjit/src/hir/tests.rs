@@ -4034,7 +4034,25 @@ pub(crate) mod hir_build_tests {
           v34:NilClass = Const Value(nil)
           Jump bb6(v34, v10)
         bb6(v16:BasicObject, v17:BasicObject):
-          v38:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Uncategorized(send)
+          v39:CBool = HasType v16, NilClass
+          CondBranch v39, bb12(), bb13()
+        bb12():
+          v41:NilClass = RefineType v16, NilClass
+          v43:CBool[true] = HasType v14, Fixnum
+          CondBranch v43, bb15(), bb16()
+        bb15():
+          v46:Fixnum[0] = RefineType v14, Fixnum
+          v47:BasicObject = Send v46, &block, :then, v41 # SendFallbackReason: Uncategorized(send)
+          Jump bb14(v47)
+        bb16():
+          v49 = Send v14, &block, :then, v41 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb14(v49)
+        bb14(v42:BasicObject):
+          Jump bb11(v42)
+        bb13():
+          v52:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb11(v52)
+        bb11(v38:BasicObject):
           CheckInterrupts
           Return v38
         bb10():
@@ -4104,7 +4122,25 @@ pub(crate) mod hir_build_tests {
           v41:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
           Jump bb6(v41, v10)
         bb6(v16:BasicObject, v17:BasicObject):
-          v45:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Uncategorized(send)
+          v46:CBool = HasType v16, NilClass
+          CondBranch v46, bb15(), bb16()
+        bb15():
+          v48:NilClass = RefineType v16, NilClass
+          v50:CBool[true] = HasType v14, Fixnum
+          CondBranch v50, bb18(), bb19()
+        bb18():
+          v53:Fixnum[0] = RefineType v14, Fixnum
+          v54:BasicObject = Send v53, &block, :then, v48 # SendFallbackReason: Uncategorized(send)
+          Jump bb17(v54)
+        bb19():
+          v56 = Send v14, &block, :then, v48 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb17(v56)
+        bb17(v49:BasicObject):
+          Jump bb14(v49)
+        bb16():
+          v59:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb14(v59)
+        bb14(v45:BasicObject):
           CheckInterrupts
           Return v45
         bb13():

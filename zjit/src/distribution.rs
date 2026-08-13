@@ -85,6 +85,15 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
         Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
     }
 
+    /// Build a summary that claims exactly one type was seen. Used when a polymorphic site has
+    /// already been split into per-type branches: within a branch, the receiver is known to have
+    /// one specific profiled type, so downstream specialization can treat it as monomorphic.
+    pub fn monomorphic(value: T) -> Self {
+        let mut buckets = [Default::default(); N];
+        buckets[0] = value;
+        Self { kind: DistributionKind::Monomorphic, buckets }
+    }
+
     pub fn new(dist: &Distribution<T, N>) -> Self {
         #[cfg(debug_assertions)]
         {

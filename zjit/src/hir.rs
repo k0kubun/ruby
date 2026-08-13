@@ -2814,6 +2814,15 @@ pub struct Function {
     /// fulfilling `(0..=opt_num)` optional parameters.
     jit_entry_blocks: Vec<BlockId>,
     profiles: Option<ProfileOracle>,
+    /// Profiled types (class *and* shape) of values that have been guarded or refined to the
+    /// class of that profiled type. `Type` only records the class, so this keeps the shape
+    /// reachable for later specializations of the same value.
+    ///
+    /// This matters most for inlined callees: an ISEQ only starts profiling once the interpreter
+    /// enters it `rb_zjit_profile_threshold` times, so a method that is only ever reached from
+    /// JIT code has no profile of its own. When it is inlined, its `self` is the caller's guarded
+    /// receiver, and this map is the only place its shape survives.
+    guarded_profiled_types: HashMap<InsnId, ProfiledType>,
     /// Rough estimate for the number of (actually executable) instructions in the function. Does
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
@@ -2966,6 +2975,7 @@ impl Function {
             jit_entry_blocks: vec![],
             param_types: vec![],
             profiles: None,
+            guarded_profiled_types: HashMap::default(),
             num_instructions: 0,
         }
     }
@@ -3932,6 +3942,15 @@ impl Function {
     fn resolve_receiver_type(&self, recv: InsnId, recv_type: Type, state: InsnId) -> ReceiverTypeResolution {
         match self.resolve_receiver_type_from_profile(recv, state) {
             ReceiverTypeResolution::NoProfile => {
+                // An earlier guard may have narrowed this value to a profiled type. That profile
+                // still carries the shape, which `Type` does not, so prefer it over the static
+                // class: it is what lets attr_reader calls in inlined callees (whose own ISEQ was
+                // never profiled) load the ivar directly instead of calling rb_ivar_get.
+                if let Some(profiled_type) = self.recorded_profiled_type(recv) {
+                    if recv_type.is_subtype(Type::from_profiled_type(profiled_type)) {
+                        return ReceiverTypeResolution::Monomorphic { profiled_type };
+                    }
+                }
                 // Use known type information as a fallback because it doesn't have shape
                 // information (and we can generally eliminate duplicate guards).
                 if let Some(class) = recv_type.runtime_exact_ruby_class() {
@@ -4062,6 +4081,43 @@ impl Function {
         let result = self.push_insn(block, Insn::GuardType { val, guard_type, state, recompile: Some(recompile) });
         self.insn_types[result.to_usize()] = self.infer_type(result);
         result
+    }
+
+    /// Guard `val` against the class of `profiled_type` and remember the full profiled type
+    /// (including its shape) for the guarded value. See [`Function::guarded_profiled_types`].
+    fn guard_profiled_type(&mut self, block: BlockId, val: InsnId, profiled_type: ProfiledType, state: InsnId) -> InsnId {
+        let result = self.guard_type_recompile(block, val, Type::from_profiled_type(profiled_type), state, Recompile);
+        self.record_profiled_type(result, profiled_type);
+        result
+    }
+
+    /// Remember that `val` was narrowed to `profiled_type`'s class, so later passes can recover
+    /// the shape that `Type` cannot carry.
+    fn record_profiled_type(&mut self, val: InsnId, profiled_type: ProfiledType) {
+        if !profiled_type.is_empty() {
+            self.guarded_profiled_types.insert(val, profiled_type);
+        }
+    }
+
+    /// Recover the profiled type recorded for `val` or for any value it was guarded/refined from.
+    /// Guards only narrow the class, so walking the guard chain is safe: every link describes the
+    /// same run-time value.
+    fn recorded_profiled_type(&self, val: InsnId) -> Option<ProfiledType> {
+        let mut insn = val;
+        loop {
+            let id = self.union_find.borrow().find_const(insn);
+            if let Some(&profiled_type) = self.guarded_profiled_types.get(&id) {
+                return Some(profiled_type);
+            }
+            match self.insns[id.to_usize()] {
+                Insn::GuardType { val, .. }
+                | Insn::GuardBitEquals { val, .. }
+                | Insn::GuardAnyBitSet { val, .. }
+                | Insn::GuardNoBitsSet { val, .. }
+                | Insn::RefineType { val, .. } => insn = val,
+                _ => return None,
+            }
+        }
     }
 
     fn count_complex_call_features(&mut self, block: BlockId, ci_flags: c_uint, state: InsnId) {
@@ -4494,7 +4550,7 @@ impl Function {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
 
                             if let Some(profiled_type) = profiled_type {
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_profiled_type(block, recv, profiled_type, state);
                             }
 
                             let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None })));
@@ -4516,7 +4572,7 @@ impl Function {
 
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_profiled_type(block, recv, profiled_type, state);
 
                                 let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
                                     self.count(block, counter);
@@ -4545,7 +4601,7 @@ impl Function {
                                 // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
                                 // operand other than CFP self. Support it with a reprofile strategy that
                                 // profiles the receiver operand even after the send insn has finished profiling.
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_profiled_type(block, recv, profiled_type, state);
                                 let recompile = None;
                                 self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
                                     self.count(block, counter);
@@ -4572,7 +4628,7 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
-                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                        recv = self.guard_profiled_type(block, recv, profiled_type, state);
                                     }
                                     let kw_splat = flags & VM_CALL_KW_SPLAT != 0;
                                     let invoke_proc = self.push_insn(block, Insn::InvokeProc { recv, args: args.clone(), state, kw_splat });
@@ -4609,7 +4665,7 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
-                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                        recv = self.guard_profiled_type(block, recv, profiled_type, state);
                                     }
                                     // All structs from the same Struct class should have the same
                                     // length. So if our recv is embedded all runtime
@@ -4727,7 +4783,7 @@ impl Function {
 
                                         if let Some(profiled_type) = profiled_type {
                                             // Guard receiver class
-                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                            recv = fun.guard_profiled_type(block, recv, profiled_type, state);
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
@@ -4794,7 +4850,7 @@ impl Function {
 
                                         if let Some(profiled_type) = profiled_type {
                                             // Guard receiver class
-                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                            recv = fun.guard_profiled_type(block, recv, profiled_type, state);
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
@@ -8264,13 +8320,21 @@ impl ProfileOracle {
     /// refined arm gets a fresh Snapshot: the receiver must resolve from its refined type rather
     /// than the polymorphic profile, but the other operands' profiles should remain visible so
     /// argument-profile-dependent specializations (e.g. Array#[]) still apply.
-    fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function) {
+    ///
+    /// When `recv_profile` is `Some`, the receiver's entry is replaced with a monomorphic summary
+    /// of that profiled type instead of being dropped. The refined type only carries the class,
+    /// while the profiled type also carries the shape, which specializations such as attr_reader
+    /// ivar loads need to emit a direct field access instead of a `rb_ivar_get` call.
+    fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function, recv_profile: Option<ProfiledType>) {
         let Some(entries) = self.types.get(&src) else { return };
         let exclude = fun.chase_insn(exclude);
-        let filtered: Vec<_> = entries.iter()
+        let mut filtered: Vec<_> = entries.iter()
             .filter(|(insn, _)| fun.chase_insn(*insn) != exclude)
             .cloned()
             .collect();
+        if let Some(profiled_type) = recv_profile {
+            filtered.push((exclude, TypeDistributionSummary::monomorphic(profiled_type)));
+        }
         if !filtered.is_empty() {
             self.types.insert(dst, filtered);
         }
@@ -8331,6 +8395,89 @@ struct AddIseqResult {
     profiles: ProfileOracle,
 }
 
+/// Emit a receiver-type-specialized dispatch for a send: one `HasType` branch per profiled
+/// receiver type, each with its own `Send` that `type_specialize` can turn into a direct call,
+/// plus a dynamic-send fallthrough. All branches join on a single block parameter.
+///
+/// Returns the block to continue compiling in and the joined result, or `None` when the receiver
+/// is not polymorphic, in which case the caller should emit a single `Send`.
+fn emit_polymorphic_send(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    mut block: BlockId,
+    insn_idx: u32,
+    exit_id: InsnId,
+    exit_state: &FrameState,
+    cd: *const rb_call_data,
+    recv: InsnId,
+    args: &[InsnId],
+    block_handler: Option<BlockHandler>,
+    opcode: u32,
+    branch_monomorphic: bool,
+) -> Option<(BlockId, InsnId)> {
+    // A monomorphic profile normally becomes a GuardType, which side-exits when the profile turns
+    // out to be wrong. `branch_monomorphic` asks for a branch instead: callers use it where the
+    // alternative is a dynamic send anyway, so a missed branch is no worse than not specializing,
+    // whereas a failed guard is much worse.
+    let summary = if branch_monomorphic {
+        let summary = fun.profile_summary(profiles, recv, exit_id);
+        if !(summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
+            return None;
+        }
+        summary
+    } else {
+        fun.polymorphic_summary(profiles, recv, exit_id)?
+    };
+    let join_block = fun.new_block(insn_idx);
+    let join_param = fun.push_insn(join_block, Insn::Param);
+    // Dedup by expected type so immediate/heap variants
+    // under the same Ruby class can still get separate branches.
+    let mut seen_types = Vec::with_capacity(summary.buckets().len());
+    for &profiled_type in summary.buckets() {
+        if profiled_type.is_empty() { break; }
+        let expected = Type::from_profiled_type(profiled_type);
+        if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
+            continue;
+        }
+        seen_types.push(expected);
+        // The branch only tests the class, so the profiled shape is only valid inside it when no
+        // other bucket shares this class. Otherwise objects with the sibling shape also reach
+        // this branch.
+        let recv_profile = summary.buckets().iter()
+            .filter(|other| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
+            .count() == 1;
+        let recv_profile = recv_profile.then_some(profiled_type);
+        let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
+        let iftrue_block = fun.new_block(insn_idx);
+        let fall_through = fun.new_block(insn_idx);
+        fun.push_insn(block, Insn::CondBranch {
+            val: has_type,
+            if_true: BranchEdge { target: iftrue_block, args: vec![] },
+            if_false: BranchEdge { target: fall_through, args: vec![] }
+        });
+        block = fall_through;
+        // Take a fresh Snapshot rather than reusing exit_id so type specialization resolves the
+        // receiver from this branch's profile instead of the polymorphic one keyed at exit_id.
+        let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+        // Keep the other operands' profile entries visible at the fresh Snapshot so the
+        // specialized send can still see argument profiles (e.g. Array#[] needs a Fixnum-profiled
+        // index to be inlined). The receiver's polymorphic entry is replaced by the single
+        // profiled type this branch selects, so specializations that need the shape (attr_reader
+        // ivar loads) can still use it.
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun, recv_profile);
+        let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
+        if let Some(profiled_type) = recv_profile {
+            fun.record_profiled_type(refined_recv, profiled_type);
+        }
+        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.to_vec(), state: snapshot, reason: Uncategorized(opcode.into()) });
+        fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    }
+    // In the fallthrough case, do a generic interpreter send and then join.
+    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args: args.to_vec(), state: exit_id, reason: SendPolymorphicFallback });
+    fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    Some((join_block, join_param))
+}
+
 /// Compile ISEQ into High-level IR
 pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     if !ZJITState::can_compile_iseq(iseq) {
@@ -8375,6 +8522,11 @@ fn add_iseq_to_hir(
 ) -> Result<AddIseqResult, ParseError> {
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
+
+    // In a final version there are no recompiles left, so a receiver guard that turns out to be
+    // wrong side-exits on every call forever. Branch on the type instead: a missed branch costs a
+    // dynamic send, which is what the site would have done without the speculation anyway.
+    let branch_monomorphic_sends = fun.policy.no_side_exits;
 
     // Build the initial FrameState for a block being translated. In inlined
     // mode it carries the caller's post-send Snapshot and this frame's depth;
@@ -9718,50 +9870,12 @@ fn add_iseq_to_hir(
                     let args = state.stack_pop_n(argc as usize)?;
                     let recv = state.stack_pop()?;
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
-                        let join_block = fun.new_block(insn_idx);
-                        let join_param = fun.push_insn(join_block, Insn::Param);
-                        // Dedup by expected type so immediate/heap variants
-                        // under the same Ruby class can still get separate branches.
-                        let mut seen_types = Vec::with_capacity(summary.buckets().len());
-                        for &profiled_type in summary.buckets() {
-                            if profiled_type.is_empty() { break; }
-                            let expected = Type::from_profiled_type(profiled_type);
-                            if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
-                                continue;
-                            }
-                            seen_types.push(expected);
-                            let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
-                            let iftrue_block = fun.new_block(insn_idx);
-                            let fall_through = fun.new_block(insn_idx);
-                            fun.push_insn(block, Insn::CondBranch {
-                                val: has_type,
-                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
-                                if_false: BranchEdge { target: fall_through, args: vec![] }
-                            });
-                            block = fall_through;
-                            // Take a fresh Snapshot rather than
-                            // reusing exit_id so type specialization resolves the receiver from
-                            // its refined, exact type instead of the polymorphic profile that is
-                            // keyed at exit_id.
-                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
-                            // Keep the other operands' profile entries visible at the fresh
-                            // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun);
-                            let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-                            let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
-                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        }
-                        // In the fallthrough case, do a generic interpreter send and then join.
-                        let reason = SendPolymorphicFallback;
-                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, state: exit_id, reason });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        state.stack_push(join_param);
-                        // Continue compilation from the join block at the next instruction.
-                        block = join_block;
+                    if let Some((new_block, result)) = emit_polymorphic_send(
+                        fun, &mut profiles, block, insn_idx, exit_id, &exit_state,
+                        cd, recv, &args, None, opcode, branch_monomorphic_sends,
+                    ) {
+                        block = new_block;
+                        state.stack_push(result);
                     } else {
                         // Maybe monomorphic; handled in type_specialize
                         let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, state: exit_id, reason: Uncategorized(opcode.into()) });
@@ -9794,8 +9908,73 @@ fn add_iseq_to_hir(
                     } else {
                         None
                     };
-                    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode.into()) });
-                    state.stack_push(send);
+                    // A block argument that is nil at run time is stripped by type_specialize,
+                    // which is what lets `bar(&block)` become a direct send. Anything else keeps
+                    // the send dynamic, so only branch on the receiver's type when the block
+                    // argument has a chance of being nil.
+                    let block_arg_summary = if block_arg {
+                        args.last().map(|&insn| fun.profile_summary(&profiles, insn, exit_id))
+                    } else {
+                        None
+                    };
+                    let block_arg_can_be_nil = match &block_arg_summary {
+                        None => true,
+                        Some(summary) => summary.buckets().iter().any(|ty| !ty.is_empty() && ty.is_nil()),
+                    };
+                    // `def foo(&block) = bar(&block)` forwarding sites see both nil and non-nil
+                    // block arguments. type_specialize can only turn `bar(&block)` into a direct
+                    // send when it can prove the block argument is nil, so a site that sometimes
+                    // receives a block makes every call dynamic. Branch on nil instead so the
+                    // common no-block case still gets a direct send.
+                    let split_nil_block_arg = blockiseq.is_null() && block_arg_can_be_nil
+                        && block_arg_summary.as_ref().is_some_and(|summary| !summary.is_monomorphic());
+                    // Literal-block sends are left alone: they need reload_locals_modified_by_block
+                    // after the call, which the join-block structure would complicate.
+                    let dispatch_on_recv = blockiseq.is_null() && block_arg_can_be_nil;
+                    if split_nil_block_arg {
+                        let block_arg_insn = *args.last().unwrap();
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        let nil_block = fun.new_block(insn_idx);
+                        let other_block = fun.new_block(insn_idx);
+                        let is_nil = fun.push_insn(block, Insn::HasType { val: block_arg_insn, expected: types::NilClass });
+                        fun.push_insn(block, Insn::CondBranch {
+                            val: is_nil,
+                            if_true: BranchEdge { target: nil_block, args: vec![] },
+                            if_false: BranchEdge { target: other_block, args: vec![] },
+                        });
+
+                        // Nil branch: refine the block argument so type_specialize sees it as
+                        // statically nil, strips it, and emits a direct send.
+                        let mut nil_args = args.clone();
+                        *nil_args.last_mut().unwrap() = fun.push_insn(nil_block, Insn::RefineType { val: block_arg_insn, new_type: types::NilClass });
+                        let (nil_block, nil_send) = match emit_polymorphic_send(
+                            fun, &mut profiles, nil_block, insn_idx, exit_id, &exit_state,
+                            cd, recv, &nil_args, block_handler, opcode, true,
+                        ) {
+                            Some(result) => result,
+                            None => {
+                                let send = fun.push_insn(nil_block, Insn::Send { recv, cd, block: block_handler, args: nil_args, state: exit_id, reason: Uncategorized(opcode.into()) });
+                                (nil_block, send)
+                            }
+                        };
+                        fun.push_insn(nil_block, Insn::Jump(BranchEdge { target: join_block, args: vec![nil_send] }));
+
+                        let other_send = fun.push_insn(other_block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: SendBlockArgNotNil });
+                        fun.push_insn(other_block, Insn::Jump(BranchEdge { target: join_block, args: vec![other_send] }));
+
+                        block = join_block;
+                        state.stack_push(join_param);
+                    } else if let Some((new_block, result)) = dispatch_on_recv.then(|| emit_polymorphic_send(
+                        fun, &mut profiles, block, insn_idx, exit_id, &exit_state,
+                        cd, recv, &args, block_handler, opcode, branch_monomorphic_sends,
+                    )).flatten() {
+                        block = new_block;
+                        state.stack_push(result);
+                    } else {
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode.into()) });
+                        state.stack_push(send);
+                    }
 
                     if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {
                         // Reload locals that may have been modified by the blockiseq.
