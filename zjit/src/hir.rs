@@ -6551,7 +6551,21 @@ impl Function {
             return false;
         }
         let lead_num = unsafe { rb_get_iseq_body_param_lead_num(blockiseq) } as usize;
-        block_call_inlinable_iseq(blockiseq, lead_num).is_ok()
+        if block_call_inlinable_iseq(blockiseq, lead_num).is_err() {
+            return false;
+        }
+        // A block that can `throw` is the one case where inlining the iterator can cost more
+        // than the dispatch saves. The throw longjmps past every native frame, and the frame it
+        // unwinds into resumes at a mid-ISEQ PC that the compiled exception entries have to
+        // cover for execution to get back into JIT code -- with an inlined iterator body in
+        // the way there are more such PCs and the dispatch misses more of them, so the frame
+        // and its callers run interpreted from there on. On liquid-render, which throws half a
+        // million times per run, extending the relaxation to these blocks traded 940K
+        // `rb_vm_invokeblock()` calls for 99K failed re-entries and came out 3% behind.
+        //
+        // [`Self::inlining_unlocks_block_return`] is the right answer for those blocks: it
+        // takes the ones whose `throw` inlining can *erase*, so no unwind happens at all.
+        !crate::codegen::block_iseq_may_throw(blockiseq)
     }
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
