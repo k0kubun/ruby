@@ -3062,7 +3062,7 @@ fn gen_send_chain(
         // exact type, and resolve_receiver_type prefers profiles over types.
         profiles.copy_entries_except(exit_id, snapshot, recv, fun);
         let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.clone(), state: snapshot, reason: Uncategorized(opcode) });
+        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
         fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
     }
     // In the fallthrough case, do a generic interpreter send and then join.
@@ -10493,7 +10493,7 @@ fn add_iseq_to_hir(
                         // the local reload below covers every arm of the chain.
                         block = join_block;
                     } else {
-                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode) });
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, state: exit_id, reason: Uncategorized(opcode.into()) });
                         state.stack_push(send);
                     }
 
@@ -10767,7 +10767,7 @@ fn add_iseq_to_hir(
                             let covered = summary.coverage(|_, profiled_type| {
                                 !profiled_type.is_empty()
                                     && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
-                                    && polymorphic_iseqs.contains(&profiled_type.class().as_iseq())
+                                    && polymorphic_iseqs.iter().any(|&(seen, _)| seen == profiled_type.class().as_iseq())
                             });
                             if covered < CHAIN_COVERAGE_THRESHOLD {
                                 polymorphic_iseqs.clear();
