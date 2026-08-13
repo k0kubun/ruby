@@ -44,6 +44,29 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         }
     }
 
+    /// Look `item` up and, if `matches` finds no bucket holding it and a bucket is free, record
+    /// it there. Unlike [`Self::observe`] this does not count the sighting and does not reorder
+    /// the buckets, so the index it reports stays valid for as long as the distribution is only
+    /// updated this way: a caller that remembers how many buckets were occupied at some earlier
+    /// point can tell from the index alone whether an item was already known then.
+    ///
+    /// New buckets always start at a count of 1, which cannot exceed `counts[0]`, so this
+    /// preserves "`buckets[0]` is the most common item" without bubbling.
+    pub fn observe_stable(&mut self, item: T, matches: impl Fn(T, T) -> bool) -> StableBucket {
+        for (index, (bucket, count)) in self.buckets.iter_mut().zip(self.counts.iter_mut()).enumerate() {
+            if *count == 0 {
+                *bucket = item;
+                *count = 1;
+                return StableBucket::Inserted(index);
+            }
+            if matches(*bucket, item) {
+                return StableBucket::Existing(index);
+            }
+        }
+        self.other = self.other.saturating_add(1);
+        StableBucket::Full
+    }
+
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
         self.buckets.iter().zip(self.counts.iter())
             .filter_map(|(&bucket, &count)| if count > 0 { Some(bucket) } else { None })
@@ -53,6 +76,17 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         self.buckets.iter_mut().zip(self.counts.iter())
             .filter_map(|(bucket, &count)| if count > 0 { Some(bucket) } else { None })
     }
+}
+
+/// Where an item sits in a [`Distribution`] after [`Distribution::observe_stable`].
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum StableBucket {
+    /// The item already had this bucket.
+    Existing(usize),
+    /// The item was recorded in this bucket, which was empty until now.
+    Inserted(usize),
+    /// Every bucket belongs to some other item; this one was only counted as `other`.
+    Full,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -227,6 +261,54 @@ mod distribution_tests {
         assert!(dist.buckets.is_empty());
         assert!(dist.counts.is_empty());
         assert_eq!(dist.other, 1);
+    }
+
+    #[test]
+    fn observe_stable_reports_new_and_known_buckets() {
+        let mut dist = Distribution::<usize, 4>::new();
+        dist.observe(10);
+        // A bucket that already exists is reported without being counted again.
+        assert_eq!(dist.observe_stable(10, |a, b| a == b), StableBucket::Existing(0));
+        assert_eq!(dist.counts[0], 1);
+        // New items land past the buckets that were occupied, which is how a caller tells
+        // them apart from the ones the compiled code already knows about.
+        assert_eq!(dist.observe_stable(11, |a, b| a == b), StableBucket::Inserted(1));
+        assert_eq!(dist.observe_stable(11, |a, b| a == b), StableBucket::Existing(1));
+        assert_eq!(dist.observe_stable(12, |a, b| a == b), StableBucket::Inserted(2));
+    }
+
+    #[test]
+    fn observe_stable_does_not_reorder_buckets() {
+        let mut dist = Distribution::<usize, 4>::new();
+        dist.observe(10);
+        for _ in 0..10 {
+            dist.observe_stable(11, |a, b| a == b);
+        }
+        // `observe` would have bubbled 11 to the front; a stable observation may not, or the
+        // index it reported earlier would now name a different item.
+        assert_eq!(dist.buckets[0], 10);
+        assert_eq!(dist.buckets[1], 11);
+        // Counts stay ordered, so DistributionSummary's invariant still holds.
+        assert!(dist.counts[0] >= dist.counts[1]);
+    }
+
+    #[test]
+    fn observe_stable_reports_full_without_recording() {
+        let mut dist = Distribution::<usize, 2>::new();
+        assert_eq!(dist.observe_stable(10, |a, b| a == b), StableBucket::Inserted(0));
+        assert_eq!(dist.observe_stable(11, |a, b| a == b), StableBucket::Inserted(1));
+        assert_eq!(dist.observe_stable(12, |a, b| a == b), StableBucket::Full);
+        assert_eq!(dist.other, 1);
+        assert_eq!(dist.buckets, [10, 11]);
+    }
+
+    #[test]
+    fn observe_stable_matches_with_the_given_predicate() {
+        let mut dist = Distribution::<(usize, usize), 4>::new();
+        dist.observe_stable((1, 100), |a, b| a.0 == b.0);
+        // Equal under the predicate, different as a whole: still the same bucket.
+        assert_eq!(dist.observe_stable((1, 999), |a, b| a.0 == b.0), StableBucket::Existing(0));
+        assert_eq!(dist.buckets[0], (1, 100));
     }
 
     #[test]
