@@ -890,6 +890,9 @@ pub enum SendFallbackReason {
     InvokeSuperForwardNotSpecialized,
     /// The single-ractor-mode assumption could not be made.
     SingleRactorModeRequired,
+    /// A `send`/`__send__` call site whose method-name argument did not match any of the
+    /// names the profiler observed there.
+    SendUnprofiledMethodName,
     /// Initial fallback reason for every instruction, which should be mutated to
     /// a more actionable reason when an attempt to specialize the instruction fails.
     Uncategorized(VmInsnType),
@@ -946,6 +949,7 @@ impl Display for SendFallbackReason {
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
             InvokeSuperForwardNotSpecialized => write!(f, "InvokeSuperForward: not yet specialized"),
             SingleRactorModeRequired => write!(f, "Single-ractor mode required"),
+            SendUnprofiledMethodName => write!(f, "send: method name not seen while profiling"),
             Uncategorized(insn) => write!(f, "Uncategorized({})", insn_name(insn.to_usize())),
         }
     }
@@ -2975,6 +2979,10 @@ pub struct Function {
     /// Whether the current [`Self::inline_methods`] pass found the function already past its
     /// cumulative inlining budget. Only yield-unlocking callees are considered from then on.
     inline_budget_exhausted: bool,
+    /// For `Send` instructions on a `send`/`__send__` call site that HIR build has already
+    /// guarded to one method name, the ID of that method. `type_specialize` uses it (and
+    /// drops the leading method-name argument) to resolve the call like a direct call.
+    send_mid_overrides: HashMap<InsnId, ID>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3821,6 +3829,7 @@ impl Function {
             num_instructions: 0,
             yield_inline_bonuses: 0,
             inline_budget_exhausted: false,
+            send_mid_overrides: HashMap::new(),
         }
     }
 
@@ -5597,9 +5606,35 @@ impl Function {
                         } };
                         let ci = unsafe { (*cd).ci }; // info about the call site
 
-                        let flags = unsafe { rb_vm_ci_flag(ci) };
+                        let mut flags = unsafe { rb_vm_ci_flag(ci) };
+                        let mut mid = unsafe { vm_ci_mid(ci) };
 
-                        let mid = unsafe { vm_ci_mid(ci) };
+                        // A `send`/`__send__` call site that HIR build guarded to one method name
+                        // is compiled as a call to that method: the name argument is dropped and,
+                        // like the interpreter's vm_call_opt_send, private and protected methods
+                        // are callable. Only plain positional call sites get an override (see
+                        // send_method_names), so every other property of `ci` — the keyword
+                        // table, the splat and block-arg flags — is unchanged by the rewrite and
+                        // stays valid for the resolved call.
+                        let mut send_mid_override = self.send_mid_overrides.get(&insn_id).copied();
+                        if let Some(target_mid) = send_mid_override {
+                            // Only rewrite while `send` really is BasicObject#send. If it has
+                            // been replaced, call it like any other method.
+                            let send_cme = unsafe { rb_callable_method_entry(klass, mid) };
+                            let is_opt_send = !send_cme.is_null()
+                                && unsafe { get_cme_def_type(send_cme) } == VM_METHOD_TYPE_OPTIMIZED
+                                && unsafe { get_cme_def_body_optimized_type(send_cme) } == OPTIMIZED_METHOD_TYPE_SEND;
+                            if is_opt_send {
+                                self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: send_cme }, state });
+                                mid = target_mid;
+                                flags |= VM_CALL_FCALL;
+                            } else {
+                                send_mid_override = None;
+                            }
+                        }
+                        let flags = flags;
+                        let mid = mid;
+
                         // Do method lookup
                         let mut cme = unsafe { rb_callable_method_entry(klass, mid) };
                         if cme.is_null() {
@@ -5637,6 +5672,15 @@ impl Function {
                             Insn::Send { args, .. } => args.to_vec(),
                             _ => panic!("Expected Send instruction"),
                         };
+                        if send_mid_override.is_some() {
+                            // Drop the method-name argument, as vm_call_opt_send does. The
+                            // pre-send `state` is kept for guards so that a side exit re-runs
+                            // `send` in the interpreter with the name still on the stack;
+                            // `send_frame_state` describes the callee frame without it.
+                            args.remove(0);
+                            let new_state = self.frame_state(state).with_replaced_args(&args, args.len() + 1);
+                            send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                        }
                         let mut stripped_nil_block = false;
                         if send_block == Some(BlockHandler::BlockArg) && def_type == VM_METHOD_TYPE_ISEQ {
                             // The block arg is the last element in args
@@ -5951,10 +5995,10 @@ impl Function {
                                 recv_class: VALUE,
                                 profiled_type: Option<ProfiledType>,
                                 cme: *const rb_callable_method_entry_struct,
+                                method_id: ID,
+                                argc: u32,
                             ) -> Result<(), ()> {
                                 let call_info = unsafe { (*cd).ci };
-                                let argc = unsafe { vm_ci_argc(call_info) };
-                                let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
                                 let ci_flags = unsafe { vm_ci_flag(call_info) };
                                 // When seeing &block argument, fall back to dynamic dispatch for now
@@ -6137,11 +6181,12 @@ impl Function {
                                         fun.set_dynamic_send_reason(send_insn_id, SendCfuncArrayVariadic);
                                         Err(())
                                     }
-                                    _ => unreachable!("unknown cfunc kind: argc={argc}")
+                                    _ => unreachable!("unknown cfunc kind: cfunc_argc={cfunc_argc}")
                                 }
                             }
 
-                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme).is_ok() {
+                            let ccall_argc = if send_mid_override.is_some() { args.len() as u32 } else { unsafe { vm_ci_argc(ci) } };
+                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme, mid, ccall_argc).is_ok() {
                                 continue;
                             }
 
@@ -9695,6 +9740,43 @@ impl ProfileOracle {
             self.types.insert(dst, filtered);
         }
     }
+
+    /// Copy every profile entry recorded for the `src` Snapshot to the `dst` Snapshot. Used by
+    /// `send` method-name dispatch, where each arm gets a fresh Snapshot but sees exactly the
+    /// same receiver and arguments as the original call site.
+    fn copy_entries(&mut self, src: InsnId, dst: InsnId) {
+        if let Some(entries) = self.types.get(&src).cloned() {
+            self.types.entry(dst).or_default().extend(entries);
+        }
+    }
+}
+
+/// Return the method names to build a `send`/`__send__` method-name dispatch on, most frequent
+/// first. Empty when this is not a specializable `send` call site or the profile is unusable.
+fn send_method_names(profile: &crate::profile::IseqProfile, cd: *const rb_call_data, insn_idx: YarvInsnIdx, argc: usize) -> Vec<VALUE> {
+    if argc == 0 {
+        return vec![];
+    }
+    let ci = unsafe { (*cd).ci };
+    let mid = unsafe { vm_ci_mid(ci) };
+    if mid != ID!(send) && mid != ID!(__send__) {
+        return vec![];
+    }
+    // Keep this in sync with profile_send_method_name: anything else is rejected downstream.
+    let flags = unsafe { vm_ci_flag(ci) };
+    if flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0 {
+        return vec![];
+    }
+    let Some(summary) = profile.get_send_method_names(insn_idx) else { return vec![] };
+    // A megamorphic name distribution means the profiler ran out of buckets, so the arms we
+    // could build would not cover the call site. Leave it as a dynamic send.
+    if summary.is_megamorphic() || summary.is_skewed_megamorphic() {
+        return vec![];
+    }
+    summary.buckets().iter()
+        .take_while(|profiled_type| !profiled_type.is_empty())
+        .map(|profiled_type| profiled_type.class())
+        .collect()
 }
 
 fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
@@ -11160,7 +11242,43 @@ fn add_iseq_to_hir(
                     let recv = state.stack_pop()?;
                     let caller_splat_length = fun.monomorphic_caller_splat_length(call_info, exit_id);
 
-                    if let Some(plan) = fun.send_chain_plan(&profiles, recv, exit_id, cd) {
+                    // `recv.send(:name, ...)` chooses its callee from the first argument, so the
+                    // call site's method ID (`send`) tells the optimizer nothing. Branch on the
+                    // method names the profiler saw and let each arm resolve as a call to that
+                    // method; anything unseen falls through to the ordinary dynamic send.
+                    let send_names = send_method_names(&payload.profile, cd, exit_state.insn_idx, args.len());
+                    if !send_names.is_empty() {
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        for name in send_names {
+                            let expected = fun.push_insn(block, Insn::Const { val: Const::Value(name) });
+                            let is_name = fun.push_insn(block, Insn::IsBitEqual { left: args[0], right: expected });
+                            let iftrue_block = fun.new_block(insn_idx);
+                            let fall_through = fun.new_block(insn_idx);
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: is_name,
+                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
+                                if_false: BranchEdge { target: fall_through, args: vec![] }
+                            });
+                            block = fall_through;
+                            // Each arm needs its own Snapshot so that the recorded method name
+                            // only applies to that arm. The operand profiles still apply, so
+                            // carry them over.
+                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+                            profiles.copy_entries(exit_id, snapshot);
+                            // Keep the full argument list (including the method name) so that a
+                            // send that turns out not to be specializable still lowers to a
+                            // correct dynamic `send`. type_specialize drops the name argument
+                            // when, and only when, it resolves the call.
+                            let send = fun.push_insn(iftrue_block, Insn::Send { recv, cd, block: None, args: args.clone(), caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
+                            fun.send_mid_overrides.insert(send, unsafe { rb_sym2id(name) });
+                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                        }
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, caller_splat_length, state: exit_id, reason: SendUnprofiledMethodName });
+                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+                        state.stack_push(join_param);
+                        block = join_block;
+                    } else if let Some(plan) = fun.send_chain_plan(&profiles, recv, exit_id, cd) {
                         let (join_block, join_param) = match plan {
                             SendChainPlan::Ancestor(dispatch) => gen_send_ancestor_chain(
                                 fun, &mut profiles, &dispatch, block, insn_idx, &exit_state, exit_id,
