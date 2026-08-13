@@ -728,6 +728,65 @@ fn test_yield_with_too_many_args_for_lir() {
 }
 
 #[test]
+fn test_send_direct_passes_extra_args_on_the_stack() {
+    // `self` + eight positional args don't fit in C argument registers on x86_64, so the
+    // last ones travel through the callee's local slots on the VM stack instead.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, f, g, h) = [a, b, c, d, e, f, g, h]
+        def test = target(1, 2, 3, 4, 5, 6, 7, 8)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6, 7, 8]");
+}
+
+#[test]
+fn test_send_direct_passes_extra_kwargs_on_the_stack() {
+    // Keyword arguments are reordered into the callee's parameter order before they are
+    // split between registers and the callee's local slots.
+    set_call_threshold(2);
+    eval("
+        def target(a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0) = [a, b, c, d, e, f, g]
+        def test = target(g: 7, b: 2, f: 6, a: 1)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 0, 0, 0, 6, 7]");
+}
+
+#[test]
+fn test_send_direct_with_extra_args_on_the_stack_side_exits() {
+    // A callee that side-exits after reading its stack-passed arguments must still see
+    // them, both in JIT code and once the interpreter takes over its frame.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, f, g, h)
+          $exit = true
+          [a, b, c, d, e, f, g, h]
+        end
+        def test = target(1, 2, 3, 4, 5, 6, 7, 8)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6, 7, 8]");
+}
+
+#[test]
+fn test_send_direct_with_extra_args_on_the_stack_and_block_param() {
+    // The synthesized block-handler argument is the last one, so it is the one that ends
+    // up in a local slot here.
+    set_call_threshold(2);
+    eval("
+        def target(a, b, c, d, e, &blk) = [a, b, c, d, e, blk.call]
+        def test = target(1, 2, 3, 4, 5) { 6 }
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 3, 4, 5, 6]");
+}
+
+#[test]
 fn test_yield_inline_invocation_live_stack_below_args() {
     // A live value sits on the stack below the yield args; the no-receiver-slot SP math
     // must preserve it so `x +` sees the right operand.
