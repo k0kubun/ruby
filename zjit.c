@@ -147,6 +147,39 @@ rb_zjit_iseq_insn_set(const rb_iseq_t *iseq, unsigned int insn_idx, enum ruby_vm
     iseq->body->iseq_encoded[insn_idx] = (VALUE)insn_table[bare_insn];
 }
 
+struct zjit_cdhash_entries {
+    // Interleaved (key, offset) pairs, both as C longs
+    long *buf;
+    long capacity;
+    long size;
+};
+
+static int
+zjit_cdhash_fixnum_entries_i(st_data_t key, st_data_t val, st_data_t data)
+{
+    struct zjit_cdhash_entries *entries = (struct zjit_cdhash_entries *)data;
+    if (!FIXNUM_P((VALUE)key) || entries->size >= entries->capacity) {
+        entries->size = -1;
+        return ST_STOP;
+    }
+    entries->buf[entries->size * 2] = FIX2LONG((VALUE)key);
+    // Values are raw jump offsets, not Ruby objects. See cdhash_set_label_replace_i().
+    entries->buf[entries->size * 2 + 1] = (long)val;
+    entries->size++;
+    return ST_CONTINUE;
+}
+
+// Write the (key, jump offset) pairs of an `opt_case_dispatch` hash into `buf` as
+// interleaved C longs. Returns the number of pairs written, or -1 if any key is not
+// a Fixnum or if there is not enough room for all of them in `buf`.
+long
+rb_zjit_cdhash_fixnum_entries(VALUE cdhash, long *buf, long capacity)
+{
+    struct zjit_cdhash_entries entries = { .buf = buf, .capacity = capacity, .size = 0 };
+    st_foreach(rb_imemo_cdhash_tbl(cdhash), zjit_cdhash_fixnum_entries_i, (st_data_t)&entries);
+    return entries.size;
+}
+
 // Get profiling information for ISEQ
 void *
 rb_iseq_get_zjit_payload(const rb_iseq_t *iseq)

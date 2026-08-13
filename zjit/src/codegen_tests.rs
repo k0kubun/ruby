@@ -7090,6 +7090,48 @@ fn test_opt_case_dispatch() {
 }
 
 #[test]
+fn test_opt_case_dispatch_fixnum() {
+    eval("
+        def test(x)
+          case x
+          when -3 then :a
+          when 0, 1 then :b
+          when 5 then :c
+          else :d
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(
+        assert_compiles("[-4, -3, 0, 1, 2, 5, 1.0, :x, nil].map { |x| test(x) }"),
+        @"[:d, :a, :b, :b, :d, :c, :b, :d, :d]"
+    );
+}
+
+#[test]
+fn test_opt_case_dispatch_fixnum_redefined() {
+    eval("
+        def test(x)
+          case x
+          when 0 then :a
+          when 1 then :b
+          else :c
+          end
+        end
+        test(0)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    assert_snapshot!(assert_compiles_allowing_exits("
+        [test(0), test(1), test(2)].tap {
+          class Integer
+            def ===(other) = true
+          end
+        } + [test(0), test(1), test(2)] + 100.times.map { test(2) }.uniq
+    "), @"[:a, :b, :c, :a, :a, :a, :a]");
+}
+
+#[test]
 fn test_checkmatch_case() {
     eval(r#"
         def test(o)
@@ -7509,6 +7551,50 @@ fn test_max_iseq_versions() {
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+#[test]
+fn test_ivar_respecialization_beyond_max_versions() {
+    let max_versions = max_iseq_versions();
+    // Burn every version on constant invalidation so `read` compiles its last version with
+    // `no_side_exits`, freezing a shape dispatch built from a profile that has only seen A.
+    eval(&format!("
+        TEST = -1
+        class Base
+          def read = @v + TEST
+        end
+        class A < Base; def initialize = @v = 1; end
+        class B < Base; def initialize = (@w = 0; @v = 2); end
+
+        a = A.new
+        i = 0
+        while i < {max_versions} + 1
+          a.read; a.read
+          Object.send(:remove_const, :TEST)
+          TEST = i
+          i += 1
+        end
+    "));
+    let iseq = get_instance_method_iseq("Base", "read");
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), max_versions);
+
+    // Now feed it a shape the frozen dispatch has no arm for, at a different ivar index. The
+    // fallback path samples it and earns the ISEQ an extra version, so it exceeds the plain
+    // version limit but stays within the respecialization budget.
+    eval("
+        b = B.new
+        i = 0
+        while i < 2000
+          b.read
+          i += 1
+        end
+    ");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(payload.ivar_respecializations >= 1, "expected an ivar respecialization");
+    assert!(payload.ivar_respecializations <= crate::payload::MAX_IVAR_RESPECIALIZATIONS);
+    assert!(payload.versions.len() > max_versions);
+    assert!(payload.versions.len() <= max_versions + crate::payload::MAX_IVAR_RESPECIALIZATIONS as usize);
+    assert_snapshot!(assert_compiles_allowing_exits("[A.new.read, B.new.read]"), @"[5, 6]");
 }
 
 #[test]

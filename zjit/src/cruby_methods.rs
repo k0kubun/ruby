@@ -252,6 +252,10 @@ pub fn init() -> Annotations {
     annotate!(rb_cInteger, "succ", inline_integer_succ);
     annotate!(rb_cInteger, "^", inline_integer_xor);
     annotate!(rb_cInteger, "==", inline_integer_eq);
+    // Integer#=== is rb_int_equal, the same C function as Integer#==. `case`/`when`
+    // over integer literals compiles to a chain of `===` sends when opt_case_dispatch
+    // misses, so inlining this avoids a cfunc call per `when` clause tested.
+    annotate!(rb_cInteger, "===", inline_integer_eq);
     annotate!(rb_cInteger, "+", inline_integer_plus);
     annotate!(rb_cInteger, "-", inline_integer_minus);
     annotate!(rb_cInteger, "*", inline_integer_mult);
