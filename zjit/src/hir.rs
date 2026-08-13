@@ -9920,7 +9920,9 @@ impl Function {
             return;
         }
         let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.ivar_respecializations >= crate::payload::MAX_IVAR_RESPECIALIZATIONS {
+        if payload.ivar_respecializations >= crate::payload::MAX_IVAR_RESPECIALIZATIONS
+            || payload.ivar_reprofile_giveup
+        {
             return;
         }
         self.push_insn(block, Insn::IvarReprofile { self_val: self_param, state });
