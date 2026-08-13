@@ -86,7 +86,9 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
     }
 
     /// Build a summary that looks like only `item` was ever observed. Used to hand a
-    /// single, already-narrowed observation to consumers that expect a distribution.
+    /// guarded arm of a polymorphic dispatch the one type it guarded on, and more
+    /// generally to hand a single, already-narrowed observation to consumers that
+    /// expect a distribution.
     pub fn monomorphic(item: T) -> Self {
         let mut buckets = [Default::default(); N];
         assert!(N > 0);

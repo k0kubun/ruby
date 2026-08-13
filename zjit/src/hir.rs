@@ -1028,6 +1028,11 @@ pub enum Insn {
     /// Push `val` onto `array`, where `array` is already `Array`.
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
+    /// Like [`Insn::ArrayAref`], but `index` (already adjusted by [`Insn::AdjustBounds`]) may be
+    /// out of `0...length`, in which case the result is `nil`. Lets `ary[i]` compile without a
+    /// bounds guard, so the ordinary Ruby idiom of walking an array until it reads past the end
+    /// does not have to leave JIT code.
+    ArrayArefOrNil { array: InsnId, index: InsnId, length: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
@@ -1558,6 +1563,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*array);
                 $visit_one!(*index);
             }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                $visit_one!(*array);
+                $visit_one!(*index);
+                $visit_one!(*length);
+            }
             Insn::ArrayAset { array, index, val } => {
                 $visit_one!(*array);
                 $visit_one!(*index);
@@ -1807,6 +1817,7 @@ impl Insn {
             Insn::ArrayExtend { .. } => effects::Any,
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
+            Insn::ArrayArefOrNil { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
@@ -2096,6 +2107,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::ArrayAref { array, index, .. } => {
                 write!(f, "ArrayAref {array}, {index}")
+            }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                write!(f, "ArrayArefOrNil {array}, {index}, {length}")
             }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
@@ -3810,6 +3824,7 @@ impl Function {
             Insn::NewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
+            Insn::ArrayArefOrNil { .. } => types::BasicObject,
             Insn::ArrayPop { .. } => types::BasicObject,
             Insn::ArrayLength { .. } => types::CInt64,
             Insn::AdjustBounds { .. } => types::CInt64,
@@ -5051,18 +5066,40 @@ impl Function {
                                 // rather than guarding: a receiver of the right class but a
                                 // different shape takes rb_ivar_get instead of side-exiting and
                                 // recompiling the ISEQ around a shape the arm never promised.
-                                let replacement = if profiled_type.flags().is_polymorphic_arm()
-                                    && !profiled_type.shape().is_complex() && !profiled_type.flags().is_immediate() {
+                                let shape_miss = if profiled_type.flags().is_polymorphic_arm() {
+                                    ShapeMiss::CallFallbackWithoutReprofile
+                                } else {
+                                    ShapeMiss::SideExit
+                                };
+                                let branch_on_shape = shape_miss.calls_fallback()
+                                    && !profiled_type.shape().is_complex()
+                                    && !profiled_type.flags().is_immediate();
+                                let replacement = if branch_on_shape {
                                     let insn_idx = self.frame_state_insn_idx(state) as u32;
-                                    let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, ShapeMiss::CallFallbackWithoutReprofile)
+                                    let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
                                         .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
                                     block = join_block;
                                     result
                                 } else {
-                                    self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
-                                        self.count(block, counter);
-                                        self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
-                                    })
+                                    match self.try_emit_optimized_getivar(block, recv, id, profiled_type, state) {
+                                        Ok(replacement) => replacement,
+                                        // The final version of an ISEQ may not speculate with a
+                                        // guard that side-exits, but it can still branch on the
+                                        // shape the way getinstancevariable does, so the common
+                                        // shape reads inline instead of calling rb_ivar_get every
+                                        // time.
+                                        Err(Counter::getivar_fallback_no_side_exits) => {
+                                            let insn_idx = self.frame_state_insn_idx(state) as u32;
+                                            let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
+                                                .expect("dispatch_getivar only side-exits without a profiled shape");
+                                            block = join_block;
+                                            result
+                                        }
+                                        Err(counter) => {
+                                            self.count(block, counter);
+                                            self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                        }
+                                    }
                                 };
                                 self.make_equal_to(insn_id, replacement);
                             } else {
@@ -7062,6 +7099,20 @@ impl Function {
                             _ => None,
                         })
                     }
+                    &Insn::ArrayArefOrNil { array, index, .. }
+                        if self.type_of(array).ruby_object_known()
+                            && self.type_of(index).is_subtype(types::CInt64) => {
+                        let array_obj = self.type_of(array).ruby_object().unwrap();
+                        match (array_obj.is_frozen(), self.type_of(index).cint64_value()) {
+                            (true, Some(index)) => {
+                                // rb_yarv_ary_entry_internal returns nil out of bounds, which is
+                                // exactly what ArrayArefOrNil does.
+                                let val = unsafe { rb_yarv_ary_entry_internal(array_obj, index) };
+                                self.new_insn(Insn::Const { val: Const::Value(val) })
+                            }
+                            _ => insn_id,
+                        }
+                    }
                     &Insn::ArrayAref { array, index }
                         if self.type_of(array).ruby_object_known()
                             && self.type_of(index).is_subtype(types::CInt64) => {
@@ -8035,6 +8086,11 @@ impl Function {
                 self.assert_subtype(insn_id, array, types::Array)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
             }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                self.assert_subtype(insn_id, array, types::Array)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
+                self.assert_subtype(insn_id, length, types::CInt64)
+            }
             Insn::ArrayAset { array, index, .. } => {
                 self.assert_subtype(insn_id, array, types::ArrayExact)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
@@ -8944,11 +9000,12 @@ impl ProfileOracle {
         }
     }
 
-    /// Copy the profile entries recorded for the `src` Snapshot to the `dst` Snapshot, excluding
+    /// Copy the profile entries recorded for the `src` Snapshot to the `dst` Snapshot, minus the
     /// entries for `exclude` (chased through guards). Used by polymorphic dispatch, where each
     /// refined arm gets a fresh Snapshot: the receiver must resolve from its refined type rather
     /// than the polymorphic profile, but the other operands' profiles should remain visible so
-    /// argument-profile-dependent specializations (e.g. Array#[]) still apply.
+    /// argument-profile-dependent specializations (e.g. Array#[]) still apply. Callers that want
+    /// the arm to keep the profiled shape re-add the receiver with [`ProfileOracle::add_entry`].
     fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function) {
         let Some(entries) = self.types.get(&src) else { return };
         let exclude = fun.chase_insn(exclude);
@@ -10620,13 +10677,6 @@ fn add_iseq_to_hir(
                                 continue;
                             }
                             seen_types.push(expected);
-                            // This arm is only guarded on `expected`, which carries the class but
-                            // not the shape. Only treat the bucket's shape as representative when
-                            // every observation that lands in this arm agreed on it; otherwise a
-                            // shape guard here would keep side-exiting.
-                            let unique_shape_for_type = summary.buckets().iter()
-                                .filter(|other| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
-                                .all(|other| *other == profiled_type);
                             let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
                             let iftrue_block = fun.new_block(insn_idx);
                             let fall_through = fun.new_block(insn_idx);
@@ -10651,10 +10701,13 @@ fn add_iseq_to_hir(
                             // bucket. Type::from_profiled_type only carries the class, so without
                             // this the arm resolves as StaticallyKnown and loses the shape,
                             // forcing attr_reader sends into a full rb_ivar_get C call instead of
-                            // a shape-guarded field load.
-                            if unique_shape_for_type {
-                                profiles.add_entry(snapshot, recv, TypeDistributionSummary::monomorphic(profiled_type.as_polymorphic_arm()));
-                            }
+                            // an inline field load. The entry is flagged as a polymorphic arm:
+                            // this arm is only guarded on `expected`, which pins the class but not
+                            // the shape, so consumers branch on the shape instead of guarding it
+                            // (see the VM_METHOD_TYPE_IVAR/ATTRSET cases in type_specialize).
+                            // That holds whether or not every observation in the arm agreed on the
+                            // shape -- a miss takes the C fallback rather than a side exit.
+                            profiles.add_entry(snapshot, recv, TypeDistributionSummary::monomorphic(profiled_type.as_polymorphic_arm()));
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
                             let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
                             fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
