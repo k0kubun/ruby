@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
-use crate::distribution::{Distribution, DistributionSummary};
+use crate::distribution::{Distribution, DistributionSummary, StableBucket};
 use crate::stats::Counter::profile_time_ns;
 use crate::stats::with_time_stat;
 
@@ -248,19 +248,32 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
 /// unusual receiver does not spend a version.
 const IVAR_REPROFILE_WINDOW: u32 = 64;
 
+/// Share of a window that the shapes a recompile would add an arm for must account for,
+/// in percent, before the recompile is worth a version.
+///
+/// A single missing shape is not evidence that a recompile helps: at a site that is genuinely
+/// polymorphic the fallback sees a long tail of shapes, and an arm for one of them removes a
+/// few percent of the calls while costing a version and the code for every other arm. What
+/// matters is the share the arms a recompile would add cover *together*, which is why this is
+/// not a per-shape threshold -- a window split evenly between three missing shapes is a good
+/// bet, and a window with one missing shape in it is not.
+const IVAR_REPROFILE_MIN_SHARE_PERCENT: u32 = 50;
+
 /// Result of [`IseqProfile::observe_ivar_fallback`].
 #[derive(PartialEq, Eq, Debug)]
 enum IvarReprofiled {
-    /// Recorded. Nothing to do.
+    /// Recorded, mid-window. Nothing to do.
     Sampled,
-    /// The window closed on a shape the compiled dispatch does not have an arm for.
-    /// The shape is now in the instruction's profile; recompile to pick it up.
+    /// The window closed without making the case for a recompile.
+    Declined,
+    /// The window closed with most of its samples on shapes the compiled dispatch has no arm
+    /// for. They are now in the instruction's profile; recompile to pick them up.
     Recompile,
 }
 
 impl IseqProfile {
     /// Record the shape of a receiver that reached an ivar site's fallback path, and report
-    /// whether a recompile would now give that receiver an arm of its own.
+    /// whether a recompile would now take most of that traffic off the fallback.
     ///
     /// The window is kept in the instruction's own profile entry, so a site that falls back
     /// rarely costs one distribution slot and nothing else.
@@ -269,27 +282,58 @@ impl IseqProfile {
         if entry.opnd_types.is_empty() {
             entry.opnd_types.resize(1, TypeDistribution::new());
         }
+        // The dispatch that is running was built from the shapes the profile held when the ISEQ
+        // was last compiled. Remember how many that was the first time we sample: because this
+        // path only ever grows the distribution through `observe_stable`, every bucket at or
+        // past that index is a shape folded in since, which the running code has no arm for.
+        let dispatch_shapes = match entry.ivar_dispatch_shapes {
+            Some(shapes) => shapes,
+            None => {
+                let shapes = entry.opnd_types[0].each_item().count() as u8;
+                entry.ivar_dispatch_shapes = Some(shapes);
+                shapes
+            }
+        };
         let ty = ProfiledType::new(recv);
-        if !entry.opnd_types[0].each_item().any(|seen| seen.shape() == ty.shape()) {
-            // A shape the profile the compiled dispatch was built from has never seen. Fold it
-            // in so a recompile can give it an arm, and remember that this window found one.
-            // The distribution keeps the class alive for as long as the profile does.
-            VALUE::from(iseq).write_barrier(ty.class());
-            entry.opnd_types[0].observe(ty);
-            entry.ivar_fallback_new_shape = true;
-        }
+        let fixable = if ty.shape().is_complex() {
+            // Too-complex shapes keep their ivars in a hash table, so the dispatch would filter
+            // this one back out. Recording it would only cost a bucket a fixable shape could use.
+            false
+        } else {
+            // De-duplicate by shape, the way the dispatch itself does.
+            let bucket = entry.opnd_types[0].observe_stable(ty, |seen, ty| seen.shape() == ty.shape());
+            if let StableBucket::Inserted(_) = bucket {
+                // The distribution keeps the class alive for as long as the profile does.
+                VALUE::from(iseq).write_barrier(ty.class());
+            }
+            match bucket {
+                StableBucket::Existing(index) | StableBucket::Inserted(index) => index >= dispatch_shapes as usize,
+                // No bucket left to record this shape in, so no recompile can specialize it.
+                // It argues against spending a version on this site, not for one.
+                StableBucket::Full => false,
+            }
+        };
         entry.ivar_fallback_samples = entry.ivar_fallback_samples.saturating_add(1);
+        if fixable {
+            entry.ivar_fallback_fixable = entry.ivar_fallback_fixable.saturating_add(1);
+        }
         if entry.ivar_fallback_samples < IVAR_REPROFILE_WINDOW {
             return IvarReprofiled::Sampled;
         }
         entry.ivar_fallback_samples = 0;
-        if std::mem::take(&mut entry.ivar_fallback_new_shape) {
+        let fixable = std::mem::take(&mut entry.ivar_fallback_fixable);
+        if fixable * 100 >= IVAR_REPROFILE_WINDOW * IVAR_REPROFILE_MIN_SHARE_PERCENT {
+            // The recompile rebuilds the dispatch from the whole profile, so start the next
+            // window measuring against all of it.
+            entry.ivar_dispatch_shapes = None;
             IvarReprofiled::Recompile
         } else {
-            // Everything this window saw is already in the profile, so the fallback is being
-            // taken for a reason a recompile cannot fix (a too-complex shape, or an arm the
-            // dispatch dropped). Keep sampling in case that changes, but do not spend a version.
-            IvarReprofiled::Sampled
+            // Most of what the fallback handles is something a recompile cannot take away: a
+            // shape already in the dispatch (whose arm was dropped, or which is unspecializable),
+            // or one of so many shapes that the profile has no room left for them. Do not spend a
+            // version to move a few percent of it.
+            crate::stats::incr_counter!(ivar_respecialize_declined_count);
+            IvarReprofiled::Declined
         }
     }
 }
@@ -315,7 +359,9 @@ impl IseqProfile {
 /// Testing it also disarms frames still running the invalidated code.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersion, frame_iseq: VALUE, insn_idx: u32, recv: VALUE) {
-    if unsafe { (*version).is_invalidated() } {
+    // Both of these are one load off `version`, which keeps the give-up path from paying for the
+    // payload lookup and the profile timer below.
+    if unsafe { (*version).is_invalidated() || (*version).ivar_reprofile_windows == 0 } {
         return;
     }
     // Immediates have no shape to specialize and would poison the profile with a bucket the
@@ -328,8 +374,26 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
     let reprofiled = with_time_stat(profile_time_ns, || {
         get_or_create_iseq_payload(frame_iseq).profile.observe_ivar_fallback(frame_iseq, insn_idx, recv)
     });
-    if reprofiled == IvarReprofiled::Sampled {
-        return;
+    match reprofiled {
+        IvarReprofiled::Sampled => return,
+        IvarReprofiled::Declined => {
+            // Spend one of the version's windows. When they run out the sampling call stays in
+            // the code, but every execution of it stops at the check above.
+            let windows = unsafe { &mut (*version).ivar_reprofile_windows };
+            *windows -= 1;
+            if *windows == 0 {
+                crate::stats::incr_counter!(ivar_respecialize_giveup_count);
+                // Leave the sampling out of whatever this ISEQ compiles next. Invalidating just
+                // to drop it is not worth a compile -- the call is already a no-op after the
+                // check above -- but a version compiled for any other reason should not pay for
+                // evidence this ISEQ has already gathered and rejected.
+                // The flag belongs to the unit that compiled the call, which is what
+                // `Function::emit_ivar_reprofile` tests, not the frame the site came from.
+                get_or_create_iseq_payload(unsafe { (*version).iseq }).ivar_reprofile_giveup = true;
+            }
+            return;
+        }
+        IvarReprofiled::Recompile => {}
     }
     // Read the compiled unit's ISEQ out before taking the lock: `version` points into the
     // payload, and holding a reference to it across the lock's unwind boundary is not allowed.
@@ -598,8 +662,11 @@ pub struct ProfileEntry {
     /// Receivers seen on this ivar site's fallback path in the current re-profiling window.
     /// See [`rb_zjit_ivar_reprofile`].
     ivar_fallback_samples: u32,
-    /// Whether the current re-profiling window has seen a shape the profile did not have.
-    ivar_fallback_new_shape: bool,
+    /// How many of those a recompile would give an arm of its own.
+    ivar_fallback_fixable: u32,
+    /// Number of shapes the dispatch now running was compiled from, i.e. how many buckets of
+    /// `opnd_types[0]` it has arms for. `None` until the first sample after a compile.
+    ivar_dispatch_shapes: Option<u8>,
 }
 
 impl ProfileEntry {
@@ -653,7 +720,8 @@ impl IseqProfile {
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
                     ivar_fallback_samples: 0,
-                    ivar_fallback_new_shape: false,
+                    ivar_fallback_fixable: 0,
+                    ivar_dispatch_shapes: None,
                 });
                 &mut self.entries[i]
             }
