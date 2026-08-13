@@ -1292,6 +1292,73 @@ fn test_inline_array_each_to_erase_block_non_local_return() {
     assert_snapshot!(assert_compiles("test([1, 5, 3])"), @"10");
 }
 
+/// The relaxation is not limited to blocks with a non-local `return`: a plain
+/// `ary.each { ... }` gets the oversized `Array#each` inlined too, so its `yield` reaches
+/// the direct block dispatch instead of `rb_vm_invokeblock()`. `assert_inlines` is what
+/// pins the relaxation down -- at the plain threshold `Array#each` is too large and the
+/// program inlines nothing.
+#[test]
+fn test_inline_array_each_to_dispatch_yield_directly() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        "), @"15");
+    });
+}
+
+/// A multi-parameter block over pairs, which needs the yielded Array destructured on top of
+/// the oversized-iterator relaxation.
+#[test]
+fn test_inline_array_each_to_dispatch_autosplat_yield_directly() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def test(pairs)
+              out = []
+              pairs.each { |a, b| out << [b, a] }
+              out
+            end
+            test([[1, 2]])
+            test([[1, 2]])
+            test([[1, 2], [3, 4]]).inspect
+        "), @r#""[[2, 1], [4, 3]]""#);
+    });
+}
+
+/// The relaxation only applies to a callee whose `yield` can benefit from it: an oversized
+/// method with no `yield` in it stays out of line however it is called.
+#[test]
+fn test_oversized_callee_without_yield_is_not_relaxed() {
+    with_inlining(|| {
+        let counters = crate::state::ZJITState::get_counters();
+        let before = counters.inline_method_count;
+        assert_snapshot!(assert_compiles("
+            def no_yield(a)
+              pad0 = a + 1
+              pad1 = pad0 + 2
+              pad2 = pad1 + 3
+              pad3 = pad2 + 4
+              pad4 = pad3 + 5
+              pad5 = pad4 + 6
+              pad6 = pad5 + 7
+              [pad0, pad1, pad2, pad3, pad4, pad5, pad6].last
+            end
+            def test(a) = no_yield(a) { :unused_block }
+            test(1)
+            test(1)
+            test(2)
+        "), @"30");
+        assert_eq!(before, counters.inline_method_count,
+            "an oversized callee without a `yield` must not get the relaxed threshold");
+    });
+}
+
 #[test]
 fn test_inline_block_non_local_return_with_args() {
     set_call_threshold(2);

@@ -3399,11 +3399,12 @@ unsafe extern "C" {
     fn rb_jit_iseq_has_ensure_catch_entry(iseq: IseqPtr) -> bool;
 }
 
-/// How much bigger a callee may be when inlining it is what lets [`inline_block_at_yield`]
-/// erase a block's non-local `return`. Multiplies `--zjit-inline-threshold`, so tuning that
-/// option down (or to 0, which disables inlining) still applies here. The default 30 * 3 = 90
-/// clears the iterators this shape shows up with: the Ruby-level `Array#each` needs 45.
-const BLOCK_RETURN_INLINE_THRESHOLD_FACTOR: usize = 3;
+/// How much bigger a callee may be when inlining it is what lets the `yield` inside it
+/// dispatch to the caller's literal block directly instead of through
+/// `rb_vm_invokeblock()`. Multiplies `--zjit-inline-threshold`, so tuning that option down
+/// (or to 0, which disables inlining) still applies here. The default 30 * 3 = 90 clears the
+/// iterators this shape shows up with: the Ruby-level `Array#each` needs 45.
+const YIELD_INLINE_THRESHOLD_FACTOR: usize = 3;
 
 /// True if the ISEQ contains an `invokeblock`, i.e. a `yield`.
 fn iseq_contains_invokeblock(iseq: IseqPtr) -> bool {
@@ -6514,6 +6515,45 @@ impl Function {
         block_return_inlinable(blockiseq, callee_iseq, self.iseq())
     }
 
+    /// True if inlining `callee_iseq` is what lets a `yield` inside it dispatch straight to
+    /// the literal block this call site passes.
+    ///
+    /// A `yield` only reaches the guard-free single-ISEQ dispatch when the yielding frame was
+    /// itself inlined and the block is that frame's literal block; see `inlined_known_block`
+    /// in [`add_iseq_to_hir`]. Left out of line, a shared iterator's `invokeblock` sees a
+    /// different block on every call, so the monomorphic dispatch's profile never settles and
+    /// the polymorphic chain's coverage check rejects the unbounded handler sets that
+    /// process-wide `each`/`map`/`times` sites collect. The site then calls
+    /// `rb_vm_invokeblock()` forever, which is the largest remaining dynamic-dispatch item on
+    /// liquid, rack and erubi.
+    ///
+    /// This is strictly broader than [`Self::inlining_unlocks_block_return`], which only fires
+    /// when the block also has a non-local `return` to erase and the yielding frame lands at
+    /// inlining depth 1. The direct dispatch needs neither: any depth will do, and a block
+    /// that just runs and falls off the end benefits as much.
+    ///
+    /// Kept narrow on purpose, because the whole point of a targeted relaxation is not to hand
+    /// every oversized callee the bigger budget: the call site has to pass a literal block, the
+    /// callee has to contain a `yield`, and the block has to be one the direct dispatch can
+    /// actually take. Only the *size* limit is relaxed; the yield site rechecks every
+    /// condition itself, and a miss costs nothing beyond the code the inlined body took.
+    fn inlining_unlocks_direct_yield(&self, callee_iseq: IseqPtr, blockiseq: Option<IseqPtr>) -> bool {
+        let Some(blockiseq) = blockiseq else { return false };
+        if !iseq_contains_invokeblock(callee_iseq) {
+            return false;
+        }
+        // `block_call_inlinable_iseq` is what the yield site tests, and it needs the arity the
+        // `yield` passes, which is not known here. Test the block at its own parameter count:
+        // that is the arity a matching `yield` passes, and the one a lone yielded Array
+        // auto-splats into. A `yield` with some other argument count just doesn't take the
+        // dispatch, which the site sorts out on its own.
+        if !unsafe { rb_simple_iseq_p(blockiseq) } {
+            return false;
+        }
+        let lead_num = unsafe { rb_get_iseq_body_param_lead_num(blockiseq) } as usize;
+        block_call_inlinable_iseq(blockiseq, lead_num).is_ok()
+    }
+
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics. `blockiseq` is the literal block the call site passes,
     /// if any.
@@ -6552,11 +6592,15 @@ impl Function {
             }
         }
 
-        // Check callee bytecode size against threshold. An iterator whose inlining is the
-        // only thing keeping a block's non-local `return` on the throw path gets a larger
-        // budget, because leaving it out of line costs an interpreted unwind per call.
-        let threshold = if self.inlining_unlocks_block_return(callee_iseq, blockiseq) {
-            threshold.saturating_mul(BLOCK_RETURN_INLINE_THRESHOLD_FACTOR)
+        // Check callee bytecode size against threshold. An iterator gets a larger budget when
+        // inlining it is the only thing keeping the `yield` inside it off the direct block
+        // dispatch: leaving it out of line costs an `rb_vm_invokeblock()` per iteration, and
+        // an interpreted unwind per call on top of that when the block has a non-local
+        // `return`.
+        let unlocks_yield = self.inlining_unlocks_direct_yield(callee_iseq, blockiseq)
+            || self.inlining_unlocks_block_return(callee_iseq, blockiseq);
+        let threshold = if unlocks_yield {
+            threshold.saturating_mul(YIELD_INLINE_THRESHOLD_FACTOR)
         } else {
             threshold
         };
