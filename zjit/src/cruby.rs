@@ -1743,6 +1743,8 @@ pub(crate) mod ids {
         name: or                 content: b"|"
         name: xor                content: b"^"
         name: freeze
+        name: send
+        name: __send__
         name: minusat            content: b"-@"
         name: aref               content: b"[]"
         name: rb_ivar_get_at_no_ractor_check
