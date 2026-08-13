@@ -101,6 +101,7 @@ fn profile_insn_sample(
             // Profile all the arguments and self (+1).
             profile_operands(profiler, profile, argc + 1);
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
+            profile_send_method_name(profiler, profile, cd);
         }
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
         _ => return false,
@@ -196,6 +197,36 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     };
     profile.splat_lengths.entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
+}
+
+/// `recv.send(:name, ...)` picks its callee from the first argument rather than from the
+/// call site's method ID, so the ordinary operand type profile (always `Symbol`) says
+/// nothing useful. Record the method-name objects themselves; `type_specialize` uses them
+/// to turn each observed name into a direct call.
+fn profile_send_method_name(profiler: &mut Profiler, profile: &mut IseqProfile, cd: *const rb_call_data) {
+    let ci = unsafe { (*cd).ci };
+    let mid = unsafe { rb_vm_ci_mid(ci) };
+    if mid != ID!(send) && mid != ID!(__send__) {
+        return;
+    }
+    // Only plain positional calls can be specialized; don't spend profile slots on the rest.
+    let flags = unsafe { rb_vm_ci_flag(ci) };
+    if flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0 {
+        return;
+    }
+    let argc = unsafe { vm_ci_argc(ci) } as usize;
+    if argc == 0 {
+        return;
+    }
+    // Stack is [.., recv, name, arg1, .., argN-1] with argN-1 on top.
+    let name = profiler.peek_at_stack((argc - 1) as isize);
+    // Dynamic symbols and Strings are not stable enough to key a guard on; static symbols
+    // are immortal, so recording one keeps no object alive that would not be alive anyway.
+    if !name.static_sym_p() {
+        return;
+    }
+    profile.send_mid.entry(profiler.insn_idx)
+        .or_insert_with(TypeDistribution::new).observe(ProfiledType::object(name));
 }
 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -423,6 +454,10 @@ pub struct IseqProfile {
     /// Method entries for `super` calls (stored as VALUE to be GC-safe)
     super_cme: HashMap<YarvInsnIdx, TypeDistribution>,
 
+    /// Method-name symbols observed as the first argument of `send`/`__send__` call sites
+    /// (stored as VALUE to be GC-safe)
+    send_mid: HashMap<YarvInsnIdx, TypeDistribution>,
+
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
 }
@@ -432,6 +467,7 @@ impl IseqProfile {
         Self {
             entries: Vec::new(),
             super_cme: HashMap::new(),
+            send_mid: HashMap::new(),
             splat_lengths: HashMap::new(),
         }
     }
@@ -485,6 +521,11 @@ impl IseqProfile {
         }
     }
 
+    /// Get the distribution of method-name symbols seen at a `send`/`__send__` call site.
+    pub fn get_send_method_names(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
+        self.send_mid.get(&insn_idx).map(TypeDistributionSummary::new)
+    }
+
     /// Run a given callback with every object in IseqProfile
     pub fn each_object(&self, callback: impl Fn(VALUE)) {
         for entry in &self.entries {
@@ -498,6 +539,12 @@ impl IseqProfile {
 
         for super_cme_values in self.super_cme.values() {
             for profiled_type in super_cme_values.each_item() {
+                callback(profiled_type.class)
+            }
+        }
+
+        for send_mid_values in self.send_mid.values() {
+            for profiled_type in send_mid_values.each_item() {
                 callback(profiled_type.class)
             }
         }
@@ -517,6 +564,12 @@ impl IseqProfile {
         // Update CME references if they move during compaction.
         for super_cme_values in self.super_cme.values_mut() {
             for ref mut profiled_type in super_cme_values.each_item_mut() {
+                callback(&mut profiled_type.class)
+            }
+        }
+
+        for send_mid_values in self.send_mid.values_mut() {
+            for ref mut profiled_type in send_mid_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
