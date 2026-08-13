@@ -9773,16 +9773,16 @@ struct AddIseqResult {
     profiles: ProfileOracle,
 }
 
+/// A sibling shape needs at least this fraction (1/N) of a dispatch arm's samples to earn an arm
+/// of its own. See the filter in [`emit_polymorphic_send`].
+const ARM_SHAPE_MIN_SHARE: u32 = 4;
+
 /// Emit a receiver-type-specialized dispatch for a send: one `HasType` branch per profiled
 /// receiver type, each with its own `Send` that `type_specialize` can turn into a direct call,
 /// plus a dynamic-send fallthrough. All branches join on a single block parameter.
 ///
 /// Returns the block to continue compiling in and the joined result, or `None` when the receiver
 /// is not polymorphic, in which case the caller should emit a single `Send`.
-/// A sibling shape needs at least this fraction (1/N) of a dispatch arm's samples to earn an arm
-/// of its own. See the filter in [`emit_polymorphic_send`].
-const ARM_SHAPE_MIN_SHARE: u32 = 4;
-
 fn emit_polymorphic_send(
     fun: &mut Function,
     profiles: &mut ProfileOracle,
