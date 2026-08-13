@@ -1029,7 +1029,8 @@ pub enum FieldName {
     thread_ptr,
     len,
     SelfParam,
-    /// A VM stack slot, read relative to a frame's local EP
+    /// A VM stack slot, read relative to a frame's local EP, e.g. read back at an
+    /// exception handler entry
     StackSlot,
     Id(ID),
 }
@@ -3443,6 +3444,24 @@ pub struct Function {
     /// [`Insn::SendSymbolBlockMega`] or, failing that, the generic `invokeblock` the site would
     /// have made anyway (`restore_unspecialized_symbol_blocks`).
     symbol_block_mids: HashMap<InsnId, SymbolBlockSend>,
+    /// Set when this function is compiled as an exception handler entry
+    /// (`jit_exec_exception`). The interpreter entry block then starts in the
+    /// middle of the ISEQ instead of at an opt-table entry. See
+    /// [`ExceptionEntry`].
+    exception_entry: Option<ExceptionEntry>,
+}
+
+/// Where an exception-handler entry (`body->jit_exception`) resumes the ISEQ.
+/// The interpreter jumps to a catch-table continuation, so both the resume PC
+/// and the VM stack depth at that PC are fixed at compile time; the generated
+/// entry guards `cfp->pc` to make sure a different continuation doesn't run
+/// this code.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExceptionEntry {
+    /// Instruction index in the ISEQ where execution resumes
+    pub insn_idx: u32,
+    /// Number of VM stack slots live at `insn_idx`, i.e. `cfp->sp - vm_base_ptr(cfp)`
+    pub stack_size: usize,
 }
 
 /// The Symbol a `yield`'s Symbol-block arm matched, and the method it sends.
@@ -4448,11 +4467,17 @@ impl Function {
             inline_budget_exhausted: false,
             send_mid_overrides: HashMap::new(),
             symbol_block_mids: HashMap::default(),
+            exception_entry: None,
         }
     }
 
     pub fn iseq(&self) -> *const rb_iseq_t {
         self.iseq
+    }
+
+    /// If this function was compiled as an exception handler entry, where it resumes
+    pub fn exception_entry(&self) -> Option<ExceptionEntry> {
+        self.exception_entry
     }
 
     // Add an instruction to the function without adding it to any block
@@ -11662,6 +11687,11 @@ impl InlinedBlock {
 #[derive(Clone, Copy)]
 enum AddIseqMode {
     Standalone,
+    /// Like `Standalone`, but the interpreter entry resumes at a catch-table
+    /// continuation in the middle of the ISEQ instead of an opt-table entry.
+    /// Used to compile `body->jit_exception`. No JIT-to-JIT entry blocks are
+    /// generated: other JIT code always calls the `Standalone` version.
+    ExceptionEntry(ExceptionEntry),
     Inlined {
         return_block: BlockId,
         /// The caller's post-send `Snapshot`. Allows side-exits to restore the outer frame.
@@ -11725,6 +11755,16 @@ fn profiled_recv_takes_block_handler(
 
 /// Compile ISEQ into High-level IR
 pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
+    iseq_to_hir_with_mode(iseq, AddIseqMode::Standalone)
+}
+
+/// Compile ISEQ into High-level IR with an entry at a catch-table continuation.
+/// Used for `body->jit_exception`; see [`ExceptionEntry`].
+pub fn iseq_to_hir_exception_entry(iseq: *const rb_iseq_t, entry: ExceptionEntry) -> Result<Function, ParseError> {
+    iseq_to_hir_with_mode(iseq, AddIseqMode::ExceptionEntry(entry))
+}
+
+fn iseq_to_hir_with_mode(iseq: *const rb_iseq_t, mode: AddIseqMode) -> Result<Function, ParseError> {
     if !ZJITState::can_compile_iseq(iseq) {
         return Err(ParseError::NotAllowed);
     }
@@ -11732,8 +11772,11 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     let mut fun = Function::new(iseq);
     fun.was_invalidated_for_singleton_class_creation = payload.was_invalidated_for_singleton_class_creation;
     fun.self_is_heap_object = payload.self_is_heap_object;
+    if let AddIseqMode::ExceptionEntry(entry) = mode {
+        fun.exception_entry = Some(entry);
+    }
 
-    let result = add_iseq_to_hir(&mut fun, iseq, AddIseqMode::Standalone)?;
+    let result = add_iseq_to_hir(&mut fun, iseq, mode)?;
     fun.profiles = Some(result.profiles);
 
     if let Err(err) = crate::stats::trace_compile_phase("validate", || fun.validate()) {
@@ -11781,7 +11824,7 @@ fn add_iseq_to_hir(
     fn new_frame_state(mode: AddIseqMode, iseq: IseqPtr) -> FrameState {
         match mode {
             AddIseqMode::Inlined { caller, depth, extra_locals, .. } => FrameState::inlined(iseq, caller, depth, extra_locals),
-            AddIseqMode::Standalone => FrameState::new(iseq),
+            AddIseqMode::Standalone | AddIseqMode::ExceptionEntry(_) => FrameState::new(iseq),
         }
     }
 
@@ -11794,14 +11837,21 @@ fn add_iseq_to_hir(
     // Those entries are known to be unreachable so slicing them off here avoids
     // translating prologue blocks that would only be discarded later, rather
     // than emitting them and relying on a downstream pass to prune the dead CFG.
+    //
+    // An exception-handler entry has exactly one entry PC, the catch-table
+    // continuation the interpreter wants to resume at, which is unrelated to the
+    // opt table.
     let jit_entry_start = match mode {
-        AddIseqMode::Standalone => 0,
+        AddIseqMode::Standalone | AddIseqMode::ExceptionEntry(_) => 0,
         AddIseqMode::Inlined { jit_entry_idx, .. } => jit_entry_idx,
     };
-    let jit_entry_insns = unsafe { iseq.params() }.opt_table_slice()
-        .get(jit_entry_start..)
-        .expect("JIT entry index must be within the callee opt table")
-        .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>();
+    let jit_entry_insns = match mode {
+        AddIseqMode::ExceptionEntry(entry) => vec![entry.insn_idx],
+        _ => unsafe { iseq.params() }.opt_table_slice()
+            .get(jit_entry_start..)
+            .expect("JIT entry index must be within the callee opt table")
+            .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>(),
+    };
     let BytecodeInfo { jump_targets } = compute_bytecode_info(iseq, &jit_entry_insns);
 
     let compile_jit_entries = matches!(mode, AddIseqMode::Standalone) && iseq_supports_jit_entry(iseq);
@@ -11836,9 +11886,18 @@ fn add_iseq_to_hir(
     // optionals, reached from this one by fallthrough rather than targeted directly.
     // Standalone compilation has no single body entry block, so it produces none.
     let body_entry_block = match mode {
-        AddIseqMode::Standalone => None,
+        AddIseqMode::Standalone | AddIseqMode::ExceptionEntry(_) => None,
         AddIseqMode::Inlined { .. } => Some(insn_idx_to_block[&jit_entry_insns[0]]),
     };
+
+    // The state the exception entry block loads from the CFP, threaded into the
+    // queue below so the continuation block gets stack parameters for the VM
+    // stack slots that were live at the continuation.
+    let mut exception_entry_state = None;
+    if let AddIseqMode::ExceptionEntry(entry) = mode {
+        let target_block = insn_idx_to_block[&entry.insn_idx];
+        exception_entry_state = Some(compile_exception_entry_block(fun, entry, target_block));
+    }
 
     if matches!(mode, AddIseqMode::Standalone) {
         // Compile an entry_block for the interpreter
@@ -11873,7 +11932,11 @@ fn add_iseq_to_hir(
     // TODO(max): Basic block arguments at edges
     let mut queue = VecDeque::new();
     for &insn_idx in jit_entry_insns.iter() {
-        queue.push_back((new_frame_state(mode, iseq), insn_idx_to_block[&insn_idx], /*insn_idx=*/insn_idx, /*local_inval=*/false));
+        // The exception entry seeds the state the entry block loaded, so that the
+        // continuation block is given as many stack parameters as there are live
+        // VM stack slots at the continuation.
+        let state = exception_entry_state.take().unwrap_or_else(|| new_frame_state(mode, iseq));
+        queue.push_back((state, insn_idx_to_block[&insn_idx], /*insn_idx=*/insn_idx, /*local_inval=*/false));
     }
 
     // Keep compiling blocks until the queue becomes empty
@@ -13050,7 +13113,7 @@ fn add_iseq_to_hir(
                     fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     let val = state.stack_pop()?;
                     match mode {
-                        AddIseqMode::Standalone => fun.push_insn(block, Insn::Return { val, pop_inlined_frames: 0 }),
+                        AddIseqMode::Standalone | AddIseqMode::ExceptionEntry(_) => fun.push_insn(block, Insn::Return { val, pop_inlined_frames: 0 }),
                         AddIseqMode::Inlined { return_block, .. } => { fun.push_insn(block, Insn::Jump(BranchEdge { target: return_block, args: vec![val] })) }
                     };
                     break;  // Don't enqueue the next block as a successor
@@ -14257,7 +14320,7 @@ fn add_iseq_to_hir(
         }
     }
 
-    if matches!(mode, AddIseqMode::Standalone) {
+    if matches!(mode, AddIseqMode::Standalone | AddIseqMode::ExceptionEntry(_)) {
         // Populate the entries superblock with an Entries instruction targeting all entry blocks
         fun.seal_entries();
 
@@ -14277,6 +14340,54 @@ fn add_iseq_to_hir(
     }
 
     Ok(AddIseqResult { body_entry_block, profiles })
+}
+
+/// Compile the interpreter entry block for an exception handler entry
+/// (`body->jit_exception`). Unlike the ordinary entry block, this resumes in the
+/// middle of the ISEQ, so it reads back every local from the frame's EP and
+/// every live VM stack slot that the interpreter's unwinder wrote before it
+/// jumped to the catch-table continuation.
+///
+/// Returns the `FrameState` it loaded so that the continuation block is created
+/// with a matching number of stack parameters.
+fn compile_exception_entry_block(fun: &mut Function, entry: ExceptionEntry, target_block: BlockId) -> FrameState {
+    let entry_block = fun.entry_block;
+    // Codegen reads `fun.exception_entry` to emit the `cfp->pc` guard and to
+    // rebase the SP register onto the frame's stack base.
+    fun.push_insn(entry_block, Insn::EntryPoint { jit_entry_idx: None });
+
+    let iseq = fun.iseq;
+    let self_param = fun.load_self(entry_block);
+    let mut state = FrameState::new(iseq);
+
+    // Locals may have been escaped to the heap by a block created earlier in
+    // this frame, so read them through cfp->ep rather than through the SP
+    // shortcut that the method entry can use.
+    let ep = fun.get_ep(entry_block, 0);
+    for local_idx in 0..num_locals(iseq) {
+        let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
+        let ep_offset = u32::try_from(ep_offset)
+            .unwrap_or_else(|_| panic!("Could not convert ep_offset {ep_offset} to u32"));
+        let val = fun.get_local_from_ep(entry_block, iseq, ep, ep_offset, 0, types::BasicObject);
+        state.locals.push(val);
+    }
+
+    // Read back the VM stack slots that are live at the continuation. They were
+    // all written to the VM stack: ZJIT frames are materialized by
+    // rb_zjit_materialize_frames() during unwinding, and the throw value (if the
+    // catch type pushes one) is written by vm_exec_handle_exception().
+    if entry.stack_size > 0 {
+        let sp = fun.load_sp(entry_block);
+        for stack_idx in 0..entry.stack_size {
+            let offset = i32::try_from(stack_idx * SIZEOF_VALUE)
+                .unwrap_or_else(|_| panic!("Could not convert stack offset {stack_idx} to i32"));
+            let val = fun.load_field(entry_block, sp, FieldName::StackSlot, offset, types::BasicObject);
+            state.stack.push(val);
+        }
+    }
+
+    fun.push_insn(entry_block, Insn::Jump(BranchEdge { target: target_block, args: state.as_args(self_param) }));
+    state
 }
 
 /// Compile an entry_block for the interpreter
