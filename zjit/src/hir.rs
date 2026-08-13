@@ -4588,6 +4588,12 @@ impl Function {
                                 self.make_equal_to(insn_id, getivar);
                             }
                         } else if let (false, VM_METHOD_TYPE_ATTRSET, &[val]) = (has_block, def_type, args.as_slice()) {
+                            // A polymorphic-arm profile pins the shape the profiler saw at the
+                            // *original*, unrefined call site. attr_writer speculation adds a
+                            // shape transition keyed on that shape and invalidates the whole ISEQ
+                            // when it misses, which throws away the polymorphic profile that the
+                            // arms were built from. Only ivar reads speculate on an arm's shape.
+                            let profiled_type = profiled_type.filter(|t| !t.flags().is_polymorphic_arm());
                             // Check if we're accessing ivars of a Class or Module object as they require single-ractor mode.
                             // We omit gen_prepare_non_leaf_call on gen_getivar, so it's unsafe to raise for multi-ractor mode.
                             if klass.is_metaclass() && !self.assume_single_ractor_mode(block, state) {
@@ -8280,6 +8286,12 @@ impl ProfileOracle {
         self.types.get(&state).map(|v| v.as_slice())
     }
 
+    /// Record `summary` as the profile of `insn` at the `dst` Snapshot. Used by polymorphic
+    /// dispatch to give each refined arm a monomorphic view of the receiver.
+    fn add_entry(&mut self, dst: InsnId, insn: InsnId, summary: TypeDistributionSummary) {
+        self.types.entry(dst).or_default().push((insn, summary));
+    }
+
     /// Map the interpreter-recorded types of the stack onto the HIR operands on our compile-time virtual stack.
     fn profile_stack(&mut self, snapshot: InsnId, state: &FrameState) {
         let iseq_insn_idx = state.insn_idx;
@@ -9861,6 +9873,13 @@ fn add_iseq_to_hir(
                                 continue;
                             }
                             seen_types.push(expected);
+                            // This arm is only guarded on `expected`, which carries the class but
+                            // not the shape. Only treat the bucket's shape as representative when
+                            // every observation that lands in this arm agreed on it; otherwise a
+                            // shape guard here would keep side-exiting.
+                            let unique_shape_for_type = summary.buckets().iter()
+                                .filter(|other| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
+                                .all(|other| *other == profiled_type);
                             let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
                             let iftrue_block = fun.new_block(insn_idx);
                             let fall_through = fun.new_block(insn_idx);
@@ -9877,10 +9896,18 @@ fn add_iseq_to_hir(
                             let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
                             // Keep the other operands' profile entries visible at the fresh
                             // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
+                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). The
+                            // receiver's polymorphic entry is dropped: it must resolve from this
+                            // arm's type, and resolve_receiver_type prefers profiles over types.
                             profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                            // Re-add the receiver as a monomorphic profile of just this arm's
+                            // bucket. Type::from_profiled_type only carries the class, so without
+                            // this the arm resolves as StaticallyKnown and loses the shape,
+                            // forcing attr_reader sends into a full rb_ivar_get C call instead of
+                            // a shape-guarded field load.
+                            if unique_shape_for_type {
+                                profiles.add_entry(snapshot, recv, TypeDistributionSummary::monomorphic(profiled_type.as_polymorphic_arm()));
+                            }
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
                             let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
                             fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
