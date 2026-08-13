@@ -10315,6 +10315,7 @@ fn test_splat_with_ruby2_keywords_hash_is_not_forwarded() {
     "#), @"[:n, [1, {k: 2}]]");
 }
 
+
 #[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);

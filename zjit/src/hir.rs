@@ -1100,6 +1100,11 @@ pub enum Insn {
     /// Push `val` onto `array`, where `array` is already `Array`.
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
+    /// Like [`Insn::ArrayAref`], but `index` (already adjusted by [`Insn::AdjustBounds`]) may be
+    /// out of `0...length`, in which case the result is `nil`. Lets `ary[i]` compile without a
+    /// bounds guard, so the ordinary Ruby idiom of walking an array until it reads past the end
+    /// does not have to leave JIT code.
+    ArrayArefOrNil { array: InsnId, index: InsnId, length: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
@@ -1621,6 +1626,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*array);
                 $visit_one!(*index);
             }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                $visit_one!(*array);
+                $visit_one!(*index);
+                $visit_one!(*length);
+            }
             Insn::ArrayAset { array, index, val } => {
                 $visit_one!(*array);
                 $visit_one!(*index);
@@ -1868,6 +1878,7 @@ impl Insn {
             Insn::ArrayExtend { .. } => effects::Any,
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
+            Insn::ArrayArefOrNil { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
@@ -2153,6 +2164,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::ArrayAref { array, index, .. } => {
                 write!(f, "ArrayAref {array}, {index}")
+            }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                write!(f, "ArrayArefOrNil {array}, {index}, {length}")
             }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
@@ -4454,6 +4468,7 @@ impl Function {
             Insn::NewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
+            Insn::ArrayArefOrNil { .. } => types::BasicObject,
             Insn::ArrayPop { .. } => types::BasicObject,
             Insn::ArrayLength { .. } => types::CInt64,
             Insn::AdjustBounds { .. } => types::CInt64,
@@ -7854,6 +7869,20 @@ impl Function {
                             _ => None,
                         })
                     }
+                    &Insn::ArrayArefOrNil { array, index, .. }
+                        if self.type_of(array).ruby_object_known()
+                            && self.type_of(index).is_subtype(types::CInt64) => {
+                        let array_obj = self.type_of(array).ruby_object().unwrap();
+                        match (array_obj.is_frozen(), self.type_of(index).cint64_value()) {
+                            (true, Some(index)) => {
+                                // rb_yarv_ary_entry_internal returns nil out of bounds, which is
+                                // exactly what ArrayArefOrNil does.
+                                let val = unsafe { rb_yarv_ary_entry_internal(array_obj, index) };
+                                self.new_insn(Insn::Const { val: Const::Value(val) })
+                            }
+                            _ => insn_id,
+                        }
+                    }
                     &Insn::ArrayAref { array, index }
                         if self.type_of(array).ruby_object_known()
                             && self.type_of(index).is_subtype(types::CInt64) => {
@@ -8825,6 +8854,11 @@ impl Function {
             Insn::ArrayAref { array, index } => {
                 self.assert_subtype(insn_id, array, types::Array)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
+            }
+            Insn::ArrayArefOrNil { array, index, length } => {
+                self.assert_subtype(insn_id, array, types::Array)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
+                self.assert_subtype(insn_id, length, types::CInt64)
             }
             Insn::ArrayAset { array, index, .. } => {
                 self.assert_subtype(insn_id, array, types::ArrayExact)?;
