@@ -7937,7 +7937,9 @@ fn test_invokesuper_with_local_written_by_blockiseq() {
 
 #[test]
 fn test_max_iseq_versions() {
-    let max_versions = max_iseq_versions();
+    // A version killed by PatchPoint invalidation is replaced rather than counted against
+    // the respecialization budget, so the total budget is the sum of the two limits.
+    let max_versions = max_iseq_versions() + MAX_INVALIDATION_RECOMPILES as usize;
     eval(&format!("
         TEST = -1
         def test = TEST
@@ -7954,10 +7956,10 @@ fn test_max_iseq_versions() {
         end
     "));
 
-    // It should not exceed MAX_ISEQ_VERSIONS
+    // It should not exceed MAX_ISEQ_VERSIONS + MAX_INVALIDATION_RECOMPILES
     let iseq = get_method_iseq("self", "test");
     let payload = get_or_create_iseq_payload(iseq);
-    assert_eq!(payload.versions.len(), max_iseq_versions());
+    assert_eq!(payload.versions.len(), max_versions);
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
@@ -7984,9 +7986,19 @@ fn test_ivar_respecialization_beyond_max_versions() {
           TEST = i
           i += 1
         end
+
+        # Compile the frozen version while the profile has still only seen A.
+        i = 0
+        while i < 200
+          a.read
+          i += 1
+        end
     "));
     let iseq = get_instance_method_iseq("Base", "read");
-    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), max_versions);
+    // Each constant redefinition also earns the ISEQ a replacement version, so the count
+    // here is max_versions plus however many of those it took to reach the frozen version.
+    let frozen_versions = get_or_create_iseq_payload(iseq).versions.len();
+    assert!(frozen_versions >= max_versions, "expected at least {max_versions} versions, got {frozen_versions}");
 
     // Now feed it a shape the frozen dispatch has no arm for, at a different ivar index. The
     // fallback path samples it and earns the ISEQ an extra version, so it exceeds the plain
@@ -8002,8 +8014,8 @@ fn test_ivar_respecialization_beyond_max_versions() {
     let payload = get_or_create_iseq_payload(iseq);
     assert!(payload.ivar_respecializations >= 1, "expected an ivar respecialization");
     assert!(payload.ivar_respecializations <= crate::payload::MAX_IVAR_RESPECIALIZATIONS);
-    assert!(payload.versions.len() > max_versions);
-    assert!(payload.versions.len() <= max_versions + crate::payload::MAX_IVAR_RESPECIALIZATIONS as usize);
+    assert!(payload.versions.len() > frozen_versions);
+    assert!(payload.versions.len() <= payload.version_limit());
     assert_snapshot!(assert_compiles_allowing_exits("[A.new.read, B.new.read]"), @"[5, 6]");
 }
 

@@ -43,7 +43,20 @@ pub struct IseqPayload {
     /// fallback path, so once the evidence says a recompile would not help, later compiles of
     /// this ISEQ leave the sampling out.
     pub ivar_reprofile_giveup: bool,
+    /// Number of extra versions granted because a PatchPoint invalidation would
+    /// otherwise have left this ISEQ permanently side-exiting. See
+    /// [`crate::codegen::invalidate_iseq_version`]. Unlike `num_exits_until_invalidate`,
+    /// which budgets the recompile side exits a compiled version tolerates before
+    /// `exit_recompile` invalidates it, this counts replacement versions granted after an
+    /// external invalidation (a redefined constant or method) at the version limit.
+    pub invalidation_recompiles: u8,
 }
+
+/// Upper bound on the extra versions [`IseqPayload::invalidation_recompiles`] can grant.
+/// Invalidation is an external event (a constant or method was redefined), not a
+/// mis-speculation, so it should not consume the respecialization budget. We still cap
+/// the total so that an ISEQ whose assumptions keep getting busted cannot recompile forever.
+pub const MAX_INVALIDATION_RECOMPILES: u8 = 8;
 
 /// The interpreter state observed at one exception-handler entry.
 #[derive(Clone, Debug)]
@@ -79,6 +92,7 @@ impl IseqPayload {
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
             ivar_respecializations: 0,
             ivar_reprofile_giveup: false,
+            invalidation_recompiles: 0,
         }
     }
 
@@ -103,9 +117,12 @@ impl IseqPayload {
     }
 
     /// Number of versions this ISEQ may compile, including any it earned by proving from
-    /// its ivar fallback path that a recompile would specialize a shape it is missing.
+    /// its ivar fallback path that a recompile would specialize a shape it is missing, and
+    /// any granted because a PatchPoint invalidation left a version permanently exiting.
     pub fn version_limit(&self) -> usize {
-        crate::codegen::max_iseq_versions() + self.ivar_respecializations as usize
+        crate::codegen::max_iseq_versions()
+            + self.ivar_respecializations as usize
+            + self.invalidation_recompiles as usize
     }
 }
 
