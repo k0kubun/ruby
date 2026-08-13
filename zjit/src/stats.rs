@@ -311,6 +311,7 @@ make_counters! {
         send_fallback_sendforward_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
+        send_fallback_unprofiled_method_name,
         send_fallback_uncategorized,
     }
 
@@ -804,6 +805,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,
+        SendUnprofiledMethodName                  => send_fallback_unprofiled_method_name,
         Uncategorized(_)                          => send_fallback_uncategorized,
     }
 }
