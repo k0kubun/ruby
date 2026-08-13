@@ -158,6 +158,7 @@ make_counters! {
         failed_iseq_count,
         ivar_respecialize_count,
         skipped_native_stack_full,
+        invalidation_recompiles_granted,
 
         compile_time_ns,
         profile_time_ns,
