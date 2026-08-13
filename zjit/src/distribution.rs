@@ -85,6 +85,14 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
         Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
     }
 
+    /// A summary that describes a single item, as if the profiler had only ever seen `item`.
+    /// Used to hand a guarded arm of a polymorphic dispatch the one type it guarded on.
+    pub fn monomorphic(item: T) -> Self {
+        let mut buckets = [Default::default(); N];
+        buckets[0] = item;
+        Self { kind: DistributionKind::Monomorphic, buckets }
+    }
+
     pub fn new(dist: &Distribution<T, N>) -> Self {
         #[cfg(debug_assertions)]
         {

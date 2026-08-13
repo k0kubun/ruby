@@ -8259,21 +8259,20 @@ impl ProfileOracle {
         }
     }
 
-    /// Copy the profile entries recorded for the `src` Snapshot to the `dst` Snapshot, excluding
-    /// entries for `exclude` (chased through guards). Used by polymorphic dispatch, where each
-    /// refined arm gets a fresh Snapshot: the receiver must resolve from its refined type rather
-    /// than the polymorphic profile, but the other operands' profiles should remain visible so
-    /// argument-profile-dependent specializations (e.g. Array#[]) still apply.
-    fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function) {
-        let Some(entries) = self.types.get(&src) else { return };
-        let exclude = fun.chase_insn(exclude);
-        let filtered: Vec<_> = entries.iter()
-            .filter(|(insn, _)| fun.chase_insn(*insn) != exclude)
-            .cloned()
-            .collect();
-        if !filtered.is_empty() {
-            self.types.insert(dst, filtered);
-        }
+    /// Copy the profile entries recorded for the `src` Snapshot to the `dst` Snapshot, replacing
+    /// the entry for `recv` (chased through guards) with `recv_summary`. Used by polymorphic
+    /// dispatch, where each refined arm gets a fresh Snapshot: the receiver must not resolve from
+    /// the polymorphic profile recorded at the shared exit, but the other operands' profiles
+    /// should remain visible so argument-profile-dependent specializations (e.g. Array#[]) still
+    /// apply. Handing the arm a monomorphic summary of the type it guarded on keeps the profiled
+    /// shape available, which is what lets ivar reads on the refined receiver stay inline loads.
+    fn copy_entries_with_recv(&mut self, src: InsnId, dst: InsnId, recv: InsnId, recv_summary: TypeDistributionSummary, fun: &Function) {
+        let chased_recv = fun.chase_insn(recv);
+        let mut entries: Vec<_> = self.types.get(&src)
+            .map(|entries| entries.iter().filter(|(insn, _)| fun.chase_insn(*insn) != chased_recv).cloned().collect())
+            .unwrap_or_default();
+        entries.push((recv, recv_summary));
+        self.types.insert(dst, entries);
     }
 }
 
@@ -9747,10 +9746,13 @@ fn add_iseq_to_hir(
                             let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
                             // Keep the other operands' profile entries visible at the fresh
                             // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). The
+                            // receiver's entry is narrowed to the one type this arm guarded on:
+                            // the polymorphic summary must not leak in, but dropping the entry
+                            // entirely would leave the arm with only the refined class, and a
+                            // class without a shape turns every ivar read on it into an
+                            // rb_ivar_get call.
+                            profiles.copy_entries_with_recv(exit_id, snapshot, recv, TypeDistributionSummary::monomorphic(profiled_type), fun);
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
                             let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), state: snapshot, reason: Uncategorized(opcode.into()) });
                             fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
