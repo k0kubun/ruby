@@ -135,11 +135,23 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
     /// generally to hand a single, already-narrowed observation to consumers that
     /// expect a distribution.
     pub fn monomorphic(item: T) -> Self {
-        let mut buckets = [Default::default(); N];
+        Self::monomorphic_variants(&[item])
+    }
+
+    /// Build a monomorphic summary out of several items that a consumer treats as one. Dispatch
+    /// arms use this: the arm has already branched on the Ruby class, so every item in it is the
+    /// same class as far as method lookup is concerned (hence `Monomorphic`), but the items still
+    /// differ in the shape they carry, and a consumer that specializes on shape wants all of them.
+    /// `items` beyond the bucket count are dropped, most significant first.
+    pub fn monomorphic_variants(items: &[T]) -> Self {
         assert!(N > 0);
-        buckets[0] = item;
+        assert!(!items.is_empty(), "a monomorphic summary needs at least one item");
+        let mut buckets = [Default::default(); N];
         let mut counts = [0; N];
-        counts[0] = 1;
+        for (i, &item) in items.iter().take(N).enumerate() {
+            buckets[i] = item;
+            counts[i] = 1;
+        }
         Self { kind: DistributionKind::Monomorphic, buckets, counts, other: 0 }
     }
 
