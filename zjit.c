@@ -155,6 +155,15 @@ rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, void *code_ptr)
     ISEQ_BODY(iseq)->jit_entry = (rb_jit_func_t)code_ptr;
 }
 
+// Point an ISEQ's exception handler entry at newly compiled code. ZJIT calls
+// this when it extends the ISEQ's dispatch chain with another continuation,
+// which happens from JIT code rather than from rb_zjit_compile_iseq().
+void
+rb_zjit_set_jit_exception(const rb_iseq_t *iseq, void *code_ptr)
+{
+    iseq->body->jit_exception = (rb_jit_func_t)code_ptr;
+}
+
 extern VALUE *rb_vm_base_ptr(struct rb_control_frame_struct *cfp);
 
 // Convert a given ISEQ's instructions to zjit_* instructions
