@@ -644,6 +644,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
+        Insn::ArrayArefOrNil { array, index, length } => gen_array_aref_or_nil(jit, asm, opnd!(array), opnd!(index), opnd!(length)),
         Insn::ArrayAset { array, index, val } => {
             no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
         }
@@ -2682,6 +2683,52 @@ fn gen_array_aref(
     let elem_offset = asm.lshift(unboxed_idx, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
     let elem_ptr = asm.add(array_ptr, elem_offset);
     asm.load(Opnd::mem(VALUE_BITS, elem_ptr, 0))
+}
+
+/// Compile `array[index]` where `index` is already adjusted for negative values but is not known
+/// to be within `0...length`. Produces nil when it is not, matching `Array#[]`, so an
+/// out-of-bounds read does not have to side-exit. The in-bounds path costs the same two
+/// comparisons a bounds guard did; only their not-taken targets differ.
+fn gen_array_aref_or_nil(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    array: Opnd,
+    index: Opnd,
+    length: Opnd,
+) -> lir::Opnd {
+    let index = asm.load_mem(index);
+    let length = asm.load_mem(length);
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let oob_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let oob_edge = Target::Block(Box::new(lir::BranchEdge { target: oob_block, args: vec![] }));
+    let result_edge = |val| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+
+    asm.cmp(index, length);
+    asm.jge(jit, oob_edge.clone());
+    asm.cmp(index, Opnd::Imm(0));
+    asm.jl(jit, oob_edge);
+
+    let array = asm.load_mem(array);
+    let array_ptr = gen_array_ptr(asm, array);
+    let elem_offset = asm.lshift(index, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let elem_ptr = asm.add(array_ptr, elem_offset);
+    let elem = asm.load(Opnd::mem(VALUE_BITS, elem_ptr, 0));
+    asm.jmp(result_edge(elem));
+
+    asm.set_current_block(oob_block);
+    let label = jit.get_label(asm, oob_block, hir_block_id);
+    asm.write_label(label);
+    asm.jmp(result_edge(Qnil.into()));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 fn gen_array_aset(
