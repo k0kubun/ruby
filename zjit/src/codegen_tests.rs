@@ -10074,3 +10074,147 @@ fn test_narrowed_test_high_bits() {
          test(1.5), test(1.5e300), test(nil), test(false), test(true)]
     "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
 }
+
+#[test]
+fn test_send_with_profiled_method_name() {
+    eval("
+        class SendProfiled
+          def double(n) = n * 2
+        end
+        def entry(c) = c.send(:double, 21)
+        C1 = SendProfiled.new
+        5.times { entry(C1) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C1)"), @"42");
+}
+
+#[test]
+fn test_send_with_two_profiled_method_names() {
+    eval("
+        class SendTwoNames
+          def a(n) = n + 1
+          def b(n) = n + 2
+        end
+        def call_by_name(c, name) = c.send(name, 10)
+        C2 = SendTwoNames.new
+        def entry = (1..10).map { |i| call_by_name(C2, i.even? ? :a : :b) }.uniq.sort
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[11, 12]");
+}
+
+#[test]
+fn test_send_can_call_private_method() {
+    eval("
+        class SendPrivate
+          private def secret = :shh
+        end
+        def entry(c) = c.send(:secret)
+        C3 = SendPrivate.new
+        5.times { entry(C3) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C3)"), @":shh");
+}
+
+#[test]
+fn test_send_with_unprofiled_method_name_falls_back() {
+    // The dispatch chain only covers the names seen while profiling; anything else has to
+    // reach the generic send in the fall-through arm and still produce the right answer.
+    eval("
+        class SendUnprofiled
+          def a = :a
+          def b = :b
+        end
+        def entry(c, name) = c.send(name)
+        C4 = SendUnprofiled.new
+        20.times { entry(C4, :a) }
+    ");
+    assert_snapshot!(assert_compiles("[entry(C4, :a), entry(C4, :b)]"), @"[:a, :b]");
+}
+
+#[test]
+fn test_send_with_string_method_name() {
+    // String names are never recorded by the profiler, so this stays a dynamic send.
+    eval("
+        class SendStringName
+          def a = :a
+        end
+        def entry(c, name) = c.send(name)
+        C5 = SendStringName.new
+        20.times { entry(C5, 'a') }
+    ");
+    assert_snapshot!(assert_compiles("entry(C5, 'a')"), @":a");
+}
+
+#[test]
+fn test_send_to_cfunc() {
+    eval("
+        def entry(s) = s.send(:upcase)
+        5.times { entry('ab') }
+    ");
+    assert_snapshot!(assert_compiles("entry('ab')"), @r#""AB""#);
+}
+
+#[test]
+fn test_send_with_multiple_arguments() {
+    eval("
+        class SendManyArgs
+          def add(a, b, c) = a + b + c
+        end
+        def entry(o) = o.send(:add, 1, 2, 3)
+        C6 = SendManyArgs.new
+        5.times { entry(C6) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C6)"), @"6");
+}
+
+#[test]
+fn test_send_picks_up_redefinition() {
+    eval("
+        class SendRedefined
+          def a = 1
+        end
+        def entry(c) = c.send(:a)
+        C7 = SendRedefined.new
+        20.times { entry(C7) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = entry(C7)
+        class SendRedefined
+          def a = 2
+        end
+        [before, entry(C7)]
+    "), @"[1, 2]");
+}
+
+#[test]
+fn test_send_picks_up_redefinition_of_send_itself() {
+    eval("
+        class SendOverridden
+          def a = :a
+        end
+        def entry(c) = c.send(:a)
+        C9 = SendOverridden.new
+        20.times { entry(C9) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = entry(C9)
+        class SendOverridden
+          def send(name) = :overridden
+        end
+        [before, entry(C9)]
+    "), @"[:a, :overridden]");
+}
+
+#[test]
+fn test_send_nested_is_not_specialized() {
+    eval("
+        class SendNested
+          def a = :a
+        end
+        def entry(c) = c.send(:send, :a)
+        C8 = SendNested.new
+        20.times { entry(C8) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C8)"), @":a");
+}
