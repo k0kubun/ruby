@@ -1376,6 +1376,41 @@ fn test_inline_block_non_local_return_keeps_frames_walkable() {
 }
 
 #[test]
+fn test_inline_block_non_local_return_restores_the_callers_sp() {
+    // A non-local `return` out of an inlined block returns with the inlined frames still
+    // pushed, and it has to hand the SP register back the way it received it: a direct
+    // JIT-to-JIT caller restores its own SP with a fixed `sub` after the call. `find`
+    // below is padded past the inline threshold so `test` really does call it directly,
+    // and `test` then spills `hit` and `count` for the block to read out of its EP, which
+    // only lands in the right slots if SP survived the call.
+    set_call_threshold(2);
+    eval("
+        def each3
+          yield 1
+          yield 2
+        end
+        def find(key)
+          pad0 = key.to_s
+          pad1 = pad0.size
+          pad2 = pad1 + 1
+          pad3 = pad2 * 2
+          pad4 = pad3 - 1
+          each3 { |v| return [v, key, pad4] if v == 2 }
+          [pad0, pad1, pad2, pad3, pad4]
+        end
+        def test(key)
+          hit = find(key)
+          count = 0
+          [1, 2].each { count += hit.size }
+          [hit, count]
+        end
+        test(:a)
+        test(:a)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test(:ab)"), @r#"[[2, :ab, 5], 6]"#);
+}
+
+#[test]
 fn test_inline_block_raise_unwinds_through_inlined_frames() {
     set_call_threshold(2);
     eval("
