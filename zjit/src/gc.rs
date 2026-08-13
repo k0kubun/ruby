@@ -332,7 +332,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     let mut payload = unsafe { Box::from_raw(payload_ptr) };
     unsafe { rb_iseq_set_zjit_payload(iseq, std::ptr::null_mut()) };
 
-    for version in payload.versions.iter_mut() {
+    for version in payload.all_versions_mut() {
         let version = unsafe { version.as_mut() };
         version.iseq = null();
         // GC offsets are only read by iseq_mark(), which the GC reaches through
@@ -429,7 +429,7 @@ fn iseq_mark(payload: &mut IseqPayload) {
     // Mark objects baked in JIT code
     time_gc_phase(gc_iseq_mark_offsets_time_ns, || {
         let mut marked = 0u64;
-        for version in payload.versions.iter() {
+        for version in payload.all_versions() {
             let gc_offsets = &unsafe { version.as_ref() }.gc_offsets;
             marked += gc_offsets.len() as u64;
             gc_offsets.mark();
@@ -448,7 +448,7 @@ fn iseq_update_references(payload: &mut IseqPayload) {
         }
     });
 
-    for &version in payload.versions.iter() {
+    for &version in payload.all_versions() {
         iseq_version_update_references(version);
     }
 }
