@@ -167,8 +167,13 @@ pub fn memory_breakdown() -> MemoryBreakdown {
         out.profile_monomorphic_distribution_count += profile.monomorphic_distribution_count;
         out.profile_marked_object_count += profile.marked_object_count;
 
-        out.iseq_version_bytes += payload.versions.capacity() * size_of::<crate::payload::IseqVersionRef>();
-        for version in payload.versions.iter() {
+        // Both version lists, plus the continuation table that indexes the
+        // exception entries. `all_versions()` is what the GC callbacks walk, so
+        // accounting has to match it or exception handler code goes missing.
+        out.iseq_version_bytes += payload.versions.capacity() * size_of::<crate::payload::IseqVersionRef>()
+            + payload.exception_versions.capacity() * size_of::<crate::payload::IseqVersionRef>()
+            + payload.exception_entries.capacity() * size_of::<crate::payload::ExceptionEntryCode>();
+        for version in payload.all_versions() {
             let version = unsafe { version.as_ref() };
             out.version_count += 1;
             out.iseq_version_bytes += size_of::<crate::payload::IseqVersion>()

@@ -1761,6 +1761,27 @@ fn test_exception_entry_at_retry_continuation() {
 }
 
 #[test]
+fn test_exception_entry_dispatches_over_several_continuations() {
+    set_call_threshold(2);
+    // Both breaks resume in the same ISEQ at different continuations, so the
+    // dispatch chain has to hold an entry for each of them.
+    let result = assert_compiles_exception_entry("
+        def two_breaks(arr)
+          a = arr.each { |x| break x * 10 if x == 2 }
+          b = arr.each { |x| break x * 100 if x == 3 }
+          [a, b]
+        end
+        def test = two_breaks([1, 2, 3])
+        test
+        test
+        test
+    ", "test");
+    assert_snapshot!(result, @"[20, 300]");
+    assert!(crate::state::ZJITState::get_counters().compiled_exception_entry_count >= 2,
+        "expected an entry for each continuation, but only one was compiled");
+}
+
+#[test]
 fn test_exception_entry_with_non_local_return() {
     set_call_threshold(2);
     assert_snapshot!(assert_compiles_exception_entry("
