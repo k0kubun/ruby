@@ -7919,6 +7919,37 @@ fn test_send_no_profiles_with_disabled_specialized_instruction() {
 }
 
 #[test]
+fn test_array_aref_out_of_bounds_reads_nil() {
+    assert_snapshot!(inspect(r#"
+      def test(ary, idx) = ary[idx]
+      ary = [1, 2, 3]
+      test(ary, 0)
+      test(ary, 0)
+      [test(ary, 0), test(ary, 2), test(ary, 3), test(ary, 100),
+       test(ary, -1), test(ary, -3), test(ary, -4), test(ary, -100),
+       test([], 0), test([], -1)]
+    "#), @"[1, 3, nil, nil, 3, 1, nil, nil, nil, nil]");
+}
+
+#[test]
+fn test_array_aref_walks_off_the_end_without_exiting() {
+    assert_snapshot!(inspect(r#"
+      def test(ary)
+        out = []
+        idx = 0
+        while (elem = ary[idx])
+          out << elem
+          idx += 1
+        end
+        out
+      end
+      test([1, 2, 3])
+      test([1, 2, 3])
+      test([4, 5])
+    "#), @"[4, 5]");
+}
+
+#[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
 }
