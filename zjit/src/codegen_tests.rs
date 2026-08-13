@@ -9617,6 +9617,69 @@ fn test_array_aref_walks_off_the_end_without_exiting() {
 }
 
 #[test]
+fn test_splat_forwarded_to_rest_parameter() {
+    assert_snapshot!(inspect(r#"
+      def callee(name, *args) = [name, args]
+      def test(name, args) = callee(name, *args)
+      test(:a, [1])
+      test(:a, [1])
+      [test(:a, []), test(:b, [1]), test(:c, [1, 2, 3]),
+       test(:d, [{x: 1}]), test(:e, [nil])]
+    "#), @"[[:a, []], [:b, [1]], [:c, [1, 2, 3]], [:d, [{x: 1}]], [:e, [nil]]]");
+}
+
+#[test]
+fn test_splat_forwarded_to_rest_parameter_after_extra_positionals() {
+    assert_snapshot!(inspect(r#"
+      def callee(name, *args) = [name, args]
+      def test(name, obj, args) = callee(name, obj, *args)
+      test(:a, :o, [1])
+      test(:a, :o, [1])
+      [test(:a, :o, []), test(:b, :o, [1]), test(:c, :o, [1, 2])]
+    "#), @"[[:a, [:o]], [:b, [:o, 1]], [:c, [:o, 1, 2]]]");
+}
+
+#[test]
+fn test_splat_forwarded_to_rest_parameter_is_a_copy() {
+    assert_snapshot!(inspect(r#"
+      def callee(*args)
+        args << :added
+        args
+      end
+      def test(args) = callee(*args)
+      ary = [1, 2]
+      test(ary)
+      test(ary)
+      [test(ary), ary]
+    "#), @"[[1, 2, :added], [1, 2]]");
+}
+
+#[test]
+fn test_splat_forwarded_through_two_frames_with_varying_length() {
+    assert_snapshot!(inspect(r#"
+      def inner(name, *args) = [name, args]
+      def middle(name, *args) = inner(name, *args)
+      def test(name, args) = middle(name, *args)
+      3.times { test(:warm, [1]) }
+      3.times { test(:warm, [1, 2]) }
+      [test(:a, []), test(:b, [1]), test(:c, [1, 2, 3])]
+    "#), @"[[:a, []], [:b, [1]], [:c, [1, 2, 3]]]");
+}
+
+#[test]
+fn test_splat_with_ruby2_keywords_hash_is_not_forwarded() {
+    assert_snapshot!(inspect(r#"
+      def target(*args, **kw) = [args, kw]
+      def callee(name, *args) = [name, args]
+      ruby2_keywords def fwd(*args) = callee(:n, *args)
+      def test(*args) = fwd(*args)
+      test(1, k: 2)
+      test(1, k: 2)
+      test(1, k: 2)
+    "#), @"[:n, [1, {k: 2}]]");
+}
+
+#[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
 }
