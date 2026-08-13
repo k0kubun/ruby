@@ -539,7 +539,7 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
         crate::stats::incr_counter!(ivar_respecialize_count);
         if let Some(version) = payload.versions.last_mut() {
             let cb = crate::state::ZJITState::get_code_block();
-            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
+            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version, crate::codegen::InvalidationCause::Respecialize);
             cb.mark_all_executable();
         }
     });
@@ -684,7 +684,7 @@ pub extern "C" fn rb_zjit_block_reprofile(version: *mut crate::payload::IseqVers
             let cb = crate::state::ZJITState::get_code_block();
             // The respecialization budget was just raised above, so this is not the
             // grant path in invalidate_iseq_version(): it simply fits under the new limit.
-            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
+            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version, crate::codegen::InvalidationCause::Respecialize);
             cb.mark_all_executable();
         }
         false
