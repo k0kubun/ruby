@@ -3054,9 +3054,12 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                 }
                 else {
                     /* TAG_BREAK */
+                    // Materialize before pushing the value: zjit_materialize_frames()
+                    // writes the frame's stack map into the slots below cfp->sp, so
+                    // pushing first would make it overwrite the value we just pushed.
+                    rb_zjit_materialize_frames(ec, cfp);
                     *cfp->sp++ = THROW_DATA_VAL(err);
                     ec->errinfo = Qnil;
-                    rb_zjit_materialize_frames(ec, cfp);
                     return Qundef;
                 }
             }
