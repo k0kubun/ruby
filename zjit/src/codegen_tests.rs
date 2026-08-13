@@ -6786,6 +6786,27 @@ fn test_binding_sees_locals_written_through_the_ep_chain() {
     "), @"[7, 7]");
 }
 
+// Codegen builds control flow inside a single HIR block, so "already spilled in this
+// HIR block" is not enough to skip a store. gen_new_range() puts the rb_range_new()
+// call -- and the spill that comes with it -- in its own LIR block, and the fixnum/nil
+// fast path jumps straight to the join. A spill after the join has to write every slot
+// again, or the block below reads `total` out of an EP slot that still holds nil.
+#[test]
+fn test_locals_spilled_after_a_range_fast_path() {
+    assert_snapshot!(inspect("
+        def test(ary)
+          i = ary.index(3)
+          total = 0
+          ary[i..].each do |v|
+            total += v
+          end
+          total
+        end
+        test([1, 2, 3, 4]); test([1, 2, 3, 4])
+        test([1, 2, 3, 4])
+    "), @"7");
+}
+
 // Consecutive calls reuse the block handler derived from CFP, but each has to install
 // its own block ISEQ in cfp->block_code.
 #[test]

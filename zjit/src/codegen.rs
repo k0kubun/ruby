@@ -66,17 +66,45 @@ struct JITState {
     /// current frame's depth.
     jit_frame_size: usize,
 
+    /// What each LIR block already knows about the frame, indexed by [`lir::BlockId`].
+    /// See [`FrameCaches`].
+    frame_caches: Vec<FrameCaches>,
+}
+
+/// Values codegen has already emitted for the current frame and can reuse instead of
+/// emitting again.
+///
+/// These are kept per LIR block, not per HIR block. Codegen builds control flow *inside*
+/// one HIR block -- `gen_new_range()` puts the `rb_range_new()` call behind a fixnum/nil
+/// fast path, `gc_fastpath` puts the allocation slow path in its own block, and so on --
+/// so what one of those blocks emitted has not necessarily run by the time the join
+/// block executes.
+///
+/// A new block instead inherits the caches of the block that creates it. Codegen only
+/// ever creates a block from the head of the region it is building, which dominates
+/// every block in it, so everything the creating block had emitted at that point runs on
+/// all paths into the new block. Anything a block emits afterwards stays private to it.
+#[derive(Clone, Default)]
+struct FrameCaches {
     /// `VM_CFP_TO_CAPTURED_BLOCK(cfp)`, which only depends on the CFP register, kept
-    /// around so that a run of sends with a block in one basic block computes it once.
-    /// Holds the `Assembler::cfp_generation()` it was computed at: a write to the CFP
-    /// register (a direct JIT-to-JIT call, for instance) makes it stale.
+    /// around so that a run of sends with a block computes it once. Holds the
+    /// `Assembler::cfp_generation()` it was computed at: a write to the CFP register
+    /// (a direct JIT-to-JIT call, for instance) makes it stale.
     block_handler_specval: Option<(u64, Opnd)>,
 
-    /// The locals already written to their EP slots, as the (ISEQ, depth) of the frame
-    /// they belong to and the [`InsnId`] spilled into each local slot. Lets a later
-    /// spill of the same values in the same basic block skip the stores. Cleared at
-    /// every basic block start.
-    spilled_locals: Option<(IseqPtr, usize, Vec<InsnId>)>,
+    /// What [`gen_spill_locals`] last wrote to the frame's EP slots.
+    spilled_locals: Option<SpilledLocals>,
+}
+
+/// A record of what [`gen_spill_locals`] wrote to a frame's EP slots.
+#[derive(Clone)]
+struct SpilledLocals {
+    /// The frame the slots belong to. Frame states for different frames map to
+    /// different slots, so a record only applies to the frame that built it.
+    iseq: IseqPtr,
+    depth: usize,
+    /// The [`InsnId`] spilled into each local slot.
+    locals: Vec<InsnId>,
 }
 
 impl JITState {
@@ -89,16 +117,31 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
-            block_handler_specval: None,
-            spilled_locals: None,
+            frame_caches: Vec::default(),
         }
     }
 
-    /// Forget what we know about the frame's registers and VM stack slots. Called at
-    /// every basic block boundary, where the predecessors' state is unknown.
-    fn reset_frame_caches(&mut self) {
-        self.block_handler_specval = None;
-        self.spilled_locals = None;
+    /// Create a LIR basic block that inherits the current block's [`FrameCaches`].
+    /// Every LIR block codegen creates outside of [`gen_function`]'s per-HIR-block loop
+    /// has to go through here: `Assembler::new_block()` alone would leave the new block
+    /// looking at whatever the last block to emit code happened to cache.
+    fn new_block(&mut self, asm: &mut Assembler, hir_block_id: hir::BlockId, is_entry: bool, rpo_index: usize) -> lir::BlockId {
+        let inherited = self.frame_caches(asm).clone();
+        let block_id = asm.new_block(hir_block_id, is_entry, rpo_index);
+        *self.frame_caches_for(block_id) = inherited;
+        block_id
+    }
+
+    /// The [`FrameCaches`] of the block codegen is currently emitting into.
+    fn frame_caches(&mut self, asm: &Assembler) -> &mut FrameCaches {
+        self.frame_caches_for(asm.current_block_id())
+    }
+
+    fn frame_caches_for(&mut self, block_id: lir::BlockId) -> &mut FrameCaches {
+        if self.frame_caches.len() <= block_id.0 {
+            self.frame_caches.resize_with(block_id.0 + 1, FrameCaches::default);
+        }
+        &mut self.frame_caches[block_id.0]
     }
 
     /// Retrieve the output of a given instruction that has been compiled
@@ -137,7 +180,7 @@ impl Assembler {
         let hir_block_id = self.current_block().hir_block_id;
         let rpo_idx = self.current_block().rpo_index;
 
-        let fall_through_target = self.new_block(hir_block_id, false, rpo_idx);
+        let fall_through_target = jit.new_block(self, hir_block_id, false, rpo_idx);
         let fall_through_edge = lir::BranchEdge {
             target: fall_through_target,
             args: vec![],
@@ -460,9 +503,6 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             // Write a label to jump to the basic block
             let label = jit.get_label(&mut asm, lir_block_id, block_id);
             asm.write_label(label);
-
-            // Whatever the predecessors cached about the frame doesn't carry into this block.
-            jit.reset_frame_caches();
 
             let block = function.block(block_id);
             asm_comment!(
@@ -970,7 +1010,7 @@ fn gen_guard_not_ruby2_keywords_hash(
     // Create a result block that all the "not a flagged hash" paths converge to
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
-    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let result_edge = Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
     if !val_type.is_subtype(types::HeapBasicObject) {
@@ -1210,14 +1250,15 @@ fn gen_block_handler_specval(jit: &mut JITState, asm: &mut Assembler, blockiseq:
     asm.store(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), VALUE::from(blockiseq).into());
     // The handler is just `&cfp->self | 1`, the same value for every block this frame
     // passes, so reuse it until something writes the CFP register.
-    if let Some((generation, specval)) = jit.block_handler_specval {
+    if let Some((generation, specval)) = jit.frame_caches(asm).block_handler_specval {
         if generation == asm.cfp_generation() {
             return specval;
         }
     }
     let cfp_self_addr = asm.lea(Opnd::mem(VALUE_BITS, CFP, RUBY_OFFSET_CFP_SELF));
     let specval = asm.or(cfp_self_addr, Opnd::Imm(1));
-    jit.block_handler_specval = Some((asm.cfp_generation(), specval));
+    let generation = asm.cfp_generation();
+    jit.frame_caches(asm).block_handler_specval = Some((generation, specval));
     specval
 }
 
@@ -1519,7 +1560,7 @@ fn gen_write_barrier(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, val: O
         // Create a result block that all paths converge to
         let hir_block_id = asm.current_block().hir_block_id;
         let rpo_idx = asm.current_block().rpo_index;
-        let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
         let result_edge = Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
         // If non-false immediate, don't fire write barrier
@@ -1533,7 +1574,7 @@ fn gen_write_barrier(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, val: O
         // Both objects are on the heap. If the GC lets us decide inline whether the
         // barrier has anything to do, check that and put the call in its own block.
         if let Some(fastpath) = gc_fastpath::prepare_write_barrier_fastpath() {
-            let call_block = asm.new_block(hir_block_id, false, rpo_idx);
+            let call_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
             let call_edge = Target::Block(Box::new(lir::BranchEdge { target: call_block, args: vec![] }));
             let val = asm.load_mem(val);
             gc_fastpath::gc_fastpath_write_barrier(jit, asm, &fastpath, recv, val, &result_edge, &call_edge);
@@ -2581,7 +2622,7 @@ fn gen_is_a(jit: &mut JITState, asm: &mut Assembler, obj: Opnd, class: Opnd) -> 
         let rpo_idx = asm.current_block().rpo_index;
 
         // Create a result block that all paths converge to
-        let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
         let result_edge = |v| Target::Block(Box::new(lir::BranchEdge {
             target: result_block,
             args: vec![v],
@@ -2685,9 +2726,9 @@ fn gen_new_range(
 ) -> lir::Opnd {
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
-    let fast_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let fast_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let slow_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let fast_edge = Target::Block(Box::new(lir::BranchEdge { target: fast_block, args: vec![] }));
     let slow_edge = Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
     let result_edge = |range| Target::Block(Box::new(lir::BranchEdge {
@@ -3125,7 +3166,7 @@ fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_typ
         let rpo_idx = asm.current_block().rpo_index;
 
         // Create a result block that all paths converge to
-        let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
         let result_edge = |v| Target::Block(Box::new(lir::BranchEdge {
             target: result_block,
             args: vec![v],
@@ -3164,7 +3205,7 @@ fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_typ
         let rpo_idx = asm.current_block().rpo_index;
 
         // Create a result block that all paths converge to
-        let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+        let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
         let result_edge = |v| Target::Block(Box::new(lir::BranchEdge {
             target: result_block,
             args: vec![v],
@@ -3534,8 +3575,8 @@ fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState)
     let locals: Vec<InsnId> = state.locals().copied().collect();
     // Frame states for different frames can map to different slots, so only reuse the
     // record when it belongs to the frame we're spilling now.
-    let spilled = match jit.spilled_locals.take() {
-        Some((iseq, depth, spilled)) if iseq == state.iseq && depth == state.depth => Some(spilled),
+    let spilled = match jit.frame_caches(asm).spilled_locals.take() {
+        Some(prev) if prev.iseq == state.iseq && prev.depth == state.depth => Some(prev.locals),
         _ => None,
     };
     for (idx, &insn_id) in locals.iter().enumerate() {
@@ -3544,7 +3585,7 @@ fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState)
         }
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
-    jit.spilled_locals = Some((state.iseq, state.depth, locals));
+    jit.frame_caches(asm).spilled_locals = Some(SpilledLocals { iseq: state.iseq, depth: state.depth, locals });
 }
 
 /// Spill the virtual stack onto the stack.
@@ -4326,13 +4367,13 @@ fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Functio
 
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
-    let copy_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let copy_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let copy_edge = || Target::Block(Box::new(lir::BranchEdge { target: copy_block, args: vec![] }));
-    let simple_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let simple_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let simple_edge = || Target::Block(Box::new(lir::BranchEdge { target: simple_block, args: vec![] }));
-    let mismatch_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let mismatch_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let mismatch_edge = || Target::Block(Box::new(lir::BranchEdge { target: mismatch_block, args: vec![] }));
-    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
     // Only copy bytes for the 3 preserved ASCII-compatible encodings (see
@@ -4432,9 +4473,9 @@ fn gen_string_append_codepoint(jit: &mut JITState, asm: &mut Assembler, function
 
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
-    let fallback_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let fallback_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let fallback_edge = || Target::Block(Box::new(lir::BranchEdge { target: fallback_block, args: vec![] }));
-    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
     let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
     // The receiver must be a bare mutable ASCII-8BIT heap string to append in place: no
@@ -4491,9 +4532,6 @@ fn gen_string_append_codepoint(jit: &mut JITState, asm: &mut Assembler, function
     asm.set_current_block(result_block);
     let label = jit.get_label(asm, result_block, hir_block_id);
     asm.write_label(label);
-    // The locals were only spilled on the fallback edge, so the next spill can't reuse
-    // what gen_prepare_non_leaf_call() recorded above.
-    jit.spilled_locals = None;
 
     // String#<< returns the receiver
     string

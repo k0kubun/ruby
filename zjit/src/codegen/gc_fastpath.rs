@@ -88,8 +88,8 @@ pub(super) fn gc_fastpath_new_obj(
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
 
-    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let miss_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let miss_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
 
     let result_edge = |v: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![v] }));
 
