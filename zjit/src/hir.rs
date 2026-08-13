@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    backend::lir::C_ARG_OPNDS, cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -767,7 +767,9 @@ pub enum SendFallbackReason {
     SendBlockArgNotNil,
     CCallWithFrameTooManyArgs,
     ObjToStringNotString,
-    TooManyArgsForLir,
+    /// An operand doesn't fit in the integer type that encodes it, e.g. an
+    /// argument count that overflows IseqCall's u16.
+    OperandTooLarge,
     /// The Proc object for a BMETHOD is not defined by an ISEQ. (See `enum rb_block_type`.)
     BmethodNonIseqProc,
     /// Caller supplies too few or too many arguments than what the callee's parameters expects.
@@ -837,7 +839,7 @@ impl Display for SendFallbackReason {
             SendBlockArgNotNil => write!(f, "Send: block argument is not nil"),
             CCallWithFrameTooManyArgs => write!(f, "CCallWithFrame: too many arguments"),
             ObjToStringNotString => write!(f, "ObjToString: result is not a string"),
-            TooManyArgsForLir => write!(f, "Too many arguments for LIR"),
+            OperandTooLarge => write!(f, "Operand doesn't fit in its encoding"),
             BmethodNonIseqProc => write!(f, "Bmethod: Proc object is not defined by an ISEQ"),
             ArgcParamMismatch => write!(f, "Argument count does not match parameter count"),
             ComplexArgPass => write!(f, "Complex argument passing"),
@@ -2690,14 +2692,8 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
         return Err(SendDirectFailure::new(ArgcParamMismatch));
     }
 
-    // asm.ccall() doesn't support 6+ args. Compute the final argc after keyword setup
-    // and rest packing:
+    // Compute the final argc after keyword setup and rest packing:
     // send_argc = packed positional args + callee's total keywords (all kw slots are filled).
-    // c_argc = self + send_argc + synthetic block handler arg.
-    // Right now, the JIT entrypoint accepts the block as an param
-    // We may remove it, remove the block_arg addition to match
-    // See: https://github.com/ruby/ruby/pull/15911#discussion_r2710544982
-    let block_arg = if 0 != params.flags.has_block() { 1 } else { 0 };
     // With *rest, SendDirect receives one rest-array slot instead of each rest
     // element, so cap positional argc at required/post + filled opts + rest slot.
     let passed_opt_num = (caller_positional_i32 - min_positional).min(opt_num) as usize;
@@ -2705,16 +2701,10 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
     let send_argc = send_positional_argc + kw_total_num as usize;
-    let c_argc = 1 + send_argc + block_arg; // +1 for self
-
-    // TODO: Support passing arguments on the stack in C calls
-    if c_argc > C_ARG_OPNDS.len() {
-        return Err(SendDirectFailure::new(TooManyArgsForLir));
-    }
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
-        return Err(SendDirectFailure::new(TooManyArgsForLir));
+        return Err(SendDirectFailure::new(OperandTooLarge));
     }
 
     Ok(())
@@ -2991,12 +2981,6 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallb
     }
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
         return Err(InvokeBlockNotSpecialized);
-    }
-    // The JIT-to-JIT call in gen_invoke_block_iseq_direct passes captured self plus
-    // each argument in C argument registers.
-    // TODO: Support passing arguments on the stack in C calls
-    if 1 + argc > C_ARG_OPNDS.len() {
-        return Err(TooManyArgsForLir);
     }
     if crate::codegen::block_iseq_may_throw(iseq) {
         return Err(InvokeBlockNotSpecialized);
@@ -3971,7 +3955,7 @@ impl Function {
         // rest packing changes the SendDirect argument count.
         // See: vm_args.c's setup_parameters_complex and args_setup_opt_parameters.
         let passed_opt_num = (positional_argc - min_positional_argc).min(opt_num);
-        let jit_entry_idx = passed_opt_num.try_into().map_err(|_| TooManyArgsForLir)?;
+        let jit_entry_idx = passed_opt_num.try_into().map_err(|_| OperandTooLarge)?;
 
         // Methods without *rest still need the jit_entry_idx computed above,
         // but their positional args do not need repacking.
@@ -4658,7 +4642,7 @@ impl Function {
                                     {
                                         let native_index = (index as i64) * (SIZEOF_VALUE as i64);
                                         if native_index > (i32::MAX as i64) {
-                                            self.set_dynamic_send_reason(insn_id, TooManyArgsForLir);
+                                            self.set_dynamic_send_reason(insn_id, OperandTooLarge);
                                             self.push_insn_id(block, insn_id); continue;
                                         }
                                     }
@@ -4772,13 +4756,6 @@ impl Function {
                                         // Bail on argc mismatch
                                         if argc != cfunc_argc as u32 {
                                             fun.set_dynamic_send_reason(send_insn_id, ArgcParamMismatch);
-                                            return Err(());
-                                        }
-
-                                        // TODO: Support passing arguments on the stack in C calls
-                                        // +1 for self
-                                        if (argc as usize)+1 > C_ARG_OPNDS.len() {
-                                            fun.set_dynamic_send_reason(send_insn_id, TooManyArgsForLir);
                                             return Err(());
                                         }
 
@@ -5135,14 +5112,6 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    // TODO: Support passing arguments on the stack in C calls
-                                    // +1 for self
-                                    if args.len()+1 > C_ARG_OPNDS.len() {
-                                        self.push_insn_id(block, insn_id);
-                                        self.set_dynamic_send_reason(insn_id, TooManyArgsForLir);
-                                        continue;
-                                    }
-
                                     emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
 
                                     // Try inlining the cfunc into HIR
