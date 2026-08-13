@@ -383,12 +383,11 @@ fn inline_array_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             let index = fun.coerce_to(block, index, types::Fixnum, state);
             let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
             let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
-            let index = fun.push_insn(block, hir::Insn::GuardLess { left: index, right: length, reason: Box::new(SideExitReason::GuardLess), state });
             let index = fun.push_insn(block, hir::Insn::AdjustBounds { index, length });
-            let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
-            use crate::hir::SideExitReason;
-            let index = fun.push_insn(block, hir::Insn::GuardGreaterEq { left: index, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
-            let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
+            // An index past either end of the array is not an error in Ruby; it reads nil. Loops
+            // written as `while (x = ary[i])` walk off the end on their last iteration, so a
+            // bounds guard here would side-exit once per loop.
+            let result = fun.push_insn(block, hir::Insn::ArrayArefOrNil { array: recv, index, length });
             return Some(result);
         }
     }
