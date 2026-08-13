@@ -2088,6 +2088,42 @@ fn test_send_nil_block_arg() {
 }
 
 #[test]
+fn test_send_mixed_nil_and_non_nil_block_arg() {
+    // A `&block` forwarding site that sees both nil and non-nil blocks is split on nil, so the
+    // no-block calls become direct sends. Both branches must still produce the right answer.
+    assert_snapshot!(inspect("
+        def callee(n, &block)
+          block ? block.call(n) : n
+        end
+        def forward(n, &block) = callee(n, &block)
+        results = []
+        100.times do |i|
+          results << forward(i)
+          results << forward(i) { |n| n * 2 }
+        end
+        [forward(7), forward(7) { |n| n + 1 }, results.last(2)]
+    "), @"[7, 8, [99, 198]]");
+}
+
+#[test]
+fn test_send_nil_block_arg_split_polymorphic_receiver() {
+    // The nil branch of the split dispatches on the receiver type, so a forwarding site shared by
+    // several receiver classes still has to pick the right method for each.
+    assert_snapshot!(inspect("
+        class A; def value(&block) = block ? block.call(1) : 1; end
+        class B; def value(&block) = block ? block.call(2) : 2; end
+        def forward(obj, &block) = obj.value(&block)
+        out = []
+        200.times do |i|
+          obj = i.even? ? A.new : B.new
+          out << forward(obj)
+          out << forward(obj) { |n| n * 10 } if i % 3 == 0
+        end
+        [forward(A.new), forward(B.new), forward(A.new) { |n| n * 10 }, out.sum]
+    "), @"[1, 2, 10, 1300]");
+}
+
+#[test]
 fn test_send_symbol_block_arg() {
     assert_snapshot!(inspect("
         def test = [1, 2].map(&:to_s)
