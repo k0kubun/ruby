@@ -2038,6 +2038,13 @@ pub struct rb_gc_zjit_default_new_obj_fastpath {
     pub klass: VALUE,
 }
 #[repr(C)]
+pub struct rb_gc_zjit_default_writebarrier_fastpath {
+    pub incremental_marking_count: *const ::std::os::raw::c_void,
+    pub incremental_marking_count_num_bits: usize,
+    pub recv_slowpath_flags: VALUE,
+    pub promoted_flag: VALUE,
+}
+#[repr(C)]
 pub struct rb_gc_zjit_mmtk_new_obj_fastpath {
     pub objspace: *const ::std::os::raw::c_void,
     pub objspace_total_allocated_objects_offset: usize,

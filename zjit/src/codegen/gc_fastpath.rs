@@ -5,6 +5,7 @@ use crate::cruby::{
     RUBY_OFFSET_THREAD_RACTOR, VALUE, VALUE_BITS, rb_zjit_new_obj_shape,
     rb_zjit_runtime_offsets,
     rb_gc_zjit_default_new_obj_fastpath as RbGcZjitDefaultNewObjFastpath,
+    rb_gc_zjit_default_writebarrier_fastpath as RbGcZjitDefaultWriteBarrierFastpath,
     rb_gc_zjit_mmtk_new_obj_fastpath as RbGcZjitMmtkNewObjFastpath,
 };
 use crate::hir::{FrameState, Function, Invariant};
@@ -15,6 +16,11 @@ impl Clone for RbGcZjitDefaultNewObjFastpath {
 }
 impl Copy for RbGcZjitDefaultNewObjFastpath {}
 
+impl Clone for RbGcZjitDefaultWriteBarrierFastpath {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for RbGcZjitDefaultWriteBarrierFastpath {}
+
 impl Clone for RbGcZjitMmtkNewObjFastpath {
     fn clone(&self) -> Self { *self }
 }
@@ -23,6 +29,7 @@ impl Copy for RbGcZjitMmtkNewObjFastpath {}
 #[repr(C)]
 union RbGcZjitFastpathData {
     default_gc: RbGcZjitDefaultNewObjFastpath,
+    default_write_barrier: RbGcZjitDefaultWriteBarrierFastpath,
     mmtk: RbGcZjitMmtkNewObjFastpath,
 }
 
@@ -39,6 +46,8 @@ unsafe extern "C" {
         klass: VALUE,
         fastpath: *mut RbGcZjitFastpath,
     ) -> bool;
+
+    fn rb_gc_zjit_writebarrier_fastpath(fastpath: *mut RbGcZjitFastpath) -> bool;
 
     fn rb_zjit_newobj_hook_enabled_p() -> bool;
 }
@@ -100,6 +109,90 @@ pub(super) fn gc_fastpath_new_obj(
     let param = asm.new_block_param(VALUE_BITS);
     asm.current_block().add_parameter(param);
     param
+}
+
+/// Everything ZJIT needs to inline the fast path of the default GC's write barrier,
+/// validated so that emitting it cannot fail.
+pub(super) struct PreparedWriteBarrierFastpath {
+    incremental_marking_count: *const u8,
+    incremental_marking_count_num_bits: u8,
+    promoted_flag: u64,
+    recv_slowpath_flags: u64,
+}
+
+/// Ask the GC whether writes to heap objects can skip rb_gc_writebarrier() based on
+/// information available to JIT-compiled code. Returns None if they always have to
+/// call it.
+pub(super) fn prepare_write_barrier_fastpath() -> Option<PreparedWriteBarrierFastpath> {
+    let mut fastpath: RbGcZjitFastpath = unsafe { std::mem::zeroed() };
+    if !unsafe { rb_gc_zjit_writebarrier_fastpath(&mut fastpath) } {
+        return None;
+    }
+    if fastpath.kind != RB_GC_ZJIT_FASTPATH_DEFAULT {
+        return None;
+    }
+
+    let fastpath = unsafe { fastpath.data.default_write_barrier };
+    let count = fastpath.incremental_marking_count;
+    let count_num_bits = u8::try_from(fastpath.incremental_marking_count_num_bits).ok()?;
+    let promoted_flag = fastpath.promoted_flag.as_u64();
+    let recv_slowpath_flags = fastpath.recv_slowpath_flags.as_u64();
+    if count.is_null()
+        || !matches!(count_num_bits, 8 | 16 | 32 | 64)
+        || promoted_flag == 0
+        // The masks are tested against a 64-bit operand with a sign-extended 32-bit immediate.
+        || (promoted_flag | recv_slowpath_flags) > i32::MAX as u64
+    {
+        return None;
+    }
+
+    Some(PreparedWriteBarrierFastpath {
+        incremental_marking_count: count.cast(),
+        incremental_marking_count_num_bits: count_num_bits,
+        promoted_flag,
+        recv_slowpath_flags,
+    })
+}
+
+/* This function implements the fast path of rb_gc_impl_writebarrier() for the default
+ * GC: writing `val` into `recv` is a no-op for the GC unless an incremental mark is
+ * running, the receiver needs shareable-object bookkeeping, or the generational barrier
+ * has an old -> young edge to remember. All three are decidable from a counter the GC
+ * exports plus the two objects' RBasic flags.
+ *
+ * `recv` and `val` must both be heap objects (the caller filters out immediates). Every
+ * path that proves the barrier has nothing to do jumps to `skip`; every path that needs
+ * the C function jumps to `call`, as does the fall-through. */
+pub(super) fn gc_fastpath_write_barrier(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    fastpath: &PreparedWriteBarrierFastpath,
+    recv: Opnd,
+    val: Opnd,
+    skip: &Target,
+    call: &Target,
+) {
+    asm_comment!(asm, "GC inline write barrier");
+
+    // An incremental mark needs the mark state of both objects, which is not in their flags.
+    let count_ptr = asm.load(Opnd::const_ptr(fastpath.incremental_marking_count));
+    asm.cmp(Opnd::mem(fastpath.incremental_marking_count_num_bits, count_ptr, 0), 0.into());
+    asm.jne(jit, call.clone());
+
+    // A young receiver that needs no shareable bookkeeping can never own a remembered edge.
+    let recv_flags = asm.load(Opnd::mem(VALUE_BITS, recv, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(recv_flags, Opnd::UImm(fastpath.promoted_flag | fastpath.recv_slowpath_flags));
+    asm.jz(jit, skip.clone());
+
+    if fastpath.recv_slowpath_flags != 0 {
+        asm.test(recv_flags, Opnd::UImm(fastpath.recv_slowpath_flags));
+        asm.jnz(jit, call.clone());
+    }
+
+    // The receiver is old: only an old -> young edge has to be remembered.
+    let val_flags = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(val_flags, Opnd::UImm(fastpath.promoted_flag));
+    asm.jnz(jit, skip.clone());
 }
 
 fn prepare_new_obj_fastpath(alloc_size: usize, flags: u64, klass: VALUE) -> Option<PreparedNewObjFastpath> {

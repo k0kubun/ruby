@@ -658,6 +658,7 @@ typedef struct gc_function_map {
     // Object allocation
     VALUE (*new_obj)(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags, bool wb_protected, size_t alloc_size, size_t *actual_alloc_size);
     bool (*zjit_new_obj_fastpath)(void *objspace_ptr, size_t alloc_size, VALUE flags, VALUE klass, struct rb_gc_zjit_fastpath *fastpath);
+    bool (*zjit_writebarrier_fastpath)(void *objspace_ptr, struct rb_gc_zjit_fastpath *fastpath);
     size_t (*obj_slot_size)(VALUE obj);
     size_t (*size_slot_size)(void *objspace_ptr, size_t size);
     bool (*size_allocatable_p)(size_t size);
@@ -878,6 +879,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(pinned_p);
     load_modular_gc_func(location);
     // Write barriers
+    load_modular_gc_func(zjit_writebarrier_fastpath);
     load_modular_gc_func(writebarrier);
     load_modular_gc_func(writebarrier_unprotect);
     load_modular_gc_func(writebarrier_remember);
@@ -983,6 +985,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_pinned_p rb_gc_functions.pinned_p
 # define rb_gc_impl_location rb_gc_functions.location
 // Write barriers
+# define rb_gc_impl_zjit_writebarrier_fastpath rb_gc_functions.zjit_writebarrier_fastpath
 # define rb_gc_impl_writebarrier rb_gc_functions.writebarrier
 # define rb_gc_impl_writebarrier_unprotect rb_gc_functions.writebarrier_unprotect
 # define rb_gc_impl_writebarrier_remember rb_gc_functions.writebarrier_remember
@@ -3725,6 +3728,12 @@ rb_gc_obj_optimal_size(VALUE obj)
       default:
         return 0;
     }
+}
+
+bool
+rb_gc_zjit_writebarrier_fastpath(struct rb_gc_zjit_fastpath *fastpath)
+{
+    return rb_gc_impl_zjit_writebarrier_fastpath(rb_gc_get_objspace(), fastpath);
 }
 
 void

@@ -1413,7 +1413,21 @@ fn gen_write_barrier(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, val: O
         asm.cmp(val, Qfalse.into());
         asm.je(jit, result_edge.clone());
 
-        // Heap object; fire the write barrier
+        // Both objects are on the heap. If the GC lets us decide inline whether the
+        // barrier has anything to do, check that and put the call in its own block.
+        if let Some(fastpath) = gc_fastpath::prepare_write_barrier_fastpath() {
+            let call_block = asm.new_block(hir_block_id, false, rpo_idx);
+            let call_edge = Target::Block(Box::new(lir::BranchEdge { target: call_block, args: vec![] }));
+            let val = asm.load_mem(val);
+            gc_fastpath::gc_fastpath_write_barrier(jit, asm, &fastpath, recv, val, &result_edge, &call_edge);
+            asm.jmp(call_edge);
+
+            asm.set_current_block(call_block);
+            let label = jit.get_label(asm, call_block, hir_block_id);
+            asm.write_label(label);
+        }
+
+        // Fire the write barrier
         asm_ccall!(asm, rb_gc_writebarrier, recv, val);
         asm.jmp(result_edge);
 
