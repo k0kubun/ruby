@@ -1640,6 +1640,114 @@ fn test_yield_break() {
     assert_snapshot!(assert_compiles_allowing_exits("test"), @"5");
 }
 
+/// `eval` the setup code and then run `program`, asserting that an exception
+/// handler entry (`body->jit_exception`) was compiled along the way. Returns the
+/// `#inspect` of `program`.
+#[track_caller]
+fn assert_compiles_exception_entry(setup: &str, program: &str) -> String {
+    // The setup runs the program often enough to reach the call threshold, so
+    // the entry is compiled here and `program` below runs the compiled code.
+    eval(setup);
+    assert!(crate::state::ZJITState::get_counters().compiled_exception_entry_count > 0,
+        "expected the program to compile an exception handler entry, but none was compiled");
+    assert_compiles_allowing_exits(program)
+}
+
+#[test]
+fn test_exception_entry_at_break_continuation() {
+    set_call_threshold(2);
+    // The frame that catches the `break` resumes at the catch-table
+    // continuation, which is compiled as an exception handler entry.
+    assert_snapshot!(assert_compiles_exception_entry("
+        def find_it(arr, target)
+          n = 0
+          arr.each do |x|
+            n += 1
+            break x * 10 if x == target
+          end
+          n + 100
+        end
+        def test = find_it([1, 2, 3], 2)
+        test
+        test
+    ", "test"), @"102");
+}
+
+#[test]
+fn test_exception_entry_at_break_continuation_with_live_stack() {
+    set_call_threshold(2);
+    // The value 7 is live on the VM stack across the send, so the exception
+    // entry has to read it back from the VM stack.
+    assert_snapshot!(assert_compiles_exception_entry("
+        def find_it(arr, target)
+          [7, arr.each { |x| break x * 10 if x == target }, 9]
+        end
+        def test = find_it([1, 2, 3], 2)
+        test
+        test
+    ", "test"), @"[7, 20, 9]");
+}
+
+#[test]
+fn test_exception_entry_in_rescue_iseq() {
+    set_call_threshold(2);
+    // The rescue ISEQ is entered by the interpreter with the exception in its
+    // first local, so the entry must read locals from the frame rather than
+    // initialize them to nil like an ordinary call entry does.
+    assert_snapshot!(assert_compiles_exception_entry("
+        def risky(n)
+          x = n
+          begin
+            raise 'boom'
+          rescue => e
+            x += e.message.length
+          end
+          x
+        end
+        def test = risky(1)
+        test
+        test
+    ", "test"), @"5");
+}
+
+#[test]
+fn test_exception_entry_at_retry_continuation() {
+    set_call_threshold(2);
+    assert_snapshot!(assert_compiles_exception_entry("
+        def attempt(limit)
+          tries = 0
+          begin
+            tries += 1
+            raise 'again' if tries < limit
+          rescue
+            retry
+          end
+          tries
+        end
+        def test = attempt(3)
+        test
+        test
+    ", "test"), @"3");
+}
+
+#[test]
+fn test_exception_entry_with_non_local_return() {
+    set_call_threshold(2);
+    assert_snapshot!(assert_compiles_exception_entry("
+        def inner(a)
+          a.each { |x| yield x }
+          :fell_through
+        end
+        def middle(a)
+          inner(a) { |x| return x + 1000 if x == 2 }
+          :no_return
+        end
+        def test = [middle([1, 2, 3]), middle([1])]
+        test
+        test
+    ", "test"), @"[1002, :no_return]");
+}
+
 #[test]
 fn test_yield_non_local_return() {
     set_call_threshold(2);
@@ -11163,8 +11271,11 @@ fn test_inlined_method_with_rescue_caught_in_caller() {
 
 #[test]
 fn test_inlined_method_with_ensure_runs_on_propagation() {
+    // The ensure ISEQ is compiled as an exception handler entry
+    // (body->jit_exception), and it side-exits on the `throw` that re-raises the
+    // exception after the ensure body runs.
     with_inlining(|| {
-        assert_snapshot!(assert_inlines(r##"
+        assert_snapshot!(assert_inlines_allowing_exits(r##"
             $log = []
             def callee(x)
               begin
@@ -11194,8 +11305,10 @@ fn test_inlined_method_with_ensure_runs_on_propagation() {
 fn test_inlined_method_with_retry_resumes_begin_block() {
     // The begin/rescue/retry callee is larger than the default test inline budget,
     // so raise the threshold enough for it to be inlined.
+    // The rescue ISEQ is compiled as an exception handler entry
+    // (body->jit_exception), and it side-exits on the `throw` that `retry` emits.
     with_inlining_threshold(100, || {
-        assert_snapshot!(assert_inlines(r#"
+        assert_snapshot!(assert_inlines_allowing_exits(r#"
             def callee(counter)
               begin
                 counter[0] += 1

@@ -640,13 +640,37 @@ static inline VALUE
 jit_exec_exception(rb_execution_context_t *ec)
 {
     rb_jit_func_t func = jit_compile_exception(ec);
-    if (func) {
-        // Call the JIT code
-        return func(ec, ec->cfp);
-    }
-    else {
+    if (!func) {
         return Qundef;
     }
+
+#if USE_ZJIT
+    void *zjit_entry = rb_zjit_entry;
+    if (zjit_entry) {
+        // ZJIT code expects the entry trampoline to set up its register
+        // conventions (CFP, EC, SP), just like jit_exec() does.
+        rb_control_frame_t *const entry_cfp = ec->cfp;
+
+        // Unlike jit_exec(), it's NOT safe to return a non-Qundef value from a
+        // non-FINISH frame here: vm_exec_loop() would stop running the frames
+        // below this one. ZJIT's `leave` pops the frame and returns the value,
+        // so when the entry frame isn't a FINISH frame, push the value onto the
+        // caller's stack and let the interpreter continue from there instead.
+        // See [jit_compile_exception] and YJIT's gen_leave_exception().
+        bool finished = VM_FRAME_FINISHED_P(entry_cfp);
+
+        VALUE result = ((rb_zjit_func_t)zjit_entry)(ec, entry_cfp, func);
+        if (!UNDEF_P(result) && !finished) {
+            // JIT code returned from the entry frame, so ec->cfp is now its caller.
+            *ec->cfp->sp++ = result;
+            return Qundef;
+        }
+        return result;
+    }
+#endif
+
+    // Call the JIT code
+    return func(ec, ec->cfp);
 }
 #else
 # define jit_compile_exception(ec) ((rb_jit_func_t)0)

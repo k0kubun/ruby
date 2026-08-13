@@ -14,6 +14,10 @@ pub struct IseqPayload {
     pub profile: IseqProfile,
     /// JIT code versions. Different versions should have different assumptions.
     pub versions: Vec<IseqVersionRef>,
+    /// JIT code versions compiled for `body->jit_exception`, which enter the ISEQ
+    /// at a catch-table continuation. Kept separate from `versions` because they
+    /// are not usable as the ISEQ's ordinary entry point.
+    pub exception_versions: Vec<IseqVersionRef>,
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
     pub was_invalidated_for_singleton_class_creation: bool,
@@ -80,6 +84,7 @@ impl IseqPayload {
         Self {
             profile: IseqProfile::new(),
             versions: vec![],
+            exception_versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
             ivar_respecializations: 0,
@@ -98,6 +103,17 @@ impl IseqPayload {
             + self.ivar_respecializations as usize
             + self.block_respecializations as usize
             + self.invalidation_recompiles as usize
+    }
+
+    /// Every compiled version of this ISEQ, ordinary entries and exception
+    /// handler entries alike. GC callbacks must visit all of them.
+    pub fn all_versions(&self) -> impl Iterator<Item = &IseqVersionRef> {
+        self.versions.iter().chain(self.exception_versions.iter())
+    }
+
+    /// Mutable counterpart of [`IseqPayload::all_versions`]
+    pub fn all_versions_mut(&mut self) -> impl Iterator<Item = &mut IseqVersionRef> {
+        self.versions.iter_mut().chain(self.exception_versions.iter_mut())
     }
 
     /// Profile counts are used for compilation policy.
