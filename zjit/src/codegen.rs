@@ -17,7 +17,7 @@ use crate::invariants::{
     track_root_box_assumption, track_no_newobj_hook_assumption, track_no_method_override_assumption
 };
 use crate::gc::append_gc_offsets;
-use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
+use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, MAX_INVALIDATION_RECOMPILES, get_or_create_iseq_payload};
 use crate::profile::reset_profiles_remaining;
 use crate::state::ZJITState;
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
@@ -254,18 +254,33 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
 pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+    if unsafe { version.as_ref() }.is_invalidated() {
+        return;
+    }
     let payload = get_or_create_iseq_payload(iseq);
-    if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < payload.version_limit()
-    {
-        unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
-        unsafe { rb_iseq_reset_jit_func(iseq) };
 
-        // Recompile JIT-to-JIT calls into the invalidated ISEQ
-        for incoming in unsafe { version.as_ref() }.incoming.iter() {
-            if let Err(err) = gen_iseq_call(cb, incoming) {
-                debug!("{err:?}: gen_iseq_call failed during invalidation: {}", iseq_get_location(incoming.iseq.get(), 0));
-            }
+    // The caller has already patched this version's PatchPoint into a jump to a side exit,
+    // so this version is now guaranteed to bail out to the interpreter every time it runs.
+    // If we cannot compile a replacement, the ISEQ keeps executing that dead code forever.
+    // Grant an extra version so the ISEQ can recover: invalidation is an external event
+    // (a constant or method was redefined), not a mis-speculation, so it should not be
+    // paid for out of the respecialization budget.
+    if payload.versions.len() >= payload.version_limit() {
+        if payload.invalidation_recompiles >= MAX_INVALIDATION_RECOMPILES {
+            debug!("Invalidation recompile budget exhausted: {}", iseq_get_location(iseq, 0));
+            return;
+        }
+        payload.invalidation_recompiles += 1;
+        incr_counter!(invalidation_recompiles_granted);
+    }
+
+    unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
+    unsafe { rb_iseq_reset_jit_func(iseq) };
+
+    // Recompile JIT-to-JIT calls into the invalidated ISEQ
+    for incoming in unsafe { version.as_ref() }.incoming.iter() {
+        if let Err(err) = gen_iseq_call(cb, incoming) {
+            debug!("{err:?}: gen_iseq_call failed during invalidation: {}", iseq_get_location(incoming.iseq.get(), 0));
         }
     }
 }
