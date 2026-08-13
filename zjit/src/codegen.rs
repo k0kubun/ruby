@@ -1288,6 +1288,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToAryForExpand { val, state } => { gen_to_ary_for_expand(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::ToHash { val, state } => { gen_to_hash(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -2050,6 +2051,16 @@ fn gen_check_array_type(jit: &mut JITState, asm: &mut Assembler, function: &Func
 fn gen_to_ary_for_expand(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_ary_to_ary, val)
+}
+
+fn gen_to_hash(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_zjit_splatkw(hash: VALUE) -> VALUE;
+    }
+
+    // rb_to_hash_type() can call #to_hash, which runs arbitrary Ruby code and can raise.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_zjit_splatkw, val)
 }
 
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {

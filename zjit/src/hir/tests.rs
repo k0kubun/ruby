@@ -2948,7 +2948,10 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v54, v21)
         bb6(v34:BasicObject, v35:BasicObject):
-          SideExit SplatKwNotProfiled
+          v62:NilClass|HashExact = ToHash v20
+          v64:BasicObject = Send v17, &block, :foo, v18, v29, v62, v34 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v64
         bb12():
           SideExit BlockParamProxyUnknownHandler
         ");
@@ -4468,7 +4471,7 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
-    fn test_splatkw_unprofiled_side_exits() {
+    fn test_splatkw_unprofiled_converts_generically() {
         eval("
             def foo(**kw, &b) = kw
             def test(**kw, &b) = foo(**kw, &b)
@@ -4522,7 +4525,10 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v39, v13)
         bb6(v19:BasicObject, v20:BasicObject):
-          SideExit SplatKwNotProfiled
+          v47:NilClass|HashExact = ToHash v12
+          v49:BasicObject = Send v11, &block, :foo, v47, v19 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v49
         bb12():
           SideExit BlockParamProxyUnknownHandler
         ");
@@ -4732,7 +4738,7 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
-    fn test_splatkw_polymorphic_side_exits() {
+    fn test_splatkw_polymorphic_converts_generically() {
         set_call_threshold(3);
         eval("
             def foo(a, ...) = a
@@ -4797,14 +4803,17 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v54, v21)
         bb6(v34:BasicObject, v35:BasicObject):
-          SideExit SplatKwPolymorphic
+          v62:NilClass|HashExact = ToHash v20
+          v64:BasicObject = Send v17, &block, :foo, v18, v29, v62, v34 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v64
         bb12():
           SideExit BlockParamProxyUnknownHandler
         ");
     }
 
     #[test]
-    fn test_splatkw_with_non_hash_side_exits() {
+    fn test_splatkw_with_non_hash_converts_generically() {
         eval("
             def foo(a:) = a
             def test(obj, &block) = foo(**obj, &block)
@@ -4861,7 +4870,10 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v39, v13)
         bb6(v19:BasicObject, v20:BasicObject):
-          SideExit SplatKwNotNilOrHash
+          v47:NilClass|HashExact = ToHash v12
+          v49:BasicObject = Send v11, &block, :foo, v47, v19 # SendFallbackReason: Uncategorized(send)
+          CheckInterrupts
+          Return v49
         bb12():
           SideExit BlockParamProxyUnknownHandler
         ");
