@@ -942,7 +942,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         },
         &Insn::InvokeSuper { cd, blockiseq, state, reason, .. } => gen_invokesuper(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::InvokeSuperForward { cd, blockiseq, state, reason, .. } => gen_invokesuperforward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
-        &Insn::InvokeBlock { cd, state, reason, .. } => gen_invokeblock(jit, asm, function, cd, &function.frame_state(state), reason),
+        Insn::InvokeBlock { cd, state, reason, reprofile, args } => gen_invokeblock(jit, asm, function, *cd, &function.frame_state(*state), *reason, *reprofile, args.len()),
         Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, &function.frame_state(*state), unsafe { &**bf }, *leaf, opnds!(args)),
@@ -2264,11 +2264,34 @@ fn gen_invokeblock(
     cd: *const rb_call_data,
     state: &FrameState,
     reason: SendFallbackReason,
+    reprofile: bool,
+    argc: usize,
 ) -> lir::Opnd {
     gen_incr_send_fallback_counter(asm, reason);
     gen_trace_send_fallback(asm, &reason);
 
     gen_prepare_fallback_call(jit, asm, function, state);
+
+    if reprofile {
+        // Refresh this yield site's block-handler profile from what the fallback actually
+        // sees, and recompile once the fresh samples outvote the ones the current dispatch
+        // was built from. See `rb_zjit_invokeblock_reprofile`.
+        asm_comment!(asm, "reprofile block handler");
+        use crate::profile::rb_zjit_invokeblock_reprofile;
+        asm_ccall!(asm, rb_zjit_invokeblock_reprofile,
+            CFP,
+            Opnd::const_ptr(jit.version.as_ptr()),
+            Opnd::Value(VALUE::from(state.iseq)),
+            Opnd::UImm(state.insn_idx() as u64),
+            Opnd::UImm(argc as u64));
+    }
+
+    if get_option!(stats) {
+        // Record what the handler actually is here, so --zjit-stats can tell a gate rejection
+        // apart from a profile that no longer describes the site.
+        use crate::stats::rb_zjit_count_runtime_block_handler;
+        asm_ccall!(asm, rb_zjit_count_runtime_block_handler, CFP);
+    }
 
     asm_comment!(asm, "call invokeblock");
     unsafe extern "C" {

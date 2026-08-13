@@ -505,6 +505,23 @@ make_counters! {
     invokeblock_handler_megamorphic_ifunc,
     invokeblock_handler_no_profiles,
 
+    // --zjit-stats only: what the block handler at a generic `invokeblock` fallback actually
+    // was at run time. Compare against invokeblock_handler_* (what the profile predicted) to
+    // tell a gate rejection apart from an unrepresentative profile.
+    invokeblock_runtime_iseq,
+    invokeblock_runtime_ifunc,
+    invokeblock_runtime_symbol,
+    invokeblock_runtime_dsymbol,
+    invokeblock_runtime_proc,
+    invokeblock_runtime_none,
+
+    // Re-profiling of `yield` sites from the generic `rb_vm_invokeblock` fallback (see
+    // `rb_zjit_invokeblock_reprofile`). `sample` counts fallback executions that recorded
+    // their handler; `recompile` counts the sites whose fresh samples outvoted the stale
+    // profile and invalidated the compiled code.
+    invokeblock_reprofile_sample_count,
+    invokeblock_reprofile_recompile_count,
+
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may
     // be incremented only once, rather than once per SendDirect, if the caller
@@ -532,6 +549,28 @@ make_counters! {
     getblockparamproxy_handler_no_profiles,
 
     total_native_stack_bytes,
+}
+
+/// Record the block handler a generic `invokeblock` fallback saw at run time. Called from JIT
+/// code only under `--zjit-stats`: comparing this against the `invokeblock_handler_*` counters,
+/// which describe the *profiled* handler, separates "the dispatch gates rejected this site"
+/// from "the profile no longer describes this site".
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_count_runtime_block_handler(cfp: CfpPtr) {
+    let handler = unsafe { rb_vm_get_untagged_block_handler(cfp) };
+    if handler.nil_p() {
+        incr_counter!(invokeblock_runtime_none);
+    } else if unsafe { rb_IMEMO_TYPE_P(handler, imemo_iseq) == 1 } {
+        incr_counter!(invokeblock_runtime_iseq);
+    } else if unsafe { rb_IMEMO_TYPE_P(handler, imemo_ifunc) == 1 } {
+        incr_counter!(invokeblock_runtime_ifunc);
+    } else if handler.static_sym_p() {
+        incr_counter!(invokeblock_runtime_symbol);
+    } else if handler.symbol_p() {
+        incr_counter!(invokeblock_runtime_dsymbol);
+    } else {
+        incr_counter!(invokeblock_runtime_proc);
+    }
 }
 
 /// Increase a counter by a specified amount
