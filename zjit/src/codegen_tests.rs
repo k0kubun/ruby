@@ -7207,7 +7207,9 @@ fn test_invokesuper_with_local_written_by_blockiseq() {
 
 #[test]
 fn test_max_iseq_versions() {
-    let max_versions = max_iseq_versions();
+    // A version killed by PatchPoint invalidation is replaced rather than counted against
+    // the respecialization budget, so the total budget is the sum of the two limits.
+    let max_versions = max_iseq_versions() + MAX_INVALIDATION_RECOMPILES as usize;
     eval(&format!("
         TEST = -1
         def test = TEST
@@ -7224,10 +7226,10 @@ fn test_max_iseq_versions() {
         end
     "));
 
-    // It should not exceed MAX_ISEQ_VERSIONS
+    // It should not exceed MAX_ISEQ_VERSIONS + MAX_INVALIDATION_RECOMPILES
     let iseq = get_method_iseq("self", "test");
     let payload = get_or_create_iseq_payload(iseq);
-    assert_eq!(payload.versions.len(), max_iseq_versions());
+    assert_eq!(payload.versions.len(), max_versions);
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
