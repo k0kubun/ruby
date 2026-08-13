@@ -1910,6 +1910,13 @@ impl Assembler
         &mut self.basic_blocks[self.current_block_id.0]
     }
 
+    /// The block instructions are currently being pushed into. Codegen keys caches of
+    /// already-emitted values and stores on this: a LIR block is straight-line code, so
+    /// anything emitted earlier in the same block is guaranteed to have run.
+    pub fn current_block_id(&self) -> BlockId {
+        self.current_block_id
+    }
+
     /// Return basic blocks sorted by RPO index, then by block ID.
     /// TODO: Use a more advanced scheduling algorithm
     pub fn sorted_blocks(&self) -> Vec<&BasicBlock> {
