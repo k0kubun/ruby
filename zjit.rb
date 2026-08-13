@@ -150,6 +150,7 @@ class << RubyVM::ZJIT
       :ivar_respecialize_count,
       :ivar_respecialize_declined_count,
       :ivar_respecialize_giveup_count,
+      :invalidation_recompiles_granted,
 
       :compile_time_ns,
       :compile_side_exit_time_ns,

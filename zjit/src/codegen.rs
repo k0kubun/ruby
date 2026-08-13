@@ -246,6 +246,18 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
     })
 }
 
+/// Why an ISEQ version is being retired, which decides whether it may exceed
+/// `--zjit-max-versions`. See [`invalidate_iseq_version`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationCause {
+    /// A PatchPoint's invariant was broken and the patch point has already been rewritten
+    /// into a jump to a side exit, so this version is now dead code.
+    PatchPoint,
+    /// Enough profiles were collected to compile a better-specialized version. The existing
+    /// code is still correct, so there is nothing to recover from if we decline.
+    Respecialize,
+}
+
 /// Invalidate an ISEQ version and allow it to be recompiled on the next call.
 /// Both PatchPoint invalidation and exit-profiling recompilation go through this
 /// function, serving as the central point for all invalidation/recompile decisions.
@@ -253,21 +265,24 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 /// TODO: evolve this into a general `handle_event(iseq, event)` state machine that
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
-pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, cause: InvalidationCause) {
     if unsafe { version.as_ref() }.is_invalidated() {
         return;
     }
     let payload = get_or_create_iseq_payload(iseq);
 
-    // The caller has already patched this version's PatchPoint into a jump to a side exit,
-    // so this version is now guaranteed to bail out to the interpreter every time it runs.
-    // If we cannot compile a replacement, the ISEQ keeps executing that dead code forever.
-    // Grant an extra version so the ISEQ can recover: invalidation is an external event
-    // (a constant or method was redefined), not a mis-speculation, so it should not be
-    // paid for out of the respecialization budget.
     if payload.versions.len() >= payload.version_limit() {
-        if payload.invalidation_recompiles >= MAX_INVALIDATION_RECOMPILES {
-            debug!("Invalidation recompile budget exhausted: {}", iseq_get_location(iseq, 0));
+        // For a broken PatchPoint the caller has already rewritten the patch point into a
+        // jump to a side exit, so this version now bails out to the interpreter every time
+        // it runs. Declining to invalidate would leave the ISEQ executing that dead code
+        // forever, so grant an extra version to recover with: the invariant was broken by
+        // an external event (some constant or method was redefined), not by a
+        // mis-speculation, and should not be paid for out of the respecialization budget.
+        // A respecialization request has no such problem to fix, so it just waits.
+        if cause == InvalidationCause::Respecialize
+            || payload.invalidation_recompiles >= MAX_INVALIDATION_RECOMPILES
+        {
+            debug!("Not invalidating at the version limit: {}", iseq_get_location(iseq, 0));
             return;
         }
         payload.invalidation_recompiles += 1;
@@ -1022,6 +1037,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToAryForExpand { val, state } => { gen_to_ary_for_expand(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::ToHash { val, state } => { gen_to_hash(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -1995,6 +2011,16 @@ fn gen_check_array_type(jit: &mut JITState, asm: &mut Assembler, function: &Func
 fn gen_to_ary_for_expand(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_ary_to_ary, val)
+}
+
+fn gen_to_hash(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_zjit_splatkw(hash: VALUE) -> VALUE;
+    }
+
+    // rb_to_hash_type() can call #to_hash, which runs arbitrary Ruby code and can raise.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_zjit_splatkw, val)
 }
 
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {
@@ -5521,7 +5547,7 @@ c_callable! {
                 let payload = get_or_create_iseq_payload(compiled_iseq);
                 if let Some(version) = payload.versions.last_mut() {
                     let cb = ZJITState::get_code_block();
-                    invalidate_iseq_version(cb, compiled_iseq, version);
+                    invalidate_iseq_version(cb, compiled_iseq, version, InvalidationCause::Respecialize);
                     cb.mark_all_executable();
                 }
             }
