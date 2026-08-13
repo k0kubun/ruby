@@ -1,6 +1,6 @@
 //! Runtime state of ZJIT.
 
-use crate::codegen::{gen_entry_trampoline, gen_exit_meta_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_jit_entry_call_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
+use crate::codegen::{gen_entry_trampoline, gen_exception_mismatch_trampoline, gen_exit_meta_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_jit_entry_call_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
 use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
@@ -71,6 +71,9 @@ pub struct ZJITState {
     /// [`ExitMeta`] whose index the exit stub left in the scratch register, then
     /// materializes JIT frames. See [`crate::exit_meta`].
     exit_meta_trampoline: CodePtr,
+
+    /// Trampoline to side-exit from an exception handler entry whose PC guard failed
+    exception_mismatch_trampoline: CodePtr,
 
     /// Trampoline to call function_stub_hit
     function_stub_hit_trampoline: CodePtr,
@@ -203,6 +206,9 @@ impl ZJITState {
             materialize_exit_trampoline,
             materialize_exit_trampoline_with_counter: materialize_exit_trampoline,
             exit_meta_trampoline,
+            // Replaced below: the trampoline reads counter pointers, so it can
+            // only be generated once ZJIT_STATE is initialized.
+            exception_mismatch_trampoline: exit_trampoline,
             function_stub_hit_trampoline,
             jit_entry_call_trampoline,
             full_frame_cfunc_counter_pointers: HashMap::new(),
@@ -219,6 +225,13 @@ impl ZJITState {
             dead_iseq_version_bytes: 0,
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
+
+        // Generated after ZJIT_STATE is initialized because it increments a counter.
+        {
+            let cb = ZJITState::get_code_block();
+            let code_ptr = gen_exception_mismatch_trampoline(cb, exit_trampoline).unwrap();
+            ZJITState::get_instance().exception_mismatch_trampoline = code_ptr;
+        }
 
         // With --zjit-stats, use a different trampoline on function stub exits
         // to count exit_compilation_failure. Note that the trampoline code depends
@@ -398,6 +411,11 @@ impl ZJITState {
     /// Return a code pointer to the trampoline every side exit jumps to
     pub fn get_exit_meta_trampoline() -> CodePtr {
         ZJITState::get_instance().exit_meta_trampoline
+    }
+
+    /// Return a code pointer to the trampoline for a failed exception entry PC guard
+    pub fn get_exception_mismatch_trampoline() -> CodePtr {
+        ZJITState::get_instance().exception_mismatch_trampoline
     }
 
     /// Return a code pointer to the materialize_exit trampoline

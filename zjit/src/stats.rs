@@ -173,6 +173,12 @@ make_counters! {
         allocated_iseq_payload_count,
         dead_iseq_payload_count,
 
+        // Exception handler entries (body->jit_exception) that were compiled as
+        // a dedicated function entering at a catch-table continuation
+        compiled_exception_entry_count,
+        // Exception handler entries we declined to compile
+        failed_exception_entry_count,
+
         compile_time_ns,
         profile_time_ns,
         gc_time_ns,
@@ -236,6 +242,7 @@ make_counters! {
         // exit_: Side exits reasons
         exit_compile_error,
         exit_exception_handler,
+        exit_exception_handler_pc_mismatch,
         exit_unhandled_newarray_send_min,
         exit_unhandled_newarray_send_hash,
         exit_unhandled_newarray_send_pack,
