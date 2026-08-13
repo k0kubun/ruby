@@ -7236,6 +7236,63 @@ fn test_max_iseq_versions() {
 }
 
 #[test]
+fn test_version_growth_is_bounded_under_invalidation_and_shape_churn() {
+    // Two sources of extra versions compose at one ISEQ: an invalidation grant per version a
+    // broken PatchPoint kills (constant redefinition here), and the plain --zjit-max-versions
+    // budget. Each is separately capped, so however long the churn runs the ISEQ must stay
+    // inside version_limit() and inside the sum of the caps.
+    eval("
+        class V0; def initialize = @a = 1; def read = @a; end
+        class V1; def initialize = (@b = 0; @a = 2); def read = @a; end
+        class V2; def initialize = (@b = 0; @c = 0; @a = 3); def read = @a; end
+        class V3; def initialize = (@b = 0; @c = 0; @d = 0; @a = 4); def read = @a; end
+        class V4; def initialize = (@b = 0; @c = 0; @d = 0; @e = 0; @a = 5); def read = @a; end
+        VOBJS = [V0.new, V1.new, V2.new, V3.new, V4.new]
+        VTEST = 0
+        def churn(o) = o.read + VTEST
+        i = 0
+        while i < 4000
+          VOBJS.each { |o| churn(o) }
+          if i % 10 == 0
+            Object.send(:remove_const, :VTEST)
+            Object.const_set(:VTEST, i)
+          end
+          i += 1
+        end
+    ");
+    let payload = get_or_create_iseq_payload(get_method_iseq("self", "churn"));
+    let cap = max_iseq_versions()
+        + crate::payload::MAX_INVALIDATION_RECOMPILES as usize;
+    assert!(payload.versions.len() <= payload.version_limit(),
+        "{} versions over the limit of {}", payload.versions.len(), payload.version_limit());
+    assert!(payload.version_limit() <= cap, "version_limit {} over the cap of {cap}", payload.version_limit());
+    assert_snapshot!(inspect("churn(VOBJS[3])"), @"3994");
+}
+
+#[test]
+fn test_splatkw_polymorphic_uses_generic_conversion() {
+    // A `**kw` site that sees both nil and a Hash has no single shape to guard, so it
+    // compiles to the generic conversion instead of a side exit that would end the block.
+    assert_snapshot!(inspect("
+        def kw(**kw) = kw
+        def test(h) = [kw(**h), :after]
+        test({a: 1}); test(nil)
+        [test(nil), test({b: 2})]
+    "), @"[[{}, :after], [{b: 2}, :after]]");
+}
+
+#[test]
+fn test_splatkw_polymorphic_calls_to_hash() {
+    assert_snapshot!(inspect("
+        class ToHash; def to_hash = {c: 3}; end
+        def kw(**kw) = kw
+        def test(h) = kw(**h)
+        test({a: 1}); test(nil)
+        [test(ToHash.new), (begin; test(1); rescue TypeError; :type_error; end)]
+    "), @"[{c: 3}, :type_error]");
+}
+
+#[test]
 fn test_optional_arguments_side_exit() {
     assert_snapshot!(inspect("
         def test(a = (def foo = nil)) = a

@@ -147,6 +147,7 @@ class << RubyVM::ZJIT
       :compiled_iseq_count,
       :compiled_side_exit_count,
       :failed_iseq_count,
+      :invalidation_recompiles_granted,
 
       :compile_time_ns,
       :compile_side_exit_time_ns,

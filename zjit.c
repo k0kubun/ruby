@@ -187,6 +187,14 @@ rb_zjit_new_obj_shape(VALUE flags, size_t alloc_size)
     return (flags & SHAPE_FLAG_MASK) | ((VALUE)shape_id << SHAPE_FLAG_SHIFT);
 }
 
+// The generic body of the splatkw instruction, for sites where the profile does not
+// let ZJIT commit to nil or to Hash. Keep in sync with insns.def's splatkw.
+VALUE
+rb_zjit_splatkw(VALUE hash)
+{
+    return NIL_P(hash) ? Qnil : rb_to_hash_type(hash);
+}
+
 VALUE
 rb_zjit_defined_ivar(VALUE obj, ID id, VALUE pushval)
 {
