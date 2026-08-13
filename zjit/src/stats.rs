@@ -159,6 +159,8 @@ make_counters! {
         jit_frame_heap_bytes,
         failed_jit_frame_bytes,
         ivar_respecialize_count,
+        ivar_respecialize_declined_count,
+        ivar_respecialize_giveup_count,
         skipped_native_stack_full,
         skipped_exceptional_entry_escaped_env,
 

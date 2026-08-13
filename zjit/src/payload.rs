@@ -38,6 +38,11 @@ pub struct IseqPayload {
     /// [`crate::profile::rb_zjit_ivar_reprofile`] grants these, and only against evidence
     /// from the fallback path. Capped at [`MAX_IVAR_RESPECIALIZATIONS`].
     pub ivar_respecializations: u8,
+    /// Whether an ivar fallback in this ISEQ has spent a compiled version's worth of
+    /// re-profiling windows without earning a recompile. Sampling costs a non-leaf call on the
+    /// fallback path, so once the evidence says a recompile would not help, later compiles of
+    /// this ISEQ leave the sampling out.
+    pub ivar_reprofile_giveup: bool,
 }
 
 /// The interpreter state observed at one exception-handler entry.
@@ -73,6 +78,7 @@ impl IseqPayload {
             self_is_heap_object: false,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
             ivar_respecializations: 0,
+            ivar_reprofile_giveup: false,
         }
     }
 
@@ -120,7 +126,19 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// Re-profiling windows this version's ivar fallback paths may still close without earning a
+    /// recompile. See [`crate::profile::rb_zjit_ivar_reprofile`]: sampling is a C call on a path
+    /// that is otherwise exit-free, so a version whose fallbacks keep failing to make the case
+    /// for a recompile stops paying for the evidence.
+    pub ivar_reprofile_windows: u8,
 }
+
+/// How many windows an ivar fallback may close without earning a recompile before the version
+/// stops sampling. A fallback that has handed the same unspecializable mix of shapes to this
+/// many windows in a row is not about to change its mind, and every sample after that is a call
+/// on a hot path buying nothing.
+pub const MAX_IVAR_REPROFILE_WINDOWS: u8 = 4;
 
 /// We use a raw pointer instead of Rc to save space for refcount
 pub type IseqVersionRef = NonNull<IseqVersion>;
@@ -139,6 +157,7 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            ivar_reprofile_windows: MAX_IVAR_REPROFILE_WINDOWS,
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
