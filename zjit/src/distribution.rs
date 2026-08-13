@@ -85,6 +85,13 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
         Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
     }
 
+    /// Build a summary that claims too many types were seen to be worth specializing. Used for
+    /// the fallthrough of a type-dispatch chain: every profiled type already has its own branch,
+    /// so whatever reaches the fallthrough is by construction a type the profile never saw.
+    pub fn megamorphic() -> Self {
+        Self { kind: DistributionKind::Megamorphic, buckets: [Default::default(); N] }
+    }
+
     /// Build a summary that claims exactly one type was seen. Used when a polymorphic site has
     /// already been split into per-type branches: within a branch, the receiver is known to have
     /// one specific profiled type, so downstream specialization can treat it as monomorphic.

@@ -8321,19 +8321,20 @@ impl ProfileOracle {
     /// than the polymorphic profile, but the other operands' profiles should remain visible so
     /// argument-profile-dependent specializations (e.g. Array#[]) still apply.
     ///
-    /// When `recv_profile` is `Some`, the receiver's entry is replaced with a monomorphic summary
-    /// of that profiled type instead of being dropped. The refined type only carries the class,
-    /// while the profiled type also carries the shape, which specializations such as attr_reader
-    /// ivar loads need to emit a direct field access instead of a `rb_ivar_get` call.
-    fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function, recv_profile: Option<ProfiledType>) {
-        let Some(entries) = self.types.get(&src) else { return };
+    /// When `recv_summary` is `Some`, the receiver's entry is replaced with that summary instead
+    /// of being dropped: a branch that selected one profiled type substitutes a monomorphic
+    /// summary (the refined type only carries the class, while the profiled type also carries the
+    /// shape that attr_reader ivar loads need), and the fallthrough substitutes a megamorphic one.
+    fn copy_entries_except(&mut self, src: InsnId, dst: InsnId, exclude: InsnId, fun: &Function, recv_summary: Option<TypeDistributionSummary>) {
         let exclude = fun.chase_insn(exclude);
-        let mut filtered: Vec<_> = entries.iter()
-            .filter(|(insn, _)| fun.chase_insn(*insn) != exclude)
-            .cloned()
-            .collect();
-        if let Some(profiled_type) = recv_profile {
-            filtered.push((exclude, TypeDistributionSummary::monomorphic(profiled_type)));
+        let mut filtered: Vec<_> = self.types.get(&src).map_or_else(Vec::new, |entries| {
+            entries.iter()
+                .filter(|(insn, _)| fun.chase_insn(*insn) != exclude)
+                .cloned()
+                .collect()
+        });
+        if let Some(summary) = recv_summary {
+            filtered.push((exclude, summary));
         }
         if !filtered.is_empty() {
             self.types.insert(dst, filtered);
@@ -8464,7 +8465,7 @@ fn emit_polymorphic_send(
         // index to be inlined). The receiver's polymorphic entry is replaced by the single
         // profiled type this branch selects, so specializations that need the shape (attr_reader
         // ivar loads) can still use it.
-        profiles.copy_entries_except(exit_id, snapshot, recv, fun, recv_profile);
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun, recv_profile.map(TypeDistributionSummary::monomorphic));
         let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
         if let Some(profiled_type) = recv_profile {
             fun.record_profiled_type(refined_recv, profiled_type);
@@ -8472,8 +8473,14 @@ fn emit_polymorphic_send(
         let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.to_vec(), state: snapshot, reason: Uncategorized(opcode.into()) });
         fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
     }
-    // In the fallthrough case, do a generic interpreter send and then join.
-    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args: args.to_vec(), state: exit_id, reason: SendPolymorphicFallback });
+    // In the fallthrough case, do a generic interpreter send and then join. Give it a Snapshot
+    // whose receiver entry is megamorphic: the branches above already cover every profiled type,
+    // so anything reaching here is a type the profile never saw. Without this, type_specialize
+    // resolves the receiver from the original profile and re-speculates on a type this path has
+    // just ruled out, and that guard then fails on every single call.
+    let fallback_snapshot = fun.push_insn(block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+    profiles.copy_entries_except(exit_id, fallback_snapshot, recv, fun, Some(TypeDistributionSummary::megamorphic()));
+    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args: args.to_vec(), state: fallback_snapshot, reason: SendPolymorphicFallback });
     fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
     Some((join_block, join_param))
 }

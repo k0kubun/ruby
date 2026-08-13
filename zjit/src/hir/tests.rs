@@ -4045,13 +4045,13 @@ pub(crate) mod hir_build_tests {
           v47:BasicObject = Send v46, &block, :then, v41 # SendFallbackReason: Uncategorized(send)
           Jump bb14(v47)
         bb16():
-          v49 = Send v14, &block, :then, v41 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb14(v49)
+          v50 = Send v14, &block, :then, v41 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb14(v50)
         bb14(v42:BasicObject):
           Jump bb11(v42)
         bb13():
-          v52:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
-          Jump bb11(v52)
+          v53:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb11(v53)
         bb11(v38:BasicObject):
           CheckInterrupts
           Return v38
@@ -4133,13 +4133,13 @@ pub(crate) mod hir_build_tests {
           v54:BasicObject = Send v53, &block, :then, v48 # SendFallbackReason: Uncategorized(send)
           Jump bb17(v54)
         bb19():
-          v56 = Send v14, &block, :then, v48 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb17(v56)
+          v57 = Send v14, &block, :then, v48 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb17(v57)
         bb17(v49:BasicObject):
           Jump bb14(v49)
         bb16():
-          v59:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
-          Jump bb14(v59)
+          v60:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb14(v60)
         bb14(v45:BasicObject):
           CheckInterrupts
           Return v45
