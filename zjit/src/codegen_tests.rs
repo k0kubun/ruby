@@ -9260,3 +9260,276 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       :done
     "#), @":done");
 }
+
+#[test]
+fn test_uminus_on_unfrozen_string_is_a_call() {
+    eval("
+        def entry(s) = -s
+        20.times { entry(+'ab') }
+    ");
+    assert_snapshot!(assert_compiles("entry(+'ab')"), @r#""ab""#);
+}
+
+#[test]
+fn test_freeze_on_unfrozen_array_is_a_call() {
+    eval("
+        def entry(a) = a.freeze
+        20.times { entry([1]) }
+    ");
+    assert_snapshot!(assert_compiles("entry([1]).frozen?"), @"true");
+}
+
+#[test]
+fn test_uminus_on_integer_is_a_call() {
+    eval("
+        def entry(n) = -n
+        20.times { entry(3) }
+    ");
+    assert_snapshot!(assert_compiles("entry(3)"), @"-3");
+}
+
+#[test]
+fn test_attr_writer_in_polymorphic_arm() {
+    // Each arm of a polymorphic dispatch branches on the profiled shape and calls
+    // rb_ivar_set only when it does not match, so a shape transition still runs inline.
+    eval("
+        class ArmWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class ArmWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def arm_set(o, v) = o.x = v
+        def entry
+          (1..6).map { |i| o = (i.even? ? ArmWriterA : ArmWriterB).new(i); arm_set(o, i); o.x }
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[1, 2, 3, 4, 5, 6]");
+}
+
+#[test]
+fn test_attr_writer_shape_miss_calls_the_fallback() {
+    // A receiver carrying an extra ivar has a shape the branch does not match; it must
+    // take the rb_ivar_set fallback rather than side-exiting.
+    eval("
+        class MissWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class MissWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def miss_set(o, v) = o.x = v
+        def entry(o)
+          miss_set(o, 42)
+          miss_set(MissWriterB.new(2), 1)
+          o.instance_variable_get(:@x)
+        end
+        def odd_shaped
+          o = MissWriterA.new(1)
+          o.instance_variable_set(:@extra, 1)
+          o
+        end
+        5.times { entry(MissWriterA.new(1)); odd_shaped }
+    ");
+    assert_snapshot!(assert_compiles("[entry(MissWriterA.new(1)), entry(odd_shaped)]"), @"[42, 42]");
+}
+
+#[test]
+fn test_attr_writer_on_frozen_receiver_raises() {
+    eval("
+        class FrozenWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class FrozenWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def frozen_set(o, v) = o.x = v
+        def entry(freeze)
+          o = FrozenWriterA.new(1)
+          o.freeze if freeze
+          frozen_set(o, 1)
+          frozen_set(FrozenWriterB.new(2), 1)
+          :written
+        rescue FrozenError
+          :frozen
+        end
+        5.times { entry(false) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[entry(false), entry(true)]"), @"[:written, :frozen]");
+}
+
+#[test]
+fn test_attr_writer_on_too_complex_shape() {
+    eval("
+        class ComplexWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class ComplexWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def complex_set(o, v) = o.x = v
+        COMPLEX_RECEIVER = ComplexWriterA.new(0)
+        2000.times { |i| COMPLEX_RECEIVER.instance_variable_set(:\"@c#{i}\", i) }
+        def entry
+          complex_set(ComplexWriterB.new(1), 1)
+          complex_set(COMPLEX_RECEIVER, 7)
+          COMPLEX_RECEIVER.x
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"7");
+}
+
+#[test]
+fn test_attr_writer_survives_gc_stress() {
+    // The inlined store has to run the write barrier, otherwise a heap value written
+    // through it is collected out from under the object.
+    eval("
+        class StressWriterA; def initialize(n) = @n = n; attr_accessor :x; end
+        class StressWriterB; def initialize(n) = @n = n; attr_accessor :x; end
+        def stress_set(o, v) = o.x = v
+        def entry
+          a = StressWriterA.new(1)
+          b = StressWriterB.new(2)
+          stress_set(a, [1, 2, 3])
+          stress_set(b, 'four')
+          [a.x, b.x]
+        end
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        GC.stress = true
+        result = entry
+        GC.stress = false
+        result
+    "), @r#"[[1, 2, 3], "four"]"#);
+}
+
+#[test]
+fn test_send_with_profiled_method_name() {
+    eval("
+        class SendProfiled
+          def double(n) = n * 2
+        end
+        def entry(c) = c.send(:double, 21)
+        C1 = SendProfiled.new
+        5.times { entry(C1) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C1)"), @"42");
+}
+
+#[test]
+fn test_send_with_two_profiled_method_names() {
+    eval("
+        class SendTwoNames
+          def a(n) = n + 1
+          def b(n) = n + 2
+        end
+        def call_by_name(c, name) = c.send(name, 10)
+        C2 = SendTwoNames.new
+        def entry = (1..10).map { |i| call_by_name(C2, i.even? ? :a : :b) }.uniq.sort
+        5.times { entry }
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[11, 12]");
+}
+
+#[test]
+fn test_send_can_call_private_method() {
+    eval("
+        class SendPrivate
+          private def secret = :shh
+        end
+        def entry(c) = c.send(:secret)
+        C3 = SendPrivate.new
+        5.times { entry(C3) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C3)"), @":shh");
+}
+
+#[test]
+fn test_send_with_unprofiled_method_name_falls_back() {
+    // The dispatch chain only covers the names seen while profiling; anything else has to
+    // reach the generic send in the fall-through arm and still produce the right answer.
+    eval("
+        class SendUnprofiled
+          def a = :a
+          def b = :b
+        end
+        def entry(c, name) = c.send(name)
+        C4 = SendUnprofiled.new
+        20.times { entry(C4, :a) }
+    ");
+    assert_snapshot!(assert_compiles("[entry(C4, :a), entry(C4, :b)]"), @"[:a, :b]");
+}
+
+#[test]
+fn test_send_with_string_method_name() {
+    // String names are never recorded by the profiler, so this stays a dynamic send.
+    eval("
+        class SendStringName
+          def a = :a
+        end
+        def entry(c, name) = c.send(name)
+        C5 = SendStringName.new
+        20.times { entry(C5, 'a') }
+    ");
+    assert_snapshot!(assert_compiles("entry(C5, 'a')"), @":a");
+}
+
+#[test]
+fn test_send_to_cfunc() {
+    eval("
+        def entry(s) = s.send(:upcase)
+        5.times { entry('ab') }
+    ");
+    assert_snapshot!(assert_compiles("entry('ab')"), @r#""AB""#);
+}
+
+#[test]
+fn test_send_with_multiple_arguments() {
+    eval("
+        class SendManyArgs
+          def add(a, b, c) = a + b + c
+        end
+        def entry(o) = o.send(:add, 1, 2, 3)
+        C6 = SendManyArgs.new
+        5.times { entry(C6) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C6)"), @"6");
+}
+
+#[test]
+fn test_send_picks_up_redefinition() {
+    eval("
+        class SendRedefined
+          def a = 1
+        end
+        def entry(c) = c.send(:a)
+        C7 = SendRedefined.new
+        20.times { entry(C7) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = entry(C7)
+        class SendRedefined
+          def a = 2
+        end
+        [before, entry(C7)]
+    "), @"[1, 2]");
+}
+
+#[test]
+fn test_send_picks_up_redefinition_of_send_itself() {
+    eval("
+        class SendOverridden
+          def a = :a
+        end
+        def entry(c) = c.send(:a)
+        C9 = SendOverridden.new
+        20.times { entry(C9) }
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        before = entry(C9)
+        class SendOverridden
+          def send(name) = :overridden
+        end
+        [before, entry(C9)]
+    "), @"[:a, :overridden]");
+}
+
+#[test]
+fn test_send_nested_is_not_specialized() {
+    eval("
+        class SendNested
+          def a = :a
+        end
+        def entry(c) = c.send(:send, :a)
+        C8 = SendNested.new
+        20.times { entry(C8) }
+    ");
+    assert_snapshot!(assert_compiles("entry(C8)"), @":a");
+}

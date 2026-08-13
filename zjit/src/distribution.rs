@@ -85,6 +85,15 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
         Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
     }
 
+    /// Build a summary that looks like only `item` was ever observed. Used to hand a
+    /// single, already-narrowed observation to consumers that expect a distribution.
+    pub fn monomorphic(item: T) -> Self {
+        let mut buckets = [Default::default(); N];
+        assert!(N > 0);
+        buckets[0] = item;
+        Self { kind: DistributionKind::Monomorphic, buckets }
+    }
+
     pub fn new(dist: &Distribution<T, N>) -> Self {
         #[cfg(debug_assertions)]
         {
