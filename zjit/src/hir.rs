@@ -9724,27 +9724,18 @@ fn add_iseq_to_hir(
                         }
                     }
 
-                    match profiled_handlers.as_slice() {
-                        // No supported profiled families. Keep the generic fallback iseq/ifunc fallback
-                        // for sites we do not specialize, such as no-profile and megamorphic sites.
-                        [] => {
-                            let block_handler = fun.load_ep_env_field(unmodified_block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
-                            // This handles two cases which are nearly identical.
-                            // Block handler is a tagged pointer. Look at the tag.
-                            //   VM_BH_ISEQ_BLOCK_P(): block_handler & 0x03 == 0x01
-                            //   VM_BH_IFUNC_P():      block_handler & 0x03 == 0x03
-                            // So to check for either of those cases we can use: val & 0x1 == 0x1
+                    if profiled_handlers.is_empty() {
+                        // Sites we could not specialize -- no profile yet, or a megamorphic one.
+                        // Dispatch on the two families that need no C call to recognize instead
+                        // of guarding for ISEQ/ifunc alone: a `&blk` parameter left unpassed is
+                        // an ordinary thing for a caller to do, and a guard makes every such
+                        // call side-exit and abandon the rest of the method.
+                        profiled_handlers.push(ProfiledBlockHandlerFamily::IseqOrIfunc);
+                        profiled_handlers.push(ProfiledBlockHandlerFamily::Nil);
+                    }
 
-                            // Bail out if the block handler is neither ISEQ nor ifunc
-                            fun.push_insn(unmodified_block, Insn::GuardAnyBitSet { val: block_handler, mask: Const::CUInt64(0x1), mask_name: None, reason: Box::new(SideExitReason::BlockParamProxyFallbackMiss), state: exit_id, recompile: Some(Recompile) });
-                            // TODO(Shopify/ruby#753): GC root, so we should be able to avoid unnecessary GC tracing
-                            let proxy_val = fun.push_insn(unmodified_block, Insn::Const { val: Const::Value(unsafe { rb_block_param_proxy }) });
-                            let mut args = vec![proxy_val];
-                            if let Some(local) = original_local {
-                                args.push(local);
-                            }
-                            fun.push_insn(unmodified_block, Insn::Jump(BranchEdge { target: join_block, args }));
-                        }
+                    match profiled_handlers.as_slice() {
+                        [] => unreachable!("profiled_handlers was just given a default"),
                         // A single supported profiled family. Emit a monomorphic fast path
                         [profiled_handler] => match profiled_handler {
                             ProfiledBlockHandlerFamily::Nil => {
