@@ -157,6 +157,8 @@ make_counters! {
         compiled_iseq_count,
         failed_iseq_count,
         ivar_respecialize_count,
+        ivar_respecialize_declined_count,
+        ivar_respecialize_giveup_count,
         skipped_native_stack_full,
 
         compile_time_ns,
