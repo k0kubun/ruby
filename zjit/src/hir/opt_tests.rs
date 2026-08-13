@@ -14825,7 +14825,9 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn dont_specialize_call_to_iseq_with_polymorphic_caller_splat() {
+    // A varying splat length has no length to bake in, but the splat lands exactly on the
+    // callee's rest parameter, so it can be forwarded there instead.
+    fn specialize_polymorphic_caller_splat_by_forwarding_to_rest() {
         enable_zjit_stats();
         set_call_threshold(3);
         eval("
@@ -14855,12 +14857,22 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           v20:ArrayExact = GuardType v11, ArrayExact recompile
           IncrCounter zjit_insn_count
-          IncrCounter complex_arg_pass_caller_splat
-          IncrCounter caller_splat_profile_polymorphic
-          v23:BasicObject = Send v10, :foo, v20 # SendFallbackReason: Complex argument passing
+          v30:CInt64 = ArrayLength v20
+          v31:CInt64[-1] = Const CInt64(-1)
+          v32:CInt64 = AdjustBounds v31, v30
+          v33:BasicObject = ArrayArefOrNil v20, v32, v30
+          v34:BasicObject = GuardNotRuby2KeywordsHash v33 recompile
+          v35:ArrayExact = ArrayDup v20
+          PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
+          v38:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :foo, v38 (0x1040), num_args=1
+          IncrCounter inline_iseq_optimized_send_count
+          IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v23
+          PopInlineFrame
+          IncrCounter zjit_insn_count
+          Return v35
         ");
     }
 
