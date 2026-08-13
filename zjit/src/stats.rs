@@ -465,7 +465,9 @@ make_counters! {
     invokeblock_handler_monomorphic_ifunc,
     invokeblock_handler_monomorphic_other,
     invokeblock_handler_polymorphic,
+    invokeblock_handler_polymorphic_ifunc,
     invokeblock_handler_megamorphic,
+    invokeblock_handler_megamorphic_ifunc,
     invokeblock_handler_no_profiles,
 
     // HIR-level method inliner counters. Most rejection counters are incremented

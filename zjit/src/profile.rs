@@ -217,7 +217,11 @@ fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
         entry.opnd_types.resize(1, TypeDistribution::new());
     }
     let obj = profiler.peek_at_block_handler();
-    let ty = ProfiledType::object(obj);
+    let ty = if unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 } {
+        ProfiledType::ifunc()
+    } else {
+        ProfiledType::object(obj)
+    };
     VALUE::from(profiler.iseq).write_barrier(ty.class());
     entry.opnd_types[0].observe(ty);
 }
@@ -269,6 +273,8 @@ impl Flags {
     const IS_STRUCT_EMBEDDED: u32 = 1 << 3;
     /// Set if the ProfiledType is used for profiling specific objects, not just classes/shapes
     const IS_OBJECT_PROFILING: u32 = 1 << 4;
+    /// Set if this is the canonical "IFUNC block handler" marker. See [`ProfiledType::ifunc`].
+    const IS_IFUNC: u32 = 1 << 5;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -278,6 +284,7 @@ impl Flags {
     pub fn is_t_object(self) -> bool { (self.0 & Self::IS_T_OBJECT) != 0 }
     pub fn is_struct_embedded(self) -> bool { (self.0 & Self::IS_STRUCT_EMBEDDED) != 0 }
     pub fn is_object_profiling(self) -> bool { (self.0 & Self::IS_OBJECT_PROFILING) != 0 }
+    pub fn is_ifunc(self) -> bool { (self.0 & Self::IS_IFUNC) != 0 }
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -310,6 +317,27 @@ impl ProfiledType {
         let mut flags = Flags::none();
         flags.0 |= Flags::IS_OBJECT_PROFILING;
         Self { class: obj, shape: INVALID_SHAPE_ID, flags }
+    }
+
+    /// The canonical marker for an IFUNC block handler. Every IFUNC collapses into this
+    /// single bucket instead of being profiled by identity: `rb_block_call` and friends
+    /// allocate a fresh `vm_ifunc` imemo per call, so profiling the object would make any
+    /// yield site driven from C look polymorphic (or push it over into megamorphic and
+    /// crowd out the ISEQ blocks the same site sees). Nothing downstream needs the ifunc
+    /// itself — dispatching one only needs the block handler's tag, and the func pointer
+    /// is read out of the captured block at run time.
+    ///
+    /// `class` is `Qtrue` so the bucket is non-empty (`VALUE(0)` means empty) and inert
+    /// for GC marking and compaction; no block handler can ever be `Qtrue` itself.
+    fn ifunc() -> Self {
+        let mut flags = Flags::none();
+        flags.0 |= Flags::IS_OBJECT_PROFILING | Flags::IS_IFUNC;
+        Self { class: Qtrue, shape: INVALID_SHAPE_ID, flags }
+    }
+
+    /// True if this is the canonical IFUNC block handler marker. See [`ProfiledType::ifunc`].
+    pub fn is_ifunc(&self) -> bool {
+        self.flags.is_ifunc()
     }
 
     /// Profile the class and shape of the given object

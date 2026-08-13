@@ -657,9 +657,9 @@ fn test_yield_polymorphic_symbol_handler_falls_back() {
 }
 
 #[test]
-fn test_yield_polymorphic_ifunc_handler_falls_back() {
+fn test_yield_polymorphic_ifunc_handler_dispatches_directly() {
     // An ifunc handler (Enumerator#each yields to the enumerator's C block) at a polymorphic
-    // yield site fails the ISEQ tag check and takes the generic InvokeBlock fallback in-line.
+    // yield site fails the ISEQ tag check and takes the in-line InvokeBlockIfunc branch.
     // Threshold 4 keeps calls 1-3 in the profile window (num_profiles defaults to 5), so
     // invoke's first compile already sees both blocks and installs the polymorphic dispatch;
     // the standalone version matters here because the Enumerator calls invoke from C.
@@ -676,10 +676,72 @@ fn test_yield_polymorphic_ifunc_handler_falls_back() {
 }
 
 #[test]
+fn test_yield_ifunc_handler_not_in_profile_dispatches_directly() {
+    // The profile only ever saw ISEQ blocks, but the ifunc branch is emitted anyway, so a
+    // C-driven caller that shows up after the profiling window still avoids the generic
+    // fallback. This is the common shape in the wild: chunky-png's hottest yield site
+    // profiles ISEQ blocks only, yet 39% of its runtime handlers are ifuncs.
+    set_call_threshold(4);
+    eval("
+        def invoke = yield(10)
+        def add_one = invoke { |x| x + 1 }
+        def double = invoke { |x| x * 2 }
+        def via_enum = to_enum(:invoke).to_a
+        add_one; double
+        add_one; double
+    ");
+    assert_snapshot!(assert_compiles("[add_one, double, via_enum]"), @"[11, 20, [10]]");
+}
+
+#[test]
+fn test_yield_ifunc_handlers_across_enumerable_drivers() {
+    // Array#each is a Ruby ISEQ, so every C-driven Enumerable method makes its `yield`
+    // see an ifunc handler. Each driver packs arguments differently (one value, an array,
+    // two values), which the ifunc dispatch has to hand to rb_vm_yield_with_cfunc intact.
+    set_call_threshold(2);
+    eval("
+        def slices(a) = a.each_slice(2).to_a
+        def conses(a) = a.each_cons(2).to_a
+        def zipped(a) = a.zip(a).length
+        def chunks(a) = a.chunk_while { |x, y| y == x + 1 }.to_a
+        def lazily(a) = a.lazy.map { |x| x * 2 }.first(3)
+        def withidx(a) = a.each_with_index.to_a
+        def grouped(a) = a.group_by { |x| x % 2 }.keys.sort
+        ARR = [1, 2, 3, 4, 5]
+        3.times { slices(ARR); conses(ARR); zipped(ARR); chunks(ARR); lazily(ARR); withidx(ARR); grouped(ARR) }
+    ");
+    assert_snapshot!(
+        assert_compiles("[slices(ARR), conses(ARR), zipped(ARR), chunks(ARR), lazily(ARR), withidx(ARR), grouped(ARR)]"),
+        @"[[[1, 2], [3, 4], [5]], [[1, 2], [2, 3], [3, 4], [4, 5]], 5, [[1, 2, 3, 4, 5]], [2, 4, 6], [[1, 0], [2, 1], [3, 2], [4, 3], [5, 4]], [0, 1]]"
+    );
+}
+
+#[test]
+fn test_yield_ifunc_handler_propagates_exception() {
+    // An exception raised inside the C-driven block has to unwind through the IFUNC frame
+    // the specialized dispatch pushes, not just through the generic fallback.
+    set_call_threshold(2);
+    eval("
+        def invoke
+          yield 1
+          yield 2
+        end
+        def test
+          to_enum(:invoke).each { |x| raise 'boom' if x == 2; x }
+        rescue RuntimeError => e
+          e.message
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @r#""boom""#);
+}
+
+#[test]
 fn test_yield_megamorphic_mixed_block_handlers() {
     // A yield site that sees ISEQ, proc, symbol, and ifunc handlers mixed together goes
-    // megamorphic (each to_enum call profiles a distinct ifunc), so it compiles to the
-    // generic InvokeBlock and must return the right result for every handler kind.
+    // megamorphic, so no ISEQ block is dispatched directly; only the always-emitted ifunc
+    // branch is. It must return the right result for every handler kind.
     set_call_threshold(2);
     eval("
         def invoke = yield(10)

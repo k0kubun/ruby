@@ -5216,13 +5216,26 @@ pub(crate) mod hir_build_tests {
           CondBranch v46, bb9(), bb4(v18, v19, v20, v21, v34, v27)
         bb9():
           v49:Truthy = RefineType v33, Truthy
-          v53:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
-          v56:BasicObject = InvokeBuiltin dir_s_close, v18, v27
+          v53:CPtr = GetEP 0
+          v54:CInt64 = LoadField v53, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
+          v55:CInt64[3] = Const CInt64(3)
+          v56:CInt64 = IntAnd v54, v55
+          v58:CInt64[3] = Const CInt64(3)
+          v59:CBool = IsBitEqual v56, v58
+          CondBranch v59, bb12(), bb11()
+        bb12():
+          v61:BasicObject = InvokeBlockIfunc v54, v27
+          Jump bb10(v61)
+        bb11():
+          v63:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb10(v63)
+        bb10(v57:BasicObject):
+          v67:BasicObject = InvokeBuiltin dir_s_close, v18, v27
           CheckInterrupts
-          Return v53
-        bb4(v62:BasicObject, v63:BasicObject, v64:BasicObject, v65:BasicObject, v66:BasicObject, v67:BasicObject):
+          Return v57
+        bb4(v73:BasicObject, v74:BasicObject, v75:BasicObject, v76:BasicObject, v77:BasicObject, v78:BasicObject):
           CheckInterrupts
-          Return v67
+          Return v78
         ");
     }
 
@@ -5740,9 +5753,22 @@ pub(crate) mod hir_build_tests {
           v4:BasicObject = LoadArg :self@0
           Jump bb3(v4)
         bb3(v6:BasicObject):
-          v10:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: not yet specialized
+          v10:CPtr = GetEP 0
+          v11:CInt64 = LoadField v10, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v12:CInt64[3] = Const CInt64(3)
+          v13:CInt64 = IntAnd v11, v12
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CBool = IsBitEqual v13, v15
+          CondBranch v16, bb6(), bb5()
+        bb6():
+          v18:BasicObject = InvokeBlockIfunc v11
+          Jump bb4(v18)
+        bb5():
+          v20:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb4(v20)
+        bb4(v14:BasicObject):
           CheckInterrupts
-          Return v10
+          Return v14
         ");
     }
 
@@ -5769,9 +5795,22 @@ pub(crate) mod hir_build_tests {
           v9:BasicObject = LoadArg :y@2
           Jump bb3(v7, v8, v9)
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
-          v19:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: not yet specialized
+          v19:CPtr = GetEP 0
+          v20:CInt64 = LoadField v19, :VM_ENV_DATA_INDEX_SPECVAL@0x1002
+          v21:CInt64[3] = Const CInt64(3)
+          v22:CInt64 = IntAnd v20, v21
+          v24:CInt64[3] = Const CInt64(3)
+          v25:CBool = IsBitEqual v22, v24
+          CondBranch v25, bb6(), bb5()
+        bb6():
+          v27:BasicObject = InvokeBlockIfunc v20, v12, v13
+          Jump bb4(v27)
+        bb5():
+          v29:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb4(v29)
+        bb4(v23:BasicObject):
           CheckInterrupts
-          Return v19
+          Return v23
         ");
     }
 
@@ -6056,11 +6095,24 @@ pub(crate) mod hir_build_tests {
           v75:Array = RefineType v70, Array
           v76:CInt64 = UnboxFixnum v71
           v77:BasicObject = ArrayAref v75, v76
-          v79:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: not yet specialized
-          v83:Fixnum[1] = Const Value(1)
-          v84:Fixnum = FixnumAdd v71, v83
+          v79:CPtr = GetEP 0
+          v80:CInt64 = LoadField v79, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v81:CInt64[3] = Const CInt64(3)
+          v82:CInt64 = IntAnd v80, v81
+          v84:CInt64[3] = Const CInt64(3)
+          v85:CBool = IsBitEqual v82, v84
+          CondBranch v85, bb14(), bb13()
+        bb14():
+          v87:BasicObject = InvokeBlockIfunc v80, v77
+          Jump bb12(v87)
+        bb13():
+          v89:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb12(v89)
+        bb12(v83:BasicObject):
+          v94:Fixnum[1] = Const Value(1)
+          v95:Fixnum = FixnumAdd v71, v94
           PatchPoint NoEPEscape(each)
-          Jump bb8(v70, v84)
+          Jump bb8(v70, v95)
         bb4(v23:BasicObject, v24:NilClass):
           v28:BasicObject = InvokeBuiltin <inline_expr>, v23
           Jump bb5(v23, v24, v28)
