@@ -4311,9 +4311,12 @@ impl Function {
     /// opens the door for inlining.
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
-        for block in self.reverse_post_order() {
-            let old_insns = std::mem::take(&mut self.blocks[block.to_usize()].insns);
-            assert!(self.blocks[block.to_usize()].insns.is_empty());
+        for entry_block in self.reverse_post_order() {
+            let old_insns = std::mem::take(&mut self.blocks[entry_block.to_usize()].insns);
+            assert!(self.blocks[entry_block.to_usize()].insns.is_empty());
+            // Rewriting an instruction into a branch splits the block: everything after it,
+            // including the original terminator, is emitted into the join block instead.
+            let mut block = entry_block;
             for insn_id in old_insns {
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
@@ -4533,10 +4536,24 @@ impl Function {
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
 
-                                let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
-                                });
+                                let replacement = match self.try_emit_optimized_getivar(block, recv, id, profiled_type, state) {
+                                    Ok(replacement) => replacement,
+                                    // The final version of an ISEQ may not speculate with a guard
+                                    // that side-exits, but it can still branch on the shape the
+                                    // way getinstancevariable does, so the common shape reads
+                                    // inline instead of calling rb_ivar_get every time.
+                                    Err(Counter::getivar_fallback_no_side_exits) => {
+                                        let insn_idx = self.frame_state(state).insn_idx() as u32;
+                                        let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state)
+                                            .expect("dispatch_getivar only side-exits without a profiled shape");
+                                        block = join_block;
+                                        result
+                                    }
+                                    Err(counter) => {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                    }
+                                };
                                 self.make_equal_to(insn_id, replacement);
                             } else {
                                 // No shape information, just static class information
