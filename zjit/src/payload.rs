@@ -45,6 +45,10 @@ pub struct IseqPayload {
     /// fallback path, so once the evidence says a recompile would not help, later compiles of
     /// this ISEQ leave the sampling out.
     pub ivar_reprofile_giveup: bool,
+    /// Number of extra versions granted because a PatchPoint invalidation would
+    /// otherwise have left this ISEQ permanently side-exiting. See
+    /// [`crate::codegen::invalidate_iseq_version`].
+    pub invalidation_recompiles: u8,
 }
 
 /// How many extra versions a single ISEQ may earn for ivar shape respecialization.
@@ -52,6 +56,12 @@ pub struct IseqPayload {
 /// process terminates on its own; the cap bounds code growth for an ISEQ whose receivers
 /// keep changing shape.
 pub const MAX_IVAR_RESPECIALIZATIONS: u8 = 2;
+
+/// Upper bound on the extra versions [`IseqPayload::invalidation_recompiles`] can grant.
+/// Invalidation is an external event (a constant or method was redefined), not a
+/// mis-speculation, so it should not consume the respecialization budget. We still cap
+/// the total so that an ISEQ whose assumptions keep getting busted cannot recompile forever.
+pub const MAX_INVALIDATION_RECOMPILES: u8 = 8;
 
 impl IseqPayload {
     fn new() -> Self {
@@ -65,6 +75,7 @@ impl IseqPayload {
             self_is_heap_object: false,
             ivar_respecializations: 0,
             ivar_reprofile_giveup: false,
+            invalidation_recompiles: 0,
         }
     }
 
@@ -79,11 +90,14 @@ impl IseqPayload {
         self.versions.iter_mut().chain(self.exception_versions.iter_mut())
     }
 
-
-    /// Number of versions this ISEQ may compile, including any it earned by proving from
-    /// its ivar fallback path that a recompile would specialize a shape it is missing.
+    /// Number of versions this ISEQ may compile: `--zjit-max-versions`, plus any it earned
+    /// by proving from its ivar fallback path that a recompile would specialize a shape it
+    /// is missing, plus one for each version killed by PatchPoint invalidation so that dead
+    /// code does not eat into the budget meant for respecialization.
     pub fn version_limit(&self) -> usize {
-        crate::codegen::max_iseq_versions() + self.ivar_respecializations as usize
+        crate::codegen::max_iseq_versions()
+            + self.ivar_respecializations as usize
+            + self.invalidation_recompiles as usize
     }
 
     /// Profile counts are used for compilation policy.

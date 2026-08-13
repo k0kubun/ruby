@@ -160,6 +160,7 @@ make_counters! {
         ivar_respecialize_declined_count,
         ivar_respecialize_giveup_count,
         skipped_native_stack_full,
+        invalidation_recompiles_granted,
 
         // Exception handler entries (body->jit_exception) that were compiled as
         // a dedicated function entering at a catch-table continuation
