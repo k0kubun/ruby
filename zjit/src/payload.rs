@@ -18,6 +18,12 @@ pub struct IseqPayload {
     /// at a catch-table continuation. Kept separate from `versions` because they
     /// are not usable as the ISEQ's ordinary entry point.
     pub exception_versions: Vec<IseqVersionRef>,
+    /// The continuations `exception_versions` were compiled for, one per version
+    /// that compiled successfully.
+    pub exception_entries: Vec<ExceptionEntryCode>,
+    /// Head of the dispatch chain over `exception_entries`, which is what
+    /// `body->jit_exception` points at. Rebuilt from scratch after invalidation.
+    pub exception_dispatch: Option<CodePtr>,
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
     pub was_invalidated_for_singleton_class_creation: bool,
@@ -37,6 +43,8 @@ impl IseqPayload {
             profile: IseqProfile::new(),
             versions: vec![],
             exception_versions: vec![],
+            exception_entries: vec![],
+            exception_dispatch: None,
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
         }
@@ -102,6 +110,16 @@ impl IseqVersion {
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
     }
+}
+
+/// A compiled exception handler entry and the continuation PC it was compiled
+/// for. `body->jit_exception` dispatches on `cfp->pc` over these.
+#[derive(Clone, Copy, Debug)]
+pub struct ExceptionEntryCode {
+    /// Continuation the interpreter resumes at, i.e. the `cfp->pc` this entry expects
+    pub pc: *const VALUE,
+    /// Machine code address of the entry
+    pub code_ptr: CodePtr,
 }
 
 /// Set of CodePtrs for an ISEQ
