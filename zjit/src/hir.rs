@@ -4183,6 +4183,24 @@ impl Function {
         self.type_of(insn).is_subtype(ty)
     }
 
+    /// Type an instruction an inline cfunc body handed back, if nothing has typed it yet. The
+    /// inline pushes its instructions into a scratch block that is spliced in after the pass has
+    /// already walked past this point, so the value it returns never gets typed by the pass
+    /// itself.
+    ///
+    /// A `Param` is left alone. Several inlines are identity-shaped -- `Hash#[]=` and
+    /// `Array#[]=` hand back the value that was stored, `Kernel#itself` and `Array#<<` hand back
+    /// the receiver -- and the operand they hand back has been through [`Self::resolve`], so it
+    /// can be a join block's parameter: the result of a polymorphic dispatch emitted moments
+    /// earlier in this same pass, say. A parameter's type comes from the edges that jump to its
+    /// block rather than from the instruction, so there is nothing to infer here; `infer_types`
+    /// computes it once the whole function is in its final shape.
+    fn infer_inlined_type(&mut self, insn: InsnId) {
+        if !self.type_of(insn).bit_equal(types::Any) { return; }
+        if matches!(self.insns[insn.to_usize()], Insn::Param) { return; }
+        self.insn_types[insn.to_usize()] = self.infer_type(insn);
+    }
+
     fn infer_type(&self, insn: InsnId) -> Type {
         assert!(self.insns[insn.to_usize()].has_output());
         match &self.insns[insn.to_usize()] {
@@ -5317,10 +5335,7 @@ impl Function {
             let insns = std::mem::take(&mut self.blocks[tmp_block.to_usize()].insns);
             self.blocks[block.to_usize()].insns.extend(insns);
             self.count(block, Counter::inline_cfunc_optimized_send_count);
-            if self.type_of(replacement).bit_equal(types::Any) {
-                // Not set yet; infer type
-                self.insn_types[replacement.to_usize()] = self.infer_type(replacement);
-            }
+            self.infer_inlined_type(replacement);
             self.remove_block(tmp_block);
             return replacement;
         }
@@ -5980,10 +5995,7 @@ impl Function {
                                                 fun.blocks[block.to_usize()].insns.extend(insns);
                                                 fun.count(block, Counter::inline_cfunc_optimized_send_count);
                                                 fun.make_equal_to(send_insn_id, replacement);
-                                                if fun.type_of(replacement).bit_equal(types::Any) {
-                                                    // Not set yet; infer type
-                                                    fun.insn_types[replacement.to_usize()] = fun.infer_type(replacement);
-                                                }
+                                                fun.infer_inlined_type(replacement);
                                                 fun.remove_block(tmp_block);
                                                 return Ok(());
                                             }
@@ -6047,10 +6059,7 @@ impl Function {
                                                 fun.blocks[block.to_usize()].insns.extend(insns);
                                                 fun.count(block, Counter::inline_cfunc_optimized_send_count);
                                                 fun.make_equal_to(send_insn_id, replacement);
-                                                if fun.type_of(replacement).bit_equal(types::Any) {
-                                                    // Not set yet; infer type
-                                                    fun.insn_types[replacement.to_usize()] = fun.infer_type(replacement);
-                                                }
+                                                fun.infer_inlined_type(replacement);
                                                 fun.remove_block(tmp_block);
                                                 return Ok(());
                                             }
@@ -6334,10 +6343,7 @@ impl Function {
                                         self.blocks[block.to_usize()].insns.extend(insns);
                                         self.count(block, Counter::inline_cfunc_optimized_send_count);
                                         self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement.to_usize()] = self.infer_type(replacement);
-                                        }
+                                        self.infer_inlined_type(replacement);
                                         self.remove_block(tmp_block);
                                         continue;
                                     }
@@ -6384,10 +6390,7 @@ impl Function {
                                         self.blocks[block.to_usize()].insns.extend(insns);
                                         self.count(block, Counter::inline_cfunc_optimized_send_count);
                                         self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement.to_usize()] = self.infer_type(replacement);
-                                        }
+                                        self.infer_inlined_type(replacement);
                                         self.remove_block(tmp_block);
                                         continue;
                                     }
