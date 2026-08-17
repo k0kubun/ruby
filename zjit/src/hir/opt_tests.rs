@@ -2334,11 +2334,10 @@ mod hir_opt_tests {
         ");
         // All three calls to foo are inlined, each with its own
         // PushInlineFrame/PopInlineFrame pair, but only the last two pairs get
-        // eliminated: remove_redundant_patch_points and
-        // remove_duplicate_check_interrupts keep just the first copy of foo's
-        // PatchPoints and CheckInterrupts, and those may take side exits that
-        // materialize the enclosing frame, so the first pair must be kept
-        // while the second and third pairs become empty.
+        // eliminated: remove_redundant_patch_points keeps just the first copy
+        // of foo's PatchPoints, and those may take side exits that materialize
+        // the enclosing frame, so the first pair must be kept while the second
+        // and third pairs become empty.
         assert_snapshot!(hir_string("test"), @"
         fn test@<compiled>:8:
         bb1():
@@ -2377,7 +2376,7 @@ mod hir_opt_tests {
         ");
         // Like test_eliminate_empty_inline_frames, only the last two of the
         // three inlined pairs get eliminated; the first pair keeps the sole
-        // surviving copy of foo's PatchPoints and CheckInterrupts.
+        // surviving copy of foo's PatchPoints.
         assert_snapshot!(hir_string("test"), @"
         fn test@<compiled>:7:
         bb1():
@@ -2433,6 +2432,42 @@ mod hir_opt_tests {
           v90:Fixnum[10] = Const Value(10)
           CheckInterrupts
           Return v90
+        ");
+    }
+
+    #[test]
+    fn test_eliminate_inline_frames_with_only_check_interrupts() {
+        eval("
+            def foo(a = 0) = a
+            def test
+              foo
+              foo
+            end
+            test
+        ");
+        // foo is too complex for the trivial inliner (the entry point for zero
+        // arguments runs the default-value code for the optional parameter),
+        // so both calls are inlined with PushInlineFrame/PopInlineFrame pairs.
+        // After constant folding, only a CheckInterrupts is left between each
+        // pair, which gets removed along with the pair, so no frame remains. The
+        // CheckInterrupts that survives is `test`'s own leave check, which
+        // remove_duplicate_check_interrupts kept as the block's last one.
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
+          v23:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          v55:Fixnum[0] = Const Value(0)
+          CheckInterrupts
+          Return v55
         ");
     }
 
