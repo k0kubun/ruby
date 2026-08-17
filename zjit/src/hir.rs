@@ -9647,6 +9647,14 @@ impl Function {
         if matches!(insn, Insn::LoadSP) {
             return false;
         }
+        // Snapshot is metadata that generates no code, so it never observes the
+        // frame by itself. Whether a side exit can materialize the frame from it
+        // is determined by the instructions that reference it, which this scan
+        // checks individually; without this early return, the operand scan below
+        // would reject every Snapshot whose `caller` chains to another Snapshot.
+        if matches!(insn, Insn::Snapshot { .. }) {
+            return true;
+        }
         let effects = insn.effects_of();
         if !(abstract_heaps::Stats.includes(effects.read_bits()) && abstract_heaps::Stats.includes(effects.write_bits())) {
             return false;
@@ -9676,6 +9684,16 @@ impl Function {
     /// walk the frame chain, so pushing and popping the frame is pure overhead.
     /// This pass deletes both instructions of each such pair.
     ///
+    /// CheckInterrupts gets special treatment: it can take a side exit, but it's
+    /// also removed if it's the only such instruction between the push and the
+    /// pop. Such a CheckInterrupts is the one emitted for the inlined callee's
+    /// `leave`, and since the callee's body does nothing else, removing the check
+    /// only delays interrupt delivery until the next CheckInterrupts the caller
+    /// (or its caller) runs. The delay is bounded: CheckInterrupts on loop
+    /// back-edges are never removed here because a loop body spans multiple
+    /// blocks while this pass only matches pairs within a single block, so any
+    /// cycle in execution still checks interrupts.
+    ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
@@ -9689,22 +9707,32 @@ impl Function {
             /// Whether an instruction that may take a side exit or observe the
             /// frame has been seen since the push. If so, the pair must be kept.
             frame_observed: bool,
+            /// CheckInterrupts instructions seen since the push. They don't set
+            /// `frame_observed` on their own; if the pair is otherwise empty,
+            /// they are removed together with the pair.
+            check_interrupts: Vec<InsnId>,
         }
 
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
+            let mut elided_check_interrupts: Vec<InsnId> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             for &insn_id in &self.blocks[block_id.to_usize()].insns {
                 match self.find_ref(insn_id) {
                     Insn::PushInlineFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false });
+                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, check_interrupts: Vec::new() });
+                    }
+                    Insn::CheckInterrupts { .. } if !pending_pushes.is_empty() => {
+                        pending_pushes.last_mut().unwrap().check_interrupts.push(insn_id);
                     }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, frame_observed: false }) => {
-                                // Empty pair: elide both the push and this pop.
+                            Some(PendingPush { push_id, frame_observed: false, check_interrupts }) => {
+                                // Empty pair: elide both the push and this pop, along
+                                // with the callee's CheckInterrupts (if any).
                                 elided_pairs.push((push_id, insn_id));
+                                elided_check_interrupts.extend(check_interrupts);
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
                                 // Keep the pair. It observes the frame chain, so the
@@ -9743,6 +9771,9 @@ impl Function {
                     .then(|| self.new_insn(Insn::IncrCounter(Counter::empty_inline_frame_count)));
                 rewrites.insert(push_id, replacement);
                 rewrites.insert(pop_id, None);
+            }
+            for check_interrupts_id in elided_check_interrupts {
+                rewrites.insert(check_interrupts_id, None);
             }
             self.blocks[block_id.to_usize()].insns.retain_mut(|insn_id| {
                 match rewrites.get(insn_id) {
