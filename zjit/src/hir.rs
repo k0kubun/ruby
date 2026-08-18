@@ -3369,15 +3369,6 @@ struct SymbolBlockSend {
     mid: ID,
 }
 
-/// The kind of a value an ISEQ returns
-enum IseqReturn {
-    Value(VALUE),
-    LocalVariable(u32),
-    Receiver,
-    // Builtin descriptor and return type
-    InvokeLeafBuiltin(*const rb_builtin_function, Type),
-}
-
 /// Arguments and metadata prepared for lowering an ISEQ call to `SendDirect`.
 struct SendDirectArgs {
     state: InsnId,
@@ -3507,82 +3498,6 @@ impl SendDirectFailure {
 
 unsafe extern "C" {
     fn rb_simple_iseq_p(iseq: IseqPtr) -> bool;
-}
-
-/// Return the ISEQ's return value if it consists of one simple instruction and leave.
-fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags: u32) -> Option<IseqReturn> {
-    // Expect only two instructions and one possible operand
-    // NOTE: If an ISEQ has an optional keyword parameter with a default value that requires
-    // computation, the ISEQ will always have more than two instructions and won't be inlined.
-
-    // Get the first two instructions
-    let first_insn = iseq_opcode_at_idx(iseq, 0);
-    let second_insn = iseq_opcode_at_idx(iseq, insn_len(first_insn as usize));
-
-    // Extract the return value if known
-    if second_insn != YARVINSN_leave {
-        return None;
-    }
-    // Make sure the leave is the final instruction. Otherwise this is a
-    // non-trivial ISEQ that should go through the general inliner.
-    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
-    if insn_len(first_insn as usize) + insn_len(second_insn as usize) != iseq_size {
-        return None;
-    }
-    match first_insn {
-        YARVINSN_getlocal_WC_0  => {
-            // Accept only cases where only positional arguments are used by both the callee and the caller.
-            // Keyword arguments may be specified by the callee or the caller but not used.
-            if captured_opnd.is_some()
-                // Equivalent to `VM_CALL_ARGS_SIMPLE - VM_CALL_KWARG - has_block_iseq`
-                || ci_flags & (
-                      VM_CALL_ARGS_SPLAT
-                    | VM_CALL_KW_SPLAT
-                    | VM_CALL_ARGS_BLOCKARG
-                    | VM_CALL_FORWARDING
-                ) != 0
-                 {
-                return None;
-            }
-
-            let ep_offset = unsafe { *rb_iseq_pc_at_idx(iseq, 1) }.as_u32();
-            let local_idx = ep_offset_to_local_idx(iseq, ep_offset);
-
-            // Only inline if the local is a parameter (not a method-defined local) as we are indexing args.
-            let param_size = unsafe { rb_get_iseq_body_param_size(iseq) } as usize;
-            if local_idx >= param_size {
-                return None;
-            }
-
-            if unsafe { rb_simple_iseq_p(iseq) } {
-                return Some(IseqReturn::LocalVariable(local_idx.try_into().unwrap()));
-            }
-
-            // TODO(max): Support only_kwparam case where the local_idx is a positional parameter
-
-            None
-        }
-        YARVINSN_putnil => Some(IseqReturn::Value(Qnil)),
-        YARVINSN_putobject => Some(IseqReturn::Value(unsafe { *rb_iseq_pc_at_idx(iseq, 1) })),
-        YARVINSN_putobject_INT2FIX_0_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(0))),
-        YARVINSN_putobject_INT2FIX_1_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(1))),
-        // We don't support invokeblock for now. Such ISEQs are likely not used by blocks anyway.
-        YARVINSN_putself if captured_opnd.is_none() => Some(IseqReturn::Receiver),
-        YARVINSN_opt_invokebuiltin_delegate_leave => {
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
-            let bf: *const rb_builtin_function = get_arg(pc, 0).as_ptr();
-            let argc = unsafe { (*bf).argc } as usize;
-            if argc != 0 { return None; }
-            let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq) };
-            let leaf = builtin_attrs & BUILTIN_ATTR_LEAF != 0;
-            if !leaf { return None; }
-            // Check if this builtin is annotated
-            let return_type = ZJITState::get_method_annotations()
-                .get_builtin_return_type(bf);
-            Some(IseqReturn::InvokeLeafBuiltin(bf, return_type))
-        }
-        _ => None,
-    }
 }
 
 /// Emit a receiver-type-specialized dispatch for a send: one `HasType` branch per profiled
@@ -6323,56 +6238,6 @@ impl Function {
         return self.push_insn(block, insn);
     }
 
-    /// Try trivially inlining the method. If we can't, emit a SendDirect instruction instead and
-    /// leave it to the general-purpose inliner to handle.
-    fn try_inline_send_direct(&mut self, block: BlockId, insn: Insn) -> InsnId {
-        let Insn::SendDirect(data) = &insn else {
-            panic!("try_inline_send_direct called with non-SendDirect instruction");
-        };
-        let recv = data.recv;
-        let iseq = data.iseq;
-        let cd = data.cd;
-        let state = data.state;
-        let args = &data.args;
-        // The trivial inliner runs first to handle simple cases (constant returns,
-        // parameter returns, etc.) without frame push/pop overhead. The general
-        // inliner then handles more complex methods that require full inlining.
-        let call_info = unsafe { (*cd).ci };
-        let ci_flags = unsafe { vm_ci_flag(call_info) };
-        // .send call is not currently supported for builtins
-        if ci_flags & VM_CALL_OPT_SEND != 0 {
-            return self.push_insn(block, insn);
-        }
-        let Some(value) = iseq_get_return_value(iseq, None, ci_flags) else {
-            return self.push_insn(block, insn);
-        };
-        match value {
-            IseqReturn::LocalVariable(idx) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                args[idx as usize]
-            }
-            IseqReturn::Value(value) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                self.push_insn(block, Insn::Const { val: Const::Value(value) })
-            }
-            IseqReturn::Receiver => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                recv
-            }
-            IseqReturn::InvokeLeafBuiltin(bf, return_type) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                self.try_inline_invoke_builtin(block, Insn::InvokeBuiltin {
-                    bf,
-                    recv,
-                    args: vec![recv],
-                    state,
-                    leaf: true,
-                    return_type,
-                })
-            }
-        }
-    }
-
     /// Emit the guards a specialized `super` needs before it may call `super_cme` directly.
     ///
     /// [`SuperGuards::Full`] is the standalone form: a patch point on the target's definition,
@@ -7397,7 +7262,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block, block_arg: send_block_arg })));
+                            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block, block_arg: send_block_arg })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_BMETHOD {
                             let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
@@ -7438,7 +7303,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None, block_arg: None })));
+                            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None, block_arg: None })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_IVAR && args.is_empty() {
                             // Check if we're accessing ivars of a Class or Module object as they require single-ractor mode.
