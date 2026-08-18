@@ -5500,9 +5500,6 @@ mod hir_opt_tests {
           v23:StaticSymbol[:k] = Const Value(VALUE(0x1038))
           v24:StaticSymbol[:v] = Const Value(VALUE(0x1040))
           v25:HashExact = NewHash v23: v11, v24: v13
-          PushInlineFrame :foo, v22 (0x1048), num_args=1
-          CheckInterrupts
-          PopInlineFrame
           Return v25
         ");
     }
@@ -5734,9 +5731,6 @@ mod hir_opt_tests {
           v21:StaticSymbol[:k] = Const Value(VALUE(0x1038))
           v22:HashExact = NewHash v21: v11
           v23:ArrayExact = NewArray v22
-          PushInlineFrame :foo, v20 (0x1040), num_args=1
-          CheckInterrupts
-          PopInlineFrame
           Return v23
         ");
     }
@@ -11834,10 +11828,7 @@ mod hir_opt_tests {
           v34:NilClass = GuardBitEquals v15, Value(nil) recompile
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
           v37:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
-          PushInlineFrame :foo, v37 (0x1040), num_args=0
           v44:Fixnum[42] = Const Value(42)
-          CheckInterrupts
-          PopInlineFrame
           Return v44
         ");
     }
@@ -18668,32 +18659,24 @@ mod hir_opt_tests {
           v16:CBool = HasType v10, ObjectSubclass[class_exact:C]
           CondBranch v16, bb5(), bb6()
         bb5():
-          v19:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          PushInlineFrame :foo, v19 (0x1040), num_args=0
           v55:Fixnum[3] = Const Value(3)
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v55)
         bb6():
           v22:CBool = HasType v10, ObjectSubclass[class_exact:D]
           CondBranch v22, bb7(), bb8()
         bb7():
-          v25:ObjectSubclass[class_exact:D] = RefineType v10, ObjectSubclass[class_exact:D]
-          PatchPoint NoSingletonClass(D@0x1068)
-          PatchPoint MethodRedefined(D@0x1068, foo@0x1010, cme:0x1070)
-          PushInlineFrame :foo, v25 (0x1098), num_args=0
+          PatchPoint NoSingletonClass(D@0x1040)
+          PatchPoint MethodRedefined(D@0x1040, foo@0x1010, cme:0x1048)
           v69:Fixnum[4] = Const Value(4)
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v69)
         bb8():
           v28:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic call site
           Jump bb4(v28)
         bb4(v15:BasicObject):
           v31:Fixnum[2] = Const Value(2)
-          PatchPoint MethodRedefined(Integer@0x10c0, +@0x10c8, cme:0x10d0)
+          PatchPoint MethodRedefined(Integer@0x1070, +@0x1078, cme:0x1080)
           v48:Fixnum = GuardType v15, Fixnum recompile
           v49:Fixnum = FixnumAdd v48, v31
           CheckInterrupts
@@ -19016,13 +18999,9 @@ mod hir_opt_tests {
           v16:CBool = HasType v10, ObjectSubclass[class_exact:C]
           CondBranch v16, bb5(), bb6()
         bb5():
-          v19:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          PushInlineFrame :foo, v19 (0x1040), num_args=0
           v37:Fixnum[3] = Const Value(3)
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v37)
         bb6():
           v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic call site
@@ -22923,10 +22902,7 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1070)
           PatchPoint MethodRedefined(C@0x1070, foo@0x1078, cme:0x1080)
           v80:ObjectSubclass[class_exact:C] = GuardType v11, ObjectSubclass[class_exact:C] recompile
-          PushInlineFrame :foo, v80 (0x10a8), num_args=0
           v87:Fixnum[4] = Const Value(4)
-          CheckInterrupts
-          PopInlineFrame
           Return v87
         bb4():
           v63:NilClass = Const Value(nil)
