@@ -9681,6 +9681,14 @@ impl Function {
     /// caller runs, and since the callee's body does nothing, no events would
     /// have fired from it anyway.
     ///
+    /// A pair whose body is a single leaf InvokeBuiltin (e.g. an inlined
+    /// opt_invokebuiltin_delegate_leave method) is also elided: a leaf builtin
+    /// doesn't raise, call Ruby code, or otherwise observe the frame, so it can
+    /// run against the caller's frame. Its FrameState is rewritten from the
+    /// callee's to the PushInlineFrame's caller-side state, whose PC the
+    /// builtin's code will store for GC. This reproduces how such methods used
+    /// to call the builtin function without a frame push before inlining.
+    ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
@@ -9699,29 +9707,48 @@ impl Function {
             /// the pair is otherwise empty, they are removed together with the
             /// pair.
             removable_insns: Vec<InsnId>,
+            /// A leaf InvokeBuiltin seen since the push. It doesn't set
+            /// `frame_observed` on its own; if the pair is otherwise empty, the
+            /// pair is elided and the InvokeBuiltin's FrameState is rewritten to
+            /// the PushInlineFrame's caller-side state.
+            leaf_builtin: Option<InsnId>,
         }
 
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
             let mut elided_removable_insns: Vec<InsnId> = Vec::new();
+            // Leaf InvokeBuiltins in elided pairs, with their pair's PushInlineFrame.
+            let mut rebased_leaf_builtins: Vec<(InsnId, InsnId)> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
                     Insn::PushInlineFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, removable_insns: Vec::new() });
+                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, removable_insns: Vec::new(), leaf_builtin: None });
                     }
                     Insn::CheckInterrupts { .. } | Insn::PatchPoint { invariant: Invariant::NoTracePoint, .. } if !pending_pushes.is_empty() => {
                         pending_pushes.last_mut().unwrap().removable_insns.push(insn_id);
                     }
+                    Insn::InvokeBuiltin { leaf: true, .. } if pending_pushes.last().is_some_and(|push| push.leaf_builtin.is_none()) => {
+                        pending_pushes.last_mut().unwrap().leaf_builtin = Some(insn_id);
+                    }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, frame_observed: false, removable_insns }) => {
+                            Some(PendingPush { push_id, frame_observed: false, removable_insns, leaf_builtin }) => {
                                 // Empty pair: elide both the push and this pop, along
                                 // with the callee's CheckInterrupts and NoTracePoint
                                 // PatchPoints (if any).
                                 elided_pairs.push((push_id, insn_id));
                                 elided_removable_insns.extend(removable_insns);
+                                if let Some(builtin_id) = leaf_builtin {
+                                    rebased_leaf_builtins.push((builtin_id, push_id));
+                                    // The InvokeBuiltin stays behind with a FrameState
+                                    // that assumes the enclosing frame (if any) exists
+                                    // at run-time, so the enclosing pair must be kept.
+                                    if let Some(outer) = pending_pushes.last_mut() {
+                                        outer.frame_observed = true;
+                                    }
+                                }
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
                                 // Keep the pair. It observes the frame chain, so the
@@ -9763,6 +9790,22 @@ impl Function {
             }
             for removable_insn_id in elided_removable_insns {
                 rewrites.insert(removable_insn_id, None);
+            }
+            // Rewrite each elided pair's leaf InvokeBuiltin to use the
+            // PushInlineFrame's caller-side FrameState instead of the callee's.
+            for (builtin_id, push_id) in rebased_leaf_builtins {
+                let &Insn::PushInlineFrame { state: push_state, .. } = self.find_ref(push_id) else {
+                    panic!("Expected PushInlineFrame instruction");
+                };
+                let &Insn::InvokeBuiltin { bf, recv, ref args, leaf, return_type, .. } = self.find_ref(builtin_id) else {
+                    panic!("Expected InvokeBuiltin instruction");
+                };
+                let args = args.clone();
+                let builtin_type = self.type_of(builtin_id);
+                let replacement = self.new_insn(Insn::InvokeBuiltin { bf, recv, args, state: push_state, leaf, return_type });
+                self.insn_types[replacement] = builtin_type;
+                self.make_equal_to(builtin_id, replacement);
+                rewrites.insert(builtin_id, Some(replacement));
             }
             self.blocks[block_id].insns.retain_mut(|insn_id| {
                 match rewrites.get(insn_id) {
