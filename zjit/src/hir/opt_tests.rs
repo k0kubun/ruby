@@ -5661,9 +5661,6 @@ mod hir_opt_tests {
           v21:StaticSymbol[:k] = Const Value(VALUE(0x1038))
           v22:HashExact = NewHash v21: v11
           v23:ArrayExact = NewArray v22
-          PushInlineFrame :foo, v20 (0x1040), num_args=1
-          CheckInterrupts
-          PopInlineFrame
           Return v23
         ");
     }
@@ -14841,7 +14838,6 @@ mod hir_opt_tests {
           v22:CBool = HasType v12, ObjectSubclass[class_exact:CallerSplatA]
           CondBranch v22, bb5(), bb6()
         bb5():
-          v25:ObjectSubclass[class_exact:CallerSplatA] = RefineType v12, ObjectSubclass[class_exact:CallerSplatA]
           PatchPoint NoSingletonClass(CallerSplatA@0x1008)
           v42:CInt64 = ArrayLength v19
           v43:CInt64[1] = GuardBitEquals v42, CInt64(1) recompile
@@ -14851,27 +14847,20 @@ mod hir_opt_tests {
           v47:CInt64[0] = Const CInt64(0)
           v48:BasicObject = ArrayAref v19, v47
           v49:ArrayExact = NewArray v48
-          PushInlineFrame :target, v25 (0x1040), num_args=1
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v49)
         bb6():
           v28:CBool = HasType v12, ObjectSubclass[class_exact:CallerSplatB]
           CondBranch v28, bb7(), bb8()
         bb7():
-          v31:ObjectSubclass[class_exact:CallerSplatB] = RefineType v12, ObjectSubclass[class_exact:CallerSplatB]
-          PatchPoint NoSingletonClass(CallerSplatB@0x1060)
+          PatchPoint NoSingletonClass(CallerSplatB@0x1040)
           v53:CInt64 = ArrayLength v19
           v54:CInt64[1] = GuardBitEquals v53, CInt64(1) recompile
           v55:CInt64 = CCall v19, :rb_jit_ruby2_keywords_splat_p@0x1010
           v56:CInt64[0] = GuardBitEquals v55, CInt64(0)
-          PatchPoint MethodRedefined(CallerSplatB@0x1060, target@0x1011, cme:0x1068)
+          PatchPoint MethodRedefined(CallerSplatB@0x1040, target@0x1011, cme:0x1048)
           v58:CInt64[0] = Const CInt64(0)
           v59:BasicObject = ArrayAref v19, v58
           v60:ArrayExact = NewArray v59
-          PushInlineFrame :target, v31 (0x1090), num_args=1
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v60)
         bb8():
           v34:BasicObject = Send v12, :target, v19 # SendFallbackReason: Send: polymorphic call site
@@ -15374,11 +15363,8 @@ mod hir_opt_tests {
           v48:ObjectSubclass[class_exact*:Object@VALUE(0x1018)] = GuardType v11, ObjectSubclass[class_exact*:Object@VALUE(0x1018)] recompile
           v49:CInt64[0] = Const CInt64(0)
           v50:BasicObject = ArrayAref v30, v49
-          PushInlineFrame :target, v48 (0x1050), num_args=1
-          CheckInterrupts
-          PopInlineFrame
-          PatchPoint NoSingletonClass(Hash@0x1070)
-          PatchPoint MethodRedefined(Hash@0x1070, []=@0x1078, cme:0x1080)
+          PatchPoint NoSingletonClass(Hash@0x1050)
+          PatchPoint MethodRedefined(Hash@0x1050, []=@0x1058, cme:0x1060)
           HashAset v17, v26, v50
           CheckInterrupts
           Return v50
