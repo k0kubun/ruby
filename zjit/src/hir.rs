@@ -7177,6 +7177,15 @@ impl Function {
     /// blocks while this pass only matches pairs within a single block, so any
     /// cycle in execution still checks interrupts.
     ///
+    /// NoTracePoint PatchPoints get the same treatment. Enabling a TracePoint
+    /// invalidates all compiled code wholesale (see
+    /// rb_zjit_tracing_invalidate_all); the patch points only make execution
+    /// that is already inside compiled code side-exit as soon as possible.
+    /// Removing the callee's NoTracePoint along with an otherwise-empty pair
+    /// just delays that in-flight side exit until the next patch point the
+    /// caller runs, and since the callee's body does nothing, no events would
+    /// have fired from it anyway.
+    ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
@@ -7190,32 +7199,34 @@ impl Function {
             /// Whether an instruction that may take a side exit or observe the
             /// frame has been seen since the push. If so, the pair must be kept.
             frame_observed: bool,
-            /// CheckInterrupts instructions seen since the push. They don't set
-            /// `frame_observed` on their own; if the pair is otherwise empty,
-            /// they are removed together with the pair.
-            check_interrupts: Vec<InsnId>,
+            /// CheckInterrupts and NoTracePoint PatchPoint instructions seen
+            /// since the push. They don't set `frame_observed` on their own; if
+            /// the pair is otherwise empty, they are removed together with the
+            /// pair.
+            removable_insns: Vec<InsnId>,
         }
 
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
-            let mut elided_check_interrupts: Vec<InsnId> = Vec::new();
+            let mut elided_removable_insns: Vec<InsnId> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
                     Insn::PushInlineFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, check_interrupts: Vec::new() });
+                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, removable_insns: Vec::new() });
                     }
-                    Insn::CheckInterrupts { .. } if !pending_pushes.is_empty() => {
-                        pending_pushes.last_mut().unwrap().check_interrupts.push(insn_id);
+                    Insn::CheckInterrupts { .. } | Insn::PatchPoint { invariant: Invariant::NoTracePoint, .. } if !pending_pushes.is_empty() => {
+                        pending_pushes.last_mut().unwrap().removable_insns.push(insn_id);
                     }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, frame_observed: false, check_interrupts }) => {
+                            Some(PendingPush { push_id, frame_observed: false, removable_insns }) => {
                                 // Empty pair: elide both the push and this pop, along
-                                // with the callee's CheckInterrupts (if any).
+                                // with the callee's CheckInterrupts and NoTracePoint
+                                // PatchPoints (if any).
                                 elided_pairs.push((push_id, insn_id));
-                                elided_check_interrupts.extend(check_interrupts);
+                                elided_removable_insns.extend(removable_insns);
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
                                 // Keep the pair. It observes the frame chain, so the
@@ -7255,8 +7266,8 @@ impl Function {
                 rewrites.insert(push_id, replacement);
                 rewrites.insert(pop_id, None);
             }
-            for check_interrupts_id in elided_check_interrupts {
-                rewrites.insert(check_interrupts_id, None);
+            for removable_insn_id in elided_removable_insns {
+                rewrites.insert(removable_insn_id, None);
             }
             self.blocks[block_id].insns.retain_mut(|insn_id| {
                 match rewrites.get(insn_id) {
