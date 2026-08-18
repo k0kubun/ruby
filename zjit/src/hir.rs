@@ -4582,10 +4582,22 @@ impl Function {
         let Insn::InvokeBuiltin { bf, recv, ref args, state, .. } = insn else {
             panic!("try_inline_invoke_builtin called with non-InvokeBuiltin instruction");
         };
+        let args = args.clone();
+        if let Some(replacement) = self.try_inline_builtin_body(block, bf, recv, &args, state) {
+            return replacement;
+        }
+        return self.push_insn(block, insn);
+    }
+
+    /// Try replacing an InvokeBuiltin call with the inline HIR provided by the
+    /// builtin's annotation (if any), appending the replacement instructions to
+    /// `block`. Returns the instruction to use as the result, or None if the
+    /// builtin couldn't be inlined.
+    fn try_inline_builtin_body(&mut self, block: BlockId, bf: *const rb_builtin_function, recv: InsnId, args: &[InsnId], state: InsnId) -> Option<InsnId> {
         let props = ZJITState::get_method_annotations().get_builtin_properties(bf).unwrap_or_default();
         // Try inlining the cfunc into HIR
         let tmp_block = self.new_block(u32::MAX);
-        if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
+        if let Some(replacement) = (props.inline)(self, tmp_block, recv, args, state) {
             // Copy contents of tmp_block to block
             assert_ne!(block, tmp_block);
             let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
@@ -4596,9 +4608,9 @@ impl Function {
                 self.insn_types[replacement] = self.infer_type(replacement);
             }
             self.remove_block(tmp_block);
-            return replacement;
+            return Some(replacement);
         }
-        return self.push_insn(block, insn);
+        None
     }
 
     /// Try trivially inlining the method. If we can't, emit a SendDirect instruction instead and
@@ -5561,6 +5573,17 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::from(def_type)));
                             continue;
+                        }
+                    }
+                    &Insn::InvokeBuiltin { bf, recv, ref args, state, .. } => {
+                        // Builtins reached through inline_methods are translated to HIR
+                        // before their operand types are inferred, so their
+                        // annotation-based inlining may have failed. Retry now that
+                        // types are known.
+                        let args = args.to_vec();
+                        match self.try_inline_builtin_body(block, bf, recv, &args, state) {
+                            Some(replacement) => { self.make_equal_to(insn_id, replacement); }
+                            None => { self.push_insn_id(block, insn_id); }
                         }
                     }
                     _ => { self.push_insn_id(block, insn_id); }
