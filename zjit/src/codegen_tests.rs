@@ -7474,6 +7474,208 @@ fn test_spilled_basic_block_args() {
     "), @"55");
 }
 
+// The tests below rotate values between block parameters that the register
+// allocator spills. resolve_ssa() used to break such copy cycles through
+// SCRATCH_REG, which {arch}_scratch_split also uses to stage memory-to-memory
+// Movs, so the parked value was clobbered and the rotation degenerated into a
+// broadcast of one element. See Assembler::parcopy_spare().
+
+#[test]
+fn test_spilled_block_param_swap() {
+    assert_snapshot!(inspect("
+        def test(a, b, n)
+          i = 0
+          while i < n
+            a, b = b, a
+            i += 1
+          end
+          [a, b]
+        end
+        test(10, 20, 4)
+        test(10, 20, 4)
+        test(10, 20, 5)
+    "), @"[20, 10]");
+}
+
+#[test]
+fn test_spilled_block_param_swap_many_locals() {
+    assert_snapshot!(inspect("
+        def test(a, b, n)
+          c = 3
+          d = 4
+          e = 5
+          f = 6
+          g = 7
+          h = 8
+          i = 0
+          while i < n
+            a, b = b, a
+            i += 1
+          end
+          [a, b, c, d, e, f, g, h]
+        end
+        test(10, 20, 4)
+        test(10, 20, 4)
+        test(10, 20, 4)
+    "), @"[10, 20, 3, 4, 5, 6, 7, 8]");
+}
+
+#[test]
+fn test_spilled_block_param_rotate3() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, n)
+          i = 0
+          while i < n
+            a, b, c = b, c, a
+            i += 1
+          end
+          [a, b, c]
+        end
+        test(1, 2, 3, 4)
+        test(1, 2, 3, 4)
+        test(1, 2, 3, 4)
+    "), @"[2, 3, 1]");
+}
+
+#[test]
+fn test_spilled_block_param_rotate3_reverse() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, n)
+          i = 0
+          while i < n
+            a, b, c = c, a, b
+            i += 1
+          end
+          [a, b, c]
+        end
+        test(1, 2, 3, 4)
+        test(1, 2, 3, 4)
+        test(1, 2, 3, 4)
+    "), @"[3, 1, 2]");
+}
+
+#[test]
+fn test_spilled_block_param_swap_with_fixed_third() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, n)
+          i = 0
+          while i < n
+            a, b, c = b, a, c
+            i += 1
+          end
+          [a, b, c]
+        end
+        test(1, 2, 3, 5)
+        test(1, 2, 3, 5)
+        test(1, 2, 3, 5)
+    "), @"[2, 1, 3]");
+}
+
+#[test]
+fn test_spilled_block_param_rotate4() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, d, n)
+          i = 0
+          while i < n
+            a, b, c, d = b, c, d, a
+            i += 1
+          end
+          [a, b, c, d]
+        end
+        test(1, 2, 3, 4, 5)
+        test(1, 2, 3, 4, 5)
+        test(1, 2, 3, 4, 5)
+    "), @"[2, 3, 4, 1]");
+}
+
+#[test]
+fn test_spilled_block_param_rotate5() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, d, e, n)
+          i = 0
+          while i < n
+            a, b, c, d, e = e, a, b, c, d
+            i += 1
+          end
+          [a, b, c, d, e]
+        end
+        test(1, 2, 3, 4, 5, 7)
+        test(1, 2, 3, 4, 5, 7)
+        test(1, 2, 3, 4, 5, 7)
+    "), @"[4, 5, 1, 2, 3]");
+}
+
+#[test]
+fn test_spilled_block_param_rotate_then_swap() {
+    assert_snapshot!(inspect("
+        def test(a, b, c, d, n)
+          i = 0
+          while i < n
+            a, b, c = b, c, a
+            c, d = d, c
+            i += 1
+          end
+          [a, b, c, d]
+        end
+        test(1, 2, 3, 4, 3)
+        test(1, 2, 3, 4, 3)
+        test(1, 2, 3, 4, 3)
+    "), @"[4, 1, 2, 3]");
+}
+
+#[test]
+fn test_spilled_block_param_swap_with_early_exit() {
+    assert_snapshot!(inspect("
+        def test(a, b, n)
+          i = 0
+          while i < n
+            a, b = b, a
+            return [a, b, :early] if i == 2
+            i += 1
+          end
+          [a, b]
+        end
+        test(10, 20, 6)
+        test(10, 20, 6)
+        test(10, 20, 6)
+    "), @"[20, 10, :early]");
+}
+
+#[test]
+fn test_spilled_block_param_conditional_swap() {
+    assert_snapshot!(inspect("
+        def test(a, b, n)
+          i = 0
+          while i < n
+            a, b = b, a if i.even?
+            i += 1
+          end
+          [a, b]
+        end
+        test(10, 20, 5)
+        test(10, 20, 5)
+        test(10, 20, 5)
+    "), @"[20, 10]");
+}
+
+#[test]
+fn test_spilled_block_param_swap_with_call() {
+    assert_snapshot!(inspect("
+        def test(a, b, n)
+          i = 0
+          while i < n
+            a, b = b, a
+            a = a.itself
+            i += 1
+          end
+          [a, b]
+        end
+        test(10, 20, 4)
+        test(10, 20, 4)
+        test(10, 20, 4)
+    "), @"[10, 20]");
+}
+
 #[test]
 fn test_putself() {
     assert_snapshot!(inspect("
