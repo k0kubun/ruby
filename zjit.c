@@ -104,6 +104,38 @@ rb_zjit_profile_enable(const rb_iseq_t *iseq)
     }
 }
 
+// Count an ISEQ entry through a JIT-to-JIT function stub and return whether
+// the ISEQ is ready to compile. The compiled caller already establishes that
+// the callee is hot, so a cold callee skips directly to the profiling window
+// instead of repeating the unprofiled warmup. Each false return lets the
+// current invocation run in the interpreter and collect one profile.
+bool
+rb_zjit_profile_stub_hit(const rb_iseq_t *iseq)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+
+    if (body->jit_entry_calls >= rb_zjit_call_threshold) {
+        return true;
+    }
+
+    // The hit that compiles the ISEQ runs in generated code, so don't count it
+    // as an interpreter entry. Leaving the counter one short also lets a future
+    // interpreter entry install the lazily generated code in body->jit_entry.
+    if (body->jit_entry_calls + 1 >= rb_zjit_call_threshold) {
+        return true;
+    }
+
+    if (body->jit_entry_calls < rb_zjit_profile_threshold) {
+        body->jit_entry_calls = rb_zjit_profile_threshold;
+        rb_zjit_profile_enable(iseq);
+    }
+    else {
+        body->jit_entry_calls++;
+    }
+
+    return false;
+}
+
 // Convert a given ISEQ's ZJIT instructions to bare instructions
 void
 rb_zjit_profile_disable(const rb_iseq_t *iseq)
