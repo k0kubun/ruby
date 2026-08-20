@@ -696,6 +696,12 @@ pub fn occupancy_totals() -> (usize, usize) {
 /// Every table, for [`crate::mem_stats`] and `--zjit-stats`.
 pub type SendCaches = HashMap<SendCacheKey, Box<SendCache>>;
 
+/// Bytes every send class table owns on the Rust heap, plus the map that owns them.
+pub fn send_caches_heap_size(caches: &SendCaches) -> usize {
+    crate::mem_stats::hash_table_bytes::<(SendCacheKey, Box<SendCache>)>(caches.capacity())
+        + caches.values().map(|cache| cache.heap_size()).sum::<usize>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
