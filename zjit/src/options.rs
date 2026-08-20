@@ -99,6 +99,18 @@ pub struct Options {
     /// Turn off the HIR optimizer
     pub disable_hir_opt: bool,
 
+    /// Turn off the ivar shape table, so ivar sites that miss their inline shape
+    /// guard chain go straight to the generic C call. Only useful for A/B
+    /// measurement; see [`crate::ivar_cache`].
+    pub disable_ivar_cache: bool,
+
+    /// Slots in each ivar shape table. Must be a power of two and at least 8;
+    /// one table is allocated per ivar name a compiled fallback path accesses, so
+    /// this times 8 bytes times the number of such names bounds the memory.
+    /// Undersizing it is not a graceful degradation -- see
+    /// [`crate::ivar_cache::DEFAULT_CACHE_ENTRIES`].
+    pub ivar_cache_entries: usize,
+
     /// Dump initial High-level IR before optimization
     pub dump_hir_init: Option<DumpHIR>,
 
@@ -201,6 +213,8 @@ impl Default for Options {
             debug: false,
             disable: false,
             disable_hir_opt: false,
+            disable_ivar_cache: false,
+            ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
             dump_hir_opt: None,
             dump_hir_graphviz: None,
@@ -531,6 +545,12 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable", "") => options.disable = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
+        ("disable-ivar-cache", "") => options.disable_ivar_cache = true,
+
+        ("ivar-cache-entries", _) => match opt_val.parse::<usize>() {
+            Ok(n) if n.is_power_of_two() && n >= 8 => options.ivar_cache_entries = n,
+            _ => return None,
+        },
 
         // --zjit-dump-hir dumps the actual input to the codegen, which is currently the same as --zjit-dump-hir-opt.
         ("dump-hir" | "dump-hir-opt", "") => options.dump_hir_opt = Some(DumpHIR::WithoutSnapshot),
