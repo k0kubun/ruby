@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
+use crate::mem_stats::hash_table_bytes;
 use crate::distribution::{Distribution, DistributionSummary, StableBucket};
 use crate::stats::Counter::profile_time_ns;
 use crate::stats::with_time_stat;
@@ -149,6 +150,10 @@ pub fn num_arguments_on_stack(cd: *const rb_call_data) -> usize {
 
 const DISTRIBUTION_SIZE: usize = 8;
 
+/// How many profile entries to make room for at a time. See
+/// [`IseqProfile::entry_mut`].
+const ENTRY_GROWTH_STEP: usize = 8;
+
 pub type TypeDistribution = Distribution<ProfiledType, DISTRIBUTION_SIZE>;
 
 pub type TypeDistributionSummary = DistributionSummary<ProfiledType, DISTRIBUTION_SIZE>;
@@ -161,11 +166,17 @@ pub type SplatLengthDistribution = Distribution<Option<SplatLength>, DISTRIBUTIO
 
 pub type SplatLengthDistributionSummary = DistributionSummary<Option<SplatLength>, DISTRIBUTION_SIZE>;
 
+/// Allocate exactly `n` empty operand type distributions.
+fn new_opnd_types(n: usize) -> Box<[TypeDistribution]> {
+    // vec![elem; n] allocates exactly n elements, unlike Vec::resize().
+    vec![TypeDistribution::new(); n].into_boxed_slice()
+}
+
 /// Profile the Type of top-`n` stack operands
 fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(n, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(n);
     }
 
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate() {
@@ -198,7 +209,8 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     } else {
         None
     };
-    profile.splat_lengths.entry(profiler.insn_idx)
+    profile.splat_lengths.get_or_insert_with(Default::default)
+        .entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
 }
 
@@ -228,14 +240,15 @@ fn profile_send_method_name(profiler: &mut Profiler, profile: &mut IseqProfile, 
     if !name.static_sym_p() {
         return;
     }
-    profile.send_mid.entry(profiler.insn_idx)
+    profile.send_mid.get_or_insert_with(Default::default)
+        .entry(profiler.insn_idx)
         .or_insert_with(TypeDistribution::new).observe(ProfiledType::object(name));
 }
 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
     let obj = profiler.peek_at_self();
     // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
@@ -283,7 +296,7 @@ impl IseqProfile {
     fn observe_ivar_fallback(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, recv: VALUE) -> IvarReprofiled {
         let entry = self.entry_mut(insn_idx);
         if entry.opnd_types.is_empty() {
-            entry.opnd_types.resize(1, TypeDistribution::new());
+            entry.opnd_types = new_opnd_types(1);
         }
         // The dispatch that is running was built from the shapes the profile held when the ISEQ
         // was last compiled. Remember how many that was the first time we sample: because this
@@ -422,7 +435,7 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
     let obj = profiler.peek_at_block_handler();
     let ty = ProfiledType::block_handler(obj);
@@ -433,7 +446,7 @@ fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
 fn profile_getblockparamproxy(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
 
     let level = profiler.insn_opnd(1).as_u32();
@@ -450,7 +463,8 @@ fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let cme = unsafe { rb_vm_frame_method_entry(profiler.cfp) };
     let cme_value = VALUE(cme as usize);  // CME is a T_IMEMO, which is a VALUE
 
-    profile.super_cme.entry(profiler.insn_idx)
+    profile.super_cme.get_or_insert_with(Default::default)
+        .entry(profiler.insn_idx)
         .or_insert_with(|| TypeDistribution::new()).observe(ProfiledType::object(cme_value));
 
     unsafe { rb_gc_writebarrier(profiler.iseq.into(), cme_value) };
@@ -670,8 +684,12 @@ impl ProfiledType {
 pub struct ProfileEntry {
     /// YARV instruction index
     insn_idx: u32,
-    /// Type information of YARV instruction operands
-    opnd_types: Vec<TypeDistribution>,
+    /// Type information of YARV instruction operands. A boxed slice rather
+    /// than a `Vec` because it is sized once and never resized: `Vec` would
+    /// round the allocation up to `MIN_NON_ZERO_CAP` (4 elements), which for
+    /// 80-byte distributions wastes up to 240 bytes on every single-operand
+    /// instruction, and would also carry a capacity field we never read.
+    opnd_types: Box<[TypeDistribution]>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
     /// Receivers seen on this ivar site's fallback path in the current re-profiling window.
@@ -690,30 +708,49 @@ impl ProfileEntry {
     }
 }
 
+/// What an [`IseqProfile`]'s heap bytes are spent on. See [`IseqProfile::heap_size`].
+#[derive(Default, Debug)]
+pub struct ProfileHeapSize {
+    /// Total heap bytes owned by the profile.
+    pub bytes: usize,
+    /// Of those, bytes in the unused tail of the `entries` Vec.
+    pub entry_slack_bytes: usize,
+    /// Number of per-instruction profile entries.
+    pub entry_count: usize,
+    /// Number of operand type distributions across all entries.
+    pub distribution_count: usize,
+    /// How many of those distributions saw at most one type.
+    pub monomorphic_distribution_count: usize,
+}
+
 #[derive(Debug)]
 pub struct IseqProfile {
     /// Sparse storage of per-instruction profile data, sorted by instruction index.
     /// Only instructions that have actually been profiled have entries here.
     entries: Vec<ProfileEntry>,
 
-    /// Method entries for `super` calls (stored as VALUE to be GC-safe)
-    super_cme: HashMap<YarvInsnIdx, TypeDistribution>,
+    /// Method entries for `super` calls (stored as VALUE to be GC-safe).
+    /// Boxed because only ISEQs containing `invokesuper` ever use it, and an
+    /// inline `HashMap` costs every payload 48 bytes to hold nothing.
+    super_cme: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
     /// Method-name symbols observed as the first argument of `send`/`__send__` call sites
-    /// (stored as VALUE to be GC-safe)
-    send_mid: HashMap<YarvInsnIdx, TypeDistribution>,
+    /// (stored as VALUE to be GC-safe). Boxed for the same reason as `super_cme`: only
+    /// ISEQs that actually contain a `send`/`__send__` site ever populate it.
+    send_mid: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
-    /// Observed lengths of caller splat arrays for call instructions.
-    splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+    /// Observed lengths of caller splat arrays for call instructions. Boxed for
+    /// the same reason as `super_cme`.
+    splat_lengths: Option<Box<HashMap<YarvInsnIdx, SplatLengthDistribution>>>,
 }
 
 impl IseqProfile {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            super_cme: HashMap::new(),
-            send_mid: HashMap::new(),
-            splat_lengths: HashMap::new(),
+            super_cme: None,
+            send_mid: None,
+            splat_lengths: None,
         }
     }
 
@@ -723,9 +760,16 @@ impl IseqProfile {
         match self.entries.binary_search_by_key(&idx, |e| e.insn_idx) {
             Ok(i) => &mut self.entries[i],
             Err(i) => {
+                if self.entries.len() == self.entries.capacity() {
+                    // Grow by a fixed step rather than doubling. An ISEQ has a
+                    // bounded number of profiled instructions and these entries
+                    // live as long as the ISEQ, so doubling leaves up to half of
+                    // a long-lived table permanently unused.
+                    self.entries.reserve_exact(ENTRY_GROWTH_STEP);
+                }
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
-                    opnd_types: Vec::new(),
+                    opnd_types: Box::new([]),
                     profiles_remaining: get_option!(num_profiles),
                     ivar_fallback_samples: 0,
                     ivar_fallback_fixable: 0,
@@ -750,16 +794,16 @@ impl IseqProfile {
 
     /// Get profiled operand types for a given instruction index
     pub fn get_operand_types(&self, insn_idx: YarvInsnIdx) -> Option<&[TypeDistribution]> {
-        self.entry(insn_idx).map(|e| e.opnd_types.as_slice()).filter(|s| !s.is_empty())
+        self.entry(insn_idx).map(|e| &*e.opnd_types).filter(|s| !s.is_empty())
     }
 
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
-        self.splat_lengths.get(&insn_idx)
+        self.splat_lengths.as_ref()?.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
     }
 
     pub fn get_super_method_entry(&self, insn_idx: YarvInsnIdx) -> Option<*const rb_callable_method_entry_t> {
-        let Some(entry) = self.super_cme.get(&insn_idx) else { return None };
+        let Some(entry) = self.super_cme.as_ref()?.get(&insn_idx) else { return None };
         let summary = TypeDistributionSummary::new(entry);
 
         if summary.is_monomorphic() {
@@ -771,7 +815,43 @@ impl IseqProfile {
 
     /// Get the distribution of method-name symbols seen at a `send`/`__send__` call site.
     pub fn get_send_method_names(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
-        self.send_mid.get(&insn_idx).map(TypeDistributionSummary::new)
+        self.send_mid.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
+    }
+
+    /// Bytes this profile owns on the Rust heap, excluding the `IseqProfile`
+    /// struct itself (which lives inside the `IseqPayload` allocation), plus
+    /// counts describing what those bytes are spent on.
+    pub fn heap_size(&self) -> ProfileHeapSize {
+        let mut out = ProfileHeapSize::default();
+        out.bytes = self.entries.capacity() * size_of::<ProfileEntry>();
+        out.entry_slack_bytes = (self.entries.capacity() - self.entries.len()) * size_of::<ProfileEntry>();
+        out.entry_count = self.entries.len();
+        for entry in &self.entries {
+            out.bytes += entry.opnd_types.len() * size_of::<TypeDistribution>();
+            out.distribution_count += entry.opnd_types.len();
+            for distribution in entry.opnd_types.iter() {
+                out.bytes += distribution.heap_size();
+                if distribution.num_buckets_used() <= 1 {
+                    out.monomorphic_distribution_count += 1;
+                }
+            }
+        }
+        if let Some(super_cme) = self.super_cme.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(super_cme.capacity());
+            out.bytes += super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(send_mid) = self.send_mid.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(send_mid.capacity());
+            out.bytes += send_mid.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(splat_lengths) = self.splat_lengths.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, SplatLengthDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(splat_lengths.capacity());
+            out.bytes += splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        }
+        out
     }
 
     /// Run a given callback with every object in IseqProfile
@@ -785,13 +865,13 @@ impl IseqProfile {
             }
         }
 
-        for super_cme_values in self.super_cme.values() {
+        for super_cme_values in self.super_cme.iter().flat_map(|map| map.values()) {
             for profiled_type in super_cme_values.each_item() {
                 callback(profiled_type.class)
             }
         }
 
-        for send_mid_values in self.send_mid.values() {
+        for send_mid_values in self.send_mid.iter().flat_map(|map| map.values()) {
             for profiled_type in send_mid_values.each_item() {
                 callback(profiled_type.class)
             }
@@ -810,13 +890,13 @@ impl IseqProfile {
         }
 
         // Update CME references if they move during compaction.
-        for super_cme_values in self.super_cme.values_mut() {
+        for super_cme_values in self.super_cme.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in super_cme_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
 
-        for send_mid_values in self.send_mid.values_mut() {
+        for send_mid_values in self.send_mid.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in send_mid_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }

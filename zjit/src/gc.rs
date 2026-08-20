@@ -4,6 +4,7 @@ use std::ptr::null;
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
 use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
+use crate::profile::IseqProfile;
 use crate::stats::Counter::gc_time_ns;
 
 /// GC callback for marking GC objects in the per-ISEQ payload.
@@ -51,11 +52,35 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
         return;
     }
 
-    // TODO(Shopify/ruby#682): Free `IseqPayload`
+    // TODO(Shopify/ruby#682): Free the `IseqPayload` allocation itself. The
+    // `IseqVersion`s it points at have to outlive the ISEQ because
+    // `Invariants`' patch points hold raw pointers to them, so for now we keep
+    // the payload and release everything inside it that is provably dead.
     let payload = get_or_create_iseq_payload(iseq);
+    crate::stats::incr_counter!(dead_iseq_payload_count);
     for version in payload.all_versions_mut() {
-        unsafe { version.as_mut() }.iseq = null();
+        let version = unsafe { version.as_mut() };
+        version.iseq = null();
+        // GC offsets are only read by iseq_mark(), which the GC reaches through
+        // the ISEQ. With the ISEQ gone nothing marks this code again, so the
+        // table is dead weight.
+        version.gc_offsets = Vec::new();
     }
+    payload.versions.shrink_to_fit();
+    payload.exception_versions.shrink_to_fit();
+    payload.exception_entries.shrink_to_fit();
+    // Profiles are only read while building HIR for this ISEQ or for a caller
+    // that inlines it. Neither can happen again: the ISEQ is unreachable, so it
+    // can neither be called nor be the target of a send in newly compiled code.
+    //
+    // The re-profiling paths added on top of this (`rb_zjit_ivar_reprofile`)
+    // cannot resurrect it either: they reach a profile only through
+    // `get_or_create_iseq_payload(frame_iseq)` of a *running* frame's ISEQ,
+    // which is by definition alive, and they hold no pointer into any
+    // `IseqProfile` across a call. Nothing caches a `&IseqProfile` or a
+    // `TypeDistribution` pointer past the statement that produced it, so
+    // replacing the profile here cannot dangle.
+    payload.profile = IseqProfile::new();
 
     let invariants = ZJITState::get_invariants();
     invariants.forget_iseq(iseq);
@@ -180,7 +205,11 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
 
 /// Append a set of gc_offsets to the iseq's payload
 pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
-    unsafe { version.as_mut() }.gc_offsets.extend(offsets);
+    let gc_offsets = &mut unsafe { version.as_mut() }.gc_offsets;
+    gc_offsets.extend(offsets);
+    // This table is written once per version and then only read, so hand back
+    // whatever Vec's growth strategy over-reserved.
+    gc_offsets.shrink_to_fit();
 
     // Call writebarrier on each newly added value
     let cb = ZJITState::get_code_block();
