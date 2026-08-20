@@ -102,6 +102,12 @@ pub struct ExitDescriptor {
     num_stack: usize,
     /// 64-bit immediates referenced by [`ExitLoc::Imm`] and [`ExitLoc::Value`]
     imms: Vec<u64>,
+    /// Callee-saved registers the allocator handed out to the exiting function, paired
+    /// with the byte offset from NATIVE_BASE_PTR of the slot the function saved each one
+    /// to right after FrameSetup. The exit restores them last, after every other location
+    /// has been read, since exit operands may live in these very registers. The exit
+    /// trampoline only tears the frame down, so this is the last chance to restore them.
+    pub callee_saved: Box<[(u8, i32)]>,
     pub extra: Option<Box<ExitDescriptorExtra>>,
 }
 
@@ -128,6 +134,7 @@ impl ExitImms {
 //   u64 pc, u64 iseq, u8 flags, u8 hits, [u64 recompile version], varint num_stack, varint num_locals,
 //   loc * (num_stack + num_locals),
 //   [u64 jit_frame, svarint jit_frame_slot, varint num_captures, (loc, svarint slot) * num_captures],
+//   [varint num_callee_saved, (u8 reg_no, svarint slot) * num_callee_saved],
 //   [u64 trace_reason]
 //
 // Each loc starts with a byte whose low 3 bits are a tag and high 5 bits a payload.
@@ -135,6 +142,7 @@ impl ExitImms {
 const FLAG_RECOMPILE: u8 = 1 << 0; // a u64 IseqVersion pointer to recompile follows
 const FLAG_STACK_MAP: u8 = 1 << 1;
 const FLAG_TRACE: u8 = 1 << 2;
+const FLAG_CALLEE_SAVED: u8 = 1 << 3; // callee-saved allocator registers to restore from native slots
 
 const TAG_REG: u8 = 0; // payload: reg_no. A 64-bit register.
 const TAG_SLOT: u8 = 1; // svarint disp. A 64-bit native stack slot.
@@ -337,6 +345,12 @@ impl Decoder {
                 self.svarint();
             }
         }
+        if header.flags & FLAG_CALLEE_SAVED != 0 {
+            for _ in 0..self.varint() {
+                self.u8();
+                self.svarint();
+            }
+        }
         if header.flags & FLAG_TRACE != 0 {
             self.u64();
         }
@@ -360,11 +374,16 @@ impl Decoder {
             let captures = (0..self.varint()).map(|_| (loc(self, &mut imms), self.svarint() as i32)).collect();
             ExitStackMap { captures, jit_frame, jit_frame_slot }
         });
+        let callee_saved = if header.flags & FLAG_CALLEE_SAVED != 0 {
+            (0..self.varint()).map(|_| (self.u8(), self.svarint() as i32)).collect()
+        } else {
+            vec![]
+        };
         let trace_reason = (header.flags & FLAG_TRACE != 0).then(|| self.u64() as *const c_char);
         let extra = (stack_map.is_some() || trace_reason.is_some())
             .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
         let iseq = unsafe { header.iseq.read_unaligned() as IseqPtr };
-        ExitDescriptor::new(header.pc, iseq, stack, locals, imms, header.recompile, extra)
+        ExitDescriptor::new(header.pc, iseq, stack, locals, imms, header.recompile, callee_saved, extra)
     }
 }
 
@@ -376,12 +395,13 @@ impl ExitDescriptor {
         locals: Vec<ExitLoc>,
         imms: ExitImms,
         recompile: *mut IseqVersion,
+        callee_saved: Vec<(u8, i32)>,
         extra: Option<Box<ExitDescriptorExtra>>,
     ) -> Self {
         let num_stack = stack.len();
         let mut locs = stack;
         locs.extend(locals);
-        ExitDescriptor { pc, iseq, recompile, locs, num_stack, imms: imms.0, extra }
+        ExitDescriptor { pc, iseq, recompile, locs, num_stack, imms: imms.0, callee_saved: callee_saved.into_boxed_slice(), extra }
     }
 
     pub fn stack(&self) -> &[ExitLoc] {
@@ -415,6 +435,9 @@ impl ExitDescriptor {
         if self.trace_reason().is_some() {
             flags |= FLAG_TRACE;
         }
+        if !self.callee_saved.is_empty() {
+            flags |= FLAG_CALLEE_SAVED;
+        }
         enc.u8(flags);
         enc.u8(0); // hits
         if flags & FLAG_RECOMPILE != 0 {
@@ -431,6 +454,13 @@ impl ExitDescriptor {
             enc.varint(stack_map.captures.len() as u64);
             for &(loc, slot) in stack_map.captures.iter() {
                 enc.loc(loc, &self.imms);
+                enc.svarint(slot as i64);
+            }
+        }
+        if !self.callee_saved.is_empty() {
+            enc.varint(self.callee_saved.len() as u64);
+            for &(reg_no, slot) in self.callee_saved.iter() {
+                enc.u8(reg_no);
                 enc.svarint(slot as i64);
             }
         }
@@ -670,13 +700,15 @@ unsafe fn read_loc(loc: DecodedLoc, regs: *const usize, native_base_ptr: usize) 
 ///
 /// This does what the inline exit code used to do, in the same order: restore
 /// `cfp->pc`, `cfp->sp` and `cfp->iseq`, write out the Ruby stack and locals,
-/// install the stack map for older inlined frames, then optionally record a
-/// traced exit stack and count the exit towards recompilation. The trampoline
-/// then jumps to materialize_exit_trampoline, which clears `cfp->jit_return`
-/// and materializes the JIT frames below this one. Nothing here allocates Ruby
-/// objects or can trigger GC before the optional calls at the end.
+/// install the stack map for older inlined frames, restore the callee-saved
+/// registers the allocator handed out (by writing the caller's values into the
+/// save area, which the trampoline restores every register from), then optionally
+/// record a traced exit stack and count the exit towards recompilation. The
+/// trampoline then jumps to materialize_exit_trampoline, which clears
+/// `cfp->jit_return` and materializes the JIT frames below this one. Nothing here
+/// allocates Ruby objects or can trigger GC before the optional calls at the end.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usize) -> *const u8 {
+pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *mut usize, ret_addr: usize) -> *const u8 {
     let reg = |opnd: crate::backend::lir::Opnd| unsafe { *regs.add(opnd.unwrap_reg().reg_no as usize) };
     let cfp = reg(CFP) as CfpPtr;
 
@@ -736,6 +768,19 @@ pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usi
                     (native_base_ptr.wrapping_add_signed(slot) as *mut u64).write(value);
                 }
                 (native_base_ptr.wrapping_add_signed(jit_frame_slot) as *mut *const zjit_jit_frame).write(jit_frame);
+            }
+
+            // Restore callee-saved allocator registers last: the locations read above
+            // may live in these very registers. The trampoline restores every register
+            // from the save area before going to materialize_exit_trampoline, which
+            // only tears the frame down, so writing the caller's value here is the
+            // last chance to restore them.
+            if header.flags & FLAG_CALLEE_SAVED != 0 {
+                for _ in 0..decoder.varint() {
+                    let reg_no = decoder.u8();
+                    let slot = decoder.svarint() as isize;
+                    regs.add(reg_no as usize).write(*(native_base_ptr.wrapping_add_signed(slot) as *const usize));
+                }
             }
         }
 
@@ -882,6 +927,17 @@ fn gen_lazy_exit(desc: &ExitDescriptor) -> Assembler {
         asm.ccall_into(C_RET_OPND, exit_recompile as *const u8, vec![Opnd::const_ptr(desc.recompile)]);
     }
 
+    // Restore the callee-saved registers the allocator handed out. The trampoline this
+    // jumps to only tears the frame down, so this is the last chance. It has to come
+    // after the stores above, which read exit operands that may live in these very
+    // registers, and after the ccalls, whose callees preserve them anyway.
+    if !desc.callee_saved.is_empty() {
+        asm_comment!(asm, "restore callee-saved allocator registers");
+        for &(reg_no, slot) in desc.callee_saved.iter() {
+            asm.load_into(Opnd::Reg(crate::backend::lir::gp_reg(reg_no, 64)), Opnd::mem(64, NATIVE_BASE_PTR, slot));
+        }
+    }
+
     asm_comment!(asm, "exit to the interpreter");
     asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
     asm
@@ -990,6 +1046,7 @@ mod tests {
         assert!(matches!(locs[9], ExitLoc::Value(_)));
         let stack_map = ExitStackMap { captures: vec![(ExitLoc::Reg { reg: 1, bits: 64 }, -40)].into_boxed_slice(), jit_frame: 0x1000 as *const _, jit_frame_slot: -16 };
         let desc = ExitDescriptor::new(0x5000 as *const VALUE, 0x6000 as IseqPtr, locs[..4].to_vec(), locs[4..].to_vec(), imms, 0x7000 as *mut IseqVersion,
+            vec![(14, -56), (15, -64)],
             Some(Box::new(ExitDescriptorExtra { stack_map: Some(stack_map), trace_reason: Some(0x8000 as *const c_char) })));
         let mut encoded = desc.encode().into_vec();
         encoded.extend_from_slice(&desc.encode());
@@ -1015,6 +1072,9 @@ mod tests {
             assert_eq!(decoder.varint(), 1);
             assert!(matches!(decoder.loc(), DecodedLoc::Loc(ExitLoc::Reg { reg: 1, bits: 64 })));
             assert_eq!(decoder.svarint(), -40);
+            assert_eq!(decoder.varint(), 2);
+            assert_eq!((decoder.u8(), decoder.svarint()), (14, -56));
+            assert_eq!((decoder.u8(), decoder.svarint()), (15, -64));
             assert_eq!(decoder.u64(), 0x8000);
         }
         assert_eq!(decoder.ptr, bytes.end);
