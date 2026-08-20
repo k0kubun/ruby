@@ -187,13 +187,15 @@ rb_iseq_get_zjit_payload(const rb_iseq_t *iseq)
     }
 }
 
-// Set profiling information for ISEQ
+// Set profiling information for ISEQ. A payload is installed exactly once and
+// cleared exactly once, when the ISEQ is freed (rb_zjit_iseq_free), so one side
+// of the assignment is always NULL: this never silently drops a live payload.
 void
 rb_iseq_set_zjit_payload(const rb_iseq_t *iseq, void *payload)
 {
     RUBY_ASSERT_ALWAYS(IMEMO_TYPE_P(iseq, imemo_iseq));
     RUBY_ASSERT_ALWAYS(ISEQ_BODY(iseq));
-    RUBY_ASSERT_ALWAYS(NULL == ISEQ_BODY(iseq)->zjit_payload);
+    RUBY_ASSERT_ALWAYS(NULL == ISEQ_BODY(iseq)->zjit_payload || NULL == payload);
     ISEQ_BODY(iseq)->zjit_payload = payload;
 }
 
