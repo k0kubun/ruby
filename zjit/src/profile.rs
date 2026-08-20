@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
+use crate::mem_stats::hash_table_bytes;
 use crate::distribution::{Distribution, DistributionSummary, StableBucket};
 use crate::stats::Counter::profile_time_ns;
 use crate::stats::with_time_stat;
@@ -955,6 +956,23 @@ impl ProfileEntry {
     }
 }
 
+/// What an [`IseqProfile`]'s heap bytes are spent on. See [`IseqProfile::heap_size`].
+#[derive(Default, Debug)]
+pub struct ProfileHeapSize {
+    /// Total heap bytes owned by the profile.
+    pub bytes: usize,
+    /// Of those, bytes in the unused tail of the `entries` Vec.
+    pub entry_slack_bytes: usize,
+    /// Number of per-instruction profile entries.
+    pub entry_count: usize,
+    /// Number of operand type distributions across all entries.
+    pub distribution_count: usize,
+    /// How many of those distributions saw at most one type.
+    pub monomorphic_distribution_count: usize,
+    /// Number of objects in the dense array GC marking walks.
+    pub marked_object_count: usize,
+}
+
 #[derive(Debug)]
 pub struct IseqProfile {
     /// Sparse storage of per-instruction profile data, sorted by instruction index.
@@ -1237,6 +1255,34 @@ impl IseqProfile {
     /// The distribution of block handlers observed at an `invokeblock` site.
     pub fn get_block_handlers(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
         self.block_handlers.get(&insn_idx).map(TypeDistributionSummary::new)
+    }
+
+    /// Bytes this profile owns on the Rust heap, excluding the `IseqProfile`
+    /// struct itself (which lives inside the `IseqPayload` allocation), plus
+    /// counts describing what those bytes are spent on.
+    pub fn heap_size(&self) -> ProfileHeapSize {
+        let mut out = ProfileHeapSize::default();
+        out.bytes = self.entries.capacity() * size_of::<ProfileEntry>()
+            + self.marked_objects.capacity() * size_of::<VALUE>();
+        out.marked_object_count = self.marked_objects.len();
+        out.entry_slack_bytes = (self.entries.capacity() - self.entries.len()) * size_of::<ProfileEntry>();
+        out.entry_count = self.entries.len();
+        for entry in &self.entries {
+            out.bytes += entry.opnd_types.capacity() * size_of::<TypeDistribution>();
+            out.distribution_count += entry.opnd_types.len();
+            for distribution in entry.opnd_types.iter() {
+                if distribution.num_buckets_used() <= 1 {
+                    out.monomorphic_distribution_count += 1;
+                }
+            }
+        }
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.super_cme.capacity());
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.send_mid.capacity());
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(self.splat_lengths.capacity());
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, ForwardedCiDistribution)>(self.forwarded_cis.capacity());
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.block_handlers.capacity());
+        out.bytes += hash_table_bytes::<(YarvInsnIdx, BlockFallbackEntry)>(self.block_fallbacks.capacity());
+        out
     }
 
     /// Run a given callback with every object in IseqProfile

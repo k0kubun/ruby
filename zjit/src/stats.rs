@@ -166,6 +166,12 @@ make_counters! {
         block_respecialize_giveup_count,
         skipped_native_stack_full,
 
+        // ISEQ payloads (profiles + version lists) ZJIT has allocated, and the
+        // subset whose ISEQ the GC has since freed. ZJIT does not free the
+        // payload of a dead ISEQ, so the difference is retained forever.
+        allocated_iseq_payload_count,
+        dead_iseq_payload_count,
+
         compile_time_ns,
         profile_time_ns,
         gc_time_ns,
@@ -1149,6 +1155,40 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
     set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + jit_frame_bytes + zjit_alloc_bytes());
 
+    // Breakdown of zjit_alloc_bytes by subsystem. Walking every live ISEQ is
+    // not free, so only do it when a mem_* key was asked for or when building
+    // the full hash.
+    if target_key.nil_p() || ruby_sym_to_rust_string(target_key).starts_with("mem_") {
+        let mem = crate::mem_stats::memory_breakdown();
+        set_stat_usize!(hash, "mem_iseq_payload_bytes", mem.iseq_payload_bytes);
+        set_stat_usize!(hash, "mem_profile_bytes", mem.profile_bytes);
+        set_stat_usize!(hash, "mem_iseq_version_bytes", mem.iseq_version_bytes);
+        set_stat_usize!(hash, "mem_gc_offset_bytes", mem.gc_offset_bytes);
+        set_stat_usize!(hash, "mem_iseq_call_bytes", mem.iseq_call_bytes);
+        set_stat_usize!(hash, "mem_invariant_bytes", mem.invariant_bytes);
+        set_stat_usize!(hash, "mem_jit_frame_bytes", mem.jit_frame_bytes);
+        set_stat_usize!(hash, "mem_code_block_bytes", mem.code_block_bytes);
+        set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
+        set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
+        set_stat_usize!(hash, "mem_send_cache_bytes", mem.send_cache_bytes);
+        set_stat_usize!(hash, "mem_exit_meta_bytes", mem.exit_meta_bytes);
+        set_stat_usize!(hash, "mem_root_iseq_bytes", mem.root_iseq_bytes);
+        set_stat_usize!(hash, "mem_accounted_bytes", mem.accounted_bytes());
+        set_stat_usize!(hash, "mem_unaccounted_bytes", zjit_alloc_bytes().saturating_sub(mem.accounted_bytes()));
+        set_stat_usize!(hash, "mem_payload_count", mem.payload_count);
+        set_stat_usize!(hash, "mem_version_count", mem.version_count);
+        set_stat_usize!(hash, "mem_profile_entry_count", mem.profile_entry_count);
+        set_stat_usize!(hash, "mem_profile_entry_slack_bytes", mem.profile_entry_slack_bytes);
+        set_stat_usize!(hash, "mem_profile_distribution_count", mem.profile_distribution_count);
+        set_stat_usize!(hash, "mem_profile_monomorphic_distribution_count", mem.profile_monomorphic_distribution_count);
+        set_stat_usize!(hash, "mem_patch_point_count", mem.patch_point_count);
+        set_stat_usize!(hash, "mem_jit_frame_count", mem.jit_frame_count);
+        set_stat_usize!(hash, "mem_profile_marked_object_count", mem.profile_marked_object_count);
+        set_stat_usize!(hash, "mem_ivar_cache_count", mem.ivar_cache_count);
+        set_stat_usize!(hash, "mem_send_cache_count", mem.send_cache_count);
+        set_stat_usize!(hash, "mem_exit_meta_count", mem.exit_meta_count);
+        set_stat_usize!(hash, "mem_root_iseq_count", mem.root_iseq_count);
+    }
 
     // End of default stats. Every counter beyond this is provided only for --zjit-stats.
     if !get_option!(stats) {
