@@ -70,6 +70,9 @@ pub struct MemoryBreakdown {
     pub code_block_bytes: usize,
     /// String-keyed counter tables that only `--zjit-stats` populates.
     pub stats_counter_bytes: usize,
+    /// Ivar shape tables: one fixed-size table per ivar name accessed by a
+    /// compiled site that can reach the generic path. See [`crate::ivar_cache`].
+    pub ivar_cache_bytes: usize,
 
     /// Number of ISEQ payloads walked, for per-ISEQ math.
     pub payload_count: usize,
@@ -87,6 +90,8 @@ pub struct MemoryBreakdown {
     pub patch_point_count: usize,
     /// Number of live `JITFrame`s.
     pub jit_frame_count: usize,
+    /// Number of ivar shape tables, i.e. distinct ivar names with one.
+    pub ivar_cache_count: usize,
 }
 
 impl MemoryBreakdown {
@@ -101,6 +106,7 @@ impl MemoryBreakdown {
             + self.jit_frame_bytes
             + self.code_block_bytes
             + self.stats_counter_bytes
+            + self.ivar_cache_bytes
     }
 }
 
@@ -152,6 +158,11 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     out.jit_frame_count = jit_frames.len();
     out.jit_frame_bytes = jit_frames.capacity() * size_of::<*mut crate::jit_frame::JITFrame>()
         + jit_frames.iter().map(|&frame| unsafe { &*frame }.heap_size()).sum::<usize>();
+
+    let ivar_caches = ZJITState::get_ivar_caches();
+    out.ivar_cache_count = ivar_caches.len();
+    out.ivar_cache_bytes = hash_table_bytes::<(crate::cruby::ID, Box<crate::ivar_cache::IvarCache>)>(ivar_caches.capacity())
+        + ivar_caches.values().map(|cache| cache.heap_size()).sum::<usize>();
 
     out.code_block_bytes = ZJITState::get_code_block().heap_size();
     out.stats_counter_bytes = ZJITState::counter_table_heap_size();

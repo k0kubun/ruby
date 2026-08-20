@@ -377,6 +377,29 @@ make_counters! {
         definedivar_fallback_complex,
     }
 
+    // getivar_cache_: per-ivar-name shape table (see crate::ivar_cache). Every
+    // dynamic getivar lands in exactly one of getivar_cache_hit (served inline
+    // in JIT code, no call at all) or one of the counters
+    // rb_zjit_getivar_cached increments.
+    getivar_cache_hit,
+    getivar_cache_helper_hit,
+    getivar_cache_fill,
+    getivar_cache_evict,
+    getivar_cache_uncacheable,
+    getivar_cache_immediate,
+    // setivar_cache_: the same table, consulted by rb_zjit_setivar_cached. The
+    // write path has no inline probe, so there is no setivar_cache_hit
+    // counterpart to getivar_cache_hit: a table hit here still costs the call.
+    setivar_cache_hit,
+    setivar_cache_fill,
+    setivar_cache_evict,
+    setivar_cache_uncacheable,
+    setivar_cache_transition,
+    // Number of tables allocated, i.e. distinct ivar names read or written by a
+    // compiled site that can reach the generic path. Multiply by
+    // --zjit-ivar-cache-entries * 8 for the memory.
+    ivar_cache_alloc_count,
+
     // compile_error_: Compile error reasons
     compile_error_iseq_version_limit_reached,
     compile_error_iseq_stack_too_large,
@@ -932,6 +955,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_jit_frame_bytes", mem.jit_frame_bytes);
         set_stat_usize!(hash, "mem_code_block_bytes", mem.code_block_bytes);
         set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
+        set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
         set_stat_usize!(hash, "mem_accounted_bytes", mem.accounted_bytes());
         set_stat_usize!(hash, "mem_unaccounted_bytes", zjit_alloc_bytes().saturating_sub(mem.accounted_bytes()));
         set_stat_usize!(hash, "mem_payload_count", mem.payload_count);
@@ -942,6 +966,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_profile_monomorphic_distribution_count", mem.profile_monomorphic_distribution_count);
         set_stat_usize!(hash, "mem_patch_point_count", mem.patch_point_count);
         set_stat_usize!(hash, "mem_jit_frame_count", mem.jit_frame_count);
+        set_stat_usize!(hash, "mem_ivar_cache_count", mem.ivar_cache_count);
     }
 
     // End of default stats. Every counter beyond this is provided only for --zjit-stats.
