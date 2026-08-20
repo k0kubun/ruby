@@ -6,7 +6,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
+use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_BLOCK_CODE, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -3134,7 +3134,8 @@ impl Assembler
             asm_comment!(asm, "save cfp->iseq");
             asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
 
-            // cfp->block_code and cfp->jit_return are cleared by the materialize_exit trampoline
+            // cfp->block_code and cfp->jit_return are cleared by the materialize_exit trampoline,
+            // or by compile_exit() before C calls that can trigger GC
 
             if !stack.is_empty() {
                 asm_comment!(asm, "write stack slots: {}", join_opnds(&stack, ", "));
@@ -3192,6 +3193,14 @@ impl Assembler
                 // make a C call, we need to clear any stale JITFrame.
                 asm_comment!(asm, "clear cfp->jit_return");
                 asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
+                // With jit_return cleared, GC treats this as an interpreter frame and
+                // marks cfp->block_code, which still holds a stale value from a previous
+                // frame that occupied this CFP slot. The C call below can trigger GC
+                // (e.g. exit_recompile's with_vm_lock() calls rb_gc_disable(), which
+                // finishes in-flight incremental marking), so clear it here rather than
+                // leaving it to the materialize_exit trampoline.
+                asm_comment!(asm, "clear cfp->block_code");
+                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
             }
             if let Some(reason) = trace_reason {
                 // Leak a CString with the reason so it's available at runtime

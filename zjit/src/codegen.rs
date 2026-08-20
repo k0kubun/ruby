@@ -3776,6 +3776,18 @@ c_callable! {
             unsafe { rb_set_cfp_pc(cfp, pc) };
             unsafe { (*cfp)._iseq = iseq };
             unsafe { (*cfp).jit_return = std::ptr::null_mut() };
+            // gen_push_frame() doesn't set SP or block_code either, so this frame holds
+            // stale values from a previous frame that occupied this CFP slot. With
+            // jit_return cleared above, rb_execution_context_mark() and
+            // rb_execution_context_update() treat this as an interpreter frame: they
+            // read cfp->sp as the VM stack scan extent and mark cfp->block_code. A
+            // stale sp can truncate the scan and let the GC free or move objects that
+            // live frames still reference, and a stale block_code can be marked as an
+            // object pointer. GC can run below: the VM lock barrier lets other threads
+            // scan this frame, and with_vm_lock() calls rb_gc_disable(), which finishes
+            // in-flight incremental marking on this thread.
+            unsafe { rb_set_cfp_sp(cfp, sp) };
+            unsafe { (*cfp).block_code = std::ptr::null() };
             let ec_cfp = unsafe { ec.byte_add(RUBY_OFFSET_EC_CFP as usize) as *mut CfpPtr };
             unsafe { *ec_cfp = cfp };
         }
