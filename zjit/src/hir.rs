@@ -1645,7 +1645,40 @@ macro_rules! for_each_operand_impl {
     };
 }
 
+impl PartialEq for Insn {
+    fn eq(&self, other: &Self) -> bool {
+        // This trait should be used only for value numbering
+        assert!(self.is_value_numberable());
+        assert!(other.is_value_numberable());
+
+        match (self, other) {
+            (Insn::Const { val: left_val }, Insn::Const { val: right_val }) => left_val == right_val,
+            (
+                Insn::GuardType { val: left_val, guard_type: left_guard_type, state: _, recompile: _ },
+                Insn::GuardType { val: right_val, guard_type: right_guard_type, state: _, recompile: _ }
+            ) => left_val == right_val && left_guard_type.bit_equal(*right_guard_type),
+            (
+                Insn::FixnumAdd { left: self_left, right: self_right, state: _ },
+                Insn::FixnumAdd { left: other_left, right: other_right, state: _ }
+            ) => self_left == other_left && self_right == other_right,
+            _ => false,
+        }
+    }
+}
+
+// Just make it possible to use HashMap
+impl Eq for Insn {}
+
 impl Insn {
+    fn is_value_numberable(&self) -> bool {
+        match self {
+            Insn::Const { .. } |
+            Insn::GuardType { .. } |
+            Insn::FixnumAdd { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Not every instruction returns a value. Return true if the instruction does and false otherwise.
     pub fn has_output(&self) -> bool {
         match self {
@@ -6328,6 +6361,64 @@ impl Function {
         crate::stats::trace_compile_phase("infer_types", || self.infer_types());
     }
 
+    // ref: https://github.com/beehive-lab/Maxine-VM/blob/develop/com.sun.c1x/src/com/sun/c1x/opt/GlobalValueNumberer.java
+    fn value_numbering(&mut self) {
+        #[derive(Clone, Debug)]
+        struct ValueMap {
+            map: Vec<(Insn, InsnId)>,
+        }
+
+        impl ValueMap {
+            fn new() -> Self {
+                Self { map: Vec::new() }
+            }
+
+            fn find_insert(&mut self, insn_id: InsnId, insn: &Insn) -> Option<InsnId> {
+                for (existing_insn, existing_id) in self.map.iter().rev() {
+                    if existing_insn == insn {
+                        return Some(*existing_id);
+                    }
+                }
+                self.map.push((insn.clone(), insn_id));
+                None
+            }
+        }
+
+        println!("before value_numbering");
+        self.dump_hir();
+
+        // iterate through all the blocks
+        for block in self.reverse_post_order() {
+            // value map
+            let mut current_map = ValueMap::new();
+
+            // visit all instructions of this block
+            self.blocks[block.to_usize()].insns.retain(|&insn_id| {
+                let mut union_find = self.union_find.borrow_mut();
+                let insn_id = union_find.find_const(insn_id);
+                if !self.insns[insn_id.to_usize()].is_value_numberable() {
+                    return true;
+                }
+
+                // resolve operands of the instruction
+                self.insns[insn_id.to_usize()].for_each_operand_mut(&mut |operand: &mut InsnId| {
+                    *operand = union_find.find_const(*operand);
+                });
+
+                // attempt value numbering
+                if let Some(replacement) = current_map.find_insert(insn_id, &self.insns[insn_id.to_usize()]) {
+                    union_find.make_equal_to(insn_id, replacement);
+                    return false;
+                }
+
+                true
+            })
+        }
+
+        println!("after value_numbering");
+        self.dump_hir();
+    }
+
     /// Use type information left by `infer_types` to fold away operations that can be evaluated at compile-time.
     ///
     /// It can fold fixnum math, truthiness tests, and branches with constant conditionals.
@@ -7146,6 +7237,7 @@ impl Function {
             (remove_trivial_block_params) => { Counter::compile_hir_remove_trivial_block_params_time_ns };
             (optimize_load_store) => { Counter::compile_hir_optimize_load_store_time_ns };
             (canonicalize) => { Counter::compile_hir_canonicalize_time_ns };
+            (value_numbering) => { Counter::compile_hir_value_numbering_time_ns };
             (fold_constants) => { Counter::compile_hir_fold_constants_time_ns };
             (clean_cfg) => { Counter::compile_hir_clean_cfg_time_ns };
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
@@ -7198,6 +7290,7 @@ impl Function {
             run_pass!(convert_no_profile_sends);
             run_pass!(optimize_load_store);
             run_pass!(canonicalize);
+            run_pass!(value_numbering);
             run_pass!(fold_constants);
             run_pass!(clean_cfg);
             run_pass!(remove_redundant_patch_points);
