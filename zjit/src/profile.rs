@@ -523,13 +523,16 @@ impl IseqProfile {
             out.bytes += entry.opnd_types.len() * size_of::<TypeDistribution>();
             out.distribution_count += entry.opnd_types.len();
             for distribution in entry.opnd_types.iter() {
+                out.bytes += distribution.heap_size();
                 if distribution.num_buckets_used() <= 1 {
                     out.monomorphic_distribution_count += 1;
                 }
             }
         }
         out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.super_cme.capacity());
+        out.bytes += self.super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
         out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(self.splat_lengths.capacity());
+        out.bytes += self.splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
         out
     }
 
