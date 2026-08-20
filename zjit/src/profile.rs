@@ -183,6 +183,12 @@ pub type ForwardedCiDistribution = Distribution<Option<usize>, FORWARDED_CI_DIST
 
 pub type ForwardedCiDistributionSummary = DistributionSummary<Option<usize>, FORWARDED_CI_DISTRIBUTION_SIZE>;
 
+/// Allocate exactly `n` empty operand type distributions.
+fn new_opnd_types(n: usize) -> Box<[TypeDistribution]> {
+    // vec![elem; n] allocates exactly n elements, unlike Vec::resize().
+    vec![TypeDistribution::new(); n].into_boxed_slice()
+}
+
 /// Profile the top-`n` stack operands except the topmost one, whose slot is left empty.
 ///
 /// For a call site whose top-of-stack slot is not a Ruby object. The empty distribution keeps the
@@ -191,7 +197,7 @@ pub type ForwardedCiDistributionSummary = DistributionSummary<Option<usize>, FOR
 fn profile_operands_below_top(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(n, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(n);
     }
 
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate().take(n.saturating_sub(1)) {
@@ -206,7 +212,7 @@ fn profile_operands_below_top(profiler: &mut Profiler, profile: &mut IseqProfile
 fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(n, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(n);
     }
 
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate() {
@@ -296,7 +302,7 @@ fn profile_send_method_name(profiler: &mut Profiler, profile: &mut IseqProfile, 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
     let obj = profiler.peek_at_self();
     // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
@@ -358,7 +364,7 @@ impl IseqProfile {
     fn observe_ivar_fallback(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, recv: VALUE) -> IvarReprofiled {
         let entry = self.entry_mut(insn_idx);
         if entry.opnd_types.is_empty() {
-            entry.opnd_types.resize(1, TypeDistribution::new());
+            entry.opnd_types = new_opnd_types(1);
         }
         // The dispatch that is running was built from the shapes the profile held when the ISEQ
         // was last compiled. Remember how many that was the first time we sample: because this
@@ -915,7 +921,12 @@ pub struct ProfileEntry {
     /// YARV instruction index
     insn_idx: u32,
     /// Type information of YARV instruction operands
-    opnd_types: Vec<TypeDistribution>,
+    /// Type information of YARV instruction operands. A boxed slice rather
+    /// than a `Vec` because it is sized once and never resized: `Vec` would
+    /// round the allocation up to `MIN_NON_ZERO_CAP` (4 elements), which for
+    /// 80-byte distributions wastes up to 240 bytes on every single-operand
+    /// instruction, and would also carry a capacity field we never read.
+    opnd_types: Box<[TypeDistribution]>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
     /// Receivers seen on this ivar site's fallback path in the current re-profiling window.
@@ -1030,7 +1041,7 @@ impl IseqProfile {
             Err(i) => {
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
-                    opnd_types: Vec::new(),
+                    opnd_types: Box::new([]),
                     profiles_remaining: get_option!(num_profiles),
                     ivar_fallback_samples: 0,
                     ivar_fallback_fixable: 0,
@@ -1175,7 +1186,7 @@ impl IseqProfile {
         if recv_window.num_observed() > 0 {
             let entry = self.entry_mut(insn_idx);
             if entry.opnd_types.is_empty() {
-                entry.opnd_types.resize(argc.max(1), TypeDistribution::new());
+                entry.opnd_types = new_opnd_types(argc.max(1));
             }
             let recv_types = &mut entry.opnd_types[0];
             recv_types.retain_primary();
@@ -1193,7 +1204,7 @@ impl IseqProfile {
 
     /// Get profiled operand types for a given instruction index
     pub fn get_operand_types(&self, insn_idx: YarvInsnIdx) -> Option<&[TypeDistribution]> {
-        self.entry(insn_idx).map(|e| e.opnd_types.as_slice()).filter(|s| !s.is_empty())
+        self.entry(insn_idx).map(|e| &*e.opnd_types).filter(|s| !s.is_empty())
     }
 
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
@@ -1247,7 +1258,7 @@ impl IseqProfile {
         out.entry_slack_bytes = (self.entries.capacity() - self.entries.len()) * size_of::<ProfileEntry>();
         out.entry_count = self.entries.len();
         for entry in &self.entries {
-            out.bytes += entry.opnd_types.capacity() * size_of::<TypeDistribution>();
+            out.bytes += entry.opnd_types.len() * size_of::<TypeDistribution>();
             out.distribution_count += entry.opnd_types.len();
             for distribution in entry.opnd_types.iter() {
                 if distribution.num_buckets_used() <= 1 {
