@@ -125,6 +125,12 @@ impl JITFrame {
         Self::alloc(pc, iseq, materialize_block_code, stack_size)
     }
 
+    /// Bytes this frame occupies on the Rust heap, including the trailing
+    /// stack map that [`Self::alloc`] over-allocated for.
+    pub fn heap_size(&self) -> usize {
+        size_of::<JITFrame>() + self.stack_size as usize * size_of::<VALUE>()
+    }
+
     /// Update the iseq pointer after GC compaction.
     pub fn update_references(&mut self) {
         if !self.iseq.is_null() {
