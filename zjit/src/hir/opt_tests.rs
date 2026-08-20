@@ -2218,6 +2218,121 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_expandarray_profiled_array() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test([1, 2]); test([3, 4])
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          v4:NilClass = Const Value(nil)
+          v5:NilClass = Const Value(nil)
+          Jump bb3(v1, v3, v4, v5)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          v10:NilClass = Const Value(nil)
+          v11:NilClass = Const Value(nil)
+          Jump bb3(v8, v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
+          v22:ArrayExact = GuardType v14, ArrayExact recompile
+          v23:CInt64 = ArrayLength v22
+          v24:CInt64[2] = Const CInt64(2)
+          v25:CInt64 = GuardGreaterEq v23, v24 recompile
+          v26:CInt64[1] = Const CInt64(1)
+          v27:BasicObject = ArrayAref v22, v26
+          v28:CInt64[0] = Const CInt64(0)
+          v29:BasicObject = ArrayAref v22, v28
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v22
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_nil() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test(nil); test(nil)
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          v4:NilClass = Const Value(nil)
+          v5:NilClass = Const Value(nil)
+          Jump bb3(v1, v3, v4, v5)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          v10:NilClass = Const Value(nil)
+          v11:NilClass = Const Value(nil)
+          Jump bb3(v8, v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
+          v22:NilClass|Array = CheckArrayType v14
+          v23:NilClass = GuardType v22, NilClass recompile
+          v24:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_polymorphic() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test([1, 2]); test([3, 4]); test(nil); test(nil)
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          v4:NilClass = Const Value(nil)
+          v5:NilClass = Const Value(nil)
+          Jump bb3(v1, v3, v4, v5)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          v10:NilClass = Const Value(nil)
+          v11:NilClass = Const Value(nil)
+          Jump bb3(v8, v9, v10, v11)
+        bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
+          v22:Array = ToAryForExpand v14
+          v23:CInt64[1] = Const CInt64(1)
+          v24:BasicObject = ArrayEntry v22, v23
+          v25:CInt64[0] = Const CInt64(0)
+          v26:BasicObject = ArrayEntry v22, v25
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
     fn test_optimize_send_into_fixnum_add_both_profiled() {
         eval("
             def test(a, b) = a + b

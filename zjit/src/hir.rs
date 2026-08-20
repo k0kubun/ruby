@@ -610,6 +610,8 @@ pub enum SideExitReason {
     GuardType(Type),
     GuardShape(ShapeId),
     ExpandArray,
+    /// `expandarray` was never profiled, so we don't know what shape to compile it for.
+    NoProfileExpandArray,
     GuardNotFrozen,
     GuardNotShared,
     GuardLess,
@@ -989,6 +991,14 @@ pub enum Insn {
 
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise.
     ToArray { val: InsnId, state: InsnId },
+    /// Convert `val` to an Array by calling `#to_ary` on it, or return `nil` if it cannot be
+    /// converted. Returns `val` itself if it is already an `Array`. Mirrors
+    /// `rb_check_array_type()`; can run arbitrary Ruby code because of `#to_ary`.
+    CheckArrayType { val: InsnId, state: InsnId },
+    /// Convert `val` the way `vm_expandarray()` does: `#to_ary` if that is defined, and the
+    /// one-element array `[val]` otherwise. Always returns an `Array`. Mirrors `rb_ary_to_ary()`;
+    /// can run arbitrary Ruby code because of `#to_ary`.
+    ToAryForExpand { val: InsnId, state: InsnId },
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise. If we
     /// called `to_a`, duplicate the returned array.
     ToNewArray { val: InsnId, state: InsnId },
@@ -1009,6 +1019,9 @@ pub enum Insn {
     /// Push `val` onto `array`, where `array` is already `Array`.
     ArrayPush { array: InsnId, val: InsnId, state: InsnId },
     ArrayAref { array: InsnId, index: InsnId },
+    /// Read `array[index]`, returning `nil` if `index` is out of bounds. `index` is a C `long`
+    /// ([`types::CInt64`]) and must not be negative. Mirrors `rb_ary_entry()`.
+    ArrayEntry { array: InsnId, index: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
@@ -1281,7 +1294,9 @@ pub enum Insn {
     /// Side-exit if (val & mask) != 0
     GuardNoBitsSet { val: InsnId, mask: Const, mask_name: Option<ID>, reason: Box<SideExitReason>, state: InsnId },
     /// Side-exit if left is not greater than or equal to right (both operands are C long).
-    GuardGreaterEq { left: InsnId, right: InsnId, reason: Box<SideExitReason>, state: InsnId },
+    /// If recompile is not None, the side exit will profile and invalidate the ISEQ so that it
+    /// gets recompiled with the new profile data.
+    GuardGreaterEq { left: InsnId, right: InsnId, reason: Box<SideExitReason>, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if left is not less than right (both operands are C long).
     GuardLess { left: InsnId, right: InsnId, reason: Box<SideExitReason>, state: InsnId },
 
@@ -1429,6 +1444,8 @@ macro_rules! for_each_operand_impl {
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
             | Insn::ToArray { val, state }
+            | Insn::CheckArrayType { val, state }
+            | Insn::ToAryForExpand { val, state }
             | Insn::IsMethodCfunc { val, state, .. }
             | Insn::ToNewArray { val, state }
             | Insn::SetLocal { val, state, .. }
@@ -1502,7 +1519,8 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*val);
                 $visit_one!(*state);
             }
-            Insn::ArrayAref { array, index } => {
+            Insn::ArrayAref { array, index }
+            | Insn::ArrayEntry { array, index } => {
                 $visit_one!(*array);
                 $visit_one!(*index);
             }
@@ -1726,6 +1744,8 @@ impl Insn {
             Insn::ToRegexp { .. } => effects::Any,
             Insn::PutSpecialObject { .. } => effects::Any,
             Insn::ToArray { .. } => effects::Any,
+            Insn::CheckArrayType { .. } => effects::Any,
+            Insn::ToAryForExpand { .. } => effects::Any,
             Insn::ToNewArray { .. } => effects::Any,
             Insn::NewArray { .. } => allocates,
             Insn::NewHash { elements, .. } => {
@@ -1750,6 +1770,7 @@ impl Insn {
             Insn::ArrayExtend { .. } => effects::Any,
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => effects::Any,
+            Insn::ArrayEntry { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
@@ -2033,6 +2054,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::ArrayAref { array, index, .. } => {
                 write!(f, "ArrayAref {array}, {index}")
             }
+            Insn::ArrayEntry { array, index, .. } => {
+                write!(f, "ArrayEntry {array}, {index}")
+            }
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
             }
@@ -2296,7 +2320,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GuardNoBitsSet { val, mask, mask_name: Some(name), .. } => { write!(f, "GuardNoBitsSet {val}, {name}={}", mask.print(self.ptr_map)) },
             Insn::GuardNoBitsSet { val, mask, .. } => { write!(f, "GuardNoBitsSet {val}, {}", mask.print(self.ptr_map)) },
             Insn::GuardLess { left, right, .. } => write!(f, "GuardLess {left}, {right}"),
-            Insn::GuardGreaterEq { left, right, .. } => write!(f, "GuardGreaterEq {left}, {right}"),
+            Insn::GuardGreaterEq { left, right, recompile, .. } => {
+                write!(f, "GuardGreaterEq {left}, {right}")?;
+                if recompile.is_some() {
+                    write!(f, " recompile")?;
+                }
+                Ok(())
+            }
             &Insn::GetBlockParam { level, ep_offset, state, .. } => {
                 let iseq = self.fun.map(|fun| fun.frame_state_iseq(state));
                 let name = get_local_var_name_for_printer(iseq, level, ep_offset)
@@ -2398,6 +2428,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GetClassVar { id, .. } => write!(f, "GetClassVar :{}", id.contents_lossy()),
             Insn::SetClassVar { id, val, .. } => write!(f, "SetClassVar :{}, {val}", id.contents_lossy()),
             Insn::ToArray { val, .. } => write!(f, "ToArray {val}"),
+            Insn::CheckArrayType { val, .. } => write!(f, "CheckArrayType {val}"),
+            Insn::ToAryForExpand { val, .. } => write!(f, "ToAryForExpand {val}"),
             Insn::ToNewArray { val, .. } => write!(f, "ToNewArray {val}"),
             Insn::ArrayExtend { left, right, .. } => write!(f, "ArrayExtend {left}, {right}"),
             Insn::ArrayPush { array, val, .. } => write!(f, "ArrayPush {array}, {val}"),
@@ -2706,6 +2738,22 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
     }
 
     Ok(())
+}
+
+/// The one lowering an `expandarray` site is compiled for. `vm_expandarray()` handles arrays,
+/// values with a `#to_ary`, values without one, and arrays that are too short, but a given site
+/// almost always sees just one of those, so we compile for that case and recompile if it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpandArrayShape {
+    /// The value is an `Array` long enough for its targets: read the elements straight out of it.
+    Array,
+    /// The value has no `#to_ary`, so it destructures as the one-element array `[value]`.
+    Scalar,
+    /// Anything could show up (or we can't recompile): go through the same conversion
+    /// `vm_expandarray()` does and nil-fill out-of-bounds reads. Never side-exits.
+    General,
+    /// The site never ran while profiling, so we don't know its shape yet.
+    NoProfile,
 }
 
 /// Policy that controls how optimization passes generate code.
@@ -3518,6 +3566,7 @@ impl Function {
             Insn::NewArray { .. } => types::ArrayExact,
             Insn::ArrayDup { .. } => types::ArrayExact,
             Insn::ArrayAref { .. } => types::BasicObject,
+            Insn::ArrayEntry { .. } => types::BasicObject,
             Insn::ArrayPop { .. } => types::BasicObject,
             Insn::ArrayLength { .. } => types::CInt64,
             Insn::AdjustBounds { .. } => types::CInt64,
@@ -3603,6 +3652,8 @@ impl Function {
             Insn::GetClassVar { .. } => types::BasicObject,
             Insn::ToNewArray { .. } => types::ArrayExact,
             Insn::ToArray { .. } => types::ArrayExact,
+            Insn::CheckArrayType { .. } => types::Array.union(types::NilClass),
+            Insn::ToAryForExpand { .. } => types::Array,
             Insn::AnyToString { .. } => types::StringExact,
             Insn::IsBlockParamModified { .. } => types::CBool,
             Insn::GetBlockParam { .. } => types::BasicObject,
@@ -4059,6 +4110,47 @@ impl Function {
                 }
             }
             resolution => resolution,
+        }
+    }
+
+    /// Best-effort static type of `insn` while the HIR is still being built, where `type_of()`
+    /// has not been filled in yet and answers `Any` for everything. Returns `BasicObject` for
+    /// block parameters, whose type is only known once all predecessors have been visited.
+    fn type_at_construction(&self, insn: InsnId) -> Type {
+        if matches!(self.insns[insn.to_usize()], Insn::Param) {
+            return types::BasicObject;
+        }
+        self.infer_type(insn)
+    }
+
+    /// Pick the single shape to compile an `expandarray` site for. See [`ExpandArrayShape`].
+    fn expandarray_shape(&self, profiles: &ProfileOracle, val: InsnId, state: InsnId) -> ExpandArrayShape {
+        // The final version of an ISEQ can't recompile, so it has to handle every value.
+        if self.policy.no_side_exits {
+            return ExpandArrayShape::General;
+        }
+
+        // Static types beat the profile. `a, b = nil`, the preamble of every Ragel-generated
+        // parser, destructures a literal, and we want to compile it well even with no profile.
+        let val_type = self.type_at_construction(val);
+        if val_type.is_subtype(types::ArrayExact) {
+            return ExpandArrayShape::Array;
+        }
+        if !val_type.could_be(types::Array) {
+            return ExpandArrayShape::Scalar;
+        }
+
+        let summary = self.profile_summary(profiles, val, state);
+        if summary.bucket(0).is_empty() {
+            // The instruction never ran during the profiling window. Exit and recompile once we
+            // know what it destructures.
+            ExpandArrayShape::NoProfile
+        } else if !summary.is_monomorphic() {
+            ExpandArrayShape::General
+        } else if summary.bucket(0).is_array_exact() {
+            ExpandArrayShape::Array
+        } else {
+            ExpandArrayShape::Scalar
         }
     }
 
@@ -6397,7 +6489,7 @@ impl Function {
                             _ => insn_id,
                         }
                     },
-                    &Insn::GuardGreaterEq { left, right, state, ref reason } => {
+                    &Insn::GuardGreaterEq { left, right, state, ref reason, recompile } => {
                         let left_num = self.type_of(left).cint64_value();
                         let right_num = self.type_of(right).cint64_value();
                         match (left_num, right_num) {
@@ -6405,7 +6497,7 @@ impl Function {
                                 self.make_equal_to(insn_id, left);
                                 continue
                             },
-                            (Some(_), Some(_)) => self.new_insn(Insn::SideExit { state, reason: reason.clone(), recompile: None }),
+                            (Some(_), Some(_)) => self.new_insn(Insn::SideExit { state, reason: reason.clone(), recompile }),
                             _ => insn_id,
                         }
                     },
@@ -7450,6 +7542,8 @@ impl Function {
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
             | Insn::ToArray { val, .. }
+            | Insn::CheckArrayType { val, .. }
+            | Insn::ToAryForExpand { val, .. }
             | Insn::ToNewArray { val, .. }
             | Insn::Defined { v: val, .. }
             | Insn::ObjectAlloc { val, .. }
@@ -7579,7 +7673,8 @@ impl Function {
             | Insn::ArrayLength { array, .. } => {
                 self.assert_subtype(insn_id, array, types::Array)
             }
-            Insn::ArrayAref { array, index } => {
+            Insn::ArrayAref { array, index }
+            | Insn::ArrayEntry { array, index } => {
                 self.assert_subtype(insn_id, array, types::Array)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
             }
@@ -10436,16 +10531,55 @@ fn add_iseq_to_hir(
                         break;  // End the block
                     }
                     let val = state.stack_pop()?;
-                    let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: None });
-                    let length = fun.push_insn(block, Insn::ArrayLength { array });
-                    let expected = fun.push_insn(block, Insn::Const { val: Const::CInt64(num as i64) });
-                    fun.push_insn(block, Insn::GuardGreaterEq { left: length, right: expected, reason: Box::new(SideExitReason::ExpandArray), state: exit_id });
-                    for i in (0..num).rev() {
-                        // We do not emit a length guard here because in-bounds is already
-                        // ensured by the expandarray length check above.
-                        let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
-                        let element = fun.push_insn(block, Insn::ArrayAref { array, index });
-                        state.stack_push(element);
+
+                    // Compile the one shape the profile (or the static type) says this site has,
+                    // and let a guard failure re-profile and recompile. `expandarray` pushes
+                    // element num-1 first and element 0 last in every shape.
+                    match fun.expandarray_shape(&profiles, val, exit_id) {
+                        ExpandArrayShape::Array => {
+                            let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: Some(Recompile) });
+                            let length = fun.push_insn(block, Insn::ArrayLength { array });
+                            let expected = fun.push_insn(block, Insn::Const { val: Const::CInt64(num as i64) });
+                            fun.push_insn(block, Insn::GuardGreaterEq { left: length, right: expected, reason: Box::new(SideExitReason::ExpandArray), state: exit_id, recompile: Some(Recompile) });
+                            for i in (0..num).rev() {
+                                // We do not emit a length guard here because in-bounds is already
+                                // ensured by the expandarray length check above.
+                                let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
+                                let element = fun.push_insn(block, Insn::ArrayAref { array, index });
+                                state.stack_push(element);
+                            }
+                        }
+                        ExpandArrayShape::Scalar => {
+                            // The value is expected to have no #to_ary, so `vm_expandarray()`
+                            // treats it as the one-element array [value]: element 0 is the value
+                            // itself and everything past it is nil. We still have to run the
+                            // conversion, because #to_ary is looked up at run time and can be
+                            // defined after this code was compiled.
+                            let converted = fun.push_insn(block, Insn::CheckArrayType { val, state: exit_id });
+                            fun.push_insn(block, Insn::GuardType { val: converted, guard_type: types::NilClass, state: exit_id, recompile: Some(Recompile) });
+                            if num > 0 {
+                                let nil = fun.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                                for _ in 0..num - 1 {
+                                    state.stack_push(nil);
+                                }
+                                state.stack_push(val);
+                            }
+                        }
+                        ExpandArrayShape::General => {
+                            // No shape to speculate on, or no way to recompile if we guessed
+                            // wrong. Let the VM's own conversion handle every case and nil-fill
+                            // out-of-bounds reads with rb_ary_entry().
+                            let array = fun.push_insn(block, Insn::ToAryForExpand { val, state: exit_id });
+                            for i in (0..num).rev() {
+                                let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
+                                let element = fun.push_insn(block, Insn::ArrayEntry { array, index });
+                                state.stack_push(element);
+                            }
+                        }
+                        ExpandArrayShape::NoProfile => {
+                            fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::NoProfileExpandArray), recompile: Some(Recompile) });
+                            break;  // End the block
+                        }
                     }
                 }
                 _ => {
