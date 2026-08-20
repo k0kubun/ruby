@@ -84,6 +84,8 @@ fn profile_insn_sample(
         YARVINSN_opt_ltlt  => profile_operands(profiler, profile, 2),
         YARVINSN_opt_aset  => profile_operands(profiler, profile, 3),
         YARVINSN_opt_not   => profile_operands(profiler, profile, 1),
+        // The value being destructured is the only operand `expandarray` pops.
+        YARVINSN_expandarray => profile_operands(profiler, profile, 1),
         YARVINSN_getinstancevariable => profile_self(profiler, profile),
         YARVINSN_setinstancevariable => profile_self(profiler, profile),
         YARVINSN_definedivar   => profile_self(profiler, profile),
@@ -894,6 +896,12 @@ impl ProfiledType {
         }
 
         self.class.is_subclass_of(string) == ClassRelationship::Subclass
+    }
+
+    /// True when the profiled object was an instance of `Array` itself (not a subclass and not a
+    /// singleton), which is what the `expandarray` fast path needs.
+    pub fn is_array_exact(&self) -> bool {
+        !self.flags.is_immediate() && self.class == unsafe { rb_cArray }
     }
 
     pub fn is_flonum(&self) -> bool {
