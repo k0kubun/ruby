@@ -9856,6 +9856,31 @@ fn test_inlined_stack_map_materializes_before_rescue() {
     });
 }
 
+/// A value the allocator put in a callee-saved register has to be pushed at every CCall
+/// it survives once any stack map can name it, not just at the CCall whose stack map names
+/// it: that stack map's JITFrame stays installed in the CFP across the other calls that
+/// run under it, and a raise inside one of them materializes this frame from the slot the
+/// encoding named. Block-parameter coalescing is what makes a loop-carried value live long
+/// enough to be handed a callee-saved register, so this needs the loop.
+#[test]
+fn test_callee_saved_value_materializes_when_a_later_call_raises() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits(r#"
+            def callee(left, receiver, other)
+              left + (receiver << other rescue "b")
+            end
+            def test
+              out = ""
+              3.times { out = callee("a", "x".freeze, "y") }
+              out
+            end
+
+            test
+            test
+        "#), @r#""ab""#);
+    });
+}
+
 #[test]
 fn test_inlined_method_with_rescue_caught_in_callee() {
     // The callee's begin/rescue catches an exception raised inside the same
