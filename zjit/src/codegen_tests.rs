@@ -114,6 +114,71 @@ fn test_nil() {
 }
 
 #[test]
+fn test_function_stub_profiles_before_compiling() {
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let num_profiles = get_option!(num_profiles);
+    let call_threshold = u32::from(num_profiles) + 2;
+    set_call_threshold(call_threshold);
+
+    eval(&format!("
+        class Integer
+          def zjit_profile_stub_target = self + 1
+        end
+
+        def zjit_profile_stub_entry(run)
+          1.zjit_profile_stub_target if run
+        end
+
+        i = 0
+        while i < {call_threshold}
+          zjit_profile_stub_entry(false)
+          i += 1
+        end
+    "));
+
+    let entry_iseq = get_method_iseq("self", "zjit_profile_stub_entry");
+    let entry_payload = get_or_create_iseq_payload(entry_iseq);
+    let entry_version = unsafe { entry_payload.versions.last().unwrap().as_ref() };
+    assert_eq!(1, entry_version.outgoing.len(), "expected a JIT-to-JIT function stub");
+
+    let target_iseq = get_method_iseq("1", "zjit_profile_stub_target");
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+
+    // Every stub hit in the profiling window should interpret the callee
+    // without compiling it.
+    for _ in 0..num_profiles {
+        assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_profile_stub_entry(true)"));
+        assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+    }
+
+    // Verify that the interpreted executions populated the profile for `+`.
+    let mut insn_idx = 0;
+    let iseq_size = unsafe { get_iseq_encoded_size(target_iseq) };
+    let plus_idx = loop {
+        assert!(insn_idx < iseq_size, "target ISEQ does not contain opt_plus");
+        let opcode = iseq_opcode_at_idx(target_iseq, insn_idx);
+        let bare_opcode = unsafe { rb_zjit_insn_to_bare_insn(opcode as i32) } as u32;
+        if bare_opcode == YARVINSN_opt_plus {
+            break insn_idx as usize;
+        }
+        insn_idx += insn_len(bare_opcode as usize);
+    };
+    assert_eq!(
+        2,
+        get_or_create_iseq_payload(target_iseq)
+            .profile
+            .get_operand_types(plus_idx)
+            .unwrap()
+            .len(),
+    );
+
+    // The following hit observes a completed profiling window and compiles.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_profile_stub_entry(true)"));
+    assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
+}
+
+#[test]
 fn test_putobject() {
     assert_snapshot!(inspect("
         def test = 1
