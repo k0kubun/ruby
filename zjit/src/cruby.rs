@@ -150,6 +150,12 @@ unsafe extern "C" {
 
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
     pub fn rb_ary_new_from_args(n: c_long, ...) -> VALUE;
+    /// Convert `obj` to an Array by calling `#to_ary`, or return nil if it can't be converted.
+    /// Returns `obj` itself if it is already a T_ARRAY. Can run arbitrary Ruby code.
+    pub fn rb_check_array_type(obj: VALUE) -> VALUE;
+    /// Like [`rb_check_array_type`], but returns the one-element array `[obj]` instead of nil when
+    /// `obj` can't be converted. This is the conversion `vm_expandarray()` performs.
+    pub fn rb_ary_to_ary(obj: VALUE) -> VALUE;
     pub fn rb_str_setbyte(str: VALUE, index: VALUE, value: VALUE) -> VALUE;
     pub fn rb_str_getbyte(str: VALUE, index: VALUE) -> VALUE;
     pub fn rb_vm_splat_array(flag: VALUE, ary: VALUE) -> VALUE;

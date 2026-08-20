@@ -2268,6 +2268,113 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_expandarray_profiled_array() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test([1, 2]); test([3, 4])
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v39:NilClass = Const Value(nil)
+          v22:ArrayExact = GuardType v14, ArrayExact recompile
+          v23:CInt64 = ArrayLength v22
+          v24:CInt64[2] = Const CInt64(2)
+          v25:CInt64 = GuardGreaterEq v23, v24 recompile
+          v26:CInt64[1] = Const CInt64(1)
+          v27:BasicObject = ArrayAref v22, v26
+          v28:CInt64[0] = Const CInt64(0)
+          v29:BasicObject = ArrayAref v22, v28
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v22
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_nil() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test(nil); test(nil)
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v34:NilClass = Const Value(nil)
+          v22:NilClass|Array = CheckArrayType v14
+          v23:NilClass = GuardType v22, NilClass recompile
+          v24:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_polymorphic() {
+        eval("
+            def test(o)
+              a, b = o
+            end
+            test([1, 2]); test([3, 4]); test(nil); test(nil)
+        ");
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v37:NilClass = Const Value(nil)
+          v22:Array = ToAryForExpand v14
+          v23:CInt64 = ArrayLength v22
+          v24:CInt64[1] = Const CInt64(1)
+          v25:BasicObject = ArrayArefOrNil v22, v24, v23
+          v26:CInt64[0] = Const CInt64(0)
+          v27:BasicObject = ArrayArefOrNil v22, v26, v23
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v14
+        ");
+    }
+
+    #[test]
     fn test_optimize_send_into_fixnum_add_both_profiled() {
         eval("
             def test(a, b) = a + b
@@ -14041,15 +14148,14 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(String@0x1008)
           PatchPoint MethodRedefined(String@0x1008, ascii_only?@0x1010, cme:0x1018)
           v23:StringExact = GuardType v10, StringExact recompile
-          v24:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1040
-          v25:CUInt64[3145728] = Const CUInt64(3145728)
-          v26:CInt64 = IntAnd v24, v25
-          v27:CInt64 = StringCoderangeOrScan v23, v26
-          v28:CInt64[1048576] = Const CInt64(1048576)
-          v29:CBool = IsBitEqual v27, v28
-          v30:BoolExact = BoxBool v29
-          CheckInterrupts
-          Return v30
+          v44:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1040
+          v45:CUInt64[3145728] = Const CUInt64(3145728)
+          v46:CInt64 = IntAnd v44, v45
+          v47:CInt64 = StringCoderangeOrScan v23, v46
+          v48:CInt64[1048576] = Const CInt64(1048576)
+          v49:CBool = IsBitEqual v47, v48
+          v50:BoolExact = BoxBool v49
+          Return v50
         ");
     }
 
