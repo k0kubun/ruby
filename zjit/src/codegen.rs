@@ -511,6 +511,10 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         }
     }
     payload.versions.push(version);
+    // At most max_iseq_versions() versions are ever pushed, and every ISEQ ZJIT
+    // compiles pays for this Vec, so keep it exactly sized rather than letting
+    // it round up to Vec's four-element minimum.
+    payload.versions.shrink_to_fit();
     code_ptrs
 }
 
@@ -545,7 +549,9 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
         })?;
 
     // Prepare for GC
-    unsafe { version.as_mut() }.outgoing.extend(iseq_calls);
+    let outgoing = &mut unsafe { version.as_mut() }.outgoing;
+    outgoing.extend(iseq_calls);
+    outgoing.shrink_to_fit();
     append_gc_offsets(iseq, version, &gc_offsets);
     Ok(iseq_code_ptrs)
 }
