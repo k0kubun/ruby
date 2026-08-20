@@ -122,6 +122,14 @@ pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
     }
 }
 
+/// Get a pointer to the payload object associated with an ISEQ, or null if ZJIT
+/// has never allocated one. Unlike [`get_or_create_iseq_payload_ptr`] this never
+/// allocates, which matters on paths that only want to release what is already
+/// there (see [`crate::gc::rb_zjit_iseq_free`]).
+pub fn get_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
+    unsafe { rb_iseq_get_jit_payload(iseq) as *mut IseqPayload }
+}
+
 /// Get the payload object associated with an ISEQ. Create one if none exists.
 pub fn get_or_create_iseq_payload(iseq: IseqPtr) -> &'static mut IseqPayload {
     let payload_non_null = get_or_create_iseq_payload_ptr(iseq);

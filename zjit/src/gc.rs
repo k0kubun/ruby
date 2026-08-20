@@ -3,7 +3,7 @@
 use std::ptr::null;
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
-use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
+use crate::payload::{IseqPayload, IseqVersionRef, get_iseq_payload_ptr};
 use crate::stats::Counter::gc_time_ns;
 
 /// GC callback for marking GC objects in the per-ISEQ payload.
@@ -51,14 +51,37 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
         return;
     }
 
-    // TODO(Shopify/ruby#682): Free `IseqPayload`
-    let payload = get_or_create_iseq_payload(iseq);
-    for version in payload.versions.iter_mut() {
-        unsafe { version.as_mut() }.iseq = null();
+    ZJITState::get_invariants().forget_iseq(iseq);
+
+    // Do *not* create a payload here. Most ISEQs a process frees were never hot
+    // enough for ZJIT to touch, and allocating a payload for one on its way out
+    // used to retain `size_of::<IseqPayload>()` forever for nothing. On a Rails
+    // app that was the single largest ZJIT heap consumer.
+    let payload_ptr = get_iseq_payload_ptr(iseq);
+    if payload_ptr.is_null() {
+        return;
     }
 
-    let invariants = ZJITState::get_invariants();
-    invariants.forget_iseq(iseq);
+    // Take ownership of the payload and unhook it from the ISEQ, so the GC
+    // callbacks above can no longer reach it while we tear it down. Dropping the
+    // `Box` at the end of this function frees the `IseqPayload` allocation, the
+    // profile and the version vector's buffer.
+    let payload = unsafe { Box::from_raw(payload_ptr) };
+    unsafe { rb_iseq_set_jit_payload(iseq, std::ptr::null_mut()) };
+
+    // The `IseqVersion` allocations themselves have to outlive the ISEQ: patch
+    // points in `Invariants` hold raw pointers to them and are only dropped when
+    // the assumption they guard is broken. Dropping the payload below frees the
+    // `Vec` of pointers, not the pointees.
+    for &version in payload.versions.iter() {
+        unsafe { (*version.as_ptr()).iseq = null() };
+    }
+
+    // Everything the payload owns outright is reachable only through the ISEQ,
+    // which is gone: the profile is only read while building HIR for this ISEQ
+    // or for a caller that inlines it, and the ISEQ can no longer be called nor
+    // be the target of a send in newly compiled code.
+    drop(payload);
 }
 
 /// GC callback for finalizing a CME
