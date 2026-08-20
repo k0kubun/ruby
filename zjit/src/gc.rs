@@ -53,6 +53,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
 
     // TODO(Shopify/ruby#682): Free `IseqPayload`
     let payload = get_or_create_iseq_payload(iseq);
+    crate::stats::incr_counter!(dead_iseq_payload_count);
     for version in payload.versions.iter_mut() {
         unsafe { version.as_mut() }.iseq = null();
     }
