@@ -1443,6 +1443,12 @@ pub struct Interval {
 
     pub assigned: Cell<Option<Allocation>>,
     pub preferred: Option<Allocation>,
+
+    /// Set by [`Assembler::coalesce_block_params`] when this VReg was coalesced into
+    /// another VReg's interval. A coalesced interval has no ranges of its own and gets
+    /// its allocation from the interval it points at; every consumer that reasons about
+    /// liveness has to look at that interval instead. See [`Interval::owner`].
+    pub coalesced_into: Option<VRegId>,
 }
 
 impl Interval {
@@ -1454,6 +1460,16 @@ impl Interval {
             state: Cell::new(IntervalState::Unhandled),
             assigned: Cell::new(None),
             preferred: None,
+            coalesced_into: None,
+        }
+    }
+
+    /// The interval that owns this VReg's live ranges and allocation: itself, unless it
+    /// was coalesced into another VReg's interval.
+    pub fn owner<'a>(&'a self, intervals: &'a [Interval]) -> &'a Interval {
+        match self.coalesced_into {
+            Some(root) => &intervals[root],
+            None => self,
         }
     }
 
@@ -2711,6 +2727,176 @@ impl Assembler
         self.callee_saved_saves = saves;
     }
 
+    /// Coalesce webs of block parameters and the branch arguments that flow into them so
+    /// that every VReg in a web shares one allocation. resolve_ssa()'s copies for edges
+    /// inside a web then become self-moves and get filtered out, which removes the
+    /// per-iteration location shuffling of loop-carried values at loop backedges.
+    ///
+    /// Two VRegs are joined when one is passed as a branch argument to the other's block
+    /// parameter. A web can only share a location when its members never hold two
+    /// different values at the same time, which is checked two ways:
+    ///
+    /// * At most one member may be live at any block's entry, counting both the block's
+    ///   own parameters and the values live into it. Two members live at one block entry
+    ///   is exactly the loop-carried swap (`a, b = b, a`), where the parallel copy at the
+    ///   backedge permutes two live values instead of copying one.
+    /// * A member defined by a regular instruction writes a value into the shared
+    ///   location, so no other member's live range may span that definition.
+    ///
+    /// Both checks are hole-aware: a position inside one of an interval's lifetime holes
+    /// lies on a control-flow path where the VReg isn't live, and block-level liveness
+    /// guarantees the other members aren't live there either.
+    ///
+    /// Rejected webs are dissolved entirely, falling back to per-VReg allocation and
+    /// explicit edge copies. Accepted webs get their members' ranges and preferred
+    /// registers merged into the web's root, and their own ranges cleared, so that
+    /// linear_scan() allocates the web as a single interval. The returned map sends each
+    /// VReg to its root (identity for uncoalesced VRegs); the caller copies the root's
+    /// allocation onto the members.
+    pub fn coalesce_block_params(&self, intervals: &mut [Interval], live_in: &[BitSet<usize>]) -> Vec<usize> {
+        // Union-find with path compression
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            let mut root = x;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut cur = x;
+            while parent[cur] != root {
+                let next = parent[cur];
+                parent[cur] = root;
+                cur = next;
+            }
+            root
+        }
+        let mut parent: Vec<usize> = (0..self.num_vregs).collect();
+
+        // Every block's incoming edges, for the checks below.
+        let block_order = self.block_order();
+        let mut incoming: HashMap<BlockId, Vec<BranchEdge>> = HashMap::default();
+        for &block_id in &block_order {
+            let EdgePair(edge1, edge2) = self.basic_blocks[block_id.0].edges();
+            for edge in [edge1, edge2].into_iter().flatten() {
+                incoming.entry(edge.target).or_default().push(edge);
+            }
+        }
+
+        // Union every (branch argument, block parameter) pair.
+        for edges in incoming.values() {
+            for edge in edges {
+                let params = &self.basic_blocks[edge.target.0].parameters;
+                for (arg, param) in edge.args.iter().zip(params.iter()) {
+                    if let (Opnd::VReg { idx: arg_idx, .. }, Opnd::VReg { idx: param_idx, .. }) = (arg, param) {
+                        let arg_root = find(&mut parent, arg_idx.to_usize());
+                        let param_root = find(&mut parent, param_idx.to_usize());
+                        parent[arg_root] = param_root;
+                    }
+                }
+            }
+        }
+
+        // Group into webs, keeping only the ones with something to coalesce.
+        //
+        // VRegs with no live range are left out. A block parameter that nothing reads
+        // gets no range, and without a range linear_scan() leaves it unassigned, which is
+        // what makes resolve_ssa() skip it. Pulling it into a web would hand it the web's
+        // location and put a copy back on every incoming edge -- a copy whose destination
+        // can collide with a live sibling parameter's, because the range-less member
+        // contributes nothing to the merged interval that keeps the web apart from it.
+        let mut webs: HashMap<usize, Vec<usize>> = HashMap::default();
+        for vreg in 0..self.num_vregs {
+            if !intervals[vreg].has_bounds() {
+                continue;
+            }
+            let root = find(&mut parent, vreg);
+            webs.entry(root).or_default().push(vreg);
+        }
+        webs.retain(|_, members| members.len() > 1);
+
+        // Every block's parameter VRegs, and the set of all of them.
+        let block_params: Vec<(BlockId, Vec<usize>)> = block_order.iter()
+            .map(|&block_id| {
+                let params = self.basic_blocks[block_id.0].parameters.iter()
+                    .filter_map(|param| match param {
+                        Opnd::VReg { idx, .. } => Some(idx.to_usize()),
+                        _ => None,
+                    })
+                    .collect();
+                (block_id, params)
+            })
+            .collect();
+        let param_vregs: HashSet<usize> = block_params.iter()
+            .flat_map(|(_, params)| params.iter().copied())
+            .collect();
+
+        let mut roots: Vec<usize> = (0..self.num_vregs).collect();
+        'web: for members in webs.values() {
+            // Own the web with a member that has a range, not necessarily the union-find
+            // root, which may have been filtered out above.
+            let root = members[0];
+            let member_set: HashSet<usize> = members.iter().copied().collect();
+
+            // At most one member may be live at any block's entry. A block's parameters
+            // are all written at once by the parallel copy on each incoming edge, so two
+            // members that are parameters of the same block hold two different values
+            // there -- that is the loop-carried swap. A member that is merely live into
+            // the block would have its value clobbered by the parameter write.
+            for (block_id, params) in &block_params {
+                let live_at_entry = members.iter()
+                    .filter(|&&member| live_in[block_id.0].get(member))
+                    .count()
+                    + params.iter().filter(|param| member_set.contains(param)).count();
+                if live_at_entry > 1 {
+                    continue 'web;
+                }
+            }
+
+            // A member defined by a regular instruction writes a value from outside the
+            // web into the shared location, so no other member may be live across it.
+            for &member in members {
+                if param_vregs.contains(&member) {
+                    continue;
+                }
+                let def = intervals[member].start();
+                let clobbers_live_member = members.iter().any(|&other| {
+                    other != member && intervals[other].survives(def)
+                });
+                if clobbers_live_member {
+                    continue 'web;
+                }
+            }
+
+            // The web is safe: allocate it as one interval under `root`.
+            let mut ranges: Vec<LiveRange> = members.iter()
+                .flat_map(|&member| intervals[member].ranges.iter().cloned())
+                .collect();
+            ranges.sort_by_key(|range| range.from);
+            let mut merged: Vec<LiveRange> = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                match merged.last_mut() {
+                    Some(last) if range.from <= last.to => last.to = last.to.max(range.to),
+                    _ => merged.push(range),
+                }
+            }
+
+            for &member in members {
+                roots[member] = root;
+                if member != root {
+                    intervals[member].ranges = Vec::new();
+                    intervals[member].coalesced_into = Some(VRegId::from(root));
+                }
+            }
+            intervals[root].ranges = merged;
+            // Drop the web's preferred registers. `preferred` is only meaningful for the
+            // one-instruction "def, then move into a physical register" pattern that
+            // preferred_register_assignments() recognizes, and it can name a *pinned*
+            // register (SP/CFP/EC/NATIVE_STACK_PTR) that linear_scan() would otherwise
+            // hand to the web's much longer merged interval.
+            intervals[root].preferred = None;
+        }
+
+        roots
+    }
+
     /// Resolve SSA block parameters by inserting sequentialized move instructions
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
@@ -2919,14 +3105,20 @@ impl Assembler
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
                     // Do we have a case where a ccall is emitted, but nobody
                     // uses the result?
-                    let call_result_live = out.is_vreg()
-                        && intervals[out.vreg_idx()].has_bounds()
-                        && !intervals[out.vreg_idx()].is_dead();
+                    //
+                    // A coalesced VReg has no ranges of its own, so this and everything
+                    // else below has to ask the interval that owns its allocation.
+                    let call_result_live = out.is_vreg() && {
+                        let owner = intervals[out.vreg_idx()].owner(intervals);
+                        owner.has_bounds() && !owner.is_dead()
+                    };
 
-                    // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
+                    // Build a set of VRegIds that can be referenced by JITFrame for
+                    // materializing the VM stack, named by their owning interval so that
+                    // a coalesced VReg marks the interval that is actually allocated.
                     let stack_vreg_ids: HashSet<VRegId> = if let Some(StackMap { stack, .. }) = &stack_map {
                         stack.iter().filter_map(|entry| match entry {
-                            StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => Some(*idx),
+                            StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => Some(intervals[*idx].owner(intervals).vreg_id),
                             _ => None,
                         }).collect()
                     } else {
@@ -2939,6 +3131,11 @@ impl Assembler
                     // after we make the ccall
                     let survivors: Vec<VRegId> = intervals.iter()
                         .filter(|interval| {
+                            // Coalesced VRegs share their owner's register; saving the
+                            // owner once saves them all.
+                            if interval.coalesced_into.is_some() {
+                                return false;
+                            }
                             // We need to spill register intervals on this CCall in two cases:
                             // 1) The VReg is referenced in an instruction after the CCall
                             let survives_call = interval.has_bounds() && interval.survives(insn_number);
@@ -2999,6 +3196,7 @@ impl Assembler
                                     StackMapEntry::encode_base_ptr(slot_index, stack_size)
                                 }
                                 StackMapEntry::Opnd(Opnd::VReg { idx: vreg, .. }) => {
+                                    let vreg = intervals[vreg].owner(intervals).vreg_id;
                                     let vreg_stack_index = match intervals[vreg].assigned.get().expect("StackMap VReg should have an allocation") {
                                         Allocation::Reg(_) => {
                                             let caller_saved_reg_idx = survivors.iter().position(|&survivor_id| survivor_id == vreg).unwrap();
@@ -5823,5 +6021,219 @@ mod tests {
                 if reg.reg_no == param_reg.reg_no)).unwrap();
         assert!(save_pos < param_move_pos,
             "the caller's callee-saved value must be stored before the parameter move overwrites it: {insns:?}");
+    }
+
+    /// Build `entry -> header(params) -> body -> header`, plus an exit block that keeps
+    /// every parameter live. `backedge_args` may add instructions to the body block.
+    fn build_loop(
+        num_params: usize,
+        entry_args: &[Opnd],
+        backedge_args: impl FnOnce(&mut Assembler, BlockId, &[Opnd]) -> Vec<Opnd>,
+    ) -> (Assembler, BlockId, Vec<Opnd>) {
+        let mut asm = Assembler::new();
+        let entry = asm.new_block(hir::BlockId(0), true, 0);
+        let header = asm.new_block(hir::BlockId(1), false, 1);
+        let body = asm.new_block(hir::BlockId(2), false, 2);
+        let exit = asm.new_block(hir::BlockId(3), false, 3);
+
+        asm.set_current_block(entry);
+        let label = asm.new_label("entry");
+        asm.write_label(label);
+        asm.basic_blocks[entry.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+            target: header, args: entry_args.to_vec(),
+        }))));
+
+        asm.set_current_block(header);
+        let label = asm.new_label("header");
+        asm.write_label(label);
+        let params: Vec<Opnd> = (0..num_params).map(|_| {
+            let param = asm.new_block_param(64);
+            asm.basic_blocks[header.0].add_parameter(param);
+            param
+        }).collect();
+        asm.basic_blocks[header.0].push_insn(Insn::Cmp { left: params[0], right: Opnd::UImm(10) });
+        asm.basic_blocks[header.0].push_insn(Insn::Jl(Target::Block(Box::new(BranchEdge {
+            target: body, args: vec![],
+        }))));
+        asm.basic_blocks[header.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+            target: exit, args: vec![],
+        }))));
+
+        asm.set_current_block(body);
+        let label = asm.new_label("body");
+        asm.write_label(label);
+        let args = backedge_args(&mut asm, body, &params);
+        asm.basic_blocks[body.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+            target: header, args,
+        }))));
+
+        asm.set_current_block(exit);
+        let label = asm.new_label("exit");
+        asm.write_label(label);
+        let mut acc = params[0];
+        for &param in &params[1..] {
+            acc = asm.add(acc, param);
+        }
+        asm.basic_blocks[exit.0].push_insn(Insn::CRet(acc));
+
+        (asm, body, params)
+    }
+
+    /// Run the pipeline through coalescing and register allocation the way
+    /// compile_with_regs() does.
+    fn run_coalescing(asm: &mut Assembler, num_regs: usize) -> (Vec<Interval>, RegPool, Vec<usize>) {
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in.clone());
+        let mut regs = alloc_reg_pool(num_regs);
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        let roots = asm.coalesce_block_params(&mut intervals, &live_in);
+        let call_positions = asm.ccall_positions();
+        asm.linear_scan(&intervals, &regs, &call_positions);
+        for (vreg, &root) in roots.iter().enumerate() {
+            if root != vreg {
+                intervals[vreg].assigned.set(intervals[root].assigned.get());
+            }
+        }
+        (intervals, regs, roots)
+    }
+
+    /// A counter-style loop-carried value: the header parameter and the backedge
+    /// argument computed from it share one allocation, so the backedge needs no copy.
+    #[test]
+    fn test_coalesce_block_params_merges_loop_carried_value() {
+        let (mut asm, body, params) = build_loop(1, &[Opnd::UImm(1)], |asm, body, params| {
+            let next = asm.new_vreg(64);
+            asm.basic_blocks[body.0].push_insn(Insn::Add {
+                left: params[0], right: Opnd::UImm(2), out: next,
+            });
+            vec![next]
+        });
+        let (intervals, regs, roots) = run_coalescing(&mut asm, 5);
+
+        let param_idx = params[0].vreg_idx().to_usize();
+        // The parameter and the backedge argument are one web: exactly one of them owns
+        // the interval and the other points at it with the same allocation.
+        let coalesced: Vec<usize> = (0..roots.len()).filter(|&v| roots[v] != v).collect();
+        assert_eq!(coalesced.len(), 1, "expected the loop-carried pair to coalesce: {roots:?}");
+        let member = coalesced[0];
+        let root = roots[member];
+        assert!(member == param_idx || root == param_idx);
+        assert_eq!(intervals[member].coalesced_into, Some(VRegId::from(root)));
+        assert_eq!(intervals[member].assigned.get(), intervals[root].assigned.get());
+        assert!(intervals[member].assigned.get().is_some());
+
+        // The backedge copy is gone. The preheader still has to initialize the value.
+        asm.resolve_ssa(&intervals, &regs);
+        let shared = Assembler::rewritten_opnd(params[0], &intervals, &regs);
+        let body_insns = &asm.basic_blocks[body.0].insns;
+        assert!(!body_insns.iter()
+            .any(|insn| matches!(insn, Insn::Mov { dest, .. } | Insn::LoadInto { dest, .. } if *dest == shared)),
+            "coalescing should have removed the backedge copy into {shared:?}: {body_insns:?}");
+    }
+
+    /// `a, b = b, a` at a loop backedge: the two header parameters are copy-related in
+    /// both directions, so they land in one union-find web. Coalescing them would put two
+    /// simultaneously live values in one location, so the web has to be rejected.
+    #[test]
+    fn test_coalesce_block_params_rejects_loop_carried_swap() {
+        let (mut asm, _body, params) = build_loop(
+            2,
+            &[Opnd::UImm(1), Opnd::UImm(3)],
+            |_asm, _body, params| vec![params[1], params[0]],
+        );
+        let (intervals, regs, roots) = run_coalescing(&mut asm, 5);
+
+        let a = params[0].vreg_idx().to_usize();
+        let b = params[1].vreg_idx().to_usize();
+        assert_eq!(roots[a], a, "swapped parameters must not be coalesced");
+        assert_eq!(roots[b], b, "swapped parameters must not be coalesced");
+        assert!(intervals[a].coalesced_into.is_none());
+        assert!(intervals[b].coalesced_into.is_none());
+        assert_ne!(intervals[a].assigned.get(), intervals[b].assigned.get(),
+            "the two loop-carried values must keep distinct locations");
+
+        // resolve_ssa must still emit the swap at the backedge.
+        asm.resolve_ssa(&intervals, &regs);
+        let a_loc = Assembler::rewritten_opnd(params[0], &intervals, &regs);
+        let b_loc = Assembler::rewritten_opnd(params[1], &intervals, &regs);
+        let moves: Vec<&Insn> = asm.basic_blocks.iter()
+            .flat_map(|block| block.insns.iter())
+            .filter(|insn| matches!(insn, Insn::Mov { .. } | Insn::LoadInto { .. }))
+            .collect();
+        assert!(moves.iter().any(|insn| matches!(insn, Insn::Mov { dest, .. } if *dest == a_loc)),
+            "expected a move into {a_loc:?} for the swap, got {moves:?}");
+        assert!(moves.iter().any(|insn| matches!(insn, Insn::Mov { dest, .. } if *dest == b_loc)),
+            "expected a move into {b_loc:?} for the swap, got {moves:?}");
+    }
+
+    /// A 3-way rotation is the same hazard with three parameters.
+    #[test]
+    fn test_coalesce_block_params_rejects_loop_carried_rotation() {
+        let (mut asm, _body, params) = build_loop(
+            3,
+            &[Opnd::UImm(1), Opnd::UImm(3), Opnd::UImm(5)],
+            |_asm, _body, params| vec![params[2], params[0], params[1]],
+        );
+        let (intervals, _regs, roots) = run_coalescing(&mut asm, 5);
+
+        let ids: Vec<usize> = params.iter().map(|p| p.vreg_idx().to_usize()).collect();
+        for &id in &ids {
+            assert_eq!(roots[id], id, "rotated parameters must not be coalesced");
+        }
+        let allocs: Vec<_> = ids.iter().map(|&id| intervals[id].assigned.get()).collect();
+        assert_ne!(allocs[0], allocs[1]);
+        assert_ne!(allocs[1], allocs[2]);
+        assert_ne!(allocs[0], allocs[2]);
+    }
+
+    /// Two live parameters of the same entry block merged into one join parameter: the
+    /// web would give resolve_ssa two incoming-argument moves to the same destination.
+    #[test]
+    fn test_coalesce_block_params_rejects_merged_entry_params() {
+        let mut asm = Assembler::new();
+        let entry = asm.new_block(hir::BlockId(0), true, 0);
+        let then_block = asm.new_block(hir::BlockId(1), false, 1);
+        let else_block = asm.new_block(hir::BlockId(2), false, 2);
+        let join = asm.new_block(hir::BlockId(3), false, 3);
+
+        asm.set_current_block(entry);
+        let label = asm.new_label("entry");
+        asm.write_label(label);
+        let pa = asm.new_block_param(64);
+        let pb = asm.new_block_param(64);
+        asm.basic_blocks[entry.0].add_parameter(pa);
+        asm.basic_blocks[entry.0].add_parameter(pb);
+        asm.basic_blocks[entry.0].push_insn(Insn::Cmp { left: pa, right: Opnd::UImm(0) });
+        asm.basic_blocks[entry.0].push_insn(Insn::Jl(Target::Block(Box::new(BranchEdge {
+            target: then_block, args: vec![],
+        }))));
+        asm.basic_blocks[entry.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+            target: else_block, args: vec![],
+        }))));
+
+        for (block, arg) in [(then_block, pa), (else_block, pb)] {
+            asm.set_current_block(block);
+            let label = asm.new_label("arm");
+            asm.write_label(label);
+            asm.basic_blocks[block.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
+                target: join, args: vec![arg],
+            }))));
+        }
+
+        asm.set_current_block(join);
+        let label = asm.new_label("join");
+        asm.write_label(label);
+        let q = asm.new_block_param(64);
+        asm.basic_blocks[join.0].add_parameter(q);
+        asm.basic_blocks[join.0].push_insn(Insn::CRet(q));
+
+        let (intervals, _regs, roots) = run_coalescing(&mut asm, 5);
+
+        let pa_idx = pa.vreg_idx().to_usize();
+        let pb_idx = pb.vreg_idx().to_usize();
+        assert_eq!(roots[pa_idx], pa_idx, "entry parameters live together must not merge");
+        assert_eq!(roots[pb_idx], pb_idx, "entry parameters live together must not merge");
+        assert_ne!(intervals[pa_idx].assigned.get(), intervals[pb_idx].assigned.get());
     }
 }

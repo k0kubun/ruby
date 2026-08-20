@@ -1196,7 +1196,7 @@ impl Assembler {
             trace_compile_phase("number_instructions", || asm.number_instructions(0));
 
             let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());
-            let mut intervals = trace_compile_phase("build_intervals", || asm.build_intervals(live_in));
+            let mut intervals = trace_compile_phase("build_intervals", || asm.build_intervals(live_in.clone()));
 
             // Dump live intervals if requested
             if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
@@ -1206,8 +1206,16 @@ impl Assembler {
             }
 
             trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
+            let vreg_roots = trace_compile_phase("coalesce_block_params", || asm.coalesce_block_params(&mut intervals, &live_in));
             let call_positions = asm.ccall_positions();
             let mut num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs, &call_positions));
+            // Give every coalesced VReg its web root's allocation, before
+            // plan_callee_saved_saves() goes looking for callee-saved assignments.
+            for (vreg, &root) in vreg_roots.iter().enumerate() {
+                if root != vreg {
+                    intervals[vreg].assigned.set(intervals[root].assigned.get());
+                }
+            }
             asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
 
             asm.stack_state.num_spill_slots = num_stack_slots;
