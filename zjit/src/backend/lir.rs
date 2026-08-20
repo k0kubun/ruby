@@ -2741,6 +2741,153 @@ impl Assembler
         self.callee_saved_saves = saves;
     }
 
+    /// Coalesce webs of block parameters and the branch arguments that flow into them so
+    /// that every VReg in a web shares one allocation. resolve_ssa()'s copies for edges
+    /// inside a web then become self-moves and get filtered out, which removes the
+    /// per-iteration location shuffling of loop-carried values at loop backedges.
+    ///
+    /// Two VRegs are joined when one is passed as a branch argument to the other's block
+    /// parameter. A web can only share a location when its members never hold two
+    /// different values at the same time, which is checked two ways:
+    ///
+    /// * At most one member may be live at any block's entry, counting both the block's
+    ///   own parameters and the values live into it. Two members live at one block entry
+    ///   is exactly the loop-carried swap (`a, b = b, a`), where the parallel copy at the
+    ///   backedge permutes two live values instead of copying one.
+    /// * A member defined by a regular instruction writes a value into the shared
+    ///   location, so no other member's live range may span that definition.
+    ///
+    /// Both checks are hole-aware: a position inside one of an interval's lifetime holes
+    /// lies on a control-flow path where the VReg isn't live, and block-level liveness
+    /// guarantees the other members aren't live there either.
+    ///
+    /// Rejected webs are dissolved entirely, falling back to per-VReg allocation and
+    /// explicit edge copies. Accepted webs get their members' ranges and preferred
+    /// registers merged into the web's root, and their own ranges cleared, so that
+    /// linear_scan() allocates the web as a single interval. The returned map sends each
+    /// VReg to its root (identity for uncoalesced VRegs); the caller copies the root's
+    /// allocation onto the members.
+    pub fn coalesce_block_params(&self, intervals: &mut [Interval], live_in: &[BitSet<usize>]) -> Vec<usize> {
+        // Union-find with path compression
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            let mut root = x;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut cur = x;
+            while parent[cur] != root {
+                let next = parent[cur];
+                parent[cur] = root;
+                cur = next;
+            }
+            root
+        }
+        let mut parent: Vec<usize> = (0..self.num_vregs).collect();
+
+        // Every block's incoming edges, for the checks below.
+        let block_order = self.block_order();
+        let mut incoming: HashMap<BlockId, Vec<BranchEdge>> = HashMap::default();
+        for &block_id in &block_order {
+            let EdgePair(edge1, edge2) = self.basic_blocks[block_id.0].edges();
+            for edge in [edge1, edge2].into_iter().flatten() {
+                incoming.entry(edge.target).or_default().push(edge);
+            }
+        }
+
+        // Union every (branch argument, block parameter) pair.
+        for edges in incoming.values() {
+            for edge in edges {
+                let params = &self.basic_blocks[edge.target.0].parameters;
+                for (arg, param) in edge.args.iter().zip(params.iter()) {
+                    if let (Opnd::VReg { idx: arg_idx, .. }, Opnd::VReg { idx: param_idx, .. }) = (arg, param) {
+                        let arg_root = find(&mut parent, arg_idx.to_usize());
+                        let param_root = find(&mut parent, param_idx.to_usize());
+                        parent[arg_root] = param_root;
+                    }
+                }
+            }
+        }
+
+        // Group into webs, keeping only the ones with something to coalesce.
+        let mut webs: HashMap<usize, Vec<usize>> = HashMap::default();
+        for vreg in 0..self.num_vregs {
+            let root = find(&mut parent, vreg);
+            webs.entry(root).or_default().push(vreg);
+        }
+        webs.retain(|_, members| members.len() > 1);
+
+        let mut roots: Vec<usize> = (0..self.num_vregs).collect();
+        'web: for (&root, members) in &webs {
+            // A web that no interval gives a range to has nothing to allocate, and
+            // linear_scan() would leave its root unassigned.
+            if !members.iter().any(|&member| intervals[member].has_bounds()) {
+                continue;
+            }
+
+            // UPSTREAM CHECK (unsound, see the commit that replaces it): a block parameter
+            // reached only by in-web arguments is treated as a no-op copy and skipped.
+            let mut param_block: HashMap<usize, BlockId> = HashMap::default();
+            for &block_id in &block_order {
+                for param in &self.basic_blocks[block_id.0].parameters {
+                    if let Opnd::VReg { idx, .. } = param {
+                        param_block.insert(idx.to_usize(), block_id);
+                    }
+                }
+            }
+            let in_web = |opnd: &Opnd| matches!(opnd, Opnd::VReg { idx, .. } if members.contains(&idx.to_usize()));
+            for &member in members {
+                if let Some(&block_id) = param_block.get(&member) {
+                    let position = self.basic_blocks[block_id.0].parameters.iter()
+                        .position(|param| matches!(param, Opnd::VReg { idx, .. } if idx.to_usize() == member));
+                    let Some(position) = position else { continue 'web; };
+                    let external_entry = incoming.get(&block_id).is_none_or(|edges| edges.iter().any(|edge| {
+                        edge.args.get(position).is_none_or(|arg| !in_web(arg))
+                    }));
+                    if external_entry && members.iter().any(|&other| other != member && live_in[block_id.0].get(other)) {
+                        continue 'web;
+                    }
+                    continue;
+                }
+                if !intervals[member].has_bounds() {
+                    continue;
+                }
+                let def = intervals[member].start();
+                let clobbers_live_member = members.iter().any(|&other| {
+                    other != member && intervals[other].has_bounds() && intervals[other].survives(def)
+                });
+                if clobbers_live_member {
+                    continue 'web;
+                }
+            }
+
+            // The web is safe: allocate it as one interval under `root`.
+            let mut ranges: Vec<LiveRange> = members.iter()
+                .flat_map(|&member| intervals[member].ranges.iter().cloned())
+                .collect();
+            ranges.sort_by_key(|range| range.from);
+            let mut merged: Vec<LiveRange> = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                match merged.last_mut() {
+                    Some(last) if range.from <= last.to => last.to = last.to.max(range.to),
+                    _ => merged.push(range),
+                }
+            }
+
+            let mut preferred = None;
+            for &member in members {
+                roots[member] = root;
+                preferred = preferred.or(intervals[member].preferred);
+                if member != root {
+                    intervals[member].ranges = Vec::new();
+                }
+            }
+            intervals[root].ranges = merged;
+            intervals[root].preferred = preferred;
+        }
+
+        roots
+    }
+
     /// Resolve SSA block parameters by inserting sequentialized move instructions
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
