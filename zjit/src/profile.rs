@@ -1282,6 +1282,7 @@ impl IseqProfile {
             out.bytes += entry.opnd_types.len() * size_of::<TypeDistribution>();
             out.distribution_count += entry.opnd_types.len();
             for distribution in entry.opnd_types.iter() {
+                out.bytes += distribution.heap_size();
                 if distribution.num_buckets_used() <= 1 {
                     out.monomorphic_distribution_count += 1;
                 }
@@ -1293,6 +1294,14 @@ impl IseqProfile {
         out.bytes += hash_table_bytes::<(YarvInsnIdx, ForwardedCiDistribution)>(self.forwarded_cis.capacity());
         out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.block_handlers.capacity());
         out.bytes += hash_table_bytes::<(YarvInsnIdx, BlockFallbackEntry)>(self.block_fallbacks.capacity());
+        // Boxed distribution tails, wherever they live.
+        out.bytes += self.super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
+        out.bytes += self.send_mid.values().map(TypeDistribution::heap_size).sum::<usize>();
+        out.bytes += self.splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        out.bytes += self.forwarded_cis.values().map(ForwardedCiDistribution::heap_size).sum::<usize>();
+        out.bytes += self.block_handlers.values().map(TypeDistribution::heap_size).sum::<usize>();
+        out.bytes += self.block_fallbacks.values()
+            .map(|entry| entry.dist.heap_size() + entry.symbol_recv.heap_size()).sum::<usize>();
         out
     }
 
