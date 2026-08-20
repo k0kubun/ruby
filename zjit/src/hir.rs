@@ -9850,6 +9850,9 @@ impl Function {
         if profiles.is_empty() {
             if self.policy.no_side_exits {
                 self.count(block, no_profile_counter);
+                // The fallback path samples the shapes arriving here, which is the evidence
+                // rb_zjit_ivar_reprofile weighs when deciding to earn a respecialization.
+                self.emit_ivar_reprofile(block, self_param, exit_id);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
                 return Some((block, result));
@@ -9894,6 +9897,7 @@ impl Function {
                 let fallback_block = self.new_block(insn_idx);
                 self.push_insn(block, branch(matches, optimized_block, fallback_block));
                 self.count(fallback_block, chain_miss_counter);
+                self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
                 let fallback_result = emit_fallback(self, fallback_block);
                 self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
             } else {

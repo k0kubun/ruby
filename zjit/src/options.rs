@@ -99,11 +99,22 @@ pub struct Options {
     /// Turn off the HIR optimizer
     pub disable_hir_opt: bool,
 
+    /// Turn off the ivar shape table, so ivar sites that miss their inline shape
+    /// guard chain go straight to the generic C call. Only useful for A/B
+    /// measurement; see [`crate::ivar_cache`].
+    pub disable_ivar_cache: bool,
+
+    /// Slots in each ivar shape table. Must be a power of two and at least 8;
+    /// one table is allocated per ivar name a compiled fallback path accesses, so
+    /// this times 8 bytes times the number of such names bounds the memory.
+    /// Undersizing it is not a graceful degradation -- see
+    /// [`crate::ivar_cache::DEFAULT_CACHE_ENTRIES`].
+    pub ivar_cache_entries: usize,
+
     /// Turn off the send class table, so megamorphic send sites go straight to
     /// `rb_vm_opt_send_without_block` and its one-entry `cd->cc` inline cache.
     /// Only useful for A/B measurement; see [`crate::send_cache`].
     pub disable_send_cache: bool,
-
     /// Turn off the inline megamorphic dispatch path, so a table hit is always
     /// dispatched through `rb_zjit_send_cached_without_block` rather than by
     /// calling the callee's compiled code from JIT code. Only useful for A/B
@@ -219,6 +230,8 @@ impl Default for Options {
             debug: false,
             disable: false,
             disable_hir_opt: false,
+            disable_ivar_cache: false,
+            ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
             disable_megamorphic_direct: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
@@ -552,6 +565,12 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable", "") => options.disable = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
+        ("disable-ivar-cache", "") => options.disable_ivar_cache = true,
+
+        ("ivar-cache-entries", _) => match opt_val.parse::<usize>() {
+            Ok(n) if n.is_power_of_two() && n >= 8 => options.ivar_cache_entries = n,
+            _ => return None,
+        },
 
         ("disable-send-cache", "") => options.disable_send_cache = true,
 

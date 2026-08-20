@@ -8263,6 +8263,7 @@ mod hir_opt_tests {
           WriteBarrier v14, v10
           Jump bb4()
         bb8():
+          IvarReprofile v14
           SetIvar v14, :@a, v10
           Jump bb4()
         bb4():
@@ -10205,11 +10206,12 @@ mod hir_opt_tests {
           v20:CBool = IsBitEqual v12, v19
           CondBranch v20, bb7(), bb8()
         bb7():
-          v24:BasicObject = LoadField v6, :@foo@0x1004
-          Jump bb4(v24)
+          v25:BasicObject = LoadField v6, :@foo@0x1004
+          Jump bb4(v25)
         bb8():
-          v22:BasicObject = GetIvar v6, :@foo
-          Jump bb4(v22)
+          IvarReprofile v6
+          v23:BasicObject = GetIvar v6, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
           CheckInterrupts
           Return v13
@@ -10574,6 +10576,7 @@ mod hir_opt_tests {
           WriteBarrier v6, v10
           Jump bb4()
         bb8():
+          IvarReprofile v6
           SetIvar v6, :@foo, v10
           Jump bb4()
         bb4():
@@ -10976,19 +10979,20 @@ mod hir_opt_tests {
           v20:CBool = IsBitEqual v12, v19
           CondBranch v20, bb7(), bb8()
         bb7():
-          v24:IMemo = LoadField v11, :fields_obj@0x1004
-          v25:BasicObject = LoadField v24, :@foo@0x1004
-          Jump bb4(v25)
+          v25:IMemo = LoadField v11, :fields_obj@0x1004
+          v26:BasicObject = LoadField v25, :@foo@0x1004
+          Jump bb4(v26)
         bb8():
-          v22:BasicObject = GetIvar v11, :@foo
-          Jump bb4(v22)
+          IvarReprofile v11
+          v23:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
-          v28:Fixnum[1] = Const Value(1)
+          v29:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v39:Fixnum = GuardType v13, Fixnum recompile
-          v40:Fixnum = FixnumAdd v39, v28
+          v40:Fixnum = GuardType v13, Fixnum recompile
+          v41:Fixnum = FixnumAdd v40, v29
           CheckInterrupts
-          Return v40
+          Return v41
         ");
     }
 
@@ -11050,18 +11054,19 @@ mod hir_opt_tests {
           v21:CBool = IsBitEqual v12, v20
           CondBranch v21, bb7(), bb8()
         bb7():
-          v25:BasicObject = LoadField v11, :@foo@0x1004
-          Jump bb4(v25)
+          v26:BasicObject = LoadField v11, :@foo@0x1004
+          Jump bb4(v26)
         bb8():
-          v23:BasicObject = GetIvar v11, :@foo
-          Jump bb4(v23)
+          IvarReprofile v11
+          v24:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v24)
         bb4(v13:BasicObject):
-          v28:Fixnum[1] = Const Value(1)
+          v29:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v39:Fixnum = GuardType v13, Fixnum recompile
-          v40:Fixnum = FixnumAdd v39, v28
+          v40:Fixnum = GuardType v13, Fixnum recompile
+          v41:Fixnum = FixnumAdd v40, v29
           CheckInterrupts
-          Return v40
+          Return v41
         ");
     }
 
@@ -11114,18 +11119,19 @@ mod hir_opt_tests {
           v20:CBool = IsBitEqual v12, v19
           CondBranch v20, bb7(), bb8()
         bb7():
-          v24:BasicObject = LoadField v11, :@foo@0x1002
-          Jump bb4(v24)
+          v25:BasicObject = LoadField v11, :@foo@0x1002
+          Jump bb4(v25)
         bb8():
-          v22:BasicObject = GetIvar v11, :@foo
-          Jump bb4(v22)
+          IvarReprofile v11
+          v23:BasicObject = GetIvar v11, :@foo
+          Jump bb4(v23)
         bb4(v13:BasicObject):
-          v27:Fixnum[1] = Const Value(1)
+          v28:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v38:Fixnum = GuardType v13, Fixnum recompile
-          v39:Fixnum = FixnumAdd v38, v27
+          v39:Fixnum = GuardType v13, Fixnum recompile
+          v40:Fixnum = FixnumAdd v39, v28
           CheckInterrupts
-          Return v39
+          Return v40
         ");
     }
 
@@ -11177,12 +11183,13 @@ mod hir_opt_tests {
           v21:CBool = IsBitEqual v12, v20
           CondBranch v21, bb7(), bb8()
         bb7():
-          v25:IMemo = LoadField v11, :fields_obj@0x1004
-          v26:BasicObject = LoadField v25, :@a@0x1002
-          Jump bb4(v26)
+          v26:IMemo = LoadField v11, :fields_obj@0x1004
+          v27:BasicObject = LoadField v26, :@a@0x1002
+          Jump bb4(v27)
         bb8():
-          v23:BasicObject = GetIvar v11, :@a
-          Jump bb4(v23)
+          IvarReprofile v11
+          v24:BasicObject = GetIvar v11, :@a
+          Jump bb4(v24)
         bb4(v13:BasicObject):
           CheckInterrupts
           Return v13
@@ -16981,23 +16988,24 @@ mod hir_opt_tests {
        bb9():
          StoreField v47, :@formatted@0x1007, v21
          WriteBarrier v47, v21
-         v62:CShape[0x1006] = Const CShape(0x1006)
-         StoreField v47, :shape_id@0x1005, v62
+         v63:CShape[0x1006] = Const CShape(0x1006)
+         StoreField v47, :shape_id@0x1005, v63
          Jump bb6()
        bb10():
+         IvarReprofile v47
          SetIvar v47, :@formatted, v21
          Jump bb6()
        bb6():
-         v68:ClassSubclass[VMFrozenCore] = Const Value(VALUE(0x1010))
+         v69:ClassSubclass[VMFrozenCore] = Const Value(VALUE(0x1010))
          PatchPoint MethodRedefined(Class@0x1018, lambda@0x1020, cme:0x1028)
-         v84:BasicObject = CCallWithFrame v68, :RubyVM::FrozenCore.lambda@0x1050, block=0x1058
-         v71:CPtr = GetEP 0
-         v72:BasicObject = LoadField v71, :a@0x1001
-         v73:BasicObject = LoadField v71, :_b@0x1002
-         v74:BasicObject = LoadField v71, :_c@0x1003
-         v75:BasicObject = LoadField v71, :formatted@0x1004
+         v85:BasicObject = CCallWithFrame v69, :RubyVM::FrozenCore.lambda@0x1050, block=0x1058
+         v72:CPtr = GetEP 0
+         v73:BasicObject = LoadField v72, :a@0x1001
+         v74:BasicObject = LoadField v72, :_b@0x1002
+         v75:BasicObject = LoadField v72, :_c@0x1003
+         v76:BasicObject = LoadField v72, :formatted@0x1004
          CheckInterrupts
-         Return v84
+         Return v85
        ");
     }
 
@@ -20207,9 +20215,9 @@ mod hir_opt_tests {
         bb6(v18:HeapBasicObject, v19:Fixnum):
           v23:Fixnum[10] = Const Value(10)
           PatchPoint MethodRedefined(Integer@0x1000, <@0x1008, cme:0x1010)
-          v97:BoolExact = FixnumLt v19, v23
+          v98:BoolExact = FixnumLt v19, v23
           CheckInterrupts
-          v29:CBool = Test v97
+          v29:CBool = Test v98
           CondBranch v29, bb4(), bb7()
         bb4():
           PatchPoint SingleRactorMode
@@ -20225,30 +20233,31 @@ mod hir_opt_tests {
           v54:CBool = IsBitEqual v46, v53
           CondBranch v54, bb11(), bb12()
         bb11():
-          v58:NilClass = Const Value(nil)
-          Jump bb8(v58)
+          v59:NilClass = Const Value(nil)
+          Jump bb8(v59)
         bb12():
-          v56:BasicObject = GetIvar v18, :@levar
-          Jump bb8(v56)
+          IvarReprofile v18
+          v57:BasicObject = GetIvar v18, :@levar
+          Jump bb8(v57)
         bb8(v47:BasicObject):
-          v61:CBool = Test v47
-          CondBranch v61, bb5(v18), bb13()
+          v62:CBool = Test v47
+          CondBranch v62, bb5(v18), bb13()
         bb13():
           PatchPoint NoEPEscape(set_value_loop)
           PatchPoint SingleRactorMode
-          v71:CShape = LoadField v18, :shape_id@0x1038
-          v72:CShape[0x103b] = GuardBitEquals v71, CShape(0x103b) recompile
+          v72:CShape = LoadField v18, :shape_id@0x1038
+          v73:CShape[0x103b] = GuardBitEquals v72, CShape(0x103b) recompile
           StoreField v18, :@levar@0x103a, v19
           WriteBarrier v18, v19
-          v75:CShape[0x1039] = Const CShape(0x1039)
-          StoreField v18, :shape_id@0x1038, v75
+          v76:CShape[0x1039] = Const CShape(0x1039)
+          StoreField v18, :shape_id@0x1038, v76
           Jump bb5(v18)
-        bb5(v79:HeapBasicObject):
+        bb5(v80:HeapBasicObject):
           PatchPoint NoEPEscape(set_value_loop)
-          v87:Fixnum[1] = Const Value(1)
+          v88:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1000, +@0x103c, cme:0x1040)
-          v101:Fixnum = FixnumAdd v19, v87
-          Jump bb6(v79, v101)
+          v102:Fixnum = FixnumAdd v19, v88
+          Jump bb6(v80, v102)
         bb7():
           v34:NilClass = Const Value(nil)
           CheckInterrupts
