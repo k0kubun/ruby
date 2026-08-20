@@ -956,6 +956,8 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_code_block_bytes", mem.code_block_bytes);
         set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
         set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
+        set_stat_usize!(hash, "mem_dead_iseq_version_bytes", mem.dead_iseq_version_bytes);
+        set_stat_usize!(hash, "mem_method_annotation_bytes", mem.method_annotation_bytes);
         set_stat_usize!(hash, "mem_accounted_bytes", mem.accounted_bytes());
         set_stat_usize!(hash, "mem_unaccounted_bytes", zjit_alloc_bytes().saturating_sub(mem.accounted_bytes()));
         set_stat_usize!(hash, "mem_payload_count", mem.payload_count);

@@ -205,6 +205,8 @@ class << RubyVM::ZJIT
       :mem_jit_frame_bytes,
       :mem_code_block_bytes,
       :mem_stats_counter_bytes,
+      :mem_dead_iseq_version_bytes,
+      :mem_method_annotation_bytes,
       :mem_accounted_bytes,
       :mem_unaccounted_bytes,
       :total_mem_bytes,

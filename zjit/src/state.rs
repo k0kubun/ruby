@@ -89,6 +89,12 @@ pub struct ZJITState {
     /// per ivar name. Owned here so [`crate::mem_stats`] can account for them;
     /// the addresses are baked into JIT code, so the `Box`es must never move.
     ivar_caches: HashMap<ID, Box<crate::ivar_cache::IvarCache>>,
+    /// Bytes held by `IseqVersion`s whose ISEQ has been freed. They cannot be
+    /// released because `Invariants`' patch points hold raw pointers to them,
+    /// and they are no longer reachable from any live ISEQ, so the `mem_*`
+    /// walker cannot find them. Tracked here instead. See
+    /// [`crate::gc::rb_zjit_iseq_free`].
+    dead_iseq_version_bytes: usize,
 }
 
 /// Tracks the initialization progress
@@ -174,6 +180,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             ivar_caches: HashMap::new(),
+            dead_iseq_version_bytes: 0,
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -233,6 +240,16 @@ impl ZJITState {
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
     pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
         &mut ZJITState::get_instance().ivar_caches
+    }
+
+    /// Record bytes retained by an `IseqVersion` that outlived its ISEQ.
+    pub fn add_dead_iseq_version_bytes(bytes: usize) {
+        ZJITState::get_instance().dead_iseq_version_bytes += bytes;
+    }
+
+    /// Bytes retained by `IseqVersion`s whose ISEQ has been freed.
+    pub fn dead_iseq_version_bytes() -> usize {
+        ZJITState::get_instance().dead_iseq_version_bytes
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {

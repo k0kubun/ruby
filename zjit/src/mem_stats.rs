@@ -73,6 +73,11 @@ pub struct MemoryBreakdown {
     /// Ivar shape tables: one fixed-size table per ivar name accessed by a
     /// compiled site that can reach the generic path. See [`crate::ivar_cache`].
     pub ivar_cache_bytes: usize,
+    /// `IseqVersion`s whose ISEQ has been freed. Unreachable from any live
+    /// ISEQ, so they are counted from a running total rather than walked.
+    pub dead_iseq_version_bytes: usize,
+    /// Core-library method annotation tables, built once at boot.
+    pub method_annotation_bytes: usize,
 
     /// Number of ISEQ payloads walked, for per-ISEQ math.
     pub payload_count: usize,
@@ -107,6 +112,8 @@ impl MemoryBreakdown {
             + self.code_block_bytes
             + self.stats_counter_bytes
             + self.ivar_cache_bytes
+            + self.dead_iseq_version_bytes
+            + self.method_annotation_bytes
     }
 }
 
@@ -115,9 +122,9 @@ impl MemoryBreakdown {
 pub fn memory_breakdown() -> MemoryBreakdown {
     let mut out = MemoryBreakdown::default();
 
-    // Per-ISEQ payloads. Only ISEQs that are still alive are visited; ZJIT
-    // currently never frees the payload of a dead ISEQ, so those bytes show up
-    // in mem_unaccounted_bytes rather than here.
+    // Per-ISEQ payloads. Only ISEQs that are still alive are visited, which is
+    // exhaustive: `rb_zjit_iseq_free` frees the payload of a dead ISEQ and
+    // moves whatever has to outlive it into `dead_iseq_version_bytes` below.
     for_each_iseq(|iseq: IseqPtr| {
         let payload = unsafe { rb_iseq_get_zjit_payload(iseq) } as *const IseqPayload;
         if payload.is_null() {
@@ -143,7 +150,8 @@ pub fn memory_breakdown() -> MemoryBreakdown {
         for version in payload.all_versions() {
             let version = unsafe { version.as_ref() };
             out.version_count += 1;
-            out.iseq_version_bytes += size_of::<crate::payload::IseqVersion>();
+            out.iseq_version_bytes += size_of::<crate::payload::IseqVersion>()
+                + version.jit_entry_heap_size();
             out.gc_offset_bytes += version.gc_offsets.capacity() * size_of::<crate::virtualmem::CodePtr>();
             out.iseq_call_bytes += version.iseq_call_heap_size();
         }
@@ -166,6 +174,8 @@ pub fn memory_breakdown() -> MemoryBreakdown {
 
     out.code_block_bytes = ZJITState::get_code_block().heap_size();
     out.stats_counter_bytes = ZJITState::counter_table_heap_size();
+    out.dead_iseq_version_bytes = ZJITState::dead_iseq_version_bytes();
+    out.method_annotation_bytes = ZJITState::get_method_annotations().heap_size();
 
     out
 }
