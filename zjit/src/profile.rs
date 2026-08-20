@@ -1468,7 +1468,38 @@ impl IseqProfile {
 
 #[cfg(test)]
 mod tests {
-    use crate::cruby::*;
+    use super::*;
+
+    /// ZJIT retains one of these per profiled operand of every profiled instruction, and
+    /// most stay monomorphic for the life of the process, so their size is the single
+    /// biggest lever on ZJIT's non-code memory. Pin it: widening the inline part of
+    /// `Distribution`, or letting `ProfileEntry` carry a `Vec` again, costs megabytes on a
+    /// compile-heavy workload without anything else failing.
+    #[test]
+    fn profiling_metadata_stays_small() {
+        // Bucket 0 inline (16B) + two u16 counts + a null tail pointer.
+        assert_eq!(size_of::<TypeDistribution>(), 32);
+        assert_eq!(size_of::<ProfileEntry>(), 32,
+            "opnd_types must stay a Box<[_]> (16 bytes), not a Vec (24)");
+
+        // What the same distribution would cost with all 8 buckets inline, which is
+        // what it cost before the tail was boxed: [ProfiledType; 8] + [u16; 8] + other.
+        const INLINE_SIZE: usize = 8 * size_of::<ProfiledType>() + 8 * size_of::<NumProfiles>()
+            + size_of::<NumProfiles>();
+        assert!(INLINE_SIZE >= 146 && size_of::<TypeDistribution>() * 4 < INLINE_SIZE,
+            "the inline layout was {INLINE_SIZE} bytes; boxing has to be worth much more than a small constant");
+
+        // The tail a distribution pays for only once it goes polymorphic.
+        let mut dist = TypeDistribution::new();
+        let a = ProfiledType::object(VALUE(8));
+        let b = ProfiledType::object(VALUE(16));
+        dist.observe(a);
+        assert_eq!(dist.heap_size(), 0, "a monomorphic distribution owns no heap");
+        dist.observe(b);
+        assert_eq!(dist.heap_size(), 8 * size_of::<ProfiledType>() + 8 * size_of::<NumProfiles>(),
+            "the boxed tail is buckets 1..8 plus their counts, with index 0 left unused so \
+             bucket numbering lines up with Distribution's");
+    }
 
     #[test]
     fn can_profile_block_handler() {
