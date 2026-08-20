@@ -176,6 +176,25 @@ impl IseqVersion {
             + self.outgoing.len() * rc_bytes
     }
 
+    /// Bytes the JIT entry point table in [`IseqStatus::Compiled`] owns. One
+    /// entry per `opt_table` arity a JIT-to-JIT caller may enter through.
+    pub fn jit_entry_heap_size(&self) -> usize {
+        match &self.status {
+            IseqStatus::Compiled(code_ptrs) => code_ptrs.jit_entry_ptrs.capacity() * size_of::<CodePtr>(),
+            _ => 0,
+        }
+    }
+
+    /// Every byte this version owns, including the `IseqVersion` allocation
+    /// itself. Used both by the `mem_*` walker and to account versions that
+    /// outlive their ISEQ (see [`crate::gc::rb_zjit_iseq_free`]).
+    pub fn total_heap_size(&self) -> usize {
+        size_of::<IseqVersion>()
+            + self.gc_offsets.heap_size()
+            + self.jit_entry_heap_size()
+            + self.iseq_call_heap_size()
+    }
+
     /// Check if this version was invalidated
     pub fn is_invalidated(&self) -> bool {
         self.status == IseqStatus::Invalidated
@@ -236,6 +255,14 @@ pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
             payload as *mut IseqPayload
         }
     }
+}
+
+/// Get a pointer to the payload object associated with an ISEQ, or null if ZJIT
+/// has never allocated one. Unlike [`get_or_create_iseq_payload_ptr`] this never
+/// allocates, which matters on paths that only want to release what is already
+/// there (see [`crate::gc::rb_zjit_iseq_free`]).
+pub fn get_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
+    unsafe { rb_iseq_get_zjit_payload(iseq) as *mut IseqPayload }
 }
 
 /// Get the payload object associated with an ISEQ. Create one if none exists.
