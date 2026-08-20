@@ -990,29 +990,32 @@ pub struct IseqProfile {
     /// Only instructions that have actually been profiled have entries here.
     entries: Vec<ProfileEntry>,
 
-    /// Method entries for `super` calls (stored as VALUE to be GC-safe)
-    super_cme: HashMap<YarvInsnIdx, TypeDistribution>,
+    /// Method entries for `super` calls (stored as VALUE to be GC-safe).
+    /// Boxed because only ISEQs containing `invokesuper` ever use it, and an
+    /// inline `HashMap` costs every payload 48 bytes to hold nothing.
+    super_cme: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
     /// Method-name symbols observed as the first argument of `send`/`__send__` call sites
     /// (stored as VALUE to be GC-safe)
-    send_mid: HashMap<YarvInsnIdx, TypeDistribution>,
+    send_mid: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
-    /// Observed lengths of caller splat arrays for call instructions.
-    splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+    /// Observed lengths of caller splat arrays for call instructions. Boxed for
+    /// the same reason as `super_cme`.
+    splat_lengths: Option<Box<HashMap<YarvInsnIdx, SplatLengthDistribution>>>,
 
     /// Callinfos observed in the `...` local at `sendforward` sites. Unlike the tables above,
     /// this one holds no objects: see `profile_forwarded_callinfo`.
-    forwarded_cis: HashMap<YarvInsnIdx, ForwardedCiDistribution>,
+    forwarded_cis: Option<Box<HashMap<YarvInsnIdx, ForwardedCiDistribution>>>,
 
     /// Block handlers observed at `invokeblock` sites (stored as VALUE to be GC-safe).
     /// Kept out of `opnd_types` so that the entry's operand slots profile the yielded
     /// arguments instead: a `yield` to a Symbol block sends to the first argument, and
     /// that send only specializes if the argument's class was profiled.
-    block_handlers: HashMap<YarvInsnIdx, TypeDistribution>,
+    block_handlers: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
     /// Live-traffic re-profiling windows for `invokeblock` sites whose compiled dispatch keeps
     /// reaching `rb_vm_invokeblock()`.
-    block_fallbacks: HashMap<YarvInsnIdx, BlockFallbackEntry>,
+    block_fallbacks: Option<Box<HashMap<YarvInsnIdx, BlockFallbackEntry>>>,
 
     /// Dense copy of every object the distributions above reference, which is what
     /// GC marking actually walks. See [`IseqProfile::marked_objects`].
@@ -1035,12 +1038,12 @@ impl IseqProfile {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            super_cme: HashMap::new(),
-            send_mid: HashMap::new(),
-            splat_lengths: HashMap::new(),
-            forwarded_cis: HashMap::new(),
-            block_handlers: HashMap::new(),
-            block_fallbacks: HashMap::new(),
+            super_cme: None,
+            send_mid: None,
+            splat_lengths: None,
+            forwarded_cis: None,
+            block_handlers: None,
+            block_fallbacks: None,
             marked_objects: Vec::new(),
             // Nothing recorded yet, so the (empty) dense copy is already accurate.
             marked_objects_stale: false,
@@ -1076,42 +1079,42 @@ impl IseqProfile {
     /// marking walks.
     fn super_cme_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
         self.marked_objects_stale = true;
-        &mut self.super_cme
+        self.super_cme.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the `send`/`__send__` method-name distributions. Same reason
     /// as [`Self::super_cme_mut`].
     fn send_mid_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
         self.marked_objects_stale = true;
-        &mut self.send_mid
+        self.send_mid.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the splat length distributions. Unlike the two above this
     /// needs no invalidation: a `SplatLengthDistribution` holds array lengths, not
     /// objects, so GC marking never looks at it.
     fn splat_lengths_mut(&mut self) -> &mut HashMap<YarvInsnIdx, SplatLengthDistribution> {
-        &mut self.splat_lengths
+        self.splat_lengths.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the forwarded callinfo distributions. Needs no marking invalidation
     /// for the same reason `splat_lengths_mut` does not: a packed callinfo is an immediate, not
     /// an object, and a heap one is recorded as `None`.
     fn forwarded_cis_mut(&mut self) -> &mut HashMap<YarvInsnIdx, ForwardedCiDistribution> {
-        &mut self.forwarded_cis
+        self.forwarded_cis.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the `invokeblock` block-handler distributions. Same reason
     /// as [`Self::super_cme_mut`].
     fn block_handlers_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
         self.marked_objects_stale = true;
-        &mut self.block_handlers
+        self.block_handlers.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the `invokeblock` re-profiling windows. Same reason as
     /// [`Self::super_cme_mut`]: the windows hold block handlers, which are objects.
     fn block_fallbacks_mut(&mut self) -> &mut HashMap<YarvInsnIdx, BlockFallbackEntry> {
         self.marked_objects_stale = true;
-        &mut self.block_fallbacks
+        self.block_fallbacks.get_or_insert_with(Default::default)
     }
 
     /// Record one block handler that reached a compiled `yield`'s generic fallback, and say
@@ -1229,7 +1232,7 @@ impl IseqProfile {
     }
 
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
-        self.splat_lengths.get(&insn_idx)
+        self.splat_lengths.as_ref()?.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
     }
 
@@ -1248,24 +1251,24 @@ impl IseqProfile {
     /// module method reached through more than one includer; each such method entry resolves
     /// `super` to a different target.
     pub fn get_super_method_entries(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
-        let entry = self.super_cme.get(&insn_idx)?;
+        let entry = self.super_cme.as_ref()?.get(&insn_idx)?;
         Some(TypeDistributionSummary::new(entry))
     }
 
     /// Get the distribution of method-name symbols seen at a `send`/`__send__` call site.
     pub fn get_send_method_names(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
-        self.send_mid.get(&insn_idx).map(TypeDistributionSummary::new)
+        self.send_mid.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
     }
 
     /// The distribution of callinfos a `sendforward` site was seen forwarding. See
     /// [`profile_forwarded_callinfo`].
     pub fn get_forwarded_callinfos(&self, insn_idx: YarvInsnIdx) -> Option<ForwardedCiDistributionSummary> {
-        self.forwarded_cis.get(&insn_idx).map(ForwardedCiDistributionSummary::new)
+        self.forwarded_cis.as_ref()?.get(&insn_idx).map(ForwardedCiDistributionSummary::new)
     }
 
     /// The distribution of block handlers observed at an `invokeblock` site.
     pub fn get_block_handlers(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
-        self.block_handlers.get(&insn_idx).map(TypeDistributionSummary::new)
+        self.block_handlers.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
     }
 
     /// Bytes this profile owns on the Rust heap, excluding the `IseqProfile`
@@ -1288,20 +1291,38 @@ impl IseqProfile {
                 }
             }
         }
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.super_cme.capacity());
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.send_mid.capacity());
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(self.splat_lengths.capacity());
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, ForwardedCiDistribution)>(self.forwarded_cis.capacity());
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.block_handlers.capacity());
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, BlockFallbackEntry)>(self.block_fallbacks.capacity());
-        // Boxed distribution tails, wherever they live.
-        out.bytes += self.super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
-        out.bytes += self.send_mid.values().map(TypeDistribution::heap_size).sum::<usize>();
-        out.bytes += self.splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
-        out.bytes += self.forwarded_cis.values().map(ForwardedCiDistribution::heap_size).sum::<usize>();
-        out.bytes += self.block_handlers.values().map(TypeDistribution::heap_size).sum::<usize>();
-        out.bytes += self.block_fallbacks.values()
-            .map(|entry| entry.dist.heap_size() + entry.symbol_recv.heap_size()).sum::<usize>();
+        // The boxed side tables: the `HashMap` header itself once boxed, the bucket
+        // array, and each distribution's own boxed tail.
+        if let Some(table) = self.super_cme.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>()
+                + hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(table.capacity())
+                + table.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(table) = self.send_mid.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>()
+                + hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(table.capacity())
+                + table.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(table) = self.splat_lengths.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, SplatLengthDistribution>>()
+                + hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(table.capacity())
+                + table.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(table) = self.forwarded_cis.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, ForwardedCiDistribution>>()
+                + hash_table_bytes::<(YarvInsnIdx, ForwardedCiDistribution)>(table.capacity())
+                + table.values().map(ForwardedCiDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(table) = self.block_handlers.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>()
+                + hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(table.capacity())
+                + table.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(table) = self.block_fallbacks.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, BlockFallbackEntry>>()
+                + hash_table_bytes::<(YarvInsnIdx, BlockFallbackEntry)>(table.capacity())
+                + table.values().map(|entry| entry.dist.heap_size() + entry.symbol_recv.heap_size()).sum::<usize>();
+        }
         out
     }
 
@@ -1316,25 +1337,25 @@ impl IseqProfile {
             }
         }
 
-        for super_cme_values in self.super_cme.values() {
+        for super_cme_values in self.super_cme.iter().flat_map(|map| map.values()) {
             for profiled_type in super_cme_values.each_item() {
                 callback(profiled_type.class)
             }
         }
 
-        for send_mid_values in self.send_mid.values() {
+        for send_mid_values in self.send_mid.iter().flat_map(|map| map.values()) {
             for profiled_type in send_mid_values.each_item() {
                 callback(profiled_type.class)
             }
         }
 
-        for handler_values in self.block_handlers.values() {
+        for handler_values in self.block_handlers.iter().flat_map(|map| map.values()) {
             for profiled_type in handler_values.each_item() {
                 callback(profiled_type.class)
             }
         }
 
-        for fallback in self.block_fallbacks.values() {
+        for fallback in self.block_fallbacks.iter().flat_map(|map| map.values()) {
             for profiled_type in fallback.dist.each_item().chain(fallback.symbol_recv.each_item()) {
                 callback(profiled_type.class)
             }
@@ -1405,25 +1426,25 @@ impl IseqProfile {
         }
 
         // Update CME references if they move during compaction.
-        for super_cme_values in self.super_cme.values_mut() {
+        for super_cme_values in self.super_cme.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in super_cme_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
 
-        for send_mid_values in self.send_mid.values_mut() {
+        for send_mid_values in self.send_mid.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in send_mid_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
 
-        for handler_values in self.block_handlers.values_mut() {
+        for handler_values in self.block_handlers.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in handler_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
 
-        for fallback in self.block_fallbacks.values_mut() {
+        for fallback in self.block_fallbacks.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in fallback.dist.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
