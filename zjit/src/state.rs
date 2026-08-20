@@ -83,6 +83,10 @@ pub struct ZJITState {
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
 
+    /// Shape tables for ivar accesses that miss their inline guard chain, one
+    /// per ivar name. Owned here because the addresses are baked into JIT code, so
+    /// the `Box`es must never move.
+    ivar_caches: HashMap<ID, Box<crate::ivar_cache::IvarCache>>,
     /// Class tables for send sites that dispatch over more classes than an
     /// inline guard chain can cover, one per call shape. Owned here because JIT
     /// code bakes in the addresses, so the `Box`es must never move.
@@ -169,6 +173,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            ivar_caches: HashMap::new(),
             send_caches: crate::send_cache::SendCaches::new(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
@@ -211,6 +216,11 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
+    pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
+        &mut ZJITState::get_instance().ivar_caches
     }
 
     /// Owner of every per-call-shape class table. See [`crate::send_cache`].

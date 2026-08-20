@@ -769,7 +769,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
             gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, block_arg, &function.frame_state(*state))
         }
-        Insn::GetIvar { self_val, id, ic, state } => gen_getivar(asm, opnd!(self_val), *id, *ic, &function.frame_state(*state)),
+        &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, &function.frame_state(state)),
         Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), &function.frame_state(*state))),
         Insn::SetGlobal { id, val, state } => no_output!(gen_setglobal(jit, asm, function, *id, opnd!(val), &function.frame_state(*state))),
         Insn::GetGlobal { id, state } => gen_getglobal(jit, asm, function, *id, &function.frame_state(*state)),
@@ -1272,8 +1272,52 @@ fn gen_ccall_variadic(
     result
 }
 
-/// Emit an uncached instance variable lookup
-fn gen_getivar(asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
+/// Emit an instance variable lookup with no compile-time shape information.
+///
+/// The shape guard chain [`crate::hir::Function::dispatch_ivar`] emits covers
+/// the shapes the site's profile named; this is what runs for every other
+/// receiver. A generic call is fine when that is rare, but on shape-polymorphic
+/// code (hundreds of live shapes for one class) it *is* the hot path, so we put a
+/// per-ivar-name shape table in front of it: see [`gen_ivar_cache_probe`] and
+/// [`crate::ivar_cache`].
+fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, recv_type: Type, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
+    if get_option!(disable_ivar_cache) {
+        return gen_getivar_generic(asm, recv, id, ic, state);
+    }
+
+    let cache = crate::ivar_cache::ivar_cache_for(id);
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_edge = Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = |val: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+
+    let val = gen_ivar_cache_probe(jit, asm, recv, recv_type, id, cache, slow_edge);
+    gen_incr_counter(asm, Counter::getivar_cache_hit);
+    asm.jmp(result_edge(val));
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    // rb_zjit_getivar_cached only ever raises what rb_ivar_get raises, which is
+    // what this site called before, so it needs no more frame setup than the
+    // generic call it replaces.
+    gen_trace_fallback(asm, "getivar");
+    use crate::ivar_cache::rb_zjit_getivar_cached;
+    let val = asm_ccall!(asm, rb_zjit_getivar_cached, recv, Opnd::const_ptr(cache as *const u8));
+    asm.jmp(result_edge(val));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
+}
+
+/// The generic instance variable lookup, with no shape table in front of it.
+fn gen_getivar_generic(asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
     gen_trace_fallback(asm, "getivar");
     if ic.is_null() {
         asm_ccall!(asm, rb_ivar_get, recv, id.0.into())
@@ -1281,6 +1325,81 @@ fn gen_getivar(asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_i
         let iseq = Opnd::Value(state.iseq.into());
         asm_ccall!(asm, rb_vm_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic))
     }
+}
+
+/// Emit the inline half of an ivar shape table lookup: hash the receiver's shape
+/// id into the table, load one entry, and on a hit produce the ivar's value with
+/// no call. Jumps to `miss` for anything else -- an immediate receiver, a shape
+/// the table does not hold, or an entry whose kind is neither
+/// [`crate::ivar_cache::EntryKind::Direct`] nor [`crate::ivar_cache::EntryKind::Nil`].
+///
+/// The encoding is documented on [`crate::ivar_cache::Entry`]; every constant
+/// this reads comes from that module so the two halves cannot drift apart.
+fn gen_ivar_cache_probe(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    recv: Opnd,
+    recv_type: Type,
+    id: ID,
+    cache: *const crate::ivar_cache::IvarCache,
+    miss: Target,
+) -> Opnd {
+    use crate::ivar_cache::{IVAR_CACHE_HASH_MULT, IVAR_CACHE_INFO_OFFSET, IVAR_CACHE_KEY_OFFSET, IVAR_CACHE_NIL_BIT, IVAR_CACHE_NIL_SLOT, IVAR_CACHE_NOT_INLINE_MASK, cache_byte_mask, cache_hash_shift};
+
+    asm_comment!(asm, "ivar shape table probe for :{}", id.contents_lossy());
+    let recv = asm.load_mem(recv);
+    if !recv_type.is_subtype(types::HeapBasicObject) {
+        // Immediates and false have no shape id word to load.
+        asm.cmp(recv, Opnd::Value(Qfalse));
+        asm.je(jit, miss.clone());
+        asm.test(recv, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
+        asm.jnz(jit, miss.clone());
+    }
+
+    let shape_offset = unsafe { rb_shape_id_offset() };
+    // Two loads of the same word, because `Assembler::mul` is destructive: the
+    // x86 lowering emits `imul left, right` and copies the result out afterwards,
+    // so whatever register held the multiplicand is clobbered. (Same for lshift,
+    // rshift, urshift and not; add/and/or/xor copy into the output first and are
+    // safe.) The second load is what the key comparison needs, and it is a
+    // guaranteed L1 hit on a line the first load just brought in.
+    let shape_to_hash = asm.load(Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_offset));
+    let shape = asm.load(Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_offset));
+
+    // Fibonacci hash, taking the byte offset out of the product's high bits;
+    // this has to agree with `crate::ivar_cache::slot_of` or the helper will fill
+    // slots the probe does not read. Widening the loaded shape id to 64 bits
+    // relies on a 32-bit load zero-extending its destination register, which both
+    // backends do; if one ever did not, the only consequence would be probing a
+    // slot the helper does not fill -- a miss, not a wrong answer.
+    let hash = asm.mul(shape_to_hash.with_num_bits(64), Opnd::UImm(IVAR_CACHE_HASH_MULT));
+    let shifted = asm.urshift(hash, Opnd::UImm(cache_hash_shift()));
+    let slot = asm.and(shifted, Opnd::UImm(cache_byte_mask()));
+    let table = unsafe { (*cache).table_ptr() };
+    let slot_ptr = asm.add(slot, Opnd::const_ptr(table));
+
+    asm_comment!(asm, "check the entry's shape id");
+    let key = asm.load(Opnd::mem(32, slot_ptr, IVAR_CACHE_KEY_OFFSET));
+    asm.cmp(key, shape);
+    asm.jne(jit, miss.clone());
+
+    // The entry's high half is the byte offset plus the kind. Direct and Nil are
+    // servable here; everything else goes to the helper.
+    let info = asm.load(Opnd::mem(32, slot_ptr, IVAR_CACHE_INFO_OFFSET));
+    asm.test(info, Opnd::UImm(IVAR_CACHE_NOT_INLINE_MASK));
+    asm.jnz(jit, miss);
+
+    asm_comment!(asm, "load the ivar at the cached offset, or nil if absent");
+    let offset = asm.and(info.with_num_bits(64), Opnd::UImm(u16::MAX as u64));
+    let ivar_ptr = asm.add(offset, recv);
+    // A Nil entry means the shape has no such ivar. Rather than branch, read a
+    // static word that holds Qnil: this keeps the absent case -- the most
+    // expensive one to resolve generically, because the search has to fail --
+    // on the inline path for two extra instructions.
+    asm.test(info, Opnd::UImm(IVAR_CACHE_NIL_BIT));
+    let nil_slot = Opnd::const_ptr(std::ptr::addr_of!(IVAR_CACHE_NIL_SLOT) as *const u8);
+    let load_from = asm.csel_nz(nil_slot, ivar_ptr);
+    asm.load(Opnd::mem(VALUE_BITS, load_from, 0))
 }
 
 /// Record the shape of a receiver that reached a frozen ivar dispatch's fallback path so the
@@ -1296,17 +1415,30 @@ fn gen_ivar_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Functi
         recv);
 }
 
-/// Emit an uncached instance variable store
+/// Emit an instance variable store with no compile-time shape information.
+///
+/// The counterpart of [`gen_getivar`]: the shape guard chain covers what the
+/// profile named, and this runs for everything else. There is no inline probe on
+/// the write side -- a store also needs a frozen check and a write barrier, which
+/// is a lot of code to inline for a quarter of the traffic reads see -- but the
+/// call goes to a helper that resolves the location out of the same per-name
+/// shape table instead of walking the shape tree. See [`crate::ivar_cache`].
 fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val: Opnd, state: &FrameState) {
     gen_trace_fallback(asm, "setivar");
     // Setting an ivar can raise FrozenError, so we need proper frame state for exception handling.
     gen_prepare_non_leaf_call(jit, asm, function, state);
-    if ic.is_null() {
-        asm_ccall!(asm, rb_ivar_set, recv, id.0.into(), val);
-    } else {
-        let iseq = Opnd::Value(state.iseq.into());
-        asm_ccall!(asm, rb_vm_setinstancevariable, iseq, recv, id.0.into(), val, Opnd::const_ptr(ic));
+    if get_option!(disable_ivar_cache) {
+        if ic.is_null() {
+            asm_ccall!(asm, rb_ivar_set, recv, id.0.into(), val);
+        } else {
+            let iseq = Opnd::Value(state.iseq.into());
+            asm_ccall!(asm, rb_vm_setinstancevariable, iseq, recv, id.0.into(), val, Opnd::const_ptr(ic));
+        }
+        return;
     }
+    let cache = crate::ivar_cache::ivar_cache_for(id);
+    use crate::ivar_cache::rb_zjit_setivar_cached;
+    asm_ccall!(asm, rb_zjit_setivar_cached, recv, val, Opnd::const_ptr(cache as *const u8));
 }
 
 fn gen_getclassvar(jit: &mut JITState, asm: &mut Assembler, function: &Function, id: ID, ic: *const iseq_inline_cvar_cache_entry, state: &FrameState) -> Opnd {
