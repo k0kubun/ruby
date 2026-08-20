@@ -195,7 +195,11 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
 
 /// Append a set of gc_offsets to the iseq's payload
 pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
-    unsafe { version.as_mut() }.gc_offsets.extend(offsets);
+    let gc_offsets = &mut unsafe { version.as_mut() }.gc_offsets;
+    gc_offsets.extend(offsets);
+    // This table is written once per version and then only read, so hand back
+    // whatever Vec's growth strategy over-reserved.
+    gc_offsets.shrink_to_fit();
 
     // Call writebarrier on each newly added value
     let cb = ZJITState::get_code_block();
