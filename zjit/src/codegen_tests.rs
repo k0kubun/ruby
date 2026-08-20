@@ -13422,3 +13422,128 @@ fn test_invalidation_jumps_from_the_inlined_to_the_outlined_half() {
         [before, read_const]
     "), @"[2, 11]");
 }
+
+// Tests for the redundant spill elimination in gen_save_sp() and gen_spill_locals(). Each of
+// these programs lets the JIT skip a cfp->sp store or a local spill store, and then observes
+// the frame from the interpreter, where a wrongly skipped store shows up as a stale local.
+
+#[test]
+fn test_spill_elision_rescue_reads_locals() {
+    // A rescue in this frame runs in the interpreter and reads the locals out of their slots,
+    // so every local the raising call could expose must be resident when it runs.
+    assert_snapshot!(inspect("
+        def raiser = raise('boom')
+        def test(o)
+          a = 1
+          b = 2
+          begin
+            o.send(:itself)
+            a = 3
+            b = 4
+            o.send(:raiser)
+            a = 99
+          rescue RuntimeError
+            [a, b]
+          end
+        end
+        o = Object.new
+        [test(o), test(o), test(o), test(o)]
+    "), @"[[3, 4], [3, 4], [3, 4], [3, 4]]");
+}
+
+#[test]
+fn test_spill_elision_block_writes_caller_local() {
+    // A block that shares this frame's EP writes the caller's local slot directly, so the JIT
+    // must not assume the slot still holds what it last spilled there.
+    assert_snapshot!(inspect("
+        def twice
+          yield
+          yield
+        end
+        def test(o)
+          x = 0
+          y = 0
+          o.send(:itself)
+          twice { x += 1 }
+          o.send(:itself)
+          y = x + 1
+          o.send(:itself)
+          [x, y]
+        end
+        o = Object.new
+        [test(o), test(o), test(o), test(o)]
+    "), @"[[2, 3], [2, 3], [2, 3], [2, 3]]");
+}
+
+#[test]
+fn test_spill_elision_binding_reads_locals() {
+    // Binding reads the locals out of the frame, which requires them to be resident at the
+    // call that creates it.
+    assert_snapshot!(inspect("
+        def test(o)
+          a = 1
+          b = 2
+          o.send(:itself)
+          a = 3
+          o.send(:itself)
+          bind = binding
+          [bind.local_variable_get(:a), bind.local_variable_get(:b)]
+        end
+        o = Object.new
+        [test(o), test(o), test(o)]
+    "), @"[[3, 2], [3, 2], [3, 2]]");
+}
+
+#[test]
+fn test_spill_elision_loop_keeps_locals_correct() {
+    // Repeated dynamic sends in a loop: the locals that never change are spilled once, but a
+    // Binding at the end must still see every local.
+    assert_snapshot!(inspect("
+        def test(o)
+          a = 1
+          b = 2
+          c = 0
+          i = 0
+          while i < 5
+            o.send(:itself)
+            o.send(:itself)
+            c = c + a + b
+            i += 1
+          end
+          bind = binding
+          [a, b, c, i, bind.local_variable_get(:c)]
+        end
+        o = Object.new
+        [test(o), test(o), test(o)]
+    "), @"[[1, 2, 15, 5, 15], [1, 2, 15, 5, 15], [1, 2, 15, 5, 15]]");
+}
+
+#[test]
+fn test_spill_elision_ensure_reads_locals_under_gc_stress() {
+    // An ensure that runs in the interpreter while GC is stressed reads the locals out of the
+    // slots, so a skipped spill would surface as a stale or dead object.
+    assert_snapshot!(inspect(r#"
+        def raiser = raise('boom')
+        def test(o, n)
+          a = "a" * n
+          b = [a]
+          r = nil
+          begin
+            o.send(:itself)
+            a = a + "!"
+            o.send(:raiser)
+          rescue RuntimeError
+          ensure
+            r = [a.size, b.size, b[0].size]
+          end
+          r
+        end
+        o = Object.new
+        3.times { test(o, 3) }
+        GC.stress = true
+        out = 3.times.map { |i| test(o, i + 1) }
+        GC.stress = false
+        GC.start
+        out
+    "#), @"[[2, 1, 1], [3, 1, 2], [4, 1, 3]]");
+}
