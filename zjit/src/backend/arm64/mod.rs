@@ -198,8 +198,14 @@ pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[];
 const SCRATCH0_OPND: Opnd = Opnd::Reg(X15_REG);
 const SCRATCH1_OPND: Opnd = Opnd::Reg(X17_REG);
 
-/// A scratch register available for use by resolve_ssa to break register copy cycles.
-/// Must not overlap with ALLOC_REGS or other preserved registers.
+/// A scratch register that resolve_ssa()/handle_caller_saved_regs() may park a
+/// value in while they sequentialize a set of parallel copies. It aliases
+/// SCRATCH0_OPND, which arm64_scratch_split also uses, but only *within* the
+/// lowering of a single instruction. Those two lifetimes only coexist safely
+/// while none of the copies being sequentialized needs a scratch register of its
+/// own; Assembler::parcopy_spare() enforces that and falls back to a reserved
+/// stack slot otherwise. Must not overlap with ALLOC_REGS or other preserved
+/// registers.
 pub const SCRATCH_REG: Reg = X15_REG;
 const SCRATCH2_OPND: Opnd = Opnd::Reg(X14_REG);
 
@@ -1704,7 +1710,7 @@ impl Assembler {
             }
             asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
 
-            asm.stack_state.num_spill_slots = num_stack_slots;
+            asm.stack_state.set_spill_slots(num_stack_slots);
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&intervals);
             let stack_slot_count = asm.stack_state.stack_slot_count();
 
