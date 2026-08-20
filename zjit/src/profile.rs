@@ -160,6 +160,10 @@ pub fn num_arguments_on_stack(cd: *const rb_call_data) -> usize {
 
 const DISTRIBUTION_SIZE: usize = 8;
 
+/// How many profile entries to make room for at a time. See
+/// [`IseqProfile::entry_mut`].
+const ENTRY_GROWTH_STEP: usize = 8;
+
 pub type TypeDistribution = Distribution<ProfiledType, DISTRIBUTION_SIZE>;
 
 pub type TypeDistributionSummary = DistributionSummary<ProfiledType, DISTRIBUTION_SIZE>;
@@ -1059,6 +1063,13 @@ impl IseqProfile {
         match self.entries.binary_search_by_key(&idx, |e| e.insn_idx) {
             Ok(i) => &mut self.entries[i],
             Err(i) => {
+                if self.entries.len() == self.entries.capacity() {
+                    // Grow by a fixed step rather than doubling. An ISEQ has a
+                    // bounded number of profiled instructions and these entries
+                    // live as long as the ISEQ, so doubling leaves up to half of
+                    // a long-lived table permanently unused.
+                    self.entries.reserve_exact(ENTRY_GROWTH_STEP);
+                }
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
                     opnd_types: Box::new([]),
