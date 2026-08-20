@@ -91,6 +91,11 @@ pub struct ZJITState {
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
     jit_frame_allocator: Option<JITFrameAllocator>,
+
+    /// Shape tables for ivar accesses that miss their inline guard chain, one
+    /// per ivar name. Owned here because the addresses are baked into JIT code, so
+    /// the `Box`es must never move.
+    ivar_caches: HashMap<ID, Box<crate::ivar_cache::IvarCache>>,
 }
 
 /// Tracks the initialization progress
@@ -172,6 +177,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
+            ivar_caches: HashMap::new(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -218,6 +224,11 @@ impl ZJITState {
     /// Get a mutable reference to the JITFrame allocator
     pub fn get_jit_frame_allocator() -> Option<&'static mut JITFrameAllocator> {
         ZJITState::get_instance().jit_frame_allocator.as_mut()
+    }
+
+    /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
+    pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
+        &mut ZJITState::get_instance().ivar_caches
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {

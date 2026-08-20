@@ -8696,6 +8696,126 @@ fn test_ivar_shape_chain_falls_back_for_too_complex_shapes() {
 }
 
 #[test]
+fn test_ivar_cache_serves_the_shape_chain_fallback_inline() {
+    // Once the table is warm, the shapes the guard chain has no arm for are read
+    // in JIT code with no call: getivar_cache_hit is the inline path.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    eval("OBJS.each { |o| o.read }"); // warm the table
+    let before = crate::state::ZJITState::get_counters().getivar_cache_hit;
+    assert_snapshot!(inspect("OBJS.map { |o| o.read }.sum"), @"190");
+    let after = crate::state::ZJITState::get_counters().getivar_cache_hit;
+    assert!(after > before, "expected the inline ivar table probe to hit, but the counter did not move");
+}
+
+#[test]
+fn test_ivar_cache_serves_absent_ivars_as_nil() {
+    // An absent ivar is cached as such and served inline, which is the whole
+    // reason the probe has a nil arm.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("class ShapeChainBase; def missing = @never_assigned; end");
+    eval("5.times { |i| OBJS[i].missing }");
+    eval("OBJS.each { |o| o.missing }");
+    let before = crate::state::ZJITState::get_counters().getivar_cache_hit;
+    assert_snapshot!(inspect("OBJS.map { |o| o.missing }.uniq"), @"[nil]");
+    let after = crate::state::ZJITState::get_counters().getivar_cache_hit;
+    assert!(after > before, "expected absent ivars to be served by the inline probe");
+}
+
+#[test]
+fn test_ivar_cache_sees_writes_that_transition_the_shape() {
+    // The table is keyed on the whole shape id, so adding the ivar moves the
+    // receiver to a key the table has never seen rather than hitting a stale
+    // "absent" entry.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("class ShapeChainBase; def late = @late; def set_late(v) = @late = v; end");
+    eval("5.times { |i| OBJS[i].late }");
+    eval("OBJS.each { |o| o.late }");
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| o.late }
+        OBJS.each_with_index { |o, i| o.set_late(i) }
+        [before.uniq, OBJS.map { |o| o.late }.sum]
+    "#), @"[[nil], 190]");
+}
+
+#[test]
+fn test_ivar_cache_write_raises_on_a_receiver_frozen_after_warmup() {
+    // Freezing sets a bit inside shape_id, so a frozen receiver misses whatever
+    // entry its unfrozen self warmed, and the write still has to raise.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].write(i) }");
+    eval("OBJS.each_with_index { |o, i| o.write(i) }");
+    assert_snapshot!(inspect(r#"
+        obj = OBJS.last
+        reads = [obj.read]
+        obj.freeze
+        reads << obj.read
+        begin
+          obj.write(99)
+          reads << "no raise"
+        rescue FrozenError
+          reads << "raised"
+        end
+        reads
+    "#), @r#"[19, 19, "raised"]"#);
+}
+
+#[test]
+fn test_ivar_cache_still_reads_after_remove_instance_variable() {
+    // remove_instance_variable transitions the object to a rebuilt shape, so the
+    // entry warmed for the old shape cannot be reached with the new one.
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    eval("OBJS.each { |o| o.read }");
+    assert_snapshot!(inspect(r#"
+        obj = OBJS.last
+        before = obj.read
+        obj.remove_instance_variable(:@config)
+        after = obj.read
+        obj.write(7)
+        [before, after, obj.read]
+    "#), @"[19, nil, 7]");
+}
+
+#[test]
+fn test_ivar_cache_reads_class_and_module_ivars() {
+    // Classes and modules are marked uncacheable and keep going through
+    // rb_ivar_get, which is what enforces their ractor rules.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        module CacheMod; end
+        class CacheCls; end
+        CacheMod.instance_variable_set(:@a, 1)
+        CacheCls.instance_variable_set(:@a, 2)
+        def read(x) = x.instance_variable_get(:@a)
+        5.times { [CacheMod, CacheCls].each { |x| read(x) } }
+        [read(CacheMod), read(CacheCls), read(CacheMod.dup)]
+    "#), @"[1, 2, 1]");
+}
+
+#[test]
+fn test_ivar_cache_reads_survive_gc_stress() {
+    set_call_threshold(6);
+    eval(SHAPE_CHAIN_SETUP);
+    eval("5.times { |i| OBJS[i].read }");
+    eval("OBJS.each { |o| o.read }");
+    assert_snapshot!(inspect(r#"
+        GC.stress = true
+        sums = 2.times.map { OBJS.map { |o| o.read }.sum }
+        GC.stress = false
+        sums
+    "#), @"[190, 190]");
+}
+
+
+#[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
 }
