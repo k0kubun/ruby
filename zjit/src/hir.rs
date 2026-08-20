@@ -2997,6 +2997,19 @@ impl ShapeMiss {
     fn calls_fallback(self) -> bool {
         !matches!(self, ShapeMiss::SideExit)
     }
+
+    /// Whether a shape the profile genuinely predicts may still be guarded with a side exit,
+    /// even though a *chain* miss calls the fallback. Two shape dispatches are predictions the
+    /// profiler can act on: a site with no profile at all (there is nothing to build a chain
+    /// out of until it exits and gets one) and a site whose single profiled shape accounts for
+    /// every receiver the profiler saw. Everything else is a shape-polymorphic site, where an
+    /// exit would only rebuild the same chain out of the same buckets.
+    ///
+    /// `CallFallbackWithoutReprofile` says the profiled shape was never a prediction for this
+    /// program point, so nothing about it is worth an exit.
+    fn speculates_on_predicted_shape(self) -> bool {
+        !matches!(self, ShapeMiss::CallFallbackWithoutReprofile)
+    }
 }
 
 impl CompilePolicy {
@@ -5848,7 +5861,7 @@ impl Function {
                                 let replacement = if branch_on_shape {
                                     let insn_idx = self.frame_state_insn_idx(state) as u32;
                                     let shapes = self.profiled_shape_variants(recv, state, profiled_type);
-                                    let (join_block, result) = self.dispatch_getivar(&shapes, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
+                                    let (join_block, result) = self.dispatch_getivar(&shapes, /* covers_profile */ false, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
                                         .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
                                     block = join_block;
                                     result
@@ -5863,7 +5876,7 @@ impl Function {
                                         Err(Counter::getivar_fallback_no_side_exits) => {
                                             let insn_idx = self.frame_state_insn_idx(state) as u32;
                                             let shapes = self.profiled_shape_variants(recv, state, profiled_type);
-                                            let (join_block, result) = self.dispatch_getivar(&shapes, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
+                                            let (join_block, result) = self.dispatch_getivar(&shapes, /* covers_profile */ false, block, insn_idx, recv, id, std::ptr::null(), state, shape_miss)
                                                 .expect("dispatch_getivar only side-exits without a profiled shape");
                                             block = join_block;
                                             result
@@ -5910,7 +5923,7 @@ impl Function {
                                 match self.prepare_optimized_setivar(id, profiled_type) {
                                     Ok(spec) if shape_miss.calls_fallback() || self.policy.no_side_exits => {
                                         let insn_idx = self.frame_state_insn_idx(state) as u32;
-                                        block = self.dispatch_setivar(&[spec], None, block, insn_idx, recv, id, std::ptr::null(), val, state, shape_miss)
+                                        block = self.dispatch_setivar(&[spec], None, /* covers_profile */ false, block, insn_idx, recv, id, std::ptr::null(), val, state, shape_miss)
                                             .expect("dispatch_setivar with a spec never side-exits unconditionally");
                                     }
                                     Ok(spec) => {
@@ -9373,12 +9386,14 @@ impl Function {
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
+        covers_profile: bool,
         mut block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
         exit_id: InsnId,
         no_profile_reason: SideExitReason,
-        fallback_counter: Counter,
+        no_profile_counter: Counter,
+        chain_miss_counter: Counter,
         has_result: bool,
         shape_miss: ShapeMiss,
         profile_shape: impl Fn(T) -> ShapeId,
@@ -9390,10 +9405,14 @@ impl Function {
             ShapeMiss::SideExit if self.policy.no_side_exits => ShapeMiss::CallFallback,
             shape_miss => shape_miss,
         };
+        // Whether a shape this dispatch predicts may be guarded with an exit. The policy check is
+        // explicit because the conversion above only rewrites `SideExit`; a caller that asks for
+        // `CallFallback` directly still must not exit in the final version of an ISEQ.
+        let speculate = shape_miss.speculates_on_predicted_shape() && !self.policy.no_side_exits;
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
-            if shape_miss.calls_fallback() {
-                self.count(block, fallback_counter);
+            if !speculate {
+                self.count(block, no_profile_counter);
                 if shape_miss == ShapeMiss::CallFallback {
                     self.emit_ivar_reprofile(block, self_param, exit_id);
                 }
@@ -9406,7 +9425,12 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !shape_miss.calls_fallback() {
+        // A monomorphic guard is the one shape guard whose failure is worth an exit: the site has
+        // only ever seen one shape, so a miss means the profile is stale or too narrow, and the
+        // recompile it triggers can widen the site into a shape chain. That only holds if the
+        // profile accounts for every receiver: without `covers_profile` we already know at compile
+        // time that some receivers cannot match, so the guard would exit by construction.
+        if profiles.len() == 1 && covers_profile && speculate {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -9434,7 +9458,9 @@ impl Function {
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
                     let fallback_block = self.new_block(insn_idx);
                     self.push_insn(block, branch(matches, optimized_block, fallback_block));
-                    self.count(fallback_block, fallback_counter);
+                    // A receiver that misses every arm of a shape chain gets its own counter: it
+                    // is a different event from having no profile to dispatch on at all.
+                    self.count(fallback_block, chain_miss_counter);
                     if shape_miss == ShapeMiss::CallFallback {
                         self.emit_ivar_reprofile(fallback_block, self_param, exit_id);
                     }
@@ -9465,6 +9491,7 @@ impl Function {
     fn dispatch_getivar(
         &mut self,
         profiled_types: &[ProfiledType],
+        covers_profile: bool,
         block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -9475,12 +9502,14 @@ impl Function {
     ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
+            covers_profile,
             block,
             insn_idx,
             self_param,
             exit_id,
             SideExitReason::NoProfileGetIvar,
             Counter::getivar_fallback_no_side_exits,
+            Counter::getivar_fallback_shape_chain_miss,
             true,
             shape_miss,
             |profiled_type| profiled_type.shape(),
@@ -9496,6 +9525,7 @@ impl Function {
         &mut self,
         specs: &[SetIvarSpec],
         unoptimized_reason: Option<Counter>,
+        covers_profile: bool,
         block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -9514,12 +9544,16 @@ impl Function {
         }
         let (block, result) = self.dispatch_ivar(
             specs,
+            // A spec set that dropped a bucket for `unoptimized_reason` cannot account for every
+            // receiver, whatever the profile summary said.
+            covers_profile && unoptimized_reason.is_none(),
             block,
             insn_idx,
             self_param,
             exit_id,
             SideExitReason::NoProfileSetIvar,
             Counter::setivar_fallback_no_side_exits,
+            Counter::setivar_fallback_shape_chain_miss,
             false,
             shape_miss,
             |spec| spec.profiled_type.shape(),
@@ -12453,6 +12487,11 @@ fn add_iseq_to_hir(
                         // Let the fallthrough GetIvar handle these.
                         && !profiled_type.shape().is_complex()
                     }).collect::<Vec<_>>();
+                    // Whether every shape the profile recorded gets an arm. Filtered-out buckets
+                    // and buckets we never saw (megamorphic overflow) both mean some receivers
+                    // reach this site without a matching arm.
+                    let covers_profile = profiled_types.len() == summary.buckets().iter().filter(|t| !t.is_empty()).count()
+                        && !summary.is_megamorphic() && !summary.is_skewed_megamorphic();
                     // We might have two objects of class A and B with the same shape; de-duplicate
                     // profiled types by shape. This is just an optimization to reduce code size.
                     let mut profiled_types_unique_shapes = Vec::with_capacity(profiled_types.len());
@@ -12464,13 +12503,19 @@ fn add_iseq_to_hir(
                     }
                     let Some((new_block, result)) = fun.dispatch_getivar(
                         &profiled_types_unique_shapes,
+                        covers_profile,
                         block,
                         insn_idx,
                         self_param,
                         id,
                         ic,
                         exit_id,
-                        ShapeMiss::SideExit,
+                        // A receiver that misses every arm of a shape chain is not news the
+                        // profiler can act on: the site is already known to be shape-polymorphic,
+                        // so recompiling would rebuild the same chain out of the same buckets and
+                        // exit again on the next miss. Do the access generically instead, and let
+                        // the reprofile weigh the shapes for a later version.
+                        ShapeMiss::CallFallback,
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
@@ -12518,9 +12563,13 @@ fn add_iseq_to_hir(
                     if !specs.is_empty() || unoptimized_reason.is_none() {
                         self_param = fun.guard_heap(block, self_param, exit_id);
                     }
+                    // Megamorphic profiles saw more shapes than there are buckets, so the specs
+                    // cannot account for every receiver that reaches this site.
+                    let covers_profile = !summary.is_megamorphic() && !summary.is_skewed_megamorphic();
                     let Some(new_block) = fun.dispatch_setivar(
                         &specs,
                         unoptimized_reason,
+                        covers_profile,
                         block,
                         insn_idx,
                         self_param,
@@ -12528,7 +12577,10 @@ fn add_iseq_to_hir(
                         ic,
                         val,
                         exit_id,
-                        ShapeMiss::SideExit,
+                        // See the getinstancevariable case: a shape chain that misses does the
+                        // access generically rather than exiting to be recompiled into the same
+                        // chain.
+                        ShapeMiss::CallFallback,
                     ) else {
                         // Side-exiting unconditionally; end the block.
                         break;
