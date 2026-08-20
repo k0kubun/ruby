@@ -5353,7 +5353,7 @@ c_callable! {
 
             // JIT-to-JIT calls don't eagerly fill nils to non-parameter locals.
             // If we side-exit from function_stub_hit (before JIT code runs), we need to set them here.
-            fn prepare_for_exit(iseq: IseqPtr, cfp: CfpPtr, sp: *mut VALUE, argc: u16, num_opts_filled: u16, compile_error: &CompileError) {
+            fn prepare_for_exit(iseq: IseqPtr, cfp: CfpPtr, sp: *mut VALUE, argc: u16, num_opts_filled: u16, compile_error: Option<&CompileError>) {
                 unsafe {
                     // Caller frames are materialized by the materialize_exit trampoline before unwinding native frames.
                     // The current frame's pc and iseq are already set by function_stub_hit before this point.
@@ -5416,8 +5416,10 @@ c_callable! {
                 }
 
                 // Increment a compile error counter for --zjit-stats
-                if get_option!(stats) {
-                    incr_counter_by(exit_counter_for_compile_error(compile_error), 1);
+                if let Some(compile_error) = compile_error {
+                    if get_option!(stats) {
+                        incr_counter_by(exit_counter_for_compile_error(compile_error), 1);
+                    }
                 }
             }
 
@@ -5447,8 +5449,18 @@ c_callable! {
                 // We'll use this Rc again, so increment the ref count decremented by from_raw.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
 
-                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, compile_error);
+                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(compile_error));
                 return ZJITState::get_materialize_exit_trampoline_with_counter().raw_ptr(cb);
+            }
+
+            // A JIT-to-JIT call can reach this stub before the callee has run in
+            // the interpreter. Enter the callee through the interpreter until it
+            // has completed the same profiling window as a normal JIT entry.
+            if payload.versions.is_empty() && !unsafe { rb_zjit_profile_stub_hit(iseq) } {
+                // Preserve the reference owned by the stub when iseq_call is dropped.
+                unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
+                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);
+                return ZJITState::get_materialize_exit_trampoline().raw_ptr(cb);
             }
 
             // Otherwise, attempt to compile the ISEQ. We have to mark_all_executable() beyond this point.
@@ -5462,7 +5474,7 @@ c_callable! {
                 // We'll use this Rc again, so increment the ref count decremented by from_raw.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
 
-                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, &compile_error);
+                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(&compile_error));
                 ZJITState::get_materialize_exit_trampoline_with_counter()
             });
             cb.mark_all_executable();
