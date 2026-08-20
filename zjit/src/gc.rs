@@ -114,6 +114,12 @@ impl GcOffsets {
         self.objects.len()
     }
 
+    /// Bytes the two arrays own on the Rust heap.
+    pub fn heap_size(&self) -> usize {
+        self.offsets.capacity() * size_of::<CodePtr>()
+            + self.objects.capacity() * size_of::<VALUE>()
+    }
+
     /// Catch any future path that writes a baked `VALUE` without telling us, which
     /// would leave the mark phase marking a stale object. Debug builds only: this
     /// reads the code region, which is exactly what marking no longer does.
@@ -196,6 +202,12 @@ impl RootIseqs {
     /// Number of distinct ISEQs the root tables reference.
     pub fn len(&self) -> usize {
         self.iseqs.len()
+    }
+
+    /// Bytes this set owns on the Rust heap.
+    pub fn heap_size(&self) -> usize {
+        self.iseqs.capacity() * size_of::<VALUE>()
+            + crate::mem_stats::hash_table_bytes::<VALUE>(self.seen.capacity())
     }
 }
 
@@ -304,6 +316,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     if payload_ptr.is_null() {
         return;
     }
+    crate::stats::incr_counter!(dead_iseq_payload_count);
 
     // Take ownership of the payload and unhook it from the ISEQ, so the GC
     // callbacks above can no longer reach it while we tear it down. Dropping the
@@ -318,6 +331,8 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     // `Vec` of pointers, not the pointees.
     for version in payload.all_versions() {
         unsafe { (*version.as_ptr()).iseq = null() };
+        // Record what stays behind, or it would vanish from the `mem_*` breakdown.
+        ZJITState::add_dead_iseq_version_bytes(unsafe { version.as_ref() }.total_heap_size());
     }
 
     // Everything the payload owns outright is reachable only through the ISEQ,

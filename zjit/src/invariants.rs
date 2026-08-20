@@ -117,6 +117,45 @@ pub struct Invariants {
 }
 
 impl Invariants {
+    /// Bytes these patch-point tables own on the Rust heap, and the number of
+    /// patch points they hold. Every assumption is stored as a
+    /// `HashMap<Key, HashSet<PatchPoint>>` or a bare `HashSet<PatchPoint>`, so
+    /// both the outer tables and each inner set are counted.
+    pub fn heap_size(&self) -> (usize, usize) {
+        use crate::mem_stats::hash_table_bytes;
+
+        let mut bytes = 0;
+        let mut count = 0;
+
+        macro_rules! account_map {
+            ($map:expr, $key:ty) => {
+                bytes += hash_table_bytes::<($key, HashSet<PatchPoint>)>($map.capacity());
+                for set in $map.values() {
+                    bytes += hash_table_bytes::<PatchPoint>(set.capacity());
+                    count += set.len();
+                }
+            };
+        }
+        macro_rules! account_set {
+            ($set:expr) => {
+                bytes += hash_table_bytes::<PatchPoint>($set.capacity());
+                count += $set.len();
+            };
+        }
+
+        account_map!(self.no_ep_escape_iseq_patch_points, IseqPtr);
+        account_map!(self.bop_patch_points, (RedefinitionFlag, ruby_basic_operators));
+        account_map!(self.cme_patch_points, *const rb_callable_method_entry_t);
+        account_map!(self.constant_state_patch_points, ID);
+        account_map!(self.no_singleton_class_patch_points, VALUE);
+        account_set!(self.no_trace_point_patch_points);
+        account_set!(self.no_newobj_hook_patch_points);
+        account_set!(self.single_ractor_patch_points);
+        account_set!(self.root_box_patch_points);
+
+        (bytes, count)
+    }
+
     /// Update object references in Invariants
     pub fn update_references(&mut self) {
         // Keys are class VALUEs that compaction may have moved.

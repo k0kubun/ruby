@@ -39,6 +39,7 @@ mod exit_meta;
 mod payload;
 mod ivar_cache;
 mod send_cache;
+mod mem_stats;
 mod json;
 mod ttycolors;
 

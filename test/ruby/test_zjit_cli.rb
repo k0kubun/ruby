@@ -437,7 +437,8 @@ class TestZJITCLI < Test::Unit::TestCase
   # Freeing an ISEQ must not leave an `IseqPayload` behind. ZJIT used to create
   # one on the free path for every ISEQ, including the vast majority it had
   # never touched, and never released it: on a Rails app that leak was over half
-  # of `zjit_alloc_bytes`.
+  # of `zjit_alloc_bytes` and it was invisible to the `mem_*` breakdown, which
+  # only walks live ISEQs.
   def test_freed_iseqs_do_not_retain_payloads
     # A high call threshold keeps the churned ISEQs out of the JIT, so nothing
     # pins them and the GC really does free them. Compiled ISEQs stay alive for
@@ -457,11 +458,14 @@ class TestZJITCLI < Test::Unit::TestCase
       small = churn(200)
       large = churn(2000)
 
-      # Each iteration creates and frees several ISEQs. ZJIT's heap usage used to
-      # grow with the iteration count; it may not now.
+      # Each iteration creates and frees several ISEQs. Payload allocations and
+      # the unaccounted residual both used to grow with the iteration count;
+      # neither may now.
+      payload_growth = large[:allocated_iseq_payload_count] - small[:allocated_iseq_payload_count]
       alloc_growth = large[:zjit_alloc_bytes] - small[:zjit_alloc_bytes]
+      unaccounted_growth = large[:mem_unaccounted_bytes] - small[:mem_unaccounted_bytes]
 
-      alloc_growth < 100_000
+      payload_growth < 100 && alloc_growth < 100_000 && unaccounted_growth < 10_000
     RUBY
   end
 

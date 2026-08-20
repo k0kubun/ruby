@@ -215,6 +215,39 @@ pub const MAX_IVAR_REPROFILE_WINDOWS: u8 = 4;
 pub type IseqVersionRef = NonNull<IseqVersion>;
 
 impl IseqVersion {
+    /// Bytes the JIT entry point table in [`IseqStatus::Compiled`] owns. One
+    /// entry per `opt_table` arity a JIT-to-JIT caller may enter through.
+    pub fn jit_entry_heap_size(&self) -> usize {
+        match &self.status {
+            IseqStatus::Compiled(code_ptrs) => code_ptrs.jit_entry_ptrs.capacity() * size_of::<CodePtr>(),
+            _ => 0,
+        }
+    }
+
+    /// Every byte this version owns, including the `IseqVersion` allocation
+    /// itself. Used both by the `mem_*` walker and to account versions that
+    /// outlive their ISEQ (see [`crate::gc::rb_zjit_iseq_free`]).
+    pub fn total_heap_size(&self) -> usize {
+        size_of::<IseqVersion>()
+            + self.gc_offsets.heap_size()
+            + self.jit_entry_heap_size()
+            + self.iseq_call_heap_size()
+    }
+
+    /// Bytes the JIT-to-JIT call bookkeeping of this version owns on the Rust
+    /// heap: the incoming and outgoing edge vectors, plus the `IseqCall`
+    /// allocations themselves. Each `IseqCall` is created by its caller and
+    /// pushed onto that caller's `outgoing`, so counting only `outgoing`
+    /// attributes every allocation exactly once.
+    pub fn iseq_call_heap_size(&self) -> usize {
+        use crate::codegen::IseqCall;
+        // Rc<T> allocates two counters ahead of the value.
+        let rc_bytes = 2 * size_of::<usize>() + size_of::<IseqCall>();
+        self.outgoing.capacity() * size_of::<IseqCallRef>()
+            + self.incoming.capacity() * size_of::<IseqCallRef>()
+            + self.outgoing.len() * rc_bytes
+    }
+
     /// Check if this version was invalidated
     pub fn is_invalidated(&self) -> bool {
         self.status == IseqStatus::Invalidated
@@ -269,6 +302,7 @@ pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
             // We allocate in those cases anyways.
             let new_payload = IseqPayload::new();
             let new_payload = Box::into_raw(Box::new(new_payload));
+            crate::stats::incr_counter!(allocated_iseq_payload_count);
             rb_iseq_set_jit_payload(iseq, new_payload as VoidPtr);
 
             new_payload

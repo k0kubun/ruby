@@ -110,6 +110,13 @@ pub struct ZJITState {
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
 
+    /// Bytes held by `IseqVersion`s whose ISEQ has been freed. They cannot be
+    /// released because `Invariants`' patch points hold raw pointers to them,
+    /// and they are no longer reachable from any live ISEQ, so the `mem_*`
+    /// walker cannot find them. Tracked here instead. See
+    /// [`crate::gc::rb_zjit_iseq_free`].
+    dead_iseq_version_bytes: usize,
+
     /// Bump allocator that serves JITFrame allocations from address space below
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
@@ -222,6 +229,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            dead_iseq_version_bytes: 0,
             jit_frame_allocator: JITFrameAllocator::new(),
             exit_metas: vec![],
             root_iseqs: Default::default(),
@@ -264,6 +272,16 @@ impl ZJITState {
     /// Get a mutable reference to the invariants
     pub fn get_invariants() -> &'static mut Invariants {
         &mut ZJITState::get_instance().invariants
+    }
+
+    /// Record bytes retained by an `IseqVersion` that outlived its ISEQ.
+    pub fn add_dead_iseq_version_bytes(bytes: usize) {
+        ZJITState::get_instance().dead_iseq_version_bytes += bytes;
+    }
+
+    /// Bytes retained by `IseqVersion`s whose ISEQ has been freed.
+    pub fn dead_iseq_version_bytes() -> usize {
+        ZJITState::get_instance().dead_iseq_version_bytes
     }
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
@@ -424,6 +442,27 @@ impl ZJITState {
     /// Return the target for exception entry stub exits
     pub fn get_exception_entry_stub_exit() -> CodePtr {
         ZJITState::get_instance().exception_entry_stub_exit
+    }
+
+    /// Bytes the string-keyed `--zjit-stats` counter tables own on the Rust
+    /// heap. Empty unless `--zjit-stats` is on.
+    pub fn counter_table_heap_size() -> usize {
+        use crate::mem_stats::hash_table_bytes;
+
+        let instance = ZJITState::get_instance();
+        let mut bytes = 0;
+        for table in [
+            &instance.full_frame_cfunc_counter_pointers,
+            &instance.not_annotated_frame_cfunc_counter_pointers,
+            &instance.ccall_counter_pointers,
+            &instance.iseq_calls_count_pointers,
+        ] {
+            bytes += hash_table_bytes::<(String, Box<u64>)>(table.capacity());
+            for (name, _) in table.iter() {
+                bytes += name.capacity() + size_of::<u64>();
+            }
+        }
+        bytes
     }
 
     /// Get a mutable reference to the Perfetto tracer
