@@ -201,7 +201,8 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     } else {
         None
     };
-    profile.splat_lengths.entry(profiler.insn_idx)
+    profile.splat_lengths.get_or_insert_with(Default::default)
+        .entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
 }
 
@@ -249,7 +250,8 @@ fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let cme = unsafe { rb_vm_frame_method_entry(profiler.cfp) };
     let cme_value = VALUE(cme as usize);  // CME is a T_IMEMO, which is a VALUE
 
-    profile.super_cme.entry(profiler.insn_idx)
+    profile.super_cme.get_or_insert_with(Default::default)
+        .entry(profiler.insn_idx)
         .or_insert_with(|| TypeDistribution::new()).observe(ProfiledType::object(cme_value));
 
     unsafe { rb_gc_writebarrier(profiler.iseq.into(), cme_value) };
@@ -446,19 +448,22 @@ pub struct IseqProfile {
     /// Only instructions that have actually been profiled have entries here.
     entries: Vec<ProfileEntry>,
 
-    /// Method entries for `super` calls (stored as VALUE to be GC-safe)
-    super_cme: HashMap<YarvInsnIdx, TypeDistribution>,
+    /// Method entries for `super` calls (stored as VALUE to be GC-safe).
+    /// Boxed because only ISEQs containing `invokesuper` ever use it, and an
+    /// inline `HashMap` costs every payload 48 bytes to hold nothing.
+    super_cme: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
 
-    /// Observed lengths of caller splat arrays for call instructions.
-    splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+    /// Observed lengths of caller splat arrays for call instructions. Boxed for
+    /// the same reason as `super_cme`.
+    splat_lengths: Option<Box<HashMap<YarvInsnIdx, SplatLengthDistribution>>>,
 }
 
 impl IseqProfile {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            super_cme: HashMap::new(),
-            splat_lengths: HashMap::new(),
+            super_cme: None,
+            splat_lengths: None,
         }
     }
 
@@ -496,12 +501,12 @@ impl IseqProfile {
     }
 
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
-        self.splat_lengths.get(&insn_idx)
+        self.splat_lengths.as_ref()?.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
     }
 
     pub fn get_super_method_entry(&self, insn_idx: YarvInsnIdx) -> Option<*const rb_callable_method_entry_t> {
-        let Some(entry) = self.super_cme.get(&insn_idx) else { return None };
+        let Some(entry) = self.super_cme.as_ref()?.get(&insn_idx) else { return None };
         let summary = TypeDistributionSummary::new(entry);
 
         if summary.is_monomorphic() {
@@ -529,10 +534,16 @@ impl IseqProfile {
                 }
             }
         }
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(self.super_cme.capacity());
-        out.bytes += self.super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
-        out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(self.splat_lengths.capacity());
-        out.bytes += self.splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        if let Some(super_cme) = self.super_cme.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, TypeDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, TypeDistribution)>(super_cme.capacity());
+            out.bytes += super_cme.values().map(TypeDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(splat_lengths) = self.splat_lengths.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, SplatLengthDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(splat_lengths.capacity());
+            out.bytes += splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        }
         out
     }
 
@@ -547,7 +558,7 @@ impl IseqProfile {
             }
         }
 
-        for super_cme_values in self.super_cme.values() {
+        for super_cme_values in self.super_cme.iter().flat_map(|map| map.values()) {
             for profiled_type in super_cme_values.each_item() {
                 callback(profiled_type.class)
             }
@@ -566,7 +577,7 @@ impl IseqProfile {
         }
 
         // Update CME references if they move during compaction.
-        for super_cme_values in self.super_cme.values_mut() {
+        for super_cme_values in self.super_cme.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in super_cme_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
