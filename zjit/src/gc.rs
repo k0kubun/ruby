@@ -120,6 +120,13 @@ impl GcOffsets {
             + self.objects.capacity() * size_of::<VALUE>()
     }
 
+    /// Forget every entry. Used when the owning ISEQ is freed: the table is only
+    /// read through the ISEQ, so with the ISEQ gone it is dead weight.
+    pub fn clear(&mut self) {
+        self.offsets = Vec::new();
+        self.objects = Vec::new();
+    }
+
     /// Catch any future path that writes a baked `VALUE` without telling us, which
     /// would leave the mark phase marking a stale object. Debug builds only: this
     /// reads the code region, which is exactly what marking no longer does.
@@ -321,10 +328,15 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
 
     // Clear IseqVersion references. Patch points may hold raw pointers to them, so
     // they have to outlive the ISEQ. They're dropped when the assumption is broken.
-    for version in payload.all_versions() {
-        unsafe { (*version.as_ptr()).iseq = null() };
+    for mut version in payload.all_versions() {
+        let version = unsafe { version.as_mut() };
+        version.iseq = null();
+        // GC offsets are only read by iseq_mark(), which the GC reaches through
+        // the ISEQ. With the ISEQ gone nothing marks this code again, so the
+        // table is dead weight.
+        version.gc_offsets.clear();
         // Record what stays behind, or it would vanish from the `mem_*` breakdown.
-        ZJITState::add_dead_iseq_version_bytes(unsafe { version.as_ref() }.total_heap_size());
+        ZJITState::add_dead_iseq_version_bytes(version.total_heap_size());
     }
 
     // Free the IseqPayload.
