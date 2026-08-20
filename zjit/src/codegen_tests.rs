@@ -7693,6 +7693,100 @@ fn test_expandarray_no_splat() {
 }
 
 #[test]
+fn test_expandarray_nil() {
+    eval("
+        def test
+          a, b, c = nil
+          [a, b, c]
+        end
+        test
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    // The Ragel-generated parsers in the mail and parser gems start with this, so it has to be
+    // compiled without a side exit.
+    assert_snapshot!(assert_compiles("test"), @"[nil, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_scalar() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test 5
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test 5"), @"[5, nil]");
+}
+
+#[test]
+fn test_expandarray_short_array() {
+    eval("
+        def test(o)
+          a, b, c = o
+          [a, b, c]
+        end
+        test [1]
+        test [2]
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    // The array shape guards that the array is long enough, so this exits and recompiles.
+    assert_snapshot!(assert_compiles_allowing_exits("test [1]"), @"[1, nil, nil]");
+}
+
+#[test]
+fn test_expandarray_to_ary() {
+    eval("
+        class Pair
+          def to_ary = [1, 2]
+        end
+        def test(o)
+          a, b, c = o
+          [a, b, c]
+        end
+        test Pair.new
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles_allowing_exits("test Pair.new"), @"[1, 2, nil]");
+}
+
+#[test]
+fn test_expandarray_to_ary_defined_after_compile() {
+    // The nil site is compiled for the scalar shape, which still calls rb_check_array_type() at
+    // run time, so defining NilClass#to_ary afterwards must be honored rather than folded away.
+    assert_snapshot!(inspect("
+        def test
+          a, b, c = nil
+          [a, b, c]
+        end
+        test
+        test
+        test
+        class NilClass
+          def to_ary = [1, 2, 3]
+        end
+        test
+    "), @"[1, 2, 3]");
+}
+
+#[test]
+fn test_expandarray_converges_from_array_to_nil() {
+    // A site profiled as Array that starts seeing nil must recompile rather than exit forever.
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        20.times { test([1, 2]) }
+    ");
+    let exits_before = crate::stats::total_exit_count();
+    assert_snapshot!(inspect("200.times { test(nil) }; test(nil)"), @"[nil, nil]");
+    let exits = crate::stats::total_exit_count() - exits_before;
+    assert!(exits < 100, "expected the site to converge, but it exited {exits} times");
+}
+
+#[test]
 fn test_expandarray_splat() {
     eval("
         def test(o)

@@ -5947,6 +5947,80 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
+    fn test_expandarray_nil_literal() {
+        eval(r#"
+            def test
+              a, b, c = nil
+            end
+        "#);
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:NilClass = Const Value(nil)
+          v3:NilClass = Const Value(nil)
+          v4:NilClass = Const Value(nil)
+          Jump bb3(v1, v2, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:NilClass = Const Value(nil)
+          v9:NilClass = Const Value(nil)
+          v10:NilClass = Const Value(nil)
+          Jump bb3(v7, v8, v9, v10)
+        bb3(v12:BasicObject, v13:NilClass, v14:NilClass, v15:NilClass):
+          v19:NilClass = Const Value(nil)
+          v22:NilClass|Array = CheckArrayType v19
+          v23:NilClass = GuardType v22, NilClass recompile
+          v24:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v19
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_array_literal() {
+        eval(r#"
+            def test
+              a, b = [1, 2]
+            end
+        "#);
+        assert_contains_opcode("test", YARVINSN_expandarray);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:NilClass = Const Value(nil)
+          v3:NilClass = Const Value(nil)
+          Jump bb3(v1, v2, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:NilClass = Const Value(nil)
+          v8:NilClass = Const Value(nil)
+          Jump bb3(v6, v7, v8)
+        bb3(v10:BasicObject, v11:NilClass, v12:NilClass):
+          v16:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v17:ArrayExact = ArrayDup v16
+          v20:ArrayExact = GuardType v17, ArrayExact recompile
+          v21:CInt64 = ArrayLength v20
+          v22:CInt64[2] = Const CInt64(2)
+          v23:CInt64 = GuardGreaterEq v21, v22 recompile
+          v24:CInt64[1] = Const CInt64(1)
+          v25:BasicObject = ArrayAref v20, v24
+          v26:CInt64[0] = Const CInt64(0)
+          v27:BasicObject = ArrayAref v20, v26
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v17
+        ");
+    }
+
+    #[test]
     fn test_expandarray_no_splat() {
         eval(r#"
             def test(o)
@@ -5972,17 +6046,7 @@ pub(crate) mod hir_build_tests {
           v11:NilClass = Const Value(nil)
           Jump bb3(v8, v9, v10, v11)
         bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
-          v22:ArrayExact = GuardType v14, ArrayExact
-          v23:CInt64 = ArrayLength v22
-          v24:CInt64[2] = Const CInt64(2)
-          v25:CInt64 = GuardGreaterEq v23, v24
-          v26:CInt64[1] = Const CInt64(1)
-          v27:BasicObject = ArrayAref v22, v26
-          v28:CInt64[0] = Const CInt64(0)
-          v29:BasicObject = ArrayAref v22, v28
-          PatchPoint NoEPEscape(test)
-          CheckInterrupts
-          Return v14
+          SideExit NoProfileExpandArray recompile
         ");
     }
 
