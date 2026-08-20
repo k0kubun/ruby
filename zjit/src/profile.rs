@@ -158,11 +158,17 @@ pub type SplatLengthDistribution = Distribution<Option<SplatLength>, DISTRIBUTIO
 
 pub type SplatLengthDistributionSummary = DistributionSummary<Option<SplatLength>, DISTRIBUTION_SIZE>;
 
+/// Allocate exactly `n` empty operand type distributions.
+fn new_opnd_types(n: usize) -> Box<[TypeDistribution]> {
+    // vec![elem; n] allocates exactly n elements, unlike Vec::resize().
+    vec![TypeDistribution::new(); n].into_boxed_slice()
+}
+
 /// Profile the Type of top-`n` stack operands
 fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(n, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(n);
     }
 
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate() {
@@ -202,7 +208,7 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
     let obj = profiler.peek_at_self();
     // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
@@ -215,7 +221,7 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
     let obj = profiler.peek_at_block_handler();
     let ty = ProfiledType::object(obj);
@@ -226,7 +232,7 @@ fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
 fn profile_getblockparamproxy(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
-        entry.opnd_types.resize(1, TypeDistribution::new());
+        entry.opnd_types = new_opnd_types(1);
     }
 
     let level = profiler.insn_opnd(1).as_u32();
@@ -403,8 +409,12 @@ impl ProfiledType {
 pub struct ProfileEntry {
     /// YARV instruction index
     insn_idx: u32,
-    /// Type information of YARV instruction operands
-    opnd_types: Vec<TypeDistribution>,
+    /// Type information of YARV instruction operands. A boxed slice rather
+    /// than a `Vec` because it is sized once and never resized: `Vec` would
+    /// round the allocation up to `MIN_NON_ZERO_CAP` (4 elements), which for
+    /// 80-byte distributions wastes up to 240 bytes on every single-operand
+    /// instruction, and would also carry a capacity field we never read.
+    opnd_types: Box<[TypeDistribution]>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
 }
@@ -460,7 +470,7 @@ impl IseqProfile {
             Err(i) => {
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
-                    opnd_types: Vec::new(),
+                    opnd_types: Box::new([]),
                     profiles_remaining: get_option!(num_profiles),
                 });
                 &mut self.entries[i]
@@ -482,7 +492,7 @@ impl IseqProfile {
 
     /// Get profiled operand types for a given instruction index
     pub fn get_operand_types(&self, insn_idx: YarvInsnIdx) -> Option<&[TypeDistribution]> {
-        self.entry(insn_idx).map(|e| e.opnd_types.as_slice()).filter(|s| !s.is_empty())
+        self.entry(insn_idx).map(|e| &*e.opnd_types).filter(|s| !s.is_empty())
     }
 
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
@@ -510,7 +520,7 @@ impl IseqProfile {
         out.entry_slack_bytes = (self.entries.capacity() - self.entries.len()) * size_of::<ProfileEntry>();
         out.entry_count = self.entries.len();
         for entry in &self.entries {
-            out.bytes += entry.opnd_types.capacity() * size_of::<TypeDistribution>();
+            out.bytes += entry.opnd_types.len() * size_of::<TypeDistribution>();
             out.distribution_count += entry.opnd_types.len();
             for distribution in entry.opnd_types.iter() {
                 if distribution.num_buckets_used() <= 1 {
