@@ -1816,7 +1816,9 @@ const JIT_FRAME_OFFSET_FROM_JIT_RETURN: usize = 1;
 ///                                | +-------------------------+ |
 ///                                | |          ...            | | stack_idx for "slot N" in StackState::stack_map_index_for_spill
 ///                num_spill_slots | +-------------------------+ |
-///                                v | allocator spill slot X  | |
+///                                | | allocator spill slot X  | |
+///                                | +-------------------------+ |
+///                                v | parcopy spare slot      | | see StackState::parcopy_spare_slot
 ///                                  +-------------------------+ |
 ///                                ^ | side-exit stack-map     | |
 ///                                | | capture slot 0          | |
@@ -1834,8 +1836,15 @@ pub struct StackState {
     /// The number of stack slots reserved before register allocator spills.
     pub(crate) stack_base_idx: usize,
 
-    /// The number of stack slots needed by register allocator spills.
+    /// The number of stack slots needed by register allocator spills, including
+    /// the [`Self::parcopy_spare_slot`] that follows them.
     pub(crate) num_spill_slots: usize,
+
+    /// Index of a spare stack slot that resolve_ssa() may use to break parallel
+    /// copy cycles whose members live in memory. `None` when the register
+    /// allocator did not spill anything, in which case no copy can touch memory
+    /// and SCRATCH_REG is a safe spare. See `Assembler::parcopy_spare()`.
+    pub(crate) parcopy_spare_slot: Option<usize>,
 
     /// The maximum number of stack slots needed to capture side-exit stack-map
     /// operands that cannot be encoded directly.
@@ -1845,12 +1854,27 @@ pub struct StackState {
 impl StackState {
     /// Initialize an empty stack state.
     fn new() -> Self {
-        StackState { stack_base_idx: 0, num_spill_slots: 0, num_side_exit_stack_map_slots: 0 }
+        StackState { stack_base_idx: 0, num_spill_slots: 0, parcopy_spare_slot: None, num_side_exit_stack_map_slots: 0 }
     }
 
     /// Initialize a stack state with a fixed number of reserved stack slots.
     fn new_with_stack_slots(stack_base_idx: usize) -> Self {
-        StackState { stack_base_idx, num_spill_slots: 0, num_side_exit_stack_map_slots: 0 }
+        StackState { stack_base_idx, num_spill_slots: 0, parcopy_spare_slot: None, num_side_exit_stack_map_slots: 0 }
+    }
+
+    /// Record how many stack slots linear_scan() spilled to, reserving one extra
+    /// slot right after them for resolve_ssa() to break parallel copy cycles
+    /// with. The extra slot is only reserved when something was spilled: without
+    /// spills every block parameter lives in a register, so SCRATCH_REG is a
+    /// safe spare and no stack slot is needed.
+    pub(crate) fn set_spill_slots(&mut self, num_allocator_slots: usize) {
+        if num_allocator_slots == 0 {
+            self.num_spill_slots = 0;
+            self.parcopy_spare_slot = None;
+        } else {
+            self.num_spill_slots = num_allocator_slots + 1;
+            self.parcopy_spare_slot = Some(num_allocator_slots);
+        }
     }
 
     /// Reserve native stack slots for JITFrame storage and stack-allocated operands.
@@ -3060,12 +3084,60 @@ impl Assembler
         roots
     }
 
+    /// Pick the spare location `parcopy::sequentialize_register` may park a value
+    /// in while it breaks a copy cycle. The value stays there across every
+    /// remaining move of the cycle, so the spare has to survive the lowering of
+    /// all of them.
+    ///
+    /// `SCRATCH_REG` is the cheapest spare, but it is also what
+    /// `{arch}_scratch_split` stages values in while lowering a single
+    /// instruction: a memory-to-memory `Mov` becomes
+    /// `Mov SCRATCH_REG, src; Mov dest, SCRATCH_REG`, and a memory destination
+    /// that needs a `MemBase::StackIndirect` base loads that base into
+    /// `SCRATCH_REG` too. Parking a cycle there and then emitting such a move
+    /// silently loses the parked value: `a, b = b, a` with both `a` and `b`
+    /// spilled used to compile to two consecutive `Mov SCRATCH_REG, ...`, so the
+    /// swap degenerated into `b, b = b, a`.
+    ///
+    /// So SCRATCH_REG is only used when no copy in the set can need an
+    /// intra-instruction scratch register, which is exactly when no copy writes
+    /// to memory and no copy reads through a spilled base pointer. Otherwise we
+    /// break cycles through a dedicated stack slot, which no lowering touches.
+    ///
+    /// Any such copy implies the register allocator spilled (a memory
+    /// destination or a `StackIndirect` base can only come from
+    /// `Allocation::Stack`), so `StackState::set_spill_slots` has reserved the
+    /// spare slot by the time we need it.
+    fn parcopy_spare(spare_slot: Option<usize>, copies: &[crate::backend::parcopy::RegisterCopy<Opnd>]) -> Opnd {
+        use crate::backend::current::SCRATCH_REG;
+        use crate::backend::parcopy::RegisterCopy;
+
+        let needs_scratch_reg = |copy: &RegisterCopy<Opnd>| {
+            // A memory destination may be staged in SCRATCH_REG.
+            matches!(copy.destination, Opnd::Mem(_))
+                // A spilled memory base is loaded into SCRATCH_REG.
+                || matches!(copy.source, Opnd::Mem(Mem { base: MemBase::StackIndirect { .. }, .. }))
+        };
+        if !copies.iter().any(needs_scratch_reg) {
+            return Opnd::Reg(SCRATCH_REG);
+        }
+
+        let stack_idx = spare_slot
+            .expect("copies through memory imply spill slots, so a parcopy spare slot is reserved");
+        Opnd::Mem(Mem {
+            base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
+            disp: 0,
+            num_bits: 64,
+        })
+    }
+
     /// Resolve SSA block parameters by inserting sequentialized move instructions
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
     pub fn resolve_ssa(&mut self, intervals: &[Interval], regs: &RegPool) {
         use crate::backend::parcopy;
-        use crate::backend::current::SCRATCH_REG;
+
+        let parcopy_spare_slot = self.stack_state.parcopy_spare_slot;
 
         // Count predecessors for each block
         let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
@@ -3109,7 +3181,7 @@ impl Assembler
                 // parcopy algorithm can detect physical register conflicts.
                 debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                     "parcopy must operate on physical registers, not VRegs");
-                let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+                let sequentialized = parcopy::sequentialize_register(&reg_copies, Self::parcopy_spare(parcopy_spare_slot, &reg_copies));
                 let moves: Vec<Insn> = sequentialized
                     .iter()
                     .map(|copy| match copy.source {
@@ -3189,7 +3261,7 @@ impl Assembler
 
             debug_assert!(copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                 "parcopy must operate on physical locations, not VRegs");
-            let sequentialized = parcopy::sequentialize_register(&copies, Opnd::Reg(SCRATCH_REG));
+            let sequentialized = parcopy::sequentialize_register(&copies, Self::parcopy_spare(parcopy_spare_slot, &copies));
             let moves: Vec<Insn> = sequentialized
                 .iter()
                 .map(|copy| match copy.source {
@@ -3253,6 +3325,8 @@ impl Assembler
     ) {
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, NATIVE_STACK_PTR};
+
+        let parcopy_spare_slot = self.stack_state.parcopy_spare_slot;
 
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
@@ -3423,7 +3497,7 @@ impl Assembler
 
                     debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
                         "parcopy must operate on physical registers, not VRegs");
-                    let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+                    let sequentialized = parcopy::sequentialize_register(&reg_copies, Self::parcopy_spare(parcopy_spare_slot, &reg_copies));
 
                     for copy in sequentialized {
                         new_insns.push(match copy.source {
@@ -5794,6 +5868,60 @@ mod tests {
     }
 
     #[test]
+    fn test_parcopy_spare_prefers_scratch_reg_for_register_copies() {
+        use crate::backend::current::{ALLOC_REGS, SCRATCH_REG};
+        use crate::backend::parcopy::RegisterCopy;
+
+        let reg0 = Opnd::Reg(ALLOC_REGS[0]);
+        let reg1 = Opnd::Reg(ALLOC_REGS[1]);
+        let copies = [
+            RegisterCopy { source: reg0, destination: reg1 },
+            RegisterCopy { source: reg1, destination: reg0 },
+        ];
+        // Nothing writes to memory, so no lowering needs a scratch register and
+        // the cycle can be parked in SCRATCH_REG. The spare slot is not used
+        // even when one is available.
+        assert_eq!(Assembler::parcopy_spare(None, &copies), Opnd::Reg(SCRATCH_REG));
+        assert_eq!(Assembler::parcopy_spare(Some(3), &copies), Opnd::Reg(SCRATCH_REG));
+    }
+
+    #[test]
+    fn test_parcopy_spare_avoids_scratch_reg_for_memory_copies() {
+        use crate::backend::parcopy::RegisterCopy;
+
+        let stack_opnd = |stack_idx| Opnd::Mem(Mem {
+            base: MemBase::Stack { stack_idx, num_bits: 64 },
+            disp: 0,
+            num_bits: 64,
+        });
+        // A spilled swap: both copies write to memory, which {arch}_scratch_split
+        // lowers through SCRATCH_REG. Parking the cycle there would lose it, so
+        // the reserved spare stack slot must be used instead.
+        let copies = [
+            RegisterCopy { source: stack_opnd(0), destination: stack_opnd(1) },
+            RegisterCopy { source: stack_opnd(1), destination: stack_opnd(0) },
+        ];
+        assert_eq!(Assembler::parcopy_spare(Some(2), &copies), stack_opnd(2));
+    }
+
+    #[test]
+    fn test_parcopy_spare_avoids_scratch_reg_for_spilled_memory_base() {
+        use crate::backend::current::ALLOC_REGS;
+        use crate::backend::parcopy::RegisterCopy;
+
+        // Reading through a spilled base pointer loads the base into SCRATCH_REG,
+        // so a cycle cannot be parked there either.
+        let copies = [RegisterCopy {
+            source: Opnd::Mem(Mem { base: MemBase::StackIndirect { stack_idx: 0 }, disp: 8, num_bits: 64 }),
+            destination: Opnd::Reg(ALLOC_REGS[0]),
+        }];
+        assert!(matches!(
+            Assembler::parcopy_spare(Some(1), &copies),
+            Opnd::Mem(Mem { base: MemBase::Stack { stack_idx: 1, .. }, .. })
+        ));
+    }
+
+    #[test]
     fn test_resolve_ssa() {
         let TestFunc { mut asm, b1, b3, .. } = build_func();
 
@@ -5802,7 +5930,8 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs, &[]);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
+        asm.stack_state.set_spill_slots(num_stack_slots);
 
         asm.resolve_ssa(&intervals, &regs);
 
@@ -5847,7 +5976,8 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs, &[]);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
+        asm.stack_state.set_spill_slots(num_stack_slots);
 
         // Entry block b1 has parameters [v0, v1].
         // With 5 registers: v0 -> Reg(0) = regs[0], arrival = C_ARG_OPNDS[0] = regs[0] -> self-move, filtered
@@ -5903,7 +6033,8 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs, &[]);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
+        asm.stack_state.set_spill_slots(num_stack_slots);
 
         asm.resolve_ssa(&intervals, &regs);
 
@@ -5971,7 +6102,8 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs, &[]);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
+        asm.stack_state.set_spill_slots(num_stack_slots);
 
         assert_eq!(asm.basic_blocks.len(), 3);
 
@@ -6077,7 +6209,7 @@ mod tests {
         let mut regs = alloc_reg_pool(num_regs);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
-        asm.stack_state.num_spill_slots = num_stack_slots;
+        asm.stack_state.set_spill_slots(num_stack_slots);
 
         // Stand in for the C calling convention's argument registers. These
         // deliberately overlap the allocatable pool so that arguments clobber
