@@ -1019,6 +1019,11 @@ pub enum Insn {
     StringConcat { strings: Vec<InsnId>, state: InsnId },
     /// Call rb_str_getbyte with known-Fixnum index
     StringGetbyte { string: InsnId, index: InsnId },
+    /// Return the coderange of `string`, scanning the string to compute and cache it when the
+    /// cached value is [`RUBY_ENC_CODERANGE_UNKNOWN`]. `cached` is the coderange bits already
+    /// loaded out of RBASIC flags; only the UNKNOWN case reaches the scan, which is what
+    /// `String#ascii_only?` and friends do, so there is no reason to leave the JIT for it.
+    StringCoderangeOrScan { string: InsnId, cached: InsnId, state: InsnId },
     /// Write the low byte of the Fixnum `value` into `string`'s buffer at the already
     /// bounds-checked C integer `index`, clearing the cached coderange. The string must be
     /// guarded with `guard_string_not_dependant` so that writing in place is possible.
@@ -1065,6 +1070,16 @@ pub enum Insn {
     /// does not have to leave JIT code.
     ArrayArefOrNil { array: InsnId, index: InsnId, length: InsnId },
     ArrayAset { array: InsnId, index: InsnId, val: InsnId },
+    /// Store `val` into `array[index]`, growing `array` when `index` is past the end. Unlike
+    /// [`Insn::ArrayAset`], which needs an index that was already bounds-checked with side-exiting
+    /// guards, this takes the raw (possibly negative, possibly out-of-range) index plus the array
+    /// `length` and calls `rb_ary_store` for out-of-range indices. That matches `Array#[]=`, which
+    /// grows the array instead of raising, so there is no reason to leave the JIT for it. A
+    /// negative index that is still negative after adjustment raises IndexError, which
+    /// `rb_ary_store` does for us.
+    ///
+    /// `array` must already be known unfrozen and unshared, like [`Insn::ArrayAset`].
+    ArrayAsetOrStore { array: InsnId, index: InsnId, length: InsnId, val: InsnId, state: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
     ArrayLength { array: InsnId },
@@ -1488,6 +1503,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*string);
                 $visit_one!(*index);
             }
+            Insn::StringCoderangeOrScan { string, cached, state } => {
+                $visit_one!(*string);
+                $visit_one!(*cached);
+                $visit_one!(*state);
+            }
             Insn::StringSetbyteFixnum { string, index, value } => {
                 $visit_one!(*string);
                 $visit_one!(*index);
@@ -1617,6 +1637,13 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*array);
                 $visit_one!(*index);
                 $visit_one!(*val);
+            }
+            Insn::ArrayAsetOrStore { array, index, length, val, state } => {
+                $visit_one!(*array);
+                $visit_one!(*index);
+                $visit_one!(*length);
+                $visit_one!(*val);
+                $visit_one!(*state);
             }
             Insn::ArrayPop { array, state } => {
                 $visit_one!(*array);
@@ -1771,7 +1798,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. } | Insn::IvarReprofile { .. }
+            | Insn::ArrayAset { .. } | Insn::ArrayAsetOrStore { .. } | Insn::IvarReprofile { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
@@ -1832,6 +1859,9 @@ impl Insn {
             Insn::StringIntern { .. } => effects::Any,
             Insn::StringConcat { .. } => effects::Any,
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
+            // Scanning caches the computed coderange in the string's RBASIC flags, so later loads
+            // of those flags must not be forwarded from ones taken before this instruction.
+            Insn::StringCoderangeOrScan { .. } => effects::Any,
             // Writes both the string contents and the flags (to clear the coderange)
             Insn::StringSetbyteFixnum { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Other),
             Insn::StringAppend { .. } => effects::Any,
@@ -1867,6 +1897,7 @@ impl Insn {
             Insn::ArrayAref { ..  } => effects::Any,
             Insn::ArrayArefOrNil { ..  } => effects::Any,
             Insn::ArrayAset { .. } => effects::Any,
+            Insn::ArrayAsetOrStore { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
             Insn::AdjustBounds { .. } => effects::Empty,
@@ -2163,6 +2194,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::ArrayAset { array, index, val, ..} => {
                 write!(f, "ArrayAset {array}, {index}, {val}")
             }
+            Insn::ArrayAsetOrStore { array, index, length, val, .. } => {
+                write!(f, "ArrayAsetOrStore {array}, {index}, {length}, {val}")
+            }
             Insn::ArrayPop { array, .. } => {
                 write!(f, "ArrayPop {array}")
             }
@@ -2240,6 +2274,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::StringGetbyte { string, index, .. } => {
                 write!(f, "StringGetbyte {string}, {index}")
+            }
+            Insn::StringCoderangeOrScan { string, cached, .. } => {
+                write!(f, "StringCoderangeOrScan {string}, {cached}")
             }
             Insn::StringSetbyteFixnum { string, index, value, .. } => {
                 write!(f, "StringSetbyteFixnum {string}, {index}, {value}")
@@ -4210,7 +4247,7 @@ impl Function {
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
-            | Insn::IvarReprofile { .. }
+            | Insn::IvarReprofile { .. } | Insn::ArrayAsetOrStore { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn.to_usize()]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -4244,6 +4281,7 @@ impl Function {
             Insn::StringIntern { .. } => types::Symbol,
             Insn::StringConcat { .. } => types::StringExact,
             Insn::StringGetbyte { .. } => types::Fixnum,
+            Insn::StringCoderangeOrScan { .. } => types::CInt64,
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
@@ -7589,6 +7627,25 @@ impl Function {
                             _ => insn_id,
                         }
                     },
+                    &Insn::StringCoderangeOrScan { cached, .. } => {
+                        // A known coderange other than UNKNOWN needs no scan.
+                        match self.type_of(cached).cint64_value() {
+                            Some(coderange) if coderange != RUBY_ENC_CODERANGE_UNKNOWN.into() => {
+                                self.make_equal_to(insn_id, cached);
+                                continue;
+                            }
+                            _ => insn_id,
+                        }
+                    },
+                    &Insn::ArrayAsetOrStore { array, index, length, val, .. } => {
+                        match (self.type_of(index).cint64_value(), self.type_of(length).cint64_value()) {
+                            // Statically in range and nonnegative: the store can't grow the array,
+                            // so drop the bounds check and the rb_ary_store fallback.
+                            (Some(index_num), Some(length_num)) if index_num >= 0 && index_num < length_num =>
+                                self.new_insn(Insn::ArrayAset { array, index, val }),
+                            _ => insn_id,
+                        }
+                    },
                     &Insn::GuardGreaterEq { left, right, state, ref reason } => {
                         let left_num = self.type_of(left).cint64_value();
                         let right_num = self.type_of(right).cint64_value();
@@ -8967,6 +9024,11 @@ impl Function {
                 self.assert_subtype(insn_id, array, types::ArrayExact)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
             }
+            Insn::ArrayAsetOrStore { array, index, length, .. } => {
+                self.assert_subtype(insn_id, array, types::ArrayExact)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
+                self.assert_subtype(insn_id, length, types::CInt64)
+            }
             Insn::AdjustBounds { index, length } => {
                 self.assert_subtype(insn_id, index, types::CInt64)?;
                 self.assert_subtype(insn_id, length, types::CInt64)
@@ -9114,6 +9176,10 @@ impl Function {
             Insn::StringGetbyte { string, index } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
+            },
+            Insn::StringCoderangeOrScan { string, cached, .. } => {
+                self.assert_subtype(insn_id, string, types::String)?;
+                self.assert_subtype(insn_id, cached, types::CInt64)
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;

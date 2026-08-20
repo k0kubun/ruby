@@ -5170,6 +5170,30 @@ fn test_string_append_gc_stress() {
 }
 
 #[test]
+fn test_string_ascii_only_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.ascii_only?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    // A string built at runtime has an UNKNOWN coderange until something scans it, so this scans
+    // on a cold path rather than exiting.
+    assert_snapshot!(assert_compiles(r#"[test("abc#{1}"), test("é#{1}")]"#), @"[true, false]");
+}
+
+#[test]
+fn test_string_valid_encoding_p_unknown_coderange() {
+    eval(r#"
+        def test(s) = s.valid_encoding?
+        test("a#{1}")
+        test("a#{1}")
+    "#);
+    assert_snapshot!(assert_compiles(r#"
+        [test("abc#{1}"), test("é#{1}"), test("\xFF#{1}".b.force_encoding(Encoding::UTF_8))]
+    "#), @"[true, true, false]");
+}
+
+#[test]
 fn test_new_hash_nonempty() {
     eval(r#"
         def test
@@ -5696,6 +5720,60 @@ fn test_array_fixnum_aset_out_of_bounds() {
         test(arr)
         arr
     "), @"[1, 2, 3, nil, nil, 7]");
+}
+
+#[test]
+fn test_array_fixnum_aset_grows_array_without_exiting() {
+    eval("
+        def test(arr, n)
+          i = 0
+          while i < n
+            arr[i] = i
+            i += 1
+          end
+          arr
+        end
+        test([], 3)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_aset);
+    assert_snapshot!(assert_compiles("test([], 5)"), @"[0, 1, 2, 3, 4]");
+}
+
+/// The push half of a Ragel-generated parser's state machine.
+#[test]
+fn test_array_fixnum_aset_ragel_push_without_exiting() {
+    eval("
+        def test(n)
+          stack = []
+          top = 0
+          cs = 7
+          i = 0
+          while i < n
+            stack[top] = cs
+            top += 1
+            i += 1
+          end
+          stack
+        end
+        test(3)
+    ");
+    assert_snapshot!(assert_compiles("test(4)"), @"[7, 7, 7, 7]");
+}
+
+#[test]
+fn test_array_fixnum_aset_negative_out_of_bounds() {
+    assert_snapshot!(inspect("
+        def test(arr, idx)
+          arr[idx] = 7
+        end
+        test([1,2,3], -1)
+        test([1,2,3], -1)
+        begin
+          test([1,2,3], -5)
+        rescue IndexError => e
+          e.message
+        end
+    "), @r#""index -5 too small for array; minimum: -3""#);
 }
 
 #[test]
