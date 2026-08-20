@@ -398,6 +398,27 @@ impl ZJITState {
         ZJITState::get_instance().function_stub_hit_trampoline
     }
 
+    /// Bytes the string-keyed `--zjit-stats` counter tables own on the Rust
+    /// heap. Empty unless `--zjit-stats` is on.
+    pub fn counter_table_heap_size() -> usize {
+        use crate::mem_stats::hash_table_bytes;
+
+        let instance = ZJITState::get_instance();
+        let mut bytes = 0;
+        for table in [
+            &instance.full_frame_cfunc_counter_pointers,
+            &instance.not_annotated_frame_cfunc_counter_pointers,
+            &instance.ccall_counter_pointers,
+            &instance.iseq_calls_count_pointers,
+        ] {
+            bytes += hash_table_bytes::<(String, Box<u64>)>(table.capacity());
+            for (name, _) in table.iter() {
+                bytes += name.capacity() + size_of::<u64>();
+            }
+        }
+        bytes
+    }
+
     /// Get a mutable reference to the Perfetto tracer
     pub fn get_tracer() -> Option<&'static mut PerfettoTracer> {
         if !ZJITState::has_instance() { return None; }

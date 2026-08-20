@@ -203,6 +203,12 @@ impl RootIseqs {
     pub fn len(&self) -> usize {
         self.iseqs.len()
     }
+
+    /// Bytes this set owns on the Rust heap.
+    pub fn heap_size(&self) -> usize {
+        self.iseqs.capacity() * size_of::<VALUE>()
+            + crate::mem_stats::hash_table_bytes::<VALUE>(self.seen.capacity())
+    }
 }
 
 /// Note that a root table entry now points at `iseq`. See [`RootIseqs`].
@@ -302,6 +308,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
 
     // TODO(Shopify/ruby#682): Free `IseqPayload`
     let payload = get_or_create_iseq_payload(iseq);
+    crate::stats::incr_counter!(dead_iseq_payload_count);
     for version in payload.versions.iter_mut() {
         unsafe { version.as_mut() }.iseq = null();
     }
