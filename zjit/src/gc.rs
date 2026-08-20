@@ -6,6 +6,7 @@ use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
 use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
 use crate::options::get_option;
+use crate::profile::IseqProfile;
 use crate::stats::{Counter, incr_counter, incr_counter_by};
 use crate::stats::Counter::*;
 
@@ -100,6 +101,13 @@ impl GcOffsets {
         }
         self.offsets.truncate(kept);
         self.objects.truncate(kept);
+    }
+
+    /// Forget every entry. Used when the owning ISEQ is freed: the table is only
+    /// read through the ISEQ, so with the ISEQ gone it is dead weight.
+    pub fn clear(&mut self) {
+        self.offsets = Vec::new();
+        self.objects = Vec::new();
     }
 
     /// Where in the code region the baked objects sit. For tests that care which
@@ -306,12 +314,25 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
         return;
     }
 
-    // TODO(Shopify/ruby#682): Free `IseqPayload`
+    // TODO(Shopify/ruby#682): Free the `IseqPayload` allocation itself. The
+    // `IseqVersion`s it points at have to outlive the ISEQ because
+    // `Invariants`' patch points hold raw pointers to them, so for now we keep
+    // the payload and release everything inside it that is provably dead.
     let payload = get_or_create_iseq_payload(iseq);
     crate::stats::incr_counter!(dead_iseq_payload_count);
     for version in payload.versions.iter_mut() {
-        unsafe { version.as_mut() }.iseq = null();
+        let version = unsafe { version.as_mut() };
+        version.iseq = null();
+        // GC offsets are only read by iseq_mark(), which the GC reaches through
+        // the ISEQ. With the ISEQ gone nothing marks this code again, so the
+        // table is dead weight.
+        version.gc_offsets.clear();
     }
+    payload.versions.shrink_to_fit();
+    // Profiles are only read while building HIR for this ISEQ or for a caller
+    // that inlines it. Neither can happen again: the ISEQ is unreachable, so it
+    // can neither be called nor be the target of a send in newly compiled code.
+    payload.profile = IseqProfile::new();
 
     let invariants = ZJITState::get_invariants();
     invariants.forget_iseq(iseq);
