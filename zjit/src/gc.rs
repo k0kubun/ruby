@@ -3,8 +3,7 @@
 use std::ptr::null;
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
-use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
-use crate::profile::IseqProfile;
+use crate::payload::{IseqPayload, IseqVersionRef, get_iseq_payload_ptr};
 use crate::stats::Counter::gc_time_ns;
 
 /// GC callback for marking GC objects in the per-ISEQ payload.
@@ -52,12 +51,25 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
         return;
     }
 
-    // TODO(Shopify/ruby#682): Free the `IseqPayload` allocation itself. The
-    // `IseqVersion`s it points at have to outlive the ISEQ because
-    // `Invariants`' patch points hold raw pointers to them, so for now we keep
-    // the payload and release everything inside it that is provably dead.
-    let payload = get_or_create_iseq_payload(iseq);
+    ZJITState::get_invariants().forget_iseq(iseq);
+
+    // Do *not* create a payload here. Most ISEQs a process frees were never hot
+    // enough for ZJIT to touch, and allocating a payload for one on its way out
+    // used to retain `size_of::<IseqPayload>()` forever for nothing. On a Rails
+    // app that was the single largest ZJIT heap consumer.
+    let payload_ptr = get_iseq_payload_ptr(iseq);
+    if payload_ptr.is_null() {
+        return;
+    }
     crate::stats::incr_counter!(dead_iseq_payload_count);
+
+    // Take ownership of the payload and unhook it from the ISEQ, so the GC
+    // callbacks above can no longer reach it while we tear it down. Dropping the
+    // `Box` at the end of this function frees the `IseqPayload` allocation, the
+    // profile, the exception entry table and the version vectors' buffers.
+    let mut payload = unsafe { Box::from_raw(payload_ptr) };
+    unsafe { rb_iseq_set_zjit_payload(iseq, std::ptr::null_mut()) };
+
     for version in payload.all_versions_mut() {
         let version = unsafe { version.as_mut() };
         version.iseq = null();
@@ -65,25 +77,26 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
         // the ISEQ. With the ISEQ gone nothing marks this code again, so the
         // table is dead weight.
         version.gc_offsets = Vec::new();
+        // The `IseqVersion` allocation itself has to outlive the ISEQ: patch
+        // points in `Invariants` hold raw pointers to it and are only dropped
+        // when the assumption they guard is broken. Dropping the payload below
+        // frees the `Vec` of pointers, not the pointees, so record what stays
+        // behind or it would vanish from the `mem_*` breakdown.
+        ZJITState::add_dead_iseq_version_bytes(version.total_heap_size());
     }
-    payload.versions.shrink_to_fit();
-    payload.exception_versions.shrink_to_fit();
-    payload.exception_entries.shrink_to_fit();
-    // Profiles are only read while building HIR for this ISEQ or for a caller
-    // that inlines it. Neither can happen again: the ISEQ is unreachable, so it
-    // can neither be called nor be the target of a send in newly compiled code.
+
+    // Everything the payload owns outright is reachable only through the ISEQ,
+    // which is gone: the profile is only read while building HIR for this ISEQ
+    // or for a caller that inlines it (the ISEQ can no longer be called nor be
+    // the target of a send in newly compiled code), and the exception entry
+    // table is only reached through `body->jit_exception`.
     //
-    // The re-profiling paths added on top of this (`rb_zjit_ivar_reprofile`)
-    // cannot resurrect it either: they reach a profile only through
+    // The re-profiling paths (`rb_zjit_ivar_reprofile`) cannot resurrect the
+    // profile either: they reach one only through
     // `get_or_create_iseq_payload(frame_iseq)` of a *running* frame's ISEQ,
     // which is by definition alive, and they hold no pointer into any
-    // `IseqProfile` across a call. Nothing caches a `&IseqProfile` or a
-    // `TypeDistribution` pointer past the statement that produced it, so
-    // replacing the profile here cannot dangle.
-    payload.profile = IseqProfile::new();
-
-    let invariants = ZJITState::get_invariants();
-    invariants.forget_iseq(iseq);
+    // `IseqProfile` across a call.
+    drop(payload);
 }
 
 /// GC callback for finalizing a CME

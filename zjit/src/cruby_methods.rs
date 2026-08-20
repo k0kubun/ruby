@@ -27,6 +27,17 @@ pub struct Annotations {
     builtin_funcs: HashMap<*mut c_void, FnProperties>,
 }
 
+impl Annotations {
+    /// Bytes these tables own on the Rust heap. Built once at boot and never
+    /// mutated, so this is a constant, but the `mem_*` breakdown has to include
+    /// it to add up to `zjit_alloc_bytes`.
+    pub fn heap_size(&self) -> usize {
+        use crate::mem_stats::hash_table_bytes;
+        hash_table_bytes::<(*mut c_void, FnProperties)>(self.cfuncs.capacity())
+            + hash_table_bytes::<(*mut c_void, FnProperties)>(self.builtin_funcs.capacity())
+    }
+}
+
 /// Runtime behaviors of C functions that implement a Ruby method
 #[derive(Clone, Copy)]
 pub struct FnProperties {

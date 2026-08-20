@@ -84,6 +84,13 @@ pub struct ZJITState {
 
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
+
+    /// Bytes held by `IseqVersion`s whose ISEQ has been freed. They cannot be
+    /// released because `Invariants`' patch points hold raw pointers to them,
+    /// and they are no longer reachable from any live ISEQ, so the `mem_*`
+    /// walker cannot find them. Tracked here instead. See
+    /// [`crate::gc::rb_zjit_iseq_free`].
+    dead_iseq_version_bytes: usize,
 }
 
 /// Tracks the initialization progress
@@ -168,6 +175,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            dead_iseq_version_bytes: 0,
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -222,6 +230,16 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Record bytes retained by an `IseqVersion` that outlived its ISEQ.
+    pub fn add_dead_iseq_version_bytes(bytes: usize) {
+        ZJITState::get_instance().dead_iseq_version_bytes += bytes;
+    }
+
+    /// Bytes retained by `IseqVersion`s whose ISEQ has been freed.
+    pub fn dead_iseq_version_bytes() -> usize {
+        ZJITState::get_instance().dead_iseq_version_bytes
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
