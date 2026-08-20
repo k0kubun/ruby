@@ -10086,6 +10086,20 @@ fn test_send_can_call_private_method() {
 }
 
 #[test]
+fn test_send_with_profiled_method_name_side_exits_from_inlined_builtin() {
+    // `__send__` drops the method-name argument for the frame it sets up, but a guard inside
+    // an inlined builtin body side-exits back to the `__send__` instruction itself, so it has
+    // to restore the stack with the name still on it. String#ascii_only? is inlined down to a
+    // cached-coderange read that exits when the coderange is unknown, which is exactly what
+    // `delete_suffix!` leaves behind.
+    eval(r#"
+        def entry(str, name) = str.__send__(name)
+        5.times { entry("ascii", :ascii_only?) }
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits(r#"entry("hello\u{3053}".dup.tap { |s| s.delete_suffix!("\u{3053}") }, :ascii_only?)"#), @"true");
+}
+
+#[test]
 fn test_send_with_unprofiled_method_name_falls_back() {
     // The dispatch chain only covers the names seen while profiling; anything else has to
     // reach the generic send in the fall-through arm and still produce the right answer.

@@ -5423,14 +5423,19 @@ impl Function {
 
     /// Try trivially inlining the method. If we can't, emit a SendDirect instruction instead and
     /// leave it to the general-purpose inliner to handle.
-    fn try_inline_send_direct(&mut self, block: BlockId, insn: Insn) -> InsnId {
+    /// `guard_state` is the interpreter's own state at the call site, which is what an inlined
+    /// body's guards must side-exit to. It differs from `data.state` -- the state that describes
+    /// the callee frame -- whenever the caller's stack was rewritten for the frame setup: a
+    /// stripped nil block arg, an expanded splat, or a `send`/`__send__` name argument dropped by
+    /// the [`Self::send_mid_overrides`] rewrite. Inlining pushes no frame, so a side exit there
+    /// re-runs the original call instruction and needs the original stack.
+    fn try_inline_send_direct(&mut self, block: BlockId, insn: Insn, guard_state: InsnId) -> InsnId {
         let Insn::SendDirect(data) = &insn else {
             panic!("try_inline_send_direct called with non-SendDirect instruction");
         };
         let recv = data.recv;
         let iseq = data.iseq;
         let cd = data.cd;
-        let state = data.state;
         let args = &data.args;
         // The trivial inliner runs first to handle simple cases (constant returns,
         // parameter returns, etc.) without frame push/pop overhead. The general
@@ -5463,7 +5468,7 @@ impl Function {
                     bf,
                     recv,
                     args: vec![recv],
-                    state,
+                    state: guard_state,
                     leaf: true,
                     return_type,
                 })
@@ -5723,7 +5728,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block })));
+                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block })), state);
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_BMETHOD {
                             let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
@@ -5763,7 +5768,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None })));
+                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None })), state);
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_IVAR && args.is_empty() {
                             // Check if we're accessing ivars of a Class or Module object as they require single-ractor mode.
@@ -6369,7 +6374,7 @@ impl Function {
                                 jit_entry_idx,
                                 state: send_state,
                                 block: None,
-                            })));
+                            })), state);
                             self.make_equal_to(insn_id, replacement);
 
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
