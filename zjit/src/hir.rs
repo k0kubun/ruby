@@ -6384,13 +6384,26 @@ impl Function {
             }
         }
 
+        // initial value map for each block
+        let mut value_maps = vec![ValueMap::new(); self.blocks.len()];
+
         println!("before value_numbering");
         self.dump_hir();
 
         // iterate through all the blocks
+        let dominators = Dominators::new(self);
         for block in self.reverse_post_order() {
-            // value map
-            let mut current_map = ValueMap::new();
+            // Copy the value map from the immediate dominator block
+            let idom = dominators.idom(block);
+            let parent_map: Option<ValueMap> = if idom != IDOM_NONE && idom != block {
+                Some(value_maps.get(dominators.idom(block).to_usize()).unwrap().clone())
+            } else {
+                None
+            };
+            let current_map: &mut ValueMap = value_maps.get_mut(block.to_usize()).unwrap();
+            if let Some(parent_map) = parent_map {
+                current_map.map.extend(parent_map.map);
+            }
 
             // visit all instructions of this block
             self.blocks[block.to_usize()].insns.retain(|&insn_id| {
@@ -7290,8 +7303,9 @@ impl Function {
             run_pass!(convert_no_profile_sends);
             run_pass!(optimize_load_store);
             run_pass!(canonicalize);
-            run_pass!(value_numbering);
             run_pass!(fold_constants);
+            run_pass!(remove_trivial_block_params);
+            run_pass!(value_numbering);
             run_pass!(clean_cfg);
             run_pass!(remove_redundant_patch_points);
             run_pass!(remove_duplicate_check_interrupts);
