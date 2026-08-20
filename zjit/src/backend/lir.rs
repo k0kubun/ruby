@@ -5,7 +5,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
+use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -250,11 +250,32 @@ pub use crate::backend::current::{
     mem_base_reg,
     Reg,
     EC, CFP, SP,
-    NATIVE_BASE_PTR,
+    NATIVE_BASE_PTR, NATIVE_STACK_PTR,
     C_ARG_OPNDS, C_RET_OPND,
 };
 
 pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC];
+
+/// Where the C calling convention passes an argument.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CArgLocation {
+    /// In one of the argument registers.
+    Reg(Opnd),
+    /// In the stack slot that the caller reserves at the bottom of its frame.
+    /// The slot address depends on the reader: the caller writes it relative
+    /// to the native SP at the call, and the callee reads it from above its
+    /// return address and saved frame pointer.
+    StackSlot(usize),
+}
+
+/// Return where the C calling convention passes argument `idx`.
+pub fn c_arg_location(idx: usize) -> CArgLocation {
+    if idx < C_ARG_OPNDS.len() {
+        CArgLocation::Reg(C_ARG_OPNDS[idx])
+    } else {
+        CArgLocation::StackSlot(idx - C_ARG_OPNDS.len())
+    }
+}
 
 // Memory operand base
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Ord, PartialOrd)]
@@ -1644,7 +1665,10 @@ const JIT_FRAME_OFFSET_FROM_JIT_RETURN: usize = 1;
 ///                                | +-------------------------+ |
 ///                                | |          ...            | | JITState::jit_frame_size
 ///                 stack_base_idx | +-------------------------+ |
-///                                | | JITFrame slot depth X   | v
+///                                | | JITFrame slot depth X   | |
+///                                | +-------------------------+ |
+///                                | | saved SP (stack map     | | <-- one per function, not per depth.
+///                                | | anchor, base_ptr)       | v     see base_ptr_slot_offset()
 ///                                | +-------------------------+
 ///                                | | opnds.last()            | ^
 ///                                | +-------------------------+ |
@@ -1771,13 +1795,52 @@ impl StackMap {
     }
 }
 
-/// Entry in a JITFrame stack map.
+/// Entry in a JITFrame stack map. These are opcodes for zjit_materialize_frames(),
+/// which walks them in order moving a write cursor down the VM stack.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StackMapEntry {
     /// Immediate Ruby VALUE or VReg to materialize.
     Opnd(Opnd),
     /// Number of VM stack slots to skip when materializing across inlined frames.
     Skip(usize),
+    /// Anchor the write cursor on the SP register saved on the native stack
+    /// at `cfp->jit_return[-slot_index]`, plus `stack_size` VM slots. Emitted as
+    /// the first entry by gen_prepare_non_leaf_call(); see zjit.h.
+    BasePtr { slot_index: u32, stack_size: u32 },
+}
+
+/// The base_ptr payload splits in two above the tag byte, so the slot index has
+/// to occupy exactly the bits between the tag and the stack size field.
+const _: () = assert!(
+    ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK as u64
+        == (1u64 << (ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT - ZJIT_STACK_MAP_SHIFT)) - 1,
+    "BASE_PTR index mask must cover the bits between the tag byte and the stack size field",
+);
+
+/// The stack size field runs from its shift to the top of the VALUE, so a u32
+/// always fits and StackMapEntry::BasePtr needs no runtime check for it.
+const _: () = assert!(
+    ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT + u32::BITS <= usize::BITS,
+    "BASE_PTR stack size field must be at least 32 bits wide",
+);
+
+impl StackMapEntry {
+    /// Encode a [`StackMapEntry::BasePtr`] into its tagged VALUE form.
+    /// `stack_size` is bound by [`CompileError::IseqStackTooLarge`]
+    /// `slot_index` by the max inline iteration.
+    // TODO(alan): bounds check max inline iteration as it's user-controlled.
+    fn encode_base_ptr(slot_index: u32, stack_size: u32) -> VALUE {
+        const INDEX_BITS: u32 = ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT - ZJIT_STACK_MAP_SHIFT;
+        assert!(
+            slot_index <= ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK,
+            "StackMap base_ptr slot index {slot_index} does not fit in {INDEX_BITS} bits",
+        );
+        let encoded = ((stack_size as usize) << ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT)
+            | ((slot_index as usize) << ZJIT_STACK_MAP_SHIFT)
+            | ZJIT_STACK_MAP_BASE_PTR_TAG as usize;
+        debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap base_ptr should not look like an immediate VALUE");
+        VALUE(encoded)
+    }
 }
 
 /// Initial capacity for asm.insns vector
@@ -2573,33 +2636,22 @@ impl Assembler
             if self.basic_blocks[block_id.0].is_dummy() { continue; }
             let params = self.basic_blocks[block_id.0].parameters.clone();
 
-            // JIT-to-JIT entries that would need more argument registers should
-            // be unreachable because can_direct_send() refuses to call them.
-            // Keep compiling the function body, but make the unsupported entry
-            // abort if control ever reaches it. TODO: Remove this (Shopify/ruby#916)
-            if params.len() > C_ARG_OPNDS.len() {
-                let insert_pos = self.basic_blocks[block_id.0].insns.iter()
-                    .position(|insn| matches!(insn, Insn::FrameSetup { .. }))
-                    .or_else(|| self.basic_blocks[block_id.0].insns.iter().position(|insn| matches!(insn, Insn::Label(_))).map(|idx| idx + 1))
-                    .unwrap_or(0);
-                self.basic_blocks[block_id.0].insns.insert(insert_pos, Insn::Abort);
-                self.basic_blocks[block_id.0].insn_ids.insert(insert_pos, None);
-                continue;
-            }
-
-            // Rewrite VRegs to physical registers before sequentialization
-            // so the parcopy algorithm can detect physical register conflicts.
-            let reg_copies: Vec<parcopy::RegisterCopy<Opnd>> = params.iter().enumerate()
+            // Rewrite VRegs to physical registers or stack slots before sequentialization
+            // so the parcopy algorithm can detect conflicts between them.
+            let copies: Vec<parcopy::RegisterCopy<Opnd>> = params.iter().enumerate()
                 .map(|(i, param)| parcopy::RegisterCopy::<Opnd> {
-                    source: C_ARG_OPNDS[i],
+                    source: match c_arg_location(i) {
+                        CArgLocation::Reg(reg) => reg,
+                        CArgLocation::StackSlot(slot) => Opnd::mem(64, NATIVE_BASE_PTR, Self::frame_size() + slot as i32 * SIZEOF_VALUE_I32),
+                    },
                     destination: Self::rewritten_opnd(*param, intervals, regs),
                 })
                 .filter(|copy| copy.source != copy.destination)
                 .collect();
 
-            debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
-                "parcopy must operate on physical registers, not VRegs");
-            let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
+            debug_assert!(copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
+                "parcopy must operate on physical locations, not VRegs");
+            let sequentialized = parcopy::sequentialize_register(&copies, Opnd::Reg(SCRATCH_REG));
             let moves: Vec<Insn> = sequentialized
                 .iter()
                 .map(|copy| match copy.source {
@@ -2614,9 +2666,13 @@ impl Assembler
                 })
                 .collect();
 
-            // Find the position after FrameSetup to insert moves
+            // Find the position after FrameSetup to insert moves. They must come
+            // after FrameSetup (not before) because spilled destinations and
+            // stack-passed parameter sources are NATIVE_BASE_PTR-relative, and
+            // NATIVE_BASE_PTR points at the caller's frame until FrameSetup.
             let insert_pos = self.basic_blocks[block_id.0].insns.iter()
                 .position(|insn| matches!(insn, Insn::FrameSetup { .. }))
+                .map(|idx| idx + 1)
                 .or_else(|| self.basic_blocks[block_id.0].insns.iter().position(|insn| matches!(insn, Insn::Label(_))).map(|idx| idx + 1))
                 .unwrap_or(0);
 
@@ -2738,6 +2794,10 @@ impl Assembler
                                     let encoded = (size << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_SKIP_TAG as usize;
                                     debug_assert!(!VALUE(encoded).special_const_p(), "encoded StackMap skip should not look like an immediate VALUE");
                                     VALUE(encoded)
+                                }
+                                StackMapEntry::BasePtr { slot_index, stack_size } => {
+                                    debug_assert_eq!(idx, 0, "base_ptr must be the first StackMap entry so later entries decode from it");
+                                    StackMapEntry::encode_base_ptr(slot_index, stack_size)
                                 }
                                 StackMapEntry::Opnd(Opnd::VReg { idx: vreg, .. }) => {
                                     let vreg_stack_index = match intervals[vreg].assigned.get().expect("StackMap VReg should have an allocation") {
@@ -5139,18 +5199,26 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ssa_entry_params_too_many_abort() {
+    fn test_resolve_ssa_entry_params_beyond_arg_regs_use_stack() {
         let mut asm = Assembler::new();
         let block = asm.new_block(hir::BlockId(0), true, 0);
         asm.set_current_block(block);
         let label = asm.new_label("bb0");
         asm.write_label(label);
 
-        for _ in 0..=C_ARG_OPNDS.len() {
+        let params: Vec<Opnd> = (0..=C_ARG_OPNDS.len()).map(|_| {
             let param = asm.new_vreg(64);
             asm.basic_blocks[block.0].add_parameter(param);
+            param
+        }).collect();
+        // Use every parameter so they are all live and get allocations.
+        let mut acc = params[0];
+        for &param in &params[1..] {
+            let out = asm.new_vreg(64);
+            asm.basic_blocks[block.0].push_insn(Insn::Add { left: acc, right: param, out });
+            acc = out;
         }
-        asm.basic_blocks[block.0].push_insn(Insn::CRet(Opnd::UImm(0)));
+        asm.basic_blocks[block.0].push_insn(Insn::CRet(acc));
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
@@ -5161,7 +5229,16 @@ mod tests {
 
         asm.resolve_ssa(&intervals, &regs);
 
-        assert!(matches!(asm.basic_blocks[block.0].insns[1], Insn::Abort));
+        // The parameter that doesn't fit in argument registers is loaded from
+        // the caller's outgoing-argument area, right above this frame's
+        // return address and saved frame pointer.
+        let insns = &asm.basic_blocks[block.0].insns;
+        assert!(!insns.iter().any(|insn| matches!(insn, Insn::Abort)), "no entry should abort");
+        let expected_src = Opnd::mem(64, NATIVE_BASE_PTR, Assembler::frame_size());
+        assert!(
+            insns.iter().any(|insn| matches!(insn, Insn::Mov { src, .. } if *src == expected_src)),
+            "expected a load from {expected_src:?}, got: {insns:?}"
+        );
     }
 
     fn build_critical_edge() -> (Assembler, Opnd, Opnd, Opnd, Opnd, Opnd, BlockId, BlockId, BlockId) {

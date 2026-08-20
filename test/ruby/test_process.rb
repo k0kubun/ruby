@@ -210,7 +210,8 @@ class TestProcess < Test::Unit::TestCase
     # the ASAN runtime library sets RLIMIT_CORE to 0, "to avoid dumping a 16T+ core file", and
     # that inteferes with this test.
     asan_options = ENV['ASAN_OPTIONS'] || ''
-    asan_options  << ':' unless asan_options.empty?
+    # NOTE: ENV['ASAN_OPTIONS'] returns a frozen String, so append non-destructively.
+    asan_options += ':' unless asan_options.empty?
     env = {
       'ASAN_OPTIONS' => "#{asan_options}disable_coredump=0"
     }
@@ -2746,6 +2747,31 @@ EOS
         puts "OK"
       end
     end;
+  end if Process.respond_to?(:_fork)
+
+  def test__fork_raisig_after_fork
+    assert_in_out_err([], "#{<<~"{#"}\n#{<<~'};'}", [], [/.*: exception during fork in child/, :*])
+    {#
+      module BadForkTracker
+        def _fork
+          pid = super
+          if pid == 0
+            raise "exception during fork in child"
+          end
+          pid
+        end
+      end
+
+      Process.singleton_class.prepend(BadForkTracker)
+
+      begin
+        fork do
+          puts "I'm child #{Process.pid} and I'm exiting"
+        end
+      rescue StandardError
+        puts "#{Process.pid} Received Error, Ignoring"
+      end
+    };
   end if Process.respond_to?(:_fork)
 
   def test_warmup_promote_all_objects_to_oldgen

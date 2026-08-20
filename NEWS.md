@@ -228,6 +228,7 @@ They are still available on rubygems.org and can be installed with
 * irb 1.18.0
   * 1.16.0 to [v1.17.0][irb-v1.17.0], [v1.18.0][irb-v1.18.0]
 * reline 0.7.0
+  * 0.6.3 to [v0.7.0][reline-v0.7.0]
 
 ### RubyGems and Bundler
 
@@ -242,6 +243,12 @@ Ruby 4.0 bundled RubyGems and Bundler version 4. see the following links for det
     * Interix (Windows Services for UNIX)
     * SunOS 4 (Solaris, i.e. SunOS 5, is unaffected)
     * BSD/OS (BSDi)
+
+* Windows 10 1703 or later no longer needs the `LongPathsEnabled` registry
+  value to use paths longer than 260 characters.  This applies to any process
+  running the interpreter, including a program which embeds libruby.  Each path
+  component is still limited to 255 characters, and a child process still
+  starts with the `MAX_PATH` limited current directory. [[Bug #18947]]
 
 ## Compatibility issues
 
@@ -326,6 +333,7 @@ A lot of work has gone into making Ractors more stable, performant, and usable. 
 
 ## JIT
 
+[Bug #18947]: https://bugs.ruby-lang.org/issues/18947
 [Feature #8948]: https://bugs.ruby-lang.org/issues/8948
 [Feature #9779]: https://bugs.ruby-lang.org/issues/9779
 [Feature #15330]: https://bugs.ruby-lang.org/issues/15330
@@ -464,3 +472,4 @@ A lot of work has gone into making Ractors more stable, performant, and usable. 
 [win32ole-v1.9.3]: https://github.com/ruby/win32ole/releases/tag/v1.9.3
 [irb-v1.17.0]: https://github.com/ruby/irb/releases/tag/v1.17.0
 [irb-v1.18.0]: https://github.com/ruby/irb/releases/tag/v1.18.0
+[reline-v0.7.0]: https://github.com/ruby/reline/releases/tag/v0.7.0

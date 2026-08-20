@@ -236,7 +236,10 @@ pub const VM_ENV_DATA_INDEX_FLAGS: u32 = 0;
 pub const VM_BLOCK_HANDLER_NONE: u32 = 0;
 pub const ZJIT_STACK_MAP_VREG_TAG: u32 = 8;
 pub const ZJIT_STACK_MAP_SKIP_TAG: u32 = 16;
+pub const ZJIT_STACK_MAP_BASE_PTR_TAG: u32 = 24;
 pub const ZJIT_STACK_MAP_SHIFT: u32 = 8;
+pub const ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT: u32 = 32;
+pub const ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK: u32 = 16777215;
 pub const ZJIT_JIT_RETURN_C_FRAME: u32 = 1;
 pub const RB_GC_ZJIT_FASTPATH_DATA_WORDS: u32 = 19;
 pub type rb_alloc_func_t = ::std::option::Option<unsafe extern "C" fn(klass: VALUE) -> VALUE>;
@@ -323,7 +326,6 @@ pub const RSTRING_NOEMBED: ruby_rstring_flags = 8192;
 pub const RSTRING_FSTR: ruby_rstring_flags = 536870912;
 pub type ruby_rstring_flags = u32;
 pub type st_data_t = ::std::os::raw::c_ulong;
-pub type st_index_t = st_data_t;
 pub const ST_CONTINUE: st_retval = 0;
 pub const ST_STOP: st_retval = 1;
 pub const ST_DELETE: st_retval = 2;
@@ -2005,6 +2007,8 @@ pub const RCLASS_OFFSET_PRIME_SUPERCLASSES: jit_bindgen_constants = 96;
 pub const RCLASS_OFFSET_PRIME_SUPERCLASS_DEPTH: jit_bindgen_constants = 136;
 pub const TDATA_OFFSET_FIELDS_OBJ: jit_bindgen_constants = 16;
 pub const RUBY_OFFSET_RHASH_IFNONE: jit_bindgen_constants = 16;
+pub const RUBY_OFFSET_RHASH_AR_HINT: jit_bindgen_constants = 24;
+pub const RUBY_OFFSET_RHASH_AR_PAIRS: jit_bindgen_constants = 32;
 pub const RUBY_RHASH_AR_TABLE_MAX_SIZE: jit_bindgen_constants = 8;
 pub const RUBY_OFFSET_RSTRING_LEN: jit_bindgen_constants = 16;
 pub const RB_SHAPE_FLAG_SHIFT: jit_bindgen_constants = 32;
@@ -2139,6 +2143,7 @@ unsafe extern "C" {
     pub fn rb_ary_clear(ary: VALUE) -> VALUE;
     pub fn rb_ary_concat(lhs: VALUE, rhs: VALUE) -> VALUE;
     pub fn rb_hash_new() -> VALUE;
+    pub fn rb_hash_new_capa(capa: ::std::os::raw::c_long) -> VALUE;
     pub fn rb_hash_aref(hash: VALUE, key: VALUE) -> VALUE;
     pub fn rb_hash_aset(hash: VALUE, key: VALUE, val: VALUE) -> VALUE;
     pub fn rb_hash_bulk_insert(argc: ::std::os::raw::c_long, argv: *const VALUE, hash: VALUE);
@@ -2267,7 +2272,6 @@ unsafe extern "C" {
         func: st_foreach_callback_func,
         arg: st_data_t,
     ) -> ::std::os::raw::c_int;
-    pub fn rb_hash_new_with_size(size: st_index_t) -> VALUE;
     pub fn rb_hash_new_with_bulk_insert(argc: ::std::os::raw::c_long, argv: *const VALUE) -> VALUE;
     pub fn rb_hash_resurrect(hash: VALUE) -> VALUE;
     pub fn rb_hash_stlike_lookup(
@@ -2314,12 +2318,23 @@ unsafe extern "C" {
         flags_out: *mut VALUE,
         len_out: *mut ::std::os::raw::c_long,
     ) -> bool;
+    pub fn rb_zjit_array_new_can_fastpath(
+        len: ::std::os::raw::c_long,
+        alloc_size_out: *mut usize,
+        flags_out: *mut VALUE,
+    ) -> bool;
+    pub fn rb_zjit_hash_dup_can_fastpath(
+        hash: VALUE,
+        alloc_size_out: *mut usize,
+        flags_out: *mut VALUE,
+        ifnone_out: *mut VALUE,
+        bound_out: *mut ::std::os::raw::c_long,
+    ) -> bool;
     pub fn rb_zjit_range_new_fastpath(
         exclude_end: bool,
         alloc_size_out: *mut usize,
         flags_out: *mut VALUE,
     );
-    pub fn rb_zjit_array_new_fastpath(alloc_size_out: *mut usize, flags_out: *mut VALUE);
     pub fn rb_profile_frames(
         start: ::std::os::raw::c_int,
         limit: ::std::os::raw::c_int,
@@ -2334,7 +2349,6 @@ unsafe extern "C" {
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
     pub fn rb_vm_base_ptr(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
-    pub fn rb_zjit_constcache_shareable(ice: *const iseq_inline_constant_cache_entry) -> bool;
     pub fn rb_zjit_iseq_insn_set(
         iseq: *const rb_iseq_t,
         insn_idx: ::std::os::raw::c_uint,
@@ -2465,6 +2479,7 @@ unsafe extern "C" {
     pub fn rb_set_cfp_sp(cfp: *mut rb_control_frame_struct, sp: *mut VALUE);
     pub fn rb_jit_shape_complex_p(shape_id: shape_id_t) -> bool;
     pub fn rb_jit_multi_ractor_p() -> bool;
+    pub fn rb_jit_constcache_shareable(ice: *const iseq_inline_constant_cache_entry) -> bool;
     pub fn rb_jit_vm_lock_then_barrier(
         recursive_lock_level: *mut ::std::os::raw::c_uint,
         file: *const ::std::os::raw::c_char,

@@ -276,8 +276,8 @@ vm_ep_in_heap_p_(const rb_execution_context_t *ec, const VALUE *ep)
 int
 rb_vm_ep_in_heap_p(const VALUE *ep)
 {
-    const rb_execution_context_t *ec = GET_EC();
-    if (ec->vm_stack == NULL) return TRUE;
+    const rb_execution_context_t *ec = rb_current_execution_context(false);
+    if (ec == NULL || ec->vm_stack == NULL) return TRUE;
     return vm_ep_in_heap_p_(ec, ep);
 }
 #endif
@@ -483,7 +483,7 @@ rb_yjit_threshold_hit(const rb_iseq_t *iseq, uint64_t entry_calls)
 
     // Record the number of calls at the beginning of the interval
     if (entry_calls + YJIT_CALL_COUNT_INTERV == rb_yjit_call_threshold) {
-        iseq->body->yjit_calls_at_interv = yjit_total_entry_hits;
+        ISEQ_BODY(iseq)->yjit_calls_at_interv = yjit_total_entry_hits;
     }
 
     // Try to estimate the total time taken (total number of calls) to reach 20 calls to this ISEQ
@@ -494,7 +494,7 @@ rb_yjit_threshold_hit(const rb_iseq_t *iseq, uint64_t entry_calls)
             return true;
         }
 
-        uint64_t num_calls = yjit_total_entry_hits - iseq->body->yjit_calls_at_interv;
+        uint64_t num_calls = yjit_total_entry_hits - ISEQ_BODY(iseq)->yjit_calls_at_interv;
 
         // Reject ISEQs that don't get called often enough
         if (num_calls > rb_yjit_cold_threshold) {
@@ -1176,7 +1176,10 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
     // Invalidate JIT code that assumes cfp->ep == vm_base_ptr(cfp).
     // This is done before creating the imemo_env because VM_STACK_ENV_WRITE
     // below leaves the on-stack ep in a state that is unsafe to GC.
-    if (VM_FRAME_RUBYFRAME_P(cfp)) {
+    // Once the enabled JIT has recorded this iseq's escape, the invalidations
+    // are no longer useful and can slow down Ractors.
+    if (VM_FRAME_RUBYFRAME_P(cfp) &&
+        !rbimpl_atomic_load(&ISEQ_BODY(iseq)->jit_ep_escape_recorded, RBIMPL_ATOMIC_RELAXED)) {
         rb_yjit_invalidate_ep_is_bp(iseq);
         rb_zjit_invalidate_no_ep_escape(iseq);
     }
@@ -2983,6 +2986,12 @@ zjit_materialize_frames(const rb_execution_context_t *ec, rb_control_frame_t *cf
                     else if (ZJIT_STACK_MAP_SKIP_P(entry)) {
                         stack -= ZJIT_STACK_MAP_SKIP_SIZE(entry);
                     }
+                    else if (ZJIT_STACK_MAP_BASE_PTR_P(entry)) {
+                        // This has to be the first code to align the write cursor for other entries
+                        RUBY_ASSERT_ALWAYS(0 == i, "base_ptr stack map code only makes sense at 0");
+                        VALUE *base_ptr = (VALUE *)((VALUE *)cfp->jit_return)[-(ssize_t)ZJIT_STACK_MAP_BASE_PTR_SLOT_INDEX(entry)];
+                        stack = base_ptr + ZJIT_STACK_MAP_BASE_PTR_STACK_SIZE(entry);
+                    }
                     else {
                         stack--;
                         *stack = entry;
@@ -3705,7 +3714,7 @@ static VALUE
 vm_default_params(void)
 {
     rb_vm_t *vm = GET_VM();
-    VALUE result = rb_hash_new_with_size(4);
+    VALUE result = rb_hash_new_capa(4);
 #define SET(name) rb_hash_aset(result, ID2SYM(rb_intern(#name)), SIZET2NUM(vm->default_params.name));
     SET(thread_vm_stack_size);
     SET(thread_machine_stack_size);

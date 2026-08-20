@@ -2809,7 +2809,7 @@ vm_caller_setup_arg_kw(rb_control_frame_t *cfp, struct rb_calling_info *calling,
 {
     const VALUE *const passed_keywords = vm_ci_kwarg(ci)->keywords;
     const int kw_len = vm_ci_kwarg(ci)->keyword_len;
-    const VALUE h = rb_hash_new_with_size(kw_len);
+    const VALUE h = rb_hash_new_capa(kw_len);
     VALUE *sp = cfp->sp;
     int i;
 
@@ -3205,9 +3205,9 @@ vm_callee_setup_arg(rb_execution_context_t *ec, struct rb_calling_info *calling,
             VM_ASSERT(cc == calling->cc);
 
             if (vm_call_iseq_optimizable_p(ci, cc)) {
-                if ((iseq->body->builtin_attrs & BUILTIN_ATTR_SINGLE_NOARG_LEAF) && ruby_vm_c_events_enabled == 0) {
-                    VM_ASSERT(iseq->body->builtin_attrs & BUILTIN_ATTR_LEAF);
-                    vm_cc_bf_set(cc, (void *)iseq->body->iseq_encoded[1]);
+                if ((ISEQ_BODY(iseq)->builtin_attrs & BUILTIN_ATTR_SINGLE_NOARG_LEAF) && ruby_vm_c_events_enabled == 0) {
+                    VM_ASSERT(ISEQ_BODY(iseq)->builtin_attrs & BUILTIN_ATTR_LEAF);
+                    vm_cc_bf_set(cc, (void *)ISEQ_BODY(iseq)->iseq_encoded[1]);
                     CC_SET_FASTPATH(cc, vm_call_single_noarg_leaf_builtin, true);
                 }
                 else {
@@ -6554,7 +6554,7 @@ vm_opt_newarray_pack_buffer(rb_execution_context_t *ec, rb_num_t array_len, cons
         int argc = 1;
 
         if (!UNDEF_P(buffer)) {
-            args[1] = rb_hash_new_with_size(1);
+            args[1] = rb_hash_new_capa(1);
             rb_hash_aset(args[1], ID2SYM(idBuffer), buffer);
             kw_splat = RB_PASS_KEYWORDS;
             argc++;

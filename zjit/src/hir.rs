@@ -820,8 +820,6 @@ pub enum SendFallbackReason {
     SuperNotOptimizedMethodType(MethodType),
     /// The `super` call is polymorpic.
     SuperPolymorphic,
-    /// The `super` target call uses a complex argument pattern that the optimizer does not support.
-    SuperTargetComplexArgsPass,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
@@ -884,7 +882,6 @@ impl Display for SendFallbackReason {
             SuperNotOptimizedMethodType(method_type) => write!(f, "super: unsupported target method type {:?}", method_type),
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
-            SuperTargetComplexArgsPass => write!(f, "super: complex argument passing to `super` target call"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             InvokeBlockAutosplatMiss => write!(f, "InvokeBlock: auto-splat expansion miss"),
@@ -2731,13 +2728,10 @@ pub enum ValidationError {
     MiscValidationError(InsnId, String),
 }
 
-/// Check if we can do a direct send to the given iseq with the given args.
-fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq_t, ci: *const rb_callinfo, send_insn: InsnId, args: &[InsnId], has_block: bool) -> bool {
-    let mut can_send = true;
-    let mut count_failure = |counter| {
-        can_send = false;
-        function.count(block, counter);
-    };
+/// Check if we can emit SendDirect to the given ISEQ with the given arguments.
+fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnId], has_block: bool) -> Result<(), SendDirectFailure> {
+    let mut complex_arg_counters = vec![];
+    let mut count_failure = |counter| complex_arg_counters.push(counter);
     let params = unsafe { iseq.params() };
 
     let callee_has_block_param = 0 != params.flags.has_block();
@@ -2759,9 +2753,11 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     if caller_passes_block && 0 == params.flags.use_block()
                                        { count_failure(complex_arg_pass_does_not_use_block) }
 
-    if !can_send {
-        function.set_dynamic_send_reason(send_insn, ComplexArgPass);
-        return false;
+    if !complex_arg_counters.is_empty() {
+        return Err(SendDirectFailure::with_counters(
+            ComplexArgPass,
+            complex_arg_counters,
+        ));
     }
 
     let lead_num = params.lead_num;
@@ -2776,8 +2772,7 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     let caller_positional = match args.len().checked_sub(caller_kw_count) {
         Some(count) => count,
         None => {
-            function.set_dynamic_send_reason(send_insn, ArgcParamMismatch);
-            return false;
+            return Err(SendDirectFailure::new(ArgcParamMismatch));
         }
     };
 
@@ -2789,8 +2784,7 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     let caller_positional_i32 = match c_int::try_from(effective_positional) {
         Ok(argc) => argc,
         Err(_) => {
-            function.set_dynamic_send_reason(send_insn, ArgcParamMismatch);
-            return false;
+            return Err(SendDirectFailure::new(ArgcParamMismatch));
         }
     };
     let min_positional = lead_num + post_num;
@@ -2800,8 +2794,7 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
         (min_positional..=min_positional + opt_num).contains(&caller_positional_i32)
     };
     if !positional_ok {
-        function.set_dynamic_send_reason(send_insn, ArgcParamMismatch);
-        return false
+        return Err(SendDirectFailure::new(ArgcParamMismatch));
     }
 
     // Plain keyword-to-positional-hash is safe to synthesize below. Keep VM
@@ -2810,9 +2803,10 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     if keywords_as_positional_hash
         && (params.flags.accepts_no_kwarg() != 0 || params.flags.ruby2_keywords() != 0)
     {
-        function.count(block, complex_arg_pass_keyword_to_positional_hash);
-        function.set_dynamic_send_reason(send_insn, ComplexArgPass);
-        return false;
+        return Err(SendDirectFailure::with_counters(
+            ComplexArgPass,
+            vec![complex_arg_pass_keyword_to_positional_hash],
+        ));
     }
 
     // After keyword-to-positional-hash, SendDirect receives no keyword slots;
@@ -2823,18 +2817,11 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
         .map(|argc| (kw_req_num..=kw_total_num).contains(argc))
         .unwrap_or(false);
     if !keyword_ok {
-        function.set_dynamic_send_reason(send_insn, ArgcParamMismatch);
-        return false
+        return Err(SendDirectFailure::new(ArgcParamMismatch));
     }
 
-    // asm.ccall() doesn't support 6+ args. Compute the final argc after keyword setup
-    // and rest packing:
+    // Compute the final argc after keyword setup and rest packing:
     // send_argc = packed positional args + callee's total keywords (all kw slots are filled).
-    // c_argc = self + send_argc + synthetic block handler arg.
-    // Right now, the JIT entrypoint accepts the block as an param
-    // We may remove it, remove the block_arg addition to match
-    // See: https://github.com/ruby/ruby/pull/15911#discussion_r2710544982
-    let block_arg = if 0 != params.flags.has_block() { 1 } else { 0 };
     // With *rest, SendDirect receives one rest-array slot instead of each rest
     // element, so cap positional argc at required/post + filled opts + rest slot.
     let passed_opt_num = (caller_positional_i32 - min_positional).min(opt_num) as usize;
@@ -2842,23 +2829,13 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: *const rb_iseq
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
     let send_argc = send_positional_argc + kw_total_num as usize;
-    let c_argc = 1 + send_argc + block_arg; // +1 for self
-
-    // asm.ccall() can only pass C_ARG_OPNDS.len() values in registers. Arguments past that
-    // are written into the callee's local slots on the VM stack instead, which only works
-    // when argument order matches local order.
-    if c_argc > C_ARG_OPNDS.len() && !jit_entry_passes_args_on_stack(iseq, passed_opt_num) {
-        function.set_dynamic_send_reason(send_insn, TooManyArgsForLir);
-        return false;
-    }
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
-        function.set_dynamic_send_reason(send_insn, TooManyArgsForLir);
-        return false;
+        return Err(SendDirectFailure::new(TooManyArgsForLir));
     }
 
-    can_send
+    Ok(())
 }
 
 /// Policy that controls how optimization passes generate code.
@@ -3026,6 +3003,69 @@ struct SendDirectArgs {
     args: Vec<InsnId>,
     kw_bits: u32,
     jit_entry_idx: u16,
+}
+
+/// One SendDirect argument before its HIR value is materialized.
+enum SendDirectArg {
+    /// A HIR value already present in the original Send argument vector.
+    Existing(InsnId),
+    /// A Ruby value to materialize as a Const instruction on the selected path.
+    Constant(VALUE),
+    /// Explicit caller keywords to materialize as one positional Hash.
+    KeywordHash(Vec<SendDirectArg>),
+    /// Values to materialize as the Array passed to a callee rest parameter.
+    RestArray(Vec<SendDirectArg>),
+}
+
+/// Side-effect-free SendDirect argument setup before HIR emission.
+struct SendDirectCall {
+    /// Argument slots in the shape expected by SendDirect.
+    args: Vec<SendDirectArg>,
+    /// Optional keyword slots omitted by the caller.
+    kw_bits: u32,
+    /// Optional positional entry selected from the caller's argument count.
+    jit_entry_idx: u16,
+}
+
+/// Why a SendDirect call could not be built, including feature counters that
+/// should only be recorded when the caller keeps the dynamic fallback.
+struct SendDirectFailure {
+    reason: SendFallbackReason,
+    counters: Vec<Counter>,
+}
+
+/// Call context in which SendDirect argument planning failed.
+enum SendDirectFallbackContext {
+    Send,
+    Super,
+}
+
+impl SendDirectFailure {
+    fn new(reason: SendFallbackReason) -> Self {
+        Self { reason, counters: vec![] }
+    }
+
+    fn with_counters(reason: SendFallbackReason, counters: Vec<Counter>) -> Self {
+        Self { reason, counters }
+    }
+
+    fn record(
+        &self,
+        function: &mut Function,
+        block: BlockId,
+        send_insn: InsnId,
+        context: SendDirectFallbackContext,
+    ) {
+        for &counter in &self.counters {
+            function.count(block, counter);
+        }
+        let context_counter = match context {
+            SendDirectFallbackContext::Send => Counter::send_direct_fallback_context_send,
+            SendDirectFallbackContext::Super => Counter::send_direct_fallback_context_super,
+        };
+        function.count(block, context_counter);
+        function.set_dynamic_send_reason(send_insn, self.reason);
+    }
 }
 
 unsafe extern "C" {
@@ -3295,7 +3335,7 @@ fn gen_send_ancestor_chain(
 }
 
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
-fn block_call_inlinable(flags: u32) -> bool {
+fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
 }
 
@@ -3304,7 +3344,7 @@ fn block_call_inlinable(flags: u32) -> bool {
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
 /// non-local return). Anything else falls back to the generic `invokeblock` dispatch,
 /// with the returned reason attached to the fallback instruction.
-fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
+fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
         return Err(InvokeBlockNotSpecialized);
     }
@@ -3314,12 +3354,6 @@ fn block_call_inlinable_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallb
     }
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
         return Err(InvokeBlockNotSpecialized);
-    }
-    // The JIT-to-JIT call in gen_invoke_block_iseq_direct passes captured self plus
-    // each argument in C argument registers.
-    // TODO: Support passing arguments on the stack in C calls
-    if 1 + argc > C_ARG_OPNDS.len() {
-        return Err(TooManyArgsForLir);
     }
     // `break` out of a directly-invoked block frame does not unwind correctly:
     // vm_throw_start() matches the block owner's `cfp->pc` against the CATCH_TYPE_BREAK
@@ -3374,7 +3408,7 @@ fn autosplat_direct_dispatch_arity(
     block_handler_class: Option<VALUE>,
     argc: usize,
 ) -> Option<usize> {
-    if argc != 1 || !block_call_inlinable(flags) {
+    if argc != 1 || !can_direct_invoke_block(flags) {
         return None;
     }
     // Mirror the priority of the dispatch selection: a literal block of the frame we are
@@ -3388,7 +3422,7 @@ fn autosplat_direct_dispatch_arity(
     });
     for candidate in [inlined_literal, profiled].into_iter().flatten() {
         let Some(splat_num) = block_autosplat_arity(candidate) else { continue };
-        if block_call_inlinable_iseq(candidate, splat_num).is_ok() {
+        if can_direct_invoke_block_iseq(candidate, splat_num).is_ok() {
             return Some(splat_num);
         }
     }
@@ -3530,7 +3564,7 @@ fn inline_block_at_yield(
         return_block: continuation,
         caller: post_yield_caller,
         depth: block_depth,
-        // block_call_inlinable_iseq() checked the block takes the simple callee-setup path,
+        // can_direct_invoke_block_iseq() checked the block takes the simple callee-setup path,
         // so it has no optionals and only one opt-table entry.
         jit_entry_idx: 0,
         blockiseq: None,
@@ -3698,9 +3732,14 @@ impl Function {
         self.load_field(block, captured, FieldName::code_iseq, offset, types::CPtr)
     }
 
-    /// Emit the fast-path `yield` dispatch to a known ISEQ block.
-    /// When `guarded`, the block handler is read from the runtime LEP and guarded (tag + iseq
-    /// identity) because the profiled block can differ per caller. When the enclosing method is
+    /// Untag an ISEQ block handler into its `struct rb_captured_block *`:
+    /// captured = block_handler & ~0x3
+    fn untag_block_handler(&mut self, block: BlockId, block_handler: InsnId) -> InsnId {
+        let untag_mask = self.push_insn(block, Insn::Const { val: Const::CInt64(!0x3) });
+        self.push_insn(block, Insn::IntAnd { left: block_handler, right: untag_mask })
+    }
+
+    /// Dispatch `yield` to a known ISEQ block without guarding tag or ISEQ. When the enclosing method is
     /// inlined and the caller passed a literal block, [`Insn::PushInlineFrame`] wrote that exact
     /// block into this frame's EP from a compile-time constant, so both guards are unnecessary.
     ///
@@ -3719,12 +3758,10 @@ impl Function {
             self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state: guard_state, recompile: Some(Recompile) });
         }
 
-        // captured = block_handler & ~0x3 (struct rb_captured_block *)
-        let untag_mask = self.push_insn(block, Insn::Const { val: Const::CInt64(!0x3) });
-        let captured = self.push_insn(block, Insn::IntAnd { left: block_handler, right: untag_mask });
+        let captured = self.untag_block_handler(block, block_handler);
 
         if guarded {
-            // Guard captured->code.iseq is the comptime block iseq. Compare the raw imemo pointer:
+            // Guard captured->code.iseq is the profiled block iseq. Compare the raw imemo pointer:
             // type inference (from_value) can't type an iseq imemo, so guard it as a CPtr identity.
             let captured_iseq = self.load_captured_code_iseq(block, captured);
             self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::CPtr(block_iseq as *const u8), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state: guard_state, recompile: Some(Recompile) });
@@ -3732,6 +3769,7 @@ impl Function {
 
         self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state })
     }
+
 
     /// Dispatch `yield` without entering the interpreter's send path, joining on the generic
     /// `rb_vm_invokeblock` fallback for anything this can't handle. Each candidate is a branch,
@@ -4534,41 +4572,74 @@ impl Function {
         }
     }
 
-    /// Prepare arguments for a direct send, handling keyword argument reordering,
-    /// default synthesis, and rest parameter packing.
-    /// Returns the arguments to use for the SendDirect instruction,
-    /// or Err with the fallback reason if direct send isn't possible.
-    fn prepare_direct_send_args(
-        &mut self,
-        block: BlockId,
-        args: &[InsnId],
-        ci: *const rb_callinfo,
-        iseq: IseqPtr,
-        state: InsnId,
-        rest_prepacked: bool,
-    ) -> Result<SendDirectArgs, SendFallbackReason> {
-        let (processed_args, caller_argc, kw_bits) = self.setup_keyword_arguments(block, args, ci, iseq, state)?;
-        // try_forward_splat_to_rest already put the rest Array where the callee expects it.
-        let (processed_args, jit_entry_idx) = if rest_prepacked {
-            (processed_args, 0)
+    /// Validate and normalize SendDirect arguments without emitting HIR.
+    ///
+    /// `rest_prepacked` is set when [`Self::try_forward_splat_to_rest`] already put the rest
+    /// Array where the callee expects it, so the repacking below has to be skipped.
+    fn build_send_direct_args(&self, args: &[InsnId], ci: *const rb_callinfo, iseq: IseqPtr, has_block: bool, rest_prepacked: bool) -> Result<SendDirectCall, SendDirectFailure> {
+        can_direct_send(iseq, ci, args, has_block)?;
+        let args = args.iter().copied().map(SendDirectArg::Existing).collect();
+        let (args, kw_bits) = Self::plan_send_direct_keyword_arguments(args, ci, iseq)
+            .map_err(SendDirectFailure::new)?;
+        let (args, jit_entry_idx) = if rest_prepacked {
+            (args, 0)
         } else {
-            self.setup_rest_parameter(block, processed_args, iseq, state)?
+            Self::plan_send_direct_rest_parameter(args, iseq)
+                .map_err(SendDirectFailure::new)?
         };
 
-        // If args were reordered or synthesized, create a new snapshot with the updated stack
-        let send_state = if processed_args != args {
-            let new_state = self.frame_state(state).with_replaced_args(&processed_args, caller_argc);
+        Ok(SendDirectCall {
+            args,
+            kw_bits,
+            jit_entry_idx,
+        })
+    }
+
+    /// Materialize a validated SendDirect call in the selected runtime path.
+    fn emit_send_direct_args(&mut self, block: BlockId, call: SendDirectCall, original_args: &[InsnId], state: InsnId) -> SendDirectArgs {
+        let args: Vec<_> = call
+            .args
+            .into_iter()
+            .map(|arg| self.emit_send_direct_arg(block, arg, state))
+            .collect();
+
+        // If args were reordered or synthesized, create a new snapshot with the updated stack.
+        let send_state = if args != original_args {
+            let new_state = self.frame_state(state).with_replaced_args(&args, original_args.len());
             self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) })
         } else {
             state
         };
 
-        Ok(SendDirectArgs {
+        SendDirectArgs {
             state: send_state,
-            args: processed_args,
-            kw_bits,
-            jit_entry_idx,
-        })
+            args,
+            kw_bits: call.kw_bits,
+            jit_entry_idx: call.jit_entry_idx,
+        }
+    }
+
+    fn emit_send_direct_arg(&mut self, block: BlockId, arg: SendDirectArg, state: InsnId) -> InsnId {
+        match arg {
+            SendDirectArg::Existing(value) => value,
+            SendDirectArg::Constant(value) => {
+                self.push_insn(block, Insn::Const { val: Const::Value(value) })
+            }
+            SendDirectArg::KeywordHash(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|arg| self.emit_send_direct_arg(block, arg, state))
+                    .collect();
+                self.push_insn(block, Insn::NewHash { elements, state })
+            }
+            SendDirectArg::RestArray(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|arg| self.emit_send_direct_arg(block, arg, state))
+                    .collect();
+                self.push_insn(block, Insn::NewArray { elements, state })
+            }
+        }
     }
 
     /// Reorder keyword arguments to match the callee's expected order, and synthesize
@@ -4577,24 +4648,20 @@ impl Function {
     /// The output always contains all of the callee's keyword arguments (required + optional),
     /// so the returned vec may be larger than the input args.
     ///
-    /// Returns Ok with (processed_args, caller_argc, kw_bits) if successful, or Err with the fallback reason if not.
-    /// - caller_argc: number of arguments the caller actually pushed (for stack calculations)
+    /// Returns Ok with (processed_args, kw_bits) if successful, or Err with the fallback reason if not.
     /// - kw_bits: bitmask indicating which optional keywords were NOT provided by the caller
     ///            (used by checkkeyword to determine if non-constant defaults need evaluation)
-    fn setup_keyword_arguments(
-        &mut self,
-        block: BlockId,
-        args: &[InsnId],
+    fn plan_send_direct_keyword_arguments(
+        args: Vec<SendDirectArg>,
         ci: *const rb_callinfo,
         iseq: IseqPtr,
-        state: InsnId,
-    ) -> Result<(Vec<InsnId>, usize, u32), SendFallbackReason> {
+    ) -> Result<(Vec<SendDirectArg>, u32), SendFallbackReason> {
         let kwarg = unsafe { rb_vm_ci_kwarg(ci) };
         let callee_keyword = unsafe { rb_get_iseq_body_param_keyword(iseq) };
         if callee_keyword.is_null() {
             if kwarg.is_null() {
                 // Neither caller nor callee have keywords - nothing to do
-                return Ok((args.to_vec(), args.len(), 0));
+                return Ok((args, 0));
             }
 
             let params = unsafe { iseq.params() };
@@ -4616,18 +4683,17 @@ impl Function {
             // become one final positional Hash before regular parameter setup.
             let caller_kw_count = unsafe { get_cikw_keyword_len(kwarg) } as usize;
             let kw_args_start = args.len() - caller_kw_count;
+            let mut processed_args = args;
+            let keyword_values = processed_args.split_off(kw_args_start);
             let mut elements = Vec::with_capacity(caller_kw_count * 2);
-            for i in 0..caller_kw_count {
+            for (i, value) in keyword_values.into_iter().enumerate() {
                 let keyword = unsafe { get_cikw_keywords_idx(kwarg, i as i32) };
-                let key = self.push_insn(block, Insn::Const { val: Const::Value(keyword) });
-                elements.push(key);
-                elements.push(args[kw_args_start + i]);
+                elements.push(SendDirectArg::Constant(keyword));
+                elements.push(value);
             }
 
-            let hash = self.push_insn(block, Insn::NewHash { elements, state });
-            let mut processed_args = args[..kw_args_start].to_vec();
-            processed_args.push(hash);
-            return Ok((processed_args, args.len(), 0));
+            processed_args.push(SendDirectArg::KeywordHash(elements));
+            return Ok((processed_args, 0));
         }
 
         // kwarg may be null if caller passes no keywords but callee has optional keywords
@@ -4680,10 +4746,16 @@ impl Function {
             }
         }
 
+        // Move caller keyword values out of the positional prefix. Wrap them in
+        // Option so reordering can take each value without cloning it.
+        let mut processed_args = args;
+        let keyword_values = processed_args.split_off(kw_args_start);
+        let mut keyword_values: Vec<_> = keyword_values.into_iter().map(Some).collect();
+
         // Reorder keyword arguments to match callee expectation.
         // Track which optional keywords were not provided via kw_bits.
         let mut kw_bits: u32 = 0;
-        let mut reordered_kw_args: Vec<InsnId> = Vec::with_capacity(callee_kw_count);
+        let mut reordered_kw_args = Vec::with_capacity(callee_kw_count);
         for i in 0..callee_kw_count {
             let expected_id = unsafe { *callee_kw_table.add(i) };
 
@@ -4691,7 +4763,7 @@ impl Function {
             let mut found = false;
             for (j, &caller_id) in caller_kw_order.iter().enumerate() {
                 if caller_id == expected_id {
-                    reordered_kw_args.push(args[kw_args_start + j]);
+                    reordered_kw_args.push(keyword_values[j].take().unwrap());
                     found = true;
                     break;
                 }
@@ -4713,22 +4785,17 @@ impl Function {
                     // Push Qnil as a placeholder; the callee's checkkeyword will detect this
                     // and branch to evaluate the default expression.
                     kw_bits |= 1 << default_idx;
-                    let nil_insn = self.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
-                    reordered_kw_args.push(nil_insn);
+                    reordered_kw_args.push(SendDirectArg::Constant(Qnil));
                 } else {
                     // Constant default value - use it directly
-                    let const_insn = self.push_insn(block, Insn::Const { val: Const::Value(default_value) });
-                    reordered_kw_args.push(const_insn);
+                    reordered_kw_args.push(SendDirectArg::Constant(default_value));
                 }
             }
         }
 
         // Replace the keyword arguments with the reordered ones.
-        // Keep track of the original caller argc for stack calculations.
-        let caller_argc = args.len();
-        let mut processed_args = args[..kw_args_start].to_vec();
         processed_args.extend(reordered_kw_args);
-        Ok((processed_args, caller_argc, kw_bits))
+        Ok((processed_args, kw_bits))
     }
 
     /// Compute the positional optional entry index and pack positional arguments
@@ -4738,20 +4805,17 @@ impl Function {
     /// the callee's *rest array before entering the method body.
     ///
     /// The input args must already have keyword arguments normalized to the callee's
-    /// keyword table order by setup_keyword_arguments. This function only reshapes
+    /// keyword table order by plan_send_direct_keyword_arguments. This function only reshapes
     /// the positional section before those keyword slots.
     ///
     /// Returns Ok with (processed_args, jit_entry_idx) if successful, or Err with
     /// the fallback reason if direct send isn't possible.
     /// - processed_args: arguments to use for SendDirect after optional rest packing
     /// - jit_entry_idx: number of positional optional parameters provided by the caller
-    fn setup_rest_parameter(
-        &mut self,
-        block: BlockId,
-        args: Vec<InsnId>,
+    fn plan_send_direct_rest_parameter(
+        args: Vec<SendDirectArg>,
         iseq: IseqPtr,
-        state: InsnId,
-    ) -> Result<(Vec<InsnId>, u16), SendFallbackReason> {
+    ) -> Result<(Vec<SendDirectArg>, u16), SendFallbackReason> {
         let params = unsafe { iseq.params() };
         let lead_num = params.lead_num as usize;
         let opt_num = params.opt_num as usize;
@@ -4780,18 +4844,11 @@ impl Function {
         // [lead, filled opts, rest array, post, kw...].
         let rest_start = lead_num + passed_opt_num;
         let rest_end = positional_argc - post_num;
-        let (prefix, rest_and_suffix) = args.split_at(rest_start);
-        let (rest_elements, suffix) = rest_and_suffix.split_at(rest_end - rest_start);
-
-        let rest = self.push_insn(block, Insn::NewArray {
-            elements: rest_elements.to_vec(),
-            state,
-        });
-
-        let mut packed_args = Vec::with_capacity(prefix.len() + 1 + suffix.len());
-        packed_args.extend_from_slice(prefix);
-        packed_args.push(rest);
-        packed_args.extend_from_slice(suffix);
+        let mut packed_args = args;
+        let mut rest_elements = packed_args.split_off(rest_start);
+        let suffix = rest_elements.split_off(rest_end - rest_start);
+        packed_args.push(SendDirectArg::RestArray(rest_elements));
+        packed_args.extend(suffix);
 
         Ok((packed_args, jit_entry_idx))
     }
@@ -5644,13 +5701,8 @@ impl Function {
                             // Only specialize positional-positional calls
                             // TODO(max): Handle other kinds of parameter passing
                             let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
-                            if !can_direct_send(self, block, iseq, ci, insn_id, args.as_slice(), has_block) {
-                                self.push_insn_id(block, insn_id); continue;
-                            }
-
-                            // Check if the args are compatible before emitting any assmptions
-                            let Ok(SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx }) = self.prepare_direct_send_args(block, &args, ci, iseq, send_frame_state, rest_prepacked)
-                                .inspect_err(|&reason| self.set_dynamic_send_reason(insn_id, reason)) else {
+                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block, rest_prepacked)
+                                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
@@ -5669,6 +5721,8 @@ impl Function {
                                 self.insn_types[recv.to_usize()] = self.infer_type(recv);
                             }
 
+                            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                                self.emit_send_direct_args(block, call, &args, send_frame_state);
                             let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_BMETHOD {
@@ -5684,13 +5738,8 @@ impl Function {
                             let capture = unsafe { proc_block.as_.captured.as_ref() };
                             let iseq = unsafe { *capture.code.iseq.as_ref() };
 
-                            if !can_direct_send(self, block, iseq, ci, insn_id, args.as_slice(), has_block) {
-                                self.push_insn_id(block, insn_id); continue;
-                            }
-
-                            // Check if the args are compatible before emitting any assmptions
-                            let Ok(SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx }) = self.prepare_direct_send_args(block, &args, ci, iseq, send_frame_state, rest_prepacked)
-                                .inspect_err(|&reason| self.set_dynamic_send_reason(insn_id, reason)) else {
+                            let Ok(call) = self.build_send_direct_args(&args, ci, iseq, has_block, rest_prepacked)
+                                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
@@ -5712,6 +5761,8 @@ impl Function {
                                 recv = self.guard_profiled_type(block, recv, profiled_type, state);
                             }
 
+                            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                                self.emit_send_direct_args(block, call, &args, send_frame_state);
                             let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_IVAR && args.is_empty() {
@@ -6297,21 +6348,16 @@ impl Function {
                             // Check if the super method's parameters support direct send.
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-                            // TODO: pass Option<blockiseq> to can_direct_send when we start specializing `super { ... }`.
-                            if !can_direct_send(self, block, super_iseq, ci, insn_id, args.as_slice(), false) {
-                                self.push_insn_id(block, insn_id);
-                                self.set_dynamic_send_reason(insn_id, SuperTargetComplexArgsPass);
-                                continue;
-                            }
-
-                            // Check if the args are compatible before emitting any assmptions
-                            let Ok(SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx }) = self.prepare_direct_send_args(block, &args, ci, super_iseq, state, false)
-                                .inspect_err(|&reason| self.set_dynamic_send_reason(insn_id, reason)) else {
+                            // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
+                            let Ok(call) = self.build_send_direct_args(&args, ci, super_iseq, false, false)
+                                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
                             emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
 
+                            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                                self.emit_send_direct_args(block, call, &args, state);
                             // Use SendDirect with the super method's CME and ISEQ.
                             let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
                                 recv,
@@ -6472,8 +6518,8 @@ impl Function {
         // Inline callees with required, optional, post-required positional, keyword, and
         // block parameters, including callees that dispatch to a passed block with `yield`.
         // Double-splat (kwrest) and forwardable params stay out of the general
-        // inliner for now. Rest params are already normalized to a packed Array by
-        // prepare_direct_send_args, so the inliner can map that Array to the rest local.
+        // inliner for now. SendDirect argument emission normalizes rest params to a
+        // packed Array, so the inliner can map that Array to the rest local.
         let params = unsafe { callee_iseq.params() };
         if params.flags.forwardable() != 0
             || params.flags.has_kwrest() != 0
@@ -6542,7 +6588,7 @@ impl Function {
         if !iseq_contains_invokeblock(callee_iseq) {
             return false;
         }
-        // `block_call_inlinable_iseq` is what the yield site tests, and it needs the arity the
+        // `can_direct_invoke_block_iseq` is what the yield site tests, and it needs the arity the
         // `yield` passes, which is not known here. Test the block at its own parameter count:
         // that is the arity a matching `yield` passes, and the one a lone yielded Array
         // auto-splats into. A `yield` with some other argument count just doesn't take the
@@ -6551,7 +6597,7 @@ impl Function {
             return false;
         }
         let lead_num = unsafe { rb_get_iseq_body_param_lead_num(blockiseq) } as usize;
-        if block_call_inlinable_iseq(blockiseq, lead_num).is_err() {
+        if can_direct_invoke_block_iseq(blockiseq, lead_num).is_err() {
             return false;
         }
         // A block that can `throw` is the one case where inlining the iterator can cost more
@@ -6723,9 +6769,8 @@ impl Function {
                 // begins when `lead_num + k + post_num + kw_num` arguments are
                 // passed: it runs the default-init code for the remaining
                 // `opt_num - k` optionals (if any) before falling through into the
-                // post-default body. SendDirect emission already guarantees
-                // `prepare_direct_send_args` records the matching `jit_entry_idx`
-                // when it packs the caller args, so do not recover the optional
+                // post-default body. SendDirect argument planning records the matching
+                // `jit_entry_idx` before packing the caller args, so do not recover the optional
                 // positional count from args.len() here.
                 let callee_params = unsafe { iseq.params() };
                 let lead_num = callee_params.lead_num as usize;
@@ -6820,7 +6865,7 @@ impl Function {
                 //     trailing args, but their position in the local table leaves a gap
                 //     of (opt_num - passed_opt_num) above the args' compact layout, so we
                 //     shift the arg index down by that amount. Keyword args follow this
-                //     same arithmetic because `prepare_direct_send_args` already
+                //     same arithmetic because SendDirect argument planning already
                 //     reordered them into callee table order with defaults filled in.
                 //   * the hidden kw_bits storage local (when the callee has keywords) is
                 //     aliased to the SendDirect's compile-time kw_bits value as a fixnum
@@ -9615,19 +9660,6 @@ fn jit_entry_arg_locals(iseq: IseqPtr, passed_opt_num: usize) -> Vec<Option<usiz
     arg_locals
 }
 
-/// Whether a JIT-to-JIT call to this entry may pass arguments that don't fit in the C
-/// argument registers through the callee's local slots on the VM stack.
-///
-/// The caller writes them, the callee entry reads them back, and [`gen_function_stub`]
-/// leaves them alone, all addressing the slot by argument index. That only lines up when
-/// argument order matches local order, i.e. there is no gap for unfilled optionals or for
-/// the keyword bits local in the middle of the parameters.
-pub fn jit_entry_passes_args_on_stack(iseq: IseqPtr, passed_opt_num: usize) -> bool {
-    jit_entry_arg_locals(iseq, passed_opt_num).iter().enumerate()
-        .skip(1) // self has no local slot
-        .all(|(arg_idx, &local_idx)| local_idx == Some(arg_idx - 1))
-}
-
 /// Number of declared keyword parameters on the callee, or zero if the
 /// callee does not accept any keywords.
 fn callee_kw_num(iseq: *const rb_iseq_t) -> usize {
@@ -10700,7 +10732,10 @@ fn add_iseq_to_hir(
                     let ic: *const iseq_inline_constant_cache = get_arg(pc, 0).as_ptr();
                     let idlist: *const ID = unsafe { (*ic).segments };
                     let ice = unsafe { (*ic).entry };
-                    let result = if !ice.is_null() && (unsafe { (*ice).ic_cref }.is_null() && fun.assume_single_ractor_mode(block, exit_id)) {
+                    let can_fold = !ice.is_null()
+                        && unsafe { (*ice).ic_cref }.is_null()
+                        && (unsafe { rb_jit_constcache_shareable(ice) } || fun.assume_single_ractor_mode(block, exit_id));
+                    let result = if can_fold {
                         // Invalidate output code on any constant writes associated with constants
                         // referenced after the PatchPoint.
                         fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist }, state: exit_id });
@@ -11857,14 +11892,13 @@ fn add_iseq_to_hir(
                         autosplat_join = Some((join_block, join_param));
                     }
 
-                    // If the block handler is a known simple ISEQ block with exact arity and no
-                    // non-local exit, push its frame inline instead of calling rb_vm_invokeblock.
+                    // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
                     let mut fallback_reason = InvokeBlockNotSpecialized;
-                    let inline_iseq = if block_call_inlinable(flags) {
+                    let inline_iseq = if can_direct_invoke_block(flags) {
                         block_handler_class.and_then(|obj| {
                             if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                 let iseq = obj.as_iseq();
-                                match block_call_inlinable_iseq(iseq, args.len()) {
+                                match can_direct_invoke_block_iseq(iseq, args.len()) {
                                     Ok(()) => return Some(iseq),
                                     Err(reason) => fallback_reason = reason,
                                 }
@@ -11885,7 +11919,8 @@ fn add_iseq_to_hir(
                     // fallback, which still holds the unexpanded argument.
                     let mut polymorphic_iseqs: Vec<(IseqPtr, Option<usize>)> = vec![];
                     if let Some(summary) = block_handler_summary.as_ref() {
-                        if block_call_inlinable(flags) && (summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
+                        if can_direct_invoke_block(flags)
+                            && (summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
                             for &profiled_type in summary.buckets() {
                                 if profiled_type.is_empty() {
                                     break;
@@ -11896,11 +11931,11 @@ fn add_iseq_to_hir(
                                     if polymorphic_iseqs.iter().any(|&(seen, _)| seen == iseq) {
                                         continue;
                                     }
-                                    if block_call_inlinable_iseq(iseq, args.len()).is_ok() {
+                                    if can_direct_invoke_block_iseq(iseq, args.len()).is_ok() {
                                         polymorphic_iseqs.push((iseq, None));
                                     } else if args.len() == 1 {
                                         if let Some(splat_num) = block_autosplat_arity(iseq) {
-                                            if block_call_inlinable_iseq(iseq, splat_num).is_ok() {
+                                            if can_direct_invoke_block_iseq(iseq, splat_num).is_ok() {
                                                 polymorphic_iseqs.push((iseq, Some(splat_num)));
                                             }
                                         }
@@ -11925,7 +11960,7 @@ fn add_iseq_to_hir(
                     }
 
                     let inlined_known_block = if let AddIseqMode::Inlined { blockiseq: Some(bi), .. } = mode {
-                        if block_call_inlinable(flags)
+                        if can_direct_invoke_block(flags)
                             // Only methods are inlined today, so exit_state.iseq is always a method iseq and this is
                             // always 0. That matters because the emit below is guard-free and bakes in both level 0
                             // and *this* frame's block (bi) — sound only when the yield resolves to this exact frame.
@@ -11933,7 +11968,7 @@ fn add_iseq_to_hir(
                             // (level > 0). To stay guard-free we'd bake in get_lvar_level(...) as the level and fetch
                             // that ancestor's blockiseq from the inline caller chain instead of bi.
                             && get_lvar_level(exit_state.iseq) == 0 {
-                            match block_call_inlinable_iseq(bi, args.len()) {
+                            match can_direct_invoke_block_iseq(bi, args.len()) {
                                 Ok(()) => Some(bi),
                                 Err(reason) => {
                                     fallback_reason = reason;
@@ -11964,7 +11999,19 @@ fn add_iseq_to_hir(
                         fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, call_state, exit_id, false)
                     } else if let Some(block_iseq) = inline_iseq {
                         let level = get_lvar_level(exit_state.iseq);
-                        fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, call_state, exit_id, true)
+                        if fun.policy.no_side_exits && autosplat_join.is_none() {
+                            // This is the ISEQ's final version, so a failing guard would exit to
+                            // the interpreter forever. Dispatch on a branch instead, joining on
+                            // the generic fallback. The auto-splatted arm can't take this path:
+                            // its arguments were expanded for the direct call, so the generic
+                            // `invokeblock` there would yield the wrong argument list.
+                            let (continue_block, result) = fun.dispatch_invoke_block(
+                                block, insn_idx, level, cd, &[block_iseq], false, args, exit_id, fallback_reason);
+                            block = continue_block;
+                            result
+                        } else {
+                            fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, call_state, exit_id, true)
+                        }
                     } else if !polymorphic_iseqs.is_empty() {
                         // Dispatch on the runtime block ISEQ over the profiled candidates, joining
                         // on the generic fallback for anything else. Unlike the monomorphic path
@@ -12062,7 +12109,7 @@ fn add_iseq_to_hir(
                         // Continue compilation from the join block
                         block = join_block;
                         join_param
-                    } else if block_call_inlinable(flags) {
+                    } else if can_direct_invoke_block(flags) {
                         // Always test for an IFUNC handler here, even when the profile never saw
                         // one. The test is a couple of instructions on a path that would
                         // otherwise make a generic `rb_vm_invokeblock` call, and handler
@@ -12611,10 +12658,6 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         None
     };
 
-    // Arguments past the C argument registers are passed through the callee's local slots
-    // on the VM stack. See `jit_entry_passes_args_on_stack`.
-    let args_on_stack = jit_entry_passes_args_on_stack(iseq, passed_opt_num);
-
     let mut arg_idx: u32 = 0;
     // For `def` methods on classes that can only produce heap (non-immediate)
     // instances, `self` is a HeapBasicObject. See `iseq_self_is_heap_object`.
@@ -12646,17 +12689,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
             )
         } else if local_idx < param_size {
             let id = unsafe { rb_zjit_local_id(iseq, local_idx.try_into().unwrap()) };
-            let local = if args_on_stack && arg_idx as usize >= C_ARG_OPNDS.len() {
-                // The caller ran out of C argument registers and wrote this argument into
-                // our local slot instead. See gen_send_iseq_direct().
-                let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
-                let ep_offset_u32 = u32::try_from(ep_offset)
-                    .unwrap_or_else(|_| panic!("Could not convert ep_offset {ep_offset} to u32"));
-                let ep = *ep.get_or_insert_with(|| fun.get_ep(jit_entry_block, 0));
-                fun.get_local_from_ep(jit_entry_block, iseq, ep, ep_offset_u32, 0, types::BasicObject)
-            } else {
-                fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject })
-            };
+            let local = fun.push_insn(jit_entry_block, Insn::LoadArg { idx: arg_idx, id: id.into(), val_type: types::BasicObject });
             arg_idx += 1;
             local
         } else {

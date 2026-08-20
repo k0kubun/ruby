@@ -3336,20 +3336,18 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
      * live there.  A non-main Ractor's local GC skips them; a global GC walks all. */
     if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         /* Only the main Ractor can register at_exit/END procs (a non-main one gets an
-         * IsolationError), and end_procs is a lock-free linked list, so only main --
-         * the thread that registers, or a stop-the-world global GC, walks it. */
+         * IsolationError) so end_procs is a lock-free linked list */
         MARK_CHECKPOINT("end_proc");
         rb_mark_end_proc();
 
         MARK_CHECKPOINT("vm");
-        /* rb_vm_mark walks VM-global weak tables that other Ractors rewrite under the
-         * VM lock, so main's otherwise lock-free local GC takes a no-barrier VM lock
-         * for this stretch; under a global GC the barrier already protects it. */
+        /* rb_vm_mark and the JIT root marks walk VM-global weak tables and shared singleton
+         * JIT state that other Ractors rewrite under the VM lock, so main's otherwise
+         * lock-free local GC takes the VM lock for this stretch */
         const bool vm_mark_needs_lock = rb_multi_ractor_p() && !global_gc;
         unsigned int vm_mark_lock_lev = 0;
         if (vm_mark_needs_lock) vm_mark_lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         rb_vm_mark(vm);
-        if (vm_mark_needs_lock) RB_GC_VM_UNLOCK_NO_BARRIER(vm_mark_lock_lev);
 
         if (global_gc) {
             /* Mark and pin the shareable REFs of in-flight (off-heap) move couriers,
@@ -3379,6 +3377,7 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             rb_zjit_root_mark();
         }
 #endif
+        if (vm_mark_needs_lock) RB_GC_VM_UNLOCK_NO_BARRIER(vm_mark_lock_lev);
 
         if (global_gc || rb_gc_single_objspace_p()) {
             MARK_CHECKPOINT("global_symbols");
@@ -4220,7 +4219,7 @@ rb_gc_obj_foreign_p(VALUE obj)
 bool
 rb_gc_single_objspace_p(void)
 {
-    if (!rb_gc_impl_multi_objspace_p()) return true;
+    if (!rb_gc_impl_multi_objspace_p() || ruby_single_main_ractor) return true;
     rb_vm_t *vm = GET_VM();
     return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
            !gc_absorbed_since_global_gc &&
@@ -4732,7 +4731,9 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
         // set the shape on it so that the GC finalizer won't try to remove
         // it again.  A "root shape" indicates to the GC that this object
         // has no fields on it, hence it won't be in the gen fields table.
-        RBASIC_SET_SHAPE_ID((VALUE)key, ROOT_SHAPE_ID);
+        if (BUILTIN_TYPE((VALUE)key) != T_NONE) {
+            RBASIC_SET_SHAPE_ID((VALUE)key, ROOT_SHAPE_ID);
+        }
         return ST_DELETE;
 
       case ST_REPLACE: {
@@ -4813,20 +4814,6 @@ vm_weak_table_frozen_strings_foreach(VALUE *str, void *data)
 }
 
 void rb_fstring_foreach_with_replace(int (*callback)(VALUE *str, void *data), void *data);
-
-// Whether this table must be cleaned every GC after marking.
-// Other tables may be skipped cleaned up per-object via rb_gc_obj_free_vm_weak_references.
-bool
-rb_gc_vm_weak_table_essential_p(enum rb_gc_vm_weak_tables table)
-{
-    /* No bulk cleanup: the generic_fields table is process-wide, so a local GC must not
-     * wipe other Ractors' live entries.  They are dropped per freed object instead
-     * (rb_gc_obj_free_vm_weak_references), and dead keys drain in the global GC's weak pass. */
-    switch (table) {
-      default:
-        return false;
-    }
-}
 
 /* Callback of rb_generic_fields_tables_foreach: walk one generic_fields table with the
  * gen_fields foreach used by compaction, recording the current table in foreach_data so
