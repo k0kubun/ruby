@@ -121,6 +121,12 @@ pub struct ZJITState {
     /// inline guard chain can cover, one per call shape. Owned here because JIT
     /// code bakes in the addresses, so the `Box`es must never move.
     send_caches: crate::send_cache::SendCaches,
+    /// Bytes held by `IseqVersion`s whose ISEQ has been freed. They cannot be
+    /// released because `Invariants`' patch points hold raw pointers to them,
+    /// and they are no longer reachable from any live ISEQ, so the `mem_*`
+    /// walker cannot find them. Tracked here instead. See
+    /// [`crate::gc::rb_zjit_iseq_free`].
+    dead_iseq_version_bytes: usize,
 }
 
 /// Tracks the initialization progress
@@ -210,6 +216,7 @@ impl ZJITState {
             root_iseqs: Default::default(),
             ivar_caches: HashMap::new(),
             send_caches: crate::send_cache::SendCaches::new(),
+            dead_iseq_version_bytes: 0,
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -277,6 +284,16 @@ impl ZJITState {
     /// Owner of every per-call-shape class table. See [`crate::send_cache`].
     pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
         &mut ZJITState::get_instance().send_caches
+    }
+
+    /// Record bytes retained by an `IseqVersion` that outlived its ISEQ.
+    pub fn add_dead_iseq_version_bytes(bytes: usize) {
+        ZJITState::get_instance().dead_iseq_version_bytes += bytes;
+    }
+
+    /// Bytes retained by `IseqVersion`s whose ISEQ has been freed.
+    pub fn dead_iseq_version_bytes() -> usize {
+        ZJITState::get_instance().dead_iseq_version_bytes
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
