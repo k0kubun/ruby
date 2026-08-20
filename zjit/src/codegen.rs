@@ -949,7 +949,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block,
             )
         }
-        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, captured, state } => {
+        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, captured, state, guard_state: _ } => {
             let captured = captured.map(|captured| opnd!(captured));
             no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, captured))
         },

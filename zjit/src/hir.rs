@@ -971,6 +971,14 @@ pub struct SendDirectData {
     pub jit_entry_idx: u16,
     pub block: Option<BlockHandler>,
     pub state: InsnId,
+    /// The interpreter's own state at the call site, which is what code inlined in place of
+    /// this call must side-exit to. It differs from `state` -- the state that describes the
+    /// callee frame -- whenever the caller's stack was rewritten for the frame setup: a
+    /// stripped nil block arg, an expanded splat, or a `send`/`__send__` name argument
+    /// dropped by [`Function::send_mid_overrides`]. Code that runs without pushing the
+    /// callee frame re-runs the original call instruction when it exits, so it needs the
+    /// original stack.
+    pub guard_state: InsnId,
 }
 
 /// Payload of [`Insn::CCallVariadic`]. Boxed in the enum to keep `Insn` small.
@@ -1268,6 +1276,13 @@ pub enum Insn {
         /// Guarded `struct rb_captured_block *` when this frame is an inlined block.
         captured: Option<InsnId>,
         state: InsnId,
+        /// The interpreter's own state at the call site that this frame was pushed for.
+        /// Instructions that [`Function::eliminate_empty_inline_frames`] leaves behind after
+        /// eliding this frame run against the caller's frame, so they must side-exit here
+        /// rather than to `state`, which describes the callee frame this push sets up. The
+        /// two differ whenever the caller's stack was rewritten for the frame setup; see
+        /// [`SendDirectData::guard_state`].
+        guard_state: InsnId,
     },
 
     /// Pop a lighter weight frame used for inlined methods.
@@ -1635,12 +1650,13 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(args);
                 $visit_one!(*state);
             }
-            Insn::PushInlineFrame { recv, captured, state, .. } => {
+            Insn::PushInlineFrame { recv, captured, state, guard_state, .. } => {
                 $visit_one!(*recv);
                 if let Some(captured) = captured {
                     $visit_one!(*captured);
                 }
                 $visit_one!(*state);
+                $visit_one!(*guard_state);
             }
             // SendDirect/CCallWithFrame/CCallVariadic carry their operands behind a Box,
             // which stable Rust can't destructure in a pattern. visit_one takes a place, so
@@ -1649,6 +1665,7 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
                 $visit_one!(insn.state);
+                $visit_one!(insn.guard_state);
             }
             Insn::CCallWithFrame(insn) => {
                 $visit_one!(insn.recv);
@@ -2988,15 +3005,6 @@ pub struct ExceptionEntry {
     pub stack_size: usize,
 }
 
-/// The kind of a value an ISEQ returns
-enum IseqReturn {
-    Value(VALUE),
-    LocalVariable(u32),
-    Receiver,
-    // Builtin descriptor and return type
-    InvokeLeafBuiltin(*const rb_builtin_function, Type),
-}
-
 /// Arguments and metadata prepared for lowering an ISEQ call to `SendDirect`.
 struct SendDirectArgs {
     state: InsnId,
@@ -3070,82 +3078,6 @@ impl SendDirectFailure {
 
 unsafe extern "C" {
     fn rb_simple_iseq_p(iseq: IseqPtr) -> bool;
-}
-
-/// Return the ISEQ's return value if it consists of one simple instruction and leave.
-fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags: u32) -> Option<IseqReturn> {
-    // Expect only two instructions and one possible operand
-    // NOTE: If an ISEQ has an optional keyword parameter with a default value that requires
-    // computation, the ISEQ will always have more than two instructions and won't be inlined.
-
-    // Get the first two instructions
-    let first_insn = iseq_opcode_at_idx(iseq, 0);
-    let second_insn = iseq_opcode_at_idx(iseq, insn_len(first_insn as usize));
-
-    // Extract the return value if known
-    if second_insn != YARVINSN_leave {
-        return None;
-    }
-    // Make sure the leave is the final instruction. Otherwise this is a
-    // non-trivial ISEQ that should go through the general inliner.
-    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
-    if insn_len(first_insn as usize) + insn_len(second_insn as usize) != iseq_size {
-        return None;
-    }
-    match first_insn {
-        YARVINSN_getlocal_WC_0  => {
-            // Accept only cases where only positional arguments are used by both the callee and the caller.
-            // Keyword arguments may be specified by the callee or the caller but not used.
-            if captured_opnd.is_some()
-                // Equivalent to `VM_CALL_ARGS_SIMPLE - VM_CALL_KWARG - has_block_iseq`
-                || ci_flags & (
-                      VM_CALL_ARGS_SPLAT
-                    | VM_CALL_KW_SPLAT
-                    | VM_CALL_ARGS_BLOCKARG
-                    | VM_CALL_FORWARDING
-                ) != 0
-                 {
-                return None;
-            }
-
-            let ep_offset = unsafe { *rb_iseq_pc_at_idx(iseq, 1) }.as_u32();
-            let local_idx = ep_offset_to_local_idx(iseq, ep_offset);
-
-            // Only inline if the local is a parameter (not a method-defined local) as we are indexing args.
-            let param_size = unsafe { rb_get_iseq_body_param_size(iseq) } as usize;
-            if local_idx >= param_size {
-                return None;
-            }
-
-            if unsafe { rb_simple_iseq_p(iseq) } {
-                return Some(IseqReturn::LocalVariable(local_idx.try_into().unwrap()));
-            }
-
-            // TODO(max): Support only_kwparam case where the local_idx is a positional parameter
-
-            None
-        }
-        YARVINSN_putnil => Some(IseqReturn::Value(Qnil)),
-        YARVINSN_putobject => Some(IseqReturn::Value(unsafe { *rb_iseq_pc_at_idx(iseq, 1) })),
-        YARVINSN_putobject_INT2FIX_0_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(0))),
-        YARVINSN_putobject_INT2FIX_1_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(1))),
-        // We don't support invokeblock for now. Such ISEQs are likely not used by blocks anyway.
-        YARVINSN_putself if captured_opnd.is_none() => Some(IseqReturn::Receiver),
-        YARVINSN_opt_invokebuiltin_delegate_leave => {
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
-            let bf: *const rb_builtin_function = get_arg(pc, 0).as_ptr();
-            let argc = unsafe { (*bf).argc } as usize;
-            if argc != 0 { return None; }
-            let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq) };
-            let leaf = builtin_attrs & BUILTIN_ATTR_LEAF != 0;
-            if !leaf { return None; }
-            // Check if this builtin is annotated
-            let return_type = ZJITState::get_method_annotations()
-                .get_builtin_return_type(bf);
-            Some(IseqReturn::InvokeLeafBuiltin(bf, return_type))
-        }
-        _ => None,
-    }
 }
 
 /// Minimum share of the profiled executions of a call site that a guard chain must cover before
@@ -3623,6 +3555,10 @@ fn inline_block_at_yield(
         blockiseq: None,
         captured: Some(captured),
         state: exit_id,
+        // The direct block dispatch takes the simple callee-setup path with an exact
+        // arity match, so the caller's stack was never rewritten: the call-site state
+        // and the frame state are the same snapshot.
+        guard_state: exit_id,
     });
     fun.push_insn(*block, Insn::Jump(BranchEdge { target: body_entry, args: vec![] }));
 
@@ -5405,10 +5341,22 @@ impl Function {
         let Insn::InvokeBuiltin { bf, recv, ref args, state, .. } = insn else {
             panic!("try_inline_invoke_builtin called with non-InvokeBuiltin instruction");
         };
+        let args = args.clone();
+        if let Some(replacement) = self.try_inline_builtin_body(block, bf, recv, &args, state) {
+            return replacement;
+        }
+        return self.push_insn(block, insn);
+    }
+
+    /// Try replacing an InvokeBuiltin call with the inline HIR provided by the
+    /// builtin's annotation (if any), appending the replacement instructions to
+    /// `block`. Returns the instruction to use as the result, or None if the
+    /// builtin couldn't be inlined.
+    fn try_inline_builtin_body(&mut self, block: BlockId, bf: *const rb_builtin_function, recv: InsnId, args: &[InsnId], state: InsnId) -> Option<InsnId> {
         let props = ZJITState::get_method_annotations().get_builtin_properties(bf).unwrap_or_default();
         // Try inlining the cfunc into HIR
         let tmp_block = self.new_block(u32::MAX);
-        if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
+        if let Some(replacement) = (props.inline)(self, tmp_block, recv, args, state) {
             // Copy contents of tmp_block to block
             assert_ne!(block, tmp_block);
             let insns = std::mem::take(&mut self.blocks[tmp_block.to_usize()].insns);
@@ -5416,64 +5364,9 @@ impl Function {
             self.count(block, Counter::inline_cfunc_optimized_send_count);
             self.infer_inlined_type(replacement);
             self.remove_block(tmp_block);
-            return replacement;
+            return Some(replacement);
         }
-        return self.push_insn(block, insn);
-    }
-
-    /// Try trivially inlining the method. If we can't, emit a SendDirect instruction instead and
-    /// leave it to the general-purpose inliner to handle.
-    /// `guard_state` is the interpreter's own state at the call site, which is what an inlined
-    /// body's guards must side-exit to. It differs from `data.state` -- the state that describes
-    /// the callee frame -- whenever the caller's stack was rewritten for the frame setup: a
-    /// stripped nil block arg, an expanded splat, or a `send`/`__send__` name argument dropped by
-    /// the [`Self::send_mid_overrides`] rewrite. Inlining pushes no frame, so a side exit there
-    /// re-runs the original call instruction and needs the original stack.
-    fn try_inline_send_direct(&mut self, block: BlockId, insn: Insn, guard_state: InsnId) -> InsnId {
-        let Insn::SendDirect(data) = &insn else {
-            panic!("try_inline_send_direct called with non-SendDirect instruction");
-        };
-        let recv = data.recv;
-        let iseq = data.iseq;
-        let cd = data.cd;
-        let args = &data.args;
-        // The trivial inliner runs first to handle simple cases (constant returns,
-        // parameter returns, etc.) without frame push/pop overhead. The general
-        // inliner then handles more complex methods that require full inlining.
-        let call_info = unsafe { (*cd).ci };
-        let ci_flags = unsafe { vm_ci_flag(call_info) };
-        // .send call is not currently supported for builtins
-        if ci_flags & VM_CALL_OPT_SEND != 0 {
-            return self.push_insn(block, insn);
-        }
-        let Some(value) = iseq_get_return_value(iseq, None, ci_flags) else {
-            return self.push_insn(block, insn);
-        };
-        match value {
-            IseqReturn::LocalVariable(idx) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                args[idx as usize]
-            }
-            IseqReturn::Value(value) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                self.push_insn(block, Insn::Const { val: Const::Value(value) })
-            }
-            IseqReturn::Receiver => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                recv
-            }
-            IseqReturn::InvokeLeafBuiltin(bf, return_type) => {
-                self.count(block, Counter::inline_iseq_optimized_send_count);
-                self.try_inline_invoke_builtin(block, Insn::InvokeBuiltin {
-                    bf,
-                    recv,
-                    args: vec![recv],
-                    state: guard_state,
-                    leaf: true,
-                    return_type,
-                })
-            }
-        }
+        None
     }
 
     /// Rewrite eligible Send opcodes into SendDirect
@@ -5728,7 +5621,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block })), state);
+                            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, guard_state: state, block: send_block })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_BMETHOD {
                             let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
@@ -5768,7 +5661,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: None })), state);
+                            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, guard_state: state, block: None })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_IVAR && args.is_empty() {
                             // Check if we're accessing ivars of a Class or Module object as they require single-ractor mode.
@@ -6364,7 +6257,7 @@ impl Function {
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state);
                             // Use SendDirect with the super method's CME and ISEQ.
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
+                            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData {
                                 recv,
                                 cd,
                                 cme: super_cme,
@@ -6373,8 +6266,9 @@ impl Function {
                                 kw_bits,
                                 jit_entry_idx,
                                 state: send_state,
+                                guard_state: state,
                                 block: None,
-                            })), state);
+                            })));
                             self.make_equal_to(insn_id, replacement);
 
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
@@ -6509,6 +6403,17 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::from(def_type)));
                             continue;
+                        }
+                    }
+                    &Insn::InvokeBuiltin { bf, recv, ref args, state, .. } => {
+                        // Builtins reached through inline_methods are translated to HIR
+                        // before their operand types are inferred, so their
+                        // annotation-based inlining may have failed. Retry now that
+                        // types are known.
+                        let args = args.to_vec();
+                        match self.try_inline_builtin_body(block, bf, recv, &args, state) {
+                            Some(replacement) => { self.make_equal_to(insn_id, replacement); }
+                            None => { self.push_insn_id(block, insn_id); }
                         }
                     }
                     _ => { self.push_insn_id(block, insn_id); }
@@ -6735,7 +6640,7 @@ impl Function {
                 else {
                     unreachable!("position {send_insn_id} is not a SendDirect");
                 };
-                let SendDirectData { recv, cme, iseq, kw_bits, jit_entry_idx, block: call_block, state, .. } = **data;
+                let SendDirectData { recv, cme, iseq, kw_bits, jit_entry_idx, block: call_block, state, guard_state, .. } = **data;
                 let args_len = data.args.len();
                 // SendDirect invariant: block is either None or BlockIseq.
                 // BlockArg is rejected upstream during type specialization.
@@ -6949,7 +6854,7 @@ impl Function {
 
                 // Insert PushLightweightFrame and jump to callee body entry.
                 self.push_insn(block, Insn::PushInlineFrame {
-                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, captured: None, state,
+                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, captured: None, state, guard_state,
                 });
                 self.count(block, Counter::inline_iseq_optimized_send_count);
                 self.push_insn(block, Insn::Jump(BranchEdge {
@@ -8134,6 +8039,14 @@ impl Function {
         if matches!(insn, Insn::LoadSP) {
             return false;
         }
+        // Snapshot is metadata that generates no code, so it never observes the
+        // frame by itself. Whether a side exit can materialize the frame from it
+        // is determined by the instructions that reference it, which this scan
+        // checks individually; without this early return, the operand scan below
+        // would reject every Snapshot whose `caller` chains to another Snapshot.
+        if matches!(insn, Insn::Snapshot { .. }) {
+            return true;
+        }
         let effects = insn.effects_of();
         if !(abstract_heaps::Stats.includes(effects.read_bits()) && abstract_heaps::Stats.includes(effects.write_bits())) {
             return false;
@@ -8163,6 +8076,33 @@ impl Function {
     /// walk the frame chain, so pushing and popping the frame is pure overhead.
     /// This pass deletes both instructions of each such pair.
     ///
+    /// CheckInterrupts gets special treatment: it can take a side exit, but it's
+    /// also removed if it's the only such instruction between the push and the
+    /// pop. Such a CheckInterrupts is the one emitted for the inlined callee's
+    /// `leave`, and since the callee's body does nothing else, removing the check
+    /// only delays interrupt delivery until the next CheckInterrupts the caller
+    /// (or its caller) runs. The delay is bounded: CheckInterrupts on loop
+    /// back-edges are never removed here because a loop body spans multiple
+    /// blocks while this pass only matches pairs within a single block, so any
+    /// cycle in execution still checks interrupts.
+    ///
+    /// NoTracePoint PatchPoints get the same treatment. Enabling a TracePoint
+    /// invalidates all compiled code wholesale (see
+    /// rb_zjit_tracing_invalidate_all); the patch points only make execution
+    /// that is already inside compiled code side-exit as soon as possible.
+    /// Removing the callee's NoTracePoint along with an otherwise-empty pair
+    /// just delays that in-flight side exit until the next patch point the
+    /// caller runs, and since the callee's body does nothing, no events would
+    /// have fired from it anyway.
+    ///
+    /// A pair whose body is a single leaf InvokeBuiltin (e.g. an inlined
+    /// opt_invokebuiltin_delegate_leave method) is also elided: a leaf builtin
+    /// doesn't raise, call Ruby code, or otherwise observe the frame, so it can
+    /// run against the caller's frame. Its FrameState is rewritten from the
+    /// callee's to the PushInlineFrame's caller-side state, whose PC the
+    /// builtin's code will store for GC. This reproduces how such methods used
+    /// to call the builtin function without a frame push before inlining.
+    ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
@@ -8176,22 +8116,53 @@ impl Function {
             /// Whether an instruction that may take a side exit or observe the
             /// frame has been seen since the push. If so, the pair must be kept.
             frame_observed: bool,
+            /// CheckInterrupts and NoTracePoint PatchPoint instructions seen
+            /// since the push. They don't set `frame_observed` on their own; if
+            /// the pair is otherwise empty, they are removed together with the
+            /// pair.
+            removable_insns: Vec<InsnId>,
+            /// A leaf InvokeBuiltin seen since the push. It doesn't set
+            /// `frame_observed` on its own; if the pair is otherwise empty, the
+            /// pair is elided and the InvokeBuiltin's FrameState is rewritten to
+            /// the PushInlineFrame's caller-side state.
+            leaf_builtin: Option<InsnId>,
         }
 
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
+            let mut elided_removable_insns: Vec<InsnId> = Vec::new();
+            // Leaf InvokeBuiltins in elided pairs, with their pair's PushInlineFrame.
+            let mut rebased_leaf_builtins: Vec<(InsnId, InsnId)> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             for &insn_id in &self.blocks[block_id.to_usize()].insns {
                 match self.find_ref(insn_id) {
                     Insn::PushInlineFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false });
+                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false, removable_insns: Vec::new(), leaf_builtin: None });
+                    }
+                    Insn::CheckInterrupts { .. } | Insn::PatchPoint { invariant: Invariant::NoTracePoint, .. } if !pending_pushes.is_empty() => {
+                        pending_pushes.last_mut().unwrap().removable_insns.push(insn_id);
+                    }
+                    Insn::InvokeBuiltin { leaf: true, .. } if pending_pushes.last().is_some_and(|push| push.leaf_builtin.is_none()) => {
+                        pending_pushes.last_mut().unwrap().leaf_builtin = Some(insn_id);
                     }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, frame_observed: false }) => {
-                                // Empty pair: elide both the push and this pop.
+                            Some(PendingPush { push_id, frame_observed: false, removable_insns, leaf_builtin }) => {
+                                // Empty pair: elide both the push and this pop, along
+                                // with the callee's CheckInterrupts and NoTracePoint
+                                // PatchPoints (if any).
                                 elided_pairs.push((push_id, insn_id));
+                                elided_removable_insns.extend(removable_insns);
+                                if let Some(builtin_id) = leaf_builtin {
+                                    rebased_leaf_builtins.push((builtin_id, push_id));
+                                    // The InvokeBuiltin stays behind with a FrameState
+                                    // that assumes the enclosing frame (if any) exists
+                                    // at run-time, so the enclosing pair must be kept.
+                                    if let Some(outer) = pending_pushes.last_mut() {
+                                        outer.frame_observed = true;
+                                    }
+                                }
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
                                 // Keep the pair. It observes the frame chain, so the
@@ -8230,6 +8201,28 @@ impl Function {
                     .then(|| self.new_insn(Insn::IncrCounter(Counter::empty_inline_frame_count)));
                 rewrites.insert(push_id, replacement);
                 rewrites.insert(pop_id, None);
+            }
+            for removable_insn_id in elided_removable_insns {
+                rewrites.insert(removable_insn_id, None);
+            }
+            // Rewrite each elided pair's leaf InvokeBuiltin to use the PushInlineFrame's
+            // call-site FrameState instead of the callee's. This is `guard_state`, not
+            // `state`: the builtin now runs without the callee frame, so a side exit from
+            // it re-runs the original call instruction and needs the stack the interpreter
+            // had there, which `state` may have rewritten for the frame setup.
+            for (builtin_id, push_id) in rebased_leaf_builtins {
+                let &Insn::PushInlineFrame { guard_state: push_state, .. } = self.find_ref(push_id) else {
+                    panic!("Expected PushInlineFrame instruction");
+                };
+                let &Insn::InvokeBuiltin { bf, recv, ref args, leaf, return_type, .. } = self.find_ref(builtin_id) else {
+                    panic!("Expected InvokeBuiltin instruction");
+                };
+                let args = args.clone();
+                let builtin_type = self.type_of(builtin_id);
+                let replacement = self.new_insn(Insn::InvokeBuiltin { bf, recv, args, state: push_state, leaf, return_type });
+                self.insn_types[replacement.to_usize()] = builtin_type;
+                self.make_equal_to(builtin_id, replacement);
+                rewrites.insert(builtin_id, Some(replacement));
             }
             self.blocks[block_id.to_usize()].insns.retain_mut(|insn_id| {
                 match rewrites.get(insn_id) {

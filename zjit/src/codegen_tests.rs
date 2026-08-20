@@ -1336,6 +1336,10 @@ fn test_inline_array_each_to_dispatch_autosplat_yield_directly() {
 
 /// The relaxation only applies to a callee whose `yield` can benefit from it: an oversized
 /// method with no `yield` in it stays out of line however it is called.
+///
+/// `inline_method_count` is global, so the padding below deliberately avoids calling any
+/// method that would itself be inlined -- indexing the array rather than calling
+/// `Array#last`, which is a leaf builtin the general inliner would inline and count.
 #[test]
 fn test_oversized_callee_without_yield_is_not_relaxed() {
     with_inlining(|| {
@@ -1350,7 +1354,7 @@ fn test_oversized_callee_without_yield_is_not_relaxed() {
               pad4 = pad3 + 5
               pad5 = pad4 + 6
               pad6 = pad5 + 7
-              [pad0, pad1, pad2, pad3, pad4, pad5, pad6].last
+              [pad0, pad1, pad2, pad3, pad4, pad5, pad6][6]
             end
             def test(a) = no_yield(a) { :unused_block }
             test(1)
