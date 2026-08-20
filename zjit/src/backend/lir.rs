@@ -1892,6 +1892,18 @@ pub struct Assembler {
     /// Bumped every time an instruction writes the CFP register. Codegen uses this
     /// to tell whether a value it derived from CFP earlier is still valid.
     cfp_generation: u64,
+
+    /// Bumped every time an instruction writes the SP register.
+    sp_generation: u64,
+
+    /// The `(cfp_generation, sp_generation, stack_size)` of the last cfp->sp store
+    /// emitted in the current basic block, if any. `gen_save_sp()` skips a store that
+    /// would write the same value (SP register plus `stack_size`) to the same place
+    /// (the current CFP's `sp` field), which the generation counters pin down.
+    /// Cleared when codegen switches blocks, since a block can be reached without
+    /// having run the earlier store, and by `clear_saved_sp()` after VM helpers that
+    /// move cfp->sp themselves.
+    saved_sp: Option<(u64, u64, usize)>,
 }
 
 impl Assembler
@@ -1909,6 +1921,8 @@ impl Assembler
             idx: 0,
             stack_map: None,
             cfp_generation: 0,
+            sp_generation: 0,
+            saved_sp: None,
         }
     }
 
@@ -1985,6 +1999,39 @@ impl Assembler
 
     pub fn set_current_block(&mut self, block_id: BlockId) {
         self.current_block_id = block_id;
+        // Conservatively assume the new block can be entered without having run the
+        // cfp->sp store recorded for the old one, e.g. a join block with multiple
+        // predecessors. See set_current_block_fall_through() for the linear case.
+        self.saved_sp = None;
+    }
+
+    /// Like [`Assembler::set_current_block`], but keeps the recorded cfp->sp store.
+    /// Only safe when the new block is a fresh fall-through block whose single
+    /// predecessor is the current block, like the ones `split_block_jump()` creates:
+    /// control falls through linearly, so the store recorded so far has run.
+    pub fn set_current_block_fall_through(&mut self, block_id: BlockId) {
+        let saved_sp = self.saved_sp;
+        self.set_current_block(block_id);
+        self.saved_sp = saved_sp;
+    }
+
+    /// Record that the current frame's cfp->sp is being stored for `stack_size`.
+    /// Returns true when an earlier store in the current block already wrote the same
+    /// value to the same slot, in which case the store can be skipped.
+    pub fn note_sp_save(&mut self, stack_size: usize) -> bool {
+        let key = (self.cfp_generation, self.sp_generation, stack_size);
+        if self.saved_sp == Some(key) {
+            return true;
+        }
+        self.saved_sp = Some(key);
+        false
+    }
+
+    /// Forget the cfp->sp store recorded by [`Assembler::note_sp_save`]. Call this
+    /// when something other than `gen_save_sp()` may have moved the current frame's
+    /// cfp->sp, e.g. a VM fallback helper that executes an instruction on this frame.
+    pub fn clear_saved_sp(&mut self) {
+        self.saved_sp = None;
     }
 
     pub fn current_block(&mut self) -> &mut BasicBlock {
@@ -2237,6 +2284,9 @@ impl Assembler
         if Self::writes_cfp_reg(&insn) {
             self.cfp_generation += 1;
         }
+        if Self::writes_reg(&insn, crate::backend::current::SP.unwrap_reg()) {
+            self.sp_generation += 1;
+        }
 
         self.current_block().push_insn(insn);
     }
@@ -2246,11 +2296,15 @@ impl Assembler
     /// an inlined frame (gen_push_inline_frame) uses exactly that form, so they have to
     /// be checked separately. `Opnd::Mem` destinations write memory, not the register.
     fn writes_cfp_reg(insn: &Insn) -> bool {
-        let cfp_reg = crate::backend::current::CFP.unwrap_reg();
+        Self::writes_reg(insn, crate::backend::current::CFP.unwrap_reg())
+    }
+
+    /// True if `insn` writes `reg`. See [`Assembler::writes_cfp_reg`].
+    fn writes_reg(insn: &Insn, reg: Reg) -> bool {
         match insn {
             Insn::Mov { dest, .. } | Insn::LoadInto { dest, .. } =>
-                matches!(dest, Opnd::Reg(reg) if *reg == cfp_reg),
-            _ => insn.out_opnd().is_some_and(|&out| Self::has_reg(out, cfp_reg)),
+                matches!(dest, Opnd::Reg(dest_reg) if *dest_reg == reg),
+            _ => insn.out_opnd().is_some_and(|&out| Self::has_reg(out, reg)),
         }
     }
 
