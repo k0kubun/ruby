@@ -572,6 +572,14 @@ impl ExitDescriptorTable {
     pub fn len(&self) -> u32 {
         self.bytes.len() as u32
     }
+
+    /// Bytes the table owns on the Rust heap: the encoded descriptors and the
+    /// return-address and version indexes over them.
+    pub fn heap_size(&self) -> usize {
+        self.bytes.capacity()
+            + self.ret_addrs.capacity() * size_of::<(u32, u32)>()
+            + self.versions.capacity() * size_of::<(Range<u32>, IseqVersionRef)>()
+    }
 }
 
 fn read_table() -> std::sync::RwLockReadGuard<'static, ExitDescriptorTable> {

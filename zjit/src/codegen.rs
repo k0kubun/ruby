@@ -6446,6 +6446,13 @@ unsafe impl Send for IseqCallTable {}
 unsafe impl Sync for IseqCallTable {}
 
 impl IseqCallTable {
+    /// Bytes the two index arrays own on the Rust heap. The `IseqCall`s they point
+    /// at are counted by their caller version's `iseq_call_heap_size()`.
+    pub fn heap_size(&self) -> usize {
+        self.ret_addrs.capacity() * size_of::<u32>()
+            + self.iseq_calls.capacity() * size_of::<*const IseqCall>()
+    }
+
     fn register(&mut self, ret_addr: u32, iseq_call: &IseqCallRef) {
         let pos = match self.ret_addrs.last() {
             Some(&last) if last >= ret_addr => self.ret_addrs.binary_search(&ret_addr),

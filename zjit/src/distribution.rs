@@ -99,6 +99,12 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
     }
 
     /// Every item in a non-empty bucket, bucket 0 first.
+    /// How many buckets hold an observed item. Zero means nothing was observed;
+    /// `N` plus a non-zero `other` means megamorphic.
+    pub fn num_buckets_used(&self) -> usize {
+        self.counts.iter().filter(|&&count| count > 0).count()
+    }
+
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
         self.buckets.iter().zip(self.counts.iter())
             .filter_map(|(&bucket, &count)| if count > 0 { Some(bucket) } else { None })

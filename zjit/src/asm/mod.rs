@@ -123,6 +123,31 @@ impl CodeBlock {
         self.mem_size
     }
 
+    /// Bytes this CodeBlock's bookkeeping owns on the Rust heap. Does not
+    /// include the executable memory itself, which is reported separately as
+    /// `code_region_bytes`.
+    pub fn heap_size(&self) -> usize {
+        // Label names are either static strings or block IDs, so they own nothing
+        // beyond the Vec itself.
+        let mut bytes = self.label_addrs.capacity() * size_of::<usize>()
+            + self.label_names.capacity() * size_of::<LabelName>()
+            + self.label_refs.capacity() * size_of::<LabelRef>();
+        // BTreeMap nodes hold up to 11 key/value pairs; approximate a node as
+        // that many pairs plus the internal edge array.
+        const BTREE_NODE_CAPACITY: usize = 11;
+        let comment_nodes = self.asm_comments.len().div_ceil(BTREE_NODE_CAPACITY);
+        bytes += comment_nodes
+            * (BTREE_NODE_CAPACITY * (size_of::<usize>() + size_of::<Vec<String>>())
+                + (BTREE_NODE_CAPACITY + 1) * size_of::<usize>());
+        for comments in self.asm_comments.values() {
+            bytes += comments.capacity() * size_of::<String>();
+            for comment in comments.iter() {
+                bytes += comment.capacity();
+            }
+        }
+        bytes
+    }
+
     /// Add an assembly comment if the feature is on.
     pub fn add_comment(&mut self, comment: &str) {
         if !self.keep_comments {
