@@ -32,6 +32,7 @@ VALUE rb_ary_hidden_new_fill(long capa);
 VALUE rb_ary_at(VALUE, VALUE);
 size_t rb_ary_memsize(VALUE);
 VALUE rb_to_array_type(VALUE obj);
+VALUE rb_ary_to_ary(VALUE obj);
 VALUE rb_to_array(VALUE obj);
 void rb_ary_cancel_sharing(VALUE ary);
 size_t rb_ary_size_as_embedded(VALUE ary);
