@@ -3,6 +3,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::mem::take;
+use std::ops::Range;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
@@ -1583,6 +1584,31 @@ impl Interval {
     }
 }
 
+/// Return true if any position in `call_positions` falls strictly inside one of
+/// `interval`'s ranges, i.e. the VReg holds a value that has to be alive on both
+/// sides of a CCall.
+///
+/// Positions that coincide with a range boundary don't count: a value whose last
+/// use *is* the call (an argument) or that is defined *by* the call (its result)
+/// does not have to survive it.
+///
+/// This is deliberately hole-aware. A call inside one of the interval's lifetime
+/// holes is on a control-flow path where the VReg isn't live, so it doesn't have
+/// to survive that call.
+///
+/// `call_positions` must be sorted, which lets each range binary-search instead of
+/// scanning every call in the function.
+fn interval_crosses_call(interval: &Interval, call_positions: &[usize]) -> bool {
+    if call_positions.is_empty() {
+        return false;
+    }
+    interval.ranges.iter().any(|range| {
+        // First call position strictly greater than range.from, if any.
+        let idx = call_positions.partition_point(|&position| position <= range.from);
+        call_positions.get(idx).is_some_and(|&position| position < range.to)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Allocation {
     Reg(usize),
@@ -1611,30 +1637,63 @@ impl Allocation {
 /// registers (NATIVE_STACK_PTR, for example) that an interval can only end up
 /// in through its `preferred` allocation.
 ///
-/// The list and the boundary travel together so that consumers can't disagree
-/// about where the partition is, and so pinning a register can't move it.
+/// The allocatable partition is itself split in two: `0..num_caller_saved()` are
+/// caller-saved registers, which cost nothing to use but have to be pushed
+/// around every CCall they live across, and `num_caller_saved()..num_allocatable()`
+/// are callee-saved registers, which survive a CCall for free but have to be saved
+/// once in the prologue and restored on every exit path. linear_scan() prefers the
+/// latter for intervals that live across a call.
+///
+/// The list and the boundaries travel together so that consumers can't disagree
+/// about where the partitions are, and so pinning a register can't move it.
 #[derive(Debug)]
 pub struct RegPool {
     regs: Vec<Reg>,
+    caller_saved: usize,
     allocatable: usize,
 }
 
 impl RegPool {
-    /// Build a pool in which every register is allocatable.
+    /// Build a pool in which every register is allocatable and caller-saved.
     pub fn new(regs: Vec<Reg>) -> Self {
         let allocatable = regs.len();
-        Self { regs, allocatable }
+        Self { regs, caller_saved: allocatable, allocatable }
+    }
+
+    /// Build a pool of caller-saved allocatable registers followed by callee-saved
+    /// allocatable registers. Registers already present in `regs` are not added
+    /// again, so the caller-saved partition always wins a duplicate.
+    pub fn new_with_callee_saved(regs: Vec<Reg>, callee_saved: &[Reg]) -> Self {
+        let mut pool = Self::new(regs);
+        for &reg in callee_saved {
+            if pool.regs.iter().all(|candidate| candidate.reg_no != reg.reg_no) {
+                pool.regs.push(reg);
+            }
+        }
+        pool.allocatable = pool.regs.len();
+        pool
     }
 
     #[cfg(test)]
     pub fn with_allocatable(regs: Vec<Reg>, allocatable: usize) -> Self {
         assert!(allocatable <= regs.len());
-        Self { regs, allocatable }
+        Self { regs, caller_saved: allocatable, allocatable }
     }
 
     /// The number of registers linear_scan() is free to allocate.
     pub fn num_allocatable(&self) -> usize {
         self.allocatable
+    }
+
+    /// The number of allocatable registers that are caller-saved, i.e. the start of
+    /// the callee-saved partition.
+    pub fn num_caller_saved(&self) -> usize {
+        self.caller_saved
+    }
+
+    /// Return true if the pool index refers to an allocatable callee-saved register.
+    pub fn is_callee_saved(&self, index: usize) -> bool {
+        (self.caller_saved..self.allocatable).contains(&index)
     }
 
     /// The total number of registers in the pool.
@@ -1907,6 +1966,17 @@ pub struct Assembler {
     /// consumes this through Insn::CCall, after it knows whether each live VReg
     /// is in a saved register or an allocator spill slot.
     stack_map: Option<StackMap>,
+
+    /// Whether the register allocator may hand out CALLEE_SAVED_ALLOC_REGS. Only set for
+    /// compiled functions, which have the FrameSetup/FrameTeardown pair and the side-exit
+    /// code needed to save and restore them. Trampolines leave it off; they exit through
+    /// paths that don't restore, so they must not clobber their caller's callee-saved regs.
+    pub(super) allow_callee_saved: bool,
+
+    /// Callee-saved allocator registers this function assigns to VRegs, paired with the
+    /// allocator spill slot each one is saved to right after FrameSetup. Every exit path
+    /// restores them from these slots. Filled in by [`Self::plan_callee_saved_saves`].
+    callee_saved_saves: Vec<(Reg, usize)>,
 }
 
 impl Assembler
@@ -1923,12 +1993,18 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
             stack_map: None,
+            allow_callee_saved: false,
+            callee_saved_saves: Vec::default(),
         }
     }
 
     /// Create an Assembler, reserving a specified number of stack slots
     pub fn new_with_stack_slots(stack_base_idx: usize) -> Self {
-        Self { stack_state: StackState::new_with_stack_slots(stack_base_idx), ..Self::new() }
+        Self {
+            stack_state: StackState::new_with_stack_slots(stack_base_idx),
+            allow_callee_saved: true,
+            ..Self::new()
+        }
     }
 
     /// Create an Assembler that allows the use of scratch registers.
@@ -1957,6 +2033,8 @@ impl Assembler
             label_names: old_asm.label_names.clone(),
             accept_scratch_reg: old_asm.accept_scratch_reg,
             stack_state: old_asm.stack_state.clone(),
+            allow_callee_saved: old_asm.allow_callee_saved,
+            callee_saved_saves: old_asm.callee_saved_saves.clone(),
             ..Self::new()
         };
 
@@ -2346,7 +2424,13 @@ impl Assembler
     // Allocations are written back in to `intervals` as each interval's
     // `assigned` field.  The return value is the number of stack slots needed
     // for the spills.
-    pub fn linear_scan(&self, intervals: &[Interval], regs: &RegPool) -> usize {
+    ///
+    /// `call_positions` holds the instruction numbers of every CCall, in increasing
+    /// order (see [`Self::ccall_positions`]). Intervals that live across one of them
+    /// are steered into the pool's callee-saved partition, which survives a call
+    /// without the push/pop pair handle_caller_saved_regs() would otherwise emit.
+    pub fn linear_scan(&self, intervals: &[Interval], regs: &RegPool, call_positions: &[usize]) -> usize {
+        let num_caller_saved = regs.num_caller_saved();
         let num_registers = regs.num_allocatable();
 
         // `active`, `inactive`, and `unhandled` borrow the intervals they hold.
@@ -2453,9 +2537,26 @@ impl Assembler
             // Find a reg with the highest "free until use" point, then check if that "free until
             // use" point is greater than or eq to than the current interval's end.  If it is, then
             // we know the current interval can fit in the window this register is available.
-            let best_reg = (0..num_registers).rev()
+            //
+            // `.rev()` combined with max_by_key()'s last-maximum tie-break makes this pick the
+            // lowest-numbered register among equally free ones.
+            let best_in = |partition: Range<usize>| partition.rev()
                 .max_by_key(|&reg| free_registers[reg])
                 .filter(|&reg| free_registers[reg] >= cur_end);
+
+            // An interval that lives across a CCall wants a callee-saved register: the callee
+            // preserves it, so handle_caller_saved_regs() doesn't have to push and pop it around
+            // the call. Everything else prefers caller-saved registers, which cost nothing, and
+            // only reaches for a callee-saved one to avoid an outright spill.
+            let crosses_call = num_caller_saved < num_registers
+                && interval_crosses_call(cur, call_positions);
+            let caller_saved = 0..num_caller_saved;
+            let callee_saved = num_caller_saved..num_registers;
+            let best_reg = if crosses_call {
+                best_in(callee_saved).or_else(|| best_in(caller_saved))
+            } else {
+                best_in(caller_saved).or_else(|| best_in(callee_saved))
+            };
 
             match best_reg {
                 // We couldn't find a best register, so we need to spill
@@ -2509,6 +2610,135 @@ impl Assembler
         }
 
         num_stack_slots
+    }
+
+    /// Return the instruction numbers of every CCall, in increasing order. Feeds
+    /// [`Self::linear_scan`]'s preference for callee-saved registers on intervals that
+    /// live across a call. CCalls without an instruction number can't be placed in the
+    /// numbering, so they're left out; that only costs the heuristic some precision.
+    pub fn ccall_positions(&self) -> Vec<usize> {
+        let mut positions = Vec::new();
+        for block_id in self.block_order() {
+            let block = &self.basic_blocks[block_id.0];
+            for (insn, insn_id) in block.insns.iter().zip(block.insn_ids.iter()) {
+                if matches!(insn, Insn::CCall { .. }) {
+                    positions.extend(insn_id.map(|id| id.0));
+                }
+            }
+        }
+        // block_order() is reverse postorder and number_instructions() numbers in the
+        // same order, so this is already sorted. Assert rather than sort so a change in
+        // either doesn't silently turn the binary search in interval_crosses_call()
+        // into garbage.
+        debug_assert!(positions.is_sorted(), "ccall positions should come out sorted: {positions:?}");
+        positions
+    }
+
+    /// Reserve a spill slot for every callee-saved register [`Self::linear_scan`] handed
+    /// out, bumping `num_stack_slots`. The instructions that use those slots are emitted
+    /// later by [`Self::insert_callee_saved_saves`]; splitting the two lets the slot count
+    /// reach FrameSetup before any code refers to the slots.
+    pub fn plan_callee_saved_saves(&mut self, intervals: &[Interval], regs: &RegPool, num_stack_slots: &mut usize) {
+        debug_assert!(self.callee_saved_saves.is_empty());
+        for interval in intervals {
+            let Some(Allocation::Reg(index)) = interval.assigned.get() else { continue };
+            if !regs.is_callee_saved(index) {
+                continue;
+            }
+            let reg = regs.reg_at(index);
+            if self.callee_saved_saves.iter().any(|&(saved, _)| saved.reg_no == reg.reg_no) {
+                continue;
+            }
+            self.callee_saved_saves.push((reg, *num_stack_slots));
+            *num_stack_slots += 1;
+        }
+        assert!(self.allow_callee_saved || self.callee_saved_saves.is_empty(),
+            "linear_scan handed out callee-saved registers to an Assembler that cannot restore them");
+    }
+
+    /// Emit the saves and restores for the registers [`Self::plan_callee_saved_saves`]
+    /// reserved slots for: one store right after each FrameSetup, and one reload right
+    /// before each FrameTeardown. Side exits reload them in compile_exits() instead,
+    /// from the same slots.
+    ///
+    /// Must run *after* resolve_ssa(), which inserts the entry block's incoming-parameter
+    /// moves right after FrameSetup. Those moves can write a callee-saved register, so the
+    /// store that captures the caller's value has to be inserted ahead of them, and it can
+    /// only be placed ahead of moves that already exist.
+    pub fn insert_callee_saved_saves(&mut self) {
+        if self.callee_saved_saves.is_empty() {
+            return;
+        }
+        let saves = take(&mut self.callee_saved_saves);
+
+        let slot_opnd = |stack_idx: usize| Opnd::Mem(Mem {
+            base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
+            disp: 0,
+            num_bits: 64,
+        });
+
+        for block_id in self.block_order() {
+            let block = &mut self.basic_blocks[block_id.0];
+            let old_insns = take(&mut block.insns);
+            let old_ids = take(&mut block.insn_ids);
+
+            let mut new_insns = Vec::with_capacity(old_insns.len() + saves.len());
+            let mut new_ids = Vec::with_capacity(old_ids.len() + saves.len());
+            for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
+                let is_frame_setup = matches!(insn, Insn::FrameSetup { .. });
+                if matches!(insn, Insn::FrameTeardown { .. }) {
+                    // Restoring here, before the frame goes away, means the reloads still
+                    // reach their NATIVE_BASE_PTR-relative slots. Nothing after FrameTeardown
+                    // may read one of these registers: gen_return() moves the return value
+                    // into C_RET_OPND before tearing the frame down for exactly this reason.
+                    for &(reg, stack_idx) in &saves {
+                        new_insns.push(Insn::Mov { dest: Opnd::Reg(reg), src: slot_opnd(stack_idx) });
+                        new_ids.push(None);
+                    }
+                }
+                new_insns.push(insn);
+                new_ids.push(insn_id);
+                if is_frame_setup {
+                    for &(reg, stack_idx) in &saves {
+                        new_insns.push(Insn::Store { dest: slot_opnd(stack_idx), src: Opnd::Reg(reg) });
+                        new_ids.push(None);
+                    }
+                }
+            }
+            block.insns = new_insns;
+            block.insn_ids = new_ids;
+        }
+
+        // The reload has to happen before FrameTeardown, because the slots it reads are
+        // NATIVE_BASE_PTR-relative and FrameTeardown pops NATIVE_BASE_PTR. That is only
+        // safe while nothing past FrameTeardown still wants the allocator's value in one
+        // of these registers -- gen_return() moves the return value into C_RET_OPND ahead
+        // of the teardown for exactly this reason.
+        #[cfg(debug_assertions)]
+        for block_id in self.block_order() {
+            let block = &self.basic_blocks[block_id.0];
+            let mut torn_down = false;
+            for insn in &block.insns {
+                if matches!(insn, Insn::FrameTeardown { .. }) {
+                    torn_down = true;
+                    continue;
+                }
+                if !torn_down { continue; }
+                let mut clobbered = None;
+                insn.for_each_operand(|opnd| {
+                    if let Opnd::Reg(reg) = opnd {
+                        if saves.iter().any(|&(saved, _)| saved.reg_no == reg.reg_no) {
+                            clobbered = Some(reg);
+                        }
+                    }
+                });
+                assert!(clobbered.is_none(),
+                    "{:?} reads callee-saved {:?} after FrameTeardown restored it",
+                    insn, clobbered.unwrap());
+            }
+        }
+
+        self.callee_saved_saves = saves;
     }
 
     /// Resolve SSA block parameters by inserting sequentialized move instructions
@@ -2744,8 +2974,18 @@ impl Assembler
                             let survives_call = interval.has_bounds() && interval.survives(insn_number);
                             // 2) The VReg is referenced by the stack map for the CCall
                             let stack_map_reg = stack_vreg_ids.contains(&interval.vreg_id);
-                            let is_register = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs)).is_some();
-                            is_register && (survives_call || stack_map_reg)
+                            let pool_index = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs));
+                            let is_register = pool_index.is_some();
+                            // A callee-saved register survives the call by itself, so case 1
+                            // doesn't apply to it. Case 2 still does: the stack map can only
+                            // point at a VM stack slot in memory, so the value has to be
+                            // written somewhere the materializer can read it.
+                            let needs_save = if pool_index.is_some_and(|index| alloc_regs.is_callee_saved(index)) {
+                                stack_map_reg
+                            } else {
+                                survives_call || stack_map_reg
+                            };
+                            is_register && needs_save
                         })
                         .map(|interval| interval.vreg_id)
                         .collect();
@@ -3193,6 +3433,23 @@ impl Assembler
 
         /// Tear down the JIT frame and return to the interpreter.
         fn compile_exit_return(asm: &mut Assembler) {
+            // Restore the callee-saved registers the allocator handed out. The trampoline
+            // this jumps to only tears the frame down, so this is the last chance. It has
+            // to come after compile_exit_save_state(), which reads VM state operands that
+            // may live in these very registers, and after compile_exit_recompile()'s ccall,
+            // whose callee preserves them anyway.
+            if !asm.callee_saved_saves.is_empty() {
+                asm_comment!(asm, "restore callee-saved allocator registers");
+                for i in 0..asm.callee_saved_saves.len() {
+                    let (reg, stack_idx) = asm.callee_saved_saves[i];
+                    let slot = Opnd::Mem(Mem {
+                        base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
+                        disp: 0,
+                        num_bits: 64,
+                    });
+                    asm.push_insn(Insn::Mov { dest: Opnd::Reg(reg), src: slot });
+                }
+            }
             asm_comment!(asm, "exit to the interpreter");
             asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
         }
@@ -4974,7 +5231,7 @@ mod tests {
 
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
 
         // Extract vreg indices
         let r10_idx = if let Opnd::VReg { idx, .. } = r10 { idx } else { panic!() };
@@ -5013,7 +5270,7 @@ mod tests {
         // 3 registers -- enough for every interval once holes are reused
         let mut regs = alloc_reg_pool(3);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
 
         let r10_idx = if let Opnd::VReg { idx, .. } = r10 { idx } else { panic!() };
         let r11_idx = if let Opnd::VReg { idx, .. } = r11 { idx } else { panic!() };
@@ -5044,7 +5301,7 @@ mod tests {
         // Only 1 register available -- forces spills
         let mut regs = alloc_reg_pool(1);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
 
         let r10_idx = if let Opnd::VReg { idx, .. } = r10 { idx } else { panic!() };
         let r11_idx = if let Opnd::VReg { idx, .. } = r11 { idx } else { panic!() };
@@ -5090,7 +5347,7 @@ mod tests {
         };
         assert_eq!(regs.reg_at(regno), sp.unwrap_reg());
 
-        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
         assert_eq!(num_stack_slots, 0);
         assert_eq!(intervals[vreg_idx].assigned.get(), Some(Allocation::Reg(regno)));
         assert_eq!(intervals[vreg_idx].assigned.get().unwrap().assigned_reg(&regs), Some(sp.unwrap_reg()));
@@ -5124,7 +5381,7 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs);
+        asm.linear_scan(&intervals, &regs, &[]);
 
         asm.resolve_ssa(&intervals, &regs);
 
@@ -5169,7 +5426,7 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs);
+        asm.linear_scan(&intervals, &regs, &[]);
 
         // Entry block b1 has parameters [v0, v1].
         // With 5 registers: v0 -> Reg(0) = regs[0], arrival = C_ARG_OPNDS[0] = regs[0] -> self-move, filtered
@@ -5225,7 +5482,7 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs);
+        asm.linear_scan(&intervals, &regs, &[]);
 
         asm.resolve_ssa(&intervals, &regs);
 
@@ -5293,7 +5550,7 @@ mod tests {
         let mut intervals = asm.build_intervals(live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        asm.linear_scan(&intervals, &regs);
+        asm.linear_scan(&intervals, &regs, &[]);
 
         assert_eq!(asm.basic_blocks.len(), 3);
 
@@ -5398,7 +5655,7 @@ mod tests {
         let num_regs = 2;
         let mut regs = alloc_reg_pool(num_regs);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
-        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
         asm.stack_state.num_spill_slots = num_stack_slots;
 
         // Stand in for the C calling convention's argument registers. These
@@ -5448,5 +5705,165 @@ mod tests {
             }
         });
         assert!(has_stack_opnd, "v0 should be rewritten to a Stack memory operand");
+    }
+
+    fn callee_saved_reg_pool() -> RegPool {
+        RegPool::new_with_callee_saved(
+            crate::backend::current::ALLOC_REGS.to_vec(),
+            crate::backend::current::CALLEE_SAVED_ALLOC_REGS,
+        )
+    }
+
+    /// Build a one-block function with a CCall in the middle: `crossing` is live on both
+    /// sides of the call, `dying` dies before it. Mirrors what gen_return() emits, so the
+    /// return value is already in C_RET_OPND before FrameTeardown.
+    fn build_call_crossing_func() -> (Assembler, BlockId, Opnd, Opnd) {
+        use crate::backend::current::C_RET_OPND;
+
+        let mut asm = Assembler::new_with_stack_slots(0);
+        let b1 = asm.new_block(hir::BlockId(0), true, 0);
+        asm.set_current_block(b1);
+        let label = asm.new_label("bb0");
+        asm.write_label(label);
+        asm.frame_setup(&[]);
+
+        let crossing = asm.load(Opnd::UImm(1));
+        let dying = asm.load(Opnd::UImm(2));
+        let doubled = asm.add(dying, Opnd::UImm(3));
+        asm.ccall(0x1000 as *const u8, vec![doubled]);
+        let sum = asm.add(crossing, Opnd::UImm(4));
+        asm.load_into(C_RET_OPND, sum);
+        asm.frame_teardown(&[]);
+        asm.cret(C_RET_OPND);
+
+        (asm, b1, crossing, dying)
+    }
+
+    #[test]
+    fn test_linear_scan_prefers_callee_saved_across_ccall() {
+        if crate::backend::current::CALLEE_SAVED_ALLOC_REGS.is_empty() {
+            return; // no free callee-saved registers on this platform
+        }
+        let (mut asm, _b1, crossing, dying) = build_call_crossing_func();
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in);
+        let call_positions = asm.ccall_positions();
+        assert_eq!(call_positions.len(), 1, "expected exactly one CCall");
+
+        let mut regs = callee_saved_reg_pool();
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        asm.linear_scan(&intervals, &regs, &call_positions);
+
+        let Some(Allocation::Reg(crossing_reg)) = intervals[crossing.vreg_idx()].assigned.get()
+            else { panic!("crossing should be in a register") };
+        let Some(Allocation::Reg(dying_reg)) = intervals[dying.vreg_idx()].assigned.get()
+            else { panic!("dying should be in a register") };
+        assert!(regs.is_callee_saved(crossing_reg),
+            "call-crossing VReg should get a callee-saved register, got {:?}", regs.reg_at(crossing_reg));
+        assert!(!regs.is_callee_saved(dying_reg),
+            "VReg that dies before the call should stay caller-saved, got {:?}", regs.reg_at(dying_reg));
+    }
+
+    #[test]
+    fn test_callee_saved_regs_are_saved_and_restored() {
+        if crate::backend::current::CALLEE_SAVED_ALLOC_REGS.is_empty() {
+            return;
+        }
+        let (mut asm, b1, crossing, _dying) = build_call_crossing_func();
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in);
+        let call_positions = asm.ccall_positions();
+        let mut regs = callee_saved_reg_pool();
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        let mut num_stack_slots = asm.linear_scan(&intervals, &regs, &call_positions);
+
+        let crossing_reg = intervals[crossing.vreg_idx()].assigned.get().unwrap().assigned_reg(&regs).unwrap();
+
+        let slots_before = num_stack_slots;
+        asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
+        assert_eq!(num_stack_slots, slots_before + 1, "one callee-saved register needs one slot");
+        asm.stack_state.num_spill_slots = num_stack_slots;
+
+        asm.handle_caller_saved_regs(&intervals, &regs, &crate::backend::current::C_ARG_REGREGS);
+        asm.resolve_ssa(&intervals, &regs);
+        asm.insert_callee_saved_saves();
+
+        let insns = &asm.basic_blocks[b1.0].insns;
+        let setup_pos = insns.iter().position(|insn| matches!(insn, Insn::FrameSetup { .. })).unwrap();
+        let teardown_pos = insns.iter().position(|insn| matches!(insn, Insn::FrameTeardown { .. })).unwrap();
+        assert!(
+            matches!(insns[setup_pos + 1],
+                Insn::Store { dest: Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. }), src: Opnd::Reg(reg) }
+                    if reg.reg_no == crossing_reg.reg_no),
+            "expected the callee-saved register to be stored right after FrameSetup, got {:?}", insns[setup_pos + 1]);
+        assert!(
+            matches!(insns[teardown_pos - 1],
+                Insn::Mov { dest: Opnd::Reg(reg), src: Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. }) }
+                    if reg.reg_no == crossing_reg.reg_no),
+            "expected the callee-saved register to be reloaded right before FrameTeardown, got {:?}", insns[teardown_pos - 1]);
+
+        // The whole point: a callee-saved survivor is not pushed and popped around the call.
+        assert!(!insns.iter().any(|insn| matches!(insn,
+                Insn::CPushPair(first, second)
+                    if *first == Some(Opnd::Reg(crossing_reg)) || *second == Opnd::Reg(crossing_reg))),
+            "a callee-saved VReg should not be pushed around the CCall: {insns:?}");
+    }
+
+    /// The store that captures the caller's callee-saved register must come before the
+    /// entry block's incoming-parameter moves, which can write that same register.
+    #[test]
+    fn test_callee_saved_save_precedes_entry_param_moves() {
+        if crate::backend::current::CALLEE_SAVED_ALLOC_REGS.is_empty() {
+            return;
+        }
+        use crate::backend::current::C_RET_OPND;
+
+        let mut asm = Assembler::new_with_stack_slots(0);
+        let b1 = asm.new_block(hir::BlockId(0), true, 0);
+        asm.set_current_block(b1);
+        let label = asm.new_label("bb0");
+        asm.write_label(label);
+        asm.frame_setup(&[]);
+        let param = asm.new_block_param(64);
+        asm.basic_blocks[b1.0].add_parameter(param);
+
+        // `param` is live across the call, so it wants a callee-saved register.
+        asm.ccall(0x1000 as *const u8, vec![]);
+        let sum = asm.add(param, Opnd::UImm(4));
+        asm.load_into(C_RET_OPND, sum);
+        asm.frame_teardown(&[]);
+        asm.cret(C_RET_OPND);
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in);
+        let call_positions = asm.ccall_positions();
+        let mut regs = callee_saved_reg_pool();
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        let mut num_stack_slots = asm.linear_scan(&intervals, &regs, &call_positions);
+        let param_alloc = intervals[param.vreg_idx()].assigned.get().unwrap();
+        let Allocation::Reg(param_idx) = param_alloc else { panic!("param should be in a register") };
+        assert!(regs.is_callee_saved(param_idx), "param lives across the call, expected callee-saved");
+
+        asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
+        asm.stack_state.num_spill_slots = num_stack_slots;
+        asm.handle_caller_saved_regs(&intervals, &regs, &crate::backend::current::C_ARG_REGREGS);
+        asm.resolve_ssa(&intervals, &regs);
+        asm.insert_callee_saved_saves();
+
+        let insns = &asm.basic_blocks[b1.0].insns;
+        let param_reg = param_alloc.assigned_reg(&regs).unwrap();
+        let save_pos = insns.iter().position(|insn| matches!(insn,
+            Insn::Store { src: Opnd::Reg(reg), .. } if reg.reg_no == param_reg.reg_no)).unwrap();
+        // resolve_ssa moved the incoming C argument into the param's register.
+        let param_move_pos = insns.iter().position(|insn| matches!(insn,
+            Insn::Mov { dest: Opnd::Reg(reg), .. } | Insn::LoadInto { dest: Opnd::Reg(reg), .. }
+                if reg.reg_no == param_reg.reg_no)).unwrap();
+        assert!(save_pos < param_move_pos,
+            "the caller's callee-saved value must be stored before the parameter move overwrites it: {insns:?}");
     }
 }
