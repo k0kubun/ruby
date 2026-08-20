@@ -102,6 +102,19 @@ pub const ALLOC_REGS: &[Reg] = &[
     RAX_REG,
 ];
 
+/// Callee-saved registers the allocator may additionally hand out to VRegs that live
+/// across a CCall, so they don't have to be pushed and popped around every call. A
+/// function that uses one saves it to a stack slot right after FrameSetup and restores
+/// it on every exit path (before FrameTeardown, and in side-exit code).
+///
+/// RBX/R12/R13 hold SP/EC/CFP, RBP is NATIVE_BASE_PTR, RSP is NATIVE_STACK_PTR, and
+/// R10/R11 are the scratch registers, so R14 and R15 are the only free callee-saved
+/// registers under the SysV AMD64 ABI.
+pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[
+    R14_REG,
+    R15_REG,
+];
+
 /// Special scratch register for intermediate processing. It should be used only by
 /// [`Assembler::x86_scratch_split`] or [`Assembler::new_with_scratch_reg`].
 const SCRATCH0_OPND: Opnd = Opnd::Reg(R11_REG);
@@ -1232,7 +1245,11 @@ impl Assembler {
     pub fn compile_with_regs(self, cb: &mut CodeBlock, regs: Vec<Reg>) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         // The backend is allowed to use scratch registers only if it has not accepted them so far.
         let use_scratch_regs = !self.accept_scratch_reg;
-        let mut regs = RegPool::new(regs);
+        let mut regs = if self.allow_callee_saved {
+            RegPool::new_with_callee_saved(regs, CALLEE_SAVED_ALLOC_REGS)
+        } else {
+            RegPool::new(regs)
+        };
         asm_dump!(self, init);
 
         let mut asm = trace_compile_phase("split", || self.x86_split());
@@ -1253,7 +1270,9 @@ impl Assembler {
             }
 
             trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
-            let num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs));
+            let call_positions = asm.ccall_positions();
+            let mut num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs, &call_positions));
+            asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
 
             asm.stack_state.num_spill_slots = num_stack_slots;
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&intervals);
@@ -1295,6 +1314,10 @@ impl Assembler {
             trace_compile_phase("resolve_ssa", || {
                 asm.handle_caller_saved_regs(&intervals, &regs, &C_ARG_REGREGS);
                 asm.resolve_ssa(&intervals, &regs);
+                // After resolve_ssa: the entry block's parameter moves land right after
+                // FrameSetup and can write a callee-saved register, so the store that
+                // preserves the caller's value has to be inserted ahead of them.
+                asm.insert_callee_saved_saves();
             });
 
             Ok(())
