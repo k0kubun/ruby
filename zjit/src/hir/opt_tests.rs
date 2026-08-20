@@ -4497,8 +4497,11 @@ mod hir_opt_tests {
     fn test_yield_mixed_iseq_ifunc_profile_dispatches_on_iseqs() {
         // Like the above, but the non-ISEQ handler in the profile is an ifunc block
         // (Enumerator#each yields to the enumerator's C block). The ifunc gets its own
-        // branch to InvokeBlockIfunc, ahead of the ISEQ chain because it leads the
-        // profile here; only proc and symbol handlers reach the generic fallback.
+        // branch to InvokeBlockIfunc on the ISEQ chain's miss path, so a site profiled
+        // with both handler kinds dispatches both directly; only proc and symbol handlers
+        // reach the generic fallback. The ISEQ chain stays in front: CHAIN_COVERAGE_THRESHOLD
+        // only keeps the chain when its blocks account for most of the profile, so the
+        // majority of the traffic is what gets checked first.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
