@@ -355,6 +355,11 @@ fn root_update_references() {
         unsafe { &mut *jit_frame }.update_references();
     }
 
+    // Side-exit metadata holds raw ISEQ pointers for exits that have not run yet.
+    for meta in ZJITState::get_exit_metas().iter_mut() {
+        meta.update_references();
+    }
+
     // Send class tables are keyed on class addresses, which this compaction has
     // just changed, so they are dropped rather than rehashed.
     crate::send_cache::update_references();
@@ -469,11 +474,14 @@ pub extern "C" fn rb_zjit_root_mark() {
     }
     if gc_stats_p() { incr_counter!(gc_root_mark_count); }
     time_gc_hook(gc_root_mark_time_ns, || {
-        // Keep alive the ISEQ of every JITFrame. JITFrames that are currently on the
-        // stack are also marked via rb_execution_context_mark, but JITFrames not on
-        // the stack still need their iseqs kept alive because JIT code will reuse
-        // them. The table registers into [`RootIseqs`] as it grows, so this marks one
-        // entry per distinct ISEQ instead of one per frame.
+        // Keep alive every ISEQ a JITFrame or a side exit holds a raw pointer to.
+        //
+        // JITFrames that are currently on the stack are also marked via
+        // rb_execution_context_mark, but JITFrames not on the stack still need their
+        // iseqs kept alive because JIT code will reuse them; likewise a side exit
+        // that has not run yet has to be able to resume into (or recompile) its
+        // ISEQ. Both tables register into [`RootIseqs`] as they grow, so this marks
+        // one entry per distinct ISEQ instead of one per table entry.
         time_gc_phase(gc_root_mark_iseq_time_ns, || {
             let root_iseqs = ZJITState::get_root_iseqs();
             root_iseqs.mark();
