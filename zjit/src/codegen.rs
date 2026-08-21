@@ -5653,10 +5653,6 @@ pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> 
 
 /// Generate a trampoline that materializes ZJIT frames before unwinding native frames.
 pub fn gen_materialize_exit_trampoline(cb: &mut CodeBlock, exit_trampoline: CodePtr) -> Result<CodePtr, CompileError> {
-    unsafe extern "C" {
-        fn rb_zjit_materialize_frames(ec: EcPtr, cfp: CfpPtr);
-    }
-
     let mut asm = Assembler::new();
     asm.new_block_without_id("materialize_exit_trampoline");
 
@@ -5674,6 +5670,71 @@ pub fn gen_materialize_exit_trampoline(cb: &mut CodeBlock, exit_trampoline: Code
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
         register_current_code_range_with_perf(cb, "materialize_exit trampoline", code_ptr);
+        code_ptr
+    })
+}
+
+unsafe extern "C" {
+    fn rb_zjit_materialize_frames(ec: EcPtr, cfp: CfpPtr);
+}
+
+c_callable! {
+    /// The tail every side exit shares. `meta_idx` indexes [`crate::exit_meta`]'s
+    /// table, so the exit stub only had to load a 32-bit immediate instead of
+    /// materializing `cfp->pc`, `cfp->iseq`, `cfp->sp` and the `exit_recompile`
+    /// arguments with pointer-sized immediates of its own.
+    ///
+    /// The exit stub has already written the exiting frame's Ruby stack slots and
+    /// locals (those depend on register allocation, so they cannot be shared) and
+    /// installed any older frames' JITFrames. This finishes the job in the same
+    /// order the inline code did: restore the frame's interpreter state, clear
+    /// `cfp->jit_return` so the frame is not materialized twice, profile and maybe
+    /// recompile, then materialize the JIT frames below this one.
+    pub(crate) fn rb_zjit_side_exit_from_meta(ec: EcPtr, cfp: CfpPtr, sp: *mut VALUE, meta_idx: u32) {
+        let meta = crate::exit_meta::get(meta_idx);
+        unsafe {
+            (*cfp).pc = meta.pc;
+            (*cfp)._iseq = meta.iseq;
+            (*cfp).sp = sp.add(meta.sp_offset as usize);
+            // Clearing jit_return both prepares the frame for a C call and tells
+            // rb_zjit_materialize_frames to skip this frame, which this function
+            // has just materialized by hand.
+            (*cfp).jit_return = std::ptr::null_mut();
+        }
+
+        if !meta.compiled_iseq.is_null() {
+            exit_recompile(VALUE::from(meta.compiled_iseq), VALUE::from(meta.iseq), meta.insn_idx);
+        }
+
+        unsafe {
+            // Zero is the right value because we're dealing with the top most frame.
+            // Non-zero values are only set before pushing a frame.
+            (*cfp).block_code = std::ptr::null();
+            rb_zjit_materialize_frames(ec, cfp);
+        }
+    }
+}
+
+/// Generate the trampoline every side exit jumps to. It reads the [`crate::exit_meta`]
+/// index the exit stub left in the scratch register and hands it to
+/// [`rb_zjit_side_exit_from_meta`], which restores the exiting frame and materializes
+/// the JIT frames below it. Keeping this work in one place rather than inlining it into
+/// every exit is what keeps exit stubs small.
+pub fn gen_exit_meta_trampoline(cb: &mut CodeBlock, exit_trampoline: CodePtr) -> Result<CodePtr, CompileError> {
+    let (mut asm, scratch_reg) = Assembler::new_with_scratch_reg();
+    asm.new_block_without_id("exit_meta_trampoline");
+
+    asm_comment!(asm, "restore the exiting frame and materialize ZJIT frames");
+    // The parallel move that places C call arguments needs the scratch register to
+    // break cycles, so hand it the argument register instead of the scratch register.
+    // See gen_function_stub_hit_trampoline() for the same dance.
+    asm.mov(C_ARG_OPNDS[3], scratch_reg);
+    asm_ccall!(asm, rb_zjit_side_exit_from_meta, EC, CFP, SP, C_ARG_OPNDS[3]);
+    asm.jmp(Target::CodePtr(exit_trampoline));
+
+    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+        assert_eq!(gc_offsets.len(), 0);
+        register_current_code_range_with_perf(cb, "exit_meta trampoline", code_ptr);
         code_ptr
     })
 }
