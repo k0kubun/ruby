@@ -1153,6 +1153,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
         set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
         set_stat_usize!(hash, "mem_send_cache_bytes", mem.send_cache_bytes);
+        set_stat_usize!(hash, "mem_exit_meta_bytes", mem.exit_meta_bytes);
         set_stat_usize!(hash, "mem_root_iseq_bytes", mem.root_iseq_bytes);
         set_stat_usize!(hash, "mem_dead_iseq_version_bytes", mem.dead_iseq_version_bytes);
         set_stat_usize!(hash, "mem_method_annotation_bytes", mem.method_annotation_bytes);
@@ -1169,6 +1170,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_profile_marked_object_count", mem.profile_marked_object_count);
         set_stat_usize!(hash, "mem_ivar_cache_count", mem.ivar_cache_count);
         set_stat_usize!(hash, "mem_send_cache_count", mem.send_cache_count);
+        set_stat_usize!(hash, "mem_exit_meta_count", mem.exit_meta_count);
         set_stat_usize!(hash, "mem_root_iseq_count", mem.root_iseq_count);
     }
 

@@ -75,7 +75,11 @@ pub struct MemoryBreakdown {
     /// Class tables for send sites that dispatch over more classes than an
     /// inline guard chain can cover.
     pub send_cache_bytes: usize,
-    /// The deduplicated set of ISEQs the JITFrame table references,
+    /// Interpreter state for compiled side exits. Trading these bytes for
+    /// executable ones is the point of the exercise: they used to be immediates
+    /// in the exit stubs. See [`crate::exit_meta`].
+    pub exit_meta_bytes: usize,
+    /// The deduplicated set of ISEQs the JITFrame and ExitMeta tables reference,
     /// which is what the GC mark phase walks in their place. See
     /// [`crate::gc::RootIseqs`].
     pub root_iseq_bytes: usize,
@@ -105,8 +109,10 @@ pub struct MemoryBreakdown {
     pub ivar_cache_count: usize,
     /// Number of send class tables, i.e. distinct call shapes with one.
     pub send_cache_count: usize,
+    /// Number of interned `ExitMeta` records.
+    pub exit_meta_count: usize,
     /// Number of distinct ISEQs in the root set. The ratio against
-    /// `jit_frame_count` is what deduplication saves the
+    /// `jit_frame_count + 2 * exit_meta_count` is what deduplication saves the
     /// mark phase on every collection.
     pub root_iseq_count: usize,
     /// Number of objects in the dense arrays GC marking walks, i.e. the distinct
@@ -129,6 +135,7 @@ impl MemoryBreakdown {
             + self.stats_counter_bytes
             + self.ivar_cache_bytes
             + self.send_cache_bytes
+            + self.exit_meta_bytes
             + self.root_iseq_bytes
             + self.dead_iseq_version_bytes
             + self.method_annotation_bytes
@@ -180,6 +187,10 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     out.jit_frame_count = jit_frames.len();
     out.jit_frame_bytes = jit_frames.capacity() * size_of::<*mut crate::jit_frame::JITFrame>()
         + jit_frames.iter().map(|&frame| unsafe { &*frame }.heap_size()).sum::<usize>();
+
+    let exit_metas = ZJITState::get_exit_metas();
+    out.exit_meta_count = exit_metas.len();
+    out.exit_meta_bytes = exit_metas.capacity() * size_of::<crate::exit_meta::ExitMeta>();
 
     let root_iseqs = ZJITState::get_root_iseqs();
     out.root_iseq_count = root_iseqs.len();
