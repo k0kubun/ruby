@@ -635,6 +635,17 @@ impl Assembler {
                     let src = split_stack_membase(asm, src, SCRATCH0_OPND);
                     let dest = split_stack_membase(asm, dest, SCRATCH1_OPND);
 
+                    // A special-constant VALUE (nil, true, a fixnum, ...) is not a GC
+                    // reference, so it needs no `movabs` and no GC offset: it is just an
+                    // integer immediate, and the UImm arm below folds it straight into
+                    // the store when it survives sign extension. Side exits write a lot
+                    // of constant stack and local slots, and this saves the scratch
+                    // register round trip on each of them.
+                    let src = match src {
+                        Opnd::Value(value) if !value.heap_object_p() => Opnd::UImm(value.as_u64()),
+                        _ => src,
+                    };
+
                     let src = match src {
                         Opnd::Reg(_) => src,
                         Opnd::Mem(_) => {
@@ -1106,6 +1117,13 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                // Hand exit_meta_trampoline the index of this exit's metadata. Written
+                // as a 32-bit immediate: the whole point of the indirection is that an
+                // exit stub pays 6 bytes here instead of ~45 bytes of immediates.
+                Insn::ExitMetaIndex(idx) => {
+                    mov(cb, SCRATCH0_OPND.into(), uimm_opnd(*idx as u64));
+                },
+
                 Insn::BeginOutlined => {
                     cb.set_outlined(true);
                     // The last patch point is in the other half of the region; no

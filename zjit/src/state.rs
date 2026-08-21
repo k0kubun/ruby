@@ -1,6 +1,6 @@
 //! Runtime state of ZJIT.
 
-use crate::codegen::{gen_entry_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
+use crate::codegen::{gen_entry_trampoline, gen_exit_meta_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
 use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use crate::invariants::Invariants;
 use crate::asm::CodeBlock;
 use crate::options::{get_option, rb_zjit_prepare_options};
+use crate::exit_meta::ExitMeta;
 use crate::jit_frame::{JITFrame, JITFrameAllocator};
 use crate::stats::{Counters, InsnCounters, PerfettoTracer};
 use crate::virtualmem::CodePtr;
@@ -66,6 +67,11 @@ pub struct ZJITState {
     /// Trampoline to materialize JIT frames and increment exit_compilation_failure
     materialize_exit_trampoline_with_counter: CodePtr,
 
+    /// Trampoline every side exit jumps to. Restores the exiting frame from the
+    /// [`ExitMeta`] whose index the exit stub left in the scratch register, then
+    /// materializes JIT frames. See [`crate::exit_meta`].
+    exit_meta_trampoline: CodePtr,
+
     /// Trampoline to call function_stub_hit
     function_stub_hit_trampoline: CodePtr,
 
@@ -91,6 +97,11 @@ pub struct ZJITState {
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
     jit_frame_allocator: Option<JITFrameAllocator>,
+
+    /// Interpreter state for every compiled side exit, indexed by the immediate
+    /// the exit stub loads. Kept here rather than baked into the exit stubs, which
+    /// is what makes an exit stub small. See [`crate::exit_meta`].
+    exit_metas: Vec<ExitMeta>,
 }
 
 /// Tracks the initialization progress
@@ -144,6 +155,7 @@ impl ZJITState {
         let entry_trampoline = gen_entry_trampoline(&mut cb).unwrap().raw_ptr(&cb);
         let exit_trampoline = gen_exit_trampoline(&mut cb).unwrap();
         let materialize_exit_trampoline = gen_materialize_exit_trampoline(&mut cb, exit_trampoline).unwrap();
+        let exit_meta_trampoline = gen_exit_meta_trampoline(&mut cb, exit_trampoline).unwrap();
         let function_stub_hit_trampoline = gen_function_stub_hit_trampoline(&mut cb).unwrap();
 
         let perfetto_tracer = if get_option!(trace_side_exits).is_some() || get_option!(trace_compiles) || get_option!(trace_invalidation) || get_option!(trace_fallbacks) {
@@ -164,6 +176,7 @@ impl ZJITState {
             exit_trampoline,
             materialize_exit_trampoline,
             materialize_exit_trampoline_with_counter: materialize_exit_trampoline,
+            exit_meta_trampoline,
             function_stub_hit_trampoline,
             full_frame_cfunc_counter_pointers: HashMap::new(),
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
@@ -172,6 +185,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
+            exit_metas: vec![],
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -218,6 +232,12 @@ impl ZJITState {
     /// Get a mutable reference to the JITFrame allocator
     pub fn get_jit_frame_allocator() -> Option<&'static mut JITFrameAllocator> {
         ZJITState::get_instance().jit_frame_allocator.as_mut()
+    }
+
+    /// Owner of the side-exit metadata table. Indices into it are baked into exit
+    /// stubs, so entries are append-only and never move. See [`crate::exit_meta`].
+    pub fn get_exit_metas() -> &'static mut Vec<ExitMeta> {
+        &mut ZJITState::get_instance().exit_metas
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
@@ -311,6 +331,11 @@ impl ZJITState {
     /// Return a code pointer to the side-exit trampoline
     pub fn get_exit_trampoline() -> CodePtr {
         ZJITState::get_instance().exit_trampoline
+    }
+
+    /// Return a code pointer to the trampoline every side exit jumps to
+    pub fn get_exit_meta_trampoline() -> CodePtr {
+        ZJITState::get_instance().exit_meta_trampoline
     }
 
     /// Return a code pointer to the materialize_exit trampoline

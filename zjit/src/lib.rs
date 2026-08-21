@@ -34,6 +34,7 @@ mod invariants;
 mod bitset;
 mod gc;
 mod jit_frame;
+mod exit_meta;
 mod payload;
 mod json;
 mod ttycolors;

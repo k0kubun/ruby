@@ -1571,6 +1571,12 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                // Hand exit_meta_trampoline the index of this exit's metadata.
+                // See the x86_64 backend for why this is not just a Mov.
+                Insn::ExitMetaIndex(idx) => {
+                    emit_load_value(cb, SCRATCH0_OPND.into(), *idx as u64);
+                },
+
                 Insn::BeginOutlined => {
                     cb.set_outlined(true);
                     // The last patch point is in the other half of the region; no

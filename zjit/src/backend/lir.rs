@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
 use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
+use crate::exit_meta::ExitMeta;
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
@@ -970,6 +971,13 @@ pub enum Insn {
     /// rel32 of each other, so a hot-to-cold branch is the same near jump it was
     /// when the exit was ten bytes below.
     BeginOutlined,
+    /// Load a side-exit metadata index into the register `exit_meta_trampoline`
+    /// reads it from. Emitted only as the last instruction of a side-exit stub,
+    /// where the scratch register is free and nothing after it clobbers the
+    /// register. It is an instruction rather than a `Mov` into the scratch
+    /// register because ordinary LIR is not allowed to name that register.
+    /// See [`crate::exit_meta`].
+    ExitMetaIndex(u32),
 
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
@@ -1059,6 +1067,7 @@ macro_rules! for_each_operand_impl {
             Insn::BakeString(_) |
             Insn::BoundaryPad |
             Insn::BeginOutlined |
+            Insn::ExitMetaIndex(_) |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1204,6 +1213,7 @@ impl Insn {
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
             Insn::BeginOutlined => "BeginOutlined",
+            Insn::ExitMetaIndex(_) => "ExitMetaIndex",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::Comment(_) => "Comment",
@@ -3140,8 +3150,17 @@ impl Assembler
             asm.store(jit_frame_slot, Opnd::const_ptr(jit_frame));
         }
 
-        /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
-        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
+        /// Write out the parts of the exiting frame that only this exit knows: its
+        /// Ruby stack slots and locals, which live wherever the register allocator
+        /// put them, and the JITFrames of any older inlined frames.
+        ///
+        /// `inline_frame_state` additionally materializes `cfp->pc`, `cfp->sp` and
+        /// `cfp->iseq` here with immediates. That costs ~36 bytes of executable
+        /// memory per exit, so ordinary exits leave it to `exit_meta_trampoline`,
+        /// which reads the same constants out of the [`crate::exit_meta`] table. Only
+        /// `--zjit-trace-side-exits` needs them inline, because it calls
+        /// rb_zjit_record_exit_stack from the stub and that walks the control frames.
+        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit, inline_frame_state: bool) {
             let SideExit { pc, stack, locals, iseq, stack_map, .. } = exit;
 
             // Side exit blocks are not part of the CFG at the moment,
@@ -3149,16 +3168,18 @@ impl Assembler
             // so that nobody stomps on us
             asm.boundary_pad();
 
-            asm_comment!(asm, "save cfp->pc");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
+            if inline_frame_state {
+                asm_comment!(asm, "save cfp->pc");
+                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
 
-            asm_comment!(asm, "save cfp->sp");
-            asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
+                asm_comment!(asm, "save cfp->sp");
+                asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
 
-            asm_comment!(asm, "save cfp->iseq");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
+                asm_comment!(asm, "save cfp->iseq");
+                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
+            }
 
-            // cfp->block_code and cfp->jit_return are cleared by the materialize_exit trampoline
+            // cfp->block_code and cfp->jit_return are cleared by the trampoline
 
             if !stack.is_empty() {
                 asm_comment!(asm, "write stack slots: {}", join_opnds(&stack, ", "));
@@ -3179,10 +3200,14 @@ impl Assembler
             }
         }
 
-        /// Tear down the JIT frame and return to the interpreter.
-        fn compile_exit_return(asm: &mut Assembler) {
+        /// Tear down the JIT frame and return to the interpreter through `target`.
+        ///
+        /// The register allocator on this branch hands out no callee-saved registers,
+        /// so there is nothing for an exit to restore and every exit can jump to the
+        /// trampoline directly.
+        fn compile_exit_return(asm: &mut Assembler, target: CodePtr) {
             asm_comment!(asm, "exit to the interpreter");
-            asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
+            asm.jmp(Target::CodePtr(target));
         }
 
         fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
@@ -3199,33 +3224,78 @@ impl Assembler
             }
         }
 
-        /// Compile the main side-exit code.  The side exit will optionally record a traced exit
-        /// stack, optionally trigger recompilation, and then return to the interpreter. Shared
-        /// exits pass no trace reason so they can still be deduplicated by SideExit.
-        /// IOW, we should never pass a trace reason if we expect the exit to be
-        /// deduplicated.
-        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
+        /// Intern the constants this exit hands the interpreter, so the stub can name
+        /// them with one 32-bit immediate instead of materializing each of them.
+        /// `interned` dedupes within this function: two exits that differ only in
+        /// where their stack and locals live share one record.
+        fn compile_exit_meta_index(
+            exit: &SideExit,
+            interned: &mut HashMap<ExitMeta, u32>,
+        ) -> u32 {
+            let recompile = exit.recompile.as_ref();
+            if let Some(recompile) = recompile {
+                // The recompile is gated on a fresh profile of the exiting instruction.
+                let payload = get_or_create_iseq_payload(exit.iseq);
+                payload.reset_profiles_remaining(recompile.insn_idx as YarvInsnIdx);
+                debug_assert_eq!(
+                    recompile.frame_iseq, Opnd::Value(VALUE::from(exit.iseq)),
+                    "ExitMeta::iseq doubles as exit_recompile's frame_iseq",
+                );
+            }
+            let Opnd::UImm(pc) = exit.pc else {
+                unreachable!("side exit PC should be a constant pointer, got {:?}", exit.pc)
+            };
+            let meta = ExitMeta {
+                pc: pc as *const VALUE,
+                iseq: exit.iseq,
+                compiled_iseq: match recompile {
+                    Some(SideExitRecompile { compiled_iseq: Opnd::Value(iseq), .. }) => iseq.as_iseq(),
+                    Some(recompile) => unreachable!(
+                        "recompile target should be a constant ISEQ, got {:?}", recompile.compiled_iseq
+                    ),
+                    None => std::ptr::null(),
+                },
+                sp_offset: exit.stack.len().try_into().expect("exit stack size should fit in 32 bits"),
+                insn_idx: recompile.map_or(0, |recompile| recompile.insn_idx),
+            };
+            *interned.entry(meta).or_insert_with(|| crate::exit_meta::intern(meta))
+        }
+
+        /// Compile a traced side exit. `--zjit-trace-side-exits` records the exiting
+        /// stack from the stub itself, and rb_zjit_record_exit_stack walks the control
+        /// frames, so this path has to materialize the frame's interpreter state inline
+        /// and cannot share the metadata table. Traced exits are never deduplicated, so
+        /// paying for the immediates here costs nothing outside that debug option.
+        fn compile_traced_exit(asm: &mut Assembler, exit: &SideExit, reason: SideExitReason) {
             // Save VM state before the ccall so that
             // rb_profile_frames sees valid cfp->pc and the
             // ccall doesn't clobber caller-saved registers
             // holding stack/local operands.
-            compile_exit_save_state(asm, exit);
-            if trace_reason.is_some() || exit.recompile.is_some() {
-                // Clear cfp->jit_return to prepare for a C call. Normally, cfp->jit_return
-                // is cleared by the materialize_exit trampoline, but if we're about to
-                // make a C call, we need to clear any stale JITFrame.
-                asm_comment!(asm, "clear cfp->jit_return");
-                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
-            }
-            if let Some(reason) = trace_reason {
-                // Leak a CString with the reason so it's available at runtime
-                let reason_cstr = std::ffi::CString::new(reason.to_string())
-                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
-                let reason_ptr = reason_cstr.into_raw() as *const u8;
-                asm_ccall!(asm, rb_zjit_record_exit_stack, Opnd::const_ptr(reason_ptr));
-            }
+            compile_exit_save_state(asm, exit, true);
+            // Clear cfp->jit_return to prepare for a C call, so the callee doesn't see
+            // a stale JITFrame.
+            asm_comment!(asm, "clear cfp->jit_return");
+            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
+            // Leak a CString with the reason so it's available at runtime
+            let reason_cstr = std::ffi::CString::new(reason.to_string())
+                .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
+            let reason_ptr = reason_cstr.into_raw() as *const u8;
+            asm_ccall!(asm, rb_zjit_record_exit_stack, Opnd::const_ptr(reason_ptr));
             compile_exit_recompile(asm, exit);
-            compile_exit_return(asm);
+            compile_exit_return(asm, ZJITState::get_materialize_exit_trampoline());
+        }
+
+        /// Compile the main side-exit code: write out the frame's stack and locals, then
+        /// hand `exit_meta_trampoline` the index of the constants it needs to finish the
+        /// exit. Everything an exit shares with other exits -- restoring `cfp->pc`,
+        /// `cfp->iseq` and `cfp->sp`, clearing `cfp->jit_return`, calling
+        /// `exit_recompile`, and materializing older JIT frames -- happens there instead
+        /// of here, which is what keeps this stub down to the stores it cannot share.
+        fn compile_exit(asm: &mut Assembler, exit: &SideExit, meta_idx: u32, tail: Target) {
+            compile_exit_save_state(asm, exit, false);
+            asm_comment!(asm, "exit metadata #{meta_idx}");
+            asm.push_insn(Insn::ExitMetaIndex(meta_idx));
+            asm.jmp(tail);
         }
 
         fn join_opnds(opnds: &Vec<Opnd>, delimiter: &str) -> String {
@@ -3253,6 +3323,20 @@ impl Assembler
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> = HashMap::with_capacity(targets.len());
+
+        // Map from the constants an exit restores to its index in the process-wide
+        // metadata table, so exits in this function that restore the same frame state
+        // share one record.
+        let mut interned_metas: HashMap<ExitMeta, u32> = HashMap::new();
+
+        // The tail every metadata-driven exit in this function jumps to. It restores
+        // the callee-saved registers the allocator handed out -- the same ones from the
+        // same slots for every exit, which is what makes it shareable -- and jumps to
+        // exit_meta_trampoline. When there are none to restore, exits jump straight to
+        // the trampoline instead of paying for a second jump. Created on first use, so
+        // that a function with no exits (and the trampolines compiled before ZJITState
+        // exists) never asks for the trampoline's address.
+        let mut exit_tail_target: Option<Target> = None;
 
         // Everything from here on is cold, so send it to the outlined half of the
         // code region rather than letting it split the hot code in two.
@@ -3308,7 +3392,7 @@ impl Assembler
                     }
 
                     if should_record_exit {
-                        compile_exit(self, &exit, Some(reason));
+                        compile_traced_exit(self, &exit, reason);
                     } else {
                         // If the side exit has already been compiled, jump to it.
                         // Otherwise, let it fall through and compile the exit next.
@@ -3328,7 +3412,12 @@ impl Assembler
                         let new_exit = self.new_label("side_exit");
                         self.write_label(new_exit.clone());
                         asm_comment!(self, "Exit: {}", entry.key().pc);
-                        compile_exit(self, entry.key(), None);
+                        let meta_idx = compile_exit_meta_index(entry.key(), &mut interned_metas);
+                        if exit_tail_target.is_none() {
+                            exit_tail_target = Some(Target::CodePtr(ZJITState::get_exit_meta_trampoline()));
+                        }
+                        let tail = exit_tail_target.clone().expect("just set above");
+                        compile_exit(self, entry.key(), meta_idx, tail);
                         entry.insert(new_exit.unwrap_label());
                         new_exit
                     }
@@ -3336,6 +3425,13 @@ impl Assembler
 
                 *self.basic_blocks[block_id].insns[idx].target_mut().unwrap() = counted_exit.unwrap_or(compiled_exit);
             }
+        }
+
+        // The tail metadata-driven exits share. Written last so the jumps into it are
+        // forward jumps and the exits above it stay contiguous.
+        if let Some(exit_tail @ Target::Label(_)) = exit_tail_target {
+            self.write_label(exit_tail);
+            compile_exit_return(self, ZJITState::get_exit_meta_trampoline());
         }
 
         // Measure time spent compiling side-exit LIR
