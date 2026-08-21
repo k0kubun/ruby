@@ -83,6 +83,15 @@ pub fn intern(meta: ExitMeta) -> u32 {
 }
 
 /// Look up an interned record by the index baked into an exit stub.
-pub fn get(idx: u32) -> ExitMeta {
-    ZJITState::get_exit_metas()[idx as usize]
+///
+/// This runs on every taken side exit, so it skips the bounds check: the index came
+/// out of the instruction stream of an exit that [`intern`] handed it to, and the
+/// table is append-only, so it is always in range. Compilation runs under a VM
+/// barrier (see `with_vm_lock`), so no thread can be here while [`intern`] is
+/// growing the table.
+#[inline(always)]
+pub fn get(idx: u32) -> &'static ExitMeta {
+    let metas = ZJITState::get_exit_metas();
+    debug_assert!((idx as usize) < metas.len(), "exit metadata index {idx} out of range");
+    unsafe { &*metas.as_ptr().add(idx as usize) }
 }
