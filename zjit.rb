@@ -203,6 +203,7 @@ class << RubyVM::ZJIT
       :mem_iseq_call_bytes,
       :mem_invariant_bytes,
       :mem_jit_frame_bytes,
+      :mem_exit_meta_bytes,
       :mem_code_block_bytes,
       :mem_stats_counter_bytes,
       :mem_dead_iseq_version_bytes,

@@ -65,6 +65,10 @@ pub struct MemoryBreakdown {
     pub invariant_bytes: usize,
     /// `JITFrame`s: compile-time frame metadata plus their trailing stack maps.
     pub jit_frame_bytes: usize,
+    /// `ExitMeta`s: the interpreter state each compiled side exit restores. These
+    /// bytes are the point of the exercise -- they used to be immediates in the
+    /// exit stubs, i.e. executable memory. See [`crate::exit_meta`].
+    pub exit_meta_bytes: usize,
     /// `CodeBlock` bookkeeping: label tables and (with `--zjit-dump-disasm`)
     /// assembly comments.
     pub code_block_bytes: usize,
@@ -95,6 +99,8 @@ pub struct MemoryBreakdown {
     pub patch_point_count: usize,
     /// Number of live `JITFrame`s.
     pub jit_frame_count: usize,
+    /// Number of interned `ExitMeta` records.
+    pub exit_meta_count: usize,
     /// Number of ivar shape tables, i.e. distinct ivar names with one.
     pub ivar_cache_count: usize,
 }
@@ -109,6 +115,7 @@ impl MemoryBreakdown {
             + self.iseq_call_bytes
             + self.invariant_bytes
             + self.jit_frame_bytes
+            + self.exit_meta_bytes
             + self.code_block_bytes
             + self.stats_counter_bytes
             + self.ivar_cache_bytes
@@ -166,6 +173,11 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     out.jit_frame_count = jit_frames.len();
     out.jit_frame_bytes = jit_frames.capacity() * size_of::<*mut crate::jit_frame::JITFrame>()
         + jit_frames.iter().map(|&frame| unsafe { &*frame }.heap_size()).sum::<usize>();
+
+    // Side-exit metadata, one record per distinct exit.
+    let exit_metas = ZJITState::get_exit_metas();
+    out.exit_meta_count = exit_metas.len();
+    out.exit_meta_bytes = exit_metas.capacity() * size_of::<crate::exit_meta::ExitMeta>();
 
     let ivar_caches = ZJITState::get_ivar_caches();
     out.ivar_cache_count = ivar_caches.len();
