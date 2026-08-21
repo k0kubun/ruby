@@ -97,6 +97,11 @@ pub extern "C" fn rb_zjit_root_update_references() {
     for &jit_frame in ZJITState::get_jit_frames().iter() {
         unsafe { &mut *jit_frame }.update_references();
     }
+
+    // Side-exit metadata holds raw ISEQ pointers for exits that have not run yet.
+    for meta in ZJITState::get_exit_metas().iter_mut() {
+        meta.update_references();
+    }
 }
 
 fn iseq_mark(payload: &IseqPayload) {
@@ -240,5 +245,10 @@ pub extern "C" fn rb_zjit_root_mark() {
     }
     for &jit_frame in ZJITState::get_jit_frames().iter() {
         unsafe { &*jit_frame }.mark();
+    }
+    // A side exit that has not run yet has to be able to resume into (or recompile)
+    // its ISEQ, so keep alive the ISEQs its metadata record points at.
+    for meta in ZJITState::get_exit_metas().iter() {
+        meta.mark();
     }
 }
