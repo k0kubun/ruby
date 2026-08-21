@@ -918,6 +918,18 @@ pub enum Insn {
     /// Shift a value left by a certain amount.
     LShift { opnd: Opnd, shift: Opnd, out: Opnd },
 
+    /// A set of moves that happen simultaneously: every source is read before
+    /// any destination is written. `moves` is a list of `(destination, source)`
+    /// pairs with pairwise-distinct destinations.
+    ///
+    /// This is created after register allocation, so its operands are already
+    /// physical: `Opnd::Reg`, `Opnd::Mem`, or `Opnd::Value`. It is lowered into
+    /// a sequence of ordinary moves by `{x86,arm64}_scratch_split`, which owns
+    /// the scratch registers and can therefore hand the cycle breaker a spare
+    /// register that no individual move's lowering is allowed to touch. See
+    /// [`Assembler::sequentialize_parallel_mov`].
+    ParallelMov { moves: Vec<(Opnd, Opnd)> },
+
     // A low-level mov instruction. It accepts two operands.
     Mov { dest: Opnd, src: Opnd },
 
@@ -1008,10 +1020,11 @@ macro_rules! target_for_each_operand_impl {
 }
 
 /// Macro that enumerates all operands of an Insn, dispatching to caller-provided `$visit_one`
-/// macro for a single `Opnd` field and `$visit_many` macro for a slice/`Vec` of `Opnd`s. Used by
-/// both `for_each_operand` and `for_each_operand_mut`.
+/// macro for a single `Opnd` field, `$visit_many` macro for a slice/`Vec` of `Opnd`s, and
+/// `$visit_pairs` for a slice/`Vec` of `(Opnd, Opnd)` pairs. Used by both `for_each_operand`
+/// and `for_each_operand_mut`.
 macro_rules! for_each_operand_impl {
-    ($self:expr, $visit_one:ident, $visit_many:ident, $reborrow:ident $(, $const:expr)?) => {
+    ($self:expr, $visit_one:ident, $visit_many:ident, $visit_pairs:ident, $reborrow:ident $(, $const:expr)?) => {
         match $self {
             Insn::Jbe(target) |
             Insn::Jb(target) |
@@ -1092,6 +1105,9 @@ macro_rules! for_each_operand_impl {
                 visit_one!(opnd0);
                 visit_one!(opnd1);
             }
+            Insn::ParallelMov { moves } => {
+                visit_pairs!(moves);
+            }
             Insn::CCall { data } => {
                 visit_many!(data.opnds);
                 // `data` is behind a Box. `$reborrow` turns the box field into a `&`/`&mut
@@ -1129,26 +1145,29 @@ impl Insn {
     pub fn for_each_operand(&self, mut f: impl FnMut(Opnd)) {
         macro_rules! visit_one { ($id:expr) => { f(*$id) }; }
         macro_rules! visit_many { ($s:expr) => { for id in ($s).iter() { f(*id) } }; }
+        macro_rules! visit_pairs { ($s:expr) => { for (a, b) in ($s).iter() { f(*a); f(*b) } }; }
         macro_rules! reborrow { ($e:expr) => { & $e }; }
         // Extra () is a throw-away parameter to avoid iterating over FrameSetup/FrameTeardown
         // preserved in the mutable iterator.
-        for_each_operand_impl!(self, visit_one, visit_many, reborrow, ());
+        for_each_operand_impl!(self, visit_one, visit_many, visit_pairs, reborrow, ());
     }
 
     /// Call `f` on a mutable reference to each operand (Opnd) of this instruction.
     pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Opnd)) {
         macro_rules! visit_one { ($id:expr) => { f($id) }; }
         macro_rules! visit_many { ($s:expr) => { for id in ($s).iter_mut() { f(id) } }; }
+        macro_rules! visit_pairs { ($s:expr) => { for (a, b) in ($s).iter_mut() { f(a); f(b) } }; }
         macro_rules! reborrow { ($e:expr) => { &mut $e }; }
-        for_each_operand_impl!(self, visit_one, visit_many, reborrow);
+        for_each_operand_impl!(self, visit_one, visit_many, visit_pairs, reborrow);
     }
 
     /// Call `f` on each operand, short-circuiting on the first error.
     pub fn try_for_each_operand<E>(&self, mut f: impl FnMut(Opnd) -> Result<(), E>) -> Result<(), E> {
         macro_rules! visit_one { ($id:expr) => { f(*$id)? }; }
         macro_rules! visit_many { ($s:expr) => { for id in ($s).iter() { f(*id)? } }; }
+        macro_rules! visit_pairs { ($s:expr) => { for (a, b) in ($s).iter() { f(*a)?; f(*b)? } }; }
         macro_rules! reborrow { ($e:expr) => { & $e }; }
-        for_each_operand_impl!(self, visit_one, visit_many, reborrow, ());
+        for_each_operand_impl!(self, visit_one, visit_many, visit_pairs, reborrow, ());
         Ok(())
     }
 
@@ -1230,6 +1249,7 @@ impl Insn {
             Insn::LoadInto { .. } => "LoadInto",
             Insn::LoadSExt { .. } => "LoadSExt",
             Insn::LShift { .. } => "LShift",
+            Insn::ParallelMov { .. } => "ParallelMov",
             Insn::Mov { .. } => "Mov",
             Insn::Not { .. } => "Not",
             Insn::Or { .. } => "Or",
@@ -2222,6 +2242,74 @@ impl Assembler
         Target::Label(label)
     }
 
+    /// Sequentialize an [`Insn::ParallelMov`] into an ordered list of `(destination, source)`
+    /// moves, using `spare` to break copy cycles.
+    ///
+    /// This must be called from the scratch-split pass, because `spare` has to be a register
+    /// that no *individual* move's lowering is allowed to touch: the value of a cycle member
+    /// stays parked in `spare` from the move that fills it until the move that drains it, and
+    /// every move of the cycle is emitted in between. Handing out a register that the lowering
+    /// also uses as an intra-instruction temporary silently corrupts the parked value (this is
+    /// exactly what happened when `resolve_ssa` parked in `SCRATCH_REG`, which is also the
+    /// register `{x86,arm64}_scratch_split` stages memory-to-memory moves through).
+    ///
+    /// The debug assertions below check the property that makes a *single* extra register
+    /// enough. Operands whose lowering needs a scratch register of its own -- a memory operand
+    /// reached through a spilled base pointer ([`MemBase::StackIndirect`]), a memory operand
+    /// with a displacement too large for the instruction encoding, or a wide immediate -- are
+    /// never both a source and a destination of the same parallel copy: destinations are always
+    /// register-allocator locations, i.e. [`Opnd::Reg`] or [`MemBase::Stack`] slots. So such an
+    /// operand can never be a cycle member, and Boissin's algorithm 13 drains every available
+    /// (non-cycle) copy before it breaks a cycle, so those moves are all emitted outside any
+    /// park window.
+    pub(super) fn sequentialize_parallel_mov(moves: &[(Opnd, Opnd)], spare: Opnd) -> Vec<(Opnd, Opnd)> {
+        use crate::backend::parcopy;
+
+        let copies: Vec<parcopy::RegisterCopy<Opnd>> = moves.iter()
+            .filter(|(dest, src)| dest != src)
+            .map(|&(dest, src)| parcopy::RegisterCopy { destination: dest, source: src })
+            .collect();
+        debug_assert!(copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
+            "parcopy must operate on physical locations, not VRegs: {moves:?}");
+        debug_assert!(copies.iter().all(|c| !Self::has_reg(c.source, spare.unwrap_reg()) && !Self::has_reg(c.destination, spare.unwrap_reg())),
+            "the parallel-copy spare {spare:?} must not be named by any copy: {moves:?}");
+
+        let sequentialized = parcopy::sequentialize_register(&copies, spare);
+
+        #[cfg(debug_assertions)]
+        {
+            // True while the value of a cycle member is parked in `spare`.
+            let mut parked = false;
+            for copy in &sequentialized {
+                if parked {
+                    // Inside a park window, only cycle members are emitted, and cycle
+                    // members are register-allocator locations whose lowering needs no
+                    // scratch register beyond the intra-instruction ones. This includes
+                    // the move that drains the park: its destination is lowered before
+                    // the spare is read, so it cannot need the spare either.
+                    for opnd in [copy.source, copy.destination] {
+                        debug_assert!(
+                            opnd == spare
+                                || matches!(opnd, Opnd::Reg(_) | Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. })),
+                            "{opnd:?} was emitted while a parallel-copy cycle is parked in {spare:?}, \
+                             but its lowering may need a scratch register: {moves:?}"
+                        );
+                    }
+                    if copy.source == spare {
+                        parked = false;
+                    }
+                }
+                if copy.destination == spare {
+                    debug_assert!(!parked, "nested parallel-copy parks in {spare:?}: {moves:?}");
+                    parked = true;
+                }
+            }
+            debug_assert!(!parked, "parallel-copy cycle left parked in {spare:?}: {moves:?}");
+        }
+
+        sequentialized.into_iter().map(|copy| (copy.destination, copy.source)).collect()
+    }
+
     // Shuffle register moves, sometimes adding extra moves using scratch_reg,
     // so that they will not rewrite each other before they are used.
     pub fn resolve_parallel_moves(old_moves: &[(Opnd, Opnd)], scratch_opnd: Option<Opnd>) -> Option<Vec<(Opnd, Opnd)>> {
@@ -2485,9 +2573,6 @@ impl Assembler
     /// at block boundaries. This is SSA deconstruction: after linear_scan assigns
     /// registers/stack slots, we lower block parameter passing to explicit moves.
     pub fn resolve_ssa(&mut self, intervals: &[Interval], regs: &RegPool) {
-        use crate::backend::parcopy;
-        use crate::backend::current::SCRATCH_REG;
-
         // Count predecessors for each block
         let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
         let block_order = self.block_order();
@@ -2512,36 +2597,28 @@ impl Assembler
                 let params = self.basic_blocks[successor.0].parameters.clone();
 
                 // Build the list of register-to-register copies and immediate moves.
-                // Rewrite VRegs to physical registers BEFORE sequentialization so
-                // the parcopy algorithm can see real physical register conflicts.
-                let reg_copies: Vec<parcopy::RegisterCopy<Opnd>> = edge.args
+                // Rewrite VRegs to physical registers BEFORE building the copy set so
+                // that the parcopy algorithm can see real physical register conflicts.
+                //
+                // These copies are parallel: they are carried as a single
+                // Insn::ParallelMov and sequentialized by the scratch-split pass, which
+                // owns the scratch registers and can pick a cycle-breaking spare that no
+                // individual move's lowering touches. See sequentialize_parallel_mov().
+                let moves: Vec<(Opnd, Opnd)> = edge.args
                     .iter()
                     .zip(params.iter())
                     .filter(|(_arg, param)| intervals[param.vreg_idx()].assigned.get().is_some() )
-                    .map(|(arg, param)| parcopy::RegisterCopy::<Opnd> {
-                        destination: Self::rewritten_opnd(*param, intervals, regs),
-                        source: Self::rewritten_opnd(*arg, intervals, regs),
-                    })
-                    .filter(|copy| copy.source != copy.destination)
-                    .collect();
-
-                // Sequentialize register copies.
-                // Copies must use physical registers, not VRegs, so the
-                // parcopy algorithm can detect physical register conflicts.
-                debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
-                    "parcopy must operate on physical registers, not VRegs");
-                let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
-                let moves: Vec<Insn> = sequentialized
-                    .iter()
-                    .map(|copy| match copy.source {
-                        Opnd::Value(_) => Insn::LoadInto { dest: copy.destination, opnd: copy.source },
-                        _ => Insn::Mov { dest: copy.destination, src: copy.source },
-                    })
+                    .map(|(arg, param)| (
+                        Self::rewritten_opnd(*param, intervals, regs),
+                        Self::rewritten_opnd(*arg, intervals, regs),
+                    ))
+                    .filter(|(dest, src)| dest != src)
                     .collect();
 
                 if moves.is_empty() {
                     continue;
                 }
+                let parallel_mov = Insn::ParallelMov { moves };
 
                 let num_preds = *num_predecessors.get(&successor).unwrap_or(&0);
                 if num_preds > 1 && num_successors > 1 {
@@ -2549,9 +2626,7 @@ impl Assembler
                     let new_block_id = self.new_block(pred_hir_block_id, false, pred_rpo_index);
                     let label = self.new_label("split");
                     self.basic_blocks[new_block_id.0].push_insn(Insn::Label(label));
-                    for mov in moves {
-                        self.basic_blocks[new_block_id.0].push_insn(mov);
-                    }
+                    self.basic_blocks[new_block_id.0].push_insn(parallel_mov);
                     self.basic_blocks[new_block_id.0].push_insn(Insn::Jmp(Target::Block(Box::new(BranchEdge {
                         target: successor,
                         args: vec![],
@@ -2572,18 +2647,14 @@ impl Assembler
                     }
                 } else if num_successors > 1 {
                     // Multi-succ: insert at start of successor (after Label)
-                    for (i, mov) in moves.into_iter().enumerate() {
-                        self.basic_blocks[successor.0].insns.insert(1 + i, mov);
-                        self.basic_blocks[successor.0].insn_ids.insert(1 + i, None);
-                    }
+                    self.basic_blocks[successor.0].insns.insert(1, parallel_mov);
+                    self.basic_blocks[successor.0].insn_ids.insert(1, None);
                 } else {
                     assert_eq!(num_successors, 1);
                     // Single-succ: insert at end of predecessor before terminator
                     let len = self.basic_blocks[pred_id.0].insns.len();
-                    for (i, mov) in moves.into_iter().enumerate() {
-                        self.basic_blocks[pred_id.0].insns.insert(len - 1 + i, mov);
-                        self.basic_blocks[pred_id.0].insn_ids.insert(len - 1 + i, None);
-                    }
+                    self.basic_blocks[pred_id.0].insns.insert(len - 1, parallel_mov);
+                    self.basic_blocks[pred_id.0].insn_ids.insert(len - 1, None);
                 }
             }
         }
@@ -2595,35 +2666,24 @@ impl Assembler
             if self.basic_blocks[block_id.0].is_dummy() { continue; }
             let params = self.basic_blocks[block_id.0].parameters.clone();
 
-            // Rewrite VRegs to physical registers or stack slots before sequentialization
-            // so the parcopy algorithm can detect conflicts between them.
-            let copies: Vec<parcopy::RegisterCopy<Opnd>> = params.iter().enumerate()
-                .map(|(i, param)| parcopy::RegisterCopy::<Opnd> {
-                    source: match c_arg_location(i) {
+            // Rewrite VRegs to physical registers or stack slots before building the copy
+            // set so the parcopy algorithm can detect conflicts between them. As with edge
+            // copies above, these are carried as one Insn::ParallelMov and sequentialized
+            // by the scratch-split pass.
+            let moves: Vec<(Opnd, Opnd)> = params.iter().enumerate()
+                .map(|(i, param)| (
+                    Self::rewritten_opnd(*param, intervals, regs),
+                    match c_arg_location(i) {
                         CArgLocation::Reg(reg) => reg,
                         CArgLocation::StackSlot(slot) => Opnd::mem(64, NATIVE_BASE_PTR, Self::frame_size() + slot as i32 * SIZEOF_VALUE_I32),
                     },
-                    destination: Self::rewritten_opnd(*param, intervals, regs),
-                })
-                .filter(|copy| copy.source != copy.destination)
+                ))
+                .filter(|(dest, src)| dest != src)
                 .collect();
 
-            debug_assert!(copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
-                "parcopy must operate on physical locations, not VRegs");
-            let sequentialized = parcopy::sequentialize_register(&copies, Opnd::Reg(SCRATCH_REG));
-            let moves: Vec<Insn> = sequentialized
-                .iter()
-                .map(|copy| match copy.source {
-                    Opnd::Value(_) => Insn::LoadInto {
-                        dest: copy.destination,
-                        opnd: copy.source,
-                    },
-                    _ => Insn::Mov {
-                        dest: copy.destination,
-                        src: copy.source,
-                    },
-                })
-                .collect();
+            if moves.is_empty() {
+                continue;
+            }
 
             // Find the position after FrameSetup to insert moves. They must come
             // after FrameSetup (not before) because spilled destinations and
@@ -2635,15 +2695,13 @@ impl Assembler
                 .or_else(|| self.basic_blocks[block_id.0].insns.iter().position(|insn| matches!(insn, Insn::Label(_))).map(|idx| idx + 1))
                 .unwrap_or(0);
 
-            for (i, mov) in moves.into_iter().enumerate() {
-                self.basic_blocks[block_id.0].insns.insert(insert_pos + i, mov);
-                self.basic_blocks[block_id.0].insn_ids.insert(insert_pos + i, None);
-            }
+            self.basic_blocks[block_id.0].insns.insert(insert_pos, Insn::ParallelMov { moves });
+            self.basic_blocks[block_id.0].insn_ids.insert(insert_pos, None);
         }
 
-        // Clear edge args on all branch instructions since the moves have been
-        // materialized as explicit Mov instructions. This prevents
-        // linearize_instructions from generating redundant ParallelMov instructions.
+        // Clear edge args on all branch instructions since the copies have been
+        // materialized as explicit ParallelMov instructions. This prevents
+        // linearize_instructions from generating redundant moves.
         for block_id in &block_order {
             for insn in &mut self.basic_blocks[block_id.0].insns {
                 if let Some(Target::Block(edge)) = insn.target_mut() {
@@ -2672,7 +2730,6 @@ impl Assembler
         alloc_regs: &RegPool,
         c_arg_regs: &[Reg],
     ) {
-        use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, NATIVE_STACK_PTR};
 
         for block_id in self.block_order() {
@@ -2808,27 +2865,23 @@ impl Assembler
 
                     // Extract arguments from CCall, clear opnds
 
-                    // Sequentialize argument moves: each arg goes to c_arg_regs[i].
-                    // zip() drops the stack arguments handled above.
-                    let reg_copies: Vec<parcopy::RegisterCopy<Opnd>> = opnds
+                    // Argument moves: each arg goes to c_arg_regs[i]. They happen in
+                    // parallel (an argument register may still hold another argument's
+                    // value), so they are carried as one Insn::ParallelMov and
+                    // sequentialized by the scratch-split pass, which owns the scratch
+                    // registers. zip() drops the stack arguments handled above.
+                    let moves: Vec<(Opnd, Opnd)> = opnds
                         .iter()
                         .zip(c_arg_regs.iter())
-                        .map(|(arg, param)| parcopy::RegisterCopy::<Opnd> {
-                            destination: Opnd::Reg(*param),
-                            source: Self::rewritten_opnd(*arg, intervals, alloc_regs),
-                        })
-                        .filter(|copy| copy.source != copy.destination)
+                        .map(|(arg, param)| (
+                            Opnd::Reg(*param),
+                            Self::rewritten_opnd(*arg, intervals, alloc_regs),
+                        ))
+                        .filter(|(dest, src)| dest != src)
                         .collect();
 
-                    debug_assert!(reg_copies.iter().all(|c| !c.source.is_vreg() && !c.destination.is_vreg()),
-                        "parcopy must operate on physical registers, not VRegs");
-                    let sequentialized = parcopy::sequentialize_register(&reg_copies, Opnd::Reg(SCRATCH_REG));
-
-                    for copy in sequentialized {
-                        new_insns.push(match copy.source {
-                            Opnd::Value(_) => Insn::LoadInto { dest: copy.destination, opnd: copy.source },
-                            _ => Insn::Mov { dest: copy.destination, src: copy.source },
-                        });
+                    if !moves.is_empty() {
+                        new_insns.push(Insn::ParallelMov { moves });
                         new_ids.push(None);
                     }
 
@@ -3718,6 +3771,13 @@ fn format_insn_compact(asm: &Assembler, insn: &Insn) -> String {
             }
             _ => {}
         }
+    } else if let Insn::ParallelMov { moves } = insn {
+        // Print operands with a special syntax for ParallelMov
+        let mut sep = "";
+        for (dest, src) in moves {
+            output.push_str(&format!("{sep}{dest} <- {src}"));
+            sep = ", ";
+        }
     } else if insn.opnd_count() > 0 {
         let mut sep = "";
         insn.for_each_operand(|opnd| {
@@ -3846,6 +3906,13 @@ impl fmt::Display for Assembler {
                                     write!(f, ", {opnd}")?;
                                 }
                                 _ => {}
+                            }
+                        } else if let Insn::ParallelMov { moves } = insn {
+                            // Print operands with a special syntax for ParallelMov
+                            let mut sep = " ";
+                            for (dest, src) in moves {
+                                write!(f, "{sep}{dest} <- {src}")?;
+                                sep = ", ";
                             }
                         } else if insn.opnd_count() > 0 {
                             let mut sep = " ";
@@ -4359,7 +4426,7 @@ impl Assembler {
         // Create one giant block to linearize everything into
         asm_local.new_block_without_id("linearized");
 
-        // Get linearized instructions with branch parameters expanded into ParallelMov
+        // Get linearized instructions
         let linearized_insns = self.linearize_instructions();
 
         // TODO: Aaron, this could be better. We don't need to do this, FIXME
@@ -4371,6 +4438,26 @@ impl Assembler {
                         asm_local.push_insn(insn);
                     }
                 },
+                // This Assembler has no scratch register to spare -- the trampoline that
+                // created it owns SCRATCH0 -- so we can only sequentialize copy sets that
+                // don't need one, i.e. those without a cycle. Trampolines pass a fixed set
+                // of arguments to a single ccall and never spill, so a cycle here would be
+                // a bug in the trampoline: it would have to be resolved by giving the
+                // trampoline a second scratch register.
+                Insn::ParallelMov { ref moves } => {
+                    let Some(moves) = Self::resolve_parallel_moves(moves, None) else {
+                        panic!("{insn:?} has a copy cycle, but this Assembler has no spare register to break it with");
+                    };
+                    for (dest, src) in moves {
+                        if src == dest {
+                            continue;
+                        }
+                        asm_local.push_insn(match src {
+                            Opnd::Value(_) => Insn::LoadInto { dest, opnd: src },
+                            _ => Insn::Mov { dest, src },
+                        });
+                    }
+                }
                 _ => {
                     asm_local.push_insn(insn);
                 }
@@ -5091,20 +5178,20 @@ mod tests {
 
         // Edge b1->b2 (single succ): args=[UImm(1), v1], params=[v2, v3]
         // v1->Reg(1), v2->Reg(1), v3->Reg(2)
-        // Reg copy: Reg(1)->Reg(2) -> Mov(regs[2], regs[1])
-        // Imm move: Mov(regs[1], UImm(1))
-        // Inserted in b1 before Jmp: [Label, Mov, Mov, Jmp]
+        // Reg copy: Reg(1)->Reg(2), immediate copy: Reg(1)<-UImm(1). Both are carried by
+        // one ParallelMov inserted in b1 before Jmp: [Label, ParallelMov, Jmp]
         let b1_insns = &asm.basic_blocks[b1.0].insns;
-        assert_eq!(b1_insns.len(), 4);
-        assert!(matches!(&b1_insns[1], Insn::Mov { dest, src }
-            if *dest == Opnd::Reg(regs[2]) && *src == Opnd::Reg(regs[1])));
-        assert!(matches!(&b1_insns[2], Insn::Mov { dest, src }
-            if *dest == Opnd::Reg(regs[1]) && *src == Opnd::UImm(1)));
+        assert_eq!(b1_insns.len(), 3);
+        assert!(matches!(&b1_insns[1], Insn::ParallelMov { moves }
+            if *moves == vec![
+                (Opnd::Reg(regs[1]), Opnd::UImm(1)),
+                (Opnd::Reg(regs[2]), Opnd::Reg(regs[1])),
+            ]));
 
         // Edge b3->b2 (single succ): args=[v4, v5], params=[v2, v3]
         // v4->Reg(1), v5->Reg(2), v2->Reg(1), v3->Reg(2)
-        // Reg(1)->Reg(1) and Reg(2)->Reg(2) are both self-moves, filtered, so
-        // this edge needs no moves at all: [Label, Mul, Sub, Jmp]
+        // Reg(1)->Reg(1) and Reg(2)->Reg(2) are both self-copies, filtered, so
+        // this edge needs no ParallelMov at all: [Label, Mul, Sub, Jmp]
         let b3_insns = &asm.basic_blocks[b3.0].insns;
         assert_eq!(b3_insns.len(), 4);
         assert!(matches!(&b3_insns[3], Insn::Jmp(..)));
@@ -5137,19 +5224,18 @@ mod tests {
 
         asm.resolve_ssa(&intervals, &regs);
 
-        // After resolve_ssa, b1 should still have the same number of insns
-        // (plus any edge moves, but no entry param moves since they're all self-moves).
-        // Edge b1->b2 inserts 2 moves before Jmp: [Label, Mov, Mov, Jmp] = 4 insns
-        // No additional entry param moves.
+        // After resolve_ssa, b1 gains only the edge copies: since every entry parameter
+        // arrives in the register it was allocated to, the entry ParallelMov is empty and
+        // is not inserted at all. Edge b1->b2 inserts one ParallelMov before Jmp:
+        // [Label, ParallelMov, Jmp] = 3 insns
         let b1_insns = &asm.basic_blocks[b1.0].insns;
-        assert_eq!(b1_insns.len(), 4);
-        // Verify the moves are edge moves (not entry param moves)
-        assert!(matches!(&b1_insns[1], Insn::Mov { .. }));
-        assert!(matches!(&b1_insns[2], Insn::Mov { .. }));
+        assert_eq!(b1_insns.len(), 3);
+        // Verify the copies are edge copies (not entry param copies)
+        assert!(matches!(&b1_insns[1], Insn::ParallelMov { moves } if moves.len() == 2));
 
-        // After resolve_ssa, edge args are cleared since the moves have been
-        // materialized as explicit Mov instructions.
-        if let Insn::Jmp(Target::Block(edge)) = &b1_insns[3] {
+        // After resolve_ssa, edge args are cleared since the copies have been
+        // materialized as an explicit ParallelMov instruction.
+        if let Insn::Jmp(Target::Block(edge)) = &b1_insns[2] {
             assert!(edge.args.is_empty(), "Edge args should be cleared after resolve_ssa");
         } else {
             panic!("Expected Jmp at end of b1");
@@ -5194,7 +5280,8 @@ mod tests {
         assert!(!insns.iter().any(|insn| matches!(insn, Insn::Abort)), "no entry should abort");
         let expected_src = Opnd::mem(64, NATIVE_BASE_PTR, Assembler::frame_size());
         assert!(
-            insns.iter().any(|insn| matches!(insn, Insn::Mov { src, .. } if *src == expected_src)),
+            insns.iter().any(|insn| matches!(insn, Insn::ParallelMov { moves }
+                if moves.iter().any(|&(_dest, src)| src == expected_src))),
             "expected a load from {expected_src:?}, got: {insns:?}"
         );
     }
@@ -5276,7 +5363,7 @@ mod tests {
             panic!("Expected Jmp at end of b1");
         }
 
-        // The split block should contain: Label, Mov(s), Jmp(b3)
+        // The split block should contain: Label, ParallelMov, Jmp(b3)
         let split_insns = &asm.basic_blocks[split_block_id.0].insns;
         assert!(matches!(&split_insns[0], Insn::Label(_)));
         let split_last = split_insns.last().unwrap();
@@ -5287,17 +5374,17 @@ mod tests {
             panic!("Expected Jmp(b3) at end of split block");
         }
 
-        // The split block should have a Mov for v1->v4
-        let has_mov = split_insns.iter().any(|insn| matches!(insn, Insn::Mov { .. }));
-        assert!(has_mov, "Expected Mov in split block for v1->v4");
+        // The split block should have a copy for v1->v4
+        let has_copy = split_insns.iter().any(|insn| matches!(insn, Insn::ParallelMov { .. }));
+        assert!(has_copy, "Expected ParallelMov in split block for v1->v4");
 
-        // b2->b3 is not a critical edge (b2 has single succ), so moves go before Jmp in b2
+        // b2->b3 is not a critical edge (b2 has single succ), so copies go before Jmp in b2
         let v3_alloc = intervals[v3.vreg_idx()].assigned.get().unwrap();
         let b2_insns = &asm.basic_blocks[b2.0].insns;
         if v3_alloc != v4_alloc {
-            // Check that a Mov was inserted before the Jmp in b2
+            // Check that a ParallelMov was inserted before the Jmp in b2
             let second_last = &b2_insns[b2_insns.len() - 2];
-            assert!(matches!(second_last, Insn::Mov { .. }), "Expected Mov before Jmp in b2");
+            assert!(matches!(second_last, Insn::ParallelMov { .. }), "Expected ParallelMov before Jmp in b2");
         }
     }
 

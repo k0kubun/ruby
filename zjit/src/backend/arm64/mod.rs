@@ -170,7 +170,7 @@ fn emit_load_value(cb: &mut CodeBlock, rd: A64Opnd, value: u64) -> usize {
 }
 
 /// List of registers that can be used for register allocation.
-/// SCRATCH_OPND, SCRATCH1_OPND, and EMIT_OPND are excluded.
+/// SCRATCH0_OPND, SCRATCH1_OPND, SCRATCH2_OPND, and EMIT_OPND are excluded.
 pub const ALLOC_REGS: &[Reg] = &[
     X0_REG,
     X1_REG,
@@ -186,13 +186,20 @@ pub const ALLOC_REGS: &[Reg] = &[
 
 /// Special scratch registers for intermediate processing. They should be used only by
 /// [`Assembler::arm64_scratch_split`] or [`Assembler::new_with_scratch_reg`].
+///
+/// SCRATCH0 and SCRATCH1 stage the operands of a single instruction, so their values never
+/// survive one instruction. SCRATCH2 is the spare [`Insn::ParallelMov`] breaks copy cycles
+/// with, which has to outlive the individual moves of a cycle -- see the ParallelMov arm of
+/// [`Assembler::arm64_scratch_split`] for why it can be neither of the other two nor
+/// [`Assembler::EMIT_REG`].
 const SCRATCH0_OPND: Opnd = Opnd::Reg(X15_REG);
 const SCRATCH1_OPND: Opnd = Opnd::Reg(X17_REG);
-
-/// A scratch register available for use by resolve_ssa to break register copy cycles.
-/// Must not overlap with ALLOC_REGS or other preserved registers.
-pub const SCRATCH_REG: Reg = X15_REG;
 const SCRATCH2_OPND: Opnd = Opnd::Reg(X14_REG);
+
+/// A scratch register available after register allocation, e.g. to hold a CCall result
+/// across the caller-saved register restores. Must not overlap with ALLOC_REGS or other
+/// preserved registers.
+pub const SCRATCH_REG: Reg = X15_REG;
 
 impl Assembler {
     const MAX_FRAME_STACK_SLOTS: usize = 2048;
@@ -730,6 +737,29 @@ impl Assembler {
             }
         }
 
+        /// Lower a single move (`Insn::Mov`, `Insn::LoadInto`), which may move between two
+        /// stack slots. arm64 has no memory-to-memory move, so a memory destination becomes
+        /// a Store, whose memory source arm64_emit carries through EMIT_REG.
+        fn lower_mov(asm: &mut Assembler, dest: Opnd, src: Opnd) {
+            let src = split_stack_membase(asm, src, SCRATCH0_OPND);
+            let dest = split_stack_membase(asm, dest, SCRATCH1_OPND);
+            match dest {
+                Opnd::Mem(_) => {
+                    // If NATIVE_STACK_PTR is used as a source for Store, it's handled as xzr, storeing zero.
+                    // To save the content of NATIVE_STACK_PTR, we need to load it into another register first.
+                    let src = if src == NATIVE_STACK_PTR {
+                        asm.load_into(SCRATCH0_OPND, NATIVE_STACK_PTR);
+                        SCRATCH0_OPND
+                    } else {
+                        src
+                    };
+                    asm.store(dest, src);
+                }
+                Opnd::Reg(_) => asm.load_into(dest, src),
+                _ => asm.push_insn(Insn::Mov { dest, src }),
+            }
+        }
+
         let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
         asm_local.accept_scratch_reg = true;
 
@@ -738,7 +768,7 @@ impl Assembler {
 
         let asm = &mut asm_local;
 
-        // Get linearized instructions with branch parameters expanded into ParallelMov
+        // Get linearized instructions
         let linearized_insns = self.linearize_instructions();
 
         // Process each linearized instruction
@@ -881,13 +911,21 @@ impl Assembler {
                     *src = split_stack_membase(asm, *src, SCRATCH1_OPND);
                     asm.push_insn(insn);
                 }
-                Insn::Mov { dest, src } => {
-                    *src = split_stack_membase(asm, *src, SCRATCH0_OPND);
-                    *dest = split_stack_membase(asm, *dest, SCRATCH1_OPND);
-                    match dest {
-                        Opnd::Reg(_) => asm.load_into(*dest, *src),
-                        Opnd::Mem(_) => asm.store(*dest, *src),
-                        _ => asm.push_insn(insn),
+                &mut Insn::Mov { dest, src } => {
+                    lower_mov(asm, dest, src);
+                }
+                // Sequentialize a set of parallel copies and lower each resulting move.
+                //
+                // The cycle breaker gets SCRATCH2 as its spare because the value it parks
+                // there has to survive every remaining move of the cycle, and all three
+                // other scratch registers are claimed by individual move lowerings:
+                // SCRATCH0 stages a memory source, SCRATCH1 materializes a far-displacement
+                // destination address in split_large_disp(), and arm64_emit carries the
+                // memory source of a Store through EMIT_REG. Nothing keeps a value in
+                // SCRATCH2 across instructions, so the park is safe there.
+                Insn::ParallelMov { moves } => {
+                    for (dest, src) in Assembler::sequentialize_parallel_mov(moves, SCRATCH2_OPND) {
+                        lower_mov(asm, dest, src);
                     }
                 }
                 &mut Insn::PatchPoint(ref data) => {
@@ -1559,6 +1597,8 @@ impl Assembler {
                 Insn::Jonz(opnd, target) => {
                     emit_cmp_zero_jump(cb, opnd.into(), false, target.clone());
                 },
+                Insn::ParallelMov { .. } => unreachable!("ParallelMov should have been lowered by arm64_scratch_split or resolve_parallel_mov_pass"),
+
                 Insn::PatchPoint(..) => unreachable!("PatchPoint should have been lowered to PatchPointPad in arm64_scratch_split"),
                 Insn::PatchPointPad => {
                     emit_pad_after_patch_point(cb, last_patch_pos);
@@ -2780,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_no_cycle() {
+    fn test_ccall_parallel_mov_no_cycle() {
         let (mut asm, mut cb) = setup_asm();
 
         asm.ccall(0 as _, vec![
@@ -2797,7 +2837,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_single_cycle() {
+    fn test_ccall_parallel_mov_single_cycle() {
         let (mut asm, mut cb) = setup_asm();
 
         // x0 and x1 form a cycle
@@ -2809,17 +2849,17 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-            0x0: mov x15, x0
+            0x0: mov x14, x0
             0x4: mov x0, x1
-            0x8: mov x1, x15
+            0x8: mov x1, x14
             0xc: mov x16, #0
             0x10: blr x16
         ");
-        assert_snapshot!(cb.hexdump(), @"ef0300aae00301aae1030faa100080d200023fd6");
+        assert_snapshot!(cb.hexdump(), @"ee0300aae00301aae1030eaa100080d200023fd6");
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_two_cycles() {
+    fn test_ccall_parallel_mov_two_cycles() {
         let (mut asm, mut cb) = setup_asm();
 
         // x0 and x1 form a cycle, and x2 and rcx form another cycle
@@ -2832,16 +2872,16 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-        0x0: mov x15, x0
+        0x0: mov x14, x0
         0x4: mov x0, x1
-        0x8: mov x1, x15
-        0xc: mov x15, x2
+        0x8: mov x1, x14
+        0xc: mov x14, x2
         0x10: mov x2, x3
-        0x14: mov x3, x15
+        0x14: mov x3, x14
         0x18: mov x16, #0
         0x1c: blr x16
         ");
-        assert_snapshot!(cb.hexdump(), @"ef0300aae00301aae1030faaef0302aae20303aae3030faa100080d200023fd6");
+        assert_snapshot!(cb.hexdump(), @"ee0300aae00301aae1030eaaee0302aae20303aae3030eaa100080d200023fd6");
     }
 
     #[test]
@@ -2913,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_large_cycle() {
+    fn test_ccall_parallel_mov_large_cycle() {
         let (mut asm, mut cb) = setup_asm();
 
         // x0, x1, and x2 form a cycle
@@ -2925,14 +2965,14 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-            0x0: mov x15, x0
+            0x0: mov x14, x0
             0x4: mov x0, x1
             0x8: mov x1, x2
-            0xc: mov x2, x15
+            0xc: mov x2, x14
             0x10: mov x16, #0
             0x14: blr x16
         ");
-        assert_snapshot!(cb.hexdump(), @"ef0300aae00301aae10302aae2030faa100080d200023fd6");
+        assert_snapshot!(cb.hexdump(), @"ee0300aae00301aae10302aae2030eaa100080d200023fd6");
     }
 
     #[test]

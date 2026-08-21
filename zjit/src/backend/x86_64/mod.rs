@@ -102,13 +102,20 @@ pub const ALLOC_REGS: &[Reg] = &[
     RAX_REG,
 ];
 
-/// Special scratch register for intermediate processing. It should be used only by
+/// Special scratch registers for intermediate processing. They should be used only by
 /// [`Assembler::x86_scratch_split`] or [`Assembler::new_with_scratch_reg`].
+///
+/// SCRATCH0 is the general staging register: individual move lowerings carry a
+/// memory-to-memory move through it, so its value never survives one instruction.
+/// SCRATCH1 is used for the second operand of an instruction that needs two, and it is
+/// the spare [`Insn::ParallelMov`] breaks copy cycles with -- see the ParallelMov arm of
+/// [`Assembler::x86_scratch_split`] for why the two must be different registers.
 const SCRATCH0_OPND: Opnd = Opnd::Reg(R11_REG);
 const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 
-/// A scratch register available for use by resolve_ssa to break register copy cycles.
-/// Must not overlap with ALLOC_REGS or other preserved registers.
+/// A scratch register available after register allocation, e.g. to hold a CCall result
+/// across the caller-saved register restores. Must not overlap with ALLOC_REGS or other
+/// preserved registers.
 pub const SCRATCH_REG: Reg = R11_REG;
 
 impl Assembler {
@@ -447,6 +454,26 @@ impl Assembler {
             }
         }
 
+        /// Lower a single `Insn::Mov`, which may move between two stack slots.
+        fn lower_mov(asm: &mut Assembler, dest: Opnd, src: Opnd) {
+            let dest = split_stack_membase(asm, dest, SCRATCH1_OPND);
+            let src = split_stack_membase(asm, src, SCRATCH0_OPND);
+            asm_mov(asm, dest, src, SCRATCH0_OPND);
+        }
+
+        /// Lower a single `Insn::LoadInto`, used for sources that have to be materialized
+        /// into a register before they can be written to a memory destination.
+        fn lower_load_into(asm: &mut Assembler, dest: Opnd, opnd: Opnd) {
+            let opnd = split_stack_membase(asm, opnd, SCRATCH0_OPND);
+            // Split stack membase on out before checking for memory write
+            let mut out = lower_stack_membase(asm, dest);
+            let mem_out = split_memory_write(&mut out, SCRATCH0_OPND);
+            asm.push_insn(Insn::LoadInto { dest: out, opnd });
+            if let Some(mem_out) = mem_out {
+                asm.store(mem_out, SCRATCH0_OPND.with_num_bits(mem_out.rm_num_bits()));
+            }
+        }
+
         let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
         asm_local.accept_scratch_reg = true;
 
@@ -455,7 +482,7 @@ impl Assembler {
 
         let asm = &mut asm_local;
 
-        // Get linearized instructions with branch parameters expanded into ParallelMov
+        // Get linearized instructions
         let linearized_insns = self.linearize_instructions();
 
         for insn in linearized_insns.iter() {
@@ -606,8 +633,7 @@ impl Assembler {
                         asm.mov(*out, SCRATCH0_OPND);
                     }
                 }
-                Insn::Load { out, opnd } |
-                Insn::LoadInto { dest: out, opnd } => {
+                Insn::Load { out, opnd } => {
                     *opnd = split_stack_membase(asm, *opnd, SCRATCH0_OPND);
                     // Split stack membase on out before checking for memory write
                     *out = lower_stack_membase(asm, *out);
@@ -617,6 +643,9 @@ impl Assembler {
                         asm.store(mem_out, SCRATCH0_OPND.with_num_bits(mem_out.rm_num_bits()));
                     }
                 }
+                &mut Insn::LoadInto { dest, opnd } => {
+                    lower_load_into(asm, dest, opnd);
+                }
                 // Convert Opnd::const_ptr into Opnd::Mem. This split is done here to give
                 // a register for compile_exits.
                 &mut Insn::IncrCounter { mem, value } => {
@@ -625,9 +654,27 @@ impl Assembler {
                     asm.incr_counter(Opnd::mem(64, SCRATCH0_OPND, 0), value);
                 }
                 &mut Insn::Mov { dest, src } => {
-                    let dest = split_stack_membase(asm, dest, SCRATCH1_OPND);
-                    let src = split_stack_membase(asm, src, SCRATCH0_OPND);
-                    asm_mov(asm, dest, src, SCRATCH0_OPND);
+                    lower_mov(asm, dest, src);
+                }
+                // Sequentialize a set of parallel copies and lower each resulting move.
+                //
+                // The cycle breaker gets SCRATCH1 as its spare, not SCRATCH0: the value it
+                // parks there has to survive every remaining move of the cycle, while
+                // SCRATCH0 is the register lower_mov()/lower_load_into() stage individual
+                // moves through, so it is dead as soon as one move is emitted. Parking in
+                // SCRATCH0 would let a memory-to-memory move of the same cycle clobber the
+                // parked value. Nothing in this pass keeps a value in SCRATCH1 across
+                // instructions, so the park is safe there.
+                Insn::ParallelMov { moves } => {
+                    for (dest, src) in Assembler::sequentialize_parallel_mov(moves, SCRATCH1_OPND) {
+                        match src {
+                            // A Value source is never a cycle member (it is not a location
+                            // that can be written), so this can only run outside a park
+                            // window, where using SCRATCH0 is free.
+                            Opnd::Value(_) => lower_load_into(asm, dest, src),
+                            _ => lower_mov(asm, dest, src),
+                        }
+                    }
                 }
                 // Handle various operand combinations for spills on compile_exits.
                 &mut Insn::Store { dest, src } => {
@@ -1093,6 +1140,8 @@ impl Assembler {
                 }
 
                 Insn::Joz(..) | Insn::Jonz(..) => unreachable!("Joz/Jonz should be unused for now"),
+
+                Insn::ParallelMov { .. } => unreachable!("ParallelMov should have been lowered by x86_scratch_split or resolve_parallel_mov_pass"),
 
                 Insn::PatchPoint(..) => unreachable!("PatchPoint should have been lowered to PatchPointPad in x86_scratch_split"),
                 Insn::PatchPointPad => {
@@ -1881,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_no_cycle() {
+    fn test_ccall_parallel_mov_no_cycle() {
         crate::options::rb_zjit_prepare_options();
         let (mut asm, mut cb) = setup_asm();
 
@@ -1899,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_single_cycle() {
+    fn test_ccall_parallel_mov_single_cycle() {
         crate::options::rb_zjit_prepare_options();
         let (mut asm, mut cb) = setup_asm();
 
@@ -1912,17 +1961,17 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-        0x0: mov r11, rsi
+        0x0: mov r10, rsi
         0x3: mov rsi, rdi
-        0x6: mov rdi, r11
+        0x6: mov rdi, r10
         0x9: mov eax, 0
         0xe: call rax
         ");
-        assert_snapshot!(cb.hexdump(), @"4989f34889fe4c89dfb800000000ffd0");
+        assert_snapshot!(cb.hexdump(), @"4989f24889fe4c89d7b800000000ffd0");
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_two_cycles() {
+    fn test_ccall_parallel_mov_two_cycles() {
         crate::options::rb_zjit_prepare_options();
         let (mut asm, mut cb) = setup_asm();
 
@@ -1936,20 +1985,20 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-        0x0: mov r11, rcx
+        0x0: mov r10, rcx
         0x3: mov rcx, rdx
-        0x6: mov rdx, r11
-        0x9: mov r11, rsi
+        0x6: mov rdx, r10
+        0x9: mov r10, rsi
         0xc: mov rsi, rdi
-        0xf: mov rdi, r11
+        0xf: mov rdi, r10
         0x12: mov eax, 0
         0x17: call rax
         ");
-        assert_snapshot!(cb.hexdump(), @"4989cb4889d14c89da4989f34889fe4c89dfb800000000ffd0");
+        assert_snapshot!(cb.hexdump(), @"4989ca4889d14c89d24989f24889fe4c89d7b800000000ffd0");
     }
 
     #[test]
-    fn test_ccall_resolve_parallel_moves_large_cycle() {
+    fn test_ccall_parallel_mov_large_cycle() {
         crate::options::rb_zjit_prepare_options();
         let (mut asm, mut cb) = setup_asm();
 
@@ -1962,19 +2011,88 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, ALLOC_REGS.len());
 
         assert_disasm_snapshot!(cb.disasm(), @"
-        0x0: mov r11, rdx
+        0x0: mov r10, rdx
         0x3: mov rdx, rdi
         0x6: mov rdi, rsi
-        0x9: mov rsi, r11
+        0x9: mov rsi, r10
         0xc: mov eax, 0
         0x11: call rax
         ");
-        assert_snapshot!(cb.hexdump(), @"4989d34889fa4889f74c89deb800000000ffd0");
+        assert_snapshot!(cb.hexdump(), @"4989d24889fa4889f74c89d6b800000000ffd0");
+    }
+
+    /// Return a MemBase::Stack operand for a register allocator spill slot.
+    fn spill_slot(stack_idx: u32) -> Opnd {
+        Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, num_bits: 64 }, disp: 0, num_bits: 64 })
+    }
+
+    #[test]
+    fn test_parallel_mov_register_cycle_parks_in_scratch1() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // rdi and rsi form a cycle. It has to be broken through SCRATCH1 (r10), and
+        // nothing about it should touch memory.
+        asm.push_insn(Insn::ParallelMov { moves: vec![
+            (C_ARG_OPNDS[0], C_ARG_OPNDS[1]),
+            (C_ARG_OPNDS[1], C_ARG_OPNDS[0]),
+        ]});
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov r10, rsi
+        0x3: mov rsi, rdi
+        0x6: mov rdi, r10
+        ");
+    }
+
+    #[test]
+    fn test_parallel_mov_spilled_cycle_parks_in_scratch1_and_carries_in_scratch0() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // Two spilled values swap. The park lives in SCRATCH1 (r10) across the whole
+        // cycle, while the memory-to-memory move in the middle is staged through
+        // SCRATCH0 (r11). Parking in SCRATCH0 instead would clobber the parked value.
+        asm.push_insn(Insn::ParallelMov { moves: vec![
+            (spill_slot(0), spill_slot(1)),
+            (spill_slot(1), spill_slot(0)),
+        ]});
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov r10, qword ptr [rbp - 8]
+        0x4: mov r11, qword ptr [rbp - 0x10]
+        0x8: mov qword ptr [rbp - 8], r11
+        0xc: mov qword ptr [rbp - 0x10], r10
+        ");
+    }
+
+    #[test]
+    fn test_parallel_mov_emits_leaves_before_breaking_a_cycle() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // rdi and rsi form a cycle; rdx <- Stack[0] and Stack[1] <- rcx are leaves.
+        // Both leaves must be emitted before the park, so that their lowering (which
+        // may need a scratch register of its own) cannot clobber the parked value.
+        asm.push_insn(Insn::ParallelMov { moves: vec![
+            (C_ARG_OPNDS[0], C_ARG_OPNDS[1]),
+            (C_ARG_OPNDS[2], spill_slot(0)),
+            (C_ARG_OPNDS[1], C_ARG_OPNDS[0]),
+            (spill_slot(1), C_ARG_OPNDS[3]),
+        ]});
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov qword ptr [rbp - 0x10], rcx
+        0x4: mov rdx, qword ptr [rbp - 8]
+        0x8: mov r10, rsi
+        0xb: mov rsi, rdi
+        0xe: mov rdi, r10
+        ");
     }
 
     #[test]
     #[ignore]
-    fn test_ccall_resolve_parallel_moves_with_insn_out() {
+    fn test_ccall_parallel_mov_with_insn_out() {
         let (mut asm, mut cb) = setup_asm();
 
         let rax = asm.load(Opnd::UImm(1));
