@@ -8621,9 +8621,14 @@ impl Function {
             VisitEdges,
             VisitSelf,
         }
-        let mut result = vec![];
-        let mut seen = BlockSet::with_capacity(self.blocks.len());
-        let mut stack = vec![(start, Action::VisitEdges)];
+        // Both vectors are bounded by the block count, and every pass in the pipeline
+        // asks for the reverse post order, so growing them by doublings was a
+        // measurable share of the allocator traffic all by itself.
+        let num_blocks = self.blocks.len();
+        let mut result = Vec::with_capacity(num_blocks);
+        let mut seen = BlockSet::with_capacity(num_blocks);
+        let mut stack = Vec::with_capacity(num_blocks * 2);
+        stack.push((start, Action::VisitEdges));
         while let Some((block, action)) = stack.pop() {
             if action == Action::VisitSelf {
                 result.push(block);

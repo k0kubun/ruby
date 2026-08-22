@@ -4358,9 +4358,14 @@ impl Assembler
             VisitEdges,
             VisitSelf,
         }
-        let mut result = vec![];
-        let mut seen = BlockSet::with_capacity(self.basic_blocks.len());
-        let mut stack: Vec<_> = starts.iter().map(|&start| (start, Action::VisitEdges)).collect();
+        // Both vectors are bounded by the block count, and this walk runs about ten
+        // times per compile, so growing them by doublings was a measurable share of
+        // the allocator traffic all by itself.
+        let num_blocks = self.basic_blocks.len();
+        let mut result = Vec::with_capacity(num_blocks);
+        let mut seen = BlockSet::with_capacity(num_blocks);
+        let mut stack: Vec<(BlockId, Action)> = Vec::with_capacity(num_blocks * 2);
+        stack.extend(starts.iter().map(|&start| (start, Action::VisitEdges)));
         while let Some((block, action)) = stack.pop() {
             if action == Action::VisitSelf {
                 result.push(block);
