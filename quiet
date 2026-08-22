@@ -1,0 +1,94 @@
+***ZJIT: Printing ZJIT statistics on exit***
+Top-1 calls to C functions from JIT code (100.0% of total 51):
+  rb_vm_opt_send_without_block: 51 (100.0%)
+Top-2 most called JIT functions (100.0% of total 61):
+                                  test@/tmp/sc.rb:3: 31 (50.8%)
+  block (2 levels) in <top (required)>@/tmp/sc.rb:4: 30 (49.2%)
+Top-1 send fallback reasons (100.0% of total 51):
+  send_polymorphic_fallback: 51 (100.0%)
+                             send_count: 91
+                     dynamic_send_count: 51 (56.0%)
+                   optimized_send_count: 40 (44.0%)
+              iseq_optimized_send_count:  0 ( 0.0%)
+      inline_cfunc_optimized_send_count:  0 ( 0.0%)
+       inline_iseq_optimized_send_count: 40 (44.0%)
+                    inline_method_count:  1 ( 1.1%)
+               empty_inline_frame_count:  0 ( 0.0%)
+non_variadic_cfunc_optimized_send_count:  0 ( 0.0%)
+    variadic_cfunc_optimized_send_count:  0 ( 0.0%)
+                 caller_splat_optimized:  0 ( 0.0%)
+dynamic_setivar_count:                                              0
+dynamic_getivar_count:                                              0
+dynamic_definedivar_count:                                          0
+compiled_iseq_count:                                                2
+compiled_side_exit_count:                                           9
+failed_iseq_count:                                                  0
+ivar_respecialize_count:                                            0
+ivar_respecialize_declined_count:                                   0
+ivar_respecialize_giveup_count:                                     0
+compile_time:                                                     1ms
+compile_side_exit_time:                                           0ms
+compile_side_exit_time_ratio:                                    1.9%
+compile_hir_time:                                                 0ms
+compile_hir_build_time:                                           0ms
+compile_hir_strength_reduce_time:                                 0ms
+compile_hir_inline_methods_time:                                  0ms
+compile_hir_remove_trivial_block_params_time:                     0ms
+compile_hir_optimize_load_store_time:                             0ms
+compile_hir_canonicalize_time:                                    0ms
+compile_hir_fold_constants_time:                                  0ms
+compile_hir_fuse_fixnum_compare_branches_time:                    0ms
+compile_hir_clean_cfg_time:                                       0ms
+compile_hir_remove_redundant_patch_points_time:                   0ms
+compile_hir_remove_duplicate_check_interrupts_time:               0ms
+compile_hir_eliminate_dead_code_time:                             0ms
+compile_lir_time:                                                 0ms
+profile_time:                                                     0ms
+gc_time:                                                          0ms
+gc_iseq_mark_time:                                                0ms
+gc_iseq_mark_profile_time:                                        0ms
+gc_iseq_mark_offsets_time:                                        0ms
+gc_iseq_update_time:                                              0ms
+gc_root_mark_time:                                                0ms
+gc_root_mark_iseq_time:                                           0ms
+gc_root_mark_send_cache_time:                                     0ms
+gc_root_update_time:                                              0ms
+gc_iseq_mark_count:                                                 0
+gc_iseq_update_count:                                               0
+gc_root_mark_count:                                                 0
+gc_root_update_count:                                               0
+gc_mark_profile_object_count:                                       0
+gc_mark_offset_object_count:                                        0
+gc_mark_root_iseq_count:                                            0
+gc_mark_send_cache_slot_count:                                      0
+gc_mark_send_cache_probe_count:                                     0
+invalidation_time:                                                0ms
+vm_write_jit_frame_count:                                          81
+vm_write_sp_count:                                                 81
+vm_write_locals_count:                                             81
+vm_write_stack_count:                                              51
+vm_write_to_parent_iseq_local_count:                                0
+send_ancestor_guard_count:                                          0
+send_ancestor_guard_fallback_count:                                 0
+send_ancestor_guard_sites:                                          0
+guard_type_count:                                                  30
+guard_type_exit_ratio:                                           0.0%
+guard_shape_count:                                                  0
+load_field_count:                                                  61
+store_field_count:                                                  0
+throw_count:                                                        0
+side_exit_size_bytes:                                           1,045
+side_exit_size_ratio:                                           12.8%
+jit_frame_heap_bytes:                                               0
+jit_frame_region_bytes:                                         4,096
+code_region_bytes:                                              8,192
+inlined_code_bytes:                                             2,089
+outlined_code_bytes:                                            1,045
+zjit_alloc_bytes:                                              16,518
+total_mem_bytes:                                               28,806
+total_native_stack_bytes:                                           0
+side_exit_count:                                                    0
+total_insn_count:                                               3,402
+vm_insn_count:                                                  3,099
+zjit_insn_count:                                                  303
+ratio_in_zjit:                                                   8.9%
