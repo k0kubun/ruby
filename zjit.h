@@ -106,6 +106,37 @@ ZJIT_STACK_MAP_BASE_PTR_STACK_SIZE(VALUE entry)
     return entry >> ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT;
 }
 
+// Class -> callcache table for a send site that dispatches over too many
+// classes for ZJIT's inline class-guard chain. Allocated and owned by Rust; the
+// layout of these four fields must stay in step with `struct SendCache` in
+// zjit/src/send_cache.rs, which documents what the table caches and why a stale
+// entry cannot be wrong.
+struct rb_zjit_send_cache {
+    // Number of slots. A power of two.
+    uint32_t len;
+    // 64 - log2(len): the shift that turns the hash product into a slot index.
+    uint32_t shift;
+    // Slot 0. One callcache pointer per slot, NULL when the slot is empty.
+    const struct rb_callcache **slots;
+    // The ZJIT hit counter under --zjit-stats, NULL otherwise. Doubles as the
+    // flag for whether to report misses to rb_zjit_send_cache_record_miss(), so
+    // that a build without stats pays a never-taken branch rather than a call.
+    uint64_t *hit_counter;
+};
+
+// Why a probe of a `struct rb_zjit_send_cache` did not produce a callcache.
+// Must match the MISS_* constants in zjit/src/send_cache.rs.
+#define ZJIT_SEND_CACHE_MISS_FILL        0
+#define ZJIT_SEND_CACHE_MISS_EVICT       1
+#define ZJIT_SEND_CACHE_MISS_STALE       2
+#define ZJIT_SEND_CACHE_MISS_UNCACHEABLE 3
+
+// Multiplier of the Fibonacci hash that turns a class VALUE into a slot index.
+// Must match SEND_CACHE_HASH_MULT in zjit/src/send_cache.rs.
+#define ZJIT_SEND_CACHE_HASH_MULT 0x9e3779b97f4a7c15ULL
+
+void rb_zjit_send_cache_record_miss(int kind);
+
 extern void *rb_zjit_entry;
 extern bool rb_zjit_compiling_p;
 extern const zjit_jit_frame_t rb_zjit_c_frame;
