@@ -3325,21 +3325,34 @@ impl Assembler
         for &pred_id in &block_order {
             let pred_hir_block_id = self.basic_blocks[pred_id.0].hir_block_id;
             let pred_rpo_index = self.basic_blocks[pred_id.0].rpo_index;
-            let EdgePair(edge1, edge2) = self.basic_blocks[pred_id.0].edges();
 
-            let edges: Vec<BranchEdge> = [edge1, edge2].into_iter().flatten().collect();
-            let num_successors = edges.len();
+            // Take each outgoing edge's argument list rather than cloning it. The
+            // arguments become explicit moves below, and the loop at the end of
+            // this pass clears every edge's arguments anyway, so nothing reads the
+            // originals again -- while cloning them meant a heap allocation per
+            // CFG edge, for every edge in the function.
+            let mut edges: [Option<(BlockId, Vec<Opnd>)>; 2] = [None, None];
+            let mut num_successors = 0;
+            // Stub blocks (from new_block_without_id) have no CFG structure, so
+            // their trailing instructions are not terminators to read edges from.
+            if self.basic_blocks[pred_id.0].rpo_index != DUMMY_RPO_INDEX {
+                let insns = &mut self.basic_blocks[pred_id.0].insns;
+                let len = insns.len();
+                for insn in insns[len.saturating_sub(2)..].iter_mut() {
+                    if let Some(Target::Block(edge)) = insn.target_mut() {
+                        edges[num_successors] = Some((edge.target, take(&mut edge.args)));
+                        num_successors += 1;
+                    }
+                }
+            }
 
-            for edge in edges {
-                let successor = edge.target;
-                let params = self.basic_blocks[successor.0].parameters.clone();
-
+            for (successor, args) in edges.into_iter().flatten() {
                 // Build the list of register-to-register copies and immediate moves.
                 // Rewrite VRegs to physical registers BEFORE sequentialization so
                 // the parcopy algorithm can see real physical register conflicts.
-                let reg_copies: Vec<parcopy::RegisterCopy<Opnd>> = edge.args
+                let reg_copies: Vec<parcopy::RegisterCopy<Opnd>> = args
                     .iter()
-                    .zip(params.iter())
+                    .zip(self.basic_blocks[successor.0].parameters.iter())
                     .filter(|(_arg, param)| intervals[param.vreg_idx()].assigned.get().is_some() )
                     .map(|(arg, param)| parcopy::RegisterCopy::<Opnd> {
                         destination: Self::rewritten_opnd(*param, intervals, regs),

@@ -44,11 +44,22 @@ pub struct RegisterCopy<T> {
 // Varies slightly from the original algorithm as it splits the copies between
 // pending and available to reduce state tracking.
 pub fn sequentialize_register<T: PartialEq + Eq + Hash + Ord + std::fmt::Debug + Clone + Copy>(parallel_copies: &[RegisterCopy<T>], spare: T) -> Vec<RegisterCopy<T>> {
+    // Most edges in a function pass nothing, or pass values that are already
+    // where the successor wants them, so this runs on an empty list far more
+    // often than not. Answering that case up front keeps the register allocator
+    // from building a hash map and a B-tree per CFG edge just to find out there
+    // is nothing to sequentialize.
+    if parallel_copies.is_empty() {
+        return Vec::new();
+    }
     let mut sequentialized = Vec::new();
     // `resource` in the original code, this point to the current register
     // holding a particular initial value.
     // If a given Register is no longer needed, the value might be inaccurate.
-    let mut current_holder = std::collections::HashMap::new();
+    // Hashed with FastHasher: the keys are registers and stack slots the
+    // compiler made up itself, and SipHash on them was showing up on the
+    // profile of the register allocator.
+    let mut current_holder = crate::fasthash::FastHashMap::default();
     // Copies that are pending, indexed by destination register.
     // Use btree map to stay deterministic.
     let mut pending = std::collections::BTreeMap::new();
