@@ -6267,6 +6267,151 @@ rb_vm_opt_send_without_block(rb_execution_context_t *ec, rb_control_frame_t *reg
     return val;
 }
 
+#if USE_ZJIT
+/* ZJIT's megamorphic send path.
+ *
+ * A send site that dispatches over more classes than ZJIT's inline class-guard
+ * chain can cover used to call rb_vm_opt_send_without_block() above, whose
+ * cd->cc inline cache holds a single class and therefore misses on nearly every
+ * call: each miss runs vm_search_method_slowpath0() -> vm_search_cc() ->
+ * vm_lookup_cc(), an id-table lookup keyed on the method name plus a scan of
+ * that name's entries, and then stores cd->cc with a write barrier whose only
+ * effect at such a site is to dirty the ISEQ for a line that will miss again.
+ *
+ * These entry points take a class-keyed table of callcaches instead, and only
+ * fall back to that search when the table cannot answer. They change how the
+ * target is *found*, not how it is called: on a hit control reaches the very
+ * same vm_cc_call() dispatch vm_sendish() reaches after searching. See
+ * zjit/src/send_cache.rs for the table's invalidation and GC story.
+ */
+
+static inline unsigned int
+zjit_send_cache_slot(const struct rb_zjit_send_cache *cache, VALUE klass)
+{
+    /* A class VALUE is a heap address: its low bits are zero from object
+     * alignment and its high bits barely vary within a page, so neither end can
+     * index the table directly. The multiply spreads every input bit into the
+     * top of the word, which is the half the shift keeps. */
+    return (unsigned int)(((uint64_t)klass * ZJIT_SEND_CACHE_HASH_MULT) >> cache->shift);
+}
+
+/* Whether a callcache the search produced may be stored in a table.
+ *
+ * The exclusions are all about what a cached callcache would have to keep alive.
+ * ZJIT marks its tables as GC roots, and imemo.c marks a *normal* callcache's
+ * class and method entry weakly on purpose, so caching one retains nothing and
+ * lets the entry invalidate itself. `super` and `refinement` caches instead mark
+ * their method entry strongly, so caching one would pin a method that has been
+ * redefined; an unmarkable cache may be freed under us; and the shared empty
+ * cache has no method entry to validate against. */
+static inline bool
+zjit_send_cache_cacheable_p(const struct rb_callcache *cc)
+{
+    return cc != NULL
+        && vm_cc_valid(cc)
+        && vm_cc_cme(cc) != NULL
+        && vm_cc_markable(cc)
+        && !vm_cc_super_p(cc)
+        && !vm_cc_refinement_p(cc);
+}
+
+/* Resolve the callcache for `recv` at this site, out of `cache` when possible.
+ *
+ * The hit condition is exactly vm_cc_hit_p()'s: the cache's own class matches
+ * the receiver's, and its method entry has not been invalidated. Note the order
+ * -- a cache whose class or method entry was collected has had cc->klass set to
+ * Qundef by vm_cc_invalidate(), and no live class is Qundef, so the class
+ * compare rejects it before the method entry (which must not be read after
+ * invalidation) is touched. */
+static inline const struct rb_callcache *
+zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
+                       struct rb_zjit_send_cache *cache, VALUE recv)
+{
+    VALUE klass = CLASS_OF(recv);
+    unsigned int slot = zjit_send_cache_slot(cache, klass);
+    const struct rb_callcache *cached = cache->slots[slot];
+
+    if (LIKELY(cached != NULL && cached->klass == klass &&
+               !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cached)))) {
+        if (UNLIKELY(cache->hit_counter != NULL)) {
+            (*cache->hit_counter)++;
+        }
+        return cached;
+    }
+
+    /* Exactly what the old code path did, via rb_vm_opt_send_without_block(). */
+    const struct rb_callcache *cc = vm_search_method_fastpath(reg_cfp, cd, klass);
+    bool cacheable = zjit_send_cache_cacheable_p(cc);
+    if (LIKELY(cacheable)) {
+        /* One naturally-aligned pointer store, published the same way
+         * vm_search_method_slowpath0() publishes cd->cc. No write barrier: the
+         * table is a GC root, scanned on every collection, not a heap object
+         * that could be missed by a minor GC. */
+        cache->slots[slot] = cc;
+    }
+
+    if (UNLIKELY(cache->hit_counter != NULL)) {
+        int kind;
+        if (!cacheable)                        kind = ZJIT_SEND_CACHE_MISS_UNCACHEABLE;
+        else if (cached == NULL)               kind = ZJIT_SEND_CACHE_MISS_FILL;
+        else if (cached->klass == klass)       kind = ZJIT_SEND_CACHE_MISS_STALE;
+        else                                   kind = ZJIT_SEND_CACHE_MISS_EVICT;
+        rb_zjit_send_cache_record_miss(kind);
+    }
+    return cc;
+}
+
+/* Table-backed counterpart of rb_vm_opt_send_without_block(). */
+VALUE
+rb_zjit_send_cached_without_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
+                                  CALL_DATA cd, struct rb_zjit_send_cache *cache)
+{
+    stack_check(ec);
+    const struct rb_callinfo *ci = cd->ci;
+    int argc = vm_ci_argc(ci);
+    VALUE recv = TOPN(argc);
+    struct rb_calling_info calling = {
+        .block_handler = VM_BLOCK_HANDLER_NONE,
+        .kw_splat = IS_ARGS_KW_SPLAT(ci) > 0,
+        .recv = recv,
+        .argc = argc,
+        .cd = cd,
+    };
+    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, cache, recv);
+    calling.cc = cc;
+    VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling);
+    VM_EXEC(ec, val);
+    return val;
+}
+
+/* Table-backed counterpart of rb_vm_send(). The block handler is set up first,
+ * exactly as rb_vm_send() does, because vm_caller_setup_arg_block() can run
+ * arbitrary Ruby (a block argument's to_proc) and must therefore happen before
+ * anything is read out of the table. */
+VALUE
+rb_zjit_send_cached(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
+                    CALL_DATA cd, ISEQ blockiseq, struct rb_zjit_send_cache *cache)
+{
+    stack_check(ec);
+    VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), cd->ci, blockiseq, false);
+    const struct rb_callinfo *ci = cd->ci;
+    int argc = vm_ci_argc(ci);
+    VALUE recv = TOPN(argc);
+    struct rb_calling_info calling = {
+        .block_handler = bh,
+        .kw_splat = IS_ARGS_KW_SPLAT(ci) > 0,
+        .recv = recv,
+        .argc = argc,
+        .cd = cd,
+    };
+    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, cache, recv);
+    calling.cc = cc;
+    VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling);
+    VM_EXEC(ec, val);
+    return val;
+}
+#endif // USE_ZJIT
+
 VALUE
 rb_vm_invokesuper(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, CALL_DATA cd, ISEQ blockiseq)
 {
