@@ -100,6 +100,11 @@ pub struct ZJITState {
     /// per ivar name. Owned here so [`crate::mem_stats`] can account for them;
     /// the addresses are baked into JIT code, so the `Box`es must never move.
     ivar_caches: HashMap<ID, Box<crate::ivar_cache::IvarCache>>,
+    /// Class tables for send sites that dispatch over more classes than an
+    /// inline guard chain can cover, one per call shape. Owned here for the same
+    /// two reasons as `ivar_caches`: [`crate::mem_stats`] accounts for them, and
+    /// JIT code bakes in the addresses, so the `Box`es must never move.
+    send_caches: crate::send_cache::SendCaches,
     /// Bytes held by `IseqVersion`s whose ISEQ has been freed. They cannot be
     /// released because `Invariants`' patch points hold raw pointers to them,
     /// and they are no longer reachable from any live ISEQ, so the `mem_*`
@@ -194,6 +199,7 @@ impl ZJITState {
             jit_frames: vec![],
             exit_metas: vec![],
             ivar_caches: HashMap::new(),
+            send_caches: crate::send_cache::SendCaches::new(),
             dead_iseq_version_bytes: 0,
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
@@ -260,6 +266,11 @@ impl ZJITState {
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
     pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
         &mut ZJITState::get_instance().ivar_caches
+    }
+
+    /// Owner of every per-call-shape class table. See [`crate::send_cache`].
+    pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
+        &mut ZJITState::get_instance().send_caches
     }
 
     /// Record bytes retained by an `IseqVersion` that outlived its ISEQ.

@@ -77,6 +77,9 @@ pub struct MemoryBreakdown {
     /// Ivar shape tables: one fixed-size table per ivar name accessed by a
     /// compiled site that can reach the generic path. See [`crate::ivar_cache`].
     pub ivar_cache_bytes: usize,
+    /// Send class tables: one fixed-size table per call shape dispatched by a
+    /// compiled megamorphic site. See [`crate::send_cache`].
+    pub send_cache_bytes: usize,
     /// `IseqVersion`s whose ISEQ has been freed. Unreachable from any live
     /// ISEQ, so they are counted from a running total rather than walked.
     pub dead_iseq_version_bytes: usize,
@@ -103,6 +106,8 @@ pub struct MemoryBreakdown {
     pub exit_meta_count: usize,
     /// Number of ivar shape tables, i.e. distinct ivar names with one.
     pub ivar_cache_count: usize,
+    /// Number of send class tables, i.e. distinct call shapes with one.
+    pub send_cache_count: usize,
 }
 
 impl MemoryBreakdown {
@@ -119,6 +124,7 @@ impl MemoryBreakdown {
             + self.code_block_bytes
             + self.stats_counter_bytes
             + self.ivar_cache_bytes
+            + self.send_cache_bytes
             + self.dead_iseq_version_bytes
             + self.method_annotation_bytes
     }
@@ -183,6 +189,11 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     out.ivar_cache_count = ivar_caches.len();
     out.ivar_cache_bytes = hash_table_bytes::<(crate::cruby::ID, Box<crate::ivar_cache::IvarCache>)>(ivar_caches.capacity())
         + ivar_caches.values().map(|cache| cache.heap_size()).sum::<usize>();
+
+    let send_caches = ZJITState::get_send_caches();
+    out.send_cache_count = send_caches.len();
+    out.send_cache_bytes = hash_table_bytes::<(crate::send_cache::SendCacheKey, Box<crate::send_cache::SendCache>)>(send_caches.capacity())
+        + send_caches.values().map(|cache| cache.heap_size()).sum::<usize>();
 
     out.code_block_bytes = ZJITState::get_code_block().heap_size();
     out.stats_counter_bytes = ZJITState::counter_table_heap_size();
