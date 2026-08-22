@@ -485,8 +485,8 @@ impl Assembler {
         // The side exit of the patch point that sits at the current write position, if any.
         // See split_patch_point() for why consecutive patch points can share a patch site.
         let mut prev_patch_label: Option<Label> = None;
-        for insn in linearized_insns.iter() {
-            let mut insn = insn.clone();
+        for insn in linearized_insns.into_iter() {
+            let mut insn = insn;
             let keeps_patch_site = matches!(insn, Insn::Comment(_) | Insn::PatchPoint(..));
             match &mut insn {
                 Insn::Add { left, right, out } |

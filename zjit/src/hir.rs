@@ -9,12 +9,13 @@ use crate::{
     backend::lir::C_ARG_OPNDS, cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
-    cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
+    cell::RefCell, collections::VecDeque, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
     sync::atomic::Ordering,
 };
 use crate::hir_type::{Type, types};
 use crate::hir_effect::{Effect, abstract_heaps, effects};
 use crate::bitset::BitSet;
+use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use crate::profile::{TypeDistributionSummary, ProfiledType};
 use crate::stats::{Counter, incr_counter};
 use SendFallbackReason::*;
@@ -3714,7 +3715,7 @@ impl Function {
             ancestor_dispatch: HashMap::default(),
             num_instructions: 0,
             exception_entry: None,
-            send_mid_overrides: HashMap::new(),
+            send_mid_overrides: HashMap::default(),
         }
     }
 
@@ -7587,7 +7588,7 @@ impl Function {
 
     fn optimize_load_store(&mut self) {
         for block in self.reverse_post_order() {
-            let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::new();
+            let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::default();
             let old_insns = std::mem::take(&mut self.blocks[block.to_usize()].insns);
             let mut new_insns = Vec::with_capacity(old_insns.len());
             for insn_id in old_insns {
@@ -7696,7 +7697,7 @@ impl Function {
         let mut rewrite_maps: Vec<Option<HashMap<InsnId, InsnId>>> = vec![None; self.blocks.len()];
         let dominators = Dominators::new(self);
         for &block in dominators.cfi.reverse_post_order() {
-            let mut rewrite_map = rewrite_maps[dominators.idom(block).to_usize()].clone().unwrap_or_else(|| HashMap::new());
+            let mut rewrite_map = rewrite_maps[dominators.idom(block).to_usize()].clone().unwrap_or_else(|| HashMap::default());
             for i in 0..self.blocks[block.to_usize()].insns.len() {
                 let insn_id = self.blocks[block.to_usize()].insns[i];
                 let canonical_id = self.union_find.borrow().find_const(insn_id);
@@ -8191,7 +8192,7 @@ impl Function {
             }
             // Insert the constants at the top of the block so that they dominate every
             // use of the parameter they replace.
-            let mut materialized: HashMap<VALUE, InsnId> = HashMap::new();
+            let mut materialized: HashMap<VALUE, InsnId> = HashMap::default();
             let mut prologue = vec![];
             for (param, val) in consts {
                 let replacement = *materialized.entry(val).or_insert_with(|| {
@@ -8282,7 +8283,7 @@ impl Function {
     /// intervening instruction could invalidate it (i.e., writes to PatchPoint).
     fn remove_redundant_patch_points(&mut self) {
         for block_id in self.reverse_post_order() {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let insns = std::mem::take(&mut self.blocks[block_id.to_usize()].insns);
             let mut new_insns = Vec::with_capacity(insns.len());
             for insn_id in insns {
@@ -8499,7 +8500,7 @@ impl Function {
             // Elide each pair: drop the pop, and drop the push as well, except
             // that with --zjit-stats it's replaced with a counter of how many
             // times execution passes an elided pair at run-time.
-            let mut rewrites: HashMap<InsnId, Option<InsnId>> = HashMap::new();
+            let mut rewrites: HashMap<InsnId, Option<InsnId>> = HashMap::default();
             for (push_id, pop_id) in elided_pairs {
                 let replacement = get_option!(stats)
                     .then(|| self.new_insn(Insn::IncrCounter(Counter::empty_inline_frame_count)));
@@ -10482,7 +10483,7 @@ fn add_iseq_to_hir(
 
     // Make all empty basic blocks. The ordering of the BBs matters for getting fallthrough jumps
     // in good places, but it's not necessary for correctness. TODO: Higher quality scheduling during lowering.
-    let mut insn_idx_to_block = HashMap::new();
+    let mut insn_idx_to_block = HashMap::default();
     // Materialize a block at each opt-table entry PC, placing each right after
     // its JIT-to-JIT entry block so fallthrough jumps land in good places.
     // Standalone mode emits a real JIT entry block per entry. Inlined mode emits
@@ -10559,7 +10560,7 @@ fn add_iseq_to_hir(
     }
 
     // Keep compiling blocks until the queue becomes empty
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     while let Some((incoming_state, mut block, mut insn_idx, mut local_inval)) = queue.pop_front() {
         // Compile each block only once
@@ -13248,8 +13249,8 @@ pub struct ControlFlowInfo {
 
 impl ControlFlowInfo {
     pub fn new(function: &Function) -> Self {
-        let mut successor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        let mut predecessor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        let mut successor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
+        let mut predecessor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
 
         let reverse_post_order = function.reverse_post_order();
         for &block_id in &reverse_post_order {
@@ -13313,7 +13314,7 @@ impl<'a> LoopInfo<'a> {
     pub fn new(dominators: &'a Dominators) -> Self {
         let cfi = &dominators.cfi;
         let mut loop_headers: BlockSet = BlockSet::with_capacity(cfi.num_blocks());
-        let mut loop_depths: HashMap<BlockId, u32> = HashMap::new();
+        let mut loop_depths: HashMap<BlockId, u32> = HashMap::default();
         let mut back_edge_sources: BlockSet = BlockSet::with_capacity(cfi.num_blocks());
         let rpo = cfi.reverse_post_order();
 
@@ -13353,7 +13354,7 @@ impl<'a> LoopInfo<'a> {
         back_edge_source: BlockId,
     ) -> HashSet<BlockId> {
         // todo(aidenfoxivey): Reimplement using BlockSet
-        let mut loop_blocks = HashSet::new();
+        let mut loop_blocks = HashSet::default();
         let mut stack = vec![back_edge_source];
 
         loop_blocks.insert(header);

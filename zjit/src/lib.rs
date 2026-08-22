@@ -32,6 +32,7 @@ mod options;
 mod profile;
 mod invariants;
 mod bitset;
+mod fasthash;
 mod gc;
 mod jit_frame;
 mod exit_meta;

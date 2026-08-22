@@ -1,6 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+// The compiler's own tables are keyed by operands, block ids and pointers it produced
+// itself, so they use a fast non-cryptographic hasher instead of std's SipHash. See
+// `crate::fasthash`.
+use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use std::fmt;
 use std::mem::take;
 use std::ops::Range;
@@ -3170,7 +3174,7 @@ impl Assembler
         let parcopy_spare_slot = self.stack_state.parcopy_spare_slot;
 
         // Count predecessors for each block
-        let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
+        let mut num_predecessors: HashMap<BlockId, usize> = HashMap::default();
         let block_order = self.block_order();
         for &block_id in &block_order {
             for succ in self.basic_blocks[block_id.0].successors() {
@@ -4096,7 +4100,7 @@ impl Assembler
         }
 
         // Extract targets first so that we can update instructions while referencing part of them.
-        let mut targets = HashMap::new();
+        let mut targets = HashMap::default();
 
         for block_id in self.block_order() {
             let block = &self.basic_blocks[block_id.0];
@@ -4115,12 +4119,12 @@ impl Assembler
         let exit_block = self.new_block_without_id("side_exits");
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
-        let mut compiled_exits: HashMap<SideExit, Label> = HashMap::new();
+        let mut compiled_exits: HashMap<SideExit, Label> = HashMap::default();
 
         // Map from the constants an exit restores to its index in the process-wide
         // metadata table, so exits in this function that restore the same frame state
         // share one record.
-        let mut interned_metas: HashMap<ExitMeta, u32> = HashMap::new();
+        let mut interned_metas: HashMap<ExitMeta, u32> = HashMap::default();
 
         // The tail every metadata-driven exit in this function jumps to. It restores
         // the callee-saved registers the allocator handed out -- the same ones from the
@@ -4649,7 +4653,7 @@ fn format_insn_compact(asm: &Assembler, insn: &Insn) -> String {
 impl fmt::Display for Assembler {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Count the number of duplicated label names to disambiguate them if needed
-        let mut label_counts: HashMap<&String, usize> = HashMap::new();
+        let mut label_counts: HashMap<&String, usize> = HashMap::default();
         let colors = crate::ttycolors::get_colors();
         let bold_begin = colors.bold_begin;
         let bold_end = colors.bold_end;

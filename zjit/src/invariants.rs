@@ -1,6 +1,7 @@
 //! Code invalidation and patching for speculative optimizations.
 
-use std::{collections::{HashMap, HashSet}, mem, sync::atomic::{AtomicBool, Ordering}};
+use std::{mem, sync::atomic::{AtomicBool, Ordering}};
+use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
@@ -725,7 +726,7 @@ pub extern "C" fn rb_zjit_invalidate_no_singleton_class(klass: VALUE) {
             }
             None => {
                 // Let has_singleton_class_of() return true for this class
-                invariants.no_singleton_class_patch_points.insert(klass, HashSet::new());
+                invariants.no_singleton_class_patch_points.insert(klass, HashSet::default());
             }
         }
     });

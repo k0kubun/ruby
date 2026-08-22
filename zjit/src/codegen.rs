@@ -5,7 +5,7 @@
 mod gc_fastpath;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
@@ -737,7 +737,7 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
         }
     }
 
-    let mut fusion = BranchFusion { elided: vec![false; function.num_insns()], fused: HashMap::new() };
+    let mut fusion = BranchFusion { elided: vec![false; function.num_insns()], fused: HashMap::default() };
     for &block_id in reverse_post_order {
         let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
         let Some(&branch_id) = insns.last() else { continue };

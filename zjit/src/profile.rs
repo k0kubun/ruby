@@ -3,7 +3,7 @@
 // We use the YARV bytecode constants which have a CRuby-style name
 #![allow(non_upper_case_globals)]
 
-use std::collections::HashMap;
+use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
 use crate::mem_stats::hash_table_bytes;
 use crate::distribution::{Distribution, DistributionSummary, StableBucket};
