@@ -193,6 +193,30 @@ impl BasicBlock {
         }
     }
 
+    /// Like [`Self::edges`], but borrows the edges instead of cloning them. `edges()`
+    /// clones each `BranchEdge`, including its argument vector, which shows up as real
+    /// allocator traffic in passes that only want to read the arguments.
+    pub fn edge_refs(&self) -> impl DoubleEndedIterator<Item = &BranchEdge> + '_ {
+        // Stub blocks (from new_block_without_id) have no real CFG structure.
+        if self.rpo_index == DUMMY_RPO_INDEX {
+            return None.into_iter().chain(None.into_iter());
+        }
+        assert!(self.insns.last().unwrap().is_terminator());
+        fn extract_edge(insn: &Insn) -> Option<&BranchEdge> {
+            match insn.target() {
+                Some(Target::Block(edge)) => Some(&**edge),
+                _ => None,
+            }
+        }
+
+        let (edge1, edge2) = match self.insns.as_slice() {
+            [] => panic!("empty block"),
+            [.., second_last, last] => (extract_edge(second_last), extract_edge(last)),
+            [.., last] => (extract_edge(last), None),
+        };
+        edge1.into_iter().chain(edge2.into_iter())
+    }
+
     pub fn successors(&self) -> impl DoubleEndedIterator<Item = BlockId> + '_ {
         // Stub blocks (from new_block_without_id) have no real CFG structure.
         if self.rpo_index == DUMMY_RPO_INDEX {
@@ -2931,19 +2955,15 @@ impl Assembler
         }
         let mut parent: Vec<usize> = (0..self.num_vregs).collect();
 
-        // Every block's incoming edges, for the checks below.
+        // Union every (branch argument, block parameter) pair. The edges are read in
+        // place: `BasicBlock::edges()` clones the argument vectors, and nothing here needs
+        // an owned copy.
         let block_order = self.block_order();
-        let mut incoming: HashMap<BlockId, Vec<BranchEdge>> = HashMap::default();
+        let mut num_params = 0;
         for &block_id in &block_order {
-            let EdgePair(edge1, edge2) = self.basic_blocks[block_id.0].edges();
-            for edge in [edge1, edge2].into_iter().flatten() {
-                incoming.entry(edge.target).or_default().push(edge);
-            }
-        }
-
-        // Union every (branch argument, block parameter) pair.
-        for edges in incoming.values() {
-            for edge in edges {
+            let block = &self.basic_blocks[block_id.0];
+            num_params += block.parameters.len();
+            for edge in block.edge_refs() {
                 let params = &self.basic_blocks[edge.target.0].parameters;
                 for (arg, param) in edge.args.iter().zip(params.iter()) {
                     if let (Opnd::VReg { idx: arg_idx, .. }, Opnd::VReg { idx: param_idx, .. }) = (arg, param) {
@@ -2953,6 +2973,12 @@ impl Assembler
                     }
                 }
             }
+        }
+
+        // Nothing to coalesce without block parameters, which is the common case for the
+        // straight-line ISEQs that make up most of a program.
+        if num_params == 0 {
+            return (0..self.num_vregs).collect();
         }
 
         // Group into webs, keeping only the ones with something to coalesce.
@@ -2973,48 +2999,76 @@ impl Assembler
         }
         webs.retain(|_, members| members.len() > 1);
 
-        // Every block's parameter VRegs, and the set of all of them.
-        let block_params: Vec<(BlockId, Vec<usize>)> = block_order.iter()
-            .map(|&block_id| {
-                let params = self.basic_blocks[block_id.0].parameters.iter()
-                    .filter_map(|param| match param {
-                        Opnd::VReg { idx, .. } => Some(idx.to_usize()),
-                        _ => None,
-                    })
-                    .collect();
-                (block_id, params)
-            })
-            .collect();
-        let param_vregs: HashSet<usize> = block_params.iter()
-            .flat_map(|(_, params)| params.iter().copied())
-            .collect();
+        // Which VRegs are block parameters, and which web each VReg belongs to. `web_of`
+        // is the inverse of `webs`, so a block's live-in set can be turned into web hits
+        // directly instead of asking every web about every block.
+        let mut is_param_vreg = BitSet::with_capacity(self.num_vregs);
+        for &block_id in &block_order {
+            for param in self.basic_blocks[block_id.0].parameters.iter() {
+                if let Opnd::VReg { idx, .. } = param {
+                    is_param_vreg.insert(idx.to_usize());
+                }
+            }
+        }
+        let mut web_of: Vec<Option<usize>> = vec![None; self.num_vregs];
+        for (&web_root, members) in webs.iter() {
+            for &member in members {
+                web_of[member] = Some(web_root);
+            }
+        }
+
+        // A web is rejected when two of its members are live at the same block entry: a
+        // block's parameters are all written at once by the parallel copy on each incoming
+        // edge, so two members that are parameters of the same block hold two different
+        // values there -- that is the loop-carried swap -- and a member that is merely live
+        // into the block would have its value clobbered by the parameter write.
+        //
+        // Counting per block instead of per (web, block) pair keeps this proportional to
+        // the liveness information itself rather than to webs x blocks, which is what made
+        // it quadratic in ISEQ size. `hits` is stamped with the block's index so it never
+        // has to be cleared.
+        let mut rejected: HashSet<usize> = HashSet::default();
+        let mut hit_stamp: Vec<usize> = vec![usize::MAX; self.num_vregs];
+        let mut hit_count: Vec<u32> = vec![0; self.num_vregs];
+        for (stamp, &block_id) in block_order.iter().enumerate() {
+            let mut bump = |web_root: usize, rejected: &mut HashSet<usize>| {
+                if hit_stamp[web_root] != stamp {
+                    hit_stamp[web_root] = stamp;
+                    hit_count[web_root] = 1;
+                } else {
+                    hit_count[web_root] += 1;
+                    if hit_count[web_root] > 1 {
+                        rejected.insert(web_root);
+                    }
+                }
+            };
+            for member in live_in[block_id.0].iter_set_bits() {
+                if let Some(web_root) = web_of[member] {
+                    bump(web_root, &mut rejected);
+                }
+            }
+            for param in self.basic_blocks[block_id.0].parameters.iter() {
+                if let Opnd::VReg { idx, .. } = param {
+                    if let Some(web_root) = web_of[idx.to_usize()] {
+                        bump(web_root, &mut rejected);
+                    }
+                }
+            }
+        }
 
         let mut roots: Vec<usize> = (0..self.num_vregs).collect();
-        'web: for members in webs.values() {
+        'web: for (&web_root, members) in webs.iter() {
+            if rejected.contains(&web_root) {
+                continue;
+            }
             // Own the web with a member that has a range, not necessarily the union-find
             // root, which may have been filtered out above.
             let root = members[0];
-            let member_set: HashSet<usize> = members.iter().copied().collect();
-
-            // At most one member may be live at any block's entry. A block's parameters
-            // are all written at once by the parallel copy on each incoming edge, so two
-            // members that are parameters of the same block hold two different values
-            // there -- that is the loop-carried swap. A member that is merely live into
-            // the block would have its value clobbered by the parameter write.
-            for (block_id, params) in &block_params {
-                let live_at_entry = members.iter()
-                    .filter(|&&member| live_in[block_id.0].get(member))
-                    .count()
-                    + params.iter().filter(|param| member_set.contains(param)).count();
-                if live_at_entry > 1 {
-                    continue 'web;
-                }
-            }
 
             // A member defined by a regular instruction writes a value from outside the
             // web into the shared location, so no other member may be live across it.
             for &member in members {
-                if param_vregs.contains(&member) {
+                if is_param_vreg.get(member) {
                     continue;
                 }
                 let def = intervals[member].start();
@@ -3282,6 +3336,114 @@ impl Assembler
         self.rewrite_instructions(&block_order, intervals, regs);
     }
 
+    /// Work out, for every CCall in `block_order`, which VRegs have to be pushed around
+    /// it. The result is indexed by the CCall's ordinal in a walk of `block_order` that
+    /// visits `basic_blocks[block].insns` in order -- the same walk
+    /// [`Self::handle_caller_saved_regs`] does -- and each entry is sorted ascending by
+    /// VReg id.
+    ///
+    /// The straightforward way to answer this is to re-scan every interval at every call,
+    /// which costs O(calls x vregs) and is the dominant term in the backend on the huge
+    /// ISEQs that come out of real applications. Instead this walks the intervals once and
+    /// pushes each one onto the buckets of the calls it spans, found by binary search over
+    /// the sorted call positions, so the total work is proportional to the size of the
+    /// answer.
+    ///
+    /// The membership rule is the same one the old scan applied:
+    ///
+    /// * A coalesced VReg shares its owner's register, so saving the owner saves it too.
+    /// * Only VRegs the allocator put in an allocatable register need saving at all.
+    /// * A caller-saved register is saved when it is live across the call, or when the
+    ///   call's own stack map names it.
+    /// * A callee-saved register survives the call by itself, so it is only saved when the
+    ///   call's own stack map names it, or when it is live across the call *and* some stack
+    ///   map in the function can materialize it (`materializable`) -- the slot such a map
+    ///   names has to hold the value at every call its JITFrame is installed across.
+    fn plan_ccall_survivors(
+        &self,
+        block_order: &[BlockId],
+        intervals: &[Interval],
+        alloc_regs: &RegPool,
+        materializable: &HashSet<VRegId>,
+    ) -> Vec<Vec<VRegId>> {
+        // Every CCall's position, in walk order. A CCall with no instruction number is
+        // numbered 0, matching what the per-call scan used to ask survives() about.
+        let mut positions: Vec<usize> = Vec::new();
+        for &block_id in block_order {
+            let block = &self.basic_blocks[block_id.0];
+            for (insn, insn_id) in block.insns.iter().zip(block.insn_ids.iter()) {
+                if matches!(insn, Insn::CCall { .. }) {
+                    positions.push(insn_id.map_or(0, |id| id.0));
+                }
+            }
+        }
+        let mut survivors: Vec<Vec<VRegId>> = vec![Vec::new(); positions.len()];
+        if positions.is_empty() {
+            return survivors;
+        }
+
+        // Call ordinals sorted by position, so a range can binary-search the window of
+        // calls it spans. `positions` is very nearly sorted already (block_order() is
+        // reverse postorder and number_instructions() numbers in the same order), but
+        // unnumbered calls land at 0, so sort rather than assume.
+        let mut by_position: Vec<(usize, usize)> = positions.iter().copied().zip(0..).collect();
+        by_position.sort_unstable();
+
+        // Pass 1: the VRegs each call's own stack map names.
+        let mut ordinal = 0;
+        for &block_id in block_order {
+            let block = &self.basic_blocks[block_id.0];
+            for insn in block.insns.iter() {
+                let Insn::CCall { data } = insn else { continue };
+                if let Some(StackMap { stack, .. }) = &data.stack_map {
+                    for entry in stack.iter() {
+                        let StackMapEntry::Opnd(Opnd::VReg { idx, .. }) = entry else { continue };
+                        let owner = intervals[*idx].owner(intervals);
+                        if owner.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs)).is_some() {
+                            survivors[ordinal].push(owner.vreg_id);
+                        }
+                    }
+                }
+                ordinal += 1;
+            }
+        }
+
+        // Pass 2: the VRegs live across each call. `survives(position)` is
+        // `range.from < position && position < range.to`, so for each range the calls that
+        // qualify are exactly the ones in the open interval (range.from, range.to).
+        for interval in intervals {
+            if interval.coalesced_into.is_some() {
+                continue;
+            }
+            let Some(pool_index) = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs)) else {
+                continue;
+            };
+            // A callee-saved register only has to be saved for liveness when a stack map
+            // somewhere in the function can materialize it.
+            if alloc_regs.is_callee_saved(pool_index) && !materializable.contains(&interval.vreg_id) {
+                continue;
+            }
+            for range in interval.ranges.iter() {
+                let lo = by_position.partition_point(|&(position, _)| position <= range.from);
+                let hi = by_position.partition_point(|&(position, _)| position < range.to);
+                for &(_, ordinal) in &by_position[lo..hi] {
+                    survivors[ordinal].push(interval.vreg_id);
+                }
+            }
+        }
+
+        // The old scan produced survivors in ascending VReg order, and both the push/pop
+        // pairing and stack_idx_for_caller_saved_reg() depend on that order, so restore it
+        // and drop the duplicates the two passes can produce.
+        for list in survivors.iter_mut() {
+            if list.len() > 1 {
+                list.sort_unstable_by_key(|vreg| vreg.to_usize());
+                list.dedup();
+            }
+        }
+        survivors
+    }
+
     /// Handle caller-saved registers around CCall instructions.
     /// For each CCall, push live caller-saved registers, set up arguments
     /// in C calling convention registers, and pop saved registers after.
@@ -3310,8 +3472,9 @@ impl Assembler
         // the value at every one of those calls, so a value some stack map might
         // materialize is pushed exactly like a caller-saved one; only values no stack map
         // ever mentions get to skip the push.
-        let materializable_vreg_ids: HashSet<VRegId> = self.block_order().into_iter()
-            .flat_map(|block_id| self.basic_blocks[block_id.0].insns.iter())
+        let block_order = self.block_order();
+        let materializable_vreg_ids: HashSet<VRegId> = block_order.iter()
+            .flat_map(|&block_id| self.basic_blocks[block_id.0].insns.iter())
             .filter_map(|insn| match insn {
                 Insn::CCall { data } => data.stack_map.as_ref(),
                 _ => None,
@@ -3323,9 +3486,16 @@ impl Assembler
             })
             .collect();
 
+        // The set of intervals that have to be saved across each CCall, precomputed by
+        // walking the intervals once instead of re-scanning all of them at every call.
+        // `survivors_at` is indexed by the ordinal of the CCall in the walk below, which
+        // is the same walk that filled it.
+        let mut survivors_at = self.plan_ccall_survivors(&block_order, intervals, alloc_regs, &materializable_vreg_ids);
+        let mut ccall_ordinal = 0;
+
         let parcopy_spare_slot = self.stack_state.parcopy_spare_slot;
 
-        for block_id in self.block_order() {
+        for &block_id in &block_order {
             let block = &mut self.basic_blocks[block_id.0];
             let old_insns = take(&mut block.insns);
             let old_ids = take(&mut block.insn_ids);
@@ -3336,7 +3506,8 @@ impl Assembler
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids.into_iter()) {
                 if let Insn::CCall { data } = insn {
                     let CCallData { opnds, stack_map, out, start_marker, end_marker, fptr } = *data;
-                    let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
+                    let survivors = take(&mut survivors_at[ccall_ordinal]);
+                    ccall_ordinal += 1;
                     // Do we have a case where a ccall is emitted, but nobody
                     // uses the result?
                     //
@@ -3346,53 +3517,6 @@ impl Assembler
                         let owner = intervals[out.vreg_idx()].owner(intervals);
                         owner.has_bounds() && !owner.is_dead()
                     };
-
-                    // Build a set of VRegIds that can be referenced by JITFrame for
-                    // materializing the VM stack, named by their owning interval so that
-                    // a coalesced VReg marks the interval that is actually allocated.
-                    let stack_vreg_ids: HashSet<VRegId> = if let Some(StackMap { stack, .. }) = &stack_map {
-                        stack.iter().filter_map(|entry| match entry {
-                            StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => Some(intervals[*idx].owner(intervals).vreg_id),
-                            _ => None,
-                        }).collect()
-                    } else {
-                        HashSet::default()
-                    };
-
-                    // Find survivors: intervals that survive this Call instruction
-                    // We need to preserve the "surviving" registers past the ccall,
-                    // so we're going to push them all on the stack, then pop
-                    // after we make the ccall
-                    let survivors: Vec<VRegId> = intervals.iter()
-                        .filter(|interval| {
-                            // Coalesced VRegs share their owner's register; saving the
-                            // owner once saves them all.
-                            if interval.coalesced_into.is_some() {
-                                return false;
-                            }
-                            // We need to spill register intervals on this CCall in two cases:
-                            // 1) The VReg is referenced in an instruction after the CCall
-                            let survives_call = interval.has_bounds() && interval.survives(insn_number);
-                            // 2) The VReg is referenced by the stack map for the CCall
-                            let stack_map_reg = stack_vreg_ids.contains(&interval.vreg_id);
-                            let pool_index = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs));
-                            let is_register = pool_index.is_some();
-                            // A callee-saved register survives the call by itself, so case 1
-                            // only applies to it when some stack map in this function can
-                            // name it: a stack map can only point at a VM stack slot in
-                            // memory, and the slot it names has to hold the value at every
-                            // call its JITFrame is installed across, not just at the call
-                            // whose stack map named it.
-                            let needs_save = if pool_index.is_some_and(|index| alloc_regs.is_callee_saved(index)) {
-                                stack_map_reg
-                                    || (survives_call && materializable_vreg_ids.contains(&interval.vreg_id))
-                            } else {
-                                survives_call || stack_map_reg
-                            };
-                            is_register && needs_save
-                        })
-                        .map(|interval| interval.vreg_id)
-                        .collect();
 
                     let survivor_regs: Vec<Opnd> = survivors.iter()
                         .map(|&s| Opnd::Reg(intervals[s].assigned.get().unwrap().assigned_reg(alloc_regs).unwrap()))
