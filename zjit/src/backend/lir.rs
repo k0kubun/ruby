@@ -4151,15 +4151,28 @@ impl Assembler
             opnds.iter().map(|opnd| format!("{opnd}")).collect::<Vec<_>>().join(delimiter)
         }
 
-        // Extract targets first so that we can update instructions while referencing part of them.
-        let mut targets = HashMap::default();
-
+        // Take the side-exit targets out of the instructions that hold them, so that the
+        // exit code can be built while those instructions are updated. Every one of them
+        // is overwritten with the compiled exit's label before this function returns, so
+        // the data can be moved out rather than cloned -- cloning meant a fresh Box plus a
+        // copy of the exit's whole operand stack, locals and stack map, for every exit in
+        // the function. The placeholder left behind is deliberately out of range so that
+        // anything reading it before the overwrite trips an assertion.
+        //
+        // A Vec rather than a map: the keys are unique by construction, and visiting the
+        // exits in block order instead of hash order makes the layout of the emitted exit
+        // stubs reproducible.
+        let mut targets: Vec<((usize, usize), Box<SideExitTarget>)> = Vec::new();
         for block_id in self.block_order() {
-            let block = &self.basic_blocks[block_id.0];
-            for (idx, insn) in block.insns.iter().enumerate() {
-                if let Some(target @ Target::SideExit(..)) = insn.target() {
-                    targets.insert((block_id.0, idx), target.clone());
-                }
+            let block = &mut self.basic_blocks[block_id.0];
+            for idx in 0..block.insns.len() {
+                let Some(target) = block.insns[idx].target_mut() else { continue };
+                if !matches!(target, Target::SideExit(..)) { continue; }
+                let placeholder = Target::Label(Label(usize::MAX));
+                let Target::SideExit(data) = std::mem::replace(target, placeholder) else {
+                    unreachable!("just checked for Target::SideExit")
+                };
+                targets.push(((block_id.0, idx), data));
             }
         }
 
@@ -4206,10 +4219,10 @@ impl Assembler
         // Measure time spent compiling side-exit LIR
         let side_exit_start = std::time::Instant::now();
 
-        for ((block_id, idx), target) in targets {
+        for ((block_id, idx), data) in targets {
             // Compile a side exit. Note that this is past register assignment,
             // so you can't use an instruction that returns a VReg.
-            if let Target::SideExit(data) = target {
+            {
                 let SideExitTarget { exit, reason } = *data;
                 // Only record the exit if `trace_side_exits` is defined and the counter is either the one specified
                 let should_record_exit = get_option!(trace_side_exits).map(|trace| match trace {
