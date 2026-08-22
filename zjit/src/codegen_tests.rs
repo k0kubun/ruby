@@ -113,6 +113,55 @@ fn test_nil() {
     "), @"nil");
 }
 
+// A direct send hands the callee's block parameter to the JIT entry as a C
+// argument, so a function stub that returns to the interpreter instead of
+// entering JIT code has to initialize that frame slot itself. A bmethod callee
+// reads the slot with a plain `getlocal`, so a stale value there used to leak
+// into `&blk` -- `stale_block_param_filler`'s 5th argument lands in exactly the
+// slot `stale_block_param_callee` reads its block parameter from.
+#[test]
+fn test_function_stub_exit_initializes_block_param() {
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let num_profiles = u64::from(get_option!(num_profiles));
+    let call_threshold = num_profiles + 2;
+    set_call_threshold(call_threshold);
+
+    // Keep the callee below the call threshold so the stub hit below exits to the
+    // interpreter, while the caller crosses it and compiles a direct send.
+    let callee_calls: u64 = 2;
+    assert!(callee_calls < call_threshold);
+
+    assert_snapshot!(inspect(&format!("
+        $stale_block_param_sink = nil
+
+        class StaleBlockParam
+          define_method(:stale_block_param_callee) do |a, b, c, d, &blk|
+            $stale_block_param_sink = [a, b, c, d]
+            blk
+          end
+
+          def stale_block_param_filler(a, b, c, d, e, f, g, h)
+            $stale_block_param_sink = [a, b, c, d, e, f, g, h]
+            h
+          end
+
+          def stale_block_param_entry(call_callee)
+            stale_block_param_filler(Object, Comparable, Kernel, Enumerable, Math, Process, Signal, GC)
+            call_callee ? stale_block_param_callee(1, 2, 3, 4) : nil
+          end
+        end
+
+        obj = StaleBlockParam.new
+        i = 0
+        while i < {call_threshold}
+          obj.stale_block_param_entry(i < {callee_calls})
+          i += 1
+        end
+        obj.stale_block_param_entry(true)
+    ")), @"nil");
+}
+
 #[test]
 fn test_function_stub_profiles_before_compiling() {
     rb_zjit_prepare_options();
