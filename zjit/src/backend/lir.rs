@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::mem::take;
@@ -3116,14 +3117,12 @@ impl Assembler
 
         // Count predecessors for each block
         let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
-        for block_id in self.block_order() {
+        let block_order = self.block_order();
+        for &block_id in &block_order {
             for succ in self.basic_blocks[block_id.0].successors() {
                 *num_predecessors.entry(succ).or_insert(0) += 1;
             }
         }
-
-        // Collect block order upfront so we don't borrow self while mutating
-        let block_order = self.block_order();
 
         // This code is iterating over each block in our CFG and inserting
         // copy instructions at each edge.
@@ -3280,7 +3279,7 @@ impl Assembler
             }
         }
 
-        self.rewrite_instructions(intervals, regs);
+        self.rewrite_instructions(&block_order, intervals, regs);
     }
 
     /// Handle caller-saved registers around CCall instructions.
@@ -3639,8 +3638,8 @@ impl Assembler
 
     /// Walk every instruction and replace VReg operands with the physical
     /// register (or stack slot) assigned to the VReg's interval.
-    fn rewrite_instructions(&mut self, intervals: &[Interval], regs: &RegPool) {
-        for block_id in self.block_order() {
+    fn rewrite_instructions(&mut self, block_order: &[BlockId], intervals: &[Interval], regs: &RegPool) {
+        for &block_id in block_order {
             for insn in self.basic_blocks[block_id.0].insns.iter_mut() {
                 insn.for_each_operand_mut(|opnd| {
                     Self::rewrite_opnd(opnd, intervals, regs);
@@ -4070,24 +4069,25 @@ impl Assembler
                 };
 
                 // Compile the shared side exit if not compiled yet
-                let compiled_exit = if let Some(&compiled_exit) = compiled_exits.get(&exit) {
-                    Target::Label(compiled_exit)
-                } else {
-                    let new_exit = self.new_label("side_exit");
-                    self.write_label(new_exit.clone());
-                    asm_comment!(self, "Exit: {}", exit.pc);
-                    let meta_idx = compile_exit_meta_index(&exit, &mut interned_metas);
-                    if exit_tail_target.is_none() {
-                        exit_tail_target = Some(if self.callee_saved_saves.is_empty() {
-                            Target::CodePtr(ZJITState::get_exit_meta_trampoline())
-                        } else {
-                            self.new_label("exit_tail")
-                        });
+                let compiled_exit = match compiled_exits.entry(exit) {
+                    Entry::Occupied(entry) => Target::Label(*entry.get()),
+                    Entry::Vacant(entry) => {
+                        let new_exit = self.new_label("side_exit");
+                        self.write_label(new_exit.clone());
+                        asm_comment!(self, "Exit: {}", entry.key().pc);
+                        let meta_idx = compile_exit_meta_index(entry.key(), &mut interned_metas);
+                        if exit_tail_target.is_none() {
+                            exit_tail_target = Some(if self.callee_saved_saves.is_empty() {
+                                Target::CodePtr(ZJITState::get_exit_meta_trampoline())
+                            } else {
+                                self.new_label("exit_tail")
+                            });
+                        }
+                        let tail = exit_tail_target.clone().expect("just set above");
+                        compile_exit(self, entry.key(), meta_idx, tail);
+                        entry.insert(new_exit.unwrap_label());
+                        new_exit
                     }
-                    let tail = exit_tail_target.clone().expect("just set above");
-                    compile_exit(self, &exit, meta_idx, tail);
-                    compiled_exits.insert(exit, new_exit.unwrap_label());
-                    new_exit
                 };
 
                 *self.basic_blocks[block_id].insns[idx].target_mut().unwrap() = counted_exit.unwrap_or(compiled_exit);

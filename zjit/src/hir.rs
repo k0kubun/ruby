@@ -792,7 +792,11 @@ pub enum SendFallbackReason {
     SendBlockArgNotNil,
     CCallWithFrameTooManyArgs,
     ObjToStringNotString,
+    /// Too many arguments in a C call to fit in C ABI registers.
     TooManyArgsForLir,
+    /// An operand doesn't fit in the integer type that encodes it,
+    /// e.g. an argument count that overflows IseqCall's u16.
+    OperandTooLarge,
     /// The Proc object for a BMETHOD is not defined by an ISEQ. (See `enum rb_block_type`.)
     BmethodNonIseqProc,
     /// Caller supplies too few or too many arguments than what the callee's parameters expects.
@@ -874,6 +878,7 @@ impl Display for SendFallbackReason {
             CCallWithFrameTooManyArgs => write!(f, "CCallWithFrame: too many arguments"),
             ObjToStringNotString => write!(f, "ObjToString: result is not a string"),
             TooManyArgsForLir => write!(f, "Too many arguments for LIR"),
+            OperandTooLarge => write!(f, "Operand doesn't fit in its encoding"),
             BmethodNonIseqProc => write!(f, "Bmethod: Proc object is not defined by an ISEQ"),
             ArgcParamMismatch => write!(f, "Argument count does not match parameter count"),
             ComplexArgPass => write!(f, "Complex argument passing"),
@@ -2937,7 +2942,7 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
-        return Err(SendDirectFailure::new(TooManyArgsForLir));
+        return Err(SendDirectFailure::new(OperandTooLarge));
     }
 
     Ok(())
@@ -4540,12 +4545,33 @@ impl Function {
         let mut reachable = BlockSet::with_capacity(self.blocks.len());
         reachable.insert(self.entries_block);
 
-        // Walk the graph, computing types until fixpoint
+        // Repeatedly walk the graph in RPO order, computing types until fixpoint. For each
+        // iteration over the CFG, track the following two attributes to detect the fixpoint:
+        //
+        // 1. if new types were inferred
+        // 2. if back edges were traversed
+        //
+        // For point (1), if no new types were inferred it means no new information is available.
+        // Further repetitions will not change the result.
+        //
+        // For point (2), if the RPO walk does not traverse a back edge, type information can only
+        // be propagated forwards. It follows that a node's type can only be inferred from its
+        // predecessors. RPO ordering ensures all of a node's predecessors have been processed;
+        // therefore, a single walk of the RPO ordering will reach the fixpoint.
         let rpo = self.reverse_post_order();
+        // Map BlockId -> rpo index. Used to detect back edge traversal. If an edge targets a block
+        // with rpo index <= the current rpo index it's a back edge. Note that `rpo_order` must be
+        // of size `self.blocks.len()` to support all possible block IDs; however, `rpo` only
+        // includes reachable blocks. Any blocks not present in `rpo` default to `usize::MAX`.
+        let mut rpo_order = vec![usize::MAX; self.blocks.len()];
+        for (idx, &block_id) in rpo.iter().enumerate() {
+            rpo_order[block_id.to_usize()] = idx;
+        }
         loop {
             let mut changed = false;
+            let mut traversed_back_edge = false;
             let mut num_instructions = 0;
-            for &block in &rpo {
+            for (rpo_index, &block) in rpo.iter().enumerate() {
                 if !reachable.get(block) { continue; }
                 for i in 0..self.blocks[block.to_usize()].insns.len() {
                     let insn_id = self.blocks[block.to_usize()].insns[i];
@@ -4567,6 +4593,7 @@ impl Function {
                                     let param = self.blocks[if_true.target.to_usize()].params[idx];
                                     changed |= set_type!(param, self.type_of(param).union(arg_type));
                                 }
+                                traversed_back_edge |= rpo_order[if_true.target.to_usize()] <= rpo_index;
                             }
                             if self.type_of(*val).could_be(Type::from_cbool(false)) {
                                 reachable.insert(if_false.target);
@@ -4575,6 +4602,7 @@ impl Function {
                                     let param = self.blocks[if_false.target.to_usize()].params[idx];
                                     changed |= set_type!(param, self.type_of(param).union(arg_type));
                                 }
+                                traversed_back_edge |= rpo_order[if_false.target.to_usize()] <= rpo_index;
                             }
                             continue;
                         }
@@ -4585,6 +4613,7 @@ impl Function {
                                 let param = self.blocks[target.to_usize()].params[idx];
                                 changed |= set_type!(param, self.type_of(param).union(arg_type));
                             }
+                            traversed_back_edge |= rpo_order[target.to_usize()] <= rpo_index;
                             continue;
                         }
                         Insn::Entries { targets } => {
@@ -4599,7 +4628,7 @@ impl Function {
                     changed |= set_type!(insn_id, insn_type);
                 }
             }
-            if !changed {
+            if !changed || !traversed_back_edge {
                 self.num_instructions = num_instructions;
                 break;
             }
@@ -4889,7 +4918,7 @@ impl Function {
         // rest packing changes the SendDirect argument count.
         // See: vm_args.c's setup_parameters_complex and args_setup_opt_parameters.
         let passed_opt_num = (positional_argc - min_positional_argc).min(opt_num);
-        let jit_entry_idx = passed_opt_num.try_into().map_err(|_| TooManyArgsForLir)?;
+        let jit_entry_idx = passed_opt_num.try_into().map_err(|_| OperandTooLarge)?;
 
         // Methods without *rest still need the jit_entry_idx computed above,
         // but their positional args do not need repacking.
@@ -5981,7 +6010,7 @@ impl Function {
                                     {
                                         let native_index = (index as i64) * (SIZEOF_VALUE as i64);
                                         if native_index > (i32::MAX as i64) {
-                                            self.set_dynamic_send_reason(insn_id, TooManyArgsForLir);
+                                            self.set_dynamic_send_reason(insn_id, OperandTooLarge);
                                             self.push_insn_id(block, insn_id); continue;
                                         }
                                     }
@@ -6251,7 +6280,8 @@ impl Function {
                     }
                     &Insn::IsMethodCfunc { val, cd, cfunc, state } if self.type_of(val).ruby_object_known() => {
                         let class = self.type_of(val).ruby_object().unwrap();
-                        let cme = unsafe { rb_zjit_vm_search_method(self.iseq.into(), cd as *mut rb_call_data, class) };
+                        let cd_owner = self.frame_state_iseq(state);
+                        let cme = unsafe { rb_zjit_vm_search_method(cd_owner.into(), cd as *mut rb_call_data, class) };
                         let is_expected_cfunc = unsafe { rb_zjit_cme_is_cfunc(cme, cfunc as *const c_void) };
                         let method = unsafe { rb_vm_ci_mid((*cd).ci) };
                         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: class, method, cme }, state });
