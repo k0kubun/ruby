@@ -108,6 +108,10 @@ pub struct ZJITState {
     /// the `Box`es must never move.
     ivar_caches: HashMap<ID, Box<crate::ivar_cache::IvarCache>>,
 
+    /// Class tables for send sites that dispatch over more classes than an
+    /// inline guard chain can cover, one per call shape. Owned here because JIT
+    /// code bakes in the addresses, so the `Box`es must never move.
+    send_caches: crate::send_cache::SendCaches,
 }
 
 /// Tracks the initialization progress
@@ -195,6 +199,7 @@ impl ZJITState {
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
             ivar_caches: HashMap::new(),
+            send_caches: crate::send_cache::SendCaches::new(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -246,6 +251,11 @@ impl ZJITState {
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
     pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
         &mut ZJITState::get_instance().ivar_caches
+    }
+
+    /// Owner of every per-call-shape class table. See [`crate::send_cache`].
+    pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
+        &mut ZJITState::get_instance().send_caches
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {

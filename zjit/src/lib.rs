@@ -36,6 +36,7 @@ mod gc;
 mod jit_frame;
 mod payload;
 mod ivar_cache;
+mod send_cache;
 mod json;
 mod ttycolors;
 
