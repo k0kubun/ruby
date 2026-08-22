@@ -200,10 +200,16 @@ impl CodeBlock {
         }
     }
 
-    /// Write multiple bytes starting from the current position.
+    /// Write multiple bytes starting from the current position. Goes straight to
+    /// [`VirtualMem::write_bytes`] so that the whole run costs one `RefCell` borrow and
+    /// one page check instead of one of each per byte.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_byte(*byte);
+        let write_ptr = self.get_write_ptr();
+        // TODO: check has_capacity()
+        let (written, result) = self.mem_block.borrow_mut().write_bytes(write_ptr, bytes);
+        self.write_pos += written;
+        if result.is_err() {
+            self.dropped_bytes = true;
         }
     }
 
@@ -222,14 +228,11 @@ impl CodeBlock {
                 ((val >> 16) & 0xff) as u8,
                 ((val >> 24) & 0xff) as u8,
             ]),
+            64 => self.write_bytes(&val.to_le_bytes()),
             _ => {
-                let mut cur = val;
-
-                // Write out the bytes
-                for _byte in 0..(num_bits / 8) {
-                    self.write_byte((cur & 0xff) as u8);
-                    cur >>= 8;
-                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&val.to_le_bytes());
+                self.write_bytes(&buf[..(num_bits / 8) as usize]);
             }
         }
     }

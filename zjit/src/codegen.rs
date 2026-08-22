@@ -5,7 +5,7 @@
 mod gc_fastpath;
 
 use std::cell::{Cell, RefCell};
-use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
+use crate::fasthash::FastHashMap as HashMap;
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;

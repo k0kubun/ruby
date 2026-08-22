@@ -31,6 +31,11 @@ pub struct VirtualMemory<A: Allocator> {
     /// Number of bytes per "page", memory protection permission can only be controlled at this
     /// granularity.
     page_size_bytes: usize,
+    /// `!(page_size_bytes - 1)`, so that rounding an address down to its page start is
+    /// an AND rather than a division. write_byte() runs this on every emitted byte, and
+    /// dividing by a runtime-valued page size there cost several percent of the whole
+    /// compiler on a compile-heavy workload.
+    page_addr_mask: usize,
 
     /// Number of bytes that have we have allocated physical memory for starting at
     /// [Self::region_start].
@@ -139,12 +144,14 @@ impl<A: Allocator> VirtualMemory<A> {
     ) -> Self {
         assert_ne!(0, page_size);
         let page_size_bytes = page_size as usize;
+        assert!(page_size_bytes.is_power_of_two(), "page size should be a power of two, got {page_size_bytes}");
 
         Self {
             region_start: virt_region_start,
             region_size_bytes,
             memory_limit_bytes,
             page_size_bytes,
+            page_addr_mask: !(page_size_bytes - 1),
             mapped_region_bytes: 0,
             current_write_page: None,
             allocator,
@@ -183,13 +190,51 @@ impl<A: Allocator> VirtualMemory<A> {
 
     /// Write a single byte. The first write to a page makes it readable.
     pub fn write_byte(&mut self, write_ptr: CodePtr, byte: u8) -> Result<(), WriteError> {
-        let page_size = self.page_size_bytes;
         let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
-        let page_addr = (raw as usize / page_size) * page_size;
+        let page_addr = raw as usize & self.page_addr_mask;
+        if self.current_write_page != Some(page_addr) {
+            self.make_page_writable(raw, page_addr)?;
+        }
 
-        if self.current_write_page == Some(page_addr) {
-            // Writing within the last written to page, nothing to do
-        } else {
+        // We have permission to write if we get here
+        unsafe { raw.write(byte) };
+
+        Ok(())
+    }
+
+    /// Write a run of bytes, making each page it lands in writable first. Returns how many
+    /// bytes were written, which is short of `bytes.len()` only when a page could not be
+    /// mapped.
+    ///
+    /// This exists so that emitting an instruction costs one page check and one `memcpy`
+    /// per page instead of a page check per byte. Machine code is emitted a byte or two at
+    /// a time from a lot of places, and the per-byte bookkeeping was several percent of
+    /// the whole compiler on a compile-heavy workload.
+    pub fn write_bytes(&mut self, write_ptr: CodePtr, bytes: &[u8]) -> (usize, Result<(), WriteError>) {
+        let mut written = 0;
+        while written < bytes.len() {
+            let raw: *mut u8 = write_ptr.add_bytes(written).raw_ptr(self) as *mut u8;
+            let page_addr = raw as usize & self.page_addr_mask;
+            if self.current_write_page != Some(page_addr) {
+                if let Err(err) = self.make_page_writable(raw, page_addr) {
+                    return (written, Err(err));
+                }
+            }
+            // Stop at the end of this page; the next iteration maps the following one.
+            let to_page_end = page_addr + self.page_size_bytes - raw as usize;
+            let run = to_page_end.min(bytes.len() - written);
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(written), raw, run) };
+            written += run;
+        }
+        (written, Ok(()))
+    }
+
+    /// Make the page containing `raw` writable, mapping it first if this is the first
+    /// write to it, and remember it as the current write page.
+    #[cold]
+    fn make_page_writable(&mut self, raw: *mut u8, page_addr: usize) -> Result<(), WriteError> {
+        let page_size = self.page_size_bytes;
+        {
             // Switching to a different and potentially new page
             let start = self.region_start.as_ptr();
             let mapped_region_end = start.wrapping_add(self.mapped_region_bytes);
@@ -251,9 +296,6 @@ impl<A: Allocator> VirtualMemory<A> {
                 return Err(OutOfBounds);
             }
         }
-
-        // We have permission to write if we get here
-        unsafe { raw.write(byte) };
 
         Ok(())
     }

@@ -2452,6 +2452,10 @@ impl Assembler
     /// operands to this instruction.
     pub fn push_insn(&mut self, insn: Insn) {
         // If this Assembler should not accept scratch registers, assert no use of them.
+        // This walks every operand of every instruction the compiler ever pushes, which
+        // made it the single hottest function in the backend, so it is an invariant check
+        // for builds that check invariants rather than something release builds pay for.
+        #[cfg(debug_assertions)]
         if !self.accept_scratch_reg {
             insn.for_each_operand(|opnd| {
                 assert!(!Self::has_scratch_reg(opnd), "should not use scratch register: {opnd:?}");
