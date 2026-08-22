@@ -216,6 +216,7 @@ impl CodeBlock {
     /// Write multiple bytes starting from the current position. Goes straight to
     /// [`VirtualMem::write_bytes`] so that the whole run costs one `RefCell` borrow and
     /// one page check instead of one of each per byte.
+    #[inline]
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let write_ptr = self.get_write_ptr();
         // TODO: check has_capacity()
@@ -227,6 +228,7 @@ impl CodeBlock {
     }
 
     /// Write an integer over the given number of bits at the current position.
+    #[inline]
     pub fn write_int(&mut self, val: u64, num_bits: u32) {
         debug_assert!(num_bits > 0);
         debug_assert!(num_bits % 8 == 0);

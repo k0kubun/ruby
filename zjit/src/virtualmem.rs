@@ -73,6 +73,16 @@ pub struct VirtualMemory<A: Allocator> {
     /// Used for changing protection to implement W^X.
     current_write_page: Option<usize>,
 
+    /// The half-open address range that is writable right now: the page
+    /// [`Self::current_write_page`] names, or empty when there is none.
+    ///
+    /// Held as a range rather than derived from `current_write_page` on each
+    /// write so that the check a write has to pass is two unsigned compares,
+    /// with no page-address masking and no `Option` to unwrap. Emitting one
+    /// machine instruction makes several of these calls.
+    write_ok_start: usize,
+    write_ok_end: usize,
+
     /// Zero size member for making syscalls to get physical memory during normal operation.
     /// When testing this owns some memory.
     allocator: A,
@@ -189,6 +199,8 @@ impl<A: Allocator> VirtualMemory<A> {
             page_addr_mask: !(page_size_bytes - 1),
             mapped_region_bytes: 0,
             current_write_page: None,
+            write_ok_start: 0,
+            write_ok_end: 0,
             allocator,
         }
     }
@@ -223,12 +235,27 @@ impl<A: Allocator> VirtualMemory<A> {
         self.page_size_bytes
     }
 
+    /// Remember `page_addr` as the writable page.
+    fn set_write_page(&mut self, page_addr: usize) {
+        self.current_write_page = Some(page_addr);
+        self.write_ok_start = page_addr;
+        self.write_ok_end = page_addr + self.page_size_bytes;
+    }
+
+    /// Forget the writable page, so the next write maps one again.
+    fn clear_write_page(&mut self) {
+        self.current_write_page = None;
+        self.write_ok_start = 0;
+        self.write_ok_end = 0;
+    }
+
     /// Write a single byte. The first write to a page makes it readable.
     #[inline]
     pub fn write_byte(&mut self, write_ptr: CodePtr, byte: u8) -> Result<(), WriteError> {
         let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
-        let page_addr = raw as usize & self.page_addr_mask;
-        if self.current_write_page != Some(page_addr) {
+        let addr = raw as usize;
+        if addr < self.write_ok_start || addr >= self.write_ok_end {
+            let page_addr = addr & self.page_addr_mask;
             self.make_page_writable(raw, page_addr)?;
         }
 
@@ -236,6 +263,36 @@ impl<A: Allocator> VirtualMemory<A> {
         unsafe { raw.write(byte) };
 
         Ok(())
+    }
+
+    /// Write the first `len` bytes of a staged encoding buffer.
+    ///
+    /// The whole buffer is copied whether or not all of it is live, which turns
+    /// the copy into one unaligned SSE store instead of a dispatch on the length
+    /// -- and instruction encodings arrive here at every length from one to
+    /// fifteen bytes, so that dispatch never predicts. The bytes past `len` are
+    /// scratch: the next instruction overwrites them, and the last write of a
+    /// compile only ever runs past the end of live code into the same page.
+    ///
+    /// Falls back to the general path when the whole buffer would not fit in the
+    /// page that is writable right now.
+    #[inline]
+    pub fn write_staged<const N: usize>(
+        &mut self,
+        write_ptr: CodePtr,
+        staged: &[u8; N],
+        len: usize,
+    ) -> (usize, Result<(), WriteError>) {
+        debug_assert!(len <= N);
+        let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
+        let addr = raw as usize;
+        if addr >= self.write_ok_start && addr + N <= self.write_ok_end {
+            // SAFETY: `addr .. addr + N` is inside the page that is mapped and
+            // writable, and `staged` is a distinct N-byte object.
+            unsafe { std::ptr::copy_nonoverlapping(staged.as_ptr(), raw, N) };
+            return (len, Ok(()));
+        }
+        self.write_bytes(write_ptr, &staged[..len])
     }
 
     /// Write a run of bytes, making each page it lands in writable first. Returns how many
@@ -246,22 +303,27 @@ impl<A: Allocator> VirtualMemory<A> {
     /// per page instead of a page check per byte. Machine code is emitted a byte or two at
     /// a time from a lot of places, and the per-byte bookkeeping was several percent of
     /// the whole compiler on a compile-heavy workload.
+    #[inline]
     pub fn write_bytes(&mut self, write_ptr: CodePtr, bytes: &[u8]) -> (usize, Result<(), WriteError>) {
         // Fast path: the run lands entirely inside the page that is already
         // writable, which is what happens for all but one write in a few
         // thousand. Emitting one machine instruction makes several of these
-        // calls, so the loop's per-iteration pointer arithmetic and
-        // page-boundary math is worth skipping.
-        {
-            let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
-            let page_addr = raw as usize & self.page_addr_mask;
-            if self.current_write_page == Some(page_addr)
-                && bytes.len() <= page_addr + self.page_size_bytes - raw as usize
-            {
-                copy_short(bytes.as_ptr(), raw, bytes.len());
-                return (bytes.len(), Ok(()));
-            }
+        // calls, so this is inlined into them and the page-crossing loop is kept
+        // out of line: the call, the register saves it needs and the return were
+        // together a larger share of the emitter than the copies themselves.
+        let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
+        let addr = raw as usize;
+        if addr >= self.write_ok_start && addr + bytes.len() <= self.write_ok_end {
+            copy_short(bytes.as_ptr(), raw, bytes.len());
+            return (bytes.len(), Ok(()));
         }
+        self.write_bytes_crossing_pages(write_ptr, bytes)
+    }
+
+    /// The part of [`Self::write_bytes`] that has to map pages as it goes.
+    #[inline(never)]
+    #[cold]
+    fn write_bytes_crossing_pages(&mut self, write_ptr: CodePtr, bytes: &[u8]) -> (usize, Result<(), WriteError>) {
         let mut written = 0;
         while written < bytes.len() {
             let raw: *mut u8 = write_ptr.add_bytes(written).raw_ptr(self) as *mut u8;
@@ -308,7 +370,7 @@ impl<A: Allocator> VirtualMemory<A> {
                     return Err(FailedPageMapping);
                 }
 
-                self.current_write_page = Some(page_addr);
+                self.set_write_page(page_addr);
             } else if (start..whole_region_end).contains(&raw) &&
                     required_region_bytes < self.memory_limit_bytes.unwrap_or(self.region_size_bytes) {
                 // Writing to a brand new page
@@ -342,7 +404,7 @@ impl<A: Allocator> VirtualMemory<A> {
                 }
                 self.mapped_region_bytes += alloc_size;
 
-                self.current_write_page = Some(page_addr);
+                self.set_write_page(page_addr);
             } else {
                 return Err(OutOfBounds);
             }
@@ -361,7 +423,7 @@ impl<A: Allocator> VirtualMemory<A> {
     /// Make all the code in the region writable. Call this before bulk writes (e.g. GC
     /// reference updates). See [Self] for usual usage flow.
     pub fn mark_all_writable(&mut self) {
-        self.current_write_page = None;
+        self.clear_write_page();
 
         let region_start = self.region_start;
         let mapped_region_bytes: u32 = self.mapped_region_bytes.try_into().unwrap();
@@ -377,7 +439,7 @@ impl<A: Allocator> VirtualMemory<A> {
     /// Make all the code in the region executable. Call this at the end of a write session.
     /// See [Self] for usual usage flow.
     pub fn mark_all_executable(&mut self) {
-        self.current_write_page = None;
+        self.clear_write_page();
 
         let region_start = self.region_start;
         let mapped_region_bytes: u32 = self.mapped_region_bytes.try_into().unwrap();
