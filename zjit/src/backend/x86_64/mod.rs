@@ -342,7 +342,7 @@ impl Assembler {
     /// for VRegs, most splits should happen in [`Self::x86_split`]. However, some instructions
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so
     /// this splits them and uses scratch registers for it.
-    pub fn x86_scratch_split(self) -> Assembler {
+    pub fn x86_scratch_split(mut self) -> Assembler {
         /// For some instructions, we want to be able to lower a 64-bit operand
         /// without requiring more registers to be available in the register
         /// allocator. So we just use the SCRATCH0_OPND register temporarily to hold
@@ -480,7 +480,7 @@ impl Assembler {
         let asm = &mut asm_local;
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
-        let linearized_insns = self.linearize_instructions();
+        let linearized_insns = self.into_linearized_instructions();
         // Splitting emits at least one instruction per input instruction into the single
         // output block, so start it out big enough instead of growing it by doublings.
         asm.current_block().reserve_insns(linearized_insns.len());

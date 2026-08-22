@@ -2359,7 +2359,78 @@ impl Assembler
         iter
     }
 
+    /// The `Label` that starts each block, indexed by `BlockId`, or `None` for a
+    /// block that does not start with one.
+    ///
+    /// Resolved up front so that [`Self::into_linearized_instructions`] can move
+    /// each block's instructions out as it walks: reading a jump's destination
+    /// label means looking at the destination block's first instruction, which is
+    /// what otherwise forces the whole walk to keep every block readable.
+    fn block_labels(&self) -> Vec<Option<Label>> {
+        self.basic_blocks.iter().map(|block| match block.insns.first() {
+            Some(Insn::Label(Target::Label(label))) => Some(*label),
+            _ => None,
+        }).collect()
+    }
+
+    fn label_of(labels: &[Option<Label>], block_id: BlockId) -> Label {
+        labels[block_id.0].unwrap_or_else(|| {
+            panic!("Expected first instruction of block {block_id:?} to be a Label")
+        })
+    }
+
     pub fn linearize_instructions(&self) -> Vec<Insn> {
+        let labels = self.block_labels();
+        let block_ids = self.block_order();
+        let blocks = block_ids.iter()
+            .map(|id| (self.basic_blocks[id.0].is_entry, self.basic_blocks[id.0].insns.clone()))
+            .collect();
+        Self::linearize_blocks(&labels, &block_ids, blocks)
+    }
+
+    /// As [`Self::linearize_instructions`], but moves each block's instructions
+    /// into the linear list instead of cloning them.
+    ///
+    /// Cloning an `Insn` is not a copy: `CCall`, `PatchPoint` and the side-exit
+    /// targets own boxes and operand vectors, so duplicating the whole
+    /// instruction list allocated once or twice more per instruction and then
+    /// freed the originals. The passes that linearize (`x86_scratch_split`,
+    /// `resolve_parallel_mov_pass`) consume the Assembler, so there is no second
+    /// reader to keep the blocks intact for.
+    ///
+    /// Leaves the blocks empty; the Assembler must not be walked afterwards.
+    pub fn into_linearized_instructions(&mut self) -> Vec<Insn> {
+        let labels = self.block_labels();
+        let block_ids = self.block_order();
+        let blocks = block_ids.iter()
+            .map(|id| (self.basic_blocks[id.0].is_entry, take(&mut self.basic_blocks[id.0].insns)))
+            .collect();
+        Self::linearize_blocks(&labels, &block_ids, blocks)
+    }
+
+    /// Convert a branch's `Target::Block` to the `Target::Label` of the
+    /// destination block, in place.
+    fn strip_branch_edge(mut insn: Insn, labels: &[Option<Label>]) -> Insn {
+        match &mut insn {
+            Insn::Jmp(target) | Insn::Jz(target) | Insn::Jnz(target)
+            | Insn::Je(target) | Insn::Jne(target) | Insn::Jl(target)
+            | Insn::Jle(target) | Insn::Jg(target) | Insn::Jge(target)
+            | Insn::Jbe(target) | Insn::Jb(target) | Insn::Jo(target)
+            | Insn::JoMul(target) | Insn::Joz(_, target) | Insn::Jonz(_, target) => {
+                if let Target::Block(edge) = target {
+                    *target = Target::Label(Self::label_of(labels, edge.target));
+                }
+            }
+            _ => {}
+        }
+        insn
+    }
+
+    fn linearize_blocks(
+        labels: &[Option<Label>],
+        block_ids: &[BlockId],
+        blocks: Vec<(bool, Vec<Insn>)>,
+    ) -> Vec<Insn> {
         // Wrap instructions emitted by `push_insns` with PosMarkers and record
         // the emitted byte range under `symbol_name` in the perf map.
         fn push_insns_with_perf_symbol(
@@ -2401,15 +2472,13 @@ impl Assembler
         // what is actually there: a large function linearizes tens of thousands of
         // instructions, and growing from a fixed 256 meant repeatedly reallocating and
         // copying a multi-megabyte vector.
-        let block_ids = self.block_order();
-        let num_insns: usize = block_ids.iter().map(|id| self.basic_blocks[id.0].insns.len()).sum();
+        let num_insns: usize = blocks.iter().map(|(_, insns)| insns.len()).sum();
         let mut insns = Vec::with_capacity((num_insns + 2 * block_ids.len() + 2).max(ASSEMBLER_INSNS_CAPACITY));
 
-        for (i, block_id) in block_ids.iter().enumerate() {
-            let block = &self.basic_blocks[block_id.0];
+        for (i, (is_entry, block_insns)) in blocks.into_iter().enumerate() {
             // Entry blocks shouldn't ever be preceded by something that can
             // stomp on this block.
-            if !block.is_entry {
+            if !is_entry {
                 push_insns_with_perf_symbol(&mut insns, "BoundaryPad", |insns| {
                     insns.push(Insn::BoundaryPad);
                 });
@@ -2417,12 +2486,12 @@ impl Assembler
 
             // Process each instruction, expanding branch params if needed
             let mut block_end_pos_marker = None;
-            for insn in &block.insns {
+            for insn in block_insns {
                 if let Insn::PosMarkerAtBlockEnd(marker) = insn {
                     assert!(block_end_pos_marker.is_none(), "only one PosMarkerAtBlockEnd is supported per block");
-                    block_end_pos_marker = Some(marker.clone());
+                    block_end_pos_marker = Some(marker);
                 } else {
-                    self.expand_branch_insn(insn, &mut insns);
+                    insns.push(Self::strip_branch_edge(insn, labels));
                 }
             }
 
@@ -2430,7 +2499,7 @@ impl Assembler
             // unconditional jump to the next block in the linear order,
             // remove it and let execution fall through.
             if let Some(next_block_id) = block_ids.get(i + 1) {
-                let next_label = self.block_label(*next_block_id);
+                let next_label = Self::label_of(labels, *next_block_id);
                 if let Some(Insn::Jmp(Target::Label(label))) = insns.last() {
                     if *label == next_label {
                         insns.pop();
@@ -2448,40 +2517,6 @@ impl Assembler
         });
 
         insns
-    }
-
-    /// Expand and linearize a branch instruction:
-    /// 1. If the branch has Target::Block with arguments, insert a ParallelMov first
-    /// 2. Convert Target::Block to Target::Label
-    /// 3. Push the converted instruction
-    fn expand_branch_insn(&self, insn: &Insn, insns: &mut Vec<Insn>) {
-        // Helper to process branch arguments and return the label target
-        let process_edge = |edge: &BranchEdge| -> Label {
-            self.block_label(edge.target)
-        };
-
-        // Convert Target::Block to Target::Label, processing args if needed
-        let stripped_insn = match insn {
-            Insn::Jmp(Target::Block(edge)) => Insn::Jmp(Target::Label(process_edge(edge))),
-            Insn::Jz(Target::Block(edge)) => Insn::Jz(Target::Label(process_edge(edge))),
-            Insn::Jnz(Target::Block(edge)) => Insn::Jnz(Target::Label(process_edge(edge))),
-            Insn::Je(Target::Block(edge)) => Insn::Je(Target::Label(process_edge(edge))),
-            Insn::Jne(Target::Block(edge)) => Insn::Jne(Target::Label(process_edge(edge))),
-            Insn::Jl(Target::Block(edge)) => Insn::Jl(Target::Label(process_edge(edge))),
-            Insn::Jle(Target::Block(edge)) => Insn::Jle(Target::Label(process_edge(edge))),
-            Insn::Jg(Target::Block(edge)) => Insn::Jg(Target::Label(process_edge(edge))),
-            Insn::Jge(Target::Block(edge)) => Insn::Jge(Target::Label(process_edge(edge))),
-            Insn::Jbe(Target::Block(edge)) => Insn::Jbe(Target::Label(process_edge(edge))),
-            Insn::Jb(Target::Block(edge)) => Insn::Jb(Target::Label(process_edge(edge))),
-            Insn::Jo(Target::Block(edge)) => Insn::Jo(Target::Label(process_edge(edge))),
-            Insn::JoMul(Target::Block(edge)) => Insn::JoMul(Target::Label(process_edge(edge))),
-            Insn::Joz(opnd, Target::Block(edge)) => Insn::Joz(*opnd, Target::Label(process_edge(edge))),
-            Insn::Jonz(opnd, Target::Block(edge)) => Insn::Jonz(*opnd, Target::Label(process_edge(edge))),
-            _ => insn.clone()
-        };
-
-        // Push the stripped instruction
-        insns.push(stripped_insn);
     }
 
     // Get the label for a given block by extracting it from the first instruction.
@@ -5519,14 +5554,14 @@ impl Assembler {
 
     /// This is used for trampolines that don't allow scratch registers.
     /// Linearizes all blocks into a single giant block.
-    pub fn resolve_parallel_mov_pass(self) -> Assembler {
+    pub fn resolve_parallel_mov_pass(mut self) -> Assembler {
         let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
 
         // Create one giant block to linearize everything into
         asm_local.new_block_without_id("linearized");
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
-        let linearized_insns = self.linearize_instructions();
+        let linearized_insns = self.into_linearized_instructions();
 
         // TODO: Aaron, this could be better. We don't need to do this, FIXME
         // Process each linearized instruction
