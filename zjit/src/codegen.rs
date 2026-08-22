@@ -746,7 +746,7 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
 
     let mut fusion = BranchFusion { elided: vec![false; function.num_insns()], fused: HashMap::default() };
     for &block_id in reverse_post_order {
-        let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
+        let insns = function.block(block_id).insns().as_slice();
         let Some(&branch_id) = insns.last() else { continue };
         let branch_id = function.find_id(branch_id);
         let &Insn::CondBranch { val, .. } = function.find_ref(branch_id) else { continue };
@@ -4753,15 +4753,11 @@ fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameSt
 
 /// Build a side-exit context
 fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> SideExit {
-    let mut stack = Vec::new();
-    for &insn_id in state.stack() {
-        stack.push(jit.get_opnd(insn_id));
-    }
-
-    let mut locals = Vec::new();
-    for &insn_id in state.locals() {
-        locals.push(jit.get_opnd(insn_id));
-    }
+    // Sized from the frame rather than grown: a function's side exits are the bulk of
+    // the LIR it builds, and letting these two vectors double their way up meant several
+    // reallocations per exit.
+    let stack: Vec<Opnd> = state.stack().map(|&insn_id| jit.get_opnd(insn_id)).collect();
+    let locals: Vec<Opnd> = state.locals().map(|&insn_id| jit.get_opnd(insn_id)).collect();
 
     SideExit{
         pc: Opnd::const_ptr(state.pc),
