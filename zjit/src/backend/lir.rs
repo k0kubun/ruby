@@ -10,7 +10,7 @@ use std::fmt;
 use std::mem::take;
 use std::ops::Range;
 use std::rc::Rc;
-use crate::bitset::BitSet;
+use crate::bitset::{BitMatrix, BitSet};
 use crate::codegen::{perf_symbol_range_start, perf_symbol_range_end, register_with_perf};
 use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, YarvInsnIdx, zjit_jit_frame, local_size_and_idx_to_ep_offset};
 use crate::exit_meta::ExitMeta;
@@ -2994,7 +2994,7 @@ impl Assembler
     /// linear_scan() allocates the web as a single interval. The returned map sends each
     /// VReg to its root (identity for uncoalesced VRegs); the caller copies the root's
     /// allocation onto the members.
-    pub fn coalesce_block_params(&self, intervals: &mut [Interval], live_in: &[BitSet<usize>]) -> Vec<usize> {
+    pub fn coalesce_block_params(&self, intervals: &mut [Interval], live_in: &BitMatrix<usize>) -> Vec<usize> {
         // Union-find with path compression
         fn find(parent: &mut Vec<usize>, x: usize) -> usize {
             let mut root = x;
@@ -3098,7 +3098,7 @@ impl Assembler
                     }
                 }
             };
-            for member in live_in[block_id.0].iter_set_bits() {
+            for member in live_in.row(block_id.0).iter_set_bits() {
                 if let Some(web_root) = web_of[member] {
                     bump(web_root, &mut rejected);
                 }
@@ -4406,32 +4406,31 @@ impl Assembler
     /// Returns (kill_sets, gen_sets) where each is indexed by block ID.
     /// - kill: VRegs defined (written) in the block
     /// - gen: VRegs used (read) in the block before being defined
-    pub fn compute_initial_liveness_sets(&self, block_ids: &[BlockId]) -> (Vec<BitSet<usize>>, Vec<BitSet<usize>>) {
+    pub fn compute_initial_liveness_sets(&self, block_ids: &[BlockId]) -> (BitMatrix<usize>, BitMatrix<usize>) {
         let num_blocks = self.basic_blocks.len();
         let num_vregs = self.num_vregs;
 
-        let mut kill_sets: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
-        let mut gen_sets: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
+        let mut kill_sets = BitMatrix::new(num_blocks, num_vregs);
+        let mut gen_sets = BitMatrix::new(num_blocks, num_vregs);
 
         for &block_id in block_ids {
             let block = &self.basic_blocks[block_id.0];
-            let kill_set = &mut kill_sets[block_id.0];
-            let gen_set = &mut gen_sets[block_id.0];
+            let row = block_id.0;
 
             // Iterate over instructions in reverse
             for insn in block.insns.iter().rev() {
                 // If the instruction has an output that is a VReg, add to kill set
                 if let Some(out) = insn.out_opnd() {
                     if let Opnd::VReg { idx, .. } = out {
-                        kill_set.insert(idx.to_usize());
+                        kill_sets.insert(row, idx.to_usize());
                     }
                 }
 
                 // For all input operands that are VRegs (including memory base VRegs), add to gen set
                 insn.for_each_operand(|opnd| {
                     for idx in opnd.vreg_ids() {
-                        assert!(!kill_set.get(idx.to_usize()));
-                        gen_set.insert(idx.to_usize());
+                        assert!(!kill_sets.get(row, idx.to_usize()));
+                        gen_sets.insert(row, idx.to_usize());
                     }
                 });
             }
@@ -4439,7 +4438,7 @@ impl Assembler
             // Add block parameters to kill set
             for param in &block.parameters {
                 if let Opnd::VReg { idx, .. } = param {
-                    kill_set.insert(idx.to_usize());
+                    kill_sets.insert(row, idx.to_usize());
                 }
             }
 
@@ -4453,7 +4452,7 @@ impl Assembler
     }
 
     /// Calculate live intervals for each VReg.
-    pub fn build_intervals(&self, live_in: &[BitSet<usize>]) -> Vec<Interval> {
+    pub fn build_intervals(&self, live_in: &BitMatrix<usize>) -> Vec<Interval> {
         let num_vregs = self.num_vregs;
         let mut intervals: Vec<Interval> = (0..num_vregs)
             .map(|i| Interval::new(i.into()))
@@ -4470,7 +4469,7 @@ impl Assembler
             // live = union of successor.liveIn for each successor
             live.clear();
             for succ_id in block.successors() {
-                live.union_with(&live_in[succ_id.0]);
+                live.union_with_row(live_in.row(succ_id.0));
             }
 
             // Add out_vregs to live set
@@ -4510,7 +4509,7 @@ impl Assembler
     /// Analyze liveness for all blocks using a fixed-point algorithm.
     /// Returns live_in sets for each block, indexed by block ID.
     /// A VReg is live-in to a block if it may be used before being defined.
-    pub fn analyze_liveness(&self) -> Vec<BitSet<usize>> {
+    pub fn analyze_liveness(&self) -> BitMatrix<usize> {
         // Get blocks in postorder
         let po_blocks = {
             let entry_blocks: Vec<BlockId> = self.basic_blocks.iter()
@@ -4527,7 +4526,7 @@ impl Assembler
         let num_vregs = self.num_vregs;
 
         // Initialize live_in sets
-        let mut live_in: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
+        let mut live_in = BitMatrix::new(num_blocks, num_vregs);
 
         // Fixed-point iteration. `block_live` is a single scratch set reused for every
         // block of every round; allocating one per block per round meant a fresh
@@ -4544,18 +4543,18 @@ impl Assembler
                 // block_live = union of live_in[succ] for all successors
                 block_live.clear();
                 for succ_id in block.successors() {
-                    block_live.union_with(&live_in[succ_id.0]);
+                    block_live.union_with_row(live_in.row(succ_id.0));
                 }
 
                 // block_live |= gen[block]
-                block_live.union_with(&gen_sets[block_id.0]);
+                block_live.union_with_row(gen_sets.row(block_id.0));
 
                 // block_live &= ~kill[block]
-                block_live.difference_with(&kill_sets[block_id.0]);
+                block_live.difference_with_row(kill_sets.row(block_id.0));
 
                 // Update live_in if changed
-                if !live_in[block_id.0].equals(&block_live) {
-                    live_in[block_id.0].copy_from(&block_live);
+                if !block_live.equals_row(live_in.row(block_id.0)) {
+                    live_in.copy_row_from(block_id.0, &block_live);
                     changed = true;
                 }
             }
@@ -5566,10 +5565,10 @@ mod tests {
         ], Some(scratch_reg()));
     }
 
-    // Helper function to convert a BitSet to a list of vreg indices
-    fn bitset_to_vreg_indices(bitset: &BitSet<usize>, num_vregs: usize) -> Vec<usize> {
+    // Helper function to convert one row of a liveness matrix to a list of vreg indices
+    fn bitset_to_vreg_indices(row: crate::bitset::BitRow<'_, usize>, num_vregs: usize) -> Vec<usize> {
         (0..num_vregs)
-            .filter(|&idx| bitset.get(idx))
+            .filter(|&idx| row.get(idx))
             .collect()
     }
 
@@ -5655,20 +5654,20 @@ mod tests {
         let live_in = asm.analyze_liveness();
 
         // b1: [] - entry block, no variables are live-in
-        assert_eq!(bitset_to_vreg_indices(&live_in[b1.0], num_vregs), vec![]);
+        assert_eq!(bitset_to_vreg_indices(live_in.row(b1.0), num_vregs), vec![]);
 
         // b2: [r10] - r10 is live-in (used in b4 which is reachable)
-        assert_eq!(bitset_to_vreg_indices(&live_in[b2.0], num_vregs), vec![r10.vreg_idx_usize()]);
+        assert_eq!(bitset_to_vreg_indices(live_in.row(b2.0), num_vregs), vec![r10.vreg_idx_usize()]);
 
         // b3: [r10, r12, r13] - all are live-in
         assert_eq!(
-            bitset_to_vreg_indices(&live_in[b3.0], num_vregs),
+            bitset_to_vreg_indices(live_in.row(b3.0), num_vregs),
             vec![r10.vreg_idx_usize(), r12.vreg_idx_usize(), r13.vreg_idx_usize()]
         );
 
         // b4: [r10, r12] - both are live-in
         assert_eq!(
-            bitset_to_vreg_indices(&live_in[b4.0], num_vregs),
+            bitset_to_vreg_indices(live_in.row(b4.0), num_vregs),
             vec![r10.vreg_idx_usize(), r12.vreg_idx_usize()]
         );
     }

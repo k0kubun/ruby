@@ -119,17 +119,138 @@ impl<T: Into<usize> + Copy> BitSet<T> {
     /// Returns an iterator over the indices of set bits.
     /// Only iterates over bits that are set, not all possible indices.
     pub fn iter_set_bits(&self) -> impl Iterator<Item = usize> + '_ {
-        self.entries.iter().enumerate().flat_map(move |(entry_idx, &entry)| {
-            let mut bits = entry;
-            std::iter::from_fn(move || {
-                if bits == 0 {
-                    return None;
-                }
-                let bit_pos = bits.trailing_zeros() as usize;
-                bits &= bits - 1; // Clear the lowest set bit
-                Some(entry_idx * ENTRY_NUM_BITS + bit_pos)
-            })
-        }).filter(move |&idx| idx < self.num_bits)
+        iter_set_bits(&self.entries, self.num_bits)
+    }
+
+    /// Union in one row of a [`BitMatrix`]. Returns whether `self` changed.
+    pub fn union_with_row(&mut self, other: BitRow<'_, T>) -> bool {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        let mut changed = false;
+        for (entry, &other_entry) in self.entries.iter_mut().zip(other.entries) {
+            let before = *entry;
+            *entry |= other_entry;
+            changed |= *entry != before;
+        }
+        changed
+    }
+
+    /// Remove the bits set in one row of a [`BitMatrix`]. Returns whether `self` changed.
+    pub fn difference_with_row(&mut self, other: BitRow<'_, T>) -> bool {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        let mut changed = false;
+        for (entry, &other_entry) in self.entries.iter_mut().zip(other.entries) {
+            let before = *entry;
+            *entry &= !other_entry;
+            changed |= *entry != before;
+        }
+        changed
+    }
+
+    /// Whether `self` holds exactly the bits in one row of a [`BitMatrix`].
+    pub fn equals_row(&self, other: BitRow<'_, T>) -> bool {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        self.entries == other.entries
+    }
+}
+
+/// Iterate the indices of the set bits in a row of entries.
+fn iter_set_bits(entries: &[Entry], num_bits: usize) -> impl Iterator<Item = usize> + '_ {
+    entries.iter().enumerate().flat_map(move |(entry_idx, &entry)| {
+        let mut bits = entry;
+        std::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let bit_pos = bits.trailing_zeros() as usize;
+            bits &= bits - 1; // Clear the lowest set bit
+            Some(entry_idx * ENTRY_NUM_BITS + bit_pos)
+        })
+    }).filter(move |&idx| idx < num_bits)
+}
+
+/// One row of a [`BitMatrix`], borrowed. Same bit-set semantics as [`BitSet`],
+/// but with no allocation of its own.
+#[derive(Clone, Copy)]
+pub struct BitRow<'a, T: Into<usize> + Copy> {
+    entries: &'a [Entry],
+    num_bits: usize,
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Into<usize> + Copy> BitRow<'a, T> {
+    pub fn get(&self, idx: T) -> bool {
+        debug_assert!(idx.into() < self.num_bits);
+        let entry_idx = idx.into() / ENTRY_NUM_BITS;
+        let bit_idx = idx.into() % ENTRY_NUM_BITS;
+        (self.entries[entry_idx] & (1 << bit_idx)) != 0
+    }
+
+    pub fn iter_set_bits(&self) -> impl Iterator<Item = usize> + 'a {
+        iter_set_bits(self.entries, self.num_bits)
+    }
+}
+
+/// `rows` bit sets of `num_bits` bits each, in a single allocation.
+///
+/// Dataflow passes keep one set per basic block, and the obvious
+/// `vec![BitSet::with_capacity(num_vregs); num_blocks]` spelling costs a heap
+/// allocation *and* a memcpy per block per set: liveness analysis alone built
+/// three of those per compile, which measured as the largest single source of
+/// allocator traffic in the backend. The row width is fixed at construction,
+/// which is all the dataflow passes need.
+pub struct BitMatrix<T: Into<usize> + Copy> {
+    entries: Vec<Entry>,
+    /// Entries per row. Rows are laid out contiguously.
+    row_entries: usize,
+    num_bits: usize,
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Into<usize> + Copy> BitMatrix<T> {
+    /// A matrix with every bit clear.
+    pub fn new(rows: usize, num_bits: usize) -> Self {
+        let row_entries = num_bits.div_ceil(ENTRY_NUM_BITS);
+        Self {
+            entries: vec![0; rows * row_entries],
+            row_entries,
+            num_bits,
+            phantom: Default::default(),
+        }
+    }
+
+    fn range(&self, row: usize) -> std::ops::Range<usize> {
+        let start = row * self.row_entries;
+        start..start + self.row_entries
+    }
+
+    /// Borrow one row.
+    pub fn row(&self, row: usize) -> BitRow<'_, T> {
+        BitRow {
+            entries: &self.entries[self.range(row)],
+            num_bits: self.num_bits,
+            phantom: Default::default(),
+        }
+    }
+
+    /// Returns whether the bit was newly inserted.
+    pub fn insert(&mut self, row: usize, idx: T) -> bool {
+        debug_assert!(idx.into() < self.num_bits);
+        let entry_idx = row * self.row_entries + idx.into() / ENTRY_NUM_BITS;
+        let bit = 1 << (idx.into() % ENTRY_NUM_BITS);
+        let newly_inserted = (self.entries[entry_idx] & bit) == 0;
+        self.entries[entry_idx] |= bit;
+        newly_inserted
+    }
+
+    pub fn get(&self, row: usize, idx: T) -> bool {
+        self.row(row).get(idx)
+    }
+
+    /// Overwrite one row with the contents of `src`, which must be the same width.
+    pub fn copy_row_from(&mut self, row: usize, src: &BitSet<T>) {
+        debug_assert_eq!(self.num_bits, src.num_bits);
+        let range = self.range(row);
+        self.entries[range].copy_from_slice(&src.entries);
     }
 }
 
