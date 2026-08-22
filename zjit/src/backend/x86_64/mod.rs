@@ -1352,7 +1352,7 @@ impl Assembler {
         timed_compile_phase(Counter::compile_lir_emit_time_ns, "emit", || {
             // Create label instances in the code block
             for (idx, name) in asm.label_names.iter().enumerate() {
-                let label = cb.new_label(name.to_string());
+                let label = cb.new_label(name.clone());
                 assert_eq!(label, Label(idx));
             }
 
@@ -1434,7 +1434,7 @@ mod tests {
         let mut asm = split_binop(kind, left, right, out);
         let mut cb = CodeBlock::new_dummy();
         for name in &asm.label_names {
-            cb.new_label(name.to_string());
+            cb.new_label(name.clone());
         }
         assert!(asm.x86_emit(&mut cb).is_ok(), "{kind:?}: x86_emit failed");
 
@@ -2415,7 +2415,7 @@ mod tests {
 
         asm = asm.x86_scratch_split();
         for name in &asm.label_names {
-            cb.new_label(name.to_string());
+            cb.new_label(name.clone());
         }
         let gc_offsets = asm.x86_emit(&mut cb).unwrap();
         assert_eq!(1, gc_offsets.len(), "VALUE source operand should be reported as gc offset");
@@ -2570,7 +2570,7 @@ mod tests {
         let mut asm = split_binop(BinOpKind::Add, stack_mem(0), stack_mem(1), stack_mem(1));
         let mut cb = CodeBlock::new_dummy();
         for name in &asm.label_names {
-            cb.new_label(name.to_string());
+            cb.new_label(name.clone());
         }
         assert!(asm.x86_emit(&mut cb).is_ok());
 
@@ -2596,7 +2596,7 @@ mod tests {
         );
         let mut cb = CodeBlock::new_dummy();
         for name in &asm.label_names {
-            cb.new_label(name.to_string());
+            cb.new_label(name.clone());
         }
         assert!(asm.x86_emit(&mut cb).is_ok());
 
@@ -2622,7 +2622,7 @@ mod tests {
         );
         let mut cb = CodeBlock::new_dummy();
         for name in &asm.label_names {
-            cb.new_label(name.to_string());
+            cb.new_label(name.clone());
         }
         assert!(asm.x86_emit(&mut cb).is_ok());
 

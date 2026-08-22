@@ -166,7 +166,14 @@ impl JITState {
         match &self.labels[lir_block_id.0] {
             Some(label) => label.clone(),
             None => {
-                let label = asm.new_label(&format!("{hir_block_id}_{lir_block_id}"));
+                // Label names only feed the LIR and disasm dumps, so a descriptive one is
+                // worth a format!() and an allocation only when something will print it.
+                let label = if crate::options::get_option_ref!(dump_disasm).is_some()
+                    || crate::options::get_option!(dump_lir).is_some() {
+                    asm.new_label(format!("{hir_block_id}_{lir_block_id}"))
+                } else {
+                    asm.new_label("bb")
+                };
                 self.labels[lir_block_id.0] = Some(label.clone());
                 label
             }

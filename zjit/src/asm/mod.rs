@@ -1,5 +1,6 @@
 //! Model for creating generating textual assembler code.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
@@ -54,7 +55,7 @@ pub struct CodeBlock {
     label_addrs: Vec<usize>,
 
     // Table of registered label names
-    label_names: Vec<String>,
+    label_names: Vec<Cow<'static, str>>,
 
     // References to labels
     label_refs: Vec<LabelRef>,
@@ -103,10 +104,14 @@ impl CodeBlock {
     /// `code_region_bytes`.
     pub fn heap_size(&self) -> usize {
         let mut bytes = self.label_addrs.capacity() * size_of::<usize>()
-            + self.label_names.capacity() * size_of::<String>()
+            + self.label_names.capacity() * size_of::<Cow<'static, str>>()
             + self.label_refs.capacity() * size_of::<LabelRef>();
         for name in self.label_names.iter() {
-            bytes += name.capacity();
+            // Only an owned name has its own allocation; a borrowed one points at a
+            // string literal.
+            if let Cow::Owned(name) = name {
+                bytes += name.capacity();
+            }
         }
         // BTreeMap nodes hold up to 11 key/value pairs; approximate a node as
         // that many pairs plus the internal edge array.
@@ -251,8 +256,9 @@ impl CodeBlock {
     }
 
     /// Allocate a new label with a given name
-    pub fn new_label(&mut self, name: String) -> Label {
-        assert!(!name.contains(' '), "use underscores in label names, not spaces");
+    pub fn new_label(&mut self, name: impl Into<Cow<'static, str>>) -> Label {
+        let name = name.into();
+        debug_assert!(!name.contains(' '), "use underscores in label names, not spaces");
 
         // This label doesn't have an address yet
         self.label_addrs.push(0);

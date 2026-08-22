@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 // The compiler's own tables are keyed by operands, block ids and pointers it produced
 // itself, so they use a fast non-cryptographic hasher instead of std's SipHash. See
@@ -2031,7 +2032,10 @@ pub struct Assembler {
     pub(super) num_vregs: usize,
 
     /// Names of labels
-    pub(super) label_names: Vec<String>,
+    /// Names of labels. Purely cosmetic (only the LIR and disasm dumps read them), so
+    /// they are `Cow`s over string literals: a label costs no allocation unless a dump
+    /// option actually asked for a descriptive name.
+    pub(super) label_names: Vec<Cow<'static, str>>,
 
     /// If true, `push_insn` is allowed to use scratch registers.
     /// On `compile`, it also disables the backend's use of them.
@@ -2171,7 +2175,7 @@ impl Assembler
     }
 
     // Create a LIR basic block without a valid HIR block ID (for testing or internal use).
-    pub fn new_block_without_id(&mut self, name: &str) -> BlockId {
+    pub fn new_block_without_id(&mut self, name: &'static str) -> BlockId {
         let bb_id = self.new_block(hir::BlockId(DUMMY_HIR_BLOCK_ID), true, DUMMY_RPO_INDEX);
         let label = self.new_label(name);
         self.write_label(label);
@@ -2500,12 +2504,13 @@ impl Assembler
 
 
     /// Create a new label instance that we can jump to
-    pub fn new_label(&mut self, name: &str) -> Target
+    pub fn new_label(&mut self, name: impl Into<Cow<'static, str>>) -> Target
     {
-        assert!(!name.contains(' '), "use underscores in label names, not spaces");
+        let name = name.into();
+        debug_assert!(!name.contains(' '), "use underscores in label names, not spaces");
 
         let label = Label(self.label_names.len());
-        self.label_names.push(name.to_string());
+        self.label_names.push(name);
         Target::Label(label)
     }
 
@@ -4663,19 +4668,19 @@ fn format_insn_compact(asm: &Assembler, insn: &Insn) -> String {
 impl fmt::Display for Assembler {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Count the number of duplicated label names to disambiguate them if needed
-        let mut label_counts: HashMap<&String, usize> = HashMap::default();
+        let mut label_counts: HashMap<&str, usize> = HashMap::default();
         let colors = crate::ttycolors::get_colors();
         let bold_begin = colors.bold_begin;
         let bold_end = colors.bold_end;
         for label_name in self.label_names.iter() {
-            let counter = label_counts.entry(label_name).or_insert(0);
+            let counter = label_counts.entry(label_name.as_ref()).or_insert(0);
             *counter += 1;
         }
 
         /// Return a label name String. Suffix "_{label_idx}" if the label name is used multiple times.
-        fn label_name(asm: &Assembler, label_idx: usize, label_counts: &HashMap<&String, usize>) -> String {
-            let label_name = &asm.label_names[label_idx];
-            let label_count = label_counts.get(&label_name).unwrap_or(&0);
+        fn label_name(asm: &Assembler, label_idx: usize, label_counts: &HashMap<&str, usize>) -> String {
+            let label_name = asm.label_names[label_idx].as_ref();
+            let label_count = label_counts.get(label_name).unwrap_or(&0);
             if *label_count > 1 {
                 format!("{label_name}_{label_idx}")
             } else {
