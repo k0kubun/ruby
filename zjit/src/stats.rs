@@ -216,6 +216,8 @@ make_counters! {
         compile_lir_compile_exits_time_ns,
         compile_lir_scratch_split_time_ns,
         compile_lir_emit_time_ns,
+        code_mark_writable_time_ns,
+        code_mark_executable_time_ns,
     }
 
     // Exit counters that are summed as side_exit_count

@@ -1246,7 +1246,7 @@ impl Assembler {
             timed_compile_phase(Counter::compile_lir_number_instructions_time_ns, "number_instructions", || asm.number_instructions(0));
 
             let live_in = timed_compile_phase(Counter::compile_lir_analyze_liveness_time_ns, "analyze_liveness", || asm.analyze_liveness());
-            let mut intervals = timed_compile_phase(Counter::compile_lir_build_intervals_time_ns, "build_intervals", || asm.build_intervals(live_in.clone()));
+            let mut intervals = timed_compile_phase(Counter::compile_lir_build_intervals_time_ns, "build_intervals", || asm.build_intervals(&live_in));
 
             // Dump live intervals if requested
             if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {

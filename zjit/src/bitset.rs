@@ -30,6 +30,19 @@ impl<T: Into<usize> + Copy> BitSet<T> {
         newly_inserted
     }
 
+    /// Set all bits to 0, keeping the allocation. Lets a dataflow loop reuse one scratch
+    /// set instead of allocating a fresh one per block per iteration.
+    pub fn clear(&mut self) {
+        self.entries.fill(0);
+    }
+
+    /// Overwrite `self` with `other`, keeping `self`'s allocation.
+    /// `self` and `other` must have the same number of bits.
+    pub fn copy_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        self.entries.copy_from_slice(&other.entries);
+    }
+
     /// Set all bits to 1.
     pub fn insert_all(&mut self) {
         for i in 0..self.entries.len() {

@@ -375,13 +375,13 @@ pub mod sys {
 
     impl super::Allocator for SystemAllocator {
         fn mark_writable(&mut self, ptr: *const u8, size: u32) -> bool {
-            crate::stats::trace_compile_phase("mark_writable", || {
+            crate::stats::timed_compile_phase(crate::stats::Counter::code_mark_writable_time_ns, "mark_writable", || {
                 unsafe { rb_jit_mark_writable(ptr as VoidPtr, size) }
             })
         }
 
         fn mark_executable(&mut self, ptr: *const u8, size: u32) {
-            crate::stats::trace_compile_phase("mark_executable", || {
+            crate::stats::timed_compile_phase(crate::stats::Counter::code_mark_executable_time_ns, "mark_executable", || {
                 unsafe { rb_jit_mark_executable(ptr as VoidPtr, size) }
             })
         }

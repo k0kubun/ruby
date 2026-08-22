@@ -4377,7 +4377,7 @@ impl Assembler
     }
 
     /// Calculate live intervals for each VReg.
-    pub fn build_intervals(&self, live_in: Vec<BitSet<usize>>) -> Vec<Interval> {
+    pub fn build_intervals(&self, live_in: &[BitSet<usize>]) -> Vec<Interval> {
         let num_vregs = self.num_vregs;
         let mut intervals: Vec<Interval> = (0..num_vregs)
             .map(|i| Interval::new(i.into()))
@@ -4385,11 +4385,14 @@ impl Assembler
 
         let blocks = self.block_order();
 
+        // One scratch set for the whole walk instead of one allocation per block. On a
+        // large function this set is tens of kilobytes.
+        let mut live = BitSet::with_capacity(num_vregs);
         for block_id in blocks {
             let block = &self.basic_blocks[block_id.0];
 
             // live = union of successor.liveIn for each successor
-            let mut live = BitSet::with_capacity(num_vregs);
+            live.clear();
             for succ_id in block.successors() {
                 live.union_with(&live_in[succ_id.0]);
             }
@@ -4450,7 +4453,10 @@ impl Assembler
         // Initialize live_in sets
         let mut live_in: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
 
-        // Fixed-point iteration
+        // Fixed-point iteration. `block_live` is a single scratch set reused for every
+        // block of every round; allocating one per block per round meant a fresh
+        // num_vregs-bit allocation thousands of times per compile.
+        let mut block_live = BitSet::with_capacity(num_vregs);
         let mut changed = true;
         while changed {
             changed = false;
@@ -4460,7 +4466,7 @@ impl Assembler
                 let block = &self.basic_blocks[block_id.0];
 
                 // block_live = union of live_in[succ] for all successors
-                let mut block_live = BitSet::with_capacity(num_vregs);
+                block_live.clear();
                 for succ_id in block.successors() {
                     block_live.union_with(&live_in[succ_id.0]);
                 }
@@ -4473,7 +4479,7 @@ impl Assembler
 
                 // Update live_in if changed
                 if !live_in[block_id.0].equals(&block_live) {
-                    live_in[block_id.0] = block_live;
+                    live_in[block_id.0].copy_from(&block_live);
                     changed = true;
                 }
             }

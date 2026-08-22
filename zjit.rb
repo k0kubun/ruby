@@ -186,6 +186,8 @@ class << RubyVM::ZJIT
       :compile_lir_compile_exits_time_ns,
       :compile_lir_scratch_split_time_ns,
       :compile_lir_emit_time_ns,
+      :code_mark_writable_time_ns,
+      :code_mark_executable_time_ns,
       :profile_time_ns,
       :gc_time_ns,
       :invalidation_time_ns,
