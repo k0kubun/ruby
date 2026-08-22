@@ -144,6 +144,9 @@ pub extern "C" fn rb_zjit_root_update_references() {
     // Send class tables are keyed on class addresses, which this compaction has
     // just changed, so they are dropped rather than rehashed.
     crate::send_cache::update_references();
+
+    // ISEQs waiting for the background compile thread, and the thread itself.
+    crate::bgcompile::update_references();
 }
 
 fn iseq_mark(payload: &IseqPayload) {
@@ -300,4 +303,8 @@ pub extern "C" fn rb_zjit_root_mark() {
     // else roots them: the class's own callcache table drops one as soon as the
     // method is invalidated. See [`crate::send_cache`].
     crate::send_cache::mark_all();
+    // Nothing else keeps an ISEQ sitting in the background compile queue alive:
+    // the interpreter may stop calling it, or its defining module may be
+    // discarded, between the enqueue and the compile. See [`crate::bgcompile`].
+    crate::bgcompile::mark();
 }

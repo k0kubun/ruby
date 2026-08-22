@@ -105,6 +105,19 @@ pub struct Options {
     /// Turn off the HIR optimizer
     pub disable_hir_opt: bool,
 
+    /// Compile on a dedicated Ruby thread instead of on the thread that tripped
+    /// the call threshold, so request threads never pay compile latency. See
+    /// [`crate::bgcompile`].
+    pub background_compile: bool,
+
+    /// Implies `background_compile`, and makes the thread that enqueues a request
+    /// yield the GVL until the compile thread has finished it. Only for testing:
+    /// it puts the compile latency back on the requesting thread, but it makes
+    /// every compile in a run go through the compile thread deterministically,
+    /// even in a process too short-lived for the scheduler to get there on its
+    /// own. Not listed in `ruby --help`.
+    pub background_compile_block: bool,
+
     /// Turn off the ivar shape table, so ivar sites that miss their inline shape
     /// guard chain go straight to the generic C call. Only useful for A/B
     /// measurement; see [`crate::ivar_cache`].
@@ -232,6 +245,8 @@ impl Default for Options {
             debug: false,
             disable: false,
             disable_hir_opt: false,
+            background_compile: false,
+            background_compile_block: false,
             disable_ivar_cache: false,
             ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
@@ -276,6 +291,8 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Collect ZJIT stats (=file to write; .json for JSON)."),
     ("--zjit-disable",
                      "Disable ZJIT for lazily enabling it with RubyVM::ZJIT.enable."),
+    ("--zjit-background-compile",
+                     "Compile on a background thread instead of the calling one."),
     ("--zjit-perf[=iseq|hir]",
                      "Dump symbols for Linux perf /tmp/perf-{}.map (default: iseq)."),
     ("--zjit-log-compiled-iseqs=path",
@@ -571,6 +588,13 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable", "") => options.disable = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
+
+        ("background-compile", "") => options.background_compile = true,
+
+        ("background-compile-block", "") => {
+            options.background_compile = true;
+            options.background_compile_block = true;
+        },
         ("disable-ivar-cache", "") => options.disable_ivar_cache = true,
 
         ("ivar-cache-entries", _) => match opt_val.parse::<usize>() {

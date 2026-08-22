@@ -407,6 +407,295 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  #
+  # --zjit-background-compile
+  #
+  # Compilation moves to a dedicated Ruby thread. The risks are all races, so
+  # these tests aim at the specific windows the design has to close: an
+  # invalidation landing while a compile is in flight, the GC freeing or moving
+  # an ISEQ that only the compile queue still references, and losing the compile
+  # thread to `fork` or `Thread#kill`.
+  #
+
+  # Compile on the background thread and wait for it, so that a run this short
+  # deterministically exercises the whole path.
+  BG_BLOCK = %w[--zjit-background-compile-block].freeze
+  # The real feature: compiles overlap with the requesting thread.
+  BG = %w[--zjit-background-compile].freeze
+
+  def test_background_compile_option_compiles_on_the_compile_thread
+    assert_runs '[true, true, true, 7]', <<~RUBY, extra_args: BG_BLOCK, stats: :quiet, call_threshold: 2, debug: false
+      def add(a, b) = a + b
+      10.times { add(1, 2) }
+      stats = RubyVM::ZJIT.stats
+      [
+        stats[:bg_compile_count] > 0,
+        stats[:compiled_iseq_count] == stats[:bg_compile_count],
+        stats[:bg_compile_overflow_count] == 0,
+        add(3, 4),
+      ]
+    RUBY
+  end
+
+  # The default is off: nothing is enqueued and no extra thread appears.
+  def test_background_compile_is_off_by_default
+    assert_runs '[0, 1]', <<~RUBY, stats: :quiet, call_threshold: 2, debug: false
+      def add(a, b) = a + b
+      10.times { add(1, 2) }
+      [RubyVM::ZJIT.stats[:bg_compile_enqueue_count], Thread.list.size]
+    RUBY
+  end
+
+  # An ISEQ waiting in the compile queue may be the only thing keeping itself
+  # alive: here every method is removed from its class right after being made
+  # hot, so nothing but ZJIT's root marking references the ISEQ. Compaction is
+  # run in the same window to move what is left.
+  def test_background_compile_keeps_queued_iseqs_alive
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false
+      n = 300
+      n.times { |i| Object.class_eval "def gone\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      # Cross the threshold for each, which enqueues it. Neither the calls nor
+      # the GCs below release the GVL, so the queue is still full here.
+      n.times { |i| 2.times { o.send(:"gone\#{i}", 1) } }
+      n.times { |i| Object.send(:remove_method, :"gone\#{i}") }
+      5.times { GC.start; GC.compact }
+      # Let the compile thread drain what it can still see, then compact again.
+      sleep 1
+      GC.compact
+      true
+    RUBY
+  end
+
+  # GC.stress runs a collection at every allocation, so the compile thread is
+  # marking, moving and freeing ISEQ payloads underneath a queue that is being
+  # refilled the whole time.
+  def test_background_compile_under_gc_stress
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false
+      n = 40
+      n.times { |i| Object.class_eval "def s\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      GC.stress = true
+      n.times { |i| 3.times { o.send(:"s\#{i}", i) } }
+      GC.stress = false
+      GC.compact
+      n.times { |i| raise "wrong result" unless o.send(:"s\#{i}", 1) == 1 + i }
+      true
+    RUBY
+  end
+
+  # Several threads cross compile thresholds while another redefines the very
+  # methods and classes those compiles are speculating on. Every invalidation
+  # hook runs on a thread holding the GVL, as does the compile, so no
+  # invalidation may land between a compile reading the VM and registering the
+  # patch point that guards what it read.
+  def test_background_compile_invalidation_race
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false, timeout: 300
+      class Target
+        VALUE = 1
+        def value = VALUE
+        def twice = value + value
+      end
+
+      stop = false
+      workers = 6.times.map do
+        Thread.new do
+          target = Target.new
+          until stop
+            1000.times { target.twice }
+            # Fresh ISEQs, so there is always new work to enqueue.
+            Object.new.singleton_class.class_eval { def only_here = 1 }
+          end
+        end
+      end
+
+      mutator = Thread.new do
+        i = 0
+        until stop
+          i += 1
+          # Bust CME assumptions on a method compiled code is speculating on.
+          # The string form keeps `VALUE`'s lexical scope inside Target.
+          Target.class_eval("def value = VALUE")
+          # Bust constant assumptions. Re-setting an existing constant busts the
+          # cache without ever leaving it undefined, which the workers are
+          # reading concurrently.
+          verbose, $VERBOSE = $VERBOSE, nil
+          Target.const_set(:VALUE, 1)
+          $VERBOSE = verbose
+          # Bust NoSingletonClass for a class compiled code has seen.
+          Object.new.singleton_class if i.even?
+          # Bust "no subclass overrides this method".
+          Class.new(Target) { def value = 1 } if i % 8 == 0
+          Thread.pass
+        end
+      end
+
+      sleep 3
+      stop = true
+      workers.each(&:join)
+      mutator.join
+      raise "wrong result" unless Target.new.twice == 2
+      true
+    RUBY
+  end
+
+  # Redefining a basic operator invalidates code from underneath in-flight
+  # compiles, and does so through a different invalidation hook than method
+  # redefinition.
+  def test_background_compile_bop_redefinition_race
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false, timeout: 300
+      class Num
+        def initialize(v) = @v = v
+        def +(other) = Num.new(@v + other.v)
+        def v = @v
+      end
+      def sum(a, b) = a + b
+
+      stop = false
+      workers = 4.times.map do
+        Thread.new do
+          until stop
+            500.times { sum(Num.new(1), Num.new(2)) }
+            Object.new.singleton_class.class_eval { def fresh = 1 }
+          end
+        end
+      end
+      mutator = Thread.new do
+        until stop
+          Num.class_eval { def +(other) = Num.new(@v + other.v) }
+          Thread.pass
+        end
+      end
+      sleep 2
+      stop = true
+      workers.each(&:join)
+      mutator.join
+      sum(Num.new(2), Num.new(3)).v == 5
+    RUBY
+  end
+
+  # More distinct hot ISEQs than the queue can hold. Overflow must drop the
+  # request, re-arm the ISEQ's threshold so a later call offers it again, and
+  # never block or lose correctness.
+  def test_background_compile_queue_overflow
+    assert_runs '[true, true]', <<~RUBY, extra_args: BG, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      n = 3000
+      n.times { |i| Object.class_eval "def q\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      n.times { |i| 2.times { o.send(:"q\#{i}", 1) } }
+      n.times { |i| raise "wrong result" unless o.send(:"q\#{i}", 1) == 1 + i }
+      # Re-armed requests get another chance, so keep calling and let the
+      # compile thread catch up.
+      3.times do
+        sleep 0.5
+        n.times { |i| raise "wrong result" unless o.send(:"q\#{i}", 2) == 2 + i }
+      end
+      stats = RubyVM::ZJIT.stats
+      # Overflow must not be mistaken for a broken compile thread: an enqueuing
+      # loop that never yields the GVL legitimately outruns it.
+      [stats[:bg_compile_overflow_count] > 0, stats[:bg_compile_disabled_count] == 0]
+    RUBY
+  end
+
+  # `fork` can only be issued by a thread holding the GVL, and a compile holds
+  # the GVL throughout, so a fork can never interrupt one. What it does do is
+  # leave the child with no compile thread; the child must notice and start a
+  # new one, which drains whatever was still queued at the fork.
+  def test_background_compile_fork
+    omit 'fork not supported' unless Process.respond_to?(:fork)
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false, timeout: 300
+      n = 200
+      n.times { |i| Object.class_eval "def f\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      # Queue is non-empty from here on.
+      n.times { |i| 2.times { o.send(:"f\#{i}", 1) } }
+
+      pid = fork do
+        n.times { |i| 50.times { raise "wrong result" unless o.send(:"f\#{i}", 1) == 1 + i } }
+        # A fresh method after the fork forces an enqueue, which is where the
+        # dead compile thread is noticed and replaced.
+        Object.class_eval "def after_fork(x) = x * 3"
+        50.times { raise "wrong result" unless o.after_fork(2) == 6 }
+        sleep 0.5
+        exit!(Thread.list.size == 2 ? 0 : 3)
+      end
+      _, status = Process.waitpid2(pid)
+      # The parent's compile thread is untouched.
+      n.times { |i| raise "wrong result" unless o.send(:"f\#{i}", 3) == 3 + i }
+      raise "child failed: \#{status.inspect}" unless status.success?
+      true
+    RUBY
+  end
+
+  # Killing the compile thread must degrade to "ZJIT keeps working", not to
+  # "ZJIT silently stops compiling".
+  def test_background_compile_survives_killed_compile_thread
+    assert_runs '[true, true]', <<~RUBY, extra_args: BG, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      def warm(x) = x + 1
+      5.times { warm(1) }
+      sleep 0.3
+      (Thread.list - [Thread.current]).each { |t| t.kill; t.join }
+
+      n = 100
+      n.times { |i| Object.class_eval "def k\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      n.times { |i| 3.times { o.send(:"k\#{i}", 1) } }
+      sleep 1
+      n.times { |i| raise "wrong result" unless o.send(:"k\#{i}", 1) == 1 + i }
+      stats = RubyVM::ZJIT.stats
+      [stats[:bg_compile_thread_restart_count] > 0, stats[:bg_compile_count] > 0]
+    RUBY
+  end
+
+  # A non-main ractor cannot use the compile thread (it lives in the main
+  # ractor), so its compiles stay synchronous. Check both kinds coexist.
+  def test_background_compile_ractor
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false, timeout: 300
+      Warning[:experimental] = false
+      def shared(x) = x + 1
+      100.times { shared(1) }
+      ractors = 3.times.map do
+        Ractor.new do
+          acc = 0
+          20_000.times { acc += shared(1) }
+          acc
+        end
+      end
+      ractors.map { |r| r.value } == [40_000] * 3
+    RUBY
+  end
+
+  # Exiting with work still queued must not hang or crash: Ruby kills the
+  # compile thread as part of ordinary shutdown.
+  def test_background_compile_exit_with_pending_work
+    assert_runs 'true', <<~RUBY, extra_args: BG, call_threshold: 2, debug: false
+      n = 500
+      n.times { |i| Object.class_eval "def x\#{i}(y) = y + \#{i}" }
+      o = Object.new
+      n.times { |i| 2.times { o.send(:"x\#{i}", 1) } }
+      at_exit { }
+      true
+    RUBY
+  end
+
+  # A background compile must never break deadlock detection: the compile thread
+  # parks as a deadlockable sleeper precisely so that a program whose only other
+  # thread sleeps forever still reports a deadlock.
+  def test_background_compile_preserves_deadlock_detection
+    script = <<~RUBY
+      def warm(x) = x + 1
+      5.times { warm(1) }
+      sleep 0.2
+      Thread.stop
+    RUBY
+    _out, err, status = EnvUtil.invoke_ruby(
+      ['--disable-gems', '--zjit-call-threshold=2', '--zjit-background-compile', '-e', script],
+      '', true, true
+    )
+    refute_predicate status, :success?
+    assert_match(/No live threads left. Deadlock/, err)
+  end
+
   private
 
   # Assert that every method call in `test_script` can be compiled by ZJIT

@@ -155,6 +155,15 @@ class << RubyVM::ZJIT
       :ivar_respecialize_giveup_count,
       :invalidation_recompiles_granted,
 
+      # --zjit-background-compile
+      :bg_compile_enqueue_count,
+      :bg_compile_count,
+      :bg_compile_queue_high_water,
+      :bg_compile_overflow_count,
+      :bg_compile_discard_count,
+      :bg_compile_thread_restart_count,
+      :bg_compile_disabled_count,
+
       :compile_time_ns,
       :compile_side_exit_time_ns,
       :compile_side_exit_time_ratio,

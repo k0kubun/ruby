@@ -271,29 +271,43 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
         // us the owning class and thus whether `self` is always a heap object.
         update_self_is_heap_object(iseq, unsafe { get_ec_cfp(ec) });
 
-        let cb = ZJITState::get_code_block();
-        let mut code_ptr = with_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, ec, jit_exception));
+        gen_entry_point_locked(iseq, ec, jit_exception)
+    })
+}
 
-        if let Err(err) = &code_ptr {
-            // Assert that the ISEQ compiles if RubyVM::ZJIT.assert_compiles is enabled.
-            // We assert only `jit_exception: false` cases until we support exception handlers.
-            if ZJITState::assert_compiles_enabled() && !jit_exception {
-                let iseq_location = iseq_get_location(iseq, 0);
-                panic!("Failed to compile: {iseq_location}: {err:?}");
-            }
+/// Compile an entry point for `iseq` and return the address to install in
+/// `body->jit_entry` (or `body->jit_exception`), or null if nothing usable was
+/// produced. Must be called with the VM lock held.
+///
+/// Split out of [`rb_zjit_iseq_gen_entry_point`] so that
+/// [`crate::bgcompile`] can run the same compilation on the compile thread.
+/// The background path deliberately does *not* run
+/// [`update_self_is_heap_object`]: that reads the calling frame's method entry,
+/// which on the compile thread describes the compile thread, not the ISEQ. It is
+/// recorded when the request is enqueued instead.
+pub fn gen_entry_point_locked(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> *const u8 {
+    let cb = ZJITState::get_code_block();
+    let mut code_ptr = with_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, ec, jit_exception));
 
-            // For --zjit-stats, generate an entry that just increments exit_compilation_failure and exits
-            if get_option!(stats) {
-                code_ptr = gen_compile_error_counter(cb, err);
-            }
+    if let Err(err) = &code_ptr {
+        // Assert that the ISEQ compiles if RubyVM::ZJIT.assert_compiles is enabled.
+        // We assert only `jit_exception: false` cases until we support exception handlers.
+        if ZJITState::assert_compiles_enabled() && !jit_exception {
+            let iseq_location = iseq_get_location(iseq, 0);
+            panic!("Failed to compile: {iseq_location}: {err:?}");
         }
 
-        // Always mark the code region executable if asm.compile() has been used.
-        // We need to do this even if code_ptr is None because gen_iseq() may have already used asm.compile().
-        cb.mark_all_executable();
+        // For --zjit-stats, generate an entry that just increments exit_compilation_failure and exits
+        if get_option!(stats) {
+            code_ptr = gen_compile_error_counter(cb, err);
+        }
+    }
 
-        code_ptr.map_or(std::ptr::null(), |ptr| ptr.raw_ptr(cb))
-    })
+    // Always mark the code region executable if asm.compile() has been used.
+    // We need to do this even if code_ptr is None because gen_iseq() may have already used asm.compile().
+    cb.mark_all_executable();
+
+    code_ptr.map_or(std::ptr::null(), |ptr| ptr.raw_ptr(cb))
 }
 
 /// Compile an entry point for a given ISEQ
@@ -4913,7 +4927,7 @@ c_callable! {
             unsafe { *ec_cfp = cfp };
         }
 
-        with_vm_lock(src_loc!(), || {
+        let ret = with_vm_lock(src_loc!(), || {
             // Re-create the Rc inside the VM lock because IseqCall's interior
             // mutability (Cell<IseqPtr>) requires exclusive access.
             let iseq_call = unsafe { Rc::from_raw(iseq_call_ptr as *const IseqCall) };
@@ -5033,6 +5047,20 @@ c_callable! {
                 return ZJITState::get_materialize_exit_trampoline().raw_ptr(cb);
             }
 
+            // With --zjit-background-compile, hand an uncompiled callee to the
+            // compile thread and run this call in the interpreter, using the same
+            // "return to the interpreter instead of waiting" shape as the
+            // profiling window above. Once the callee has code, a later hit finds
+            // `IseqStatus::Compiled` and only the one-instruction stub rewrite
+            // below runs on this thread. Note that `payload.self_is_heap_object`
+            // was just set from this callee frame, which is what the compile
+            // thread will use.
+            if payload.versions.is_empty() && crate::bgcompile::enqueue_from_stub(iseq) {
+                unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
+                prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);
+                return ZJITState::get_materialize_exit_trampoline().raw_ptr(cb);
+            }
+
             // Otherwise, attempt to compile the ISEQ. We have to mark_all_executable() beyond this point.
             let code_ptr = with_time_stat(compile_time_ns, || function_stub_hit_body(cb, &iseq_call));
             if code_ptr.is_ok() {
@@ -5049,7 +5077,11 @@ c_callable! {
             });
             cb.mark_all_executable();
             code_ptr.raw_ptr(cb)
-        })
+        });
+        // A background enqueue made above could not wake the compile thread from
+        // inside the VM lock. See [`crate::bgcompile::PostLock`].
+        crate::bgcompile::flush_deferred_wake();
+        ret
     }
 }
 
