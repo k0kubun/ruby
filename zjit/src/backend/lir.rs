@@ -123,8 +123,9 @@ pub struct BranchEdge {
 /// largest source of allocator traffic ZJIT had (8.3M allocations of 42M on an
 /// rdoc-over-stdlib run), and this is nearly all of it. Sizing the vector to a
 /// typical block up front trades bytes -- freed at the end of the compile --
-/// for a 4x cut in allocation count.
-const INITIAL_BLOCK_INSNS: usize = 32;
+/// for a 4x cut in allocation count. 16 measured better than both 8 and 32 on
+/// the compile-only benchmark.
+const INITIAL_BLOCK_INSNS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
