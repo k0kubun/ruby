@@ -184,6 +184,7 @@ make_counters! {
         gc_iseq_update_time_ns,
         gc_root_mark_time_ns,
         gc_root_mark_iseq_time_ns,
+        gc_root_mark_send_cache_time_ns,
         gc_root_update_time_ns,
         // Callback invocations. `gc_root_mark_count` is one per GC that ran a ZJIT
         // hook at all, so `gc_iseq_mark_count / gc_root_mark_count` is the number of
@@ -197,6 +198,10 @@ make_counters! {
         gc_mark_profile_object_count,
         gc_mark_offset_object_count,
         gc_mark_root_iseq_count,
+        gc_mark_send_cache_slot_count,
+        // Slots walked to find the callcaches above. The gap against
+        // `gc_mark_send_cache_slot_count` is how much of the walk is empty slots.
+        gc_mark_send_cache_probe_count,
 
         compiled_side_exit_count,
         side_exit_size_bytes,
@@ -417,6 +422,31 @@ make_counters! {
     // compiled site that can reach the generic path. Multiply by
     // --zjit-ivar-cache-entries * 8 for the memory.
     ivar_cache_alloc_count,
+    // send_cache_: per-call-shape class table (see crate::send_cache). Every
+    // send routed through the table lands in exactly one of send_cache_hit or
+    // one of the three miss counters; send_cache_uncacheable is a miss that the
+    // table also could not record, so it will miss again next call.
+    send_cache_hit,
+    // An empty slot was filled.
+    send_cache_fill,
+    // A slot holding another class's callcache was taken over. Enough of these
+    // relative to send_cache_hit means the table is too small for the site's
+    // class working set; see --zjit-send-cache-entries.
+    send_cache_evict,
+    // The slot held this class's callcache but its method had been redefined, so
+    // the entry was replaced by a fresh lookup. This is the invalidation path.
+    send_cache_stale,
+    // The search produced a callcache the table declines to store: the empty
+    // callcache (no such method), or a super/refinement one. See
+    // zjit_send_cache_cacheable_p in vm_insnhelper.c.
+    send_cache_uncacheable,
+    // Entries dropped because a compacting GC moved the classes they were keyed
+    // on. See crate::send_cache::update_references.
+    send_cache_compaction_drop,
+    // Number of tables allocated, i.e. distinct (method name, argc, call flags)
+    // triples dispatched by a compiled megamorphic site. Multiply by
+    // --zjit-send-cache-entries * 8 for the memory.
+    send_cache_alloc_count,
 
     // compile_error_: Compile error reasons
     compile_error_iseq_version_limit_reached,
@@ -988,6 +1018,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     set_stat_usize!(hash, "code_region_bytes", code_region_bytes);
     set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
     set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + jit_frame_region_bytes + zjit_alloc_bytes());
+
 
     // End of default stats. Every counter beyond this is provided only for --zjit-stats.
     if !get_option!(stats) {
