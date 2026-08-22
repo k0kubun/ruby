@@ -140,6 +140,10 @@ pub extern "C" fn rb_zjit_root_update_references() {
     for meta in ZJITState::get_exit_metas().iter_mut() {
         meta.update_references();
     }
+
+    // Send class tables are keyed on class addresses, which this compaction has
+    // just changed, so they are dropped rather than rehashed.
+    crate::send_cache::update_references();
 }
 
 fn iseq_mark(payload: &IseqPayload) {
@@ -292,4 +296,8 @@ pub extern "C" fn rb_zjit_root_mark() {
     for meta in ZJITState::get_exit_metas().iter() {
         meta.mark();
     }
+    // Keep alive the callcaches megamorphic send sites dispatch through. Nothing
+    // else roots them: the class's own callcache table drops one as soon as the
+    // method is invalidated. See [`crate::send_cache`].
+    crate::send_cache::mark_all();
 }

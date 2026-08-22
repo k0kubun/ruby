@@ -421,6 +421,32 @@ make_counters! {
     // --zjit-ivar-cache-entries * 8 for the memory.
     ivar_cache_alloc_count,
 
+    // send_cache_: per-call-shape class table (see crate::send_cache). Every
+    // send routed through the table lands in exactly one of send_cache_hit or
+    // one of the three miss counters; send_cache_uncacheable is a miss that the
+    // table also could not record, so it will miss again next call.
+    send_cache_hit,
+    // An empty slot was filled.
+    send_cache_fill,
+    // A slot holding another class's callcache was taken over. Enough of these
+    // relative to send_cache_hit means the table is too small for the site's
+    // class working set; see --zjit-send-cache-entries.
+    send_cache_evict,
+    // The slot held this class's callcache but its method had been redefined, so
+    // the entry was replaced by a fresh lookup. This is the invalidation path.
+    send_cache_stale,
+    // The search produced a callcache the table declines to store: the empty
+    // callcache (no such method), or a super/refinement one. See
+    // zjit_send_cache_cacheable_p in vm_insnhelper.c.
+    send_cache_uncacheable,
+    // Entries dropped because a compacting GC moved the classes they were keyed
+    // on. See crate::send_cache::update_references.
+    send_cache_compaction_drop,
+    // Number of tables allocated, i.e. distinct (method name, argc, call flags)
+    // triples dispatched by a compiled megamorphic site. Multiply by
+    // --zjit-send-cache-entries * 8 for the memory.
+    send_cache_alloc_count,
+
     // compile_error_: Compile error reasons
     compile_error_iseq_version_limit_reached,
     compile_error_iseq_stack_too_large,
@@ -979,6 +1005,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_code_block_bytes", mem.code_block_bytes);
         set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
         set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
+        set_stat_usize!(hash, "mem_send_cache_bytes", mem.send_cache_bytes);
         set_stat_usize!(hash, "mem_dead_iseq_version_bytes", mem.dead_iseq_version_bytes);
         set_stat_usize!(hash, "mem_method_annotation_bytes", mem.method_annotation_bytes);
         set_stat_usize!(hash, "mem_accounted_bytes", mem.accounted_bytes());
@@ -993,6 +1020,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_jit_frame_count", mem.jit_frame_count);
         set_stat_usize!(hash, "mem_exit_meta_count", mem.exit_meta_count);
         set_stat_usize!(hash, "mem_ivar_cache_count", mem.ivar_cache_count);
+        set_stat_usize!(hash, "mem_send_cache_count", mem.send_cache_count);
     }
 
     // End of default stats. Every counter beyond this is provided only for --zjit-stats.
