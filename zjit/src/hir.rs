@@ -4266,6 +4266,42 @@ impl Function {
         ResolvedInsnId(insn_id)
     }
 
+    /// Point every instruction's operands at their union-find representatives, so that a
+    /// consumer can read instructions by reference instead of cloning one to resolve it.
+    ///
+    /// Optimizer passes resolve as they go, but only the instructions they actually look
+    /// at, so after optimization some operands still name an instruction that has since
+    /// been forwarded. Codegen dealt with that by cloning: once for the instruction it is
+    /// compiling, and again for the `Snapshot` it asks about for nearly every one of them,
+    /// which means a `Box` plus copies of the frame's stack and locals vectors per
+    /// instruction. Doing the resolution once, here, removes all of that.
+    ///
+    /// Walks the instruction arena rather than the blocks: a `Snapshot` that no block
+    /// lists any more can still be reachable as another instruction's `state` operand.
+    pub fn canonicalize_operands(&mut self) {
+        let Self { insns, union_find, .. } = self;
+        let union_find = union_find.borrow();
+        for insn in insns.iter_mut() {
+            insn.for_each_operand_mut(&mut |operand: &mut InsnId| {
+                *operand = union_find.find_const(*operand);
+            });
+        }
+    }
+
+    /// Check the postcondition of [`Self::canonicalize_operands`]. Codegen reads
+    /// instructions and frame states by reference and has no way to resolve them itself,
+    /// so a stale operand there would silently generate code for the wrong value.
+    #[cfg(debug_assertions)]
+    pub fn assert_operands_canonical(&self) {
+        let union_find = self.union_find.borrow();
+        for (idx, insn) in self.insns.iter().enumerate() {
+            insn.for_each_operand(|operand| {
+                assert_eq!(operand, union_find.find_const(operand),
+                    "operand {operand} of insn {idx} was not canonicalized");
+            });
+        }
+    }
+
     /// Update DynamicSendReason for the instruction at insn_id
     fn set_dynamic_send_reason(&mut self, insn_id: InsnId, dynamic_send_reason: SendFallbackReason) {
         use Insn::*;

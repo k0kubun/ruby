@@ -738,7 +738,7 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
     let mut use_count = vec![0u32; function.num_insns()];
     for &block_id in reverse_post_order {
         for &insn_id in function.block(block_id).insns() {
-            function.find(insn_id).for_each_operand(|operand| {
+            function.find_ref(insn_id).for_each_operand(|operand| {
                 use_count[operand.to_usize()] += 1;
             });
         }
@@ -749,18 +749,18 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
         let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
         let Some(&branch_id) = insns.last() else { continue };
         let branch_id = function.find_id(branch_id);
-        let Insn::CondBranch { val, .. } = function.find(branch_id) else { continue };
+        let &Insn::CondBranch { val, .. } = function.find_ref(branch_id) else { continue };
         // The Test must be exclusively consumed by this CondBranch, and must live in the
         // same block so that its operands are still in scope at the branch. (The compare
         // may be separated from the branch by flag-clobbering code like CheckInterrupts,
         // which is why the flags test is re-emitted at the branch instead of reused.)
-        let Insn::Test { val: cond } = function.find(val) else { continue };
+        let &Insn::Test { val: cond } = function.find_ref(val) else { continue };
         if use_count[val.to_usize()] != 1 { continue; }
         let in_this_block = |insn_id: InsnId| insns.iter().any(|&id| function.find_id(id) == insn_id);
         if !in_this_block(val) { continue; }
         fusion.elided[val.to_usize()] = true;
 
-        let fused_cmp = match function.find(cond) {
+        let fused_cmp = match *function.find_ref(cond) {
             Insn::FixnumLt  { left, right } => Some((FusedCmpKind::Lt, left, right)),
             Insn::FixnumLe  { left, right } => Some((FusedCmpKind::Le, left, right)),
             Insn::FixnumGt  { left, right } => Some((FusedCmpKind::Gt, left, right)),
@@ -867,10 +867,13 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                 if fusion.elided[function.find_id(insn_id).to_usize()] {
                     continue;
                 }
-                let insn = function.find(insn_id);
-                let perf_symbol = hir_perf_symbol_range_start(&mut asm, &insn);
+                // Read the instruction by reference: `canonicalize_operands` already
+                // pointed its operands at their representatives, so there is nothing left
+                // for a clone to resolve.
+                let insn = function.find_ref(insn_id);
+                let perf_symbol = hir_perf_symbol_range_start(&mut asm, insn);
 
-                let result = match &insn {
+                let result = match insn {
                     Insn::CondBranch { val, if_true, if_false } => {
                         let true_target = hir_to_lir[if_true.target.to_usize()].unwrap();
                         let false_target = hir_to_lir[if_false.target.to_usize()].unwrap();
@@ -930,7 +933,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         Ok(())
                     },
                     _ => {
-                        gen_insn(cb, &mut jit, &mut asm, function, insn_id, &insn)
+                        gen_insn(cb, &mut jit, &mut asm, function, insn_id, insn)
                     }
                 };
 
@@ -946,12 +949,12 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
                 if let Err(last_snapshot) = result {
                     debug!("ZJIT: gen_function: Failed to compile insn: {insn_id} {insn}. Generating side-exit.");
-                    gen_incr_counter(&mut asm, exit_counter_for_unhandled_hir_insn(&insn));
+                    gen_incr_counter(&mut asm, exit_counter_for_unhandled_hir_insn(insn));
                     let reason = match insn {
                         Insn::InvokeBuiltin { .. } => SideExitReason::UnhandledHIRInvokeBuiltin,
                         _                          => SideExitReason::UnhandledHIRUnknown(insn_id),
                     };
-                    gen_side_exit(&mut jit, &mut asm, function, &reason, None, &function.frame_state(last_snapshot));
+                    gen_side_exit(&mut jit, &mut asm, function, &reason, None, function.frame_state_ref(last_snapshot));
                     // Don't bother generating code after a side-exit. We won't run it.
                     // TODO(max): Generate ud2 or equivalent.
                     break;
@@ -1037,14 +1040,14 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             gen_const_uint32(val.0)
         }
         Insn::Const { .. } => panic!("Unexpected Const in gen_insn: {insn}"),
-        Insn::NewArray { elements, state } => gen_new_array(jit, asm, function, opnds!(elements), &function.frame_state(*state)),
+        Insn::NewArray { elements, state } => gen_new_array(jit, asm, function, opnds!(elements), function.frame_state_ref(*state)),
         Insn::NewHash { elements, state } => {
             let sym_keys = elements.iter().step_by(2).all(|&key| function.type_of(key).is_subtype(types::Symbol));
-            gen_new_hash(jit, asm, function, opnds!(elements), sym_keys, &function.frame_state(*state))
+            gen_new_hash(jit, asm, function, opnds!(elements), sym_keys, function.frame_state_ref(*state))
         }
-        Insn::NewRange { low, high, flag, state } => gen_new_range(jit, asm, function, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
-        Insn::NewRangeFixnum { low, high, flag, state } => gen_new_range_fixnum(jit, asm, function, opnd!(low), opnd!(high), *flag, &function.frame_state(*state)),
-        Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), &function.frame_state(*state)),
+        Insn::NewRange { low, high, flag, state } => gen_new_range(jit, asm, function, opnd!(low), opnd!(high), *flag, function.frame_state_ref(*state)),
+        Insn::NewRangeFixnum { low, high, flag, state } => gen_new_range_fixnum(jit, asm, function, opnd!(low), opnd!(high), *flag, function.frame_state_ref(*state)),
+        Insn::ArrayDup { val, state } => gen_array_dup(jit, asm, function, *val, opnd!(val), function.frame_state_ref(*state)),
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
         Insn::ArrayArefOrNil { array, index, length } => gen_array_aref_or_nil(jit, asm, opnd!(array), opnd!(index), opnd!(length)),
@@ -1054,62 +1057,62 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayAsetOrStore { array, index, length, val, state } => {
             let nonneg = function.type_of(index).known_nonnegative();
             let (array, index, length, val) = (opnd!(array), opnd!(index), opnd!(length), opnd!(val));
-            no_output!(gen_array_aset_or_store(jit, asm, function, array, index, length, val, nonneg, &function.frame_state(state)))
+            no_output!(gen_array_aset_or_store(jit, asm, function, array, index, length, val, nonneg, function.frame_state_ref(state)))
         }
-        Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), &function.frame_state(*state)),
+        Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), function.frame_state_ref(*state)),
         Insn::ArrayLength { array } => gen_array_length(asm, opnd!(array)),
-        Insn::ObjectAlloc { val, state } => gen_object_alloc(jit, asm, function, opnd!(val), &function.frame_state(*state)),
-        &Insn::ObjectAllocClass { class, state } => gen_object_alloc_class(jit, asm, function, class, &function.frame_state(state)),
-        Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, function, *val, opnd!(val), *chilled, &function.frame_state(*state)),
-        Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), &function.frame_state(*state)),
+        Insn::ObjectAlloc { val, state } => gen_object_alloc(jit, asm, function, opnd!(val), function.frame_state_ref(*state)),
+        &Insn::ObjectAllocClass { class, state } => gen_object_alloc_class(jit, asm, function, class, function.frame_state_ref(state)),
+        Insn::StringCopy { val, chilled, state } => gen_string_copy(jit, asm, function, *val, opnd!(val), *chilled, function.frame_state_ref(*state)),
+        Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), function.frame_state_ref(*state)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
-        &Insn::StringCoderangeOrScan { string, cached, state } => gen_string_coderange_or_scan(jit, asm, opnd!(string), opnd!(cached), &function.frame_state(state)),
+        &Insn::StringCoderangeOrScan { string, cached, state } => gen_string_coderange_or_scan(jit, asm, opnd!(string), opnd!(cached), function.frame_state_ref(state)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
-        Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
-        Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
+        Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
+        Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
         Insn::StringEqual { left, right } => gen_string_equal(asm, opnd!(left), opnd!(right)),
-        Insn::StringIntern { val, state } => gen_intern(asm, opnd!(val), &function.frame_state(*state)),
-        Insn::ToRegexp { opt, values, state } => gen_toregexp(jit, asm, function, *opt, opnds!(values), &function.frame_state(*state)),
+        Insn::StringIntern { val, state } => gen_intern(asm, opnd!(val), function.frame_state_ref(*state)),
+        Insn::ToRegexp { opt, values, state } => gen_toregexp(jit, asm, function, *opt, opnds!(values), function.frame_state_ref(*state)),
         Insn::Param => unreachable!("block.insns should not have Insn::Param"),
         Insn::LoadArg { .. } => return Ok(()), // compiled in the LoadArg pre-pass above
         Insn::Snapshot { .. } => return Ok(()), // we don't need to do anything for this instruction at the moment
-        &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, &function.frame_state(state), reason),
-        &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
-        &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
-        &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
+        &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, function.frame_state_ref(state), reason),
+        &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, function.frame_state_ref(state), reason),
+        &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), function.frame_state_ref(state), reason),
+        &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, function.frame_state_ref(state), reason),
         Insn::SendDirect(insn) => {
             let SendDirectData { cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
             gen_send_iseq_direct(
                 cb, jit, asm,
                 function, *cme, *iseq, opnd!(recv), opnds!(args),
-                *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block,
+                *kw_bits, *jit_entry_idx, function.frame_state_ref(*state), *block,
             )
         }
         Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, captured, state, guard_state: _ } => {
             let captured = captured.map(|captured| opnd!(captured));
-            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, captured))
+            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, function.frame_state_ref(*state), *blockiseq, captured))
         },
         Insn::PopInlineFrame { iseq, argc, state } => {
-            no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
+            no_output!(gen_pop_inline_frame(asm, *iseq, *argc, function.frame_state_ref(*state)))
         },
-        &Insn::InvokeSuper { cd, blockiseq, state, reason, .. } => gen_invokesuper(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
-        &Insn::InvokeSuperForward { cd, blockiseq, state, reason, .. } => gen_invokesuperforward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
-        &Insn::InvokeBlock { cd, state, reason, .. } => gen_invokeblock(jit, asm, function, cd, &function.frame_state(state), reason),
-        Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
-        Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
-        Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, &function.frame_state(*state), unsafe { &**bf }, *leaf, opnds!(args)),
-        Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), &function.frame_state(*state)),
+        &Insn::InvokeSuper { cd, blockiseq, state, reason, .. } => gen_invokesuper(jit, asm, function, cd, blockiseq, function.frame_state_ref(state), reason),
+        &Insn::InvokeSuperForward { cd, blockiseq, state, reason, .. } => gen_invokesuperforward(jit, asm, function, cd, blockiseq, function.frame_state_ref(state), reason),
+        &Insn::InvokeBlock { cd, state, reason, .. } => gen_invokeblock(jit, asm, function, cd, function.frame_state_ref(state), reason),
+        Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), function.frame_state_ref(*state)),
+        Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, function.frame_state_ref(*state)),
+        Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, function.frame_state_ref(*state), unsafe { &**bf }, *leaf, opnds!(args)),
+        Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), function.frame_state_ref(*state)),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, function, jit_entry_idx)),
         &Insn::Return { val, pop_inlined_frames } => no_output!(gen_return(asm, opnd!(val), pop_inlined_frames)),
-        Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
-        Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
-        Insn::FixnumMult { left, right, state } => gen_fixnum_mult(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
-        Insn::FixnumDiv { left, right, state } => gen_fixnum_div(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
-        Insn::FloatAdd { recv, other, state } => gen_float_add(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
-        Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
-        Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
-        Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
-        Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), &function.frame_state(*state)),
+        Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
+        Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
+        Insn::FixnumMult { left, right, state } => gen_fixnum_mult(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
+        Insn::FixnumDiv { left, right, state } => gen_fixnum_div(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
+        Insn::FloatAdd { recv, other, state } => gen_float_add(asm, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
+        Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
+        Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
+        Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), function.frame_state_ref(*state)),
+        Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), function.frame_state_ref(*state)),
         Insn::FloatLt { left, right } => asm_ccall!(asm, rb_float_lt, opnd!(left), opnd!(right)),
         Insn::FloatLe { left, right } => asm_ccall!(asm, rb_float_le, opnd!(left), opnd!(right)),
         Insn::FloatGt { left, right } => asm_ccall!(asm, rb_float_gt, opnd!(left), opnd!(right)),
@@ -1129,7 +1132,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             // We only create FixnumLShift when we know the shift amount statically and it's in [0,
             // 63].
             let shift_amount = function.type_of(right).fixnum_value().unwrap() as u64;
-            gen_fixnum_lshift(jit, asm, function, opnd!(left), shift_amount, &function.frame_state(state))
+            gen_fixnum_lshift(jit, asm, function, opnd!(left), shift_amount, function.frame_state_ref(state))
         }
         &Insn::FixnumRShift { left, right } => {
             // We only create FixnumRShift when we know the shift amount statically and it's in [0,
@@ -1137,13 +1140,13 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             let shift_amount = function.type_of(right).fixnum_value().unwrap() as u64;
             gen_fixnum_rshift(asm, opnd!(left), shift_amount)
         }
-        &Insn::FixnumMod { left, right, state } => gen_fixnum_mod(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state)),
+        &Insn::FixnumMod { left, right, state } => gen_fixnum_mod(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(state)),
         &Insn::FixnumAref { recv, index } => gen_fixnum_aref(asm, opnd!(recv), opnd!(index)),
-        &Insn::IsMethodCfunc { val, cd, cfunc, state } => gen_is_method_cfunc(asm, opnd!(val), cd, cfunc, &function.frame_state(state)),
+        &Insn::IsMethodCfunc { val, cd, cfunc, state } => gen_is_method_cfunc(asm, opnd!(val), cd, cfunc, function.frame_state_ref(state)),
         &Insn::IsBitEqual { left, right } => gen_is_bit_equal(asm, opnd!(left), opnd!(right)),
         &Insn::IsBitNotEqual { left, right } => gen_is_bit_not_equal(asm, opnd!(left), opnd!(right)),
         &Insn::BoxBool { val } => gen_box_bool(asm, opnd!(val)),
-        &Insn::BoxFixnum { val, state } => gen_box_fixnum(jit, asm, function, opnd!(val), &function.frame_state(state)),
+        &Insn::BoxFixnum { val, state } => gen_box_fixnum(jit, asm, function, opnd!(val), function.frame_state_ref(state)),
         &Insn::UnboxFixnum { val } => gen_unbox_fixnum(asm, opnd!(val)),
         Insn::Test { val } => gen_test(asm, opnd!(val)),
         Insn::RefineType { val, .. } => opnd!(val),
@@ -1157,64 +1160,64 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         }
         &Insn::GuardType { val, guard_type, state, recompile } => {
             let val_type = function.type_of(val);
-            gen_guard_type(jit, asm, function, opnd!(val), val_type, guard_type, recompile, &function.frame_state(state))
+            gen_guard_type(jit, asm, function, opnd!(val), val_type, guard_type, recompile, function.frame_state_ref(state))
         }
-        &Insn::GuardBitEquals { val, expected, ref reason, state, recompile } => gen_guard_bit_equals(jit, asm, function, opnd!(val), expected, **reason, recompile, &function.frame_state(state)),
-        &Insn::GuardAnyBitSet { val, mask, ref reason, state, recompile, .. } => gen_guard_any_bit_set(jit, asm, function, opnd!(val), mask, **reason, recompile, &function.frame_state(state)),
-        &Insn::GuardNoBitsSet { val, mask, ref reason, state, .. } => gen_guard_no_bits_set(jit, asm, function, opnd!(val), mask, **reason, &function.frame_state(state)),
+        &Insn::GuardBitEquals { val, expected, ref reason, state, recompile } => gen_guard_bit_equals(jit, asm, function, opnd!(val), expected, **reason, recompile, function.frame_state_ref(state)),
+        &Insn::GuardAnyBitSet { val, mask, ref reason, state, recompile, .. } => gen_guard_any_bit_set(jit, asm, function, opnd!(val), mask, **reason, recompile, function.frame_state_ref(state)),
+        &Insn::GuardNoBitsSet { val, mask, ref reason, state, .. } => gen_guard_no_bits_set(jit, asm, function, opnd!(val), mask, **reason, function.frame_state_ref(state)),
         &Insn::GuardNotRuby2KeywordsHash { val, state, recompile } => {
             let val_type = function.type_of(val);
-            gen_guard_not_ruby2_keywords_hash(jit, asm, function, opnd!(val), val_type, recompile, &function.frame_state(state))
+            gen_guard_not_ruby2_keywords_hash(jit, asm, function, opnd!(val), val_type, recompile, function.frame_state_ref(state))
         }
-        &Insn::GuardLess { left, right, ref reason, state } => gen_guard_less(jit, asm, function, opnd!(left), opnd!(right), **reason, &function.frame_state(state)),
-        &Insn::GuardGreaterEq { left, right, state, recompile, .. } => gen_guard_greater_eq(jit, asm, function, opnd!(left), opnd!(right), recompile, &function.frame_state(state)),
-        Insn::PatchPoint { invariant, state } => no_output!(gen_patch_point(jit, asm, function, invariant, &function.frame_state(*state))),
+        &Insn::GuardLess { left, right, ref reason, state } => gen_guard_less(jit, asm, function, opnd!(left), opnd!(right), **reason, function.frame_state_ref(state)),
+        &Insn::GuardGreaterEq { left, right, state, recompile, .. } => gen_guard_greater_eq(jit, asm, function, opnd!(left), opnd!(right), recompile, function.frame_state_ref(state)),
+        Insn::PatchPoint { invariant, state } => no_output!(gen_patch_point(jit, asm, function, invariant, function.frame_state_ref(*state))),
         Insn::CCall { cfunc, recv, args, name, owner, return_type: _, elidable: _ } => gen_ccall(asm, *cfunc, *name, *owner, opnd!(recv), opnds!(args)),
         Insn::CCallWithFrame(insn) => {
             let CCallWithFrameData { cfunc, recv, name, args, cme, state, block, .. } = &**insn;
-            gen_ccall_with_frame(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, &function.frame_state(*state))
+            gen_ccall_with_frame(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, function.frame_state_ref(*state))
         }
         Insn::CCallVariadic(insn) => {
             let CCallVariadicData { cfunc, recv, name, args, cme, state, block, .. } = &**insn;
-            gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, &function.frame_state(*state))
+            gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, function.frame_state_ref(*state))
         }
-        &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, &function.frame_state(state)),
-        Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), &function.frame_state(*state))),
-        Insn::SetGlobal { id, val, state } => no_output!(gen_setglobal(jit, asm, function, *id, opnd!(val), &function.frame_state(*state))),
-        Insn::GetGlobal { id, state } => gen_getglobal(jit, asm, function, *id, &function.frame_state(*state)),
+        &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, function.frame_state_ref(state)),
+        Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), function.frame_state_ref(*state))),
+        Insn::SetGlobal { id, val, state } => no_output!(gen_setglobal(jit, asm, function, *id, opnd!(val), function.frame_state_ref(*state))),
+        Insn::GetGlobal { id, state } => gen_getglobal(jit, asm, function, *id, function.frame_state_ref(*state)),
         &Insn::IsBlockParamModified { flags } => gen_is_block_param_modified(asm, opnd!(flags)),
-        &Insn::GetBlockParam { ep_offset, level, state } => gen_getblockparam(jit, asm, function, ep_offset, level, &function.frame_state(state)),
+        &Insn::GetBlockParam { ep_offset, level, state } => gen_getblockparam(jit, asm, function, ep_offset, level, function.frame_state_ref(state)),
         &Insn::SetLocal { val, ep_offset, level, .. } => no_output!(gen_setlocal(asm, opnd!(val), function.type_of(val), ep_offset, level)),
-        Insn::GetConstant { klass, id, allow_nil, state } => gen_getconstant(jit, asm, function, opnd!(klass), *id, opnd!(allow_nil), &function.frame_state(*state)),
-        Insn::GetConstantPath { ic, state } => gen_get_constant_path(jit, asm, function, *ic, &function.frame_state(*state)),
-        Insn::GetClassVar { id, ic, state } => gen_getclassvar(jit, asm, function, *id, *ic, &function.frame_state(*state)),
-        Insn::SetClassVar { id, val, ic, state } => no_output!(gen_setclassvar(jit, asm, function, *id, opnd!(val), *ic, &function.frame_state(*state))),
-        Insn::SetIvar { self_val, id, ic, val, state } => no_output!(gen_setivar(jit, asm, function, opnd!(self_val), *id, *ic, opnd!(val), &function.frame_state(*state))),
+        Insn::GetConstant { klass, id, allow_nil, state } => gen_getconstant(jit, asm, function, opnd!(klass), *id, opnd!(allow_nil), function.frame_state_ref(*state)),
+        Insn::GetConstantPath { ic, state } => gen_get_constant_path(jit, asm, function, *ic, function.frame_state_ref(*state)),
+        Insn::GetClassVar { id, ic, state } => gen_getclassvar(jit, asm, function, *id, *ic, function.frame_state_ref(*state)),
+        Insn::SetClassVar { id, val, ic, state } => no_output!(gen_setclassvar(jit, asm, function, *id, opnd!(val), *ic, function.frame_state_ref(*state))),
+        Insn::SetIvar { self_val, id, ic, val, state } => no_output!(gen_setivar(jit, asm, function, opnd!(self_val), *id, *ic, opnd!(val), function.frame_state_ref(*state))),
         Insn::FixnumBitCheck { val, index } => gen_fixnum_bit_check(asm, opnd!(val), *index),
-        Insn::SideExit { state, reason, recompile } => no_output!(gen_side_exit(jit, asm, function, reason, *recompile, &function.frame_state(*state))),
-        Insn::PutSpecialObject { value_type, state } => gen_putspecialobject(jit, asm, function, *value_type, &function.frame_state(*state)),
-        Insn::AnyToString { val, state } => gen_anytostring(asm, opnd!(val), &function.frame_state(*state)),
-        Insn::Defined { op_type, obj, pushval, v, lep_level, state } => gen_defined(jit, asm, function, *op_type, *obj, *pushval, opnd!(v), *lep_level, &function.frame_state(*state)),
-        Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, function, opnd!(target), opnd!(pattern), *flag, &function.frame_state(*state)),
-        Insn::GetSpecialSymbol { symbol_type, state } => gen_getspecial_symbol(asm, *symbol_type, &function.frame_state(*state)),
-        Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, &function.frame_state(*state)),
-        Insn::Once { body_iseq, ise, state } => gen_once(jit, asm, function, *body_iseq, *ise, &function.frame_state(*state)),
+        Insn::SideExit { state, reason, recompile } => no_output!(gen_side_exit(jit, asm, function, reason, *recompile, function.frame_state_ref(*state))),
+        Insn::PutSpecialObject { value_type, state } => gen_putspecialobject(jit, asm, function, *value_type, function.frame_state_ref(*state)),
+        Insn::AnyToString { val, state } => gen_anytostring(asm, opnd!(val), function.frame_state_ref(*state)),
+        Insn::Defined { op_type, obj, pushval, v, lep_level, state } => gen_defined(jit, asm, function, *op_type, *obj, *pushval, opnd!(v), *lep_level, function.frame_state_ref(*state)),
+        Insn::CheckMatch { target, pattern, flag, state } => gen_checkmatch(jit, asm, function, opnd!(target), opnd!(pattern), *flag, function.frame_state_ref(*state)),
+        Insn::GetSpecialSymbol { symbol_type, state } => gen_getspecial_symbol(asm, *symbol_type, function.frame_state_ref(*state)),
+        Insn::GetSpecialNumber { nth, state } => gen_getspecial_number(asm, *nth, function.frame_state_ref(*state)),
+        Insn::Once { body_iseq, ise, state } => gen_once(jit, asm, function, *body_iseq, *ise, function.frame_state_ref(*state)),
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
-        &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, &function.frame_state(state))),
+        &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, function.frame_state_ref(state))),
         Insn::BreakPoint => no_output!(asm.breakpoint()),
         Insn::Unreachable => no_output!(asm.abort()),
-        &Insn::HashDup { val, state } => { gen_hash_dup(jit, asm, function, val, opnd!(val), &function.frame_state(state)) },
-        &Insn::HashAref { hash, key, state } => { gen_hash_aref(jit, asm, function, opnd!(hash), opnd!(key), &function.frame_state(state)) },
-        &Insn::HashAset { hash, key, val, state } => { no_output!(gen_hash_aset(jit, asm, function, opnd!(hash), opnd!(key), opnd!(val), &function.frame_state(state))) },
-        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(jit, asm, opnd!(array), opnd!(val), function.type_of(val), &function.frame_state(state))) },
-        &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
-        &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
-        &Insn::ToHash { val, state } => { gen_to_hash(jit, asm, function, opnd!(val), &function.frame_state(state)) },
-        &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), &function.frame_state(state)) },
-        &Insn::ToAryForExpand { val, state } => { gen_to_ary_for_expand(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::HashDup { val, state } => { gen_hash_dup(jit, asm, function, val, opnd!(val), function.frame_state_ref(state)) },
+        &Insn::HashAref { hash, key, state } => { gen_hash_aref(jit, asm, function, opnd!(hash), opnd!(key), function.frame_state_ref(state)) },
+        &Insn::HashAset { hash, key, val, state } => { no_output!(gen_hash_aset(jit, asm, function, opnd!(hash), opnd!(key), opnd!(val), function.frame_state_ref(state))) },
+        &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(jit, asm, opnd!(array), opnd!(val), function.type_of(val), function.frame_state_ref(state))) },
+        &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), function.frame_state_ref(state)) },
+        &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), function.frame_state_ref(state)) },
+        &Insn::ToHash { val, state } => { gen_to_hash(jit, asm, function, opnd!(val), function.frame_state_ref(state)) },
+        &Insn::CheckArrayType { val, state } => { gen_check_array_type(jit, asm, function, opnd!(val), function.frame_state_ref(state)) },
+        &Insn::ToAryForExpand { val, state } => { gen_to_ary_for_expand(jit, asm, function, opnd!(val), function.frame_state_ref(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
-        &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
+        &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(state))) },
         Insn::LoadPC => gen_load_pc(asm),
         Insn::LoadEC => gen_load_ec(),
         Insn::LoadSP => gen_load_sp(),
@@ -1225,14 +1228,14 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::StoreField { recv, id, offset, val, num_bits } => no_output!(gen_store_field(asm, opnd!(recv), id, offset, opnd!(val), num_bits)),
         &Insn::WriteBarrier { recv, val } => no_output!(gen_write_barrier(jit, asm, opnd!(recv), opnd!(val), function.type_of(val))),
         &Insn::IsBlockGiven { block_handler } => gen_is_block_given(asm, opnd!(block_handler)),
-        Insn::ArrayInclude { elements, target, state } => gen_array_include(jit, asm, function, opnds!(elements), opnd!(target), &function.frame_state(*state)),
-        Insn::ArrayPackBuffer { elements, fmt, buffer, state } => gen_array_pack_buffer(jit, asm, function, opnds!(elements), opnd!(fmt), (*buffer).map(|buffer| opnd!(buffer)), &function.frame_state(*state)),
-        &Insn::DupArrayInclude { ary, target, state } => gen_dup_array_include(jit, asm, function, ary, opnd!(target), &function.frame_state(state)),
-        Insn::ArrayHash { elements, state } => gen_opt_newarray_hash(jit, asm, function, opnds!(elements), &function.frame_state(*state)),
+        Insn::ArrayInclude { elements, target, state } => gen_array_include(jit, asm, function, opnds!(elements), opnd!(target), function.frame_state_ref(*state)),
+        Insn::ArrayPackBuffer { elements, fmt, buffer, state } => gen_array_pack_buffer(jit, asm, function, opnds!(elements), opnd!(fmt), (*buffer).map(|buffer| opnd!(buffer)), function.frame_state_ref(*state)),
+        &Insn::DupArrayInclude { ary, target, state } => gen_dup_array_include(jit, asm, function, ary, opnd!(target), function.frame_state_ref(state)),
+        Insn::ArrayHash { elements, state } => gen_opt_newarray_hash(jit, asm, function, opnds!(elements), function.frame_state_ref(*state)),
         &Insn::IsA { val, class } => gen_is_a(jit, asm, opnd!(val), opnd!(class)),
-        &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), &function.frame_state(state)),
-        &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), &function.frame_state(state)),
-        &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), &function.frame_state(state))),
+        &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), function.frame_state_ref(state)),
+        &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), function.frame_state_ref(state)),
+        &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), function.frame_state_ref(state))),
         &Insn::CondBranch { .. }
         | &Insn::Jump { .. } | Insn::Entries { .. } => unreachable!(),
     };
@@ -4538,7 +4541,7 @@ fn gen_prepare_fallback_call(jit: &mut JITState, asm: &mut Assembler, function: 
 /// on the native stack are known.
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
     let mut stack = Vec::new();
-    let mut current_state = state.clone();
+    let mut current_state = state;
     loop {
         stack.extend(current_state.stack().rev().copied().map(|insn_id| {
             let opnd = jit.get_opnd(insn_id);
@@ -4553,7 +4556,7 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
             break;
         };
         stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq)));
-        current_state = function.frame_state(caller);
+        current_state = function.frame_state_ref(caller);
     }
     stack
 }
@@ -4713,6 +4716,12 @@ fn compile_iseq_with_entry(iseq: IseqPtr, exception_entry: Option<hir::Exception
     if !get_option!(disable_hir_opt) {
         trace_compile_phase("optimize", || function.optimize());
     }
+    // Codegen reads instructions and frame states straight out of the function, so make
+    // every operand name its union-find representative first. See
+    // [`Function::canonicalize_operands`].
+    trace_compile_phase("canonicalize_operands", || function.canonicalize_operands());
+    #[cfg(debug_assertions)]
+    function.assert_operands_canonical();
     function.dump_hir();
     // Exception entries are compiled once and never recompiled, so they should
     // not disturb the profiling lifecycle of the ordinary entry point.
@@ -4766,13 +4775,13 @@ fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> S
 
 fn build_caller_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Option<StackMap> {
     let caller = state.caller()?;
-    let caller_state = function.frame_state(caller);
-    let stack_map = build_stack_map(jit, function, &caller_state);
+    let caller_state = function.frame_state_ref(caller);
+    let stack_map = build_stack_map(jit, function, caller_state);
     if stack_map.is_empty() {
         return None;
     }
 
-    let jit_frame = jit_frame_for_state(&caller_state, stack_map.len());
+    let jit_frame = jit_frame_for_state(caller_state, stack_map.len());
     Some(StackMap::new(stack_map, jit_frame, caller_state.depth))
 }
 
