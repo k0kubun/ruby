@@ -115,6 +115,17 @@ pub struct BranchEdge {
     pub args: Vec<Opnd>,
 }
 
+/// Instructions a freshly created LIR block makes room for.
+///
+/// A `Vec` that starts empty and is pushed into reaches a 20-instruction block
+/// through capacities 4, 8, 16, 32: four allocations, three frees and three
+/// memmoves of 56-byte instructions, for one block. Lowering was the single
+/// largest source of allocator traffic ZJIT had (8.3M allocations of 42M on an
+/// rdoc-over-stdlib run), and this is nearly all of it. Sizing the vector to a
+/// typical block up front trades bytes -- freed at the end of the compile --
+/// for a 4x cut in allocation count.
+const INITIAL_BLOCK_INSNS: usize = 32;
+
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
     // Unique id for this block
@@ -151,8 +162,8 @@ impl BasicBlock {
             id,
             hir_block_id,
             is_entry,
-            insns: vec![],
-            insn_ids: vec![],
+            insns: Vec::with_capacity(INITIAL_BLOCK_INSNS),
+            insn_ids: Vec::with_capacity(INITIAL_BLOCK_INSNS),
             parameters: vec![],
             rpo_index,
             from: InsnId(0),
