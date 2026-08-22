@@ -14,7 +14,7 @@ use std::{
 };
 use crate::hir_type::{Type, types};
 use crate::hir_effect::{Effect, abstract_heaps, effects};
-use crate::bitset::BitSet;
+use crate::bitset::{BitMatrix, BitSet};
 use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use crate::profile::{TypeDistributionSummary, ProfiledType};
 use crate::stats::{Counter, incr_counter};
@@ -8956,23 +8956,26 @@ impl Function {
         // Map of block ID -> InsnSet
         // Initialize with all missing values at first, to catch if a jump target points to a
         // missing location.
-        let mut assigned_in = vec![None; self.num_blocks()];
+        // One flat matrix rather than one whole-function-width bitset per block:
+        // validate() runs this dataflow on every compile, and a `Vec<BitSet>` costs an
+        // allocation per block plus a full clone of one on every worklist visit.
+        let mut assigned_in = BitMatrix::<InsnId>::new(self.num_blocks(), self.insns.len());
+        let mut in_rpo = BlockSet::with_capacity(self.num_blocks());
         let rpo = self.reverse_post_order();
         // Begin with every block having every variable defined, except for entries_block, which
-        // starts with nothing defined.
+        // starts with nothing defined. Blocks outside the RPO are tracked separately so a jump
+        // into one is still reported.
         for &block in &rpo {
-            if block == self.entries_block {
-                assigned_in[block.to_usize()] = Some(InsnSet::with_capacity(self.insns.len()));
-            } else {
-                let mut all_ones = InsnSet::with_capacity(self.insns.len());
-                all_ones.insert_all();
-                assigned_in[block.to_usize()] = Some(all_ones);
+            in_rpo.insert(block);
+            if block != self.entries_block {
+                assigned_in.insert_all_row(block.to_usize());
             }
         }
         let mut worklist = VecDeque::with_capacity(self.num_blocks());
         worklist.push_back(self.entries_block);
+        let mut assigned = InsnSet::with_capacity(self.insns.len());
         while let Some(block) = worklist.pop_front() {
-            let mut assigned = assigned_in[block.to_usize()].clone().unwrap();
+            assigned.copy_from_row(assigned_in.row(block.to_usize()));
             for &param in &self.blocks[block.to_usize()].params {
                 assigned.insert(param);
             }
@@ -8982,10 +8985,10 @@ impl Function {
                 // operand check below resolves each operand itself.
                 let insn = self.find_ref(insn_id);
                 let mut propagate = |target: BlockId| -> Result<(), ValidationError> {
-                    let Some(block_in) = assigned_in[target.to_usize()].as_mut() else {
+                    if !in_rpo.get(target) {
                         return Err(ValidationError::JumpTargetNotInRPO(target));
-                    };
-                    if block_in.intersect_with(&assigned) {
+                    }
+                    if assigned_in.intersect_row_with(target.to_usize(), &assigned) {
                         worklist.push_back(target);
                     }
                     Ok(())
@@ -9010,7 +9013,7 @@ impl Function {
         }
         // Check that each instruction's operands are assigned
         for &block in &rpo {
-            let mut assigned = assigned_in[block.to_usize()].clone().unwrap();
+            assigned.copy_from_row(assigned_in.row(block.to_usize()));
             for &param in &self.blocks[block.to_usize()].params {
                 assigned.insert(param);
             }

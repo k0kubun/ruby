@@ -146,6 +146,12 @@ impl<T: Into<usize> + Copy> BitSet<T> {
         changed
     }
 
+    /// Overwrite `self` with one row of a [`BitMatrix`], keeping `self`'s allocation.
+    pub fn copy_from_row(&mut self, other: BitRow<'_, T>) {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        self.entries.copy_from_slice(other.entries);
+    }
+
     /// Whether `self` holds exactly the bits in one row of a [`BitMatrix`].
     pub fn equals_row(&self, other: BitRow<'_, T>) -> bool {
         debug_assert_eq!(self.num_bits, other.num_bits);
@@ -244,6 +250,25 @@ impl<T: Into<usize> + Copy> BitMatrix<T> {
 
     pub fn get(&self, row: usize, idx: T) -> bool {
         self.row(row).get(idx)
+    }
+
+    /// Set every bit in one row.
+    pub fn insert_all_row(&mut self, row: usize) {
+        let range = self.range(row);
+        self.entries[range].fill(!0);
+    }
+
+    /// Intersect one row with `other`, returning whether the row changed.
+    pub fn intersect_row_with(&mut self, row: usize, other: &BitSet<T>) -> bool {
+        debug_assert_eq!(self.num_bits, other.num_bits);
+        let range = self.range(row);
+        let mut changed = false;
+        for (entry, &other_entry) in self.entries[range].iter_mut().zip(&other.entries) {
+            let before = *entry;
+            *entry &= other_entry;
+            changed |= *entry != before;
+        }
+        changed
     }
 
     /// Overwrite one row with the contents of `src`, which must be the same width.
