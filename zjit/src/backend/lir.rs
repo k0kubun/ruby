@@ -4195,12 +4195,16 @@ impl Assembler
         self.basic_blocks[exit_block.0].reserve_insns(estimated_exit_insns);
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
-        let mut compiled_exits: HashMap<SideExit, Label> = HashMap::default();
+        // Sized for the worst case (no two exits alike) so that a function with thousands
+        // of exits doesn't rehash its way there, moving every key's operand vectors.
+        let mut compiled_exits: HashMap<SideExit, Label> =
+            HashMap::with_capacity_and_hasher(targets.len(), Default::default());
 
         // Map from the constants an exit restores to its index in the process-wide
         // metadata table, so exits in this function that restore the same frame state
         // share one record.
-        let mut interned_metas: HashMap<ExitMeta, u32> = HashMap::default();
+        let mut interned_metas: HashMap<ExitMeta, u32> =
+            HashMap::with_capacity_and_hasher(targets.len(), Default::default());
 
         // The tail every metadata-driven exit in this function jumps to. It restores
         // the callee-saved registers the allocator handed out -- the same ones from the
