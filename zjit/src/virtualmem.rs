@@ -231,7 +231,30 @@ impl<A: Allocator> VirtualMemory<A> {
             // Stop at the end of this page; the next iteration maps the following one.
             let to_page_end = page_addr + self.page_size_bytes - raw as usize;
             let run = to_page_end.min(bytes.len() - written);
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(written), raw, run) };
+            let src = unsafe { bytes.as_ptr().add(written) };
+            // Machine-code writes are almost all one to nine bytes -- an opcode
+            // with a ModRM byte and a displacement -- and `copy_nonoverlapping`
+            // of a runtime length compiles to a `memcpy` call, whose fixed
+            // overhead dwarfs the copy at that size. It measured as 3.6% of all
+            // compile instructions. Copy short runs inline instead.
+            // Dispatching on the length gives each arm a compile-time size, which
+            // becomes one or two loads and stores instead of a call.
+            macro_rules! copy_n { ($n:expr) => {
+                unsafe { std::ptr::copy_nonoverlapping(src, raw, $n) }
+            }; }
+            match run {
+                1 => unsafe { raw.write(src.read()) },
+                2 => copy_n!(2),
+                3 => copy_n!(3),
+                4 => copy_n!(4),
+                5 => copy_n!(5),
+                6 => copy_n!(6),
+                7 => copy_n!(7),
+                8 => copy_n!(8),
+                9 => copy_n!(9),
+                10 => copy_n!(10),
+                _ => unsafe { std::ptr::copy_nonoverlapping(src, raw, run) },
+            }
             written += run;
         }
         (written, Ok(()))
