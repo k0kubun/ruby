@@ -1583,6 +1583,21 @@ fn gen_send(
     gen_trace_send_fallback(asm, &reason);
 
     gen_prepare_fallback_call(jit, asm, function, state);
+
+    // A site that dispatches over many classes resolves its target out of a
+    // class table instead of thrashing cd->cc. See [`crate::send_cache`].
+    if let Some(cache) = crate::send_cache::cache_for(cd, reason) {
+        asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
+        unsafe extern "C" {
+            fn rb_zjit_send_cached(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr, cache: *const u8) -> VALUE;
+        }
+        return asm_ccall!(
+            asm,
+            rb_zjit_send_cached,
+            EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into(), Opnd::const_ptr(cache as *const u8)
+        );
+    }
+
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
@@ -1633,6 +1648,21 @@ fn gen_send_without_block(
     gen_trace_send_fallback(asm, &reason);
 
     gen_prepare_fallback_call(jit, asm, function, state);
+
+    // A site that dispatches over many classes resolves its target out of a
+    // class table instead of thrashing cd->cc. See [`crate::send_cache`].
+    if let Some(cache) = crate::send_cache::cache_for(cd, reason) {
+        asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
+        unsafe extern "C" {
+            fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
+        }
+        return asm_ccall!(
+            asm,
+            rb_zjit_send_cached_without_block,
+            EC, CFP, Opnd::const_ptr(cd), Opnd::const_ptr(cache as *const u8)
+        );
+    }
+
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
