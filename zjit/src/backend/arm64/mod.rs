@@ -760,6 +760,9 @@ impl Assembler {
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.linearize_instructions();
+        // Splitting emits at least one instruction per input instruction into the single
+        // output block, so start it out big enough instead of growing it by doublings.
+        asm.current_block().reserve_insns(linearized_insns.len());
 
         // The side exit of the patch point that sits at the current write position, if any.
         // See split_patch_point() for why consecutive patch points can share a patch site.

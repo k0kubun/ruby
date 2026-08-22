@@ -367,9 +367,18 @@ fn write_rm(cb: &mut CodeBlock, sz_pref: bool, rex_w: bool, r_opnd: X86Opnd, rm_
     // Flag to indicate SIB byte is needed
     let need_sib = r_opnd.sib_needed() || rm_opnd.sib_needed();
 
+    // The whole encoding is staged in a buffer and written once: an RM instruction is
+    // three to six separate byte writes, and each write to the code region checks (and
+    // possibly remaps) the page it lands in.
+    let mut buf = [0u8; 16];
+    let mut len = 0usize;
+    macro_rules! emit {
+        ($byte:expr) => {{ buf[len] = $byte; len += 1; }};
+    }
+
     // Add the operand-size prefix, if needed
     if sz_pref {
-        cb.write_byte(0x66);
+        emit!(0x66);
     }
 
     // Add the REX prefix, if needed
@@ -400,12 +409,12 @@ fn write_rm(cb: &mut CodeBlock, sz_pref: bool, rex_w: bool, r_opnd: X86Opnd, rm_
 
         // Encode and write the REX byte
         let rex_byte: u8 = 0x40 + (w << 3) + (r << 2) + (x << 1) + (b);
-        cb.write_byte(rex_byte);
+        emit!(rex_byte);
     }
 
     // Write the opcode bytes to the code block
     for byte in bytes {
-        cb.write_byte(*byte)
+        emit!(*byte);
     }
 
     // MODRM.mod (2 bits)
@@ -453,7 +462,7 @@ fn write_rm(cb: &mut CodeBlock, sz_pref: bool, rex_w: bool, r_opnd: X86Opnd, rm_
 
     // Encode and write the ModR/M byte
     let rm_byte: u8 = (rm_mod << 6) + (reg << 3) + (rm);
-    cb.write_byte(rm_byte);
+    emit!(rm_byte);
 
     // Add the SIB byte, if needed
     if need_sib {
@@ -474,7 +483,7 @@ fn write_rm(cb: &mut CodeBlock, sz_pref: bool, rex_w: bool, r_opnd: X86Opnd, rm_
 
                 // Encode and write the SIB byte
                 let sib_byte: u8 = (scale << 6) + (index << 3) + (base);
-                cb.write_byte(sib_byte);
+                emit!(sib_byte);
             },
             _ => panic!("Expected mem operand")
         }
@@ -485,14 +494,20 @@ fn write_rm(cb: &mut CodeBlock, sz_pref: bool, rex_w: bool, r_opnd: X86Opnd, rm_
         X86Opnd::Mem(mem) => {
             let disp_size = rm_opnd.disp_size();
             if disp_size > 0 {
-                cb.write_int(mem.disp as u64, disp_size);
+                let disp = (mem.disp as u32).to_le_bytes();
+                buf[len..len + (disp_size / 8) as usize]
+                    .copy_from_slice(&disp[..(disp_size / 8) as usize]);
+                len += (disp_size / 8) as usize;
             }
         },
         X86Opnd::IPRel(rel) => {
-            cb.write_int(rel as u64, 32);
+            buf[len..len + 4].copy_from_slice(&(rel as u32).to_le_bytes());
+            len += 4;
         },
         _ => ()
     };
+
+    cb.write_bytes(&buf[..len]);
 }
 
 // Encode a mul-like single-operand RM instruction

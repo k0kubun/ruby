@@ -68,7 +68,14 @@ pub trait Allocator {
 pub struct CodePtr(u32);
 
 impl CodePtr {
+    /// A CodePtr for a byte offset from the start of the code region.
+    #[inline]
+    pub fn from_offset(offset: usize) -> Self {
+        CodePtr(offset.try_into().expect("code offset should fit in 32 bits"))
+    }
+
     /// Advance the CodePtr. Can return a dangling pointer.
+    #[inline]
     pub fn add_bytes(self, bytes: usize) -> Self {
         let CodePtr(raw) = self;
         let bytes: u32 = bytes.try_into().unwrap();
@@ -189,6 +196,7 @@ impl<A: Allocator> VirtualMemory<A> {
     }
 
     /// Write a single byte. The first write to a page makes it readable.
+    #[inline]
     pub fn write_byte(&mut self, write_ptr: CodePtr, byte: u8) -> Result<(), WriteError> {
         let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
         let page_addr = raw as usize & self.page_addr_mask;

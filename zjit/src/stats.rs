@@ -1137,10 +1137,15 @@ pub fn with_time_stat<F, R>(counter: Counter, func: F) -> R where F: FnOnce() ->
 /// name each phase twice at the call site.
 pub fn timed_compile_phase<F, R>(counter: Counter, name: &str, func: F) -> R where F: FnOnce() -> R {
     trace_compile_phase(name, || {
-        // The backend also runs while ZJITState::init() builds trampolines, before the
+        // These counters exist to be printed by --zjit-stats and nothing else reads them,
+        // so a run without it should not pay for two clock reads per phase. Some of the
+        // phases here are fine-grained enough (make_page_writable, for one) that the
+        // timing would cost more than the phase.
+        //
+        // ZJITState::init() also runs the backend to build trampolines, before the
         // counters exist. Those compilations are a fixed handful, so leaving them out of
         // the per-phase totals costs nothing and saves a panic.
-        if !crate::state::ZJITState::has_instance() {
+        if !get_option!(stats) || !crate::state::ZJITState::has_instance() {
             return func();
         }
         with_time_stat(counter, func)

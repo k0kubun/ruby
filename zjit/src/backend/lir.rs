@@ -173,6 +173,13 @@ impl BasicBlock {
         self.insn_ids.push(None);
     }
 
+    /// Reserve room for `additional` more instructions, so that a pass that knows how
+    /// much it is about to push does not grow the vectors a doubling at a time.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        self.insns.reserve(additional);
+        self.insn_ids.reserve(additional);
+    }
+
     pub fn edges(&self) -> EdgePair {
         // Stub blocks (from new_block_without_id) have no real CFG structure.
         if self.rpo_index == DUMMY_RPO_INDEX {
@@ -2037,6 +2044,13 @@ pub struct Assembler {
     /// option actually asked for a descriptive name.
     pub(super) label_names: Vec<Cow<'static, str>>,
 
+    /// Whether `push_insn` maintains `cfp_generation`/`sp_generation`. Only the
+    /// Assembler that HIR lowering pushes into is read for them (codegen keys its
+    /// caches on them); the Assemblers the backend passes build are never asked, and
+    /// working out which register an instruction writes is not free at the volume
+    /// push_insn runs at.
+    track_reg_generations: bool,
+
     /// If true, `push_insn` is allowed to use scratch registers.
     /// On `compile`, it also disables the backend's use of them.
     pub(super) accept_scratch_reg: bool,
@@ -2097,6 +2111,7 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
             stack_map: None,
+            track_reg_generations: true,
             cfp_generation: 0,
             sp_generation: 0,
             saved_sp: None,
@@ -2138,6 +2153,7 @@ impl Assembler
     pub(super) fn new_with_asm_without_blocks(old_asm: &Assembler) -> Self {
         let mut asm = Self {
             label_names: old_asm.label_names.clone(),
+            track_reg_generations: false,
             accept_scratch_reg: old_asm.accept_scratch_reg,
             stack_state: old_asm.stack_state.clone(),
             allow_callee_saved: old_asm.allow_callee_saved,
@@ -2169,6 +2185,11 @@ impl Assembler
     pub fn new_block_from_old_block(&mut self, old_block: &BasicBlock) -> BlockId {
         let bb_id = BlockId(self.basic_blocks.len());
         let mut lir_bb = BasicBlock::new(bb_id, old_block.hir_block_id, old_block.is_entry, old_block.rpo_index);
+        // A pass rewrites roughly one instruction per instruction, so the old block's
+        // length is a good size to start at. Growing from empty meant a realloc-and-copy
+        // every doubling, for every block of every pass.
+        lir_bb.insns.reserve(old_block.insns.len());
+        lir_bb.insn_ids.reserve(old_block.insns.len());
         lir_bb.parameters = old_block.parameters.clone();
         self.basic_blocks.push(lir_bb);
         bb_id
@@ -2325,9 +2346,13 @@ impl Assembler
             })));
         }
 
-        // Emit instructions with labels, expanding branch parameters
-        let mut insns = Vec::with_capacity(ASSEMBLER_INSNS_CAPACITY);
+        // Emit instructions with labels, expanding branch parameters. Size the buffer from
+        // what is actually there: a large function linearizes tens of thousands of
+        // instructions, and growing from a fixed 256 meant repeatedly reallocating and
+        // copying a multi-megabyte vector.
         let block_ids = self.block_order();
+        let num_insns: usize = block_ids.iter().map(|id| self.basic_blocks[id.0].insns.len()).sum();
+        let mut insns = Vec::with_capacity((num_insns + 2 * block_ids.len() + 2).max(ASSEMBLER_INSNS_CAPACITY));
 
         for (i, block_id) in block_ids.iter().enumerate() {
             let block = &self.basic_blocks[block_id.0];
@@ -2468,32 +2493,44 @@ impl Assembler
 
         self.idx += 1;
 
-        // Track writes to the CFP register so that codegen can cache values derived
-        // from it (see JITState::block_handler_specval).
-        if Self::writes_cfp_reg(&insn) {
-            self.cfp_generation += 1;
-        }
-        if Self::writes_reg(&insn, crate::backend::current::SP.unwrap_reg()) {
-            self.sp_generation += 1;
+        // Track writes to the CFP and SP registers so that codegen can cache values
+        // derived from them (see JITState::block_handler_specval). Asking one question
+        // ("which register does this write?") rather than one per register keeps this off
+        // the profile: push_insn runs for every instruction the compiler ever emits.
+        if self.track_reg_generations {
+            if let Some(reg_no) = Self::written_reg_no(&insn) {
+                if reg_no == crate::backend::current::CFP.unwrap_reg().reg_no {
+                    self.cfp_generation += 1;
+                }
+                if reg_no == crate::backend::current::SP.unwrap_reg().reg_no {
+                    self.sp_generation += 1;
+                }
+            }
         }
 
         self.current_block().push_insn(insn);
     }
 
-    /// True if `insn` writes the CFP register. `Insn::Mov` and `Insn::LoadInto` write
-    /// their destination without exposing it through `out_opnd()`, and moving CFP into
-    /// an inlined frame (gen_push_inline_frame) uses exactly that form, so they have to
-    /// be checked separately. `Opnd::Mem` destinations write memory, not the register.
-    fn writes_cfp_reg(insn: &Insn) -> bool {
-        Self::writes_reg(insn, crate::backend::current::CFP.unwrap_reg())
-    }
-
-    /// True if `insn` writes `reg`. See [`Assembler::writes_cfp_reg`].
-    fn writes_reg(insn: &Insn, reg: Reg) -> bool {
+    /// The register number `insn` writes, if it writes one. `Insn::Mov` and
+    /// `Insn::LoadInto` write their destination without exposing it through `out_opnd()`,
+    /// and moving CFP into an inlined frame (gen_push_inline_frame) uses exactly that
+    /// form, so they have to be checked separately. `Opnd::Mem` destinations write memory,
+    /// not the register, except that a register-based memory operand's base register is
+    /// what [`Assembler::has_reg`] has always reported, so keep reporting it.
+    fn written_reg_no(insn: &Insn) -> Option<u8> {
+        fn reg_no(opnd: &Opnd) -> Option<u8> {
+            match opnd {
+                Opnd::Reg(reg) => Some(reg.reg_no),
+                _ => None,
+            }
+        }
         match insn {
-            Insn::Mov { dest, .. } | Insn::LoadInto { dest, .. } =>
-                matches!(dest, Opnd::Reg(dest_reg) if *dest_reg == reg),
-            _ => insn.out_opnd().is_some_and(|&out| Self::has_reg(out, reg)),
+            Insn::Mov { dest, .. } | Insn::LoadInto { dest, .. } => reg_no(dest),
+            _ => match insn.out_opnd()? {
+                Opnd::Reg(reg) => Some(reg.reg_no),
+                Opnd::Mem(Mem { base: MemBase::Reg(base_reg_no), .. }) => Some(*base_reg_no),
+                _ => None,
+            },
         }
     }
 
@@ -2863,6 +2900,12 @@ impl Assembler
 
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
+            // Only the blocks that set up or tear down the frame get anything inserted,
+            // and that is a handful of blocks in a function. Checking first is much
+            // cheaper than rebuilding every block's instruction list to change nothing.
+            if !block.insns.iter().any(|insn| matches!(insn, Insn::FrameSetup { .. } | Insn::FrameTeardown { .. })) {
+                continue;
+            }
             let old_insns = take(&mut block.insns);
             let old_ids = take(&mut block.insn_ids);
 

@@ -159,14 +159,16 @@ impl CodeBlock {
     }
 
     /// Get a (possibly dangling) direct pointer to the current write position
+    #[inline]
     pub fn get_write_ptr(&self) -> CodePtr {
         self.get_ptr(self.write_pos)
     }
 
     /// Set the current write position from a pointer
     pub fn set_write_ptr(&mut self, code_ptr: CodePtr) {
-        let pos = code_ptr.as_offset() - self.mem_block.borrow().start_ptr().as_offset();
-        self.write_pos = pos.try_into().unwrap();
+        // A CodePtr is already an offset from the start of the region, and the region's
+        // start_ptr() is CodePtr(0) by definition, so there is nothing to subtract.
+        self.write_pos = code_ptr.as_offset().try_into().unwrap();
     }
 
     /// Invoke a callback with write_ptr temporarily adjusted to a given address
@@ -190,11 +192,17 @@ impl CodeBlock {
     }
 
     /// Get a (possibly dangling) direct pointer into the executable memory block
+    ///
+    /// A CodePtr is an offset from the start of the region, so this needs nothing from
+    /// the region itself. Taking the RefCell borrow to ask it for its (constant) start
+    /// pointer showed up on the profile: this runs on every emitted byte.
+    #[inline]
     pub fn get_ptr(&self, offset: usize) -> CodePtr {
-        self.mem_block.borrow().start_ptr().add_bytes(offset)
+        CodePtr::from_offset(offset)
     }
 
     /// Write a single byte at the current position.
+    #[inline]
     pub fn write_byte(&mut self, byte: u8) {
         let write_ptr = self.get_write_ptr();
         // TODO: check has_capacity()
