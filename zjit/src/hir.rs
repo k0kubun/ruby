@@ -9721,6 +9721,35 @@ pub struct FrameState {
     pub depth: InlineDepth,
 }
 
+/// Hand-written so that `clone_from` reuses the destination's `stack` and
+/// `locals` buffers. `#[derive(Clone)]` leaves `clone_from` at its default,
+/// which throws the destination away and allocates two fresh vectors; HIR
+/// construction snapshots the frame state once per YARV instruction, which made
+/// that the largest single source of allocator traffic in the compiler.
+impl Clone for FrameState {
+    fn clone(&self) -> Self {
+        Self {
+            iseq: self.iseq,
+            insn_idx: self.insn_idx,
+            pc: self.pc,
+            stack: self.stack.clone(),
+            locals: self.locals.clone(),
+            caller: self.caller,
+            depth: self.depth,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.iseq = source.iseq;
+        self.insn_idx = source.insn_idx;
+        self.pc = source.pc;
+        self.stack.clone_from(&source.stack);
+        self.locals.clone_from(&source.locals);
+        self.caller = source.caller;
+        self.depth = source.depth;
+    }
+}
+
 impl FrameState {
     /// Get the YARV instruction index for the current instruction
     pub fn insn_idx(&self) -> YarvInsnIdx {
@@ -10598,6 +10627,10 @@ fn add_iseq_to_hir(
     // Keep compiling blocks until the queue becomes empty
     let mut visited = HashSet::default();
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    // The pre-instruction frame state, hoisted out of both loops so that
+    // `clone_from` below refills its `stack` and `locals` buffers instead of
+    // allocating a fresh pair for every YARV instruction in the ISEQ.
+    let mut exit_state = new_frame_state(mode, iseq);
     while let Some((incoming_state, mut block, mut insn_idx, mut local_inval)) = queue.pop_front() {
         // Compile each block only once
         if visited.contains(&block) { continue; }
@@ -10626,7 +10659,7 @@ fn add_iseq_to_hir(
             // Get the current pc and opcode
             let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
             state.pc = pc;
-            let exit_state = state.clone();
+            exit_state.clone_from(&state);
 
             // Strip any ZJIT profiling instrumentation so we read the ISEQ's original opcodes,
             // leaving trace variants intact for the handling below.
