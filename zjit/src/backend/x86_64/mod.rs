@@ -3,7 +3,7 @@ use std::mem;
 use crate::asm::*;
 use crate::asm::x86_64::*;
 use crate::codegen::split_patch_point;
-use crate::stats::{CompileError, trace_compile_phase};
+use crate::stats::{CompileError, Counter, trace_compile_phase, timed_compile_phase};
 use crate::virtualmem::CodePtr;
 use crate::cruby::*;
 use crate::backend::lir::*;
@@ -1238,15 +1238,15 @@ impl Assembler {
         };
         asm_dump!(self, init);
 
-        let mut asm = trace_compile_phase("split", || self.x86_split());
+        let mut asm = timed_compile_phase(Counter::compile_lir_split_time_ns, "split", || self.x86_split());
 
         asm_dump!(asm, split);
 
         trace_compile_phase("regalloc", || {
-            trace_compile_phase("number_instructions", || asm.number_instructions(0));
+            timed_compile_phase(Counter::compile_lir_number_instructions_time_ns, "number_instructions", || asm.number_instructions(0));
 
-            let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());
-            let mut intervals = trace_compile_phase("build_intervals", || asm.build_intervals(live_in.clone()));
+            let live_in = timed_compile_phase(Counter::compile_lir_analyze_liveness_time_ns, "analyze_liveness", || asm.analyze_liveness());
+            let mut intervals = timed_compile_phase(Counter::compile_lir_build_intervals_time_ns, "build_intervals", || asm.build_intervals(live_in.clone()));
 
             // Dump live intervals if requested
             if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
@@ -1255,10 +1255,10 @@ impl Assembler {
                 }
             }
 
-            trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
-            let vreg_roots = trace_compile_phase("coalesce_block_params", || asm.coalesce_block_params(&mut intervals, &live_in));
-            let call_positions = asm.ccall_positions();
-            let mut num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs, &call_positions));
+            timed_compile_phase(Counter::compile_lir_preferred_registers_time_ns, "preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
+            let vreg_roots = timed_compile_phase(Counter::compile_lir_coalesce_block_params_time_ns, "coalesce_block_params", || asm.coalesce_block_params(&mut intervals, &live_in));
+            let call_positions = timed_compile_phase(Counter::compile_lir_ccall_positions_time_ns, "ccall_positions", || asm.ccall_positions());
+            let mut num_stack_slots = timed_compile_phase(Counter::compile_lir_linear_scan_time_ns, "linear_scan", || asm.linear_scan(&intervals, &regs, &call_positions));
             // Give every coalesced VReg its web root's allocation, before
             // plan_callee_saved_saves() goes looking for callee-saved assignments.
             for (vreg, &root) in vreg_roots.iter().enumerate() {
@@ -1266,10 +1266,10 @@ impl Assembler {
                     intervals[vreg].assigned.set(intervals[root].assigned.get());
                 }
             }
-            asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots);
+            timed_compile_phase(Counter::compile_lir_plan_callee_saved_time_ns, "plan_callee_saved_saves", || asm.plan_callee_saved_saves(&intervals, &regs, &mut num_stack_slots));
 
             asm.stack_state.set_spill_slots(num_stack_slots);
-            asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&intervals);
+            asm.stack_state.num_side_exit_stack_map_slots = timed_compile_phase(Counter::compile_lir_side_exit_slots_time_ns, "side_exit_stack_map_slots", || asm.side_exit_stack_map_slots(&intervals));
             let stack_slot_count = asm.stack_state.stack_slot_count();
             if stack_slot_count > Self::MAX_FRAME_STACK_SLOTS {
                 return Err(CompileError::NativeStackTooLarge);
@@ -1295,7 +1295,7 @@ impl Assembler {
 
             // Update FrameSetup slot_count now that StackState knows the
             // register allocator spill and side-exit capture counts.
-            trace_compile_phase("count_stack_slots", || {
+            timed_compile_phase(Counter::compile_lir_count_stack_slots_time_ns, "count_stack_slots", || {
                 for block in asm.basic_blocks.iter_mut() {
                     for insn in block.insns.iter_mut() {
                         if let Insn::FrameSetup { slot_count, .. } = insn {
@@ -1306,12 +1306,15 @@ impl Assembler {
             });
 
             trace_compile_phase("resolve_ssa", || {
-                asm.handle_caller_saved_regs(&intervals, &regs, &C_ARG_REGREGS);
-                asm.resolve_ssa(&intervals, &regs);
+                timed_compile_phase(Counter::compile_lir_caller_saved_time_ns, "handle_caller_saved_regs",
+                    || asm.handle_caller_saved_regs(&intervals, &regs, &C_ARG_REGREGS));
+                timed_compile_phase(Counter::compile_lir_resolve_ssa_time_ns, "resolve_ssa",
+                    || asm.resolve_ssa(&intervals, &regs));
                 // After resolve_ssa: the entry block's parameter moves land right after
                 // FrameSetup and can write a callee-saved register, so the store that
                 // preserves the caller's value has to be inserted ahead of them.
-                asm.insert_callee_saved_saves();
+                timed_compile_phase(Counter::compile_lir_insert_callee_saved_time_ns, "insert_callee_saved_saves",
+                    || asm.insert_callee_saved_saves());
             });
 
             Ok(())
@@ -1323,7 +1326,7 @@ impl Assembler {
         // We put compile_exits after alloc_regs to avoid extending live ranges for VRegs spilled on side exits.
         // Exit code is compiled into a separate list of instructions that we append
         // to the last reachable block before scratch_split, so it gets linearized and split.
-        trace_compile_phase("compile_exits", || {
+        timed_compile_phase(Counter::compile_lir_compile_exits_time_ns, "compile_exits", || {
             let exit_insns = asm.compile_exits();
 
             // Append exit instructions to the last reachable block so they are
@@ -1338,7 +1341,7 @@ impl Assembler {
         asm_dump!(asm, compile_exits);
 
         if use_scratch_regs {
-            asm = trace_compile_phase("scratch_split", || asm.x86_scratch_split());
+            asm = timed_compile_phase(Counter::compile_lir_scratch_split_time_ns, "scratch_split", || asm.x86_scratch_split());
             asm_dump!(asm, scratch_split);
         } else {
             // For trampolines that use scratch registers, resolve ParallelMov without scratch_reg.
@@ -1346,7 +1349,7 @@ impl Assembler {
             asm_dump!(asm, resolve_parallel_mov);
         }
 
-        trace_compile_phase("emit", || {
+        timed_compile_phase(Counter::compile_lir_emit_time_ns, "emit", || {
             // Create label instances in the code block
             for (idx, name) in asm.label_names.iter().enumerate() {
                 let label = cb.new_label(name.to_string());

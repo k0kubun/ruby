@@ -198,6 +198,24 @@ make_counters! {
         compile_hir_eliminate_empty_inline_frames_time_ns,
         compile_hir_eliminate_dead_code_time_ns,
         compile_lir_time_ns,
+        compile_lir_lower_time_ns,
+        compile_lir_split_time_ns,
+        compile_lir_number_instructions_time_ns,
+        compile_lir_analyze_liveness_time_ns,
+        compile_lir_build_intervals_time_ns,
+        compile_lir_preferred_registers_time_ns,
+        compile_lir_coalesce_block_params_time_ns,
+        compile_lir_ccall_positions_time_ns,
+        compile_lir_linear_scan_time_ns,
+        compile_lir_plan_callee_saved_time_ns,
+        compile_lir_side_exit_slots_time_ns,
+        compile_lir_count_stack_slots_time_ns,
+        compile_lir_caller_saved_time_ns,
+        compile_lir_resolve_ssa_time_ns,
+        compile_lir_insert_callee_saved_time_ns,
+        compile_lir_compile_exits_time_ns,
+        compile_lir_scratch_split_time_ns,
+        compile_lir_emit_time_ns,
     }
 
     // Exit counters that are summed as side_exit_count
@@ -1110,6 +1128,21 @@ pub fn with_time_stat<F, R>(counter: Counter, func: F) -> R where F: FnOnce() ->
     let nanos = Instant::now().duration_since(start).as_nanos();
     incr_counter_by(counter, nanos as u64);
     ret
+}
+
+/// Record a Perfetto duration event *and* accumulate the elapsed time into `counter`.
+/// Used to give every backend pass its own line in --zjit-stats without having to
+/// name each phase twice at the call site.
+pub fn timed_compile_phase<F, R>(counter: Counter, name: &str, func: F) -> R where F: FnOnce() -> R {
+    trace_compile_phase(name, || {
+        // The backend also runs while ZJITState::init() builds trampolines, before the
+        // counters exist. Those compilations are a fixed handful, so leaving them out of
+        // the per-phase totals costs nothing and saves a panic.
+        if !crate::state::ZJITState::has_instance() {
+            return func();
+        }
+        with_time_stat(counter, func)
+    })
 }
 
 /// The number of bytes ZJIT has allocated on the Rust heap.

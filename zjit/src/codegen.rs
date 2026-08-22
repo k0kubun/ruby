@@ -777,7 +777,7 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
 
 /// Compile a function
 fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
-    let (mut jit, asm) = trace_compile_phase("codegen", || {
+    let (mut jit, asm) = crate::stats::timed_compile_phase(Counter::compile_lir_lower_time_ns, "codegen", || {
         // Reserve one JITFrame slot per simultaneously live frame. The top-level
         // frame is depth 0, and each level of inlining adds another frame that
         // can be on the CFP chain at the same time, so we need
