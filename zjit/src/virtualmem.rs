@@ -18,6 +18,34 @@ pub type VirtualMem = VirtualMemory<sys::SystemAllocator>;
 /// This handles ["W^X"](https://en.wikipedia.org/wiki/W%5EX) semi-automatically. Writes
 /// are always accepted and once writes are done a call to [Self::mark_all_executable] makes
 /// the code in the region executable.
+/// Copy `len` bytes, dispatching on the length so that short runs get a
+/// compile-time size.
+///
+/// Machine-code writes are almost all one to nine bytes -- an opcode with a
+/// ModRM byte and a displacement -- and `copy_nonoverlapping` of a *runtime*
+/// length compiles to a `memcpy` call whose dispatch costs far more than the
+/// copy at that size. A byte-at-a-time loop is no better; the constant size is
+/// what matters.
+#[inline(always)]
+fn copy_short(src: *const u8, dst: *mut u8, len: usize) {
+    macro_rules! copy_n { ($n:expr) => {
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, $n) }
+    }; }
+    match len {
+        1 => unsafe { dst.write(src.read()) },
+        2 => copy_n!(2),
+        3 => copy_n!(3),
+        4 => copy_n!(4),
+        5 => copy_n!(5),
+        6 => copy_n!(6),
+        7 => copy_n!(7),
+        8 => copy_n!(8),
+        9 => copy_n!(9),
+        10 => copy_n!(10),
+        _ => unsafe { std::ptr::copy_nonoverlapping(src, dst, len) },
+    }
+}
+
 pub struct VirtualMemory<A: Allocator> {
     /// Location of the virtual memory region.
     region_start: NonNull<u8>,
@@ -219,6 +247,21 @@ impl<A: Allocator> VirtualMemory<A> {
     /// a time from a lot of places, and the per-byte bookkeeping was several percent of
     /// the whole compiler on a compile-heavy workload.
     pub fn write_bytes(&mut self, write_ptr: CodePtr, bytes: &[u8]) -> (usize, Result<(), WriteError>) {
+        // Fast path: the run lands entirely inside the page that is already
+        // writable, which is what happens for all but one write in a few
+        // thousand. Emitting one machine instruction makes several of these
+        // calls, so the loop's per-iteration pointer arithmetic and
+        // page-boundary math is worth skipping.
+        {
+            let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
+            let page_addr = raw as usize & self.page_addr_mask;
+            if self.current_write_page == Some(page_addr)
+                && bytes.len() <= page_addr + self.page_size_bytes - raw as usize
+            {
+                copy_short(bytes.as_ptr(), raw, bytes.len());
+                return (bytes.len(), Ok(()));
+            }
+        }
         let mut written = 0;
         while written < bytes.len() {
             let raw: *mut u8 = write_ptr.add_bytes(written).raw_ptr(self) as *mut u8;
@@ -231,30 +274,7 @@ impl<A: Allocator> VirtualMemory<A> {
             // Stop at the end of this page; the next iteration maps the following one.
             let to_page_end = page_addr + self.page_size_bytes - raw as usize;
             let run = to_page_end.min(bytes.len() - written);
-            let src = unsafe { bytes.as_ptr().add(written) };
-            // Machine-code writes are almost all one to nine bytes -- an opcode
-            // with a ModRM byte and a displacement -- and `copy_nonoverlapping`
-            // of a runtime length compiles to a `memcpy` call, whose fixed
-            // overhead dwarfs the copy at that size. It measured as 3.6% of all
-            // compile instructions. Copy short runs inline instead.
-            // Dispatching on the length gives each arm a compile-time size, which
-            // becomes one or two loads and stores instead of a call.
-            macro_rules! copy_n { ($n:expr) => {
-                unsafe { std::ptr::copy_nonoverlapping(src, raw, $n) }
-            }; }
-            match run {
-                1 => unsafe { raw.write(src.read()) },
-                2 => copy_n!(2),
-                3 => copy_n!(3),
-                4 => copy_n!(4),
-                5 => copy_n!(5),
-                6 => copy_n!(6),
-                7 => copy_n!(7),
-                8 => copy_n!(8),
-                9 => copy_n!(9),
-                10 => copy_n!(10),
-                _ => unsafe { std::ptr::copy_nonoverlapping(src, raw, run) },
-            }
+            copy_short(unsafe { bytes.as_ptr().add(written) }, raw, run);
             written += run;
         }
         (written, Ok(()))
