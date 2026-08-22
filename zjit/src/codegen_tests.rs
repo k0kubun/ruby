@@ -8144,6 +8144,397 @@ fn test_send_no_profiles_with_disabled_specialized_instruction() {
     "#), @":ok");
 }
 
+/// Thirty unrelated classes, each defining its own `value`, called from one site: the site is
+/// megamorphic in the receiver class *and* in the method it resolves to, so neither a class
+/// guard chain nor an ancestor guard can cover it and every call takes the dynamic fallthrough
+/// that the send class table sits in front of. See [`crate::send_cache`].
+const SEND_CACHE_SETUP: &str = r#"
+    KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+    OBJS = KLASSES.map(&:new)
+    def test(o) = o.value
+    3.times { OBJS.each { |o| test o } }
+"#;
+
+/// Run `program` and assert the send class table served at least one call while it ran.
+#[track_caller]
+fn assert_send_cache_hits(program: &str) -> String {
+    let before = crate::state::ZJITState::get_counters().send_cache_hit;
+    let result = inspect(program);
+    let after = crate::state::ZJITState::get_counters().send_cache_hit;
+    assert!(after > before, "expected the send class table to serve a call, but the counter did not move");
+    result
+}
+
+#[test]
+fn test_send_cache_dispatches_every_class_at_a_megamorphic_site() {
+    // The baseline: each receiver must reach its own class's method, both for the classes the
+    // table has warmed and for one it has never seen.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(assert_send_cache_hits(r#"
+        k = Class.new; k.class_eval("def value; 99; end")
+        [OBJS.map { |o| test o }.sum, test(k.new)]
+    "#), @"[435, 99]");
+}
+
+#[test]
+fn test_send_cache_dispatches_a_method_redefined_after_it_was_cached() {
+    // The invalidation path. Redefining `value` runs rb_clear_method_cache, which sets
+    // METHOD_ENTRY_INVALIDATED on the method entry the table cached, and the probe tests
+    // exactly that flag -- so the next call re-resolves instead of calling the old body.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each_with_index { |k, i| k.class_eval("def value; #{i * 100}; end") }
+        after = OBJS.map { |o| test o }.sum
+        again = OBJS.map { |o| test o }.sum
+        [before, after, again]
+    "#), @"[435, 43500, 43500]");
+}
+
+#[test]
+fn test_send_cache_dispatches_a_method_prepended_after_it_was_cached() {
+    // prepend inserts an origin iclass above the class, which invalidates the cached method
+    // entry the same way a redefinition does.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        pre = Module.new { def value = super + 1000 }
+        KLASSES.each { |k| k.prepend(pre) }
+        [before, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 30435]");
+}
+
+#[test]
+fn test_send_cache_dispatches_a_method_included_after_it_was_cached() {
+    // Including a second module ahead of the one a class already got the method from changes
+    // which method the *same* receiver class resolves the name to, with no change to the class
+    // itself. The cached entry has to notice.
+    set_call_threshold(61);
+    eval(r#"
+        INNER = Module.new { def value = 1 }
+        BASES = 30.times.map { Class.new { include INNER } }
+        OBJS = BASES.map(&:new)
+        def test(o) = o.value
+        3.times { OBJS.each { |o| test o } }
+    "#);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        outer = Module.new { def value = 7 }
+        BASES.each { |k| k.include(outer) }
+        [before, OBJS.map { |o| test o }.sum, OBJS.map { |o| test o }.sum]
+    "#), @"[30, 210, 210]");
+}
+
+#[test]
+fn test_send_cache_dispatches_through_a_refinement_activated_after_warmup() {
+    // Activating a refinement goes through rb_clear_all_refinement_method_cache, and a
+    // refinement call site resolves to a refinement callcache, which the table declines to
+    // store at all (it would pin the method entry).
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        refined = Module.new do
+          KLASSES.each { |k| refine(k) { def value = 5 } }
+        end
+        after = OBJS.map { |o| test o }.sum
+        using refined
+        [before, after, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 435, 435]");
+}
+
+#[test]
+fn test_send_cache_raises_after_the_cached_method_is_undefined() {
+    // undef_method invalidates the entry, and the fresh lookup produces the empty callcache,
+    // which the table refuses to store -- so every later call re-resolves and still raises.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each { |k| k.send(:undef_method, :value) }
+        errors = OBJS.map { |o| begin; test o; rescue NoMethodError; :raised; end }
+        [before, errors.uniq, OBJS.map { |o| begin; test o; rescue NoMethodError; :raised; end }.uniq]
+    "#), @"[435, [:raised], [:raised]]");
+}
+
+#[test]
+fn test_send_cache_respects_a_visibility_change_after_warmup() {
+    // A visibility change is a method table mutation like any other, so the cached entry is
+    // invalidated and the re-resolved call has to fail the permission check.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each { |k| k.send(:private, :value) }
+        [before, OBJS.map { |o| begin; test o; rescue NoMethodError; :private; end }.uniq]
+    "#), @"[435, [:private]]");
+}
+
+#[test]
+fn test_send_cache_sees_a_singleton_method_defined_after_warmup() {
+    // Defining a singleton method changes the receiver's class to its singleton class, which
+    // is a key the table has never seen rather than a stale hit on the original class.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        obj = OBJS.first
+        before = test(obj)
+        obj.define_singleton_method(:value) { 555 }
+        [before, test(obj), test(OBJS[1])]
+    "#), @"[0, 555, 1]");
+}
+
+#[test]
+fn test_send_cache_dispatches_method_missing() {
+    // A name no receiver defines resolves to the empty callcache every time. The table stores
+    // nothing, so this exercises the uncacheable path on every call.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        MM_KLASSES = 30.times.map { |i| Class.new { define_method(:method_missing) { |name, *| name } } }
+        MM_OBJS = MM_KLASSES.map(&:new)
+        def test_mm(o) = o.nope
+        3.times { MM_OBJS.each { |o| test_mm o } }
+    "#);
+    let before = crate::state::ZJITState::get_counters().send_cache_uncacheable;
+    assert_snapshot!(inspect("MM_OBJS.map { |o| test_mm o }.uniq"), @"[:nope]");
+    let after = crate::state::ZJITState::get_counters().send_cache_uncacheable;
+    assert!(after > before, "expected the empty callcache to be reported uncacheable");
+}
+
+#[test]
+fn test_send_cache_passes_arguments_and_blocks() {
+    // Two more call shapes: one with positional arguments, and one with a literal block, which
+    // goes through rb_zjit_send_cached rather than its without-block sibling.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        ARG_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval(<<~RUBY); k }
+            def add(a, b) = a + b + #{i}
+            def each_twice = (yield #{i}; yield #{i})
+        RUBY
+        ARG_OBJS = ARG_KLASSES.map(&:new)
+        def test_add(o) = o.add(1, 2)
+        def test_block(o) = (n = 0; o.each_twice { |x| n += x }; n)
+        3.times { ARG_OBJS.each { |o| test_add o; test_block o } }
+    "#);
+    assert_snapshot!(assert_send_cache_hits(r#"
+        [ARG_OBJS.map { |o| test_add o }.sum, ARG_OBJS.map { |o| test_block o }.sum]
+    "#), @"[525, 870]");
+}
+
+#[test]
+fn test_send_cache_is_shared_by_two_sites_with_the_same_call_shape() {
+    // The table is keyed on (name, argc, flags), not on the site, so a second site calling
+    // `value` with no arguments reuses the first one's table and starts warm.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    eval("OBJS.map { |o| test o }");
+    let tables_before = crate::state::ZJITState::get_send_caches().len();
+    eval(r#"
+        def test_other(o) = o.value
+        3.times { OBJS.each { |o| test_other o } }
+    "#);
+    assert_snapshot!(inspect("OBJS.map { |o| test_other o }.sum"), @"435");
+    assert_eq!(
+        tables_before,
+        crate::state::ZJITState::get_send_caches().len(),
+        "a second site with the same call shape should reuse the first site's table",
+    );
+}
+
+#[test]
+fn test_send_cache_dispatches_correctly_under_gc_stress() {
+    // The table holds callcache pointers, so it has to be marked as a GC root; without that
+    // this collects them out from under the probe.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        GC.stress = true
+        sums = 2.times.map { OBJS.map { |o| test o }.sum }
+        GC.stress = false
+        sums
+    "#), @"[435, 435]");
+}
+
+#[test]
+fn test_send_cache_dispatches_correctly_across_compaction() {
+    // Compaction moves the classes the slots are hashed from, so the table drops its entries
+    // and refills; the answers must not change either way.
+    set_call_threshold(61);
+    eval(SEND_CACHE_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        GC.compact
+        middle = OBJS.map { |o| test o }.sum
+        GC.compact
+        [before, middle, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 435, 435]");
+}
+
+#[test]
+fn test_send_cache_survives_class_churn_and_redefinition() {
+    // The combination the individual tests cover one at a time: an undersized table so
+    // essentially every call evicts, classes dying under it (so the GC has to invalidate their
+    // callcaches rather than leave the table pointing at freed memory), methods redefined and
+    // prepended while the site is hot, and a compaction in the middle.
+    set_call_threshold(2);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().send_cache_entries = 8;
+    let result = inspect(r#"
+        def test(o) = o.value
+        errors = 0
+        12.times do |round|
+          ks = 20.times.map { |i| k = Class.new; k.class_eval("def value; #{i + round * 1000}; end"); k }
+          objs = ks.map(&:new)
+          objs.each_with_index { |o, i| errors += 1 unless test(o) == i + round * 1000 }
+          ks.each_with_index { |k, i| k.class_eval("def value; #{-(i + 1)}; end") }
+          objs.each_with_index { |o, i| errors += 1 unless test(o) == -(i + 1) }
+          ks.each { |k| k.prepend(Module.new { def value = super * 2 }) }
+          objs.each_with_index { |o, i| errors += 1 unless test(o) == -2 * (i + 1) }
+          GC.compact if round == 6
+          GC.start
+        end
+        errors
+    "#);
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().send_cache_entries =
+        crate::send_cache::DEFAULT_CACHE_ENTRIES;
+    assert_snapshot!(result, @"0");
+}
+
+#[test]
+fn test_send_cache_disabled_still_dispatches_correctly() {
+    // --zjit-disable-send-cache has to leave the old path intact, since that is what an A/B
+    // measurement compares against.
+    set_call_threshold(61);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_send_cache = true;
+    eval(SEND_CACHE_SETUP);
+    let result = inspect("OBJS.map { |o| test o }.sum");
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_send_cache = false;
+    assert_snapshot!(result, @"435");
+}
+
+#[test]
+fn test_send_cache_skips_keyword_argument_sites() {
+    // Sites with an explicit keyword list are deliberately excluded from the table, so this
+    // exercises the plain interpreter entry point at a megamorphic site.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        KW_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def kw(a:) = a + #{i}"); k }
+        KW_OBJS = KW_KLASSES.map(&:new)
+        def test_kw(o) = o.kw(a: 1)
+        3.times { KW_OBJS.each { |o| test_kw o } }
+    "#);
+    let before = crate::state::ZJITState::get_counters().send_cache_hit;
+    assert_snapshot!(inspect("KW_OBJS.map { |o| test_kw o }.sum"), @"465");
+    assert_eq!(
+        before,
+        crate::state::ZJITState::get_counters().send_cache_hit,
+        "a keyword-argument site should not be routed through the table",
+    );
+}
+
+#[test]
+fn test_array_aref_out_of_bounds_reads_nil() {
+    assert_snapshot!(inspect(r#"
+      def test(ary, idx) = ary[idx]
+      ary = [1, 2, 3]
+      test(ary, 0)
+      test(ary, 0)
+      [test(ary, 0), test(ary, 2), test(ary, 3), test(ary, 100),
+       test(ary, -1), test(ary, -3), test(ary, -4), test(ary, -100),
+       test([], 0), test([], -1)]
+    "#), @"[1, 3, nil, nil, 3, 1, nil, nil, nil, nil]");
+}
+
+#[test]
+fn test_array_aref_walks_off_the_end_without_exiting() {
+    assert_snapshot!(inspect(r#"
+      def test(ary)
+        out = []
+        idx = 0
+        while (elem = ary[idx])
+          out << elem
+          idx += 1
+        end
+        out
+      end
+      test([1, 2, 3])
+      test([1, 2, 3])
+      test([4, 5])
+    "#), @"[4, 5]");
+}
+
+#[test]
+fn test_splat_forwarded_to_rest_parameter() {
+    assert_snapshot!(inspect(r#"
+      def callee(name, *args) = [name, args]
+      def test(name, args) = callee(name, *args)
+      test(:a, [1])
+      test(:a, [1])
+      [test(:a, []), test(:b, [1]), test(:c, [1, 2, 3]),
+       test(:d, [{x: 1}]), test(:e, [nil])]
+    "#), @"[[:a, []], [:b, [1]], [:c, [1, 2, 3]], [:d, [{x: 1}]], [:e, [nil]]]");
+}
+
+#[test]
+fn test_splat_forwarded_to_rest_parameter_after_extra_positionals() {
+    assert_snapshot!(inspect(r#"
+      def callee(name, *args) = [name, args]
+      def test(name, obj, args) = callee(name, obj, *args)
+      test(:a, :o, [1])
+      test(:a, :o, [1])
+      [test(:a, :o, []), test(:b, :o, [1]), test(:c, :o, [1, 2])]
+    "#), @"[[:a, [:o]], [:b, [:o, 1]], [:c, [:o, 1, 2]]]");
+}
+
+#[test]
+fn test_splat_forwarded_to_rest_parameter_is_a_copy() {
+    assert_snapshot!(inspect(r#"
+      def callee(*args)
+        args << :added
+        args
+      end
+      def test(args) = callee(*args)
+      ary = [1, 2]
+      test(ary)
+      test(ary)
+      [test(ary), ary]
+    "#), @"[[1, 2, :added], [1, 2]]");
+}
+
+#[test]
+fn test_splat_forwarded_through_two_frames_with_varying_length() {
+    assert_snapshot!(inspect(r#"
+      def inner(name, *args) = [name, args]
+      def middle(name, *args) = inner(name, *args)
+      def test(name, args) = middle(name, *args)
+      3.times { test(:warm, [1]) }
+      3.times { test(:warm, [1, 2]) }
+      [test(:a, []), test(:b, [1]), test(:c, [1, 2, 3])]
+    "#), @"[[:a, []], [:b, [1]], [:c, [1, 2, 3]]]");
+}
+
+#[test]
+fn test_splat_with_ruby2_keywords_hash_is_not_forwarded() {
+    assert_snapshot!(inspect(r#"
+      def target(*args, **kw) = [args, kw]
+      def callee(name, *args) = [name, args]
+      ruby2_keywords def fwd(*args) = callee(:n, *args)
+      def test(*args) = fwd(*args)
+      test(1, k: 2)
+      test(1, k: 2)
+      test(1, k: 2)
+    "#), @"[:n, [1, {k: 2}]]");
+}
+
 #[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);

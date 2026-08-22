@@ -99,6 +99,18 @@ pub struct Options {
     /// Turn off the HIR optimizer
     pub disable_hir_opt: bool,
 
+    /// Turn off the send class table, so megamorphic send sites go straight to
+    /// `rb_vm_opt_send_without_block` and its one-entry `cd->cc` inline cache.
+    /// Only useful for A/B measurement; see [`crate::send_cache`].
+    pub disable_send_cache: bool,
+
+    /// Slots in each send class table. Must be a power of two and at least 8;
+    /// one table is allocated per `(method name, argc, call flags)` triple that a
+    /// compiled megamorphic site dispatches on, so this times 8 bytes times the
+    /// number of such triples bounds the memory. Undersizing it is not a graceful
+    /// degradation -- see [`crate::send_cache::DEFAULT_CACHE_ENTRIES`].
+    pub send_cache_entries: usize,
+
     /// Dump initial High-level IR before optimization
     pub dump_hir_init: Option<DumpHIR>,
 
@@ -201,6 +213,8 @@ impl Default for Options {
             debug: false,
             disable: false,
             disable_hir_opt: false,
+            disable_send_cache: false,
+            send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
             dump_hir_opt: None,
             dump_hir_graphviz: None,
@@ -531,6 +545,13 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable", "") => options.disable = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
+
+        ("disable-send-cache", "") => options.disable_send_cache = true,
+
+        ("send-cache-entries", _) => match opt_val.parse::<usize>() {
+            Ok(n) if n.is_power_of_two() && n >= 8 => options.send_cache_entries = n,
+            _ => return None,
+        },
 
         // --zjit-dump-hir dumps the actual input to the codegen, which is currently the same as --zjit-dump-hir-opt.
         ("dump-hir" | "dump-hir-opt", "") => options.dump_hir_opt = Some(DumpHIR::WithoutSnapshot),

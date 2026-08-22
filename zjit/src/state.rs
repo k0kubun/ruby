@@ -77,6 +77,11 @@ pub struct ZJITState {
 
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
+
+    /// Class tables for send sites that dispatch over more classes than an
+    /// inline guard chain can cover, one per call shape. Owned here because JIT
+    /// code bakes in the addresses, so the `Box`es must never move.
+    send_caches: crate::send_cache::SendCaches,
 }
 
 /// Tracks the initialization progress
@@ -157,6 +162,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            send_caches: crate::send_cache::SendCaches::new(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -198,6 +204,11 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Owner of every per-call-shape class table. See [`crate::send_cache`].
+    pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
+        &mut ZJITState::get_instance().send_caches
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
