@@ -9,7 +9,7 @@ use crate::{
     backend::lir::C_ARG_OPNDS, cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
-    cell::RefCell, collections::VecDeque, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
+    cell::{Cell, RefCell}, collections::VecDeque, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
     sync::atomic::Ordering,
 };
 use crate::hir_type::{Type, types};
@@ -2757,9 +2757,14 @@ impl<'a> FunctionPrinter<'a> {
 /// This does mean that pattern matching and analysis of the instruction graph must be careful to
 /// call `find` whenever it is inspecting an instruction (or its operands). If not, this may result
 /// in missing optimizations.
+/// The forwarding pointers live in `Cell`s so that `find` can compress paths
+/// through a shared reference. Wrapping the whole table in a `RefCell` instead
+/// meant every one of the compiler's millions of `type_of`/`resolve` lookups
+/// paid a borrow-flag round trip, and `type_of` had to take the *mutable*
+/// borrow even though all it wanted was a lookup.
 #[derive(Debug)]
 struct UnionFind<T: Copy + Into<usize>> {
-    forwarded: Vec<T>,
+    forwarded: Vec<Cell<T>>,
 }
 
 impl<T: Copy + Into<usize> + PartialEq + std::convert::From<usize>> UnionFind<T> {
@@ -2769,7 +2774,7 @@ impl<T: Copy + Into<usize> + PartialEq + std::convert::From<usize>> UnionFind<T>
 
     /// Private. Return the internal representation of the forwarding pointer for a given element.
     fn at(&self, idx: T) -> T {
-        self.forwarded.get(idx.into()).unwrap_or(&idx).to_owned()
+        self.forwarded.get(idx.into()).map_or(idx, Cell::get)
     }
 
     /// Private. Set the internal representation of the forwarding pointer for the given element
@@ -2777,10 +2782,10 @@ impl<T: Copy + Into<usize> + PartialEq + std::convert::From<usize>> UnionFind<T>
     fn set(&mut self, idx: T, value: T) {
         if idx.into() >= self.forwarded.len() {
             for i in self.forwarded.len()..=idx.into() {
-                self.forwarded.push(i.into());
+                self.forwarded.push(Cell::new(i.into()));
             }
         }
-        self.forwarded[idx.into()] = value;
+        self.forwarded[idx.into()].set(value);
     }
 
     /// Find the set representative for `insn`. Perform path compression at the same time to speed
@@ -2794,11 +2799,12 @@ impl<T: Copy + Into<usize> + PartialEq + std::convert::From<usize>> UnionFind<T>
     /// A -> C
     /// B ---^
     /// ```
-    pub fn find(&mut self, insn: T) -> T {
+    pub fn find(&self, insn: T) -> T {
         let result = self.find_const(insn);
         if result != insn {
-            // Path compression
-            self.set(insn, result);
+            // Path compression. `result != insn` means `at(insn)` found a
+            // forwarding entry, so `insn` is in range and no growth is needed.
+            self.forwarded[insn.into()].set(result);
         }
         result
     }
@@ -3075,7 +3081,7 @@ pub struct Function {
     param_types: Vec<Type>,
 
     insns: Vec<Insn>,
-    union_find: std::cell::RefCell<UnionFind<InsnId>>,
+    union_find: UnionFind<InsnId>,
     insn_types: Vec<Type>,
     blocks: Vec<Block>,
     /// Superblock that targets all entry blocks. The sole root for RPO/dominator computation.
@@ -3704,7 +3710,7 @@ impl Function {
             policy: CompilePolicy::new(iseq),
             insns: vec![],
             insn_types: vec![],
-            union_find: UnionFind::new().into(),
+            union_find: UnionFind::<InsnId>::new(),
             blocks: vec![Block::default(), Block::default()],
             entries_block: BlockId(0),
             entry_block: BlockId(1),
@@ -4009,7 +4015,7 @@ impl Function {
     /// need the depth avoid cloning the whole `FrameState`, including its stack
     /// and locals, the way [`Function::frame_state`] does.
     fn frame_depth(&self, insn_id: InsnId) -> InlineDepth {
-        let insn_id = self.union_find.borrow().find_const(insn_id);
+        let insn_id = self.union_find.find_const(insn_id);
         match &self.insns[insn_id.to_usize()] {
             Insn::Snapshot { state } => state.depth,
             insn => panic!("Unexpected non-Snapshot {insn} when looking up frame depth"),
@@ -4200,7 +4206,7 @@ impl Function {
     /// Do a shallow look up of the instruction ID in the union-find. Does inspect or rewrite any
     /// operands.
     pub fn find_id(&self, insn_id: InsnId) -> InsnId {
-        self.union_find.borrow().find_const(insn_id)
+        self.union_find.find_const(insn_id)
     }
 
     /// Return a copy of the instruction where the instruction and its operands have been read from
@@ -4227,7 +4233,7 @@ impl Function {
                 {
                     // TODO(max): Figure out why borrow_mut().find() causes `already borrowed:
                     // BorrowMutError`
-                    self.union_find.borrow().find_const($x)
+                    self.union_find.find_const($x)
                 }
             };
         }
@@ -4258,9 +4264,9 @@ impl Function {
     /// }
     /// ```
     pub fn resolve(&mut self, insn_id: InsnId) -> ResolvedInsnId {
-        let union_find = self.union_find.borrow();
+        let Self { insns, union_find, .. } = self;
         let insn_id = union_find.find_const(insn_id);
-        self.insns[insn_id.to_usize()].for_each_operand_mut(&mut |operand: &mut InsnId| {
+        insns[insn_id.to_usize()].for_each_operand_mut(&mut |operand: &mut InsnId| {
             *operand = union_find.find_const(*operand);
         });
         ResolvedInsnId(insn_id)
@@ -4280,7 +4286,7 @@ impl Function {
     /// lists any more can still be reachable as another instruction's `state` operand.
     pub fn canonicalize_operands(&mut self) {
         let Self { insns, union_find, .. } = self;
-        let union_find = union_find.borrow();
+        let union_find = union_find;
         for insn in insns.iter_mut() {
             insn.for_each_operand_mut(&mut |operand: &mut InsnId| {
                 *operand = union_find.find_const(*operand);
@@ -4293,7 +4299,7 @@ impl Function {
     /// so a stale operand there would silently generate code for the wrong value.
     #[cfg(debug_assertions)]
     pub fn assert_operands_canonical(&self) {
-        let union_find = self.union_find.borrow();
+        let union_find = &self.union_find;
         for (idx, insn) in self.insns.iter().enumerate() {
             insn.for_each_operand(|operand| {
                 assert_eq!(operand, union_find.find_const(operand),
@@ -4325,12 +4331,12 @@ impl Function {
         assert!(self.insns[replacement.to_usize()].has_output(),
                 "Can't replace instruction that has output with instruction that has no output");
         // Don't push it to the block
-        self.union_find.borrow_mut().make_equal_to(insn, replacement);
+        self.union_find.make_equal_to(insn, replacement);
     }
 
     pub fn type_of(&self, insn: InsnId) -> Type {
         debug_assert!(self.insns[insn.to_usize()].has_output());
-        self.insn_types[self.union_find.borrow_mut().find(insn).to_usize()]
+        self.insn_types[self.union_find.find(insn).to_usize()]
     }
 
     /// Check if the type of `insn` is a subtype of `ty`.
@@ -4569,7 +4575,7 @@ impl Function {
             ($insn:expr, $new_type:expr) => {{
                 let insn = $insn;
                 let new_type = $new_type;
-                let old_type = self.insn_types[self.union_find.borrow_mut().find(insn).to_usize()];
+                let old_type = self.insn_types[self.union_find.find(insn).to_usize()];
                 if old_type.bit_equal(new_type) {
                     false
                 } else {
@@ -4673,7 +4679,7 @@ impl Function {
     }
 
     fn chase_insn(&self, insn: InsnId) -> InsnId {
-        let id = self.union_find.borrow().find_const(insn);
+        let id = self.union_find.find_const(insn);
         match self.insns[id.to_usize()] {
             Insn::GuardType { val, .. }
             | Insn::GuardBitEquals { val, .. }
@@ -5229,7 +5235,7 @@ impl Function {
     fn recorded_profiled_type(&self, val: InsnId) -> Option<ProfiledType> {
         let mut insn = val;
         loop {
-            let id = self.union_find.borrow().find_const(insn);
+            let id = self.union_find.find_const(insn);
             if let Some(&profiled_type) = self.guarded_profiled_types.get(&id) {
                 return Some(profiled_type);
             }
@@ -7736,11 +7742,11 @@ impl Function {
             let mut rewrite_map = rewrite_maps[dominators.idom(block).to_usize()].clone().unwrap_or_else(|| HashMap::default());
             for i in 0..self.blocks[block.to_usize()].insns.len() {
                 let insn_id = self.blocks[block.to_usize()].insns[i];
-                let canonical_id = self.union_find.borrow().find_const(insn_id);
+                let canonical_id = self.union_find.find_const(insn_id);
 
                 let union_find = &self.union_find;
                 self.insns[canonical_id.to_usize()].for_each_operand_mut(|operand| {
-                    let canon = union_find.borrow().find_const(*operand);
+                    let canon = union_find.find_const(*operand);
                     *operand = rewrite_map.get(&canon).copied().unwrap_or(canon);
                 });
 
@@ -8163,9 +8169,9 @@ impl Function {
         while let Some(insn_id) = worklist.pop_front() {
             if necessary.get(insn_id) { continue; }
             necessary.insert(insn_id);
-            let insn_id = self.union_find.borrow().find_const(insn_id);
+            let insn_id = self.union_find.find_const(insn_id);
             self.insns[insn_id.to_usize()].for_each_operand(|operand| {
-                worklist.push_back(self.union_find.borrow().find_const(operand));
+                worklist.push_back(self.union_find.find_const(operand));
             });
         }
         // Now remove all unnecessary instructions
@@ -8396,7 +8402,7 @@ impl Function {
         // Control so that the effect check above subsumes this operand scan.
         let mut references_snapshot = false;
         insn.for_each_operand(|opnd| {
-            let opnd = self.union_find.borrow().find_const(opnd);
+            let opnd = self.union_find.find_const(opnd);
             if matches!(&self.insns[opnd.to_usize()], Insn::Snapshot { .. }) {
                 references_snapshot = true;
             }
@@ -8706,7 +8712,7 @@ impl Function {
             // Parameters are currently guaranteed to be Parameter instructions, but in the future
             // they might be refined to other instruction kinds by the optimizer.
             for insn_id in block.params.iter().chain(block.insns.iter()) {
-                let insn_id = self.union_find.borrow().find_const(*insn_id);
+                let insn_id = self.union_find.find_const(*insn_id);
                 let insn = self.find(insn_id);
 
                 // Snapshots are not serialized, so skip them.
@@ -8965,7 +8971,7 @@ impl Function {
                 assigned.insert(param);
             }
             for &insn_id in &self.blocks[block.to_usize()].insns {
-                let insn_id = self.union_find.borrow().find_const(insn_id);
+                let insn_id = self.union_find.find_const(insn_id);
                 // No need for resolve(): we only look at jump targets here, and the
                 // operand check below resolves each operand itself.
                 let insn = self.find_ref(insn_id);
@@ -9003,9 +9009,9 @@ impl Function {
                 assigned.insert(param);
             }
             for &insn_id in &self.blocks[block.to_usize()].insns {
-                let insn_id = self.union_find.borrow().find_const(insn_id);
+                let insn_id = self.union_find.find_const(insn_id);
                 self.insns[insn_id.to_usize()].try_for_each_operand(|operand| {
-                    let operand = self.union_find.borrow().find_const(operand);
+                    let operand = self.union_find.find_const(operand);
                     if !assigned.get(operand) {
                         return Err(ValidationError::OperandNotDefined(block, insn_id, operand));
                     }
@@ -9024,7 +9030,7 @@ impl Function {
         let mut seen = InsnSet::with_capacity(self.insns.len());
         for block_id in self.reverse_post_order() {
             for &insn_id in &self.blocks[block_id.to_usize()].insns {
-                let insn_id = self.union_find.borrow().find_const(insn_id);
+                let insn_id = self.union_find.find_const(insn_id);
                 if !seen.insert(insn_id) {
                     return Err(ValidationError::DuplicateInstruction(block_id, insn_id));
                 }
@@ -9042,7 +9048,7 @@ impl Function {
     }
 
     fn validate_insn_type(&self, insn_id: InsnId) -> Result<(), ValidationError> {
-        let insn_id = self.union_find.borrow().find_const(insn_id);
+        let insn_id = self.union_find.find_const(insn_id);
         // No need for resolve(): type_of() resolves operands for us.
         match *self.find_ref(insn_id) {
             // Instructions with no InsnId operands (except state) or nothing to assert
@@ -9696,7 +9702,7 @@ impl<'a> std::fmt::Display for FunctionPrinter<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct FrameState {
     pub iseq: IseqPtr,
     insn_idx: YarvInsnIdx,
