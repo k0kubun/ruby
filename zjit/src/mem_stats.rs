@@ -69,6 +69,9 @@ pub struct MemoryBreakdown {
     /// bytes are the point of the exercise -- they used to be immediates in the
     /// exit stubs, i.e. executable memory. See [`crate::exit_meta`].
     pub exit_meta_bytes: usize,
+    /// The deduplicated set of ISEQs those two tables reference, which is what the
+    /// GC mark phase walks in their place. See [`crate::gc::RootIseqs`].
+    pub root_iseq_bytes: usize,
     /// `CodeBlock` bookkeeping: label tables and (with `--zjit-dump-disasm`)
     /// assembly comments.
     pub code_block_bytes: usize,
@@ -98,12 +101,20 @@ pub struct MemoryBreakdown {
     pub profile_distribution_count: usize,
     /// How many of those distributions saw at most one type.
     pub profile_monomorphic_distribution_count: usize,
+    /// Number of objects in the dense arrays GC marking walks, i.e. the distinct
+    /// objects the profiles reference. See
+    /// [`crate::profile::IseqProfile::marked_objects`].
+    pub profile_marked_object_count: usize,
     /// Number of patch points in `Invariants`.
     pub patch_point_count: usize,
     /// Number of live `JITFrame`s.
     pub jit_frame_count: usize,
     /// Number of interned `ExitMeta` records.
     pub exit_meta_count: usize,
+    /// Number of distinct ISEQs in the root set. The ratio against
+    /// `jit_frame_count + 2 * exit_meta_count` is what deduplication saves the mark
+    /// phase on every collection.
+    pub root_iseq_count: usize,
     /// Number of ivar shape tables, i.e. distinct ivar names with one.
     pub ivar_cache_count: usize,
     /// Number of send class tables, i.e. distinct call shapes with one.
@@ -121,6 +132,7 @@ impl MemoryBreakdown {
             + self.invariant_bytes
             + self.jit_frame_bytes
             + self.exit_meta_bytes
+            + self.root_iseq_bytes
             + self.code_block_bytes
             + self.stats_counter_bytes
             + self.ivar_cache_bytes
@@ -153,6 +165,7 @@ pub fn memory_breakdown() -> MemoryBreakdown {
         out.profile_entry_slack_bytes += profile.entry_slack_bytes;
         out.profile_distribution_count += profile.distribution_count;
         out.profile_monomorphic_distribution_count += profile.monomorphic_distribution_count;
+        out.profile_marked_object_count += profile.marked_object_count;
 
         // Both version lists, plus the continuation table that indexes the
         // exception entries. `all_versions()` is what the GC callbacks walk, so
@@ -165,7 +178,7 @@ pub fn memory_breakdown() -> MemoryBreakdown {
             out.version_count += 1;
             out.iseq_version_bytes += size_of::<crate::payload::IseqVersion>()
                 + version.jit_entry_heap_size();
-            out.gc_offset_bytes += version.gc_offsets.capacity() * size_of::<crate::virtualmem::CodePtr>();
+            out.gc_offset_bytes += version.gc_offsets.heap_size();
             out.iseq_call_bytes += version.iseq_call_heap_size();
         }
     });
@@ -184,6 +197,10 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     let exit_metas = ZJITState::get_exit_metas();
     out.exit_meta_count = exit_metas.len();
     out.exit_meta_bytes = exit_metas.capacity() * size_of::<crate::exit_meta::ExitMeta>();
+
+    let root_iseqs = ZJITState::get_root_iseqs();
+    out.root_iseq_count = root_iseqs.len();
+    out.root_iseq_bytes = root_iseqs.heap_size();
 
     let ivar_caches = ZJITState::get_ivar_caches();
     out.ivar_cache_count = ivar_caches.len();

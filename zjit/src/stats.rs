@@ -205,6 +205,40 @@ make_counters! {
         gc_time_ns,
         invalidation_time_ns,
 
+        // Breakdown of `gc_time_ns` by callback and by the structure walked. See
+        // [`crate::gc`]. The four `*_time_ns` totals sum to `gc_time_ns`; the
+        // `_count`s are exact (they are plain increments, not sampled).
+        //
+        // Only collected under `--zjit-stats`: the per-payload callbacks run tens
+        // of thousands of times per collection on a large application, where an
+        // unconditional `Instant::now()` pair is itself a measurable slice of GC
+        // time. `gc_time_ns` has the same caveat for the same reason.
+        gc_iseq_mark_time_ns,
+        gc_iseq_mark_profile_time_ns,
+        gc_iseq_mark_offsets_time_ns,
+        gc_iseq_update_time_ns,
+        gc_root_mark_time_ns,
+        gc_root_mark_iseq_time_ns,
+        gc_root_mark_send_cache_time_ns,
+        gc_root_mark_bgcompile_time_ns,
+        gc_root_update_time_ns,
+        // Callback invocations. `gc_root_mark_count` is one per GC that ran a ZJIT
+        // hook at all, so `gc_iseq_mark_count / gc_root_mark_count` is the number of
+        // payloads walked per collection.
+        gc_iseq_mark_count,
+        gc_iseq_update_count,
+        gc_root_mark_count,
+        gc_root_update_count,
+        // Objects handed to `rb_gc_mark_movable` by each subsystem, summed over all
+        // collections.
+        gc_mark_profile_object_count,
+        gc_mark_offset_object_count,
+        gc_mark_root_iseq_count,
+        gc_mark_send_cache_slot_count,
+        // Slots walked to find the callcaches above. The gap against
+        // `gc_mark_send_cache_slot_count` is how much of the walk is empty slots.
+        gc_mark_send_cache_probe_count,
+
         compiled_side_exit_count,
         side_exit_size,
         compile_side_exit_time_ns,
@@ -1106,6 +1140,7 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_invariant_bytes", mem.invariant_bytes);
         set_stat_usize!(hash, "mem_jit_frame_bytes", mem.jit_frame_bytes);
         set_stat_usize!(hash, "mem_exit_meta_bytes", mem.exit_meta_bytes);
+        set_stat_usize!(hash, "mem_root_iseq_bytes", mem.root_iseq_bytes);
         set_stat_usize!(hash, "mem_code_block_bytes", mem.code_block_bytes);
         set_stat_usize!(hash, "mem_stats_counter_bytes", mem.stats_counter_bytes);
         set_stat_usize!(hash, "mem_ivar_cache_bytes", mem.ivar_cache_bytes);
@@ -1120,9 +1155,11 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, "mem_profile_entry_slack_bytes", mem.profile_entry_slack_bytes);
         set_stat_usize!(hash, "mem_profile_distribution_count", mem.profile_distribution_count);
         set_stat_usize!(hash, "mem_profile_monomorphic_distribution_count", mem.profile_monomorphic_distribution_count);
+        set_stat_usize!(hash, "mem_profile_marked_object_count", mem.profile_marked_object_count);
         set_stat_usize!(hash, "mem_patch_point_count", mem.patch_point_count);
         set_stat_usize!(hash, "mem_jit_frame_count", mem.jit_frame_count);
         set_stat_usize!(hash, "mem_exit_meta_count", mem.exit_meta_count);
+        set_stat_usize!(hash, "mem_root_iseq_count", mem.root_iseq_count);
         set_stat_usize!(hash, "mem_ivar_cache_count", mem.ivar_cache_count);
         set_stat_usize!(hash, "mem_send_cache_count", mem.send_cache_count);
     }

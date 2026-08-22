@@ -132,8 +132,9 @@ pub struct IseqVersion {
     /// Compilation status of the ISEQ. It has the JIT code address of the first block if Compiled.
     pub status: IseqStatus,
 
-    /// GC offsets of the JIT code. These are the addresses of objects that need to be marked.
-    pub gc_offsets: Vec<CodePtr>,
+    /// The objects ZJIT baked into this version's JIT code, and where in the code
+    /// region each one sits. See [`crate::gc::GcOffsets`].
+    pub gc_offsets: crate::gc::GcOffsets,
 
     /// JIT-to-JIT calls from the ISEQ. The IseqPayload's ISEQ is the caller of it.
     pub outgoing: Vec<IseqCallRef>,
@@ -186,7 +187,7 @@ impl IseqVersion {
     /// outlive their ISEQ (see [`crate::gc::rb_zjit_iseq_free`]).
     pub fn total_heap_size(&self) -> usize {
         size_of::<IseqVersion>()
-            + self.gc_offsets.capacity() * size_of::<CodePtr>()
+            + self.gc_offsets.heap_size()
             + self.jit_entry_heap_size()
             + self.iseq_call_heap_size()
     }
@@ -201,7 +202,7 @@ impl IseqVersion {
         let version = Self {
             iseq,
             status: IseqStatus::NotCompiled,
-            gc_offsets: vec![],
+            gc_offsets: Default::default(),
             outgoing: vec![],
             incoming: vec![],
             ivar_reprofile_windows: MAX_IVAR_REPROFILE_WINDOWS,
