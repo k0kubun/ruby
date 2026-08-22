@@ -14,7 +14,7 @@
 //! the same work the inline code used to do. The table is indexed rather than
 //! pointed into so that pushing to it may reallocate freely.
 
-use crate::cruby::{IseqPtr, VALUE, rb_gc_location, rb_gc_mark_movable};
+use crate::cruby::{IseqPtr, VALUE, rb_gc_location};
 use crate::state::ZJITState;
 
 /// Interpreter state a side exit restores, plus its optional recompile trigger.
@@ -44,18 +44,6 @@ pub struct ExitMeta {
 }
 
 impl ExitMeta {
-    /// Mark the ISEQs this record keeps raw pointers to. Called from
-    /// [`crate::gc::rb_zjit_root_mark`]; without it a side exit that has not run
-    /// yet could resume into a freed ISEQ.
-    pub fn mark(&self) {
-        if !self.iseq.is_null() {
-            unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
-        }
-        if !self.compiled_iseq.is_null() {
-            unsafe { rb_gc_mark_movable(VALUE::from(self.compiled_iseq)); }
-        }
-    }
-
     /// Update the ISEQ pointers after GC compaction, like `JITFrame` does. `pc`
     /// points into the ISEQ's malloc'd `iseq_encoded`, which compaction does not
     /// move, so it needs no fixup.
@@ -81,6 +69,11 @@ const GROWTH_STEP: usize = 4096;
 /// them are retained for the lifetime of the process.
 pub fn intern(meta: ExitMeta) -> u32 {
     crate::bgcompile::assert_gvl_held("exit_meta::intern");
+    // The record's ISEQs have to stay alive for as long as the record does, which is
+    // forever; the mark phase reaches them through this set rather than by walking
+    // the (much longer) table. See [`crate::gc::RootIseqs`].
+    crate::gc::register_root_iseq(meta.iseq);
+    crate::gc::register_root_iseq(meta.compiled_iseq);
     let metas = ZJITState::get_exit_metas();
     if metas.len() == metas.capacity() {
         metas.reserve_exact(GROWTH_STEP);

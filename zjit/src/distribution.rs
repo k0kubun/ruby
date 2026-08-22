@@ -202,8 +202,22 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         StableBucket::Full
     }
 
+    /// Every item in a non-empty bucket, bucket 0 first.
+    ///
+    /// Mirrors [`Self::each_item_mut`] in reaching into the boxed tail once rather
+    /// than asking `bucket`/`count` per index, which re-check `tail` every time. A
+    /// monomorphic distribution has no tail at all, and the overwhelming majority
+    /// are monomorphic, so this yields one item after one branch instead of walking
+    /// `N` indices to find `N - 1` empty buckets. GC marking walks every
+    /// distribution of every live profile on every major collection, which is where
+    /// that difference shows up.
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
-        (0..N).filter_map(|idx| if self.count(idx) > 0 { Some(self.bucket(idx)) } else { None })
+        let primary = if N > 0 && self.primary_count > 0 { Some(self.primary) } else { None };
+        let tail = self.tail.as_ref().map(|tail| {
+            tail.buckets.iter().zip(tail.counts.iter()).skip(1)
+                .filter_map(|(&bucket, &count)| if count > 0 { Some(bucket) } else { None })
+        });
+        primary.into_iter().chain(tail.into_iter().flatten())
     }
 
     pub fn each_item_mut(&mut self) -> impl Iterator<Item = &mut T> + '_ {

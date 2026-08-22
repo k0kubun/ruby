@@ -96,6 +96,10 @@ pub struct ZJITState {
     /// is what makes an exit stub small. See [`crate::exit_meta`].
     exit_metas: Vec<ExitMeta>,
 
+    /// The distinct ISEQs `jit_frames` and `exit_metas` point at, which is what the
+    /// GC mark phase walks instead of those two tables. See [`crate::gc::RootIseqs`].
+    root_iseqs: crate::gc::RootIseqs,
+
     /// Shape tables for ivar accesses that miss their inline guard chain, one
     /// per ivar name. Owned here so [`crate::mem_stats`] can account for them;
     /// the addresses are baked into JIT code, so the `Box`es must never move.
@@ -198,6 +202,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             exit_metas: vec![],
+            root_iseqs: Default::default(),
             ivar_caches: HashMap::new(),
             send_caches: crate::send_cache::SendCaches::new(),
             dead_iseq_version_bytes: 0,
@@ -265,6 +270,12 @@ impl ZJITState {
     pub fn get_exit_metas() -> &'static mut Vec<ExitMeta> {
         crate::bgcompile::assert_gvl_held("ZJITState::get_exit_metas");
         &mut ZJITState::get_instance().exit_metas
+    }
+
+    /// Owner of the deduplicated root ISEQ set. See [`crate::gc::RootIseqs`].
+    pub fn get_root_iseqs() -> &'static mut crate::gc::RootIseqs {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_root_iseqs");
+        &mut ZJITState::get_instance().root_iseqs
     }
 
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].

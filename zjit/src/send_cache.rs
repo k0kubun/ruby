@@ -241,12 +241,15 @@ impl SendCache {
 
     /// Mark every cached callcache. See the module docs on why this retains
     /// nothing but the callcaches themselves.
-    fn mark(&self) {
+    fn mark(&self) -> usize {
+        let mut marked = 0;
         for &slot in self.storage.iter() {
             if slot != 0 {
+                marked += 1;
                 unsafe { rb_gc_mark_movable(VALUE(slot)) };
             }
         }
+        marked
     }
 
     /// Drop every entry, because compaction has moved the classes the slots were
@@ -326,8 +329,15 @@ pub fn cache_for(cd: *const rb_call_data, reason: crate::hir::SendFallbackReason
 /// Mark the callcaches every table holds. Called from
 /// [`crate::gc::rb_zjit_root_mark`].
 pub fn mark_all() {
+    let mut marked = 0u64;
+    let mut probed = 0u64;
     for cache in ZJITState::get_send_caches().values() {
-        cache.mark();
+        marked += cache.mark() as u64;
+        probed += cache.storage.len() as u64;
+    }
+    if get_option!(stats, /*default=*/false) {
+        incr_counter_by(Counter::gc_mark_send_cache_slot_count, marked);
+        incr_counter_by(Counter::gc_mark_send_cache_probe_count, probed);
     }
 }
 
