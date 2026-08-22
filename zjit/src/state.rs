@@ -91,6 +91,11 @@ pub struct ZJITState {
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
     jit_frame_allocator: Option<JITFrameAllocator>,
+
+    /// Class tables for send sites that dispatch over more classes than an
+    /// inline guard chain can cover, one per call shape. Owned here because JIT
+    /// code bakes in the addresses, so the `Box`es must never move.
+    send_caches: crate::send_cache::SendCaches,
 }
 
 /// Tracks the initialization progress
@@ -172,6 +177,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
+            send_caches: crate::send_cache::SendCaches::new(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -218,6 +224,11 @@ impl ZJITState {
     /// Get a mutable reference to the JITFrame allocator
     pub fn get_jit_frame_allocator() -> Option<&'static mut JITFrameAllocator> {
         ZJITState::get_instance().jit_frame_allocator.as_mut()
+    }
+
+    /// Owner of every per-call-shape class table. See [`crate::send_cache`].
+    pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
+        &mut ZJITState::get_instance().send_caches
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
