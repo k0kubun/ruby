@@ -34,6 +34,8 @@ disasm = ["yjit?/disasm", "zjit?/disasm"]
 runtime_checks = ["yjit?/runtime_checks", "zjit?/runtime_checks"]
 yjit = [ "dep:yjit" ]
 zjit = [ "dep:zjit" ]
+# --zjit-alloc-stats support; see jit/Cargo.toml for why it is not on by default.
+alloc_stats = ["zjit?/alloc_stats"]
 
 [profile.dev]
 opt-level = 1 # On 0, functions use so much stack space that we get stray `SystemStackError`s

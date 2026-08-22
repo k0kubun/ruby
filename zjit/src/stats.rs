@@ -1151,13 +1151,101 @@ pub fn total_exit_count() -> u64 {
     EXIT_COUNTERS.iter().fold(0, |sum, counter| sum + unsafe { *counter_ptr(*counter) })
 }
 
+/// Turn on per-phase allocation attribution in the global allocator. Called
+/// from option parsing for `--zjit-alloc-stats`.
+pub fn enable_alloc_phase_tracking() {
+    #[cfg(feature = "alloc_stats")]
+    jit::alloc_stats::enable();
+    #[cfg(not(feature = "alloc_stats"))]
+    eprintln!("warning: --zjit-alloc-stats needs a build with the `alloc_stats` cargo feature");
+}
+
+/// Attribute the allocations `func` makes to `counter`'s bucket, restoring the
+/// enclosing phase afterwards so nested phases nest correctly. Compiled out
+/// entirely without the `alloc_stats` feature.
+#[cfg(feature = "alloc_stats")]
+#[inline]
+pub fn with_alloc_phase<F, R>(counter: Counter, func: F) -> R where F: FnOnce() -> R {
+    if !jit::alloc_stats::TRACKING.load(Ordering::Relaxed) {
+        return func();
+    }
+    let prev = jit::alloc_stats::set_phase(counter as usize);
+    let ret = func();
+    jit::alloc_stats::restore_phase(prev);
+    ret
+}
+
+#[cfg(not(feature = "alloc_stats"))]
+#[inline(always)]
+pub fn with_alloc_phase<F, R>(_counter: Counter, func: F) -> R where F: FnOnce() -> R {
+    func()
+}
+
+/// Print the per-phase allocation table `--zjit-alloc-stats` collected. Phases
+/// are the same ones `--zjit-stats` times, and an allocation is charged to the
+/// innermost phase that was running, so the buckets partition rather than nest.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_print_alloc_stats(_ec: EcPtr, _self: VALUE) -> VALUE {
+    #[cfg(feature = "alloc_stats")]
+    {
+        use jit::alloc_stats;
+
+        let mut rows: Vec<(&'static str, usize, usize)> = Vec::new();
+        let mut total_count = 0;
+        let mut total_bytes = 0;
+
+        let mut read = |name: &'static str, phase: usize| {
+            let count = alloc_stats::COUNT[phase].load(Ordering::Relaxed);
+            let bytes = alloc_stats::BYTES[phase].load(Ordering::Relaxed);
+            if count > 0 {
+                rows.push((name, count, bytes));
+            }
+            (count, bytes)
+        };
+
+        let (count, bytes) = read("(outside any phase)", alloc_stats::PHASE_NONE);
+        total_count += count;
+        total_bytes += bytes;
+
+        for group in [DEFAULT_COUNTERS, OTHER_COUNTERS] {
+            for &counter in group {
+                let phase = counter as usize;
+                if phase == alloc_stats::PHASE_NONE || phase >= alloc_stats::PHASES {
+                    continue;
+                }
+                let (count, bytes) = read(counter.name(), phase);
+                total_count += count;
+                total_bytes += bytes;
+            }
+        }
+
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+        eprintln!("***ZJIT: Allocations per compile phase***");
+        eprintln!("{:<52} {:>12} {:>14} {:>8}", "phase", "allocations", "bytes", "avg");
+        for (name, count, bytes) in &rows {
+            eprintln!("{:<52} {:>12} {:>14} {:>8}", name, count, bytes, bytes / count.max(&1));
+        }
+        eprintln!("{:<52} {:>12} {:>14}", "TOTAL", total_count, total_bytes);
+    }
+    Qnil
+}
+
+/// Return Qtrue if --zjit-alloc-stats has been specified.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_alloc_stats_p(_ec: EcPtr, _self: VALUE) -> VALUE {
+    if get_option!(alloc_stats, /*default=*/false) { Qtrue } else { Qfalse }
+}
+
 /// Measure the time taken by func() and add that to zjit_compile_time.
 pub fn with_time_stat<F, R>(counter: Counter, func: F) -> R where F: FnOnce() -> R {
-    let start = Instant::now();
-    let ret = func();
-    let nanos = Instant::now().duration_since(start).as_nanos();
-    incr_counter_by(counter, nanos as u64);
-    ret
+    with_alloc_phase(counter, || {
+        let start = Instant::now();
+        let ret = func();
+        let nanos = Instant::now().duration_since(start).as_nanos();
+        incr_counter_by(counter, nanos as u64);
+        ret
+    })
 }
 
 /// Record a Perfetto duration event *and* accumulate the elapsed time into `counter`.
@@ -1174,7 +1262,7 @@ pub fn timed_compile_phase<F, R>(counter: Counter, name: &str, func: F) -> R whe
         // counters exist. Those compilations are a fixed handful, so leaving them out of
         // the per-phase totals costs nothing and saves a panic.
         if !get_option!(stats, /*default=*/false) || !crate::state::ZJITState::has_instance() {
-            return func();
+            return with_alloc_phase(counter, func);
         }
         with_time_stat(counter, func)
     })

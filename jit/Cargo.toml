@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[features]
+# Attribute every Rust allocation to the compile phase that requested it, for
+# --zjit-alloc-stats. Off by default: the accounting sits in the global
+# allocator's hot path, so leaving it compiled in costs every build ~0.3% of
+# compile instructions even when the option is not passed.
+alloc_stats = []

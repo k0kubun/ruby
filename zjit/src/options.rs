@@ -86,6 +86,12 @@ pub struct Options {
     /// Print stats on exit (when stats is also true)
     pub print_stats: bool,
 
+    /// Attribute every Rust allocation to the compile phase that made it and
+    /// print the table at exit. Independent of `stats` on purpose: `stats`
+    /// changes what the compiler emits (counted exit stubs), which would
+    /// distort exactly the numbers this option exists to measure.
+    pub alloc_stats: bool,
+
     /// Print stats to file on exit (when stats is also true)
     pub print_stats_file: Option<std::path::PathBuf>,
 
@@ -221,6 +227,7 @@ impl Default for Options {
             num_profiles: DEFAULT_NUM_PROFILES,
             stats: false,
             print_stats: false,
+            alloc_stats: false,
             print_stats_file: None,
             debug: false,
             disable: false,
@@ -499,6 +506,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             }
         }
 
+
+        ("alloc-stats", _) => {
+            options.alloc_stats = true;
+            crate::stats::enable_alloc_phase_tracking();
+        }
 
         ("stats-quiet", _) => {
             options.stats = true;

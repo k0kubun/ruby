@@ -16,6 +16,9 @@ module RubyVM::ZJIT
   if Primitive.rb_zjit_print_stats_p
     at_exit { print_stats }
   end
+  if Primitive.rb_zjit_alloc_stats_p
+    at_exit { Primitive.rb_zjit_print_alloc_stats }
+  end
 end
 
 class << RubyVM::ZJIT

@@ -24,3 +24,6 @@ yjit = { path = "../yjit" }
 disasm = ["capstone"]
 runtime_checks = []
 stats_allocator = []
+# See jit/Cargo.toml. Enable with
+#   make CARGO_BUILD_ARGS="--profile stats --features disasm,yjit,zjit,alloc_stats"
+alloc_stats = ["jit/alloc_stats"]
