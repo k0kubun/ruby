@@ -179,6 +179,14 @@ make_counters! {
         bg_compile_thread_restart_count,
         // Set once if background compilation gave up for the rest of the process.
         bg_compile_disabled_count,
+        // Compiles thrown away at install time because something the snapshot
+        // assumed changed while the GVL-free phase ran. See [`crate::bgcompile`].
+        bg_compile_stale_discard_count,
+        // Time the compile thread spent compiling without the GVL, i.e. the part
+        // of `compile_time_ns` that overlapped application execution. Compiles
+        // that ran the whole pipeline under the GVL (trampolines, debug options,
+        // `--zjit-background-compile-hold-gvl`) contribute nothing here.
+        bg_compile_nogvl_time_ns,
 
         // Exception handler entries (body->jit_exception) that were compiled as
         // a dedicated function entering at a catch-table continuation
@@ -637,14 +645,92 @@ make_counters! {
     total_native_stack_bytes,
 }
 
+/// Where counter updates on this thread go while it is compiling without the GVL.
+///
+/// The global `Counters` is plain memory updated with `*ptr += n`, which is only
+/// sound because every writer holds the GVL. The background compile thread stops
+/// holding it for the middle phase of each compilation (see [`crate::bgcompile`]),
+/// so for the duration it points this at a private list and the install step
+/// replays it. The list is tiny -- a couple of dozen distinct counters across the
+/// whole phase -- so a linear scan beats a second `Counters` allocation.
+///
+/// Deliberately consulted by the increment helpers only. [`counter_ptr`] has to
+/// keep returning the address of the *real* counter: JIT code bakes those pointers
+/// into exit stubs, and one pointed at a scratch list would lose its count for the
+/// life of the process.
+mod counter_sink {
+    use super::Counter;
+    use std::cell::Cell;
+
+    pub type Sink = Vec<(Counter, u64)>;
+
+    thread_local! {
+        static SINK: Cell<*mut Sink> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    /// Redirect this thread's counter updates into `sink`, returning what was
+    /// installed before so it can be restored. Null means "go to the global
+    /// counters", which is what every thread starts at.
+    pub fn swap(sink: *mut Sink) -> *mut Sink {
+        SINK.with(|cell| cell.replace(sink))
+    }
+
+    #[inline(always)]
+    pub fn current() -> *mut Sink {
+        SINK.with(|cell| cell.get())
+    }
+}
+
+pub use counter_sink::Sink as CounterSink;
+
+/// Send this thread's counter updates to `sink` until the returned token is passed
+/// back to [`restore_counter_sink`]. See [`counter_sink`].
+pub fn redirect_counters(sink: &mut CounterSink) -> *mut CounterSink {
+    counter_sink::swap(sink)
+}
+
+/// Undo [`redirect_counters`].
+pub fn restore_counter_sink(previous: *mut CounterSink) {
+    counter_sink::swap(previous);
+}
+
+/// Fold a list recorded by [`redirect_counters`] into the global counters. Must
+/// run with the GVL held.
+pub fn flush_counter_sink(sink: &mut CounterSink) {
+    for (counter, amount) in sink.drain(..) {
+        let ptr = counter_ptr(counter);
+        unsafe { *ptr += amount; }
+    }
+}
+
 /// Increase a counter by a specified amount
 pub fn incr_counter_by(counter: Counter, amount: u64) {
+    let sink = counter_sink::current();
+    if !sink.is_null() {
+        // SAFETY: the sink belongs to this thread and nothing else aliases it for
+        // as long as it is installed.
+        let sink = unsafe { &mut *sink };
+        match sink.iter_mut().find(|(existing, _)| *existing == counter) {
+            Some((_, total)) => *total += amount,
+            None => sink.push((counter, amount)),
+        }
+        return;
+    }
     let ptr = counter_ptr(counter);
     unsafe { *ptr += amount; }
 }
 
 /// Decrease a counter by a specified amount
 pub fn decr_counter_by(counter: Counter, amount: u64) {
+    let sink = counter_sink::current();
+    if !sink.is_null() {
+        let sink = unsafe { &mut *sink };
+        match sink.iter_mut().find(|(existing, _)| *existing == counter) {
+            Some((_, total)) => *total -= amount,
+            None => sink.push((counter, 0u64.wrapping_sub(amount))),
+        }
+        return;
+    }
     let ptr = counter_ptr(counter);
     unsafe { *ptr -= amount; }
 }

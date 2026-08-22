@@ -5,6 +5,7 @@ use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
 use crate::payload::{IseqPayload, IseqVersionRef, get_iseq_payload_ptr};
 use crate::stats::Counter::gc_time_ns;
+use crate::bg_assume::Assumption;
 
 /// GC callback for marking GC objects in the per-ISEQ payload.
 #[unsafe(no_mangle)]
@@ -50,6 +51,11 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     if !ZJITState::has_instance() {
         return;
     }
+
+    // A background compilation in its GVL-free phase may hold this ISEQ as a
+    // JIT-to-JIT callee or an EP-escape assumption. It would bake the pointer into
+    // machine code, so discard it instead. See [`crate::bg_assume`].
+    crate::bgcompile::note_invalidation(Assumption::Iseq(iseq));
 
     ZJITState::get_invariants().forget_iseq(iseq);
 
@@ -105,6 +111,7 @@ pub extern "C" fn rb_zjit_cme_free(cme: *const rb_callable_method_entry_struct) 
     if !ZJITState::has_instance() {
         return;
     }
+    crate::bgcompile::note_invalidation(Assumption::Cme(cme));
     let invariants = ZJITState::get_invariants();
     invariants.forget_cme(cme);
 }
@@ -115,6 +122,7 @@ pub extern "C" fn rb_zjit_klass_free(klass: VALUE) {
     if !ZJITState::has_instance() {
         return;
     }
+    crate::bgcompile::note_invalidation(Assumption::Klass(klass));
     let invariants = ZJITState::get_invariants();
     invariants.forget_klass(klass);
 }
@@ -147,6 +155,11 @@ pub extern "C" fn rb_zjit_root_update_references() {
 
     // ISEQs waiting for the background compile thread, and the thread itself.
     crate::bgcompile::update_references();
+
+    // A compilation in its GVL-free phase holds raw pointers to ISEQs, classes,
+    // CMEs and baked-in objects that this compaction has just moved, and cannot be
+    // walked from here because the thread that owns it is running. Discard it.
+    crate::bgcompile::note_compaction();
 }
 
 fn iseq_mark(payload: &IseqPayload) {

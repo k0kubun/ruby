@@ -118,6 +118,26 @@ pub struct Options {
     /// own. Not listed in `ruby --help`.
     pub background_compile_block: bool,
 
+    /// Make the compile thread hold the GVL for the whole of each compilation, as
+    /// it did before the phase split. Only for A/B measurement of the split; see
+    /// [`crate::bgcompile`]. Not listed in `ruby --help`.
+    pub background_compile_hold_gvl: bool,
+
+    /// How long phase 1 of a background compile batch may hold the GVL before the
+    /// rest of the batch is deferred to the next one. Trades compile throughput
+    /// against how long the application can be blocked by the compile thread; see
+    /// [`crate::bgcompile::compile_batch`]. Defaults to one CRuby timeslice, so the
+    /// compile thread is no greedier with the GVL than an application thread.
+    /// Not listed in `ruby --help`.
+    pub background_compile_batch_ms: u64,
+
+    /// Sleep this many milliseconds in the middle of the GVL-free phase of every
+    /// background compilation, which is exactly the window an invalidation has to
+    /// land in to make the compilation stale. Only for testing: it makes a race
+    /// that is otherwise a few microseconds wide wide enough to hit on purpose.
+    /// Not listed in `ruby --help`.
+    pub background_compile_stall_ms: u64,
+
     /// Turn off the ivar shape table, so ivar sites that miss their inline shape
     /// guard chain go straight to the generic C call. Only useful for A/B
     /// measurement; see [`crate::ivar_cache`].
@@ -247,6 +267,9 @@ impl Default for Options {
             disable_hir_opt: false,
             background_compile: false,
             background_compile_block: false,
+            background_compile_hold_gvl: false,
+            background_compile_batch_ms: 10,
+            background_compile_stall_ms: 0,
             disable_ivar_cache: false,
             ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
@@ -594,6 +617,27 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("background-compile-block", "") => {
             options.background_compile = true;
             options.background_compile_block = true;
+        },
+
+        ("background-compile-hold-gvl", "") => {
+            options.background_compile = true;
+            options.background_compile_hold_gvl = true;
+        },
+
+        ("background-compile-batch-ms", _) => match opt_val.parse::<u64>() {
+            Ok(ms) => {
+                options.background_compile = true;
+                options.background_compile_batch_ms = ms;
+            }
+            Err(_) => return None,
+        },
+
+        ("background-compile-stall-ms", _) => match opt_val.parse::<u64>() {
+            Ok(ms) => {
+                options.background_compile = true;
+                options.background_compile_stall_ms = ms;
+            }
+            Err(_) => return None,
         },
         ("disable-ivar-cache", "") => options.disable_ivar_cache = true,
 

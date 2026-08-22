@@ -242,6 +242,8 @@ pub enum IseqStatus {
 pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
     type VoidPtr = *mut c_void;
 
+    crate::bgcompile::assert_gvl_held("get_or_create_iseq_payload");
+
     unsafe {
         let payload = rb_iseq_get_zjit_payload(iseq);
         if payload.is_null() {

@@ -80,6 +80,7 @@ const GROWTH_STEP: usize = 4096;
 /// Records are never freed, matching how `JITFrame`s and the code that references
 /// them are retained for the lifetime of the process.
 pub fn intern(meta: ExitMeta) -> u32 {
+    crate::bgcompile::assert_gvl_held("exit_meta::intern");
     let metas = ZJITState::get_exit_metas();
     if metas.len() == metas.capacity() {
         metas.reserve_exact(GROWTH_STEP);

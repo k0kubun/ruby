@@ -11,6 +11,7 @@ use std::ffi::{c_int, c_long, c_void};
 use std::slice;
 
 use crate::backend::current::ALLOC_REGS;
+use crate::bg_assume::Assumptions;
 use crate::invariants::{
     track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_no_trace_point_assumption,
     track_single_ractor_assumption, track_stable_constant_names_assumption, track_no_singleton_class_assumption,
@@ -287,7 +288,27 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
 /// recorded when the request is enqueued instead.
 pub fn gen_entry_point_locked(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> *const u8 {
     let cb = ZJITState::get_code_block();
-    let mut code_ptr = with_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, ec, jit_exception));
+    let code_ptr = with_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, ec, jit_exception));
+    finish_entry_point(iseq, jit_exception, code_ptr)
+}
+
+/// Phase 1 of an entry-point compilation: build HIR and lower it. Split out of
+/// [`gen_iseq_entry_point`] so [`crate::bgcompile`] can run the phases with the GVL
+/// released in between. Must be called with the VM lock held.
+pub fn snapshot_entry_point(cb: &CodeBlock, iseq: IseqPtr, record_assumptions: bool) -> Result<Snapshot, CompileError> {
+    // Compile ISEQ into High-level IR
+    let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq).inspect_err(|_| {
+        incr_counter!(failed_iseq_count);
+    }))?;
+    PendingCompile::snapshot(cb, iseq, Some(function), record_assumptions)
+}
+
+/// Turn the outcome of an entry-point compilation into the address to install in
+/// `body->jit_entry`, dealing with `assert_compiles`, the `--zjit-stats` failure
+/// counter, and making the region executable. Must be called with the VM lock held.
+pub fn finish_entry_point(iseq: IseqPtr, jit_exception: bool, code_ptr: Result<CodePtr, CompileError>) -> *const u8 {
+    let cb = ZJITState::get_code_block();
+    let mut code_ptr = code_ptr;
 
     if let Err(err) = &code_ptr {
         // Assert that the ISEQ compiles if RubyVM::ZJIT.assert_compiles is enabled.
@@ -318,13 +339,12 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, ec: EcPtr, jit_except
 
     let iseq_name = iseq_get_location(iseq, 0);
     trace_compile_phase(&iseq_name, || {
-        // Compile ISEQ into High-level IR
-        let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq).inspect_err(|_| {
-            incr_counter!(failed_iseq_count);
-        }))?;
-
-        // Compile the High-level IR
-        let IseqCodePtrs { start_ptr, .. } = gen_iseq(cb, iseq, Some(&function)).inspect_err(|err| {
+        let mut pending = match snapshot_entry_point(cb, iseq, false)? {
+            Snapshot::AlreadyCompiled(code_ptrs) => return Ok(code_ptrs.start_ptr),
+            Snapshot::Pending(pending) => pending,
+        };
+        pending.prepare();
+        let IseqCodePtrs { start_ptr, .. } = pending.install(cb).inspect_err(|err| {
             debug!("{err:?}: gen_iseq failed: {}", iseq_get_location(iseq, 0));
         })?;
 
@@ -631,65 +651,216 @@ pub fn gen_entry_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError>
     Ok(code_ptr)
 }
 
-/// Compile an ISEQ into machine code if not compiled yet
-fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
-    // Return an existing pointer if it's already compiled
-    let payload = get_or_create_iseq_payload(iseq);
-    let last_status = payload.versions.last().map(|version| &unsafe { version.as_ref() }.status);
-    match last_status {
-        Some(IseqStatus::Compiled(code_ptrs)) => return Ok(code_ptrs.clone()),
-        Some(IseqStatus::CantCompile(err)) => return Err(err.clone()),
-        _ => {},
-    }
-    // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= payload.version_limit() {
-        return Err(CompileError::IseqVersionLimitReached);
-    }
-
-    // Compile the ISEQ. When function is None, this is a lazy compile
-    // from a stub hit -- wrap in a trace event covering the full compile.
-    let mut version = IseqVersion::new(iseq);
-    let code_ptrs = if function.is_none() {
-        trace_compile_phase(&iseq_get_location(iseq, 0), || gen_iseq_body(cb, iseq, version, function))
-    } else {
-        gen_iseq_body(cb, iseq, version, function)
+/// Compile an ISEQ into machine code if not compiled yet, running all three phases
+/// back to back on the calling thread. [`crate::bgcompile`] drives the same phases
+/// with the GVL released in the middle.
+fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<Function>) -> Result<IseqCodePtrs, CompileError> {
+    // When function is None, this is a lazy compile from a stub hit -- wrap in a
+    // trace event covering the full compile.
+    let lazy = function.is_none();
+    let run = || {
+        let mut pending = match PendingCompile::snapshot(cb, iseq, function, false)? {
+            Snapshot::AlreadyCompiled(code_ptrs) => return Ok(code_ptrs),
+            Snapshot::Pending(pending) => pending,
+        };
+        pending.prepare();
+        pending.install(cb)
     };
-    match &code_ptrs {
-        Ok(code_ptrs) => {
-            unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
-            incr_counter!(compiled_iseq_count);
-        }
-        Err(err) => {
-            unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());
-            incr_counter!(failed_iseq_count);
-        }
+    if lazy {
+        trace_compile_phase(&iseq_get_location(iseq, 0), run)
+    } else {
+        run()
     }
-    payload.versions.push(version);
-    // At most max_iseq_versions() versions are ever pushed, and every ISEQ ZJIT
-    // compiles pays for this Vec, so keep it exactly sized rather than letting
-    // it round up to Vec's four-element minimum.
-    payload.versions.shrink_to_fit();
-    code_ptrs
 }
 
-/// Compile an ISEQ into machine code
-fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
-    // If we ran out of code region, we shouldn't attempt to generate new code.
+/// A compilation of an ISEQ's ordinary entry point, paused at the boundaries where
+/// it needs the GVL. The synchronous path runs the three phases back to back;
+/// [`crate::bgcompile`] releases the GVL for the middle one.
+///
+/// The phases are:
+///
+/// 1. [`PendingCompile::snapshot`] -- HIR construction and optimization, then HIR
+///    to LIR lowering. Everything that reads the VM: bytecode, profiles, method
+///    lookups, class hierarchies, shapes. Records what it assumed in
+///    `assumptions`.
+/// 2. [`PendingCompile::prepare`] -- register allocation, side-exit compilation
+///    and the scratch-register pass. Touches only the `Assembler`.
+/// 3. [`PendingCompile::install`] -- machine code emission, patch point
+///    registration, JIT-to-JIT stubs, and publishing the version on the payload.
+pub struct PendingCompile {
+    iseq: IseqPtr,
+
+    /// The version this compilation is going to become. Allocated in phase 1 and
+    /// owned here -- nothing outside can reach it until phase 3 pushes it onto the
+    /// payload, which is what makes [`PendingCompile::discard`] able to free it.
+    version: IseqVersionRef,
+
+    jit: JITState,
+
+    /// The function's LIR, or None once a phase has failed.
+    asm: Option<Assembler>,
+
+    /// Why a phase failed. Phase 2 runs without the GVL and so cannot record the
+    /// failure on the payload itself; phase 3 does it.
+    error: Option<CompileError>,
+
+    /// What phase 1 assumed about the VM. See [`crate::bg_assume`].
+    pub assumptions: Assumptions,
+}
+
+/// What [`PendingCompile::snapshot`] found.
+pub enum Snapshot {
+    /// The ISEQ already has usable code; there is nothing to compile.
+    AlreadyCompiled(IseqCodePtrs),
+    /// A compilation ready for phase 2.
+    Pending(PendingCompile),
+}
+
+impl PendingCompile {
+    /// Phase 1. Must run with the GVL held.
+    ///
+    /// `function` is the optimized HIR when the caller has already built it (the
+    /// entry-point path builds it to decide whether to compile at all); None means
+    /// build it here, which is what a lazy compile from a function stub does.
+    ///
+    /// `record_assumptions` asks for the [`Assumptions`] the staleness check needs.
+    /// Only a compilation that is going to be paused can go stale, and collecting
+    /// them costs a pass over every HIR instruction, so the synchronous path skips
+    /// it.
+    pub fn snapshot(cb: &CodeBlock, iseq: IseqPtr, function: Option<Function>, record_assumptions: bool) -> Result<Snapshot, CompileError> {
+        // Return existing code if it's already compiled
+        let payload = get_or_create_iseq_payload(iseq);
+        let last_status = payload.versions.last().map(|version| &unsafe { version.as_ref() }.status);
+        match last_status {
+            Some(IseqStatus::Compiled(code_ptrs)) => return Ok(Snapshot::AlreadyCompiled(code_ptrs.clone())),
+            Some(IseqStatus::CantCompile(err)) => return Err(err.clone()),
+            _ => {}
+        }
+        // If the ISEQ already has max versions, do not compile a new version.
+        if payload.versions.len() >= payload.version_limit() {
+            return Err(CompileError::IseqVersionLimitReached);
+        }
+        // If we ran out of code region, we shouldn't attempt to generate new code.
+        if cb.has_dropped_bytes() {
+            return Err(CompileError::OutOfMemory);
+        }
+
+        let function = match function {
+            Some(function) => function,
+            None => crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq))?,
+        };
+
+        let version = IseqVersion::new(iseq);
+        let (jit, asm) = crate::stats::with_time_stat(Counter::compile_lir_time_ns,
+            || lower_function(cb, iseq, version, &function));
+
+        let mut assumptions = Assumptions::new();
+        if record_assumptions {
+            collect_assumptions(&function, &jit, &mut assumptions);
+        }
+
+        Ok(Snapshot::Pending(PendingCompile {
+            iseq,
+            version,
+            jit,
+            asm: Some(asm),
+            error: None,
+            assumptions,
+        }))
+    }
+
+    /// Phase 2. Needs neither the GVL nor the VM lock: see [`Assembler::prepare`].
+    pub fn prepare(&mut self) {
+        let Some(asm) = self.asm.take() else { return };
+        match crate::stats::with_time_stat(Counter::compile_lir_time_ns, || asm.prepare()) {
+            Ok(asm) => self.asm = Some(asm),
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    /// Phase 3. Must run with the GVL held, and after the caller has checked that
+    /// [`Self::assumptions`] are not poisoned.
+    pub fn install(self, cb: &mut CodeBlock) -> Result<IseqCodePtrs, CompileError> {
+        let PendingCompile { iseq, mut version, jit, asm, error, .. } = self;
+        let code_ptrs = match (asm, error) {
+            (Some(asm), _) => emit_iseq_body(cb, iseq, version, jit, asm),
+            (None, Some(err)) => Err(err),
+            (None, None) => unreachable!("prepare() leaves either an Assembler or an error"),
+        };
+
+        match &code_ptrs {
+            Ok(code_ptrs) => {
+                unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
+                incr_counter!(compiled_iseq_count);
+            }
+            Err(err) => {
+                unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());
+                incr_counter!(failed_iseq_count);
+            }
+        }
+        let payload = get_or_create_iseq_payload(iseq);
+        payload.versions.push(version);
+        // At most max_iseq_versions() versions are ever pushed, and every ISEQ ZJIT
+        // compiles pays for this Vec, so keep it exactly sized rather than letting
+        // it round up to Vec's four-element minimum.
+        payload.versions.shrink_to_fit();
+        code_ptrs
+    }
+
+    /// Throw the compilation away without installing anything. Frees the version,
+    /// which is sound precisely because nothing outside can reach it before
+    /// [`Self::install`]: patch points are registered during emission, and the
+    /// JIT-to-JIT calls are only linked into the callees' `incoming` lists there
+    /// too. Must run with the GVL held.
+    pub fn discard(self) {
+        let version = self.version;
+        drop(self);
+        // SAFETY: IseqVersion::new leaked this Box and no one else took a copy.
+        drop(unsafe { Box::from_raw(version.as_ptr()) });
+    }
+
+    /// The ISEQ being compiled, for the caller's staleness re-checks.
+    pub fn iseq(&self) -> IseqPtr {
+        self.iseq
+    }
+}
+
+/// Record what a compilation assumed about the VM, so that an invalidation landing
+/// while the GVL is released can be matched against it. See [`crate::bg_assume`].
+///
+/// The invariants come from the HIR rather than from the LIR patch points: HIR
+/// `PatchPoint`s are a superset (lowering can drop one, never invent one), and
+/// erring towards a superset means erring towards an unnecessary discard rather
+/// than towards installing code with an unarmed guard.
+fn collect_assumptions(function: &Function, jit: &JITState, assumptions: &mut Assumptions) {
+    for block_id in function.reverse_post_order() {
+        for &insn_id in function.block(block_id).insns() {
+            if let Insn::PatchPoint { invariant, .. } = function.find_ref(insn_id) {
+                assumptions.add_invariant(*invariant);
+            }
+        }
+    }
+    // Callee ISEQs this function will link a JIT-to-JIT call to. Their code
+    // addresses are baked in by `gen_iseq_call` at install time.
+    for iseq_call in jit.iseq_calls.iter() {
+        assumptions.add_iseq(iseq_call.iseq.get());
+    }
+}
+
+/// Write a prepared ISEQ compilation into the code region: machine code, the
+/// JIT-to-JIT call stubs it needs, and the GC bookkeeping for the objects it baked
+/// in. Must run with the GVL held.
+fn emit_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, jit: JITState, asm: Assembler) -> Result<IseqCodePtrs, CompileError> {
+    // Another compilation may have exhausted the code region while this one was
+    // being prepared.
     if cb.has_dropped_bytes() {
         return Err(CompileError::OutOfMemory);
     }
 
-    // Convert ISEQ into optimized High-level IR if not given
-    let function = match function {
-        Some(function) => function,
-        None => &crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq))?,
-    };
-
-    // Compile the High-level IR
     let (iseq_code_ptrs, gc_offsets, iseq_calls) =
         trace_compile_phase("codegen", || {
             let (iseq_code_ptrs, gc_offsets, iseq_calls) =
-                crate::stats::with_time_stat(Counter::compile_lir_time_ns, || gen_function(cb, iseq, version, function))?;
+                crate::stats::with_time_stat(Counter::compile_lir_time_ns, || emit_function(cb, iseq, jit, asm))?;
 
             // Stub callee ISEQs for JIT-to-JIT calls
             trace_compile_phase("generate_jit_jit_stubs", || {
@@ -798,7 +969,21 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
 
 /// Compile a function
 fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
-    let (mut jit, asm) = crate::stats::timed_compile_phase(Counter::compile_lir_lower_time_ns, "codegen", || {
+    let (jit, asm) = lower_function(cb, iseq, version, function);
+    let asm = asm.prepare()?;
+    emit_function(cb, iseq, jit, asm)
+}
+
+/// Lower HIR to LIR. Reads ISEQs, CMEs, classes, shapes and profiles, so it must
+/// run with the GVL held. See [`crate::bgcompile`] for the phase split.
+///
+/// `cb` is read only for the placeholder address a JIT-to-JIT call site is
+/// assembled with; `gen_iseq_call` overwrites it with the real stub address at
+/// install time. Any address in the code region does, since they all encode to the
+/// same instruction width, which is why it does not matter that the write pointer
+/// may have moved on by then.
+fn lower_function(cb: &CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> (JITState, Assembler) {
+    crate::stats::timed_compile_phase(Counter::compile_lir_lower_time_ns, "codegen", || {
         // Reserve one JITFrame slot per simultaneously live frame. The top-level
         // frame is depth 0, and each level of inlining adds another frame that
         // can be on the CFP chain at the same time, so we need
@@ -985,10 +1170,13 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         asm.validate_jump_positions();
 
         (jit, asm)
-    });
+    })
+}
 
-    // Generate code if everything can be compiled
-    let result = asm.compile(cb);
+/// Write a prepared function's machine code into `cb`. Registers patch points and
+/// bakes in object references, so it must run with the GVL held.
+fn emit_function(cb: &mut CodeBlock, iseq: IseqPtr, mut jit: JITState, asm: Assembler) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
+    let result = asm.emit_prepared(cb);
     if let Ok((start_ptr, _)) = result {
         if get_option!(perf) == Some(PerfMap::ISEQ) {
             let start_usize = start_ptr.raw_addr(cb);
@@ -1014,7 +1202,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 }
 
 /// Compile an instruction
-fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, insn: &Insn) -> Result<(), InsnId> {
+fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, insn: &Insn) -> Result<(), InsnId> {
     // Convert InsnId to lir::Opnd
     macro_rules! opnd {
         ($insn_id:ident) => {
@@ -2581,7 +2769,7 @@ fn gen_pop_inline_frame(
 /// If `block_handler` is provided, it's used as the specval for the new frame (for forwarding blocks).
 /// Otherwise, `VM_BLOCK_HANDLER_NONE` is used.
 fn gen_send_iseq_direct(
-    cb: &mut CodeBlock,
+    cb: &CodeBlock,
     jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
@@ -2808,7 +2996,7 @@ fn gen_invokeproc(
 /// On a guard miss, side-exit and recompile. The HIR gate ensures the block is simple + lead-only
 /// + non-throwing.
 fn gen_invoke_block_iseq_direct(
-    cb: &mut CodeBlock,
+    cb: &CodeBlock,
     jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,

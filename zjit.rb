@@ -163,6 +163,8 @@ class << RubyVM::ZJIT
       :bg_compile_discard_count,
       :bg_compile_thread_restart_count,
       :bg_compile_disabled_count,
+      :bg_compile_stale_discard_count,
+      :bg_compile_nogvl_time_ns,
 
       :compile_time_ns,
       :compile_side_exit_time_ns,

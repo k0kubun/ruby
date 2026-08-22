@@ -5,6 +5,8 @@ use crate::fasthash::{FastHashMap as HashMap, FastHashSet as HashSet};
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
+use crate::bg_assume::Assumption;
+use crate::bgcompile::{note_invalidation, note_invalidation_all};
 use crate::codegen::{InvalidationCause, invalidate_iseq_version};
 use crate::cruby::{rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
 use crate::stats::with_time_stat;
@@ -237,6 +239,11 @@ pub extern "C" fn rb_zjit_bop_redefined(klass: RedefinitionFlag, bop: ruby_basic
         return;
     }
 
+    // A background compilation may be in its GVL-free phase having assumed this
+    // very BOP; it cannot be patched, so it has to be discarded. See
+    // [`crate::bg_assume`].
+    note_invalidation(Assumption::Bop(klass, bop));
+
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();
         if let Some(patch_points) = invariants.bop_patch_points.remove(&(klass, bop)) {
@@ -260,6 +267,8 @@ pub extern "C" fn rb_zjit_invalidate_no_ep_escape(iseq: IseqPtr) {
     if !ZJITState::has_instance() {
         return;
     }
+
+    note_invalidation(Assumption::NoEpEscape(iseq));
 
     with_vm_lock(src_loc!(), || {
         // Remember that this ISEQ may escape EP
@@ -427,6 +436,17 @@ pub extern "C" fn rb_zjit_method_lookup_changed(mid: ID) {
     if !zjit_enabled_p() || !ZJITState::has_instance() {
         return;
     }
+
+    // Before the ANY_NO_METHOD_OVERRIDE_STATE short-circuit: a compilation in its
+    // GVL-free phase has not registered its patch points yet, so that flag says
+    // nothing about it. Keyed by name, so the `def` this usually is discards
+    // nothing unless the compilation actually assumed that name's lookup.
+    if mid.0 == 0 {
+        // Every method name may have changed, which is too broad to key on.
+        note_invalidation_all();
+    } else {
+        note_invalidation(Assumption::MethodLookup(mid));
+    }
     if !ANY_NO_METHOD_OVERRIDE_STATE.load(Ordering::Acquire) {
         return;
     }
@@ -500,6 +520,8 @@ pub extern "C" fn rb_zjit_cme_invalidate(cme: *const rb_callable_method_entry_t)
         return;
     }
 
+    note_invalidation(Assumption::Cme(cme));
+
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();
         // Get the CMD's jumps and remove the entry from the map as it has been invalidated
@@ -522,6 +544,8 @@ pub extern "C" fn rb_zjit_constant_state_changed(id: ID) {
     if !zjit_enabled_p() {
         return;
     }
+
+    note_invalidation(Assumption::Constant(id));
 
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();
@@ -561,6 +585,8 @@ pub extern "C" fn rb_zjit_invalidate_single_ractor() {
         return;
     }
 
+    note_invalidation_all();
+
     with_vm_lock(src_loc!(), || {
         let cb = ZJITState::get_code_block();
         let patch_points = mem::take(&mut ZJITState::get_invariants().single_ractor_patch_points);
@@ -593,6 +619,8 @@ pub extern "C" fn rb_zjit_tracing_invalidate_all() {
     if !zjit_enabled_p() {
         return;
     }
+
+    note_invalidation_all();
 
     // Stop other ractors since we are going to patch machine code.
     with_vm_lock(src_loc!(), || {
@@ -641,6 +669,8 @@ pub extern "C" fn rb_zjit_invalidate_newobj_hook() {
         return;
     }
 
+    note_invalidation_all();
+
     with_vm_lock(src_loc!(), || {
         let cb = ZJITState::get_code_block();
         let patch_points = mem::take(&mut ZJITState::get_invariants().no_newobj_hook_patch_points);
@@ -680,6 +710,8 @@ pub extern "C" fn rb_zjit_invalidate_root_box() {
         return;
     }
 
+    note_invalidation_all();
+
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();
         invariants.non_root_box_created = true;
@@ -709,6 +741,8 @@ pub extern "C" fn rb_zjit_invalidate_no_singleton_class(klass: VALUE) {
     if !zjit_enabled_p() {
         return;
     }
+
+    note_invalidation(Assumption::NoSingletonClass(klass));
 
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();

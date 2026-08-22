@@ -22,6 +22,7 @@ mod hir_type;
 mod hir_effect;
 mod codegen;
 mod bgcompile;
+mod bg_assume;
 mod stats;
 mod cast;
 mod virtualmem;

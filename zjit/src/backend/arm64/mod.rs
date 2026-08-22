@@ -1685,6 +1685,13 @@ impl Assembler {
 
     /// Optimize and compile the stored instructions
     pub fn compile_with_regs(self, cb: &mut CodeBlock, regs: Vec<Reg>) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
+        self.prepare_with_regs(regs)?.emit_prepared(cb)
+    }
+
+    /// Run every backend pass that does not write machine code. See
+    /// [`Assembler::prepare`]: nothing here may touch the VM, the code block, or
+    /// any other state shared with a thread that holds the GVL.
+    pub fn prepare_with_regs(self, regs: Vec<Reg>) -> Result<Assembler, CompileError> {
         // The backend is allowed to use scratch registers only if it has not accepted them so far.
         let use_scratch_reg = !self.accept_scratch_reg;
         let mut regs = if self.allow_callee_saved {
@@ -1802,29 +1809,25 @@ impl Assembler {
             asm_dump!(asm, resolve_parallel_mov);
         }
 
-        timed_compile_phase(Counter::compile_lir_emit_time_ns, "emit", || {
-            // Create label instances in the code block
-            for (idx, name) in asm.label_names.iter().enumerate() {
-                let label = cb.new_label(name.clone());
-                assert_eq!(label, Label(idx));
-            }
+        Ok(asm)
+    }
 
-            let start_ptr = cb.get_write_ptr();
-            let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
-            assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
+    /// Write machine code for this architecture. Called by
+    /// [`Assembler::emit_prepared`], which owns the parts that are the same
+    /// everywhere (labels, `link_labels`, timing).
+    pub(super) fn arch_emit(&mut self, cb: &mut CodeBlock) -> Result<Vec<CodePtr>, CompileError> {
+        let start_ptr = cb.get_write_ptr();
+        let gc_offsets = self.arm64_emit(cb)?;
 
-            cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
+        trace_compile_phase("invalidate_icache", || {
+            // Invalidate icache for newly written out region so we don't run stale code.
+            unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
+        });
 
-            trace_compile_phase("invalidate_icache", || {
-                // Invalidate icache for newly written out region so we don't run stale code.
-                unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
-            });
-
-            if crate::state::ZJITState::has_instance() {
-                crate::stats::incr_counter_by(crate::stats::Counter::total_native_stack_bytes, (asm.stack_state.stack_slot_count() * (VALUE_BITS as usize)).try_into().unwrap());
-            }
-            Ok((start_ptr, gc_offsets))
-        })
+        if crate::state::ZJITState::has_instance() {
+            crate::stats::incr_counter_by(crate::stats::Counter::total_native_stack_bytes, (self.stack_state.stack_slot_count() * (VALUE_BITS as usize)).try_into().unwrap());
+        }
+        Ok(gc_offsets)
     }
 }
 

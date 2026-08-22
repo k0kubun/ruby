@@ -18,7 +18,7 @@ use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, PerfMap, get_option};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
-use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
+use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, timed_compile_phase, CompileError, Counter};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
 use crate::state::{ZJITState, rb_zjit_record_exit_stack};
@@ -2107,6 +2107,22 @@ pub struct Assembler {
     /// allocator spill slot each one is saved to right after FrameSetup. Every exit path
     /// restores them from these slots. Filled in by [`Self::plan_callee_saved_saves`].
     callee_saved_saves: Vec<(Reg, usize)>,
+
+    /// Side-exit metadata this function's exits need, in the order
+    /// [`Insn::ExitMetaIndex`] refers to it. Built by [`Self::compile_exits`] and
+    /// handed to the process-wide table by [`Self::adopt_exit_metas`].
+    ///
+    /// Exits used to intern straight into that table, which made `compile_exits`
+    /// a writer of shared state and so unable to run off the GVL. Keeping the
+    /// records local until the code is emitted costs one extra pass over the
+    /// instructions and buys the whole side-exit phase a place in
+    /// [`crate::bgcompile`]'s GVL-free window.
+    pending_exit_metas: Vec<crate::exit_meta::ExitMeta>,
+
+    /// Profile windows to reopen for the guard exits this function compiled:
+    /// `(ISEQ, instruction index)`. Applied by [`Self::adopt_exit_metas`] for the
+    /// same reason the metadata is deferred -- it writes another ISEQ's payload.
+    pending_profile_resets: Vec<(IseqPtr, u32)>,
 }
 
 impl Assembler
@@ -2129,6 +2145,8 @@ impl Assembler
             saved_sp: None,
             allow_callee_saved: false,
             callee_saved_saves: Vec::default(),
+            pending_exit_metas: Vec::default(),
+            pending_profile_resets: Vec::default(),
         }
     }
 
@@ -2170,6 +2188,10 @@ impl Assembler
             stack_state: old_asm.stack_state.clone(),
             allow_callee_saved: old_asm.allow_callee_saved,
             callee_saved_saves: old_asm.callee_saved_saves.clone(),
+            // Carried, not rebuilt: compile_exits runs before scratch_split, and
+            // scratch_split's output Assembler is the one that gets emitted.
+            pending_exit_metas: old_asm.pending_exit_metas.clone(),
+            pending_profile_resets: old_asm.pending_profile_resets.clone(),
             ..Self::new()
         };
 
@@ -3892,14 +3914,76 @@ impl Assembler
         }
     }
 
+    /// Everything the backend does to an Assembler before a single byte of machine
+    /// code is written: splitting, register allocation, side-exit compilation and
+    /// the scratch-register pass. Touches nothing but `self`, which is what lets
+    /// [`crate::bgcompile`] run it without the GVL.
+    ///
+    /// The result is only good for [`Self::emit_prepared`]; running any other pass
+    /// over it is not supported.
+    pub fn prepare(self) -> Result<Assembler, CompileError> {
+        let alloc_regs = Self::get_alloc_regs();
+        self.prepare_with_regs(alloc_regs)
+    }
+
+    /// Hand this function's side-exit metadata to the process-wide table and reopen
+    /// the profile windows its guard exits asked for, rewriting the local indices
+    /// [`Self::compile_exits`] handed out into table indices.
+    ///
+    /// Must run with the GVL held: it appends to a table the interpreter reads and
+    /// writes other ISEQs' payloads. Called from [`Self::emit_prepared`], so a
+    /// prepared Assembler carries these effects until the moment it is emitted.
+    fn adopt_exit_metas(&mut self) {
+        for (iseq, insn_idx) in std::mem::take(&mut self.pending_profile_resets) {
+            get_or_create_iseq_payload(iseq).reset_profiles_remaining(insn_idx as YarvInsnIdx);
+        }
+
+        let pending = std::mem::take(&mut self.pending_exit_metas);
+        if pending.is_empty() {
+            return;
+        }
+        // The table is append-only, so interning the records in order gives them
+        // consecutive indices and one base is enough to shift every reference.
+        let base = crate::exit_meta::intern(pending[0]);
+        for &meta in pending[1..].iter() {
+            crate::exit_meta::intern(meta);
+        }
+        for block in self.basic_blocks.iter_mut() {
+            for insn in block.insns.iter_mut() {
+                if let Insn::ExitMetaIndex(idx) = insn {
+                    *idx += base;
+                }
+            }
+        }
+    }
+
+    /// Write a prepared Assembler's machine code into `cb`. Must run with the GVL
+    /// held; this is where patch points get registered and objects get baked in.
+    pub fn emit_prepared(mut self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
+        self.adopt_exit_metas();
+        timed_compile_phase(Counter::compile_lir_emit_time_ns, "emit", || {
+            // Create label instances in the code block
+            for (idx, name) in self.label_names.iter().enumerate() {
+                let label = cb.new_label(name.clone());
+                assert_eq!(label, Label(idx));
+            }
+
+            let start_ptr = cb.get_write_ptr();
+            let gc_offsets = self.arch_emit(cb).inspect_err(|_| cb.clear_labels())?;
+            assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
+
+            cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
+            Ok((start_ptr, gc_offsets))
+        })
+    }
+
     /// Compile the instructions down to machine code.
     /// Can fail due to lack of code memory and inopportune code placement, among other reasons.
     pub fn compile(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
-        let alloc_regs = Self::get_alloc_regs();
         let had_dropped_bytes = cb.has_dropped_bytes();
-        let ret = self.compile_with_regs(cb, alloc_regs).inspect_err(|err| {
+        let ret = self.prepare().and_then(|asm| asm.emit_prepared(cb)).inspect_err(|err| {
             // If we use too much memory to compile the Assembler, it would set cb.dropped_bytes = true.
             // To avoid failing future compilation by cb.has_dropped_bytes(), attempt to reset dropped_bytes with
             // the current zjit_alloc_bytes() which may be decreased after self is dropped in compile_with_regs().
@@ -4073,8 +4157,7 @@ impl Assembler
 
         fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
             if let Some(recompile) = &exit.recompile {
-                let payload = get_or_create_iseq_payload(exit.iseq);
-                payload.reset_profiles_remaining(recompile.insn_idx as YarvInsnIdx);
+                asm.pending_profile_resets.push((exit.iseq, recompile.insn_idx));
                 use crate::codegen::exit_recompile;
                 asm_comment!(asm, "profile and maybe recompile");
                 asm_ccall!(asm, exit_recompile,
@@ -4085,19 +4168,21 @@ impl Assembler
             }
         }
 
-        /// Intern the constants this exit hands the interpreter, so the stub can name
+        /// Record the constants this exit hands the interpreter, so the stub can name
         /// them with one 32-bit immediate instead of materializing each of them.
         /// `interned` dedupes within this function: two exits that differ only in
         /// where their stack and locals live share one record.
+        ///
+        /// The index returned is into this function's own
+        /// [`Assembler::pending_exit_metas`]; [`Assembler::adopt_exit_metas`] turns
+        /// it into an index into the process-wide table once the GVL is held again.
         fn compile_exit_meta_index(
             exit: &SideExit,
+            pending: &mut Vec<ExitMeta>,
             interned: &mut HashMap<ExitMeta, u32>,
         ) -> u32 {
             let recompile = exit.recompile.as_ref();
             if let Some(recompile) = recompile {
-                // The recompile is gated on a fresh profile of the exiting instruction.
-                let payload = get_or_create_iseq_payload(exit.iseq);
-                payload.reset_profiles_remaining(recompile.insn_idx as YarvInsnIdx);
                 debug_assert_eq!(
                     recompile.frame_iseq, Opnd::Value(VALUE::from(exit.iseq)),
                     "ExitMeta::iseq doubles as exit_recompile's frame_iseq",
@@ -4110,7 +4195,13 @@ impl Assembler
                 pc: pc as *const VALUE,
                 iseq: exit.iseq,
                 compiled_iseq: match recompile {
-                    Some(SideExitRecompile { compiled_iseq: Opnd::Value(iseq), .. }) => iseq.as_iseq(),
+                    // as_ptr, not as_iseq: this runs in the GVL-free phase of a
+                    // background compile, where a compaction may already have moved
+                    // the ISEQ this points at. The compilation is discarded when
+                    // that happens (see [`crate::bgcompile`]), so the stale pointer
+                    // never reaches the code region -- but validating it as a live
+                    // handle would abort a debug build before we get there.
+                    Some(SideExitRecompile { compiled_iseq: Opnd::Value(iseq), .. }) => iseq.as_ptr(),
                     Some(recompile) => unreachable!(
                         "recompile target should be a constant ISEQ, got {:?}", recompile.compiled_iseq
                     ),
@@ -4119,7 +4210,12 @@ impl Assembler
                 sp_offset: exit.stack.len().try_into().expect("exit stack size should fit in 32 bits"),
                 insn_idx: recompile.map_or(0, |recompile| recompile.insn_idx),
             };
-            *interned.entry(meta).or_insert_with(|| crate::exit_meta::intern(meta))
+            *interned.entry(meta).or_insert_with(|| {
+                let idx = u32::try_from(pending.len())
+                    .expect("side-exit metadata index should fit in 32 bits");
+                pending.push(meta);
+                idx
+            })
         }
 
         /// Compile a traced side exit. `--zjit-trace-side-exits` records the exiting
@@ -4295,7 +4391,8 @@ impl Assembler
                         let new_exit = self.new_label("side_exit");
                         self.write_label(new_exit.clone());
                         asm_comment!(self, "Exit: {}", entry.key().pc);
-                        let meta_idx = compile_exit_meta_index(entry.key(), &mut interned_metas);
+                        let meta_idx = compile_exit_meta_index(
+                            entry.key(), &mut self.pending_exit_metas, &mut interned_metas);
                         if exit_tail_target.is_none() {
                             exit_tail_target = Some(if self.callee_saved_saves.is_empty() {
                                 Target::CodePtr(ZJITState::get_exit_meta_trampoline())
@@ -5058,7 +5155,16 @@ impl Assembler {
     pub fn count_call_to_with(&mut self, fn_name: impl FnOnce() -> String) {
         // We emit ccalls while initializing the JIT. Unfortunately, we skip those because
         // otherwise we have no counter pointers to read.
-        if crate::state::ZJITState::has_instance() && get_option!(stats) {
+        //
+        // Also skipped in the GVL-free phase of a background compile, which reaches
+        // here through the guard-exit `exit_recompile` call: the name-to-counter
+        // table is shared with every GVL-holding thread, so registering a name
+        // there without the GVL would be a data race. The cost is that the ccall
+        // counter for those exits undercounts under `--zjit-stats`, which is a
+        // strictly better trade than either racing or giving up the phase split
+        // whenever stats are on. See [`crate::bgcompile`].
+        if crate::state::ZJITState::has_instance() && get_option!(stats)
+            && !crate::bgcompile::in_nogvl_phase() {
             let ccall_counter_pointers = crate::state::ZJITState::get_ccall_counter_pointers();
             let counter_ptr = ccall_counter_pointers.entry(fn_name()).or_insert_with(|| Box::new(0));
             let counter_ptr: &mut u64 = counter_ptr.as_mut();

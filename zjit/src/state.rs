@@ -245,31 +245,37 @@ impl ZJITState {
 
     /// Get a mutable reference to the inline code block
     pub fn get_code_block() -> &'static mut CodeBlock {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_code_block");
         &mut ZJITState::get_instance().code_block
     }
 
     /// Get a mutable reference to the invariants
     pub fn get_invariants() -> &'static mut Invariants {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_invariants");
         &mut ZJITState::get_instance().invariants
     }
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_jit_frames");
         &mut ZJITState::get_instance().jit_frames
     }
 
     /// Owner of the side-exit metadata table. Indices into it are baked into exit
     /// stubs, so entries are append-only and never move. See [`crate::exit_meta`].
     pub fn get_exit_metas() -> &'static mut Vec<ExitMeta> {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_exit_metas");
         &mut ZJITState::get_instance().exit_metas
     }
 
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
     pub fn get_ivar_caches() -> &'static mut HashMap<ID, Box<crate::ivar_cache::IvarCache>> {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_ivar_caches");
         &mut ZJITState::get_instance().ivar_caches
     }
 
     /// Owner of every per-call-shape class table. See [`crate::send_cache`].
     pub fn get_send_caches() -> &'static mut crate::send_cache::SendCaches {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_send_caches");
         &mut ZJITState::get_instance().send_caches
     }
 
@@ -331,6 +337,7 @@ impl ZJITState {
 
     /// Get a mutable reference to ccall counter pointers
     pub fn get_ccall_counter_pointers() -> &'static mut HashMap<String, Box<u64>> {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_ccall_counter_pointers");
         &mut ZJITState::get_instance().ccall_counter_pointers
     }
 
@@ -429,6 +436,7 @@ impl ZJITState {
 
     /// Get a mutable reference to the Perfetto tracer
     pub fn get_tracer() -> Option<&'static mut PerfettoTracer> {
+        crate::bgcompile::assert_gvl_held("ZJITState::get_tracer");
         if !ZJITState::has_instance() { return None; }
         ZJITState::get_instance().perfetto_tracer.as_mut()
     }

@@ -424,7 +424,7 @@ class TestZJITCLI < Test::Unit::TestCase
   BG = %w[--zjit-background-compile].freeze
 
   def test_background_compile_option_compiles_on_the_compile_thread
-    assert_runs '[true, true, true, 7]', <<~RUBY, extra_args: BG_BLOCK, stats: :quiet, call_threshold: 2, debug: false
+    assert_runs '[true, true, true, true, 7]', <<~RUBY, extra_args: BG_BLOCK, stats: :quiet, call_threshold: 2, debug: false
       def add(a, b) = a + b
       10.times { add(1, 2) }
       stats = RubyVM::ZJIT.stats
@@ -432,6 +432,9 @@ class TestZJITCLI < Test::Unit::TestCase
         stats[:bg_compile_count] > 0,
         stats[:compiled_iseq_count] == stats[:bg_compile_count],
         stats[:bg_compile_overflow_count] == 0,
+        # The developer blocking flag routes through the phase-split path like
+        # everything else, rather than quietly falling back to holding the GVL.
+        stats[:bg_compile_nogvl_time_ns] > 0,
         add(3, 4),
       ]
     RUBY
@@ -594,6 +597,177 @@ class TestZJITCLI < Test::Unit::TestCase
       # Overflow must not be mistaken for a broken compile thread: an enqueuing
       # loop that never yields the GVL legitimately outruns it.
       [stats[:bg_compile_overflow_count] > 0, stats[:bg_compile_disabled_count] == 0]
+    RUBY
+  end
+
+  #
+  # The GVL-free phase. Compilation releases the GVL for register allocation and
+  # side-exit compilation, so unlike every window above, an invalidation *can*
+  # land between the compiler reading the VM and the code being installed. The
+  # compilation has to be discarded, not installed.
+  #
+  # `--zjit-background-compile-stall-ms` holds that window open so the race is
+  # deterministic instead of microseconds wide. Each test below enqueues an ISEQ,
+  # waits for the compile thread to reach the stall, invalidates something the
+  # compilation assumed, and checks both that a discard was counted and that the
+  # program still computes the right answer.
+  #
+
+  # Holds the GVL-free phase of every compile open for 40ms.
+  BG_STALL = %w[--zjit-background-compile --zjit-background-compile-stall-ms=40].freeze
+
+  # Control for the tests below: with the window held open but nothing
+  # invalidated, compiles must still install. A stall that discarded everything
+  # would make the assertions in those tests vacuous.
+  def test_background_compile_stall_still_installs
+    assert_runs '[true, true, 7]', <<~RUBY, extra_args: BG_STALL, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      def add(a, b) = a + b
+      10.times { add(1, 2) }
+      sleep 0.5
+      stats = RubyVM::ZJIT.stats
+      [stats[:bg_compile_count] > 0, stats[:bg_compile_stale_discard_count] == 0, add(3, 4)]
+    RUBY
+  end
+
+  # A method the compilation speculated on is redefined while the compilation is
+  # in its GVL-free phase. The CME it read is invalidated before its patch point
+  # exists, so installing would leave code guarded by nothing.
+  def test_background_compile_stale_cme_is_discarded
+    assert_runs '[true, true]', <<~RUBY, extra_args: BG_STALL, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      n = 40
+      n.times do |i|
+        eval "class C\#{i}; def value = 1; def twice = value + value; end"
+      end
+      objs = n.times.map { |i| Object.const_get("C\#{i}").new }
+
+      n.times do |i|
+        # Cross the threshold, which enqueues `twice` and `value`.
+        3.times { objs[i].twice }
+        # Releases the GVL, so the compile thread picks the batch up, runs its
+        # HIR, and parks in the middle of the GVL-free phase.
+        sleep 0.02
+        # Lands inside that window: the compilation assumed this CME.
+        Object.const_get("C\#{i}").class_eval("def value = 1")
+        sleep 0.04
+      end
+
+      sleep 1
+      results = objs.map(&:twice)
+      raise "wrong result: \#{results.uniq.inspect}" unless results.all? { |r| r == 2 }
+      stats = RubyVM::ZJIT.stats
+      [stats[:bg_compile_stale_discard_count] > 0, results.uniq == [2]]
+    RUBY
+  end
+
+  # Same window, different invalidation hook: a constant the compilation read is
+  # written to. Constant assumptions are keyed by name rather than by CME, so
+  # this exercises a separate path into the poisoning check.
+  def test_background_compile_stale_constant_is_discarded
+    assert_runs '[true, true]', <<~RUBY, extra_args: BG_STALL, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      n = 40
+      n.times do |i|
+        eval "class K\#{i}; LIMIT = 7; def limit = LIMIT; def double = limit + limit; end"
+      end
+      objs = n.times.map { |i| Object.const_get("K\#{i}").new }
+
+      n.times do |i|
+        3.times { objs[i].double }
+        sleep 0.02
+        klass = Object.const_get("K\#{i}")
+        verbose, $VERBOSE = $VERBOSE, nil
+        klass.const_set(:LIMIT, 7)
+        $VERBOSE = verbose
+        sleep 0.04
+      end
+
+      sleep 1
+      results = objs.map(&:double)
+      raise "wrong result: \#{results.uniq.inspect}" unless results.all? { |r| r == 14 }
+      stats = RubyVM::ZJIT.stats
+      [stats[:bg_compile_stale_discard_count] > 0, results.uniq == [14]]
+    RUBY
+  end
+
+  # A compaction lands in the window. It moves the ISEQs, classes and objects the
+  # paused compilation holds raw pointers to, so the compilation is discarded
+  # whatever it assumed -- and the discard has to happen before anything reads the
+  # ISEQ, since reading a moved one is a segfault rather than a wrong answer.
+  def test_background_compile_stale_compaction_is_discarded
+    assert_runs '[true, true]', <<~RUBY, extra_args: BG_STALL, stats: :quiet, call_threshold: 2, debug: false, timeout: 300
+      n = 40
+      n.times { |i| Object.class_eval "def m\#{i}(x) = x + \#{i}" }
+      o = Object.new
+      n.times do |i|
+        3.times { o.send(:"m\#{i}", 1) }
+        sleep 0.02
+        GC.compact
+        sleep 0.02
+      end
+      sleep 1
+      GC.compact
+      n.times { |i| raise "wrong result" unless o.send(:"m\#{i}", 5) == 5 + i }
+      stats = RubyVM::ZJIT.stats
+      [stats[:bg_compile_stale_discard_count] > 0, n.times.all? { |i| o.send(:"m\#{i}", 5) == 5 + i }]
+    RUBY
+  end
+
+  # The window with everything invalidating at once, and with more than one
+  # compilation in flight per batch. No determinism claimed; this is the fuzz
+  # counterpart of the targeted tests above.
+  def test_background_compile_stall_invalidation_storm
+    assert_runs 'true', <<~RUBY, extra_args: BG_STALL, call_threshold: 2, debug: false, timeout: 300
+      class Storm
+        VALUE = 1
+        def value = VALUE
+        def twice = value + value
+      end
+
+      stop = false
+      workers = 4.times.map do
+        Thread.new do
+          target = Storm.new
+          until stop
+            500.times { target.twice }
+            Object.new.singleton_class.class_eval { def only_here = 1 }
+          end
+        end
+      end
+
+      mutator = Thread.new do
+        i = 0
+        until stop
+          i += 1
+          Storm.class_eval("def value = VALUE")
+          verbose, $VERBOSE = $VERBOSE, nil
+          Storm.const_set(:VALUE, 1)
+          $VERBOSE = verbose
+          Object.new.singleton_class if i.even?
+          Class.new(Storm) { def value = 1 } if i % 8 == 0
+          GC.compact if i % 64 == 0
+          sleep 0.005
+        end
+      end
+
+      sleep 4
+      stop = true
+      workers.each(&:join)
+      mutator.join
+      raise "wrong result" unless Storm.new.twice == 2
+      true
+    RUBY
+  end
+
+  # `--zjit-background-compile-hold-gvl` puts the whole pipeline back under one
+  # critical section. It exists for A/B measurement, and it is also the fallback
+  # the debug options select, so it has to stay a working configuration.
+  def test_background_compile_hold_gvl
+    assert_runs '[true, true, 7]', <<~RUBY, extra_args: %w[--zjit-background-compile-hold-gvl], stats: :quiet, call_threshold: 2, debug: false
+      def add(a, b) = a + b
+      10.times { add(1, 2) }
+      sleep 0.5
+      stats = RubyVM::ZJIT.stats
+      # Nothing ran off the GVL, so nothing could have gone stale.
+      [stats[:bg_compile_count] > 0, stats[:bg_compile_nogvl_time_ns] == 0, add(3, 4)]
     RUBY
   end
 

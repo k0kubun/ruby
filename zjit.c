@@ -22,6 +22,7 @@
 #include "constant.h"
 #include "iseq.h"
 #include "ruby/debug.h"
+#include "ruby/thread.h"
 #include "internal/cont.h"
 #include "ractor_core.h"
 #include "shape.h"
@@ -114,6 +115,26 @@ bool
 rb_zjit_thread_alive_p(VALUE thread)
 {
     return rb_thread_ptr(thread)->status != THREAD_KILLED;
+}
+
+// Run the middle phase of a background compilation with the GVL released, so it
+// overlaps application execution on another core. See bgcompile.rs.
+//
+// A NULL unblocking function, which makes the region uninterruptible: there is
+// nothing for a ubf to cancel, since the work is pure computation on the Rust heap
+// rather than a syscall, and cutting it short would leave a half-prepared
+// compilation. An interrupt aimed at the compile thread sets the flag and is acted
+// on when the region returns.
+//
+// Not RB_NOGVL_INTR_FAIL, tempting as it looks: that flag also makes
+// unblock_function_set() decline to enter the region at all when any interrupt is
+// already pending, and the compile thread always has one pending -- it runs for
+// long stretches without a check point, so the timer thread's periodic
+// TIMER_INTERRUPT is still set. func would simply never run.
+void
+rb_zjit_compile_without_gvl(void (*func)(void *), void *data)
+{
+    rb_thread_call_without_gvl((void *(*)(void *))func, data, NULL, NULL);
 }
 
 // Put an ISEQ's call counter one short of the call threshold, so that the next
