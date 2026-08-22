@@ -4183,6 +4183,17 @@ impl Assembler
         let saved_block = self.current_block_id;
         let exit_block = self.new_block_without_id("side_exits");
 
+        // Every exit stub writes out its frame's stack and locals, so the block about to
+        // hold them all is as big as the sum of those, plus a handful of instructions per
+        // exit. On an ISEQ with a large frame and many exits that block runs to millions
+        // of instructions, and growing it from empty meant reallocating and copying
+        // hundreds of megabytes on the way there.
+        const INSNS_PER_EXIT_OVERHEAD: usize = 8;
+        let estimated_exit_insns: usize = targets.iter()
+            .map(|(_, data)| data.exit.stack.len() + data.exit.locals.len() + INSNS_PER_EXIT_OVERHEAD)
+            .sum();
+        self.basic_blocks[exit_block.0].reserve_insns(estimated_exit_insns);
+
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> = HashMap::default();
 
@@ -5864,7 +5875,7 @@ mod tests {
         asm.number_instructions(16);
 
         // Build intervals
-        let intervals = asm.build_intervals(live_in);
+        let intervals = asm.build_intervals(&live_in);
 
         // Extract vreg indices
         let r10_idx = if let Opnd::VReg { idx, .. } = r10 { idx } else { panic!() };
@@ -5909,7 +5920,7 @@ mod tests {
         asm.number_instructions(16);
 
         // Build intervals
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
 
         println!("LIR live_intervals:\n{}", crate::backend::lir::debug_intervals(&asm, &intervals));
 
@@ -5949,7 +5960,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(16);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
 
         // 3 registers -- enough for every interval once holes are reused
         let mut regs = alloc_reg_pool(3);
@@ -5980,7 +5991,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(16);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
 
         // Only 1 register available -- forces spills
         let mut regs = alloc_reg_pool(1);
@@ -6018,7 +6029,7 @@ mod tests {
 
         asm.number_instructions(0);
         let live_in = asm.analyze_liveness();
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         // Zero allocatable registers: the only register this interval can get
         // is the pinned one appended to the pool, so the preference is what
         // makes this succeed rather than spill.
@@ -6046,7 +6057,7 @@ mod tests {
 
         // Get the debug output
         let live_in = asm.analyze_liveness();
-        let intervals = asm.build_intervals(live_in);
+        let intervals = asm.build_intervals(&live_in);
         let output = debug_intervals(&asm, &intervals);
 
         // Verify it contains the grid structure
@@ -6133,7 +6144,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(16);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
@@ -6179,7 +6190,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(16);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
@@ -6236,7 +6247,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
@@ -6305,7 +6316,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(16);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let mut regs = alloc_reg_pool(5);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let num_stack_slots = asm.linear_scan(&intervals, &regs, &[]);
@@ -6410,7 +6421,7 @@ mod tests {
         // Run liveness + numbering + intervals + linear scan with 2 registers
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let num_regs = 2;
         let mut regs = alloc_reg_pool(num_regs);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
@@ -6507,7 +6518,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let call_positions = asm.ccall_positions();
         assert_eq!(call_positions.len(), 1, "expected exactly one CCall");
 
@@ -6534,7 +6545,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let call_positions = asm.ccall_positions();
         let mut regs = callee_saved_reg_pool();
         asm.preferred_register_assignments(&mut intervals, &mut regs);
@@ -6602,7 +6613,7 @@ mod tests {
 
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in);
+        let mut intervals = asm.build_intervals(&live_in);
         let call_positions = asm.ccall_positions();
         let mut regs = callee_saved_reg_pool();
         asm.preferred_register_assignments(&mut intervals, &mut regs);
@@ -6690,7 +6701,7 @@ mod tests {
     fn run_coalescing(asm: &mut Assembler, num_regs: usize) -> (Vec<Interval>, RegPool, Vec<usize>) {
         let live_in = asm.analyze_liveness();
         asm.number_instructions(0);
-        let mut intervals = asm.build_intervals(live_in.clone());
+        let mut intervals = asm.build_intervals(&live_in);
         let mut regs = alloc_reg_pool(num_regs);
         asm.preferred_register_assignments(&mut intervals, &mut regs);
         let roots = asm.coalesce_block_params(&mut intervals, &live_in);
@@ -6843,3 +6854,4 @@ mod tests {
         assert_ne!(intervals[pa_idx].assigned.get(), intervals[pb_idx].assigned.get());
     }
 }
+

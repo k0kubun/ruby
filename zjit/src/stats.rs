@@ -1145,7 +1145,7 @@ pub fn timed_compile_phase<F, R>(counter: Counter, name: &str, func: F) -> R whe
         // ZJITState::init() also runs the backend to build trampolines, before the
         // counters exist. Those compilations are a fixed handful, so leaving them out of
         // the per-phase totals costs nothing and saves a panic.
-        if !get_option!(stats) || !crate::state::ZJITState::has_instance() {
+        if !get_option!(stats, /*default=*/false) || !crate::state::ZJITState::has_instance() {
             return func();
         }
         with_time_stat(counter, func)
