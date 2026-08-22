@@ -4266,7 +4266,7 @@ impl Function {
     pub fn resolve(&mut self, insn_id: InsnId) -> ResolvedInsnId {
         let Self { insns, union_find, .. } = self;
         let insn_id = union_find.find_const(insn_id);
-        insns[insn_id.to_usize()].for_each_operand_mut(&mut |operand: &mut InsnId| {
+        insns[insn_id.to_usize()].for_each_operand_mut(|operand: &mut InsnId| {
             *operand = union_find.find_const(*operand);
         });
         ResolvedInsnId(insn_id)
@@ -4288,7 +4288,7 @@ impl Function {
         let Self { insns, union_find, .. } = self;
         let union_find = union_find;
         for insn in insns.iter_mut() {
-            insn.for_each_operand_mut(&mut |operand: &mut InsnId| {
+            insn.for_each_operand_mut(|operand: &mut InsnId| {
                 *operand = union_find.find_const(*operand);
             });
         }
@@ -4610,6 +4610,9 @@ impl Function {
         for (idx, &block_id) in rpo.iter().enumerate() {
             rpo_order[block_id.to_usize()] = idx;
         }
+        // One scratch buffer for the per-edge argument type snapshots below,
+        // instead of a fresh Vec for every jump on every round of the fixpoint.
+        let mut arg_types: Vec<Type> = Vec::new();
         loop {
             let mut changed = false;
             let mut traversed_back_edge = false;
@@ -4631,8 +4634,9 @@ impl Function {
                                 // Snapshot arg types before any param updates so phi-style
                                 // updates happen in parallel (the args of a self-loop may name
                                 // params of `target` itself).
-                                let arg_types: Vec<Type> = if_true.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                                arg_types.clear();
+                                arg_types.extend(if_true.args.iter().map(|a| self.type_of(*a)));
+                                for (idx, arg_type) in arg_types.drain(..).enumerate() {
                                     let param = self.blocks[if_true.target.to_usize()].params[idx];
                                     changed |= set_type!(param, self.type_of(param).union(arg_type));
                                 }
@@ -4640,8 +4644,9 @@ impl Function {
                             }
                             if self.type_of(*val).could_be(Type::from_cbool(false)) {
                                 reachable.insert(if_false.target);
-                                let arg_types: Vec<Type> = if_false.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                                arg_types.clear();
+                                arg_types.extend(if_false.args.iter().map(|a| self.type_of(*a)));
+                                for (idx, arg_type) in arg_types.drain(..).enumerate() {
                                     let param = self.blocks[if_false.target.to_usize()].params[idx];
                                     changed |= set_type!(param, self.type_of(param).union(arg_type));
                                 }
@@ -4651,8 +4656,9 @@ impl Function {
                         }
                         &Insn::Jump(BranchEdge { target, ref args }) => {
                             reachable.insert(target);
-                            let arg_types: Vec<Type> = args.iter().map(|a| self.type_of(*a)).collect();
-                            for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                            arg_types.clear();
+                            arg_types.extend(args.iter().map(|a| self.type_of(*a)));
+                            for (idx, arg_type) in arg_types.drain(..).enumerate() {
                                 let param = self.blocks[target.to_usize()].params[idx];
                                 changed |= set_type!(param, self.type_of(param).union(arg_type));
                             }
