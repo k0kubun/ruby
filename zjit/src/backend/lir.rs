@@ -2123,6 +2123,22 @@ pub struct Assembler {
     /// `(ISEQ, instruction index)`. Applied by [`Self::adopt_exit_metas`] for the
     /// same reason the metadata is deferred -- it writes another ISEQ's payload.
     pending_profile_resets: Vec<(IseqPtr, u32)>,
+
+    /// Memoized [`Self::block_order`], with the `basic_blocks.len()` it was
+    /// computed at.
+    ///
+    /// Reverse postorder is what roughly ten backend passes iterate in, and
+    /// recomputing it means a depth-first walk of the CFG plus a `successors()`
+    /// call per block, which together were about 4% of all compile instructions.
+    /// Nothing in the register allocator changes the shape of the CFG, so those
+    /// passes can all share one traversal.
+    ///
+    /// Validity: growing `basic_blocks` invalidates the entry by itself (the
+    /// recorded length no longer matches), and the passes that retarget
+    /// terminators or push past one call [`Self::invalidate_block_order`]. Debug
+    /// builds recompute on every hit and assert the memo agrees, so the test
+    /// suite fails loudly if a future pass reshapes the CFG without saying so.
+    block_order_memo: std::cell::RefCell<Option<(usize, Vec<BlockId>)>>,
 }
 
 impl Assembler
@@ -2131,6 +2147,7 @@ impl Assembler
     pub fn new() -> Self {
         Self {
             label_names: Vec::default(),
+            block_order_memo: std::cell::RefCell::new(None),
             accept_scratch_reg: false,
             stack_state: StackState::new(),
             leaf_ccall_stack_size: None,
@@ -3424,6 +3441,11 @@ impl Assembler
         }
 
         self.rewrite_instructions(&block_order, intervals, regs);
+
+        // Splitting a critical edge above both adds a block and retargets the
+        // predecessor's branch at it, so the reverse postorder this pass ran on is
+        // not the one the passes after it should see.
+        self.invalidate_block_order();
     }
 
     /// Work out, for every CCall in `block_order`, which VRegs have to be pushed around
@@ -4561,8 +4583,32 @@ impl Assembler
         (kill_sets, gen_sets)
     }
 
+    /// The order the backend walks blocks in: reverse postorder of the CFG.
+    ///
+    /// Memoized; see [`Self::block_order_memo`] for what keeps the memo honest.
     pub fn block_order(&self) -> Vec<BlockId> {
-        self.reverse_post_order()
+        let num_blocks = self.basic_blocks.len();
+        if let Some((cached_len, cached)) = self.block_order_memo.borrow().as_ref() {
+            if *cached_len == num_blocks {
+                debug_assert_eq!(
+                    *cached, self.reverse_post_order(),
+                    "block order memo is stale: a pass reshaped the CFG without \
+                     calling invalidate_block_order()",
+                );
+                return cached.clone();
+            }
+        }
+        let order = self.reverse_post_order();
+        *self.block_order_memo.borrow_mut() = Some((num_blocks, order.clone()));
+        order
+    }
+
+    /// Drop the [`Self::block_order`] memo. Passes that retarget a terminator, or
+    /// that push instructions past the terminator of a block, have to call this:
+    /// [`BasicBlock::successors`] reads a block's outgoing edges out of its last
+    /// two instructions, so either change can move a block in reverse postorder.
+    pub fn invalidate_block_order(&mut self) {
+        self.block_order_memo.replace(None);
     }
 
     /// Calculate live intervals for each VReg.

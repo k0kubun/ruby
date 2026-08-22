@@ -1353,6 +1353,10 @@ impl Assembler {
                     asm.basic_blocks[last_block.0].insns.push(insn);
                     asm.basic_blocks[last_block.0].insn_ids.push(None);
                 }
+                // The exit code goes in *after* this block's terminator, so the last
+                // two instructions -- which is where successors() reads a block's
+                // outgoing edges from -- are no longer the terminator.
+                asm.invalidate_block_order();
             }
         });
         asm_dump!(asm, compile_exits);
