@@ -65,9 +65,83 @@ const zjit_jit_frame_t rb_zjit_c_frame = (zjit_jit_frame_t) {
 void rb_zjit_profile_disable(const rb_iseq_t *iseq);
 int rb_zjit_insn_to_bare_insn(int insn);
 
+// Helpers for the background compile thread. See zjit/src/bgcompile.rs.
+
+// The calling thread's execution context. The compile thread needs its own to
+// check for native stack space.
+rb_execution_context_t *
+rb_zjit_current_ec(void)
+{
+    return GET_EC();
+}
+
+// Whether the calling thread belongs to the main ractor. Background compilation
+// is offered only there, so that the compile thread outlives every requester.
+bool
+rb_zjit_main_ractor_p(void)
+{
+    return GET_RACTOR() == GET_VM()->ractor.main_ractor;
+}
+
+bool
+rb_zjit_iseq_has_jit_entry(const rb_iseq_t *iseq)
+{
+    return ISEQ_BODY(iseq)->jit_entry != NULL;
+}
+
+void
+rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, void *code_ptr)
+{
+    ISEQ_BODY(iseq)->jit_entry = (rb_jit_func_t)code_ptr;
+}
+
+// Move a thread out of the application's default ThreadGroup, so that ZJIT's
+// compile thread does not show up in `ThreadGroup::Default.list`. It is still
+// visible in `Thread.list`, which has no supported way to hide from.
+void
+rb_zjit_thread_group_isolate(VALUE thread)
+{
+    VALUE klass = rb_const_get(rb_cObject, rb_intern("ThreadGroup"));
+    VALUE group = rb_funcallv(klass, rb_intern("new"), 0, NULL);
+    rb_funcall(group, rb_intern("add"), 1, thread);
+}
+
+// Whether a Thread object has not been killed. Only a field read, so unlike
+// rb_thread_wakeup_alive() it is safe to call while holding the VM lock: waking
+// a thread re-enters vm->ractor.sched.lock, which rb_ractor_sched_barrier_start()
+// holds for the whole of a barriered critical section.
+bool
+rb_zjit_thread_alive_p(VALUE thread)
+{
+    return rb_thread_ptr(thread)->status != THREAD_KILLED;
+}
+
+// Put an ISEQ's call counter one short of the call threshold, so that the next
+// call trips it again. zjit_compile() tests for equality with the threshold, so
+// an ISEQ whose compile request was dropped would otherwise never be offered
+// again. Profiling is left enabled: it was turned on at the profile threshold,
+// which this counter is at or past.
+void
+rb_zjit_iseq_rearm_threshold(const rb_iseq_t *iseq)
+{
+    if (rb_zjit_call_threshold > 0) {
+        ISEQ_BODY(iseq)->jit_entry_calls = (unsigned long)(rb_zjit_call_threshold - 1);
+    }
+}
+
 void
 rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception)
 {
+    // With --zjit-background-compile, hand ordinary entry points to the compile
+    // thread and keep interpreting. Returns false when it declines (flag off,
+    // non-main ractor, queue full, no thread), in which case compile here as
+    // usual. Exception handler entries are always compiled here: they compile for
+    // the live control frame, which the compile thread cannot see.
+    bool rb_zjit_bg_enqueue(const rb_iseq_t *iseq, rb_execution_context_t *ec); // defined in Rust
+    if (!jit_exception && rb_zjit_bg_enqueue(iseq, ec)) {
+        return;
+    }
+
     RB_VM_LOCKING() {
         rb_vm_barrier();
 

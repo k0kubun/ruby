@@ -142,6 +142,14 @@ extern const zjit_jit_frame_t rb_zjit_c_frame;
 extern uint64_t rb_zjit_call_threshold;
 extern uint64_t rb_zjit_profile_threshold;
 void rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception);
+// Called by the background compile thread. See zjit/src/bgcompile.rs.
+rb_execution_context_t *rb_zjit_current_ec(void);
+bool rb_zjit_main_ractor_p(void);
+bool rb_zjit_iseq_has_jit_entry(const rb_iseq_t *iseq);
+void rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, void *code_ptr);
+void rb_zjit_iseq_rearm_threshold(const rb_iseq_t *iseq);
+bool rb_zjit_thread_alive_p(VALUE thread);
+void rb_zjit_thread_group_isolate(VALUE thread);
 void rb_zjit_profile_insn(uint32_t insn, rb_execution_context_t *ec);
 void rb_zjit_profile_enable(const rb_iseq_t *iseq);
 void rb_zjit_bop_redefined(int redefined_flag, enum ruby_basic_operators bop);

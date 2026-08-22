@@ -162,6 +162,24 @@ make_counters! {
         skipped_native_stack_full,
         invalidation_recompiles_granted,
 
+        // --zjit-background-compile. See [`crate::bgcompile`].
+        // ISEQs handed to the compile thread, and compiles it completed.
+        bg_compile_enqueue_count,
+        bg_compile_count,
+        // Deepest the queue ever got, including the request being compiled.
+        bg_compile_queue_high_water,
+        // Requests dropped because the queue was full. The ISEQ's threshold is
+        // re-armed, so the work is deferred rather than lost.
+        bg_compile_overflow_count,
+        // Requests the compile thread dropped at install time because another
+        // path had already installed `body->jit_entry` for the ISEQ.
+        bg_compile_discard_count,
+        // Times we noticed the compile thread was gone (killed, or we are in a
+        // forked child) and started a replacement.
+        bg_compile_thread_restart_count,
+        // Set once if background compilation gave up for the rest of the process.
+        bg_compile_disabled_count,
+
         // Exception handler entries (body->jit_exception) that were compiled as
         // a dedicated function entering at a catch-table continuation
         compiled_exception_entry_count,

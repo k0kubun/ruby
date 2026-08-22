@@ -55,6 +55,12 @@ pub struct IseqPayload {
     /// The answer only depends on which bare opcodes the ISEQ contains, which never
     /// changes after the ISEQ is compiled, so it is safe to cache for the ISEQ's lifetime.
     pub may_write_block_code: Option<bool>,
+    /// Whether this ISEQ is sitting in the background compile queue. Dedupes
+    /// enqueues: the interpreter keeps calling (and keeps incrementing
+    /// `jit_entry_calls`) while the request waits, and a JIT-to-JIT stub may hit
+    /// the same ISEQ meanwhile. Cleared when the compile thread takes it off the
+    /// queue. See [`crate::bgcompile`].
+    pub bg_queued: bool,
 }
 
 /// How many extra versions a single ISEQ may earn for ivar shape respecialization.
@@ -83,6 +89,7 @@ impl IseqPayload {
             ivar_reprofile_giveup: false,
             invalidation_recompiles: 0,
             may_write_block_code: None,
+            bg_queued: false,
         }
     }
 
