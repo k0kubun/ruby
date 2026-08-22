@@ -38,6 +38,7 @@ mod jit_frame;
 mod exit_desc;
 mod payload;
 mod ivar_cache;
+mod send_cache;
 mod json;
 mod ttycolors;
 

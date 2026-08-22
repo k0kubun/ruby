@@ -176,6 +176,7 @@ class << RubyVM::ZJIT
       :gc_iseq_update_time_ns,
       :gc_root_mark_time_ns,
       :gc_root_mark_iseq_time_ns,
+      :gc_root_mark_send_cache_time_ns,
       :gc_root_update_time_ns,
       :gc_iseq_mark_count,
       :gc_iseq_update_count,
@@ -184,6 +185,8 @@ class << RubyVM::ZJIT
       :gc_mark_profile_object_count,
       :gc_mark_offset_object_count,
       :gc_mark_root_iseq_count,
+      :gc_mark_send_cache_slot_count,
+      :gc_mark_send_cache_probe_count,
       :invalidation_time_ns,
 
       :vm_write_jit_frame_count,
