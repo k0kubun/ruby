@@ -228,8 +228,8 @@ impl CodeBlock {
 
     /// Write an integer over the given number of bits at the current position.
     pub fn write_int(&mut self, val: u64, num_bits: u32) {
-        assert!(num_bits > 0);
-        assert!(num_bits % 8 == 0);
+        debug_assert!(num_bits > 0);
+        debug_assert!(num_bits % 8 == 0);
 
         // Switch on the number of bits
         match num_bits {

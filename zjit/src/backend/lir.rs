@@ -245,7 +245,7 @@ impl BasicBlock {
         if self.rpo_index == DUMMY_RPO_INDEX {
             return None.into_iter().chain(None.into_iter());
         }
-        assert!(self.insns.last().unwrap().is_terminator());
+        debug_assert!(self.insns.last().unwrap().is_terminator());
         let extract_target = |insn: &Insn| -> Option<BlockId> {
             if let Some(Target::Block(edge)) = insn.target() {
                 Some(edge.target)
