@@ -4429,7 +4429,7 @@ impl Assembler
                 // For all input operands that are VRegs (including memory base VRegs), add to gen set
                 insn.for_each_operand(|opnd| {
                     for idx in opnd.vreg_ids() {
-                        assert!(!kill_sets.get(row, idx.to_usize()));
+                        debug_assert!(!kill_sets.get(row, idx.to_usize()));
                         gen_sets.insert(row, idx.to_usize());
                     }
                 });

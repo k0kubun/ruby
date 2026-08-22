@@ -4329,7 +4329,7 @@ impl Function {
     }
 
     pub fn type_of(&self, insn: InsnId) -> Type {
-        assert!(self.insns[insn.to_usize()].has_output());
+        debug_assert!(self.insns[insn.to_usize()].has_output());
         self.insn_types[self.union_find.borrow_mut().find(insn).to_usize()]
     }
 
@@ -4357,7 +4357,7 @@ impl Function {
     }
 
     fn infer_type(&self, insn: InsnId) -> Type {
-        assert!(self.insns[insn.to_usize()].has_output());
+        debug_assert!(self.insns[insn.to_usize()].has_output());
         match &self.insns[insn.to_usize()] {
             Insn::Param => unimplemented!("params should not be present in block.insns"),
             Insn::LoadArg { val_type, .. } => *val_type,
