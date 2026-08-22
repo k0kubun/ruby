@@ -49,6 +49,12 @@ pub struct IseqPayload {
     /// otherwise have left this ISEQ permanently side-exiting. See
     /// [`crate::codegen::invalidate_iseq_version`].
     pub invalidation_recompiles: u8,
+    /// Memoized [`crate::codegen::iseq_may_write_block_code`]. Answering it scans the
+    /// whole ISEQ once per question, and every JITFrame we build asks (there is one per
+    /// GC-able call site), so recomputing makes compiling an ISEQ quadratic in its size.
+    /// The answer only depends on which bare opcodes the ISEQ contains, which never
+    /// changes after the ISEQ is compiled, so it is safe to cache for the ISEQ's lifetime.
+    pub may_write_block_code: Option<bool>,
 }
 
 /// How many extra versions a single ISEQ may earn for ivar shape respecialization.
@@ -76,6 +82,7 @@ impl IseqPayload {
             ivar_respecializations: 0,
             ivar_reprofile_giveup: false,
             invalidation_recompiles: 0,
+            may_write_block_code: None,
         }
     }
 

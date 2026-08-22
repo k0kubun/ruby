@@ -4293,8 +4293,25 @@ fn gen_incr_send_fallback_counter(asm: &mut Assembler, reason: SendFallbackReaso
 /// Check if an ISEQ contains instructions that may write to block_code
 /// (send, sendforward, invokesuper, invokesuperforward, invokeblock).
 /// These instructions call vm_caller_setup_arg_block which writes to cfp->block_code.
-#[allow(non_upper_case_globals)]
+///
+/// Answering this walks the entire ISEQ, and every JITFrame we build asks (one per
+/// GC-able call site), so the answer is memoized on the ISEQ payload: without that,
+/// compiling one ISEQ costs O(insns * call sites). The set of bare opcodes in an ISEQ
+/// is fixed once it is compiled, so the memo never needs invalidating.
 pub(crate) fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    match payload.may_write_block_code {
+        Some(cached) => cached,
+        None => {
+            let result = iseq_may_write_block_code_uncached(iseq);
+            payload.may_write_block_code = Some(result);
+            result
+        }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn iseq_may_write_block_code_uncached(iseq: IseqPtr) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
     let mut insn_idx: u32 = 0;
 
