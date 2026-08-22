@@ -3925,6 +3925,32 @@ c_callable! {
                         // Nil-fill the now-vacant optional parameter slots
                         param_locals[gap_start..gap_end].fill(Qnil);
                     }
+
+                    // `param.size` counts the block parameter, so the nil-fill above skips
+                    // its slot, and `gen_send_iseq_direct` hands the block parameter to the
+                    // JIT entry as a C argument instead of writing it to the frame. The JIT
+                    // entry never runs on this path, so without this the slot keeps whatever
+                    // unrelated value the VM stack happened to hold at that offset -- e.g.
+                    // an argument of an earlier JIT-to-JIT call from the same caller, which
+                    // the interpreter then hands to the callee as its block. Nil is what the
+                    // JIT entry would have stored:
+                    //
+                    // - A bmethod callee (a block ISEQ invoked as a method, where
+                    //   `local_iseq != iseq`) reads this slot with a plain `getlocal`,
+                    //   mirroring `args_setup_block_parameter` in the interpreter, and
+                    //   `can_direct_send`/`gen_send_iseq_direct` only emit a direct send to a
+                    //   bmethod when the caller passes no block.
+                    // - A method callee reads it with `getblockparam`, which re-derives the
+                    //   value from the frame's block handler unless
+                    //   VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM is set, so the slot value is a
+                    //   don't-care there.
+                    if params.flags.has_block() != 0 {
+                        let block_start: usize = params.block_start.try_into()
+                            .expect("ISEQ block_start should be non-negative when has_block");
+                        if let Some(block_local) = locals.get_mut(block_start) {
+                            *block_local = Qnil;
+                        }
+                    }
                 }
 
                 // Increment a compile error counter for --zjit-stats
