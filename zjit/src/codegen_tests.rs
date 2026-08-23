@@ -13182,3 +13182,115 @@ fn test_jit_frame_arena_raise_through_jit_frames() {
     "#), @r#"["deep", true]"#);
 }
 
+// --- HasType fused into the branch that consumes it -----------------------------
+//
+// A CondBranch on a HasType now jumps out of the type checks directly instead of
+// merging them into a 0/1 that the branch re-tests. These cover each arm of
+// gen_has_type_branch() and, importantly, the values that must take the *false*
+// path out of the heap-object arm: immediates and Qfalse, which are rejected
+// before the class field is ever loaded.
+
+// Every kind of receiver through one polymorphic call site. nil/false/true and
+// the immediates must not have their RBasic read.
+#[test]
+fn test_has_type_branch_polymorphic_receivers() {
+    assert_snapshot!(inspect(r#"
+        class Wrapped; def kind = :obj; end
+        def dispatch(o) = o.kind
+        class Integer; def kind = :int; end
+        class Symbol; def kind = :sym; end
+        class Float; def kind = :float; end
+        class NilClass; def kind = :nil; end
+        class FalseClass; def kind = :false; end
+        class TrueClass; def kind = :true; end
+        class String; def kind = :str; end
+        class Array; def kind = :ary; end
+        vals = [1, :s, 1.5, nil, false, true, "x", [1], Wrapped.new]
+        20.times { vals.each { |v| dispatch(v) } }
+        vals.map { |v| dispatch(v) }
+    "#), @"[:int, :sym, :float, :nil, :false, :true, :str, :ary, :obj]");
+}
+
+// A class-check arm whose receiver turns out to be an immediate or `false` must
+// take the false edge. This is the case the fused form rules out with the
+// `test`/`cmp` pair before touching RBASIC(val)->klass; getting it wrong reads a
+// class field out of a tagged integer.
+#[test]
+fn test_has_type_branch_rejects_immediates_and_false() {
+    assert_snapshot!(inspect(r#"
+        class Box; def val = 1; end
+        def dispatch(o) = o.val
+        class Integer; def val = 2; end
+        # Train the site on Box only, so Box is the single guarded class and every
+        # other receiver has to fall out of the class check.
+        b = Box.new
+        20.times { dispatch(b) }
+        [dispatch(b), dispatch(7), dispatch(-1)]
+    "#), @"[1, 2, 2]");
+}
+
+// The builtin-type arm (T_ tag rather than an exact class) with a subclass
+// receiver, plus the same immediate/false rejection.
+#[test]
+fn test_has_type_branch_builtin_type_arm() {
+    assert_snapshot!(inspect(r#"
+        class MyStr < String; end
+        def sizeof(o) = o.size
+        vals = ["abc", MyStr.new("wxyz"), [1, 2], {a: 1}]
+        20.times { vals.each { |v| sizeof(v) } }
+        vals.map { |v| sizeof(v) }
+    "#), @"[3, 4, 2, 1]");
+}
+
+// The fused branch keeps the tested value live across the checks; a guard that
+// fails on a later arm still has to be able to side-exit with correct state.
+#[test]
+fn test_has_type_branch_side_exit_state() {
+    assert_snapshot!(inspect(r#"
+        class A; def go(x) = x + 1; end
+        class B; def go(x) = x + 2; end
+        def test(o, x)
+          y = x * 10
+          z = o.go(x)
+          [y, z, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new, i) }
+        # C was never profiled: the call site falls out of every fused type check.
+        class C; def go(x) = x + 3; end
+        [test(A.new, 1), test(B.new, 1), test(C.new, 1)]
+    "#), @r#"[[10, 2, "A"], [10, 3, "B"], [10, 4, "C"]]"#);
+}
+
+// Fusing must not fire when the HasType result is used by something other than
+// the branch, or the second consumer would read a value that was never
+// materialized.
+#[test]
+fn test_has_type_branch_multi_use_not_fused() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = 1; end
+        class B; def go = 2; end
+        def test(o)
+          # `o.go` builds the fused type dispatch; storing the receiver keeps
+          # other values from the same block live past the branch.
+          r = o.go
+          [r, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        [test(A.new), test(B.new)]
+    "#), @r#"[[1, "A"], [2, "B"]]"#);
+}
+
+// Under GC stress with a moving collector, the guarded class VALUE baked into the
+// fused compare has to be updated like the unfused one was.
+#[test]
+fn test_has_type_branch_gc_compact() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = :a; end
+        class B; def go = :b; end
+        def test(o) = o.go
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        GC.compact
+        [test(A.new), test(B.new), test(A.new)]
+    "#), @"[:a, :b, :a]");
+}
+
