@@ -2432,6 +2432,28 @@ fn test_send_block_param_proxy_from_block_body() {
 }
 
 #[test]
+fn test_send_forwards_block_arg_to_cfunc() {
+    // A C method takes its block from the frame's specval too, so `&blk` forwarding reaches
+    // `Hash#fetch` (variadic) and `Array#bsearch_index` (fixed arity) as a direct C call. The
+    // no-block calls must still see no block.
+    assert_snapshot!(inspect("
+        def fetch(h, k, &b) = h.fetch(k, &b)
+        def search(a, &b) = a.bsearch_index(&b)
+        def each_with_proc(a, p) = a.each(&p)
+        out = []
+        300.times do
+          out << fetch({ a: 1 }, :b) { |k| \"no #{k}\" }
+          out << fetch({ a: 1 }, :a) { |k| \"no #{k}\" }
+          out << search([1, 3, 5, 7]) { |x| x >= 5 }
+          out << (fetch({ a: 1 }, :b) rescue :keyerror)
+        end
+        seen = []
+        each_with_proc([1, 2], ->(x) { seen << x })
+        [out.last(4), seen]
+    "), @r#"[["no b", 1, 2, :keyerror], [1, 2]]"#);
+}
+
+#[test]
 fn test_send_symbol_block_arg() {
     assert_snapshot!(inspect("
         def test = [1, 2].map(&:to_s)
