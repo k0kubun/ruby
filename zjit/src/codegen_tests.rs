@@ -3692,6 +3692,103 @@ fn test_invokesuper_with_target_redefined_after_compile() {
     "#), @r#"[["b", "a1"], ["b", "a2"]]"#);
 }
 
+/// A `super` reached through a prepended module, an included module and a singleton class all
+/// at once runs under a different frame method entry each time, so the site dispatches on the
+/// entry and each arm resolves `super` from its own defining class.
+#[test]
+fn test_invokesuper_chain_over_prepend_include_and_singleton() {
+    assert_snapshot!(inspect(r#"
+        module ChainSuperM
+          def tag(x) = super(x) + [:m]
+        end
+        class ChainSuperBase
+          def tag(x) = [x]
+        end
+        class ChainSuperPrepend < ChainSuperBase
+          prepend ChainSuperM
+        end
+        class ChainSuperInclude
+          include ChainSuperM
+          def self.new_with_singleton
+            o = allocate
+            def o.extra = :sing
+            o
+          end
+        end
+        class ChainSuperIncludeBase
+          def tag(x) = [x, :incbase]
+        end
+        class ChainSuperInclude2 < ChainSuperIncludeBase
+          include ChainSuperM
+        end
+        $chain_super = [ChainSuperPrepend.new, ChainSuperInclude2.new, ChainSuperInclude2.new.tap { |o| def o.z = 1 }]
+        def chain_super_run(n) = n.times { $chain_super.each { |o| o.tag(1) } }
+        chain_super_run(300)
+        $chain_super.map { |o| o.tag(2) }
+    "#), @"[[2, :m], [2, :incbase, :m], [2, :incbase, :m]]");
+    assert!(crate::state::ZJITState::get_counters().super_chain_sites > 0,
+        "the super site never got a method-entry dispatch chain");
+}
+
+/// Redefining the target of one arm of a `super` dispatch chain has to take effect, the same way
+/// it does for a single guarded `super`.
+#[test]
+fn test_invokesuper_chain_with_target_redefined_after_compile() {
+    assert_snapshot!(inspect(r#"
+        module ChainRedefM
+          def val = ["m", super]
+        end
+        class ChainRedefA
+          def val = "a1"
+        end
+        class ChainRedefB
+          def val = "b1"
+        end
+        class ChainRedefSubA < ChainRedefA
+          prepend ChainRedefM
+        end
+        class ChainRedefSubB < ChainRedefB
+          prepend ChainRedefM
+        end
+        $chain_redef = [ChainRedefSubA.new, ChainRedefSubB.new]
+        def chain_redef_run(n) = n.times { $chain_redef.each(&:val) }
+        chain_redef_run(300)
+        before = $chain_redef.map(&:val)
+        class ChainRedefA
+          def val = "a2"
+        end
+        [before, $chain_redef.map(&:val)]
+    "#), @r#"[[["m", "a1"], ["m", "b1"]], [["m", "a2"], ["m", "b1"]]]"#);
+}
+
+/// A zsuper (`super` with no argument list) forwards the caller's arguments, which the
+/// specialized call cannot reproduce, so it keeps a dynamic dispatch -- including inside a
+/// dispatch chain's arms, where the arm still has to produce the right answer.
+#[test]
+fn test_zsuper_stays_dynamic_but_correct() {
+    assert_snapshot!(inspect(r#"
+        module ZSuperM
+          def calc(a, b) = super * 10
+        end
+        class ZSuperBase1
+          def calc(a, b) = a + b
+        end
+        class ZSuperBase2
+          def calc(a, b) = a * b
+        end
+        class ZSuperA < ZSuperBase1
+          prepend ZSuperM
+        end
+        class ZSuperB < ZSuperBase2
+          prepend ZSuperM
+        end
+        $zsuper = [ZSuperA.new, ZSuperB.new]
+        def zsuper_run(n) = n.times { $zsuper.each { |o| o.calc(2, 3) } }
+        zsuper_run(300)
+        $zsuper.map { |o| o.calc(2, 3) }
+    "#), @"[50, 60]");
+}
+
 #[test]
 fn test_invokesuper_with_keyword_args() {
     assert_snapshot!(inspect(r#"
