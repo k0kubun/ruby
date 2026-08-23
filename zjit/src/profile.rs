@@ -808,8 +808,7 @@ impl IseqProfile {
     }
 
     pub fn get_super_method_entry(&self, insn_idx: YarvInsnIdx) -> Option<*const rb_callable_method_entry_t> {
-        let Some(entry) = self.super_cme.get(&insn_idx) else { return None };
-        let summary = TypeDistributionSummary::new(entry);
+        let summary = self.get_super_method_entries(insn_idx)?;
 
         if summary.is_monomorphic() {
             Some(summary.bucket(0).class.0 as *const rb_callable_method_entry_t)
@@ -827,6 +826,15 @@ impl IseqProfile {
     /// [`profile_forwarded_callinfo`].
     pub fn get_forwarded_callinfos(&self, insn_idx: YarvInsnIdx) -> Option<ForwardedCiDistributionSummary> {
         self.forwarded_cis.get(&insn_idx).map(ForwardedCiDistributionSummary::new)
+    }
+
+    /// The whole distribution of frame method entries seen at an `invokesuper` site. A site with
+    /// more than one is a `super` inside a method body that several classes run, most often a
+    /// module method reached through more than one includer; each such method entry resolves
+    /// `super` to a different target.
+    pub fn get_super_method_entries(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
+        let entry = self.super_cme.get(&insn_idx)?;
+        Some(TypeDistributionSummary::new(entry))
     }
 
     /// Get the distribution of method-name symbols seen at a `send`/`__send__` call site.
