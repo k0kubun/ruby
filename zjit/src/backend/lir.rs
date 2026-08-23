@@ -1008,6 +1008,22 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Zero-width marker: everything after it in this Assembler is cold, and is
+    /// emitted into the outlined half of the code region instead of after the
+    /// function body. Emitted once, as the first instruction of the block
+    /// [`Assembler::compile_exits`] builds.
+    ///
+    /// This is what makes hot code contiguous: without it a function's side-exit
+    /// stubs -- around a third of the bytes ZJIT emits -- sit between one
+    /// function's body and the next one's, so every instruction cache line and
+    /// every page a hot loop touches is part exit stub.
+    ///
+    /// Jumps across the boundary need nothing special. A label is an offset from
+    /// the one region base either way, and both halves of the region are inside
+    /// rel32 of each other, so a hot-to-cold branch is the same near jump it was
+    /// when the exit was ten bytes below.
+    BeginOutlined,
+
     /// Load a side-exit metadata index into the register `exit_meta_trampoline`
     /// reads it from. Emitted only as the last instruction of a side-exit stub,
     /// where the scratch register is free and nothing after it clobbers the
@@ -1104,6 +1120,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::BeginOutlined |
             Insn::ExitMetaIndex(_) |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
@@ -1250,6 +1267,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::BeginOutlined => "BeginOutlined",
             Insn::ExitMetaIndex(_) => "ExitMetaIndex",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
@@ -4038,8 +4056,17 @@ impl Assembler
                 assert_eq!(label, Label(idx));
             }
 
+            let entry_outlined = cb.is_outlined();
             let start_ptr = cb.get_write_ptr();
-            let gc_offsets = self.arch_emit(cb).inspect_err(|_| cb.clear_labels())?;
+            // `Insn::BeginOutlined` may leave emission pointed at the outlined half.
+            // Everything after this -- the next compile, a patch, the caller reading
+            // `cb.get_write_ptr()` for the end of the function body -- expects the
+            // half we came in on, so put it back however this turns out. The
+            // pos_marker callbacks that arch_emit fires do run in the outlined half,
+            // which is what lets the side-exit size counter measure the right range.
+            let gc_offsets = self.arch_emit(cb)
+                .inspect_err(|_| { cb.set_outlined(entry_outlined); cb.clear_labels() })?;
+            cb.set_outlined(entry_outlined);
             assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
 
             cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
@@ -4052,6 +4079,8 @@ impl Assembler
     pub fn compile(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
+        #[cfg(feature = "disasm")]
+        let outlined_start_addr = cb.outlined_write_ptr();
         let had_dropped_bytes = cb.has_dropped_bytes();
         let ret = self.prepare().and_then(|asm| asm.emit_prepared(cb)).inspect_err(|err| {
             // If we use too much memory to compile the Assembler, it would set cb.dropped_bytes = true.
@@ -4066,6 +4095,10 @@ impl Assembler
         if let Some(dump_disasm) = crate::options::get_option_ref!(dump_disasm).filter(|_| ret.is_ok()) {
             let end_addr = cb.get_write_ptr();
             crate::disasm::dump_disasm_addr_range(cb, start_addr, end_addr, dump_disasm);
+            // The cold code this compile appended lives elsewhere in the region, so
+            // dump it as its own range rather than losing it from the dump.
+            let outlined_end_addr = cb.outlined_write_ptr();
+            crate::disasm::dump_disasm_addr_range(cb, outlined_start_addr, outlined_end_addr, dump_disasm);
         }
         ret
     }
@@ -4392,6 +4425,12 @@ impl Assembler
         // that a function with no exits (and the trampolines compiled before ZJITState
         // exists) never asks for the trampoline's address.
         let mut exit_tail_target: Option<Target> = None;
+
+        // Everything from here on is cold, so send it to the outlined half of the
+        // code region rather than letting it split the hot code in two.
+        if !targets.is_empty() {
+            self.push_insn(Insn::BeginOutlined);
+        }
 
         // Start a new perf range for side exits
         let perf_symbol = if get_option!(perf) == Some(PerfMap::HIR) {
