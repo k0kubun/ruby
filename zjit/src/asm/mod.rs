@@ -255,6 +255,13 @@ impl CodeBlock {
 
     /// Invoke a callback with write_ptr temporarily adjusted to a given address
     pub fn with_write_ptr(&mut self, code_ptr: CodePtr, callback: impl Fn(&mut CodeBlock)) -> Range<CodePtr> {
+        // The callback overwrites existing code in place, so it must not be one that
+        // switches halves: a `set_outlined` in the middle would carry `code_ptr` off
+        // into the other half's saved position and hand back an empty written range.
+        // Everything that patches (invalidation jumps, call-site regeneration) emits
+        // a single jump or call and has no side exits, so there is nothing to switch.
+        debug_assert!(!self.outlined, "with_write_ptr patches the half it is already on");
+
         // Temporarily update the write_pos. Ignore the dropped_bytes flag at the old address.
         let old_write_pos = self.write_pos;
         let old_dropped_bytes = self.dropped_bytes;
