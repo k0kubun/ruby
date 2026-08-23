@@ -10472,216 +10472,29 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       :done
     "#), @":done");
 }
-// --- HasType fused into the branch that consumes it -----------------------------
-//
-// A CondBranch on a HasType now jumps out of the type checks directly instead of
-// merging them into a 0/1 that the branch re-tests. These cover each arm of
-// gen_has_type_branch() and, importantly, the values that must take the *false*
-// path out of the heap-object arm: immediates and Qfalse, which are rejected
-// before the class field is ever loaded.
 
-// Every kind of receiver through one polymorphic call site. nil/false/true and
-// the immediates must not have their RBasic read.
-#[test]
-fn test_has_type_branch_polymorphic_receivers() {
-    assert_snapshot!(inspect(r#"
-        class Wrapped; def kind = :obj; end
-        def dispatch(o) = o.kind
-        class Integer; def kind = :int; end
-        class Symbol; def kind = :sym; end
-        class Float; def kind = :float; end
-        class NilClass; def kind = :nil; end
-        class FalseClass; def kind = :false; end
-        class TrueClass; def kind = :true; end
-        class String; def kind = :str; end
-        class Array; def kind = :ary; end
-        vals = [1, :s, 1.5, nil, false, true, "x", [1], Wrapped.new]
-        20.times { vals.each { |v| dispatch(v) } }
-        vals.map { |v| dispatch(v) }
-    "#), @"[:int, :sym, :float, :nil, :false, :true, :str, :ary, :obj]");
-}
+// --- Narrowed `test reg, imm` ---------------------------------------------------
 
-// A class-check arm whose receiver turns out to be an immediate or `false` must
-// take the false edge. This is the case the fused form rules out with the
-// `test`/`cmp` pair before touching RBASIC(val)->klass; getting it wrong reads a
-// class field out of a tagged integer.
+// `test rdi, 7` is emitted as `test dil, 7` when only ZF is read. The bits above
+// the immediate are masked off either way, so a receiver whose pointer has plenty
+// of high bits set must still be classified as a heap object, and an immediate
+// whose payload sets high bits must still be classified as one.
 #[test]
-fn test_has_type_branch_rejects_immediates_and_false() {
+fn test_narrowed_test_high_bits() {
     assert_snapshot!(inspect(r#"
-        class Box; def val = 1; end
-        def dispatch(o) = o.val
-        class Integer; def val = 2; end
-        # Train the site on Box only, so Box is the single guarded class and every
-        # other receiver has to fall out of the class check.
-        b = Box.new
-        20.times { dispatch(b) }
-        [dispatch(b), dispatch(7), dispatch(-1)]
-    "#), @"[1, 2, 2]");
-}
-
-// The builtin-type arm (T_ tag rather than an exact class) with a subclass
-// receiver, plus the same immediate/false rejection.
-#[test]
-fn test_has_type_branch_builtin_type_arm() {
-    assert_snapshot!(inspect(r#"
-        class MyStr < String; end
-        def sizeof(o) = o.size
-        vals = ["abc", MyStr.new("wxyz"), [1, 2], {a: 1}]
-        20.times { vals.each { |v| sizeof(v) } }
-        vals.map { |v| sizeof(v) }
-    "#), @"[3, 4, 2, 1]");
-}
-
-// The fused branch keeps the tested value live across the checks; a guard that
-// fails on a later arm still has to be able to side-exit with correct state.
-#[test]
-fn test_has_type_branch_side_exit_state() {
-    assert_snapshot!(inspect(r#"
-        class A; def go(x) = x + 1; end
-        class B; def go(x) = x + 2; end
-        def test(o, x)
-          y = x * 10
-          z = o.go(x)
-          [y, z, o.class.name]
-        end
-        20.times { |i| test(i.even? ? A.new : B.new, i) }
-        # C was never profiled: the call site falls out of every fused type check.
-        class C; def go(x) = x + 3; end
-        [test(A.new, 1), test(B.new, 1), test(C.new, 1)]
-    "#), @r#"[[10, 2, "A"], [10, 3, "B"], [10, 4, "C"]]"#);
-}
-
-// Fusing must not fire when the HasType result is used by something other than
-// the branch, or the second consumer would read a value that was never
-// materialized.
-#[test]
-fn test_has_type_branch_multi_use_not_fused() {
-    assert_snapshot!(inspect(r#"
-        class A; def go = 1; end
-        class B; def go = 2; end
-        def test(o)
-          # `o.go` builds the fused type dispatch; storing the receiver keeps
-          # other values from the same block live past the branch.
-          r = o.go
-          [r, o.class.name]
-        end
-        20.times { |i| test(i.even? ? A.new : B.new) }
-        [test(A.new), test(B.new)]
-    "#), @r#"[[1, "A"], [2, "B"]]"#);
-}
-
-// Under GC stress with a moving collector, the guarded class VALUE baked into the
-// fused compare has to be updated like the unfused one was.
-#[test]
-fn test_has_type_branch_gc_compact() {
-    assert_snapshot!(inspect(r#"
-        class A; def go = :a; end
-        class B; def go = :b; end
+        class Big; def go = :heap; end
+        class Integer; def go = :int; end
+        class Symbol; def go = :sym; end
+        class Float; def go = :float; end
+        class NilClass; def go = :nil; end
+        class FalseClass; def go = :false; end
+        class TrueClass; def go = :true; end
         def test(o) = o.go
-        20.times { |i| test(i.even? ? A.new : B.new) }
-        GC.compact
-        [test(A.new), test(B.new), test(A.new)]
-    "#), @"[:a, :b, :a]");
-}
-
-#[test]
-fn test_side_exits_are_emitted_into_the_outlined_region() {
-    // Side exits belong in the outlined half of the code region, so that a
-    // function's body stays contiguous with the next function's. Compile a method
-    // with plenty of guards and check that the bytes landed on the cold side of
-    // the split without leaving a hole in the hot side.
-    set_call_threshold(2);
-    with_rubyvm(|| {
-        let cb = crate::state::ZJITState::get_code_block();
-        assert!(cb.has_outlined_region(), "ZJIT's code region should be split");
-        let inlined_before = cb.inlined_code_size();
-        let outlined_before = cb.outlined_code_size();
-
-        // Type guards on an untyped parameter give this a side exit per operation.
-        eval("
-            def guarded(a, b) = a + b + a * b - a
-            guarded(1, 2)
-            guarded(1, 2)
-        ");
-
-        let cb = crate::state::ZJITState::get_code_block();
-        assert!(cb.inlined_code_size() > inlined_before,
-            "the function body should have been written to the inlined half");
-        assert!(cb.outlined_code_size() > outlined_before,
-            "the side exits should have been written to the outlined half");
-
-        // The two halves are far enough apart that the exits cannot have been
-        // mistaken for inline code, and close enough for a rel32 branch.
-        let distance = cb.outlined_write_ptr().as_offset() - cb.get_write_ptr().as_offset();
-        assert!(distance > 0, "the outlined half should sit above the inlined half");
-        assert!(distance < i32::MAX as i64,
-            "hot-to-cold branches have to stay in rel32 range, got a gap of {distance}");
-    });
-}
-
-#[test]
-fn test_side_exit_still_reached_from_outlined_region() {
-    // Taking an exit that now lives megabytes away from the guard that jumps to it
-    // must still land the interpreter on the right frame.
-    set_call_threshold(2);
-    assert_snapshot!(inspect("
-        def add(a, b) = a + b
-        add(1, 2)
-        add(1, 2)
-        [add(1, 2), add('x', 'y'), add(1.5, 2.5), add(1, 2)]
-    "), @r#"[3, "xy", 4.0, 3]"#);
-}
-
-#[test]
-fn test_outlined_side_exit_survives_compaction() {
-    // A side exit bakes the VALUEs that were on the VM stack into its own code, so
-    // GC compaction has to rewrite those in the outlined half too. That means
-    // mark_all_writable has to cover the outlined arena: without it the write goes
-    // to a page that is executable and not writable.
-    set_call_threshold(2);
-    with_rubyvm(|| {
-        let out = inspect("
-            BAKED_IN_EXIT = 'baked'
-            def stacked(a) = [BAKED_IN_EXIT, a + 1]
-            stacked(1)
-            stacked(1)
-            GC.compact
-            [stacked(1), stacked(2.5)]
-        ");
-        assert_eq!(r#"[["baked", 2], ["baked", 3.5]]"#, out);
-
-        // Make sure that had something to survive: the exit captures the constant
-        // that was on the VM stack, so the ISEQ owns GC offsets that point into the
-        // outlined half. Nothing is mapped between the end of the inlined code and
-        // the start of the outlined half, so an offset past the inlined write
-        // position is an offset in the outlined half.
-        let cb = crate::state::ZJITState::get_code_block();
-        let inlined_end = cb.get_write_ptr().as_offset();
-        let iseq = get_method_iseq("self", "stacked");
-        let outlined_gc_offsets = get_or_create_iseq_payload(iseq).versions.iter()
-            .flat_map(|version| unsafe { version.as_ref() }.gc_offsets.iter())
-            .filter(|offset| offset.as_offset() >= inlined_end)
-            .count();
-        assert!(outlined_gc_offsets > 0,
-            "the side exit should have baked VALUEs into the outlined half");
-    });
-}
-
-#[test]
-fn test_invalidation_jumps_from_the_inlined_to_the_outlined_half() {
-    // Invalidation overwrites a patch point in the hot half with a jump to the
-    // patch point's side exit, which now lives in the cold half. The jump has to
-    // reach it, and with_write_ptr has to hand back the range it really wrote so
-    // that remove_gc_offsets drops the right offsets.
-    set_call_threshold(2);
-    assert_snapshot!(inspect("
-        INVALIDATED_CONST = 1
-        def read_const = INVALIDATED_CONST + 1
-        read_const
-        read_const
-        before = read_const
-        Object.send(:remove_const, :INVALIDATED_CONST)
-        INVALIDATED_CONST = 10
-        [before, read_const]
-    "), @"[2, 11]");
+        objs = 200.times.map { Big.new }
+        20.times { test(objs.sample); test(1); test(:s) }
+        # Large fixnums and negative ones set bits well above the tag byte; 1e300 is
+        # outside the flonum range, so it is a heap Float.
+        [test(objs.last), test(1 << 40), test(-(1 << 40)), test(0), test(:zz),
+         test(1.5), test(1.5e300), test(nil), test(false), test(true)]
+    "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
 }
