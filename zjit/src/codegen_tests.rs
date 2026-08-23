@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions};
+use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_budget, set_inline_threshold, set_max_versions};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -1030,6 +1030,143 @@ fn test_block_autosplat_nested_destructuring() {
     ");
     assert_snapshot!(assert_compiles("each_of([[1, [2, 3]], [4, [5, 6]]]).inspect"),
         @r#""[[1, 2, 3], [4, 5, 6]]""#);
+}
+
+/// The real-world shape the larger threshold is for: `Array#each` is 41 instructions, so the
+/// ordinary threshold leaves `ary.each { return ... }` throwing on every call.
+#[test]
+fn test_inline_array_each_to_erase_block_non_local_return() {
+    set_call_threshold(2);
+    eval("
+        def test(ary)
+          ary.each { |x| return x * 2 if x > 2 }
+          -1
+        end
+        test([1, 2, 3])
+        test([1, 2, 3])
+    ");
+    assert_snapshot!(assert_compiles("test([1, 5, 3])"), @"10");
+}
+
+/// The relaxation is not limited to blocks with a non-local `return`: a plain
+/// `ary.each { ... }` gets the oversized `Array#each` inlined too, so its `yield` reaches
+/// the direct block dispatch instead of `rb_vm_invokeblock()`. `assert_inlines` is what
+/// pins the relaxation down -- at the plain threshold `Array#each` is too large and the
+/// program inlines nothing.
+#[test]
+fn test_inline_array_each_to_dispatch_yield_directly() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        "), @"15");
+    });
+}
+
+/// A caller already over its cumulative inlining budget still gets the iterator inlined, which
+/// is what puts its `yield` on the direct block dispatch. A budget of 0 stands in for the big
+/// Rails methods that spend the real one long before they reach their `.each`.
+#[test]
+fn test_inline_iterator_past_exhausted_budget() {
+    with_inlining(|| {
+        let old_budget = get_option!(inline_budget);
+        set_inline_budget(1);
+        let result = assert_inlines("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        ");
+        set_inline_budget(old_budget);
+        assert_snapshot!(result, @"15");
+    });
+}
+
+/// The allowance is not unlimited: a caller over budget gets a few iterator bodies, not one per
+/// `.each` it contains. The `.each` calls past the cap keep their out-of-line dispatch, which
+/// respecializes on the block it sees, so exits are expected here.
+#[test]
+fn test_inline_iterator_past_budget_is_capped() {
+    with_inlining(|| {
+        let old_budget = get_option!(inline_budget);
+        set_inline_budget(1);
+        let result = assert_inlines_allowing_exits("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        ");
+        set_inline_budget(old_budget);
+        assert_snapshot!(result, @"75");
+    });
+}
+
+/// A multi-parameter block over pairs, which needs the yielded Array destructured on top of
+/// the oversized-iterator relaxation.
+#[test]
+fn test_inline_array_each_to_dispatch_autosplat_yield_directly() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def test(pairs)
+              out = []
+              pairs.each { |a, b| out << [b, a] }
+              out
+            end
+            test([[1, 2]])
+            test([[1, 2]])
+            test([[1, 2], [3, 4]]).inspect
+        "), @r#""[[2, 1], [4, 3]]""#);
+    });
+}
+
+/// The relaxation only applies to a callee whose `yield` can benefit from it: an oversized
+/// method with no `yield` in it stays out of line however it is called.
+///
+/// `inline_method_count` is global, so the padding below deliberately avoids calling any
+/// method that would itself be inlined -- indexing the array rather than calling
+/// `Array#last`, which is a leaf builtin the general inliner would inline and count.
+#[test]
+fn test_oversized_callee_without_yield_is_not_relaxed() {
+    with_inlining(|| {
+        let counters = crate::state::ZJITState::get_counters();
+        let before = counters.inline_method_count;
+        assert_snapshot!(assert_compiles("
+            def no_yield(a)
+              pad0 = a + 1
+              pad1 = pad0 + 2
+              pad2 = pad1 + 3
+              pad3 = pad2 + 4
+              pad4 = pad3 + 5
+              pad5 = pad4 + 6
+              pad6 = pad5 + 7
+              [pad0, pad1, pad2, pad3, pad4, pad5, pad6][6]
+            end
+            def test(a) = no_yield(a) { :unused_block }
+            test(1)
+            test(1)
+            test(2)
+        "), @"30");
+        assert_eq!(before, counters.inline_method_count,
+            "an oversized callee without a `yield` must not get the relaxed threshold");
+    });
 }
 
 #[test]
