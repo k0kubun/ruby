@@ -7651,6 +7651,104 @@ fn test_invokeblock_truncated_block_with_return() {
     assert_snapshot!(assert_compiles_allowing_exits("entry"), @":returned");
 }
 
+/// A block that `break`s is dispatched directly, not through `rb_vm_invokeblock()`. The
+/// throw unwinds out of the JIT-pushed block frame, which reports its ISEQ through the
+/// JITFrame rather than `cfp->_iseq`.
+#[test]
+fn test_invokeblock_direct_dispatch_with_break() {
+    eval("
+        def test
+          yield 1
+          yield 2
+          :not_reached
+        end
+        def entry
+          test { |x| break x * 10 if x == 2 }
+        end
+        entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @"20");
+}
+
+/// `break` out of a directly dispatched block nested two `yield`s deep unwinds only out of
+/// the `yield` that owns that block, leaving the outer one to run to completion.
+#[test]
+fn test_invokeblock_direct_dispatch_with_nested_break() {
+    eval("
+        def test
+          yield 1
+          :after
+        end
+        def entry
+          test { |a| test { |b| break [:inner, a, b] } }
+        end
+        entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @":after");
+}
+
+/// `break` inside a lambda is a `return` from the lambda, not an unwind to the block owner.
+#[test]
+fn test_invokeblock_direct_dispatch_break_in_lambda() {
+    eval("
+        def test
+          yield 1
+        end
+        def entry
+          l = lambda { break :from_lambda }
+          [test { |x| x }, l.call]
+        end
+        entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @"[1, :from_lambda]");
+}
+
+/// A `break` whose block outlived the method that created it is still an orphan.
+#[test]
+fn test_invokeblock_direct_dispatch_orphan_break() {
+    eval("
+        def make(&b) = b
+        def test
+          yield 1
+        end
+        def entry
+          test { |x| x }
+          pr = make { break :nope }
+          begin
+            pr.call
+          rescue LocalJumpError
+            :orphan
+          end
+        end
+        entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @":orphan");
+}
+
+/// An `ensure` inside a block that `break`s still runs while the throw unwinds out of the
+/// JIT-pushed block frame.
+#[test]
+fn test_invokeblock_direct_dispatch_break_runs_ensure() {
+    eval("
+        def test
+          yield 1
+          :not_reached
+        end
+        def entry
+          ran = false
+          out = test { |x| begin; break :broke; ensure; ran = true; end }
+          [out, ran]
+        end
+        entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @"[:broke, true]");
+}
+
 /// The iterator is inlined into the caller and its `yield` reshapes the arguments for the
 /// block, whose body is then inlined at the yield too. The frame that push lays out has to
 /// follow the reshaped arguments, not the interpreter's stack, or the frame the block raises
