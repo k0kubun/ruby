@@ -11351,8 +11351,8 @@ fn test_ivar_cache_still_reads_after_remove_instance_variable() {
 
 #[test]
 fn test_ivar_cache_reads_class_and_module_ivars() {
-    // Classes and modules are marked uncacheable and keep going through
-    // rb_ivar_get, which is what enforces their ractor rules.
+    // Classes and modules get a table entry kind of their own, read through
+    // rb_ivar_get_at_no_ractor_check while only one ractor exists.
     set_call_threshold(2);
     assert_snapshot!(inspect(r#"
         module CacheMod; end
@@ -11363,6 +11363,137 @@ fn test_ivar_cache_reads_class_and_module_ivars() {
         5.times { [CacheMod, CacheCls].each { |x| read(x) } }
         [read(CacheMod), read(CacheCls), read(CacheMod.dup)]
     "#), @"[1, 2, 1]");
+}
+
+/// A getivar site whose profile filled up with shapes that stop appearing, followed by a long
+/// run of shapes it has no bucket left to record. `observe_ivar_fallback` drops the cold buckets
+/// so the live shapes can be recorded and the site respecialized; every read has to keep
+/// answering correctly through the eviction, the refill and the recompile.
+const IVAR_EVICTION_SETUP: &str = r#"
+    class EvictBase
+      def read = @config
+      def write(val) = @config = val
+    end
+
+    def evict_shapes(prefix, count, first_ivar)
+      (0...count).map do |i|
+        klass = Class.new(EvictBase)
+        ivars = (0...(first_ivar + i)).map { |j| "@#{prefix}#{j} = #{j}" }.join("; ")
+        klass.class_eval("def initialize(n); #{ivars}; @config = n; end")
+        klass.new(i)
+      end
+    end
+
+    BOOT_OBJS = evict_shapes("boot", 10, 0)
+    LIVE_OBJS = evict_shapes("live", 3, 30)
+"#;
+
+#[test]
+fn test_getivar_profile_eviction_keeps_reads_correct() {
+    set_call_threshold(6);
+    eval(IVAR_EVICTION_SETUP);
+    // Fill every profile bucket with shapes that never come back.
+    eval("20.times { BOOT_OBJS.each { |o| o.read } }");
+    // Then hammer the site with shapes the profile cannot hold. This is what triggers the
+    // eviction, the refill and the recompile.
+    eval("500.times { LIVE_OBJS.each { |o| o.read } }");
+    assert_snapshot!(assert_no_shape_guard_exits("
+        LIVE_OBJS.map { |o| o.read } + BOOT_OBJS.map { |o| o.read }
+    "), @"[0, 1, 2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]");
+}
+
+#[test]
+fn test_getivar_profile_eviction_runs_and_is_bounded() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(6);
+    eval(IVAR_EVICTION_SETUP);
+    eval("20.times { BOOT_OBJS.each { |o| o.read } }");
+    let before = crate::state::ZJITState::get_counters().ivar_profile_evicted_count;
+    eval("500.times { LIVE_OBJS.each { |o| o.read } }");
+    let after = crate::state::ZJITState::get_counters().ivar_profile_evicted_count;
+    assert!(after > before, "expected the crowded profile to drop its cold buckets");
+    // MAX_IVAR_PROFILE_EVICTIONS per site, and this program only has the one.
+    assert!(after - before <= 2, "expected at most two evictions, got {}", after - before);
+}
+
+#[test]
+fn test_getivar_profile_eviction_reads_ivars_added_after_it() {
+    // The refilled buckets are shapes, not objects: an object that transitions after the
+    // recompile still has to read correctly off the fallback.
+    set_call_threshold(6);
+    eval(IVAR_EVICTION_SETUP);
+    eval("20.times { BOOT_OBJS.each { |o| o.read } }");
+    eval("500.times { LIVE_OBJS.each { |o| o.read } }");
+    assert_snapshot!(assert_no_shape_guard_exits(r#"
+        fresh = EvictBase.new
+        before = fresh.read
+        fresh.write(7)
+        frozen = LIVE_OBJS.first.clone.freeze
+        [before, fresh.read, frozen.read]
+    "#), @"[nil, 7, 0]");
+}
+
+#[test]
+fn test_setivar_profile_is_not_evicted() {
+    // A setivar arm has to survive `prepare_optimized_setivar` as well as a shape match, so
+    // refilling its buckets from the fallback is a worse bet than keeping what the profile saw.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(6);
+    eval(IVAR_EVICTION_SETUP);
+    eval("20.times { BOOT_OBJS.each_with_index { |o, i| o.write(i) } }");
+    let before = crate::state::ZJITState::get_counters().ivar_profile_evicted_count;
+    eval("500.times { LIVE_OBJS.each_with_index { |o, i| o.write(i) } }");
+    let after = crate::state::ZJITState::get_counters().ivar_profile_evicted_count;
+    assert_eq!(before, after, "a setinstancevariable site must not evict its profile");
+    assert_snapshot!(assert_no_shape_guard_exits("LIVE_OBJS.map { |o| o.read }"), @"[0, 1, 2]");
+}
+
+#[test]
+fn test_ivar_cache_class_ivars_follow_shape_transitions() {
+    // Class and module shapes get their own table entry kind, so a class that gains an ivar
+    // after the site was compiled -- and one that is frozen, and a singleton class -- all have
+    // to keep reading the right slot.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        KLASSES = 12.times.map do |i|
+          k = Class.new
+          i.times { |j| k.instance_variable_set(:"@pad#{j}", j) }
+          k.instance_variable_set(:@a, i)
+          k
+        end
+        def read(x) = x.instance_variable_get(:@a)
+        5.times { KLASSES.each { |k| read(k) } }
+
+        grown = KLASSES.first
+        grown.instance_variable_set(:@later, 99)
+        singleton = Object.new.singleton_class
+        singleton.instance_variable_set(:@a, :sing)
+        frozen = Class.new
+        frozen.instance_variable_set(:@a, :frz)
+        frozen.freeze
+
+        [KLASSES.map { |k| read(k) }, read(grown), read(singleton), read(frozen), read(Class.new)]
+    "#), @"[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 0, :sing, :frz, nil]");
+}
+
+#[test]
+fn test_ivar_cache_class_and_instance_ivars_share_a_table() {
+    // One table per ivar name, so a class shape and an object shape land in the same table and
+    // must not read each other's slot.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        class Holder; def initialize(v) = (@pad = 0; @a = v); end
+        HOLDERS = 12.times.map { |i| Holder.new(i) }
+        CLS = 12.times.map do |i|
+          k = Class.new
+          i.times { |j| k.instance_variable_set(:"@pad#{j}", j) }
+          k.instance_variable_set(:@a, -i)
+          k
+        end
+        def read(x) = x.instance_variable_get(:@a)
+        5.times { (HOLDERS + CLS).each { |x| read(x) } }
+        [HOLDERS.map { |h| read(h) }.sum, CLS.map { |k| read(k) }.sum]
+    "#), @"[66, -66]");
 }
 
 #[test]
