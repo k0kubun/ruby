@@ -471,6 +471,155 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
     });
 }
 
+/// Samples a `yield` site's generic fallback path has to see before it decides whether the
+/// handlers arriving there are worth a recompile. Same trade as [`IVAR_REPROFILE_WINDOW`]: small
+/// enough that an iterator frozen on a boot-time profile recovers within the first requests,
+/// large enough that a brief detour through an unusual handler does not spend a version.
+const BLOCK_REPROFILE_WINDOW: u16 = 64;
+
+/// Share of a window, in percent, that the handlers a recompile would give an arm to must
+/// account for together before the recompile is worth a version. Matches the HIR builder's
+/// `CHAIN_COVERAGE_THRESHOLD`, which is the bar the rebuilt dispatch itself has to clear:
+/// asking for less here would earn a version and then decline to use it.
+const BLOCK_REPROFILE_MIN_SHARE_PERCENT: u32 = 50;
+
+/// How many windows of live traffic one `yield` site may fold into its handler profile.
+///
+/// This bounds how often the *profile* is rewritten, not how many recompiles it can cause. A
+/// site inside a shared iterator is compiled once standalone and again inside every caller that
+/// inlines it, and all of those copies read the one profile: the first window to close fixes it
+/// for all of them, and the rest only need to notice that their own dispatch is behind. Capping
+/// the recompiles here instead would fix whichever compiled units happened to sample first and
+/// freeze every other one for the life of the process.
+const MAX_BLOCK_PROFILE_REFRESHES: u8 = 3;
+
+/// Live-traffic re-profiling state for one `invokeblock` site. Only sites whose compiled
+/// dispatch actually reaches `rb_vm_invokeblock()` ever get one.
+#[derive(Debug)]
+struct BlockFallbackEntry {
+    /// Block handlers seen on the generic fallback path in the current window. Built fresh
+    /// rather than added to the site's profile directly: the profile is what the *running* code
+    /// was compiled from, and the decision below is about what the fallback alone is seeing.
+    dist: TypeDistribution,
+    /// Classes of the first `yield`ed argument, recorded only for the samples whose handler was
+    /// a Symbol. A Symbol block turns the `yield` into a send to that argument, and that send
+    /// only compiles if its receiver's class resolves -- but the site's operand profile holds
+    /// the class of everything the iterator ever yielded, which at `Array#each` is everything in
+    /// the process. Recorded here it is conditioned on the handler being a Symbol, which is the
+    /// only traffic the arm dispatches over.
+    symbol_recv: TypeDistribution,
+    /// Samples taken in the current window.
+    samples: u16,
+    /// How many windows this site has already folded into its profile.
+    refreshes: u8,
+}
+
+/// Result of [`IseqProfile::observe_block_fallback`].
+#[derive(PartialEq, Eq, Debug)]
+enum BlockReprofiled {
+    /// Recorded, mid-window. Nothing to do.
+    Sampled,
+    /// The window closed without making the case for a recompile.
+    Declined,
+    /// The window closed with most of its samples on handlers the compiled dispatch has no arm
+    /// for. They are now in the site's handler profile; recompile to pick them up.
+    Recompile,
+}
+
+/// Called from JIT code on the generic `rb_vm_invokeblock()` fallback of a compiled `yield`.
+///
+/// The shared core iterators -- `Array#each`, `Array#map`, `Array#select` in
+/// `<internal:array>` -- are called enough times during boot to be compiled there, from a
+/// profile of their first few dozen yields. That profile contains the IFUNC handlers the C
+/// runtime passes them and none of the ISEQ blocks or `&:sym` handlers the application will.
+/// Nothing refreshes it either: the dispatch those iterators got does not side-exit on a miss,
+/// it branches to `rb_vm_invokeblock()`, so no guard ever fails and no recompile is ever
+/// triggered. On lobsters that froze 875K yields per run at one call site.
+///
+/// So sample what the fallback is handed. Once a window's worth of samples is mostly handlers a
+/// rebuilt dispatch could serve, fold the window into the site's handler profile -- dropping the
+/// cold buckets the boot-time traffic is holding, the way
+/// [`IseqProfile::observe_ivar_fallback`] does for shapes -- grant the ISEQ one extra version,
+/// and invalidate the compiled unit to spend it.
+///
+/// `version` is the compiled unit this call lives in, not the ISEQ owning the instruction. See
+/// [`rb_zjit_ivar_reprofile`], whose structure this follows exactly.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_block_reprofile(version: *mut crate::payload::IseqVersion, frame_iseq: VALUE, insn_idx: u32, block_handler: VALUE, argc: u32, arg0: VALUE) {
+    // JIT code only reaches here once the countdown has run out, so this is the point at which
+    // the next one is set. Anything that returns early below has to leave one behind or the site
+    // would call in on every fallback for the rest of the process.
+    fn set_countdown(version: *mut crate::payload::IseqVersion, value: u32) {
+        unsafe { (*version).block_reprofile_countdown = value };
+    }
+    if unsafe { (*version).is_invalidated() } {
+        // Frames still running the invalidated code have nothing to earn.
+        set_countdown(version, u32::MAX);
+        return;
+    }
+    // No block was passed at all, so this `yield` is on its way to raising. Nothing to specialize.
+    if block_handler == VALUE(VM_BLOCK_HANDLER_NONE as usize) {
+        set_countdown(version, crate::payload::BLOCK_REPROFILE_COOLDOWN);
+        return;
+    }
+    let untagged = unsafe { rb_vm_untag_block_handler(block_handler) };
+    let insn_idx = insn_idx as YarvInsnIdx;
+    let frame_iseq = frame_iseq.as_iseq();
+    let reprofiled = with_time_stat(profile_time_ns, || {
+        get_or_create_iseq_payload(frame_iseq).profile
+            .observe_block_fallback(frame_iseq, insn_idx, untagged, argc as usize, arg0)
+    });
+    match reprofiled {
+        BlockReprofiled::Sampled => {
+            set_countdown(version, 0);
+            return;
+        }
+        BlockReprofiled::Declined => {
+            // Spend one of the version's windows. When they run out the site goes dormant for a
+            // cooldown and then opens a fresh set: what a shared iterator yields to changes
+            // completely between boot and steady state, so a verdict is only ever provisional.
+            let windows = unsafe { &mut (*version).block_reprofile_windows };
+            *windows = windows.saturating_sub(1);
+            if *windows == 0 {
+                crate::stats::incr_counter!(block_respecialize_giveup_count);
+                *windows = crate::payload::MAX_BLOCK_REPROFILE_WINDOWS;
+                set_countdown(version, crate::payload::BLOCK_REPROFILE_COOLDOWN);
+            } else {
+                set_countdown(version, 0);
+            }
+            return;
+        }
+        BlockReprofiled::Recompile => set_countdown(version, 0),
+    }
+    // `version` points into the payload, and holding a reference to it across the lock's unwind
+    // boundary is not allowed: read the compiled unit's ISEQ out first, and let the closure
+    // report back whether the site has anything left to earn rather than writing it itself.
+    let compiled_iseq = VALUE::from(unsafe { (*version).iseq });
+    let out_of_versions = with_vm_lock(src_loc!(), || {
+        let compiled_iseq = compiled_iseq.as_iseq();
+        let payload = get_or_create_iseq_payload(compiled_iseq);
+        if payload.block_respecializations >= crate::payload::MAX_BLOCK_RESPECIALIZATIONS {
+            // Out of versions: nothing this site reports can be acted on any more. Leave the
+            // call out of whatever this ISEQ compiles next, too.
+            payload.block_reprofile_giveup = true;
+            return true;
+        }
+        payload.block_respecializations += 1;
+        crate::stats::incr_counter!(block_respecialize_count);
+        if let Some(version) = payload.versions.last_mut() {
+            let cb = crate::state::ZJITState::get_code_block();
+            // The respecialization budget was just raised above, so this is not the
+            // grant path in invalidate_iseq_version(): it simply fits under the new limit.
+            crate::codegen::invalidate_iseq_version(cb, compiled_iseq, version);
+            cb.mark_all_executable();
+        }
+        false
+    });
+    if out_of_versions {
+        set_countdown(version, u32::MAX);
+    }
+}
+
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let obj = profiler.peek_at_block_handler();
     let ty = ProfiledType::block_handler(obj);
@@ -758,6 +907,10 @@ pub struct IseqProfile {
     /// arguments instead: a `yield` to a Symbol block sends to the first argument, and
     /// that send only specializes if the argument's class was profiled.
     block_handlers: HashMap<YarvInsnIdx, TypeDistribution>,
+
+    /// Live-traffic re-profiling windows for `invokeblock` sites whose compiled dispatch keeps
+    /// reaching `rb_vm_invokeblock()`.
+    block_fallbacks: HashMap<YarvInsnIdx, BlockFallbackEntry>,
 }
 
 impl IseqProfile {
@@ -768,6 +921,7 @@ impl IseqProfile {
             send_mid: HashMap::new(),
             splat_lengths: HashMap::new(),
             block_handlers: HashMap::new(),
+            block_fallbacks: HashMap::new(),
         }
     }
 
@@ -810,6 +964,103 @@ impl IseqProfile {
     /// Mutable access to the `invokeblock` block-handler distributions.
     fn block_handlers_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
         &mut self.block_handlers
+    }
+
+    /// Record one block handler that reached a compiled `yield`'s generic fallback, and say
+    /// whether the window it closed makes the case for recompiling the site.
+    /// See [`rb_zjit_block_reprofile`].
+    fn observe_block_fallback(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, handler: VALUE, argc: usize, arg0: VALUE) -> BlockReprofiled {
+        let entry = self.block_fallbacks
+            .entry(insn_idx).or_insert_with(|| BlockFallbackEntry {
+                dist: TypeDistribution::new(), symbol_recv: TypeDistribution::new(),
+                samples: 0, refreshes: 0,
+            });
+        let ty = ProfiledType::block_handler(handler);
+        if ty.flags().is_block_ifunc() {
+            crate::stats::incr_counter!(block_fallback_sample_ifunc);
+        } else if ty.flags().is_block_proc() {
+            crate::stats::incr_counter!(block_fallback_sample_proc);
+        } else if unsafe { crate::cruby::rb_IMEMO_TYPE_P(ty.class(), crate::cruby::imemo_iseq) == 1 } {
+            crate::stats::incr_counter!(block_fallback_sample_iseq);
+        } else if ty.class().static_sym_p() {
+            crate::stats::incr_counter!(block_fallback_sample_symbol);
+        } else {
+            crate::stats::incr_counter!(block_fallback_sample_other);
+        }
+        VALUE::from(iseq).write_barrier(ty.class());
+        entry.dist.observe(ty);
+        if handler.static_sym_p() && argc > 0 && !arg0.special_const_p() {
+            let recv_ty = ProfiledType::new(arg0);
+            VALUE::from(iseq).write_barrier(recv_ty.class());
+            entry.symbol_recv.observe(recv_ty);
+        }
+        entry.samples += 1;
+        if entry.samples < BLOCK_REPROFILE_WINDOW {
+            return BlockReprofiled::Sampled;
+        }
+        entry.samples = 0;
+        let summary = TypeDistributionSummary::new(&entry.dist);
+        let symbol_recv = TypeDistributionSummary::new(&entry.symbol_recv);
+        let share = crate::hir::block_fallback_specializable_share(&summary, &symbol_recv, argc);
+        if (share * 100.0) < BLOCK_REPROFILE_MIN_SHARE_PERCENT as f64 {
+            // Start the next window from scratch rather than accumulating: what matters is what
+            // the fallback is seeing now, not what it saw before the last verdict.
+            entry.dist = TypeDistribution::new();
+            entry.symbol_recv = TypeDistribution::new();
+            crate::stats::incr_counter!(block_respecialize_declined_count);
+            return BlockReprofiled::Declined;
+        }
+        let refresh = entry.refreshes < MAX_BLOCK_PROFILE_REFRESHES;
+        entry.refreshes = entry.refreshes.saturating_add(1);
+        let window = std::mem::replace(&mut entry.dist, TypeDistribution::new());
+        let recv_window = std::mem::replace(&mut entry.symbol_recv, TypeDistribution::new());
+        if !refresh {
+            // The profile already holds what this window would add -- some other compiled unit's
+            // window folded it in. The dispatch *running here* still has no arm for it, so this
+            // version has just as much reason to recompile; it simply needs no profile change.
+            return BlockReprofiled::Recompile;
+        }
+
+        // Fold the window into the profile the next compile will read. The buckets already there
+        // are what the running dispatch was built from -- for these sites, boot-time traffic
+        // that has not been seen since -- and there are only eight of them, so keep the hottest
+        // one (the handler kind the dispatch is ordered around) and give the rest to live
+        // traffic. Replaying the window's counts rather than assigning them keeps the
+        // distribution's "bucket 0 is the most common item" invariant.
+        /// Add every bucket of `window` to `dist` with the count it was seen with. Replaying the
+        /// counts rather than assigning them keeps the "bucket 0 is the most common item"
+        /// invariant that `DistributionSummary::new` asserts on.
+        fn replay_into(dist: &mut TypeDistribution, window: &TypeDistribution) {
+            for idx in 0..DISTRIBUTION_SIZE {
+                let count = window.count(idx);
+                if count == 0 { continue; }
+                let item = window.bucket(idx);
+                for _ in 0..count {
+                    dist.observe(item);
+                }
+            }
+        }
+
+        let handlers = self.block_handlers
+            .entry(insn_idx).or_insert_with(TypeDistribution::new);
+        handlers.retain_primary();
+        replay_into(handlers, &window);
+
+        // The Symbol arms the recompile emits send to the first `yield`ed argument and resolve
+        // that send from the operand profile. Refresh it from the receivers this window saw
+        // while the handler was a Symbol, for the same reason and in the same way: what the
+        // iterator yields to its other handlers says nothing about what a `&:sym` block is
+        // about to be called on.
+        if recv_window.num_observed() > 0 {
+            let entry = self.entry_mut(insn_idx);
+            if entry.opnd_types.is_empty() {
+                entry.opnd_types.resize(argc.max(1), TypeDistribution::new());
+            }
+            let recv_types = &mut entry.opnd_types[0];
+            recv_types.retain_primary();
+            replay_into(recv_types, &recv_window);
+        }
+        BlockReprofiled::Recompile
     }
 
     /// Get a profile entry for the given instruction index (read-only).
@@ -891,6 +1142,12 @@ impl IseqProfile {
                 callback(profiled_type.class)
             }
         }
+
+        for fallback in self.block_fallbacks.values() {
+            for profiled_type in fallback.dist.each_item().chain(fallback.symbol_recv.each_item()) {
+                callback(profiled_type.class)
+            }
+        }
     }
 
     /// Run a given callback with a mutable reference to every object in IseqProfile.
@@ -919,6 +1176,15 @@ impl IseqProfile {
 
         for handler_values in self.block_handlers.values_mut() {
             for ref mut profiled_type in handler_values.each_item_mut() {
+                callback(&mut profiled_type.class)
+            }
+        }
+
+        for fallback in self.block_fallbacks.values_mut() {
+            for ref mut profiled_type in fallback.dist.each_item_mut() {
+                callback(&mut profiled_type.class)
+            }
+            for ref mut profiled_type in fallback.symbol_recv.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
