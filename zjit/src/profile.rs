@@ -490,14 +490,21 @@ pub extern "C" fn rb_zjit_ivar_reprofile(version: *mut crate::payload::IseqVersi
 }
 
 fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
-    let entry = profile.entry_mut(profiler.insn_idx);
-    if entry.opnd_types.is_empty() {
-        entry.opnd_types = new_opnd_types(1);
-    }
     let obj = profiler.peek_at_block_handler();
     let ty = ProfiledType::block_handler(obj);
     VALUE::from(profiler.iseq).write_barrier(ty.class());
-    entry.opnd_types[0].observe(ty);
+    let insn_idx = profiler.insn_idx;
+    profile.block_handlers_mut().entry(insn_idx)
+        .or_insert_with(TypeDistribution::new).observe(ty);
+
+    // The operand slots profile the `yield`ed arguments, not the handler. A Symbol
+    // handler turns the `yield` into a send to the first argument, and the class of
+    // that argument is what decides whether the send can be compiled directly.
+    let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
+    let argc = num_arguments_on_stack(cd);
+    if argc > 0 {
+        profile_operands(profiler, profile, argc);
+    }
 }
 
 fn profile_getblockparamproxy(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -807,6 +814,13 @@ pub struct IseqProfile {
     /// the same reason as `super_cme`.
     splat_lengths: Option<Box<HashMap<YarvInsnIdx, SplatLengthDistribution>>>,
 
+    /// Block handlers observed at `invokeblock` sites (stored as VALUE to be GC-safe).
+    /// Kept out of `opnd_types` so that the entry's operand slots profile the yielded
+    /// arguments instead: a `yield` to a Symbol block sends to the first argument, and
+    /// that send only specializes if the argument's class was profiled. Boxed for the
+    /// same reason as `super_cme`.
+    block_handlers: Option<Box<HashMap<YarvInsnIdx, TypeDistribution>>>,
+
     /// Dense copy of every object the distributions above reference, which is what
     /// GC marking actually walks. See [`IseqProfile::marked_objects`].
     ///
@@ -830,6 +844,7 @@ impl IseqProfile {
             super_cme: None,
             send_mid: None,
             splat_lengths: None,
+            block_handlers: None,
             marked_objects: Vec::new(),
             // Nothing recorded yet, so the (empty) dense copy is already accurate.
             marked_objects_stale: false,
@@ -890,6 +905,13 @@ impl IseqProfile {
         self.splat_lengths.get_or_insert_with(Default::default)
     }
 
+    /// Mutable access to the `invokeblock` block-handler distributions, creating the
+    /// table on first use. Same reason as [`Self::super_cme_mut`].
+    fn block_handlers_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
+        self.marked_objects_stale = true;
+        self.block_handlers.get_or_insert_with(Default::default)
+    }
+
     /// Get a profile entry for the given instruction index (read-only).
     fn entry(&self, insn_idx: YarvInsnIdx) -> Option<&ProfileEntry> {
         let idx = insn_idx as u32;
@@ -926,6 +948,11 @@ impl IseqProfile {
     /// Get the distribution of method-name symbols seen at a `send`/`__send__` call site.
     pub fn get_send_method_names(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
         self.send_mid.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
+    }
+
+    /// The distribution of block handlers observed at an `invokeblock` site.
+    pub fn get_block_handlers(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
+        self.block_handlers.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
     }
 
     /// Bytes this profile owns on the Rust heap, excluding the `IseqProfile`
@@ -985,6 +1012,12 @@ impl IseqProfile {
 
         for send_mid_values in self.send_mid.iter().flat_map(|map| map.values()) {
             for profiled_type in send_mid_values.each_item() {
+                callback(profiled_type.class)
+            }
+        }
+
+        for handler_values in self.block_handlers.iter().flat_map(|map| map.values()) {
+            for profiled_type in handler_values.each_item() {
                 callback(profiled_type.class)
             }
         }
@@ -1064,6 +1097,12 @@ impl IseqProfile {
 
         for send_mid_values in self.send_mid.iter_mut().flat_map(|map| map.values_mut()) {
             for ref mut profiled_type in send_mid_values.each_item_mut() {
+                callback(&mut profiled_type.class)
+            }
+        }
+
+        for handler_values in self.block_handlers.iter_mut().flat_map(|map| map.values_mut()) {
+            for ref mut profiled_type in handler_values.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }

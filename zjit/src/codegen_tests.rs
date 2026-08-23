@@ -9634,6 +9634,129 @@ fn test_invokeblock_direct_dispatch_break_runs_ensure() {
     assert_snapshot!(assert_compiles_allowing_exits("entry"), @"[:broke, true]");
 }
 
+/// A `yield` to a Symbol block sends the Symbol's method to the first yielded argument.
+#[test]
+fn test_invokeblock_symbol_handler() {
+    eval("
+        def test(a, b)
+          [yield(a), yield(b)]
+        end
+        def entry
+          test(1, 2, &:to_s)
+        end
+        entry; entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @r#"["1", "2"]"#);
+}
+
+/// The extra `yield`ed arguments become the send's arguments, with the first one the receiver.
+#[test]
+fn test_invokeblock_symbol_handler_with_args() {
+    eval("
+        def test(a, b)
+          yield a, b
+        end
+        def entry
+          test(3, 4, &:+)
+        end
+        entry; entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"7");
+}
+
+/// A Symbol block only reaches public methods, exactly like `vm_call_symbol()`: a private or
+/// protected method is a NoMethodError, not a call.
+#[test]
+fn test_invokeblock_symbol_handler_visibility() {
+    eval("
+        class SymVis
+          def pub = :pub
+          private def priv = :priv
+          protected def prot = :prot
+        end
+        def test(a)
+          yield a
+        end
+        def entry
+          out = [test(SymVis.new, &:pub)]
+          [:priv, :prot].each do |name|
+            begin
+              test(SymVis.new, &name)
+            rescue NoMethodError => e
+              out << e.message.split(' ').first
+            end
+          end
+          out
+        end
+        entry; entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @r#"[:pub, "private", "protected"]"#);
+}
+
+/// A Symbol naming no method routes to `method_missing`, as the interpreter's Symbol block does.
+#[test]
+fn test_invokeblock_symbol_handler_method_missing() {
+    eval("
+        class SymMM
+          def method_missing(name, *args) = [:mm, name]
+          def respond_to_missing?(name, priv = false) = true
+        end
+        def test(a)
+          yield a
+        end
+        def entry
+          test(SymMM.new, &:nope)
+        end
+        entry; entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @"[:mm, :nope]");
+}
+
+/// A site that yields to more than one Symbol dispatches on each, and anything the chain does
+/// not name still goes through the generic `invokeblock`.
+#[test]
+fn test_invokeblock_symbol_handler_polymorphic() {
+    eval("
+        def test(a)
+          yield a
+        end
+        def entry
+          [test(1, &:to_s), test(1, &:succ), test(1, &:-@)]
+        end
+        entry; entry; entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @r#"["1", 2, -1]"#);
+}
+
+/// Redefining the method a Symbol block names invalidates the compiled dispatch rather than
+/// keeping the old target. Each call redefines it again, so the value the compiled code
+/// returns can only be right if it re-resolved.
+#[test]
+fn test_invokeblock_symbol_handler_redefined() {
+    eval("
+        class SymRedef
+          def val = 0
+        end
+        def test(a)
+          yield a
+        end
+        def entry
+          before = test(SymRedef.new, &:val)
+          nxt = before + 1
+          SymRedef.class_eval { define_method(:val) { nxt } }
+          [before, test(SymRedef.new, &:val)]
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @"[1, 2]");
+}
+
 /// The iterator is inlined into the caller and its `yield` reshapes the arguments for the
 /// block, whose body is then inlined at the yield too. The frame that push lays out has to
 /// follow the reshaped arguments, not the interpreter's stack, or the frame the block raises

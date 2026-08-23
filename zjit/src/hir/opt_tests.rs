@@ -4561,7 +4561,8 @@ mod hir_opt_tests {
         // A yield site whose profile is dominated by handlers we cannot dispatch directly
         // (here proc and symbol handlers) does not get an ISEQ dispatch chain: the ISEQ
         // candidates only cover a small share of the executions, so the chain would compare
-        // and miss on nearly every call and still perform the same generic dispatch.
+        // and miss on nearly every call and still perform the same generic dispatch. The
+        // Symbol handler does get an arm, and `Integer#itself` folds away behind it.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4591,13 +4592,21 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb6(), bb5()
-        bb6():
+          CondBranch v18, bb7(), bb6()
+        bb7():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
+        bb6():
+          v22:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v23:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
+          v24:CBool = IsBitEqual v22, v23
+          CondBranch v24, bb8(), bb5()
+        bb8():
+          PatchPoint MethodRedefined(Integer@0x1010, itself@0x1018, cme:0x1020)
+          Jump bb4(v10)
         bb5():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
-          Jump bb4(v22)
+          v28:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
+          Jump bb4(v28)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
