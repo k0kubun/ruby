@@ -1013,6 +1013,10 @@ pub struct CCallWithFrameData {
     pub return_type: Type,
     pub elidable: bool,
     pub block: Option<BlockHandler>,
+    /// See [`SendDirectData::block_arg`]. Unlike the ISEQ case this is *not* taken off the VM
+    /// stack: the frame the C method runs in is pushed over the argument slots, so the frame
+    /// setup counts the block argument's slot even though the C function never sees it.
+    pub block_arg: Option<InsnId>,
 }
 
 /// Payload of [`Insn::SendDirect`]. Boxed in the enum to keep `Insn` small.
@@ -1046,6 +1050,8 @@ pub struct CCallVariadicData {
     pub return_type: Type,
     pub elidable: bool,
     pub block: Option<BlockHandler>,
+    /// See [`CCallWithFrameData::block_arg`].
+    pub block_arg: Option<InsnId>,
 }
 
 /// An instruction in the SSA IR. The output of an instruction is referred to by the index of
@@ -1692,11 +1698,13 @@ macro_rules! for_each_operand_impl {
             Insn::CCallWithFrame(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
+                $visit_many!(insn.block_arg);
                 $visit_one!(insn.state);
             }
             Insn::CCallVariadic(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
+                $visit_many!(insn.block_arg);
                 $visit_one!(insn.state);
             }
             Insn::InvokeBlock { args, state, .. } => {
@@ -2475,7 +2483,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 Ok(())
             },
             Insn::CCallWithFrame(insn) => {
-                let CCallWithFrameData { cfunc, recv, args, name, cme, block, .. } = &**insn;
+                let CCallWithFrameData { cfunc, recv, args, name, cme, block, block_arg, .. } = &**insn;
                 write!(f, "CCallWithFrame {recv}, :{}@{:p}", qualified_method_name(unsafe { (**cme).owner }, *name), self.ptr_map.map_ptr(*cfunc))?;
                 write_separated!(f, ", ", ", ", args);
                 match block {
@@ -2485,12 +2493,18 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                         write!(f, ", block=&block")?,
                     None => {}
                 }
+                if let Some(block_arg) = block_arg {
+                    write!(f, ", block=&{block_arg}")?;
+                }
                 Ok(())
             },
             Insn::CCallVariadic(insn) => {
-                let CCallVariadicData { cfunc, recv, args, name, cme, .. } = &**insn;
+                let CCallVariadicData { cfunc, recv, args, name, cme, block_arg, .. } = &**insn;
                 write!(f, "CCallVariadic {recv}, :{}@{:p}", qualified_method_name(unsafe { (**cme).owner }, *name), self.ptr_map.map_ptr(*cfunc))?;
                 write_separated!(f, ", ", ", ", args);
+                if let Some(block_arg) = block_arg {
+                    write!(f, ", block=&{block_arg}")?;
+                }
                 Ok(())
             },
             Insn::IncrCounterPtr { .. } => write!(f, "IncrCounterPtr"),
@@ -5847,7 +5861,12 @@ impl Function {
                         }
                         let mut stripped_block_arg = false;
                         let mut send_block_arg = None;
-                        if send_block == Some(BlockHandler::BlockArg) && def_type == VM_METHOD_TYPE_ISEQ {
+                        // A C method's frame carries the block handler in its specval just like an
+                        // ISEQ frame's, so the same reduction applies; the difference is that the
+                        // block argument keeps its VM stack slot, which the C frame setup accounts
+                        // for. Nothing else reads `args` positionally for a C call.
+                        if send_block == Some(BlockHandler::BlockArg)
+                            && matches!(def_type, VM_METHOD_TYPE_ISEQ | VM_METHOD_TYPE_CFUNC) {
                             // The block arg is the last element in args
                             if let Some(&block_arg) = args.last() {
                                 let statically_nil = self.is_a(block_arg, types::NilClass);
@@ -6210,12 +6229,13 @@ impl Function {
                                 cme: *const rb_callable_method_entry_struct,
                                 method_id: ID,
                                 argc: u32,
+                                // The call site's flags with `VM_CALL_ARGS_BLOCKARG` cleared when
+                                // `block_arg` already holds the handler the interpreter would have
+                                // built from it.
+                                ci_flags: u32,
+                                block_arg: Option<InsnId>,
                             ) -> Result<(), ()> {
-                                let call_info = unsafe { (*cd).ci };
-
-                                let ci_flags = unsafe { vm_ci_flag(call_info) };
-                                // When seeing &block argument, fall back to dynamic dispatch for now
-                                // TODO: Support block forwarding
+                                // Argument shapes the C frame setup cannot reproduce.
                                 if unspecializable_c_call_type(ci_flags) {
                                     // Only count features NOT already counted in type_specialize.
                                     if !unspecializable_call_type(ci_flags) {
@@ -6230,6 +6250,10 @@ impl Function {
                                     Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq),
                                     None => None,
                                 };
+                                // A block reaches the callee either way, so neither the inline
+                                // bodies nor the leaf fast path (which push no frame to carry the
+                                // handler) can serve this call.
+                                let passes_block = blockiseq.is_some() || block_arg.is_some();
 
                                 let cfunc = unsafe { get_cme_def_body_cfunc(cme) };
                                 // Find the `argc` (arity) of the C method, which describes the parameters it expects
@@ -6244,10 +6268,8 @@ impl Function {
                                 }
                                 let props = props.unwrap_or_default();
                                 let return_type = props.return_type;
-                                let elidable = match blockiseq {
-                                    Some(_) => false, // Don't consider cfuncs with block arguments as elidable for now
-                                    None => props.elidable,
-                                };
+                                // Don't consider cfuncs with block arguments as elidable for now
+                                let elidable = !passes_block && props.elidable;
 
                                 match cfunc_argc {
                                     0.. => {
@@ -6274,7 +6296,7 @@ impl Function {
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
-                                        if blockiseq.is_none() {
+                                        if !passes_block {
                                             let tmp_block = fun.new_block(u32::MAX);
                                             if let Some(replacement) = (props.inline)(fun, tmp_block, recv, &args, state) {
                                                 // Copy contents of tmp_block to block
@@ -6317,6 +6339,7 @@ impl Function {
                                             return_type,
                                             elidable,
                                             block: blockiseq.map(BlockHandler::BlockIseq),
+                                            block_arg,
                                         })));
                                         fun.insn_types[ccall] = fun.infer_type(ccall);
                                         fun.make_equal_to(send_insn_id, ccall);
@@ -6341,7 +6364,7 @@ impl Function {
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
-                                        if blockiseq.is_none() {
+                                        if !passes_block {
                                             let tmp_block = fun.new_block(u32::MAX);
                                             if let Some(replacement) = (props.inline)(fun, tmp_block, recv, &args, state) {
                                                 // Copy contents of tmp_block to block
@@ -6384,6 +6407,7 @@ impl Function {
                                             return_type,
                                             elidable,
                                             block: blockiseq.map(BlockHandler::BlockIseq),
+                                            block_arg,
                                         })));
                                         fun.insn_types[ccall] = fun.infer_type(ccall);
                                         fun.make_equal_to(send_insn_id, ccall);
@@ -6399,7 +6423,7 @@ impl Function {
                             }
 
                             let ccall_argc = if send_mid_override.is_some() { args.len() as u32 } else { unsafe { vm_ci_argc(ci) } };
-                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme, mid, ccall_argc).is_ok() {
+                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme, mid, ccall_argc, flags_for_check, send_block_arg).is_ok() {
                                 continue;
                             }
 
@@ -6658,6 +6682,7 @@ impl Function {
                                             return_type,
                                             elidable,
                                             block: None,
+                                            block_arg: None,
                                         })))
                                     };
                                     self.make_equal_to(insn_id, ccall);
@@ -6707,6 +6732,7 @@ impl Function {
                                             return_type,
                                             elidable,
                                             block: None,
+                                            block_arg: None,
                                         })))
                                     };
                                     self.make_equal_to(insn_id, ccall);
@@ -9056,12 +9082,18 @@ impl Function {
                 for &arg in &insn.args {
                     self.assert_subtype(insn_id, arg, types::BasicObject)?;
                 }
+                if let Some(block_arg) = insn.block_arg {
+                    self.assert_subtype(insn_id, block_arg, types::BasicObject)?;
+                }
                 Ok(())
             }
             Insn::CCallVariadic(ref insn) => {
                 self.assert_subtype(insn_id, insn.recv, types::BasicObject)?;
                 for &arg in &insn.args {
                     self.assert_subtype(insn_id, arg, types::BasicObject)?;
+                }
+                if let Some(block_arg) = insn.block_arg {
+                    self.assert_subtype(insn_id, block_arg, types::BasicObject)?;
                 }
                 Ok(())
             }
@@ -10052,9 +10084,10 @@ struct AddIseqResult {
     profiles: ProfileOracle,
 }
 
-/// Whether any receiver class this site profiled resolves the call to an ISEQ method, which is
-/// the only method type whose frame setup `type_specialize` can hand a `&blk` block handler to.
-fn profiled_recv_has_iseq_callee(
+/// Whether any receiver class this site profiled resolves the call to a method whose frame setup
+/// `type_specialize` can hand a `&blk` block handler to. Only ISEQ and C methods get such a
+/// frame; the rest keep the dynamic send whatever the block argument is.
+fn profiled_recv_takes_block_handler(
     fun: &Function,
     profiles: &ProfileOracle,
     recv: InsnId,
@@ -10071,7 +10104,7 @@ fn profiled_recv_has_iseq_callee(
             cme = unsafe { rb_aliased_callable_method_entry(cme) };
             def_type = unsafe { get_cme_def_type(cme) };
         }
-        def_type == VM_METHOD_TYPE_ISEQ
+        matches!(def_type, VM_METHOD_TYPE_ISEQ | VM_METHOD_TYPE_CFUNC)
     })
 }
 
@@ -11617,10 +11650,9 @@ fn add_iseq_to_hir(
                         && args.last().is_some_and(|arg| block_param_proxy_values.contains(arg))
                         && block_arg_summary.as_ref().is_some_and(|summary| summary.buckets().iter().any(|profiled_type|
                             !profiled_type.is_empty() && profiled_type.class() == proxy_class))
-                        // Only an ISEQ callee's frame setup takes the handler; a C method reads
-                        // its block from a frame ZJIT does not build for a `&blk` argument, so
-                        // its call stays dynamic and the branch would be dead weight.
-                        && profiled_recv_has_iseq_callee(fun, &profiles, recv, exit_id, cd);
+                        // Only an ISEQ or C callee's frame setup takes the handler; for anything
+                        // else the call stays dynamic and the branch would be dead weight.
+                        && profiled_recv_takes_block_handler(fun, &profiles, recv, exit_id, cd);
                     let proxy_join = if proxy_split {
                         let block_arg_insn = *args.last().unwrap();
                         let join_block = fun.new_block(insn_idx);
