@@ -1377,12 +1377,14 @@ fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &
         Insn::PatchPoint { invariant, state } => no_output!(gen_patch_point(jit, asm, function, invariant, function.frame_state_ref(*state))),
         Insn::CCall { cfunc, recv, args, name, owner, return_type: _, elidable: _ } => gen_ccall(asm, *cfunc, *name, *owner, opnd!(recv), opnds!(args)),
         Insn::CCallWithFrame(insn) => {
-            let CCallWithFrameData { cfunc, recv, name, args, cme, state, block, .. } = &**insn;
-            gen_ccall_with_frame(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, function.frame_state_ref(*state))
+            let CCallWithFrameData { cfunc, recv, name, args, cme, state, block, block_arg, .. } = &**insn;
+            let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
+            gen_ccall_with_frame(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, block_arg, function.frame_state_ref(*state))
         }
         Insn::CCallVariadic(insn) => {
-            let CCallVariadicData { cfunc, recv, name, args, cme, state, block, .. } = &**insn;
-            gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, function.frame_state_ref(*state))
+            let CCallVariadicData { cfunc, recv, name, args, cme, state, block, block_arg, .. } = &**insn;
+            let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
+            gen_ccall_variadic(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, block_arg, function.frame_state_ref(*state))
         }
         &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, function.frame_state_ref(state)),
         Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), function.frame_state_ref(*state))),
@@ -1744,16 +1746,19 @@ fn gen_ccall_with_frame(
     args: Vec<Opnd>,
     cme: *const rb_callable_method_entry_t,
     block: Option<BlockHandler>,
+    block_arg: Option<lir::Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::non_variadic_cfunc_optimized_send_count);
     gen_stack_overflow_check(jit, asm, function, state, state.stack_size());
 
-    let args_with_recv_len = args.len() + 1;
-    if args_with_recv_len > C_ARG_OPNDS.len() {
+    if args.len() + 1 > C_ARG_OPNDS.len() {
         unimplemented!("Passing C call arguments on the stack");
     }
-    let caller_stack_size = state.stack().len() - args_with_recv_len;
+    // A `&blk` argument keeps its VM stack slot, above the arguments and below the frame this
+    // pushes, so the frame setup consumes one more slot than the C function has arguments.
+    let stack_slots_consumed = args.len() + 1 + usize::from(block_arg.is_some());
+    let caller_stack_size = state.stack().len() - stack_slots_consumed;
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
@@ -1772,10 +1777,10 @@ fn gen_ccall_with_frame(
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
         gen_block_handler_specval(jit, asm, block_iseq)
     } else {
-        VM_BLOCK_HANDLER_NONE.into()
+        block_arg.unwrap_or_else(|| VM_BLOCK_HANDLER_NONE.into())
     };
 
-    gen_push_frame(asm, args_with_recv_len, state, ControlFrame {
+    gen_push_frame(asm, stack_slots_consumed, state, ControlFrame {
         recv,
         iseq: None,
         cme,
@@ -1852,16 +1857,16 @@ fn gen_ccall_variadic(
     args: Vec<Opnd>,
     cme: *const rb_callable_method_entry_t,
     block: Option<BlockHandler>,
+    block_arg: Option<lir::Opnd>,
     state: &FrameState,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::variadic_cfunc_optimized_send_count);
     gen_stack_overflow_check(jit, asm, function, state, state.stack_size());
 
-    let args_with_recv_len = args.len() + 1;
-
-    // Compute the caller's stack size after consuming recv and args.
-    // state.stack() includes recv + args, so subtract both.
-    let caller_stack_size = state.stack_size() - args_with_recv_len;
+    // Compute the caller's stack size after consuming recv, args and, when the site passes one,
+    // the `&blk` argument's slot. state.stack() includes all of them.
+    let stack_slots_consumed = args.len() + 1 + usize::from(block_arg.is_some());
+    let caller_stack_size = state.stack_size() - stack_slots_consumed;
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
@@ -1880,10 +1885,10 @@ fn gen_ccall_variadic(
     let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
         gen_block_handler_specval(jit, asm, blockiseq)
     } else {
-        VM_BLOCK_HANDLER_NONE.into()
+        block_arg.unwrap_or_else(|| VM_BLOCK_HANDLER_NONE.into())
     };
 
-    gen_push_frame(asm, args_with_recv_len, state, ControlFrame {
+    gen_push_frame(asm, stack_slots_consumed, state, ControlFrame {
         recv,
         iseq: None,
         cme,
