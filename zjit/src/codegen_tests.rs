@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions};
+use crate::options::{get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_budget, set_inline_threshold, set_max_versions};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -1432,6 +1432,56 @@ fn test_inline_array_each_to_dispatch_yield_directly() {
             test([1, 2, 3])
             test([4, 5, 6])
         "), @"15");
+    });
+}
+
+/// A caller already over its cumulative inlining budget still gets the iterator inlined, which
+/// is what puts its `yield` on the direct block dispatch. A budget of 0 stands in for the big
+/// Rails methods that spend the real one long before they reach their `.each`.
+#[test]
+fn test_inline_iterator_past_exhausted_budget() {
+    with_inlining(|| {
+        let old_budget = get_option!(inline_budget);
+        set_inline_budget(1);
+        let result = assert_inlines("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        ");
+        set_inline_budget(old_budget);
+        assert_snapshot!(result, @"15");
+    });
+}
+
+/// The allowance is not unlimited: a caller over budget gets a few iterator bodies, not one per
+/// `.each` it contains. The `.each` calls past the cap keep their out-of-line dispatch, which
+/// respecializes on the block it sees, so exits are expected here.
+#[test]
+fn test_inline_iterator_past_budget_is_capped() {
+    with_inlining(|| {
+        let old_budget = get_option!(inline_budget);
+        set_inline_budget(1);
+        let result = assert_inlines_allowing_exits("
+            def test(ary)
+              out = 0
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              ary.each { |x| out += x }
+              out
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+            test([4, 5, 6])
+        ");
+        set_inline_budget(old_budget);
+        assert_snapshot!(result, @"75");
     });
 }
 
