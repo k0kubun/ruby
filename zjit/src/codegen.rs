@@ -649,6 +649,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::Comment { .. } => return Ok(()), // comment instruction, no code generation
         &Insn::Const { val: Const::Value(val) } => gen_const_value(val),
         &Insn::Const { val: Const::CPtr(val) } => gen_const_cptr(val),
+        // The `...` local of an inlined forwardable frame is just the caller's callinfo
+        // pointer. `gen_push_inline_frame` already stored the same value in the frame slot.
+        // Materialized into a register rather than left as an immediate because `getlocal ...`
+        // puts it on the modeled VM stack, and a JITFrame stack map can only reconstruct a slot
+        // from a register or an immediate `VALUE` -- which a callinfo pointer is not.
+        &Insn::ForwardingCallInfo { ci, .. } => asm.load(gen_const_cptr(ci as *const u8)),
         &Insn::Const { val: Const::CInt64(val) } => gen_const_long(val),
         &Insn::Const { val: Const::CUInt16(val) } => gen_const_uint16(val),
         &Insn::Const { val: Const::CUInt32(val) } => gen_const_uint32(val),
@@ -703,10 +709,13 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block, block_arg,
             )
         }
-        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, block_arg, captured, state } => {
+        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, block_arg, captured, forwarded, state } => {
             let captured = captured.map(|captured| opnd!(captured));
             let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
-            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, block_arg, captured))
+            let forwarded = forwarded.as_ref().map(|forwarded| {
+                (forwarded.ci, forwarded.args.iter().map(|&arg| opnd!(arg)).collect::<Vec<_>>())
+            });
+            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, block_arg, captured, forwarded))
         },
         Insn::PopInlineFrame { iseq, argc, state } => {
             no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
@@ -2362,8 +2371,20 @@ fn gen_push_inline_frame(
     blockiseq: Option<IseqPtr>,
     block_arg: Option<lir::Opnd>,
     captured: Option<Opnd>,
+    forwarded: Option<(*const rb_callinfo, Vec<Opnd>)>,
 ) {
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    // A `def foo(...)` callee keeps the caller's arguments in the frame instead of binding them
+    // to parameters, so the frame is `argc` slots taller than the local table, exactly as
+    // `vm_call_iseq_forwardable` makes it. See `gen_send_iseq_direct`, which builds the same
+    // frame for the out-of-line call.
+    let forwarded_argc = forwarded.as_ref().map_or(0, |(_, args)| args.len());
+    debug_assert_eq!(
+        forwarded.is_some(),
+        unsafe { rb_get_iseq_flags_forwardable(iseq) },
+        "forwarded arguments are set exactly for a forwardable callee",
+    );
+    debug_assert!(forwarded.is_none() || forwarded_argc == num_args.to_usize());
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, state, stack_growth);
 
@@ -2419,8 +2440,27 @@ fn gen_push_inline_frame(
         frame_type,
         specval,
         write_block_code: iseq_may_write_block_code(iseq),
-        forwarded_argc: None, // `can_inline` rejects forwardable callees
+        forwarded_argc: forwarded.is_some().then_some(forwarded_argc),
     });
+
+    // A forwardable callee reads its arguments out of the frame rather than out of parameter
+    // locals, so they have to be in memory: a side exit lands the interpreter on a `sendforward`
+    // whose `vm_adjust_stack_forwarding` copies them back out from below the frame, the GC scans
+    // them there once this frame's `cfp->sp` is published above them, and a `getlocal ...` reads
+    // the callinfo from the slot directly above them. This mirrors the same block in
+    // `gen_send_iseq_direct`; the inlined body reads none of it, because the `...` local is an
+    // `Insn::ForwardingCallInfo` constant and the arguments are the caller's own SSA values.
+    if let Some((ci, args)) = forwarded {
+        asm_comment!(asm, "copy forwarded arguments and callinfo to inlined callee frame");
+        let locals_base = state.stack().len() - args.len();
+        for (idx, &arg) in args.iter().enumerate() {
+            asm.store(Opnd::mem(64, SP, ((locals_base + idx) * SIZEOF_VALUE) as i32), arg);
+        }
+        asm.store(
+            Opnd::mem(64, SP, ((locals_base + forwarded_argc) * SIZEOF_VALUE) as i32),
+            Opnd::const_ptr(ci as *const u8),
+        );
+    }
 
     // Publish the inlined callee's entry JITFrame before the inlined body runs.
     // Frame walking functions such as rb_profile_frames can inspect the new
@@ -2486,7 +2526,10 @@ fn gen_pop_inline_frame(
     argc: usize,
     state: &FrameState,
 ) {
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    // Undo `gen_push_inline_frame`'s SP math, including the extension a forwardable callee's
+    // frame was grown by.
+    let forwarded_argc = if unsafe { rb_get_iseq_flags_forwardable(iseq) } { argc } else { 0 };
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let sp_offset = (state.stack().len() + local_size - argc + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
 
     asm_comment!(asm, "restore caller SP after inline");
@@ -4703,6 +4746,9 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
 /// on the native stack are known.
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
     let mut stack = Vec::new();
+    // Owned rather than borrowed: `Function::frame_state` resolves the state's operands through
+    // the union-find, which `jit.get_opnd` below needs. `frame_state_ref` would hand back the
+    // stored state with stale operand ids.
     let mut current_state = state.clone();
     loop {
         stack.extend(current_state.stack().rev().copied().map(|insn_id| {
@@ -4717,17 +4763,19 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         let Some(caller) = current_state.caller() else {
             break;
         };
-        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq)));
+        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq, current_state.extra_locals)));
         current_state = function.frame_state(caller);
     }
     stack
 }
 
-fn inline_frame_stack_gap(iseq: IseqPtr) -> usize {
+fn inline_frame_stack_gap(iseq: IseqPtr, extra_locals: u16) -> usize {
     // The extra slot is for the callee's receiver below its local table.
     // We currently never map out the stack for `invokeblock`, which doesn't
     // put a receiver on cfp->sp stack.
-    1 + unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + VM_ENV_DATA_SIZE.to_usize()
+    // `extra_locals` is the frame extension a `def foo(...)` callee's arguments live in, which
+    // makes the frame that much taller. See `FrameState::extra_locals`.
+    1 + unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + extra_locals as usize + VM_ENV_DATA_SIZE.to_usize()
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.
