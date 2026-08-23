@@ -2825,11 +2825,10 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
                                        { count_failure(complex_arg_pass_param_block) }
     // A `**rest` parameter collects the caller keywords the callee's keyword table does not
     // name, which `plan_send_direct_keyword_arguments` can build as one more Hash argument.
-    // `def foo(**)` is left out: `args_setup_kw_rest_parameter` leaves the anonymous slot nil
-    // rather than allocating an empty Hash when no keywords are passed, and `ruby2_keywords`
-    // needs the VM to move RHASH_PASS_AS_KEYWORDS across the call.
+    // `ruby2_keywords` is left out: it needs the VM to move RHASH_PASS_AS_KEYWORDS across
+    // the call.
     let has_kwrest = 0 != params.flags.has_kwrest();
-    if has_kwrest && (0 != params.flags.anon_kwrest() || 0 != params.flags.ruby2_keywords())
+    if has_kwrest && 0 != params.flags.ruby2_keywords()
                                        { count_failure(complex_arg_pass_param_kwrest) }
 
     // If the caller passes a block (literal or &block), we need to fall back to the
@@ -5242,8 +5241,7 @@ impl Function {
         processed_args.extend(reordered_kw_args);
 
         // `**rest` takes the keywords the loop above did not claim, in the order the caller
-        // wrote them, which is what `make_rest_kw_hash` builds from the leftover slots. The
-        // Hash is always allocated, even when nothing is left over.
+        // wrote them, which is what `make_rest_kw_hash` builds from the leftover slots.
         if has_kwrest {
             let mut leftover = Vec::with_capacity(keyword_values.len() * 2);
             for (idx, value) in keyword_values.into_iter().enumerate() {
@@ -5252,7 +5250,18 @@ impl Function {
                 leftover.push(SendDirectArg::Constant(keyword));
                 leftover.push(value);
             }
-            processed_args.push(SendDirectArg::KeywordHash(leftover));
+            // A callee with no named keywords goes through `args_setup_kw_rest_parameter`
+            // instead of `args_setup_kw_parameters`, and that one skips the allocation for
+            // an anonymous `**` with nothing to collect: the slot is left nil, not `{}`.
+            let params = unsafe { iseq.params() };
+            let nil_anon_kwrest = leftover.is_empty()
+                && 0 == params.flags.has_kw()
+                && 0 != params.flags.anon_kwrest();
+            processed_args.push(if nil_anon_kwrest {
+                SendDirectArg::Constant(Qnil)
+            } else {
+                SendDirectArg::KeywordHash(leftover)
+            });
         }
 
         Ok((processed_args, kw_bits))
