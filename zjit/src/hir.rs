@@ -10432,6 +10432,29 @@ struct AddIseqResult {
 /// of its own. See the filter in [`emit_polymorphic_send`].
 const ARM_SHAPE_MIN_SHARE: u32 = 4;
 
+/// Whether any receiver class this site profiled resolves the call to an ISEQ method, which is
+/// the only method type whose frame setup `type_specialize` can hand a `&blk` block handler to.
+fn profiled_recv_has_iseq_callee(
+    fun: &Function,
+    profiles: &ProfileOracle,
+    recv: InsnId,
+    state: InsnId,
+    cd: *const rb_call_data,
+) -> bool {
+    let mid = unsafe { vm_ci_mid((*cd).ci) };
+    fun.profile_summary(profiles, recv, state).buckets().iter().any(|profiled_type| {
+        if profiled_type.is_empty() { return false; }
+        let mut cme = unsafe { rb_callable_method_entry(profiled_type.class(), mid) };
+        if cme.is_null() { return false; }
+        let mut def_type = unsafe { get_cme_def_type(cme) };
+        while def_type == VM_METHOD_TYPE_ALIAS {
+            cme = unsafe { rb_aliased_callable_method_entry(cme) };
+            def_type = unsafe { get_cme_def_type(cme) };
+        }
+        def_type == VM_METHOD_TYPE_ISEQ
+    })
+}
+
 /// Emit a receiver-type-specialized dispatch for a send: one `HasType` branch per profiled
 /// receiver type, each with its own `Send` that `type_specialize` can turn into a direct call,
 /// plus a dynamic-send fallthrough. All branches join on a single block parameter.
@@ -12199,7 +12222,11 @@ fn add_iseq_to_hir(
                         && !unspecializable_call_type(flags & !VM_CALL_ARGS_BLOCKARG)
                         && args.last().is_some_and(|arg| block_param_proxy_values.contains(arg))
                         && block_arg_summary.as_ref().is_some_and(|summary| summary.buckets().iter().any(|profiled_type|
-                            !profiled_type.is_empty() && profiled_type.class() == proxy_class));
+                            !profiled_type.is_empty() && profiled_type.class() == proxy_class))
+                        // Only an ISEQ callee's frame setup takes the handler; a C method reads
+                        // its block from a frame ZJIT does not build for a `&blk` argument, so
+                        // its call stays dynamic and the branch would be dead weight.
+                        && profiled_recv_has_iseq_callee(fun, &profiles, recv, exit_id, cd);
                     let proxy_join = if proxy_split {
                         let block_arg_insn = *args.last().unwrap();
                         let join_block = fun.new_block(insn_idx);
