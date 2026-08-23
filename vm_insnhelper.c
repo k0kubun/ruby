@@ -6288,8 +6288,12 @@ zjit_send_cache_slot(const struct rb_zjit_send_cache *cache, VALUE klass)
     /* A class VALUE is a heap address: its low bits are zero from object
      * alignment and its high bits barely vary within a page, so neither end can
      * index the table directly. The multiply spreads every input bit into the
-     * top of the word, which is the half the shift keeps. */
-    return (unsigned int)(((uint64_t)klass * ZJIT_SEND_CACHE_HASH_MULT) >> cache->shift);
+     * top of the word, and the second one scales those bits down to the table's
+     * current length -- for a power-of-two `len` the same number a shift by
+     * 64 - log2(len) would give, but computed without knowing `len` in advance,
+     * which is what lets a table grow. See slot_of() in zjit/src/send_cache.rs. */
+    uint64_t hash = (uint64_t)klass * ZJIT_SEND_CACHE_HASH_MULT;
+    return (unsigned int)(((hash >> 32) * cache->len) >> 32);
 }
 
 /* Whether a callcache the search produced may be stored in a table.
@@ -6402,6 +6406,7 @@ zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
 
     /* Exactly what the old code path did, via rb_vm_opt_send_without_block(). */
     const struct rb_callcache *cc = vm_search_method_fastpath(reg_cfp, cd, klass);
+    bool evicted = cached != NULL && cached->klass != klass;
     bool cacheable = zjit_send_cache_cacheable_p(cc);
     if (LIKELY(cacheable)) {
         /* Two naturally-aligned stores, published the same way
@@ -6421,9 +6426,18 @@ zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
         int kind;
         if (!cacheable)                        kind = ZJIT_SEND_CACHE_MISS_UNCACHEABLE;
         else if (cached == NULL)               kind = ZJIT_SEND_CACHE_MISS_FILL;
-        else if (cached->klass == klass)       kind = ZJIT_SEND_CACHE_MISS_STALE;
+        else if (!evicted)                     kind = ZJIT_SEND_CACHE_MISS_STALE;
         else                                   kind = ZJIT_SEND_CACHE_MISS_EVICT;
         rb_zjit_send_cache_record_miss(kind);
+    }
+
+    /* This table is too small for the classes this call shape dispatches over:
+     * it is not answering, it is replacing one live class with another. Trade
+     * memory for the hit rate, dropping what is cached here -- the entry stored
+     * just above included, which is why this is the last thing the fill path
+     * does. See SendCache::grow in zjit/src/send_cache.rs. */
+    if (UNLIKELY(evicted && cache->grow_at != 0 && ++cache->evictions >= cache->grow_at)) {
+        rb_zjit_send_cache_grow(cache);
     }
     return cc;
 }
