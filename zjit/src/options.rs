@@ -116,6 +116,10 @@ pub struct Options {
     /// number of such triples bounds the memory. Undersizing it is not a graceful
     /// degradation -- see [`crate::send_cache::DEFAULT_CACHE_ENTRIES`].
     pub send_cache_entries: usize,
+    /// Turn off the run-time block ISEQ dispatch, so a `yield` whose handler is not one of the
+    /// block ISEQs the site profiled always goes out through `rb_vm_invokeblock()`. Only useful
+    /// for A/B measurement; see [`crate::codegen::gen_invoke_block_iseq_dynamic`].
+    pub disable_block_dynamic_dispatch: bool,
 
     /// Dump initial High-level IR before optimization
     pub dump_hir_init: Option<DumpHIR>,
@@ -222,6 +226,7 @@ impl Default for Options {
             disable_send_cache: false,
             disable_megamorphic_direct: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
+            disable_block_dynamic_dispatch: false,
             dump_hir_init: None,
             dump_hir_opt: None,
             dump_hir_graphviz: None,
@@ -552,6 +557,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable", "") => options.disable = true,
 
         ("disable-hir-opt", "") => options.disable_hir_opt = true,
+        ("disable-block-dynamic-dispatch", "") => options.disable_block_dynamic_dispatch = true,
 
         ("disable-send-cache", "") => options.disable_send_cache = true,
 

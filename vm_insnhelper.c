@@ -6493,7 +6493,52 @@ size_t rb_zjit_cme_def_offset(void) { return offsetof(rb_callable_method_entry_t
 size_t rb_zjit_def_iseqptr_offset(void) { return offsetof(rb_method_definition_t, body.iseq.iseqptr); }
 VALUE rb_zjit_method_entry_invalidated_flag(void) { return IMEMO_FL_USER5; }
 size_t rb_zjit_mega_direct_max_stack(void) { return ZJIT_MEGA_DIRECT_MAX_STACK; }
+/* Field offsets and flag masks the inline *block* dispatch bakes into JIT code.
+ * See rb_zjit_block_direct_layout() in zjit.h: the dispatch resolves the block
+ * ISEQ at run time, so it has to re-derive there what rb_simple_iseq_p() and
+ * vm_callee_setup_block_arg() decide in C. */
+size_t rb_zjit_iseq_body_param_flags_offset(void) { return offsetof(struct rb_iseq_constant_body, param.flags); }
+size_t rb_zjit_iseq_body_param_lead_num_offset(void) { return offsetof(struct rb_iseq_constant_body, param.lead_num); }
+size_t rb_zjit_iseq_body_local_table_size_offset(void) { return offsetof(struct rb_iseq_constant_body, local_table_size); }
+size_t rb_zjit_iseq_body_stack_max_offset(void) { return offsetof(struct rb_iseq_constant_body, stack_max); }
 
+/* The bitfields in `param.flags` have no portable layout, so build each mask by
+ * setting the bits in a zeroed body and reading the storage unit back out. */
+static uint32_t
+zjit_param_flags_word(const struct rb_iseq_constant_body *body)
+{
+    uint32_t word = 0;
+    STATIC_ASSERT(zjit_param_flags_fit_in_u32, sizeof(body->param.flags) == sizeof(uint32_t));
+    memcpy(&word, &body->param.flags, sizeof(word));
+    return word;
+}
+
+uint32_t
+rb_zjit_iseq_param_flags_not_simple_mask(void)
+{
+    struct rb_iseq_constant_body body;
+    memset(&body, 0, sizeof(body));
+    /* Keep in sync with rb_simple_iseq_p(). */
+    body.param.flags.has_opt = TRUE;
+    body.param.flags.has_rest = TRUE;
+    body.param.flags.has_post = TRUE;
+    body.param.flags.has_kw = TRUE;
+    body.param.flags.has_kwrest = TRUE;
+    body.param.flags.accepts_no_kwarg = TRUE;
+    body.param.flags.forwardable = TRUE;
+    body.param.flags.has_block = TRUE;
+    body.param.flags.accepts_no_block = TRUE;
+    return zjit_param_flags_word(&body);
+}
+
+uint32_t
+rb_zjit_iseq_param_flags_ambiguous_param0_mask(void)
+{
+    struct rb_iseq_constant_body body;
+    memset(&body, 0, sizeof(body));
+    body.param.flags.ambiguous_param0 = TRUE;
+    return zjit_param_flags_word(&body);
+}
 #endif // USE_ZJIT
 
 VALUE
