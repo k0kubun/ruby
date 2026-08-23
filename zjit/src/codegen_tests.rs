@@ -2787,6 +2787,340 @@ fn test_invokesuper_with_prepend() {
     "#), @r#"["B", "M"]"#);
 }
 
+/// A monomorphic `super` should stay specialized: no side exits, no dynamic dispatch.
+#[test]
+fn test_invokesuper_monomorphic_does_not_exit() {
+    eval("
+        class MonoSuperA
+          def foo(x) = x + 1
+        end
+        class MonoSuperB < MonoSuperA
+          def foo(x) = super(x) * 10
+        end
+        def test = MonoSuperB.new.foo(1)
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles("[test, test, test]"), @"[20, 20, 20]");
+}
+
+/// The VM replaces a frame's `ep[VM_ENV_DATA_INDEX_ME_CREF]` with an `imemo_svar` wrapping the
+/// frame's method entry as soon as the frame touches a special variable, which a regexp match
+/// does. The `super` guard has to read through the svar; otherwise it misses on every single
+/// call and the site side-exits forever.
+#[test]
+fn test_invokesuper_after_regexp_match_does_not_exit() {
+    eval(r#"
+        class SvarSuperA
+          def foo(x) = x + 1
+        end
+        class SvarSuperB < SvarSuperA
+          def foo(x)
+            x.to_s =~ /(\d+)/
+            [$1, super(x)]
+          end
+        end
+        def test = SvarSuperB.new.foo(3)
+        test
+        test
+    "#);
+    assert_snapshot!(assert_compiles("[test, test, test]"), @r#"[["3", 4], ["3", 4], ["3", 4]]"#);
+}
+
+/// A `super` inside a module body resolves through a different complemented CME for each
+/// including class, so no single CME can be guarded. The site must converge on dispatching
+/// `super` dynamically rather than side-exiting once per call.
+#[test]
+fn test_invokesuper_polymorphic_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_guard_super_method_entry;
+    // `run` keeps the calls in one ISEQ so that the second phase does not compile anything new.
+    assert_snapshot!(inspect(r#"
+        class PolySuperBase1
+          def foo(x) = [:base1, x]
+        end
+        class PolySuperBase2
+          def foo(x) = [:base2, x]
+        end
+        module PolySuperM
+          def foo(x) = super(x) << :m
+        end
+        class PolySuperA < PolySuperBase1
+          include PolySuperM
+        end
+        class PolySuperB < PolySuperBase2
+          include PolySuperM
+        end
+        def test(o) = o.foo(1)
+        def run(a, b, n) = n.times { test(a); test(b) }
+
+        $poly_super_a = PolySuperA.new
+        $poly_super_b = PolySuperB.new
+        run($poly_super_a, $poly_super_b, 200)
+        [test($poly_super_a), test($poly_super_b)]
+    "#), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+
+    // The site has converged, so exits are now bounded by the recompile budget (a handful per
+    // compiled ISEQ) rather than one per call: without the dynamic fallback, all 1000 super
+    // calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        run($poly_super_a, $poly_super_b, 500)
+        [test($poly_super_a), test($poly_super_b)]
+    "), @"[[:base1, 1, :m], [:base2, 1, :m]]");
+    let delta = exits() - before;
+    assert!(delta < 25, "guard_super_method_entry exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// A `super` in a method that is always called with a block can never pass the specialized
+/// call's block-handler guard. The exits must stop once the site gives up and dispatches
+/// `super` dynamically.
+#[test]
+fn test_invokesuper_always_with_block_converges_without_repeated_exits() {
+    let exits = || crate::state::ZJITState::get_counters().exit_unhandled_block_arg;
+    assert_snapshot!(inspect(r#"
+        class BlockSuperA
+          def foo(x) = x + 1
+        end
+        class BlockSuperB < BlockSuperA
+          def foo(x) = super(x) * 10
+        end
+        def block_super_test(o) = o.foo(1) { }
+        def block_super_run(o, n) = n.times { block_super_test(o) }
+        $block_super_o = BlockSuperB.new
+        block_super_run($block_super_o, 500)
+        block_super_test($block_super_o)
+    "#), @"20");
+
+    // Exits are bounded by the recompile budget now, not one per call: without the dynamic
+    // fallback all 1000 calls below would exit.
+    let before = exits();
+    assert_snapshot!(inspect("
+        block_super_run($block_super_o, 1000)
+        block_super_test($block_super_o)
+    "), @"20");
+    let delta = exits() - before;
+    assert!(delta < 25, "unhandled_block_arg exits still scale with call count: {delta} exits over 1000 super calls");
+}
+
+/// Redefining the target of a specialized `super` after it is compiled must take effect.
+#[test]
+fn test_invokesuper_with_target_redefined_after_compile() {
+    assert_snapshot!(inspect(r#"
+        class RedefSuperA
+          def foo = "a1"
+        end
+        class RedefSuperB < RedefSuperA
+          def foo = ["b", super]
+        end
+        def test = RedefSuperB.new.foo
+        before = [test, test, test]
+        class RedefSuperA
+          def foo = "a2"
+        end
+        [before.last, test]
+    "#), @r#"[["b", "a1"], ["b", "a2"]]"#);
+}
+
+/// A `super` reached through a prepended module, an included module and a singleton class all
+/// at once runs under a different frame method entry each time, so the site dispatches on the
+/// entry and each arm resolves `super` from its own defining class.
+#[test]
+fn test_invokesuper_chain_over_prepend_include_and_singleton() {
+    assert_snapshot!(inspect(r#"
+        module ChainSuperM
+          def tag(x) = super(x) + [:m]
+        end
+        class ChainSuperBase
+          def tag(x) = [x]
+        end
+        class ChainSuperPrepend < ChainSuperBase
+          prepend ChainSuperM
+        end
+        class ChainSuperInclude
+          include ChainSuperM
+          def self.new_with_singleton
+            o = allocate
+            def o.extra = :sing
+            o
+          end
+        end
+        class ChainSuperIncludeBase
+          def tag(x) = [x, :incbase]
+        end
+        class ChainSuperInclude2 < ChainSuperIncludeBase
+          include ChainSuperM
+        end
+        $chain_super = [ChainSuperPrepend.new, ChainSuperInclude2.new, ChainSuperInclude2.new.tap { |o| def o.z = 1 }]
+        def chain_super_run(n) = n.times { $chain_super.each { |o| o.tag(1) } }
+        chain_super_run(300)
+        $chain_super.map { |o| o.tag(2) }
+    "#), @"[[2, :m], [2, :incbase, :m], [2, :incbase, :m]]");
+}
+
+/// Redefining the target of one arm of a `super` dispatch chain has to take effect, the same way
+/// it does for a single guarded `super`.
+#[test]
+fn test_invokesuper_chain_with_target_redefined_after_compile() {
+    assert_snapshot!(inspect(r#"
+        module ChainRedefM
+          def val = ["m", super]
+        end
+        class ChainRedefA
+          def val = "a1"
+        end
+        class ChainRedefB
+          def val = "b1"
+        end
+        class ChainRedefSubA < ChainRedefA
+          prepend ChainRedefM
+        end
+        class ChainRedefSubB < ChainRedefB
+          prepend ChainRedefM
+        end
+        $chain_redef = [ChainRedefSubA.new, ChainRedefSubB.new]
+        def chain_redef_run(n) = n.times { $chain_redef.each(&:val) }
+        chain_redef_run(300)
+        before = $chain_redef.map(&:val)
+        class ChainRedefA
+          def val = "a2"
+        end
+        [before, $chain_redef.map(&:val)]
+    "#), @r#"[[["m", "a1"], ["m", "b1"]], [["m", "a2"], ["m", "b1"]]]"#);
+}
+
+/// A zsuper (`super` with no argument list) forwards the caller's arguments, which the
+/// specialized call cannot reproduce, so it keeps a dynamic dispatch -- including inside a
+/// dispatch chain's arms, where the arm still has to produce the right answer.
+#[test]
+fn test_zsuper_stays_dynamic_but_correct() {
+    assert_snapshot!(inspect(r#"
+        module ZSuperM
+          def calc(a, b) = super * 10
+        end
+        class ZSuperBase1
+          def calc(a, b) = a + b
+        end
+        class ZSuperBase2
+          def calc(a, b) = a * b
+        end
+        class ZSuperA < ZSuperBase1
+          prepend ZSuperM
+        end
+        class ZSuperB < ZSuperBase2
+          prepend ZSuperM
+        end
+        $zsuper = [ZSuperA.new, ZSuperB.new]
+        def zsuper_run(n) = n.times { $zsuper.each { |o| o.calc(2, 3) } }
+        zsuper_run(300)
+        $zsuper.map { |o| o.calc(2, 3) }
+    "#), @"[50, 60]");
+}
+
+/// A protected method called with an explicit receiver from an instance of a subclass is
+/// permitted, and one called from an unrelated class still raises.
+#[test]
+fn test_protected_call_permitted_from_subclass_and_refused_elsewhere() {
+    assert_snapshot!(inspect(r#"
+        class ProtBase
+          def initialize(v) = @v = v
+          def combine(other) = secret + other.secret
+          protected
+          def secret = @v
+        end
+        class ProtSub < ProtBase; end
+        class ProtStranger
+          def peek(o) = o.secret
+        end
+        $prot_a = ProtBase.new(1)
+        $prot_b = ProtSub.new(2)
+        def prot_run(n) = n.times { $prot_a.combine($prot_b); $prot_b.combine($prot_a) }
+        prot_run(300)
+        stranger = (ProtStranger.new.peek($prot_a) rescue $!.class)
+        [$prot_a.combine($prot_b), $prot_b.combine($prot_a), stranger]
+    "#), @"[3, 3, NoMethodError]");
+    assert!(crate::state::ZJITState::get_counters().send_protected_guard_sites > 0,
+        "the protected call never got a caller-self guard");
+}
+
+/// A refinement's protected method is defined in the refinement's ICLASS, which is not a class
+/// the caller's `self` can be checked against, so the call keeps its dynamic dispatch -- and
+/// keeps refusing callers the interpreter would refuse.
+#[test]
+fn test_protected_call_under_refinement() {
+    assert_snapshot!(inspect(r#"
+        class RefProt
+          def initialize(v) = @v = v
+        end
+        module RefProtM
+          refine RefProt do
+            def combine(other) = secret + other.secret
+            protected def secret = @v * 2
+          end
+        end
+        using RefProtM
+        $ref_prot_a = RefProt.new(1)
+        $ref_prot_b = RefProt.new(2)
+        def ref_prot_run(n) = n.times { $ref_prot_a.combine($ref_prot_b) }
+        ref_prot_run(300)
+        [$ref_prot_a.combine($ref_prot_b), ($ref_prot_a.secret rescue $!.class)]
+    "#), @"[6, NoMethodError]");
+}
+
+/// `self.foo = x` is a legal call to a private writer, and the bytecode marks it FCALL, so it
+/// specializes with no visibility guard at all.
+#[test]
+fn test_private_writer_through_self_receiver_compiles() {
+    assert_snapshot!(inspect(r#"
+        class PrivWriter
+          def set(x)
+            self.value = x
+            self.value
+          end
+          private
+          attr_accessor :value
+        end
+        $priv_writer = PrivWriter.new
+        def priv_writer_run(n) = n.times { |i| $priv_writer.set(i) }
+        priv_writer_run(300)
+        $priv_writer.set(7)
+    "#), @"7");
+}
+
+/// A private method reached through a receiver that is not literally `self` is still refused,
+/// even when the receiver happens to be the same object at runtime.
+#[test]
+fn test_private_call_with_non_self_receiver_still_raises() {
+    assert_snapshot!(inspect(r#"
+        class PrivRecv
+          def call_through(o) = o.hidden rescue $!.class
+          private
+          def hidden = :nope
+        end
+        $priv_recv = PrivRecv.new
+        def priv_recv_run(n) = n.times { $priv_recv.call_through($priv_recv) }
+        priv_recv_run(300)
+        $priv_recv.call_through($priv_recv)
+    "#), @"NoMethodError");
+}
+
+/// `respond_to?` reports visibility, not callability, and nothing here changes that.
+#[test]
+fn test_respond_to_visibility_unaffected() {
+    assert_snapshot!(inspect(r#"
+        class RespondVis
+          def pub = 1
+          protected def prot = 2
+          private def priv = 3
+        end
+        $respond_vis = RespondVis.new
+        def respond_vis_test(o) = [o.respond_to?(:pub), o.respond_to?(:prot), o.respond_to?(:priv),
+                                   o.respond_to?(:prot, true), o.respond_to?(:priv, true)]
+        def respond_vis_run(n) = n.times { respond_vis_test($respond_vis) }
+        respond_vis_run(300)
+        respond_vis_test($respond_vis)
+    "#), @"[true, false, false, true, true]");
+}
+
 #[test]
 fn test_invokesuper_with_keyword_args() {
     assert_snapshot!(inspect(r#"
