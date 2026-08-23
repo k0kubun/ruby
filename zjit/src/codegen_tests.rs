@@ -720,11 +720,32 @@ fn test_kwrest_only_kwrest_param() {
 }
 
 #[test]
-fn test_kwrest_anonymous_stays_dynamic() {
+fn test_kwrest_anonymous() {
     assert_snapshot!(inspect("
         def target(**) = :anon
-        5.times.map { target }.uniq
+        5.times.flat_map { [target, target(k: 1)] }.uniq
     "), @"[:anon]");
+}
+
+#[test]
+fn test_kwrest_anonymous_forwarded() {
+    assert_snapshot!(inspect("
+        def sink(*x, **k) = [x, k]
+        def anon_only(**) = sink(**)
+        def anon_with_lead(a, **) = sink(a, **)
+        def anon_with_rest(*, **) = sink(*, **)
+        5.times.flat_map do
+          [anon_only, anon_only(k: 1), anon_with_lead(1), anon_with_lead(1, z: 2), anon_with_rest(1, 2)]
+        end.uniq
+    "), @"[[[], {}], [[], {k: 1}], [[1], {}], [[1], {z: 2}], [[1, 2], {}]]");
+}
+
+#[test]
+fn test_kwrest_anonymous_named_keyword_still_allocates_hash() {
+    assert_snapshot!(inspect("
+        def target(a, b: 5, **) = [a, b]
+        5.times.flat_map { [target(1), target(1, b: 3, q: 4)] }.uniq
+    "), @"[[1, 5], [1, 3]]");
 }
 
 #[test]
