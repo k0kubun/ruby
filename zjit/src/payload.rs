@@ -55,6 +55,10 @@ pub struct IseqPayload {
     /// The answer only depends on which bare opcodes the ISEQ contains, which never
     /// changes after the ISEQ is compiled, so it is safe to cache for the ISEQ's lifetime.
     pub may_write_block_code: Option<bool>,
+    /// Memoized [`crate::codegen::iseq_may_expose_locals`]. Cached for the same reason
+    /// as `may_write_block_code`: answering it scans the whole ISEQ, and every call site
+    /// in the ISEQ asks.
+    pub may_expose_locals: Option<bool>,
     /// Whether this ISEQ is sitting in the background compile queue. Dedupes
     /// enqueues: the interpreter keeps calling (and keeps incrementing
     /// `jit_entry_calls`) while the request waits, and a JIT-to-JIT stub may hit
@@ -89,6 +93,7 @@ impl IseqPayload {
             ivar_reprofile_giveup: false,
             invalidation_recompiles: 0,
             may_write_block_code: None,
+            may_expose_locals: None,
             bg_queued: false,
         }
     }

@@ -1998,6 +1998,10 @@ eval_string_with_cref(VALUE self, VALUE src, rb_cref_t *cref, VALUE file, int li
     // EP is not escaped to the heap here, but captured and reused by another frame.
     // ZJIT's locals are incompatible with it unlike YJIT's, so invalidate the ISEQ for ZJIT.
     rb_zjit_invalidate_no_ep_escape(CFP_ISEQ(cfp));
+    // The eval'd ISEQ reads this frame's locals through the EP we just captured, and a
+    // ZJIT frame that hands its EP to nothing syntactically visible keeps them off the
+    // VM stack. Publish them from the frame's stack map before the eval'd code runs.
+    rb_zjit_materialize_locals(ec, cfp);
 
     iseq = eval_make_iseq(src, file, line, &block);
     if (!iseq) {

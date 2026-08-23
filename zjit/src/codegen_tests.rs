@@ -13417,3 +13417,212 @@ fn test_side_exit_still_reached_from_outlined_region() {
         [add(1, 2), add('x', 'y'), add(1.5, 2.5), add(1, 2)]
     "), @r#"[3, "xy", 4.0, 3]"#);
 }
+
+// ---------------------------------------------------------------------------
+// Locals whose values live in the JITFrame stack map instead of in the frame's
+// environment. See codegen::local_in_stack_map and codegen::iseq_may_expose_locals.
+// ---------------------------------------------------------------------------
+
+// The analysis behind the elision: only an ISEQ that can hand its EP to a child frame,
+// or that runs a `__builtin_` body reading `ec->cfp->ep`, keeps its locals eager.
+#[test]
+fn test_iseq_may_expose_locals_analysis() {
+    use crate::codegen::iseq_may_expose_locals;
+    crate::cruby::with_rubyvm(|| {
+        eval("
+            class ExposeProbe
+              def plain(a) = a.to_s + a.to_s
+              def with_block(a) = [a].each { |x| x }
+              def with_lambda(a) = lambda { a }
+              def with_define(a) = self.class.send(:define_method, :dyn) { a }
+              def with_super_block(a) = super() { a }
+              def yields = yield
+              def takes_block(&b) = b
+            end
+        ");
+        let probe = |name: &str| iseq_may_expose_locals(get_instance_method_iseq("ExposeProbe", name));
+        assert!(!probe("plain"), "a method with no child ISEQ cannot expose its locals");
+        assert!(probe("with_block"), "a block literal captures this frame's EP");
+        assert!(probe("with_lambda"), "a lambda captures this frame's EP");
+        assert!(probe("with_define"), "define_method's block captures this frame's EP");
+        assert!(probe("with_super_block"), "invokesuper's block captures this frame's EP");
+        assert!(!probe("yields"), "yield runs a block of the *caller*, not of this frame");
+        assert!(!probe("takes_block"), "a block parameter is this frame's own specval");
+        // `__builtin_cexpr!` bodies read locals as ec->cfp->ep[-N] regardless of argc.
+        assert!(
+            iseq_may_expose_locals(get_instance_method_iseq("Ractor::Port", "receive")),
+            "an ISEQ with invokebuiltin must keep its locals in the environment",
+        );
+    });
+}
+
+// binding() on a JIT frame reads the locals straight out of the VM stack, so
+// vm_make_env_object() has to replay the frame's stack map first.
+#[test]
+fn test_binding_sees_locals_kept_in_the_stack_map() {
+    assert_snapshot!(inspect("
+        def helper(a) = a.to_s
+        def test(n)
+          nil_local = nil
+          sym_local = :sym
+          true_local = true
+          computed = helper(n)
+          b = binding
+          [b.local_variable_get(:nil_local), b.local_variable_get(:sym_local),
+           b.local_variable_get(:true_local), b.local_variable_get(:computed)]
+        end
+        test(1); test(1)
+        test(1)
+    "), @r#"[nil, :sym, true, "1"]"#);
+}
+
+// Kernel#eval builds an ISEQ whose EP chains to this frame and reads its locals
+// with getlocal at level 1, without going through any materialization point.
+#[test]
+fn test_eval_sees_locals_kept_in_the_stack_map() {
+    assert_snapshot!(inspect(r#"
+        def helper(a) = a.to_s
+        def test(n)
+          flag = nil
+          label = :done
+          helper(n)
+          eval("[flag, label]")
+        end
+        test(1); test(1)
+        test(1)
+    "#), @"[nil, :done]");
+}
+
+// A block reads its parent frame's locals through the EP chain while the parent is
+// live in JIT code. Such a parent passes a block literal, so it keeps its locals
+// eager and the reads see the current values.
+#[test]
+fn test_block_reads_parent_locals_at_level_1() {
+    assert_snapshot!(inspect("
+        def test(n)
+          seen = nil
+          tag = :tag
+          [n].each { seen = [tag, n] }
+          seen
+        end
+        test(1); test(1)
+        test(2)
+    "), @"[:tag, 2]");
+}
+
+// Same, two levels up: the inner block reads a local of the method frame.
+#[test]
+fn test_block_reads_parent_locals_at_level_2() {
+    assert_snapshot!(inspect("
+        def test(n)
+          outer = :outer
+          got = nil
+          [n].each { [n].each { got = [outer, n] } }
+          got
+        end
+        test(1); test(1)
+        test(3)
+    "), @"[:outer, 3]");
+}
+
+// A TracePoint handler asks for the traced frame's binding, which walks back into
+// the JIT frames below it.
+#[test]
+fn test_tracepoint_binding_reads_jit_frame_locals() {
+    assert_snapshot!(inspect("
+        def helper(a) = a.to_s
+        def traced(n)
+          kept = nil
+          mark = :mark
+          helper(n)
+          RubyVM::ZJIT # touch a constant so the line event has somewhere to fire
+          [kept, mark]
+        end
+        traced(1); traced(1)
+        seen = nil
+        tp = TracePoint.new(:line) do |t|
+          next unless t.method_id == :traced
+          seen ||= t.binding.local_variable_get(:mark)
+        end
+        tp.enable { traced(1) }
+        seen
+    "), @":mark");
+}
+
+// caller_locations only needs the JITFrame's pc/iseq, but it runs while the frames
+// below keep their locals off the VM stack.
+#[test]
+fn test_caller_locations_through_elided_frames() {
+    assert_snapshot!(inspect(r#"
+        def innermost = caller_locations(1, 2).map(&:label)
+        def middle(n)
+          spare = nil
+          innermost
+        end
+        def outer(n) = middle(n)
+        outer(1); outer(1)
+        outer(1)
+    "#), @r#"["Object#middle", "Object#outer"]"#);
+}
+
+// GC.stress through frames that keep locals in stack maps: the VM stack slots the
+// frames skipped are marked conservatively, and the values themselves are kept
+// alive by the machine stack.
+#[test]
+fn test_gc_stress_through_elided_frames() {
+    assert_snapshot!(inspect(r#"
+        def helper(a) = a.to_s
+        def test(n)
+          untouched = nil
+          kept = "str#{n}"
+          [helper(n), kept, untouched]
+        end
+        test(1); test(1)
+        GC.stress = true
+        out = test(2)
+        GC.stress = false
+        GC.compact
+        out
+    "#), @r#"["2", "str2", nil]"#);
+}
+
+// Raising through a frame that keeps its locals in the stack map: the rescue handler
+// runs in the interpreter and reads them out of the environment, so
+// rb_zjit_materialize_frames() has to write them from the map.
+#[test]
+fn test_raise_through_elided_frames() {
+    assert_snapshot!(inspect(r#"
+        def boom(n) = raise("bad #{n}")
+        def test(n)
+          empty = nil
+          tag = :tag
+          doubled = n * 2
+          boom(n)
+        rescue => e
+          [empty, tag, doubled, e.message]
+        end
+        test(1); test(1)
+        test(3)
+    "#), @r#"[nil, :tag, 6, "bad 3"]"#);
+}
+
+// A callee side exit hands the whole stack back to the interpreter, which resumes
+// every caller frame at its call PC and reads its locals from the environment.
+#[test]
+fn test_callee_side_exit_resumes_callers_with_their_locals() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def exiting(n) = 1 + n
+        def middle(n)
+          blank = nil
+          name = :middle
+          [name, blank, exiting(n)]
+        end
+        def outer(n)
+          spare = nil
+          [spare, middle(n)]
+        end
+        outer(1); outer(1)
+        [outer(1), outer(1.5)]
+    "#), @"[[nil, [:middle, nil, 2]], [nil, [:middle, nil, 2.5]]]");
+}
