@@ -165,6 +165,10 @@ struct rb_zjit_send_cache {
 
 void rb_zjit_send_cache_record_miss(int kind);
 
+// The packed callinfo for a call shape ZJIT synthesized rather than read out of
+// the bytecode, or 0 when the shape does not fit in one.
+VALUE rb_zjit_packed_ci(ID mid, unsigned int flags, unsigned int argc);
+
 // Field offsets and flag masks the inline send-cache probe in JIT code needs.
 // They are functions rather than bindgen constants because the structs they
 // reach into (rb_callcache, rb_iseq_constant_body) are opaque to Rust.
