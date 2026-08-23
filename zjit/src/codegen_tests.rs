@@ -7680,6 +7680,31 @@ fn test_invokeblock_truncated_block_with_return() {
     assert_snapshot!(assert_compiles_allowing_exits("entry"), @":returned");
 }
 
+/// The iterator is inlined into the caller and its `yield` reshapes the arguments for the
+/// block, whose body is then inlined at the yield too. The frame that push lays out has to
+/// follow the reshaped arguments, not the interpreter's stack, or the frame the block raises
+/// through is one slot too tall. `bootstraptest/test_syntax.rb` catches this as a
+/// "Stack consistency error".
+#[test]
+fn test_inlined_block_at_reshaped_yield_unwinds_correctly() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def bar = raise
+            def test
+              1.times {
+                begin
+                  return bar
+                rescue
+                  :ok
+                end
+              }
+            end
+            test
+            test
+        "), @"1");
+    });
+}
+
 /// Replacing the block at a site the dispatch specialized for a reshape has to keep giving
 /// the new block the arity rules it asks for.
 #[test]
