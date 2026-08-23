@@ -292,6 +292,8 @@ make_counters! {
         send_fallback_super_not_optimized_method_type,
         send_fallback_super_polymorphic,
         send_fallback_super_method_entry_unstable,
+        send_fallback_super_chain_arm,
+        send_fallback_super_chain_fallback,
         send_fallback_super_target_not_found,
         send_fallback_cannot_send_direct,
         send_fallback_invokeblock_not_specialized,
@@ -468,6 +470,15 @@ make_counters! {
     // The number of times we ran a dynamic check
     guard_type_count,
     guard_shape_count,
+
+    // Executions of a `super` that reached one of the arms of a method-entry dispatch chain.
+    super_chain_arm_count,
+    // Executions of a `super` that fell through every arm of the chain and dispatched
+    // dynamically.
+    super_chain_fallback_count,
+    // Compile-time count of `super` sites that got a method-entry dispatch chain.
+    super_chain_sites,
+
 
     load_field_count,
     store_field_count,
@@ -719,6 +730,8 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SuperNotOptimizedMethodType(_)            => send_fallback_super_not_optimized_method_type,
         SuperPolymorphic                          => send_fallback_super_polymorphic,
         SuperMethodEntryUnstable                  => send_fallback_super_method_entry_unstable,
+        SuperChainArm                             => send_fallback_super_chain_arm,
+        SuperChainFallback                        => send_fallback_super_chain_fallback,
         SuperTargetNotFound                       => send_fallback_super_target_not_found,
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
