@@ -1,6 +1,6 @@
 //! Runtime state of ZJIT.
 
-use crate::codegen::{gen_entry_trampoline, gen_exception_handler_counter, gen_exception_miss_trampoline, gen_exception_mismatch_trampoline, gen_exit_meta_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_jit_entry_call_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
+use crate::codegen::{ARG_REG_CALL_TRAMPOLINES, gen_arg_reg_call_trampoline, gen_entry_trampoline, gen_exception_handler_counter, gen_exception_miss_trampoline, gen_exception_mismatch_trampoline, gen_exit_meta_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter};
 use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
@@ -73,10 +73,11 @@ pub struct ZJITState {
     /// Trampoline to call function_stub_hit
     function_stub_hit_trampoline: CodePtr,
 
-    /// Trampoline that tail-jumps to a callee's `body->jit_entry`, whose address
-    /// is only known at run time. Kept as a raw address because JIT code calls
-    /// it like any other C function. See [`gen_jit_entry_call_trampoline`].
-    jit_entry_call_trampoline: *const u8,
+    /// Trampolines that tail-jump to a callee whose address is only known at run
+    /// time, indexed by the C argument register that carries that address. Kept
+    /// as raw addresses because JIT code calls them like any other C function.
+    /// See [`gen_arg_reg_call_trampoline`].
+    arg_reg_call_trampolines: [*const u8; ARG_REG_CALL_TRAMPOLINES],
 
     /// Counter pointers for full frame C functions
     full_frame_cfunc_counter_pointers: HashMap<String, Box<u64>>,
@@ -175,7 +176,9 @@ impl ZJITState {
         let materialize_exit_trampoline = gen_materialize_exit_trampoline(&mut cb, exit_trampoline).unwrap();
         let exit_meta_trampoline = gen_exit_meta_trampoline(&mut cb, exit_trampoline).unwrap();
         let function_stub_hit_trampoline = gen_function_stub_hit_trampoline(&mut cb).unwrap();
-        let jit_entry_call_trampoline = gen_jit_entry_call_trampoline(&mut cb).unwrap().raw_ptr(&cb);
+        let arg_reg_call_trampolines = std::array::from_fn(|idx| {
+            gen_arg_reg_call_trampoline(&mut cb, idx).unwrap().raw_ptr(&cb)
+        });
 
         let perfetto_tracer = if get_option!(trace_side_exits).is_some() || get_option!(trace_compiles) || get_option!(trace_invalidation) || get_option!(trace_fallbacks) {
             Some(PerfettoTracer::new())
@@ -201,7 +204,7 @@ impl ZJITState {
             exception_mismatch_trampoline: exit_trampoline,
             exception_miss_trampoline: exit_trampoline,
             function_stub_hit_trampoline,
-            jit_entry_call_trampoline,
+            arg_reg_call_trampolines,
             full_frame_cfunc_counter_pointers: HashMap::new(),
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
             ccall_counter_pointers: HashMap::new(),
@@ -397,9 +400,18 @@ impl ZJITState {
     }
 
     /// Return a code pointer to the trampoline that tail-jumps to a run-time
-    /// callee entry point
+    /// callee entry point held in the `idx`th C argument register. The callee
+    /// must not read that register itself, which for a C function means `idx`
+    /// has to be past its last argument.
+    pub fn get_arg_reg_call_trampoline(idx: usize) -> *const u8 {
+        ZJITState::get_instance().arg_reg_call_trampolines[idx]
+    }
+
+    /// Return a code pointer to the trampoline that tail-jumps to a run-time
+    /// callee entry point, for a callee that takes its arguments out of its
+    /// frame rather than out of registers.
     pub fn get_jit_entry_call_trampoline() -> *const u8 {
-        ZJITState::get_instance().jit_entry_call_trampoline
+        ZJITState::get_arg_reg_call_trampoline(0)
     }
 
     /// Return a code pointer to the side-exit trampoline

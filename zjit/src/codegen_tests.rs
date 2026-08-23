@@ -12986,6 +12986,313 @@ fn test_megamorphic_direct_disabled_still_dispatches_correctly() {
     assert_snapshot!(result, @"435");
 }
 
+/// 30 classes with an `attr_reader` of the same name, each carrying a different number of
+/// other ivars so that no two share a shape, warmed past the direct path's threshold.
+const MEGA_IVAR_SETUP: &str = r#"
+    IVAR_KLASSES = 30.times.map do |i|
+      Class.new do
+        attr_reader :value
+        define_method(:initialize) do
+          i.times { |j| instance_variable_set(:"@pad#{j}", j) }
+          @value = i
+        end
+      end
+    end
+    IVAR_OBJS = IVAR_KLASSES.map(&:new)
+    def test_ivar(o) = o.value
+    61.times { IVAR_OBJS.each { |o| test_ivar o } }
+"#;
+
+/// Run `program` and assert JIT code answered at least one attr_reader inline.
+#[track_caller]
+fn assert_megamorphic_direct_ivar_hits(program: &str) -> String {
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct_ivar;
+    let result = inspect(program);
+    let after = crate::state::ZJITState::get_counters().send_megamorphic_direct_ivar;
+    assert!(after > before, "expected an attr_reader to be served inline, but the counter did not move");
+    result
+}
+
+/// Run `program` and assert JIT code called at least one C method out of the table.
+#[track_caller]
+fn assert_megamorphic_direct_cfunc_hits(program: &str) -> String {
+    let counters = || {
+        let c = crate::state::ZJITState::get_counters();
+        (c.send_megamorphic_direct_cfunc, c.send_megamorphic_direct_cfunc_variadic)
+    };
+    let before = counters();
+    let result = inspect(program);
+    let after = counters();
+    assert!(after.0 > before.0, "expected a fixed-arity C method to be called directly, but the counter did not move");
+    assert!(after.1 > before.1, "expected a variadic C method to be called directly, but the counter did not move");
+    result
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_reads_every_class_and_shape() {
+    // Each class has its own callcache and so its own attribute cache, and each has a
+    // different shape, so this is the case the per-name shape table could not serve: the
+    // ivar's name is a field of the method entry, not something the site knows.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(
+        "IVAR_OBJS.map { |o| test_ivar o }.sum"
+    ), @"435");
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_with_shape_polymorphism_within_a_class() {
+    // One class, many shapes: the attribute cache on the callcache holds one shape id, so
+    // every other receiver misses it and falls through to the shape walk inside the helper.
+    // The answer has to be the same either way.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        SHAPY_KLASSES = 30.times.map { Class.new { attr_reader :value } }
+        SHAPY_OBJS = SHAPY_KLASSES.flat_map do |k|
+          5.times.map do |n|
+            o = k.new
+            n.times { |j| o.instance_variable_set(:"@pad#{j}", j) }
+            o.instance_variable_set(:@value, n)
+            o
+          end
+        end
+        def test_shapy(o) = o.value
+        61.times { SHAPY_OBJS.each { |o| test_shapy o } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(
+        "SHAPY_OBJS.map { |o| test_shapy o }.sum"
+    ), @"300");
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_on_frozen_and_unset_receivers() {
+    // A read never writes, so a frozen receiver is ordinary; a receiver whose shape has no
+    // such ivar answers nil, which is the case the attribute cache records as
+    // ATTR_INDEX_NOT_SET rather than as a miss.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
+        frozen = IVAR_KLASSES.map { |k| k.new.freeze }
+        unset = IVAR_KLASSES.map { |k| k.allocate }
+        [frozen.map { |o| test_ivar o }.sum, unset.map { |o| test_ivar o }.uniq]
+    "#), @"[435, [nil]]");
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_after_redefinition_as_a_method() {
+    // Replacing the attr_reader with a real method must take effect from the next call: the
+    // slot still names the old method entry, which rb_clear_method_cache() has flagged, and
+    // the probe tests that flag before it reads the tag.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
+        before = IVAR_OBJS.map { |o| test_ivar o }.sum
+        IVAR_KLASSES.each_with_index { |k, i| k.class_eval("def value; #{i} * 100; end") }
+        after = IVAR_OBJS.map { |o| test_ivar o }.sum
+        [before, after, IVAR_OBJS.map { |o| test_ivar o }.sum]
+    "#), @"[435, 43500, 43500]");
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_after_becoming_private() {
+    // The direct path skips vm_call_method(), where the visibility check lives, so an
+    // attr_reader turned private has to stop being served here and start raising.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
+        before = IVAR_OBJS.map { |o| test_ivar o }.sum
+        IVAR_KLASSES.each { |k| k.send(:private, :value) }
+        [before, IVAR_OBJS.map { |o| begin; test_ivar o; rescue NoMethodError; :private; end }.uniq]
+    "#), @"[435, [:private]]");
+}
+
+#[test]
+fn test_megamorphic_direct_ivar_survives_gc_stress() {
+    // The read takes no frame and spills nothing, so what it does have to get right is
+    // cfp->sp: a stale one would have the GC scan VM stack slots this frame never wrote.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
+        GC.stress = true
+        sum = IVAR_OBJS.map { |o| test_ivar o }.sum
+        GC.stress = false
+        sum
+    "#), @"435");
+}
+
+/// 30 classes over three built-in receivers, so one site dispatches over enough classes to
+/// be megamorphic while resolving to a handful of distinct C functions.
+const MEGA_CFUNC_SETUP: &str = r#"
+    CFUNC_KLASSES = 30.times.map { |i| Class.new([Array, String, Hash][i % 3]) }
+    CFUNC_OBJS = CFUNC_KLASSES.map do |k|
+      o = k.new
+      case o
+      when Array then o << 1 << 2
+      when String then o << "abc"
+      when Hash then o[:a] = 1
+      end
+      o
+    end
+    def test_size(o) = o.size
+    def test_slice(o) = o.slice(0)
+    61.times { CFUNC_OBJS.each { |o| test_size o; test_slice o } }
+"#;
+
+#[test]
+fn test_megamorphic_direct_cfunc_fixed_and_variadic() {
+    // `size` is a fixed-arity C method on all three, `slice` a variadic one, so this covers
+    // both arms: arguments in registers, and arguments through an argv the call site builds.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_CFUNC_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_cfunc_hits(r#"
+        [CFUNC_OBJS.map { |o| test_size o }.sum, CFUNC_OBJS.map { |o| test_slice o }]
+    "#), @r#"[60, [1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}, 1, "a", {}]]"#);
+}
+
+#[test]
+fn test_megamorphic_direct_cfunc_passes_arguments() {
+    // A wrong frame layout shows up as a wrong argument rather than a crash, so check what
+    // the callee saw. `include?` is a one-argument C method on all three receivers, and `tr`
+    // a two-argument one -- the site stays megamorphic because one class answers `tr`
+    // itself, which is what keeps the ancestor guard from collapsing it.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_CFUNC_SETUP);
+    eval(r#"
+        TR_KLASSES = 29.times.map { Class.new(String) } + [Class.new { def tr(a, b) = :ruby }]
+        TR_OBJS = TR_KLASSES.map { |k| k < String ? k.new("hello") : k.new }
+        def test_incl(o) = o.include?("a")
+        def test_tr(o) = o.tr("el", "ip")
+        61.times { TR_OBJS.each { |o| test_tr o } }
+        61.times { CFUNC_OBJS.each { |o| test_incl o } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_cfunc_hits(r#"
+        [CFUNC_OBJS.map { |o| test_incl o }.uniq,
+         TR_OBJS.map { |o| test_tr o }.uniq,
+         CFUNC_OBJS.map { |o| test_slice o }.uniq]
+    "#), @r#"[[false, true], ["hippo", :ruby], [1, "a", {}]]"#);
+}
+
+#[test]
+fn test_megamorphic_direct_cfunc_propagates_a_raise() {
+    // The C frame this arm pushes is what the unwinder walks and the spills are what the
+    // handler reads its locals out of, so a raise from inside the callee exercises both --
+    // from the fixed-arity arm (String#include? rejects an Integer) and from the variadic
+    // one (Array#fetch and Hash#fetch reject a missing index).
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_CFUNC_SETUP);
+    eval(r#"
+        def test_raises(o, marker)
+          [marker, o.include?(1), o.fetch(99)]
+        rescue TypeError, IndexError, KeyError, NoMethodError => e
+          [marker, e.class.name.split("::").last]
+        end
+        61.times { CFUNC_OBJS.each { |o| test_raises o, :m } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_cfunc_hits(
+        "CFUNC_OBJS.map { |o| test_raises o, :m }.uniq"
+    ), @r#"[[:m, "IndexError"], [:m, "TypeError"], [:m, "KeyError"]]"#);
+}
+
+#[test]
+fn test_megamorphic_direct_cfunc_survives_gc_stress() {
+    // The arguments never reach a VM stack slot -- the frame env lands on theirs -- so what
+    // keeps them alive across the call is the C stack the conservative mark walks.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_CFUNC_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_cfunc_hits(r#"
+        GC.stress = true
+        out = [CFUNC_OBJS.map { |o| test_size o }.sum, CFUNC_OBJS.map { |o| test_slice o }.compact.size]
+        GC.stress = false
+        out
+    "#), @"[60, 30]");
+}
+
+#[test]
+fn test_megamorphic_direct_declines_a_cfunc_of_the_wrong_arity() {
+    // The fill path holds a fixed-arity C method to the site's exact argc, because the
+    // inline path has no rb_check_arity(). A site that passes too many has to keep raising.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        ARITY_KLASSES = 30.times.map { |i| Class.new([Array, String][i % 2]) }
+        ARITY_OBJS = ARITY_KLASSES.map { |k| k.new }
+        def test_arity(o) = (begin; o.size(1); rescue ArgumentError; :argerror; end)
+        61.times { ARITY_OBJS.each { |o| test_arity o } }
+    "#);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct_cfunc;
+    assert_snapshot!(inspect("ARITY_OBJS.map { |o| test_arity o }.uniq"), @"[:argerror]");
+    assert_eq!(
+        before,
+        crate::state::ZJITState::get_counters().send_megamorphic_direct_cfunc,
+        "a C method whose arity does not match the site must not be called directly",
+    );
+}
+
+#[test]
+fn test_megamorphic_direct_flushes_both_arms_when_a_tracepoint_is_enabled() {
+    // Neither arm fires C_CALL/C_RETURN, and neither is invalidated when a TracePoint turns
+    // up, so what has to hold is the run-time check: with a hook installed both go back out
+    // through the interpreter, which fires the events.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_IVAR_SETUP);
+    eval(MEGA_CFUNC_SETUP);
+    let before = {
+        let c = crate::state::ZJITState::get_counters();
+        (c.send_megamorphic_direct_ivar, c.send_megamorphic_direct_cfunc, c.send_megamorphic_direct_cfunc_variadic)
+    };
+    assert_snapshot!(inspect(r#"
+        seen = Hash.new(0)
+        tp = TracePoint.new(:c_call) { |t| seen[t.method_id] += 1 }
+        tp.enable do
+          IVAR_OBJS.each { |o| test_ivar o }
+          CFUNC_OBJS.each { |o| test_size o; test_slice o }
+        end
+        [seen[:value], seen[:size], seen[:slice]]
+    "#), @"[30, 30, 30]");
+    let after = {
+        let c = crate::state::ZJITState::get_counters();
+        (c.send_megamorphic_direct_ivar, c.send_megamorphic_direct_cfunc, c.send_megamorphic_direct_cfunc_variadic)
+    };
+    assert_eq!(before, after, "no arm may serve a call while a C_CALL hook is installed");
+}
+
+#[test]
+fn test_megamorphic_direct_iseq_only_still_dispatches_correctly() {
+    // --zjit-megamorphic-direct-iseq-only has to leave the two newer arms' calls answered
+    // the way they were before those arms existed, since that is what an A/B compares to.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = true;
+    eval(MEGA_IVAR_SETUP);
+    eval(MEGA_CFUNC_SETUP);
+    let before = {
+        let c = crate::state::ZJITState::get_counters();
+        (c.send_megamorphic_direct_ivar, c.send_megamorphic_direct_cfunc)
+    };
+    let result = inspect(r#"
+        [IVAR_OBJS.map { |o| test_ivar o }.sum, CFUNC_OBJS.map { |o| test_size o }.sum]
+    "#);
+    let after = {
+        let c = crate::state::ZJITState::get_counters();
+        (c.send_megamorphic_direct_ivar, c.send_megamorphic_direct_cfunc)
+    };
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
+    assert_eq!(before, after, "the newer arms should be off");
+    assert_snapshot!(result, @"[435, 60]");
+}
+
 #[test]
 fn test_array_aref_out_of_bounds_reads_nil() {
     assert_snapshot!(inspect(r#"

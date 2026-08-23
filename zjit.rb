@@ -142,6 +142,15 @@ class << RubyVM::ZJIT
       :non_variadic_cfunc_optimized_send_count,
       :variadic_cfunc_optimized_send_count,
     ], buf:, stats:, right_align: true, base: :send_count)
+    # How the megamorphic class table answered, of the sends that reached it.
+    print_counters([
+      :send_cache_hit,
+      :send_megamorphic_direct,
+      :send_megamorphic_direct_ivar,
+      :send_megamorphic_direct_cfunc,
+      :send_megamorphic_direct_cfunc_variadic,
+      :send_megamorphic_direct_miss,
+    ], buf:, stats:, right_align: true)
     print_counters([
       :dynamic_setivar_count,
       :dynamic_getivar_count,

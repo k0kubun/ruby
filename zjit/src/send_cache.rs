@@ -66,6 +66,17 @@
 //! clears whenever that code stops being valid, so an invalidated callee reads
 //! as a null and takes the slow path.
 //!
+//! An ISEQ method is not the only target worth serving there. On lobsters the
+//! next two largest groups of table dispatches are `attr_reader`s (639K/run) and
+//! C methods (743K/run), and the interpreter itself serves neither with anything
+//! like the machinery a Ruby-level call needs: `vm_call_ivar()` pushes no frame
+//! at all, and `vm_call_cfunc_with_frame_()` pushes the same C frame ZJIT's own
+//! [`crate::codegen::gen_ccall_with_frame`] does. So the second word carries a
+//! *kind* in its low three bits -- the `MEGA_DIRECT_*` constants below -- and the
+//! call site branches on it. That costs nothing extra to validate: JIT code XORs
+//! the word against the method entry, which yields the kind when they agree and
+//! a value far past any kind when they do not.
+//!
 //! # What the table is keyed on, and why that is enough
 //!
 //! The table memoizes `vm_lookup_cc(klass, ci)`. That function's answer depends
@@ -257,10 +268,28 @@ pub struct SendCacheKey {
 pub struct SendCacheEntry {
     /// The cached callcache as a raw word, 0 when the slot is empty.
     cc: usize,
-    /// `vm_cc_cme(cc)` when the target is directly callable from JIT code, 0
-    /// otherwise. Never dereferenced from Rust.
+    /// `vm_cc_cme(cc)` tagged with one of the `MEGA_DIRECT_*` kinds below when
+    /// the target is one JIT code can serve itself, 0 otherwise. Never
+    /// dereferenced from Rust.
     direct_cme: usize,
 }
+
+/// A simple ISEQ method, entered through `ISEQ_BODY(iseq)->jit_entry`.
+///
+/// This and the three below are how JIT code serves a table hit, tagged into
+/// the low three bits of a slot's `direct_cme`. They must match the
+/// `ZJIT_MEGA_DIRECT_*` constants in `zjit.h`, which
+/// `zjit_send_cache_direct_cme()` tags with and which
+/// [`crate::codegen::gen_send_megamorphic_direct`] branches on. Zero is not one
+/// of them: it means the slot is empty, or that only the interpreter can
+/// dispatch the target.
+pub const MEGA_DIRECT_ISEQ: u64 = 0x1;
+/// An `attr_reader`, served with no frame at all.
+pub const MEGA_DIRECT_IVAR: u64 = 0x2;
+/// A C method of the site's exact arity, called as `f(recv, arg...)`.
+pub const MEGA_DIRECT_CFUNC: u64 = 0x3;
+/// A variadic C method, called as `f(argc, argv, recv)`.
+pub const MEGA_DIRECT_CFUNC_VARIADIC: u64 = 0x4;
 
 /// One class table, shared by every compiled site with the same call shape.
 ///
@@ -533,6 +562,16 @@ pub struct SendCacheLayout {
     /// directly-callable callees to, which is what the call site's stack
     /// overflow check is compiled against.
     pub direct_max_stack: usize,
+    /// `offsetof(rb_method_definition_t, body.cfunc.func)`
+    pub def_cfunc_func: i32,
+    /// `ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC`: the largest argc for which the C fill
+    /// path will mark a C method directly callable, and so the largest argc for
+    /// which a call site emits the inline cfunc path at all.
+    pub max_cfunc_argc: usize,
+    /// `&ruby_vm_c_events_enabled`, the counter the frameless and C-frame paths
+    /// test to see whether a hook is waiting for the C_CALL/C_RETURN events they
+    /// do not fire.
+    pub c_events_enabled: *const u8,
 }
 
 impl SendCacheLayout {
@@ -548,6 +587,9 @@ impl SendCacheLayout {
             fn rb_zjit_send_cache_entry_direct_cme_offset() -> usize;
             fn rb_zjit_method_entry_invalidated_flag() -> VALUE;
             fn rb_zjit_mega_direct_max_stack() -> usize;
+            fn rb_zjit_def_cfunc_func_offset() -> usize;
+            fn rb_zjit_mega_direct_max_cfunc_argc() -> usize;
+            fn rb_zjit_c_events_enabled_ptr() -> *const u8;
         }
         // The C declaration of a slot has to agree with the Rust one, or the
         // helper would fill slots the probe never reads.
@@ -569,6 +611,9 @@ impl SendCacheLayout {
                 body_jit_entry: rb_zjit_iseq_body_jit_entry_offset() as i32,
                 cme_invalidated_flag: rb_zjit_method_entry_invalidated_flag().as_u64(),
                 direct_max_stack: rb_zjit_mega_direct_max_stack(),
+                def_cfunc_func: rb_zjit_def_cfunc_func_offset() as i32,
+                max_cfunc_argc: rb_zjit_mega_direct_max_cfunc_argc(),
+                c_events_enabled: rb_zjit_c_events_enabled_ptr(),
             }
         }
     }

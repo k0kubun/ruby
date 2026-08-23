@@ -6325,12 +6325,16 @@ zjit_send_cache_cacheable_p(const struct rb_callcache *cc)
         && !vm_cc_refinement_p(cc);
 }
 
-/* The callee's method entry when a hit on `cc` is one that JIT code may enter
- * with a direct call, or NULL.
+/* The callee's method entry, tagged with the ZJIT_MEGA_DIRECT_* kind that says
+ * how JIT code should serve it, when a hit on `cc` is one JIT code may serve
+ * without the interpreter at all; 0 otherwise.
  *
- * The inline dispatch path in gen_send_megamorphic_direct() reproduces exactly
- * what vm_call_iseq_setup() does for the simplest possible callee, and nothing
- * else, so the callee has to be one this list of conditions describes:
+ * Four kinds of target qualify, and each is only as wide as the code
+ * gen_send_megamorphic_direct() emits for it.
+ *
+ * ISEQ. The inline dispatch path reproduces exactly what vm_call_iseq_setup()
+ * does for the simplest possible callee, and nothing else, so the callee has to
+ * be one this list of conditions describes:
  *
  *  - an ordinary ISEQ method, not a bmethod, alias, refinement or anything else
  *    with its own frame shape;
@@ -6345,6 +6349,28 @@ zjit_send_cache_cacheable_p(const struct rb_callcache *cc)
  *  - a `stack_max` within ZJIT_MEGA_DIRECT_MAX_STACK, the bound the call site's
  *    stack overflow check is compiled against.
  *
+ * IVAR. An attr_reader is served with no frame at all -- which is also what
+ * vm_call_ivar() does -- so the only condition beyond the shared visibility
+ * test is the arity one: vm_call_method_each_type() runs rb_check_arity(argc,
+ * 0, 0) before it gets there, and the inline path cannot raise ArgumentError.
+ *
+ * CFUNC. The frame push is gen_ccall_with_frame()'s, so the callee has to be a
+ * plain C method of exactly the site's arity (there is no rb_check_arity() on
+ * the inline path either), or a variadic one. Fixed-arity callees are bounded
+ * by ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC: the function pointer is resolved at run
+ * time and reaches the `call` through an argument register the callee does not
+ * read, which only works while one is left over. Variadic callees take their
+ * arguments through a pointer and so need no such room, but they do need the
+ * arguments somewhere contiguous, which caps them at the same argc for the sake
+ * of the scratch space the call site reserves.
+ *
+ * Neither of the two frameless-or-C-frame kinds fires C_CALL/C_RETURN, which
+ * the interpreter does fire for both (VM_CALL_METHOD_ATTR for an attr_reader,
+ * EXEC_EVENT_HOOK in vm_call_cfunc_with_frame_ for a C method). Rather than
+ * invalidate on TracePoint, JIT code tests ruby_vm_c_events_enabled -- the same
+ * counter VM_CALL_METHOD_ATTR tests -- and hands the call back to the
+ * interpreter while any hook wants those events. So nothing here has to care.
+ *
  * The *method entry* rather than the ISEQ is what goes in the slot, and JIT code
  * checks it against the one it read out of the callcache. That is what makes the
  * two-word slot safe to fill with two plain stores: a reader that sees a fresh
@@ -6356,13 +6382,12 @@ zjit_send_cache_cacheable_p(const struct rb_callcache *cc)
  * ISEQ_BODY(iseq)->jit_entry on every call, which rb_iseq_reset_jit_func()
  * clears whenever that code stops being valid, and the ISEQ is only reached
  * through a method entry that has already validated. */
-static const rb_callable_method_entry_t *
+static uintptr_t
 zjit_send_cache_direct_cme(const struct rb_zjit_send_cache *cache, const struct rb_callcache *cc)
 {
-    if (!cache->direct_ok) return NULL;
+    if (!cache->direct_ok) return 0;
 
     const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
-    if (cme->def->type != VM_METHOD_TYPE_ISEQ) return NULL;
 
     /* The direct path skips vm_call_method(), so it must only take over calls
      * that function would have let straight through to vm_call_method_each_type().
@@ -6374,19 +6399,64 @@ zjit_send_cache_direct_cme(const struct rb_zjit_send_cache *cache, const struct 
       case METHOD_VISI_PUBLIC:
         break;
       case METHOD_VISI_PRIVATE:
-        if (!(cache->direct_flags & VM_CALL_FCALL)) return NULL;
+        if (!(cache->direct_flags & VM_CALL_FCALL)) return 0;
         break;
       default:
-        return NULL;
+        return 0;
     }
 
-    const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
-    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
-    if (!rb_simple_iseq_p(iseq)) return NULL;
-    if (body->param.lead_num != (int)cache->direct_argc) return NULL;
-    if (body->local_table_size != (unsigned int)body->param.lead_num) return NULL;
-    if (body->stack_max > ZJIT_MEGA_DIRECT_MAX_STACK) return NULL;
-    return cme;
+    /* The tag rides in the low bits of the method entry, which is a heap object
+     * and so never has them set. */
+    VM_ASSERT(((uintptr_t)cme & ZJIT_MEGA_DIRECT_TAG_MASK) == 0);
+
+    switch (cme->def->type) {
+      case VM_METHOD_TYPE_ISEQ: {
+        const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
+        const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+        if (!rb_simple_iseq_p(iseq)) return 0;
+        if (body->param.lead_num != (int)cache->direct_argc) return 0;
+        if (body->local_table_size != (unsigned int)body->param.lead_num) return 0;
+        if (body->stack_max > ZJIT_MEGA_DIRECT_MAX_STACK) return 0;
+        return (uintptr_t)cme | ZJIT_MEGA_DIRECT_ISEQ;
+      }
+      case VM_METHOD_TYPE_IVAR:
+        if (cache->direct_argc != 0) return 0;
+        return (uintptr_t)cme | ZJIT_MEGA_DIRECT_IVAR;
+      case VM_METHOD_TYPE_CFUNC: {
+        if (cache->direct_argc > ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC) return 0;
+        const rb_method_cfunc_t *cfunc = UNALIGNED_MEMBER_PTR(cme->def, body.cfunc);
+        if (cfunc->argc == (int)cache->direct_argc) {
+            return (uintptr_t)cme | ZJIT_MEGA_DIRECT_CFUNC;
+        }
+        if (cfunc->argc == -1) {
+            return (uintptr_t)cme | ZJIT_MEGA_DIRECT_CFUNC_VARIADIC;
+        }
+        return 0;
+      }
+      default:
+        return 0;
+    }
+}
+
+/* vm_call_ivar() without the frame plumbing: everything that function does
+ * other than moving `cfp->sp`, which JIT code has not moved in the first place.
+ *
+ * Neither raises, allocates nor runs Ruby, which is what lets the call site
+ * treat this as a leaf call and skip the spills a raise would need to unwind
+ * through. An attr_reader's read either hits the attribute cache on `cc`, walks
+ * the shape tree, or looks the id up in the receiver's field table, and answers
+ * Qnil when there is no such ivar.
+ *
+ * The one exception is off the main ractor, where reading an ivar off a
+ * shareable object is an isolation error and reading one off a class or module
+ * needs the shareability check the general path does. Rather than teach the
+ * call site to unwind, decline: Qundef sends it down the slow path, which is
+ * the interpreter's own dispatch and raises or answers as it always did. */
+VALUE
+rb_zjit_mega_ivar_get(VALUE recv, const struct rb_callcache *cc)
+{
+    if (UNLIKELY(!rb_ractor_main_p())) return Qundef;
+    return vm_getivar(recv, vm_cc_cme(cc)->def->body.attr.id, NULL, NULL, cc, TRUE, Qnil);
 }
 
 /* Resolve the callcache for `recv` at this site, out of `cache` when possible.
@@ -6513,6 +6583,9 @@ size_t rb_zjit_cme_def_offset(void) { return offsetof(rb_callable_method_entry_t
 size_t rb_zjit_def_iseqptr_offset(void) { return offsetof(rb_method_definition_t, body.iseq.iseqptr); }
 VALUE rb_zjit_method_entry_invalidated_flag(void) { return IMEMO_FL_USER5; }
 size_t rb_zjit_mega_direct_max_stack(void) { return ZJIT_MEGA_DIRECT_MAX_STACK; }
+size_t rb_zjit_def_cfunc_func_offset(void) { return offsetof(rb_method_definition_t, body.cfunc.func); }
+size_t rb_zjit_mega_direct_max_cfunc_argc(void) { return ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC; }
+unsigned int *rb_zjit_c_events_enabled_ptr(void) { return &ruby_vm_c_events_enabled; }
 
 /* Field offsets and flag masks the inline *block* dispatch bakes into JIT code.
  * See rb_zjit_block_direct_layout() in zjit.h: the dispatch resolves the block
