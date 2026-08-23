@@ -10296,3 +10296,74 @@ fn test_narrowed_test_high_bits() {
          test(1.5), test(1.5e300), test(nil), test(false), test(true)]
     "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
 }
+
+// --- JITFrame low-address arena -------------------------------------------------
+//
+// JITFrames are bump-allocated out of memory mapped below INT32_MAX so that the
+// store at each call site can encode the pointer as a 32-bit immediate. Nothing
+// about how a frame is *used* changed, but the frames now share pages with each
+// other instead of coming from the Rust heap, so these exercise the readers:
+// backtraces, GC marking of the frame's ISEQ, and materialization on unwind.
+
+// Kernel#caller walks the CFP chain and reads each JIT frame's pc/iseq through
+// CFP_ZJIT_FRAME. A frame allocated in the arena has to answer exactly as before.
+#[test]
+fn test_jit_frame_arena_caller_sees_every_frame() {
+    // Compare two chains that differ by exactly two frames rather than asserting an
+    // absolute depth, which depends on how the test harness evals the program.
+    assert_snapshot!(inspect(r#"
+        def depth = caller.length
+        def short = depth
+        def long1 = short
+        def long2 = long1
+        def test_short = short
+        def test_long = long2
+        5.times { test_short; test_long }
+        [test_long - test_short, test_short.positive?]
+    "#), @"[2, true]");
+}
+
+// Marking reaches a JITFrame's ISEQ through the root set, not by walking the
+// arena, so a GC in the middle of a deep JIT-to-JIT chain must keep every
+// frame's ISEQ alive. Compaction additionally rewrites the iseq field in place.
+#[test]
+fn test_jit_frame_arena_gc_stress_deep_chain() {
+    assert_snapshot!(inspect(r#"
+        def d0(n) = n * 2
+        def d1(n) = d0(n) + 1
+        def d2(n) = d1(n) + 1
+        def d3(n) = d2(n) + 1
+        def d4(n) = d3(n) + 1
+        def test(n) = d4(n)
+        5.times { |i| test(i) }
+        GC.stress = true
+        out = 5.times.map { |i| test(i) }
+        GC.stress = false
+        GC.compact
+        out << test(10)
+        out
+    "#), @"[4, 6, 8, 10, 12, 24]");
+}
+
+// Unwinding through JIT frames materializes each caller from its JITFrame before
+// the interpreter runs the handler, which reads the frame out of the arena.
+#[test]
+fn test_jit_frame_arena_raise_through_jit_frames() {
+    assert_snapshot!(inspect(r#"
+        def boom = raise(ArgumentError, "deep")
+        def m1 = boom
+        def m2 = m1
+        def m3 = m2
+        def test
+          m3
+        rescue ArgumentError => e
+          [e.message, e.backtrace.length > 3]
+        end
+        5.times { test }
+        GC.stress = true
+        out = test
+        GC.stress = false
+        out
+    "#), @r#"["deep", true]"#);
+}
+

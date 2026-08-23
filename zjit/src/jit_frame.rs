@@ -1,8 +1,9 @@
 use std::alloc::{alloc, handle_alloc_error, Layout};
+use std::cell::Cell;
 use std::mem::{align_of, size_of};
 use std::ptr;
 
-use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location};
+use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location, rb_jit_reserve_low_addr_space};
 use crate::cruby::zjit_jit_frame;
 use crate::codegen::iseq_may_write_block_code;
 use crate::state::ZJITState;
@@ -10,6 +11,98 @@ use crate::state::ZJITState;
 /// JITFrame struct is defined in zjit.h (the single source of truth) and
 /// imported into Rust via bindgen. See zjit.h for field documentation.
 pub type JITFrame = zjit_jit_frame;
+
+/// How much address space to grab per arena chunk. Lobsters, ZJIT's largest
+/// benchmark, allocates under 4MiB of JITFrames in total, so one chunk normally
+/// serves a whole process.
+const ARENA_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// A bump allocator for [`JITFrame`]s backed by memory below `INT32_MAX`.
+///
+/// Every JIT-to-JIT call site stores the address of a JITFrame into the native
+/// stack slot that `cfp->jit_return` points at. That address is a compile-time
+/// constant, so its width decides the width of the store: an address that
+/// survives sign extension from 32 bits is folded into the store as an immediate
+/// (`mov qword ptr [rbp - 8], imm32`, 8 bytes on x86-64), while a full 64-bit
+/// address needs a `movabs` into a scratch register first (14 bytes). The stores
+/// happen at essentially every call site in JIT code, so the difference is worth
+/// a dedicated allocator.
+///
+/// JITFrames are never freed -- a frame stays reachable for as long as the code
+/// that references it, which is for the life of the process -- so a bump
+/// allocator with no free list is all this needs. When the low address space is
+/// unavailable or exhausted, allocation falls back to the ordinary Rust heap and
+/// codegen simply emits the wide form for those frames.
+struct LowArena {
+    /// Next free byte in the current chunk, or null before the first chunk.
+    cursor: Cell<*mut u8>,
+    /// One past the last usable byte of the current chunk.
+    end: Cell<*mut u8>,
+    /// Set once the platform has told us it cannot provide low memory, so that
+    /// we stop asking on every allocation.
+    exhausted: Cell<bool>,
+    /// Total bytes mapped, for --zjit-stats memory accounting.
+    mapped_bytes: Cell<usize>,
+}
+
+impl LowArena {
+    const fn new() -> Self {
+        LowArena {
+            cursor: Cell::new(ptr::null_mut()),
+            end: Cell::new(ptr::null_mut()),
+            exhausted: Cell::new(false),
+            mapped_bytes: Cell::new(0),
+        }
+    }
+
+    /// Bump-allocate `layout` from low memory, or return null when unavailable.
+    fn try_alloc(&self, layout: Layout) -> *mut u8 {
+        debug_assert!(layout.align() <= 16, "arena chunks are page aligned");
+        if self.exhausted.get() {
+            return ptr::null_mut();
+        }
+        loop {
+            let cursor = self.cursor.get();
+            if !cursor.is_null() {
+                let aligned = (cursor as usize).next_multiple_of(layout.align());
+                // The chunk is one mapping, so this arithmetic stays inside it.
+                if let Some(next) = aligned.checked_add(layout.size()) {
+                    if next <= self.end.get() as usize {
+                        self.cursor.set(next as *mut u8);
+                        return aligned as *mut u8;
+                    }
+                }
+            }
+            // Current chunk is full (or there is none yet): map another one.
+            let chunk = unsafe { rb_jit_reserve_low_addr_space(ARENA_CHUNK_SIZE) } as *mut u8;
+            if chunk.is_null() || layout.size() > ARENA_CHUNK_SIZE {
+                self.exhausted.set(true);
+                return ptr::null_mut();
+            }
+            self.mapped_bytes.set(self.mapped_bytes.get() + ARENA_CHUNK_SIZE);
+            self.cursor.set(chunk);
+            self.end.set(unsafe { chunk.add(ARENA_CHUNK_SIZE) });
+        }
+    }
+}
+
+// Only ever touched with the GVL held, from JITFrame::alloc() on the compiling
+// thread and from mem_stats.
+unsafe impl Sync for LowArena {}
+
+static LOW_ARENA: LowArena = LowArena::new();
+
+/// Bytes of JITFrame that the arena could not serve and that went to the Rust heap.
+struct HeapFallbackBytes(Cell<usize>);
+unsafe impl Sync for HeapFallbackBytes {}
+static HEAP_FALLBACK_BYTES: HeapFallbackBytes = HeapFallbackBytes(Cell::new(0));
+
+/// Bytes the JITFrame allocator holds: whole arena chunks plus any heap fallback.
+/// This counts mapped chunks rather than live frames, so it includes the slack at
+/// the end of the current chunk. For --zjit-stats.
+pub fn allocated_bytes() -> usize {
+    LOW_ARENA.mapped_bytes.get() + HEAP_FALLBACK_BYTES.0.get()
+}
 
 impl JITFrame {
     /// Allocate a JITFrame and its trailing stack map on the heap, register it
@@ -27,7 +120,13 @@ impl JITFrame {
             .checked_add(stack_size.checked_mul(size_of::<VALUE>()).unwrap())
             .unwrap();
         let layout = Layout::from_size_align(frame_size, align_of::<JITFrame>()).unwrap();
-        let raw_ptr = unsafe { alloc(layout) as *mut JITFrame };
+        // Prefer the low-address arena so that call sites can store this pointer
+        // as a 32-bit immediate. Falling back to the heap only costs code size.
+        let mut raw_ptr = LOW_ARENA.try_alloc(layout) as *mut JITFrame;
+        if raw_ptr.is_null() {
+            raw_ptr = unsafe { alloc(layout) as *mut JITFrame };
+            HEAP_FALLBACK_BYTES.0.set(HEAP_FALLBACK_BYTES.0.get() + layout.size());
+        }
         if raw_ptr.is_null() {
             handle_alloc_error(layout);
         }
