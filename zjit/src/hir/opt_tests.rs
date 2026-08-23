@@ -11284,9 +11284,10 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_send_with_block_forwarding_to_cfunc() {
-        // The block param proxy arm passes this frame's own block handler straight through, but
-        // only an ISEQ callee has frame setup for it; `Array#map` keeps the dynamic send.
+    fn test_send_forwards_block_to_array_map() {
+        // `[].map(&block)` reads `block` with `getblockparamproxy`, so the proxy arm passes this
+        // frame's own block handler to `Array#map` (an ISEQ method) as a direct send. The other
+        // arm, a block param that `setblockparam` materialized, keeps the dynamic send.
         eval(r#"
             def test(&block) = [].map(&block)
             test { |x| x }; test { |x| x }
