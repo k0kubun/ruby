@@ -1283,10 +1283,10 @@ fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), function.frame_state_ref(state), reason),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, function.frame_state_ref(state), reason),
         Insn::SendDirect(insn) => {
-            let SendDirectData { cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
+            let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
             gen_send_iseq_direct(
                 cb, jit, asm,
-                function, *cme, *iseq, opnd!(recv), opnds!(args),
+                function, *cd, *cme, *iseq, opnd!(recv), opnds!(args),
                 *kw_bits, *jit_entry_idx, function.frame_state_ref(*state), *block,
             )
         }
@@ -1781,6 +1781,7 @@ fn gen_ccall_with_frame(
         frame_type: VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL,
         specval: block_handler_specval,
         write_block_code: false,
+        extra_locals: 0,
     });
 
     // Unlike JIT-to-JIT calls, the C function doesn't use the SP and CFP registers,
@@ -1889,6 +1890,7 @@ fn gen_ccall_variadic(
         frame_type: VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL,
         specval: block_handler_specval,
         write_block_code: false,
+        extra_locals: 0,
     });
 
     // Unlike JIT-to-JIT calls, the C function doesn't use the SP and CFP registers,
@@ -2688,6 +2690,7 @@ fn gen_push_inline_frame(
         frame_type,
         specval,
         write_block_code: iseq_may_write_block_code(iseq),
+        extra_locals: 0,
     });
 
     // Publish the inlined callee's entry JITFrame before the inlined body runs.
@@ -2773,6 +2776,7 @@ fn gen_send_iseq_direct(
     jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
+    cd: *const rb_call_data,
     cme: *const rb_callable_method_entry_t,
     iseq: IseqPtr,
     recv: Opnd,
@@ -2784,7 +2788,12 @@ fn gen_send_iseq_direct(
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::iseq_optimized_send_count);
 
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    // `def foo(...)` keeps the caller's arguments in the callee frame instead of binding them
+    // to parameters, so the frame is `argc` slots taller than the local table and the JIT
+    // entry takes only the callinfo. See vm_call_iseq_forwardable().
+    let forwarding = unsafe { rb_get_iseq_flags_forwardable(iseq) };
+    let forwarded_argc = if forwarding { args.len() } else { 0 };
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, state, stack_growth);
 
@@ -2830,6 +2839,7 @@ fn gen_send_iseq_direct(
         frame_type,
         specval,
         write_block_code: iseq_may_write_block_code(iseq),
+        extra_locals: forwarded_argc,
     });
 
     // Write "keyword_bits" to the callee's frame if the callee accepts keywords.
@@ -2845,6 +2855,25 @@ fn gen_send_iseq_direct(
         let bits_offset = (state.stack().len() - args.len() + bits_start) * SIZEOF_VALUE;
         asm_comment!(asm, "write keyword bits to callee frame");
         asm.store(Opnd::mem(64, SP, bits_offset as i32), unspecified_bits.into());
+    }
+
+    // A forwardable callee reads its arguments out of the frame rather than out of parameter
+    // locals, so they have to be in memory before the call: `rb_vm_sendforward` copies them
+    // from there, the interpreter finds them there after a side exit, and the GC scans them
+    // there once the callee publishes its `cfp->sp` above them. The callinfo goes into the
+    // `...` local, which sits directly above them, matching argv[param_size - 1] in
+    // vm_callee_setup_arg().
+    if forwarding {
+        asm_comment!(asm, "copy forwarded arguments and callinfo to callee frame");
+        let locals_base = state.stack().len() - args.len();
+        for (idx, &arg) in args.iter().enumerate() {
+            asm.store(Opnd::mem(64, SP, ((locals_base + idx) * SIZEOF_VALUE) as i32), arg);
+        }
+        let ci = unsafe { (*cd).ci };
+        asm.store(
+            Opnd::mem(64, SP, ((locals_base + forwarded_argc) * SIZEOF_VALUE) as i32),
+            Opnd::const_ptr(ci as *const u8),
+        );
     }
 
     asm_comment!(asm, "switch to new SP register");
@@ -2870,7 +2899,13 @@ fn gen_send_iseq_direct(
         1 /* recv */ + args.len() + if needs_block { 1 } else { 0 }
     });
     c_args.push(recv);
-    c_args.extend(&args);
+    if forwarding {
+        // The JIT entry of a forwardable ISEQ takes exactly one parameter, the `...` local.
+        // The forwarded arguments were written to the frame above instead.
+        c_args.push(Opnd::const_ptr(unsafe { (*cd).ci } as *const u8));
+    } else {
+        c_args.extend(&args);
+    }
     if needs_block {
         if callee_is_bmethod {
             // For bmethods, specval is the captured EP, not the block handler.
@@ -2883,7 +2918,8 @@ fn gen_send_iseq_direct(
     }
 
     // Make a method call. The target address will be rewritten once compiled.
-    let iseq_call = IseqCall::new(iseq, jit_entry_idx, args.len().try_into().expect("checked in HIR"));
+    let call_argc = if forwarding { 1 } else { args.len() };
+    let iseq_call = IseqCall::new(iseq, jit_entry_idx, call_argc.try_into().expect("checked in HIR"));
     let dummy_ptr = cb.get_write_ptr().raw_ptr(cb);
     jit.iseq_calls.push(iseq_call.clone());
     let ret = asm.ccall_with_iseq_call(dummy_ptr, c_args, &iseq_call);
@@ -3035,6 +3071,7 @@ fn gen_invoke_block_iseq_direct(
         frame_type: VM_FRAME_MAGIC_BLOCK,
         specval,
         write_block_code: iseq_may_write_block_code(block_iseq),
+        extra_locals: 0,
     });
 
     asm_comment!(asm, "switch to new SP register");
@@ -4838,6 +4875,10 @@ struct ControlFrame {
     /// Whether to write block_code = 0 at frame push time.
     /// True when the callee ISEQ may write to block_code (has send/invokesuper/invokeblock).
     write_block_code: bool,
+    /// Frame slots the callee needs below its own local table. A forwardable callee
+    /// (`def foo(...)`) keeps the caller's arguments there, exactly like
+    /// `vm_call_iseq_forwardable` growing `local_size` by `vm_ci_argc(ci)`. Zero otherwise.
+    extra_locals: usize,
 }
 
 /// Compile an interpreter frame
@@ -4848,7 +4889,7 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
     asm_comment!(asm, "push cme, specval, frame type");
     // ep[-2]: cref of cme
     let local_size = if let Some(iseq) = frame.iseq {
-        (unsafe { get_iseq_body_local_table_size(iseq) }) as i32
+        (unsafe { get_iseq_body_local_table_size(iseq) }) as i32 + frame.extra_locals as i32
     } else {
         0
     };

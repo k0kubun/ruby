@@ -2845,6 +2845,52 @@ pub enum ValidationError {
     MiscValidationError(InsnId, String),
 }
 
+/// Call-site features that keep a `def foo(...)` callee on the interpreter's argument setup.
+///
+/// Everything here changes what the callee's `...` local has to describe, so passing the
+/// call site's own callinfo through would misrepresent the arguments we copied:
+/// `VM_CALL_FORWARDING` means the caller is itself forwarding and the callinfo to hand over
+/// lives in *its* `...` local rather than at this call site, `VM_CALL_ARGS_BLOCKARG` puts a
+/// block on the stack that `vm_caller_setup_arg_block` pops before argument setup, splats
+/// and `**kwrest` mean the stack does not hold `vm_ci_argc(ci)` plain values, and
+/// super/`__send__`/tailcall reach the callee through a different setup path entirely.
+const FORWARDABLE_CALLEE_BLOCKERS: u32 = VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT
+    | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING | VM_CALL_TAILCALL
+    | VM_CALL_OPT_SEND | VM_CALL_SUPER | VM_CALL_ZSUPER;
+
+/// Check if we can emit SendDirect to a `def foo(...)` (forwardable) ISEQ.
+///
+/// `vm_call_iseq_forwardable` does not run `setup_parameters_complex` at all: it grows the
+/// callee frame by `vm_ci_argc(ci)`, leaves the caller's arguments where they already are,
+/// and stores the call site's callinfo in the `...` local so a later `sendforward` can
+/// replay the call. [`super::codegen::gen_send_iseq_direct`] can do the same, because the
+/// argument count is a property of the call site and therefore known at compile time.
+///
+/// A literal block needs no check of its own: `optimized_forward` in `iseq_set_arguments`
+/// gives a forwardable ISEQ no block parameter and always sets `use_block`, so the frame's
+/// specval that SendDirect already writes is the whole of it.
+fn can_direct_send_forwardable(ci: *const rb_callinfo, args: &[InsnId]) -> Result<(), SendDirectFailure> {
+    use Counter::*;
+    let ci_flags = unsafe { rb_vm_ci_flag(ci) };
+    if ci_flags & FORWARDABLE_CALLEE_BLOCKERS != 0 {
+        return Err(SendDirectFailure::with_counters(
+            ComplexArgPass,
+            vec![complex_arg_pass_param_forwardable],
+        ));
+    }
+    // The frame is grown by exactly the call site's argument count, so the HIR argument
+    // list has to be the whole of it. Keyword arguments count here: they stay on the stack
+    // as plain values and the callinfo records their names.
+    if args.len() != unsafe { rb_vm_ci_argc(ci) } as usize {
+        return Err(SendDirectFailure::new(ArgcParamMismatch));
+    }
+    // `IseqCall` stores argc as u16, and the callee frame has to fit the copied arguments.
+    if u16::try_from(args.len()).is_err() {
+        return Err(SendDirectFailure::new(OperandTooLarge));
+    }
+    Ok(())
+}
+
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
 fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnId], has_block: bool) -> Result<(), SendDirectFailure> {
     let mut complex_arg_counters = vec![];
@@ -2855,7 +2901,9 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
     let caller_passes_block_arg = has_block && (unsafe { rb_vm_ci_flag(ci) } & VM_CALL_ARGS_BLOCKARG) != 0;
 
     use Counter::*;
-    if 0 != params.flags.forwardable() { count_failure(complex_arg_pass_param_forwardable) }
+    if 0 != params.flags.forwardable() {
+        return can_direct_send_forwardable(ci, args);
+    }
     if callee_has_block_param && caller_passes_block_arg
                                        { count_failure(complex_arg_pass_param_block) }
     if 0 != params.flags.has_kwrest()  { count_failure(complex_arg_pass_param_kwrest) }
@@ -4714,6 +4762,16 @@ impl Function {
     /// Array where the callee expects it, so the repacking below has to be skipped.
     fn build_send_direct_args(&self, args: &[InsnId], ci: *const rb_callinfo, iseq: IseqPtr, has_block: bool, rest_prepacked: bool) -> Result<SendDirectCall, SendDirectFailure> {
         can_direct_send(iseq, ci, args, has_block)?;
+        // A forwardable callee takes the caller's arguments verbatim: no reordering, no
+        // synthesized keyword Hash, no rest packing. `gen_send_iseq_direct` copies them into
+        // the callee frame and stores the callinfo in the `...` local.
+        if 0 != unsafe { iseq.params() }.flags.forwardable() {
+            return Ok(SendDirectCall {
+                args: args.iter().copied().map(SendDirectArg::Existing).collect(),
+                kw_bits: 0,
+                jit_entry_idx: 0,
+            });
+        }
         let args = args.iter().copied().map(SendDirectArg::Existing).collect();
         let (args, kw_bits) = Self::plan_send_direct_keyword_arguments(args, ci, iseq)
             .map_err(SendDirectFailure::new)?;
