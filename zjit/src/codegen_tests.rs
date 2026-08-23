@@ -8555,3 +8555,29 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
       :done
     "#), @":done");
 }
+
+// --- Narrowed `test reg, imm` ---------------------------------------------------
+
+// `test rdi, 7` is emitted as `test dil, 7` when only ZF is read. The bits above
+// the immediate are masked off either way, so a receiver whose pointer has plenty
+// of high bits set must still be classified as a heap object, and an immediate
+// whose payload sets high bits must still be classified as one.
+#[test]
+fn test_narrowed_test_high_bits() {
+    assert_snapshot!(inspect(r#"
+        class Big; def go = :heap; end
+        class Integer; def go = :int; end
+        class Symbol; def go = :sym; end
+        class Float; def go = :float; end
+        class NilClass; def go = :nil; end
+        class FalseClass; def go = :false; end
+        class TrueClass; def go = :true; end
+        def test(o) = o.go
+        objs = 200.times.map { Big.new }
+        20.times { test(objs.sample); test(1); test(:s) }
+        # Large fixnums and negative ones set bits well above the tag byte; 1e300 is
+        # outside the flonum range, so it is a heap Float.
+        [test(objs.last), test(1 << 40), test(-(1 << 40)), test(0), test(:zz),
+         test(1.5), test(1.5e300), test(nil), test(false), test(true)]
+    "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
+}
