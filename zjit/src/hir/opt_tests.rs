@@ -4838,13 +4838,23 @@ mod hir_opt_tests {
           v37:CInt64 = IntAnd v35, v36
           v39:CInt64[3] = Const CInt64(3)
           v40:CBool = IsBitEqual v37, v39
-          CondBranch v40, bb8(), bb7()
+          CondBranch v40, bb8(), bb9()
         bb8():
           v42:BasicObject = InvokeBlockIfunc v35, v32
           Jump bb6(v42)
+        bb9():
+          v44:CInt64[1] = Const CInt64(1)
+          v45:CBool = IsBitEqual v37, v44
+          CondBranch v45, bb10(), bb7()
+        bb10():
+          v47:CInt64[-4] = Const CInt64(-4)
+          v48:CInt64 = IntAnd v35, v47
+          v50:BasicObject = InvokeBlockIseqDynamic v48, v32 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb6(v50)
         bb7():
-          v44:BasicObject = InvokeBlock v32 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb6(v44)
+          BlockReprofile v35
+          v53:BasicObject = InvokeBlock v32 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb6(v53)
         bb6(v38:BasicObject):
           PopInlineFrame
           CheckInterrupts
@@ -4940,23 +4950,25 @@ mod hir_opt_tests {
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
+          v33:BasicObject = InvokeBlockIseqDynamic v21, v10 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v33)
         bb6():
-          v34:CPtr = GetEP 0
-          v35:CInt64 = LoadField v34, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v36:CInt64[3] = Const CInt64(3)
-          v37:CInt64 = IntAnd v35, v36
-          v39:CInt64[3] = Const CInt64(3)
-          v40:CBool = IsBitEqual v37, v39
-          CondBranch v40, bb13(), bb12()
+          v35:CPtr = GetEP 0
+          v36:CInt64 = LoadField v35, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v37:CInt64[3] = Const CInt64(3)
+          v38:CInt64 = IntAnd v36, v37
+          v40:CInt64[3] = Const CInt64(3)
+          v41:CBool = IsBitEqual v38, v40
+          CondBranch v41, bb13(), bb12()
         bb13():
-          v42:BasicObject = InvokeBlockIfunc v35, v10
-          Jump bb11(v42)
+          v43:BasicObject = InvokeBlockIfunc v36, v10
+          Jump bb11(v43)
         bb12():
-          v44:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb11(v44)
-        bb11(v38:BasicObject):
-          Jump bb4(v38)
+          BlockReprofile v36
+          v46:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb11(v46)
+        bb11(v39:BasicObject):
+          Jump bb4(v39)
         bb4(v14:BasicObject):
           CheckInterrupts
           Return v14
@@ -4998,21 +5010,31 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb7(), bb6()
+          CondBranch v18, bb7(), bb8()
         bb7():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb6():
-          v22:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v23:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb8(), bb5()
         bb8():
-          v35:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: symbol block handler's send did not specialize
-          Jump bb4(v35)
-        bb5():
-          v28:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
+          v22:CInt64[1] = Const CInt64(1)
+          v23:CBool = IsBitEqual v15, v22
+          CondBranch v23, bb9(), bb6()
+        bb9():
+          v25:CInt64[-4] = Const CInt64(-4)
+          v26:CInt64 = IntAnd v13, v25
+          v28:BasicObject = InvokeBlockIseqDynamic v26, v10 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
           Jump bb4(v28)
+        bb6():
+          v30:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v31:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
+          v32:CBool = IsBitEqual v30, v31
+          CondBranch v32, bb10(), bb5()
+        bb10():
+          v44:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: symbol block handler's send did not specialize
+          Jump bb4(v44)
+        bb5():
+          BlockReprofile v13
+          v37:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
+          Jump bb4(v37)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -5073,23 +5095,25 @@ mod hir_opt_tests {
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
+          v33:BasicObject = InvokeBlockIseqDynamic v21, v10 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v33)
         bb6():
-          v34:CPtr = GetEP 0
-          v35:CInt64 = LoadField v34, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v36:CInt64[3] = Const CInt64(3)
-          v37:CInt64 = IntAnd v35, v36
-          v39:CInt64[3] = Const CInt64(3)
-          v40:CBool = IsBitEqual v37, v39
-          CondBranch v40, bb13(), bb12()
+          v35:CPtr = GetEP 0
+          v36:CInt64 = LoadField v35, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v37:CInt64[3] = Const CInt64(3)
+          v38:CInt64 = IntAnd v36, v37
+          v40:CInt64[3] = Const CInt64(3)
+          v41:CBool = IsBitEqual v38, v40
+          CondBranch v41, bb13(), bb12()
         bb13():
-          v42:BasicObject = InvokeBlockIfunc v35, v10
-          Jump bb11(v42)
+          v43:BasicObject = InvokeBlockIfunc v36, v10
+          Jump bb11(v43)
         bb12():
-          v44:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb11(v44)
-        bb11(v38:BasicObject):
-          Jump bb4(v38)
+          BlockReprofile v36
+          v46:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb11(v46)
+        bb11(v39:BasicObject):
+          Jump bb4(v39)
         bb4(v14:BasicObject):
           CheckInterrupts
           Return v14
@@ -5139,20 +5163,24 @@ mod hir_opt_tests {
           v22:CPtr = LoadField v21, :code_iseq@0x1011
           v23:CPtr[CPtr(0x1012)] = Const CPtr(0x1012)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb8(), bb6()
-        bb8():
+          CondBranch v24, bb9(), bb8()
+        bb9():
           v26:BasicObject = InvokeBlockIseqDirect (0x1012), v21, v10
           Jump bb4(v26)
+        bb8():
+          v28:BasicObject = InvokeBlockIseqDynamic v21, v10 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v28)
         bb6():
-          v28:CInt64[3] = Const CInt64(3)
-          v29:CBool = IsBitEqual v15, v28
-          CondBranch v29, bb9(), bb5()
-        bb9():
-          v31:BasicObject = InvokeBlockIfunc v13, v10
-          Jump bb4(v31)
-        bb5():
-          v33:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v30:CInt64[3] = Const CInt64(3)
+          v31:CBool = IsBitEqual v15, v30
+          CondBranch v31, bb10(), bb5()
+        bb10():
+          v33:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v33)
+        bb5():
+          BlockReprofile v13
+          v36:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb4(v36)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -7351,13 +7379,23 @@ mod hir_opt_tests {
           v87:CInt64 = IntAnd v85, v86
           v89:CInt64[3] = Const CInt64(3)
           v90:CBool = IsBitEqual v87, v89
-          CondBranch v90, bb22(), bb21()
+          CondBranch v90, bb22(), bb23()
         bb22():
           v92:BasicObject = InvokeBlockIfunc v85, v14
           Jump bb20(v92)
+        bb23():
+          v94:CInt64[1] = Const CInt64(1)
+          v95:CBool = IsBitEqual v87, v94
+          CondBranch v95, bb24(), bb21()
+        bb24():
+          v97:CInt64[-4] = Const CInt64(-4)
+          v98:CInt64 = IntAnd v85, v97
+          v100:BasicObject = InvokeBlockIseqDynamic v98, v14 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb20(v100)
         bb21():
-          v94:BasicObject = InvokeBlock v14 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb20(v94)
+          BlockReprofile v85
+          v103:BasicObject = InvokeBlock v14 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb20(v103)
         bb20(v88:BasicObject):
           PopInlineFrame
           CheckInterrupts
@@ -7837,23 +7875,25 @@ mod hir_opt_tests {
           v140:BasicObject = InvokeBlockIseqDirect (0x1069), v134
           Jump bb32(v140)
         bb36():
-          Jump bb34()
+          v142:BasicObject = InvokeBlockIseqDynamic v134, v14 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb32(v142)
         bb34():
-          v143:CPtr = GetEP 0
-          v144:CInt64 = LoadField v143, :VM_ENV_DATA_INDEX_SPECVAL@0x1003
-          v145:CInt64[3] = Const CInt64(3)
-          v146:CInt64 = IntAnd v144, v145
-          v148:CInt64[3] = Const CInt64(3)
-          v149:CBool = IsBitEqual v146, v148
-          CondBranch v149, bb39(), bb38()
+          v144:CPtr = GetEP 0
+          v145:CInt64 = LoadField v144, :VM_ENV_DATA_INDEX_SPECVAL@0x1003
+          v146:CInt64[3] = Const CInt64(3)
+          v147:CInt64 = IntAnd v145, v146
+          v149:CInt64[3] = Const CInt64(3)
+          v150:CBool = IsBitEqual v147, v149
+          CondBranch v150, bb39(), bb38()
         bb39():
-          v151:BasicObject = InvokeBlockIfunc v144, v14
-          Jump bb37(v151)
+          v152:BasicObject = InvokeBlockIfunc v145, v14
+          Jump bb37(v152)
         bb38():
-          v153:BasicObject = InvokeBlock v14 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb37(v153)
-        bb37(v147:BasicObject):
-          Jump bb32(v147)
+          BlockReprofile v145
+          v155:BasicObject = InvokeBlock v14 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb37(v155)
+        bb37(v148:BasicObject):
+          Jump bb32(v148)
         bb32(v127:BasicObject):
           CheckInterrupts
           Jump bb26(v127)
@@ -7861,18 +7901,18 @@ mod hir_opt_tests {
           v118:BasicObject = InvokeBuiltin <inline_expr>, v14
           CheckInterrupts
           Jump bb26(v118)
-        bb26(v167:BasicObject):
+        bb26(v169:BasicObject):
           PopInlineFrame
-          Jump bb14(v167)
+          Jump bb14(v169)
         bb16():
           CondBranchHasType v16, NilClass, bb21(), bb22()
         bb21():
           PatchPoint MethodRedefined(Integer@0x1010, then@0x1018, cme:0x1020)
           PushInlineFrame :then, v14 (0x1048), num_args=0
-          v252:BasicObject = InvokeBuiltin <inline_expr>, v14
+          v256:BasicObject = InvokeBuiltin <inline_expr>, v14
           CheckInterrupts
           PopInlineFrame
-          Jump bb20(v252)
+          Jump bb20(v256)
         bb22():
           v80:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
           Jump bb20(v80)
@@ -8445,7 +8485,7 @@ mod hir_opt_tests {
             obj.test
             TEST = C.instance_method(:test)
         ");
-        assert_snapshot!(hir_string_proc("TEST"), @r"
+        assert_snapshot!(hir_string_proc("TEST"), @"
         fn test@<compiled>:3:
         bb1():
           EntryPoint interpreter
@@ -12779,7 +12819,7 @@ mod hir_opt_tests {
           StoreField v7, :blk@0x1000, v6
           Jump bb3(v5)
         bb3(v10:BasicObject):
-          v67:NilClass = Const Value(nil)
+          v76:NilClass = Const Value(nil)
           PatchPoint MethodRedefined(Object@0x1008, proc@0x1010, cme:0x1018)
           v35:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
           v36:BasicObject = CCallWithFrame v35, :Kernel#proc@0x1040, block=0x1048
@@ -12797,13 +12837,23 @@ mod hir_opt_tests {
           v50:CInt64 = IntAnd v48, v49
           v52:CInt64[3] = Const CInt64(3)
           v53:CBool = IsBitEqual v50, v52
-          CondBranch v53, bb8(), bb7()
+          CondBranch v53, bb8(), bb9()
         bb8():
           v55:BasicObject = InvokeBlockIfunc v48
           Jump bb6(v55)
+        bb9():
+          v57:CInt64[1] = Const CInt64(1)
+          v58:CBool = IsBitEqual v50, v57
+          CondBranch v58, bb10(), bb7()
+        bb10():
+          v60:CInt64[-4] = Const CInt64(-4)
+          v61:CInt64 = IntAnd v48, v60
+          v63:BasicObject = InvokeBlockIseqDynamic v61 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb6(v63)
         bb7():
-          v57:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb6(v57)
+          BlockReprofile v48
+          v66:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb6(v66)
         bb6(v51:BasicObject):
           PopInlineFrame
           CheckInterrupts
@@ -12973,7 +13023,7 @@ mod hir_opt_tests {
           StoreField v7, :blk@0x1000, v6
           Jump bb3(v5)
         bb3(v10:BasicObject):
-          v92:NilClass = Const Value(nil)
+          v101:NilClass = Const Value(nil)
           PatchPoint MethodRedefined(Object@0x1008, proc@0x1010, cme:0x1018)
           v39:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
           v40:BasicObject = CCallWithFrame v39, :Kernel#proc@0x1040, block=0x1048
@@ -12988,29 +13038,39 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1068, cme:0x1070)
           v45:ArrayExact = NewArray v26
           v46:Fixnum[20] = Const Value(20)
-          v87:Fixnum[0] = Const Value(0)
+          v96:Fixnum[0] = Const Value(0)
           PushInlineFrame :foo, v39 (0x1098), &v41, num_args=3
           PatchPoint NoSingletonClass(Array@0x10b8)
           PatchPoint MethodRedefined(Array@0x10b8, sum@0x10c0, cme:0x10c8)
-          v97:BasicObject = CCallVariadic v45, :Array#sum@0x10f0
+          v106:BasicObject = CCallVariadic v45, :Array#sum@0x10f0
           PatchPoint MethodRedefined(Integer@0x10f8, +@0x1100, cme:0x1108)
-          v101:Fixnum = GuardType v97, Fixnum
-          v102:Fixnum = FixnumAdd v24, v101
+          v110:Fixnum = GuardType v106, Fixnum
+          v111:Fixnum = FixnumAdd v24, v110
           PatchPoint NoEPEscape(foo)
-          v106:Fixnum = FixnumAdd v102, v46
+          v115:Fixnum = FixnumAdd v111, v46
           v71:CPtr = GetEP 0
           v72:CInt64 = LoadField v71, :VM_ENV_DATA_INDEX_SPECVAL@0x1130
           v73:CInt64[3] = Const CInt64(3)
           v74:CInt64 = IntAnd v72, v73
           v76:CInt64[3] = Const CInt64(3)
           v77:CBool = IsBitEqual v74, v76
-          CondBranch v77, bb8(), bb7()
+          CondBranch v77, bb8(), bb9()
         bb8():
-          v79:BasicObject = InvokeBlockIfunc v72, v106
+          v79:BasicObject = InvokeBlockIfunc v72, v115
           Jump bb6(v79)
+        bb9():
+          v81:CInt64[1] = Const CInt64(1)
+          v82:CBool = IsBitEqual v74, v81
+          CondBranch v82, bb10(), bb7()
+        bb10():
+          v84:CInt64[-4] = Const CInt64(-4)
+          v85:CInt64 = IntAnd v72, v84
+          v87:BasicObject = InvokeBlockIseqDynamic v85, v115 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb6(v87)
         bb7():
-          v81:BasicObject = InvokeBlock v106 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb6(v81)
+          BlockReprofile v72
+          v90:BasicObject = InvokeBlock v115 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb6(v90)
         bb6(v75:BasicObject):
           PopInlineFrame
           CheckInterrupts
@@ -23061,31 +23121,51 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb6(), bb5()
+          CondBranch v18, bb6(), bb7()
         bb6():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb5():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb4(v22)
-        bb4(v16:BasicObject):
-          v27:Fixnum[2] = Const Value(2)
-          v29:CPtr = GetEP 0
-          v30:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v31:CInt64[3] = Const CInt64(3)
-          v32:CInt64 = IntAnd v30, v31
-          v34:CInt64[3] = Const CInt64(3)
-          v35:CBool = IsBitEqual v32, v34
-          CondBranch v35, bb9(), bb8()
-        bb9():
-          v37:BasicObject = InvokeBlockIfunc v30, v27
-          Jump bb7(v37)
+        bb7():
+          v22:CInt64[1] = Const CInt64(1)
+          v23:CBool = IsBitEqual v15, v22
+          CondBranch v23, bb8(), bb5()
         bb8():
-          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
-          Jump bb7(v39)
-        bb7(v33:BasicObject):
+          v25:CInt64[-4] = Const CInt64(-4)
+          v26:CInt64 = IntAnd v13, v25
+          v28:BasicObject = InvokeBlockIseqDynamic v26, v10 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v28)
+        bb5():
+          BlockReprofile v13
+          v31:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb4(v31)
+        bb4(v16:BasicObject):
+          v36:Fixnum[2] = Const Value(2)
+          v38:CPtr = GetEP 0
+          v39:CInt64 = LoadField v38, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v40:CInt64[3] = Const CInt64(3)
+          v41:CInt64 = IntAnd v39, v40
+          v43:CInt64[3] = Const CInt64(3)
+          v44:CBool = IsBitEqual v41, v43
+          CondBranch v44, bb11(), bb12()
+        bb11():
+          v46:BasicObject = InvokeBlockIfunc v39, v36
+          Jump bb9(v46)
+        bb12():
+          v48:CInt64[1] = Const CInt64(1)
+          v49:CBool = IsBitEqual v41, v48
+          CondBranch v49, bb13(), bb10()
+        bb13():
+          v51:CInt64[-4] = Const CInt64(-4)
+          v52:CInt64 = IntAnd v39, v51
+          v54:BasicObject = InvokeBlockIseqDynamic v52, v36 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb9(v54)
+        bb10():
+          BlockReprofile v39
+          v57:BasicObject = InvokeBlock v36 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
+          Jump bb9(v57)
+        bb9(v42:BasicObject):
           CheckInterrupts
-          Return v33
+          Return v42
         ");
     }
 
