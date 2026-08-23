@@ -6318,6 +6318,70 @@ zjit_send_cache_cacheable_p(const struct rb_callcache *cc)
         && !vm_cc_refinement_p(cc);
 }
 
+/* The callee's method entry when a hit on `cc` is one that JIT code may enter
+ * with a direct call, or NULL.
+ *
+ * The inline dispatch path in gen_send_megamorphic_direct() reproduces exactly
+ * what vm_call_iseq_setup() does for the simplest possible callee, and nothing
+ * else, so the callee has to be one this list of conditions describes:
+ *
+ *  - an ordinary ISEQ method, not a bmethod, alias, refinement or anything else
+ *    with its own frame shape;
+ *  - rb_simple_iseq_p(), i.e. no optional, rest, post, keyword or block
+ *    parameters and not `...`-forwardable, so vm_callee_setup_arg() would take
+ *    its no-op fast path and the frame is no taller than the local table;
+ *  - arity exactly the site's argc, since the inline path cannot raise
+ *    ArgumentError;
+ *  - no locals beyond the parameters, so the frame's local area is exactly the
+ *    arguments already sitting on the caller's stack: nothing to nil-fill, and
+ *    the frame size is a compile-time constant at the call site;
+ *  - a `stack_max` within ZJIT_MEGA_DIRECT_MAX_STACK, the bound the call site's
+ *    stack overflow check is compiled against.
+ *
+ * The *method entry* rather than the ISEQ is what goes in the slot, and JIT code
+ * checks it against the one it read out of the callcache. That is what makes the
+ * two-word slot safe to fill with two plain stores: a reader that sees a fresh
+ * `cc` beside a previous class's `direct_cme` (or the reverse) fails the compare
+ * and searches, exactly as it would for an empty slot. No store ordering, and so
+ * no atomics or barriers, are needed on either side.
+ *
+ * Nothing about the compiled code is cached: the entry point is re-read from
+ * ISEQ_BODY(iseq)->jit_entry on every call, which rb_iseq_reset_jit_func()
+ * clears whenever that code stops being valid, and the ISEQ is only reached
+ * through a method entry that has already validated. */
+static const rb_callable_method_entry_t *
+zjit_send_cache_direct_cme(const struct rb_zjit_send_cache *cache, const struct rb_callcache *cc)
+{
+    if (!cache->direct_ok) return NULL;
+
+    const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
+    if (cme->def->type != VM_METHOD_TYPE_ISEQ) return NULL;
+
+    /* The direct path skips vm_call_method(), so it must only take over calls
+     * that function would have let straight through to vm_call_method_each_type().
+     * A protected method's check reads the *caller's* self, which the table
+     * cannot be keyed on, and a private method is only callable without an
+     * explicit receiver. Everything else raises NoMethodError through
+     * vm_call_method_missing(), which is very much not a frame push. */
+    switch (METHOD_ENTRY_VISI(cme)) {
+      case METHOD_VISI_PUBLIC:
+        break;
+      case METHOD_VISI_PRIVATE:
+        if (!(cache->direct_flags & VM_CALL_FCALL)) return NULL;
+        break;
+      default:
+        return NULL;
+    }
+
+    const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    if (!rb_simple_iseq_p(iseq)) return NULL;
+    if (body->param.lead_num != (int)cache->direct_argc) return NULL;
+    if (body->local_table_size != (unsigned int)body->param.lead_num) return NULL;
+    if (body->stack_max > ZJIT_MEGA_DIRECT_MAX_STACK) return NULL;
+    return cme;
+}
+
 /* Resolve the callcache for `recv` at this site, out of `cache` when possible.
  *
  * The hit condition is exactly vm_cc_hit_p()'s: the cache's own class matches
@@ -6332,7 +6396,7 @@ zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
 {
     VALUE klass = CLASS_OF(recv);
     unsigned int slot = zjit_send_cache_slot(cache, klass);
-    const struct rb_callcache *cached = cache->slots[slot];
+    const struct rb_callcache *cached = cache->slots[slot].cc;
 
     if (LIKELY(cached != NULL && cached->klass == klass &&
                !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cached)))) {
@@ -6346,11 +6410,17 @@ zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
     const struct rb_callcache *cc = vm_search_method_fastpath(reg_cfp, cd, klass);
     bool cacheable = zjit_send_cache_cacheable_p(cc);
     if (LIKELY(cacheable)) {
-        /* One naturally-aligned pointer store, published the same way
+        /* Two naturally-aligned stores, published the same way
          * vm_search_method_slowpath0() publishes cd->cc. No write barrier: the
          * table is a GC root, scanned on every collection, not a heap object
-         * that could be missed by a minor GC. */
-        cache->slots[slot] = cc;
+         * that could be missed by a minor GC.
+         *
+         * The two words need no ordering between them either: JIT code checks
+         * `direct_cme` against the method entry it read out of `cc`, so a reader
+         * that catches this fill half-done sees a mismatched pair and searches.
+         * See zjit_send_cache_direct_cme(). */
+        cache->slots[slot].direct_cme = zjit_send_cache_direct_cme(cache, cc);
+        cache->slots[slot].cc = cc;
     }
 
     if (UNLIKELY(cache->hit_counter != NULL)) {
@@ -6413,6 +6483,20 @@ rb_zjit_send_cached(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
     VM_EXEC(ec, val);
     return val;
 }
+
+/* Field offsets and flag masks that the inline send-cache probe bakes into JIT
+ * code. See the declarations in zjit.h. */
+size_t rb_zjit_cc_klass_offset(void) { return offsetof(struct rb_callcache, klass); }
+size_t rb_zjit_cc_cme_offset(void) { return offsetof(struct rb_callcache, cme_); }
+size_t rb_zjit_iseq_body_offset(void) { return offsetof(struct rb_iseq_struct, body); }
+size_t rb_zjit_iseq_body_jit_entry_offset(void) { return offsetof(struct rb_iseq_constant_body, jit_entry); }
+size_t rb_zjit_send_cache_entry_size(void) { return sizeof(struct rb_zjit_send_cache_entry); }
+size_t rb_zjit_send_cache_entry_direct_cme_offset(void) { return offsetof(struct rb_zjit_send_cache_entry, direct_cme); }
+size_t rb_zjit_cme_def_offset(void) { return offsetof(rb_callable_method_entry_t, def); }
+size_t rb_zjit_def_iseqptr_offset(void) { return offsetof(rb_method_definition_t, body.iseq.iseqptr); }
+VALUE rb_zjit_method_entry_invalidated_flag(void) { return IMEMO_FL_USER5; }
+size_t rb_zjit_mega_direct_max_stack(void) { return ZJIT_MEGA_DIRECT_MAX_STACK; }
+
 #endif // USE_ZJIT
 
 VALUE

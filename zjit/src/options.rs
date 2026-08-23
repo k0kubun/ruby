@@ -155,9 +155,15 @@ pub struct Options {
     /// Only useful for A/B measurement; see [`crate::send_cache`].
     pub disable_send_cache: bool,
 
+    /// Turn off the inline megamorphic dispatch path, so a table hit is always
+    /// dispatched through `rb_zjit_send_cached_without_block` rather than by
+    /// calling the callee's compiled code from JIT code. Only useful for A/B
+    /// measurement; see [`crate::codegen::gen_send_megamorphic_direct`].
+    pub disable_megamorphic_direct: bool,
+
     /// Slots in each send class table. Must be a power of two and at least 8;
     /// one table is allocated per `(method name, argc, call flags)` triple that a
-    /// compiled megamorphic site dispatches on, so this times 8 bytes times the
+    /// compiled megamorphic site dispatches on, so this times 16 bytes times the
     /// number of such triples bounds the memory. Undersizing it is not a graceful
     /// degradation -- see [`crate::send_cache::DEFAULT_CACHE_ENTRIES`].
     pub send_cache_entries: usize,
@@ -273,6 +279,7 @@ impl Default for Options {
             disable_ivar_cache: false,
             ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
+            disable_megamorphic_direct: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
             dump_hir_opt: None,
@@ -647,6 +654,8 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         },
 
         ("disable-send-cache", "") => options.disable_send_cache = true,
+
+        ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
 
         ("send-cache-entries", _) => match opt_val.parse::<usize>() {
             Ok(n) if n.is_power_of_two() && n >= 8 => options.send_cache_entries = n,
