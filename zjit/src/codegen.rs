@@ -106,8 +106,9 @@ struct SpilledLocals {
     /// different slots, so a record only applies to the frame that built it.
     iseq: IseqPtr,
     depth: usize,
-    /// The [`InsnId`] spilled into each local slot.
-    locals: Vec<InsnId>,
+    /// The [`InsnId`] spilled into each local slot, or None for a slot left to the
+    /// JITFrame stack map and therefore not written.
+    locals: Vec<Option<InsnId>>,
 }
 
 impl JITState {
@@ -1834,13 +1835,19 @@ fn gen_ccall_with_frame(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (and block arguments if any)
-    gen_write_jit_frame(asm, state, 0);
+    // The Ruby stack below cfp->sp is stored eagerly here, so the stack map only has to
+    // say where the locals of the frames that keep them off the VM stack are. It is
+    // anchored on cfp->sp: the C frame pushed below runs on its own cfp, so nothing
+    // moves this frame's cfp->sp for the duration of the call.
+    let caller_state = state.with_stack_size(caller_stack_size);
+    let stack_map = build_locals_stack_map(jit, function, &caller_state);
+    let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, caller_stack_size);
     // The receiver and arguments are above the saved cfp->sp: the frame env
     // written by gen_push_frame() overwrites their slots and nothing reads VM
     // stack slots above cfp->sp, so only spill the stack below them.
-    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
-    gen_spill_locals(jit, asm, state);
+    gen_spill_stack(jit, asm, function, &caller_state);
+    gen_spill_locals_unless_mapped(jit, asm, state);
 
     // The receiver is used twice: as the callee frame's self and as the first C argument.
     // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
@@ -1872,6 +1879,9 @@ fn gen_ccall_with_frame(
     let mut cfunc_args = vec![recv];
     cfunc_args.extend(args);
     asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
+    if !stack_map.is_empty() {
+        asm.stack_map(stack_map, jit_frame, state.depth);
+    }
     let result = asm.ccall(cfunc, cfunc_args);
 
     asm_comment!(asm, "pop C frame");
@@ -1943,13 +1953,19 @@ fn gen_ccall_variadic(
 
     // Can't use gen_prepare_non_leaf_call() because we need to adjust the SP
     // to account for the receiver and arguments (like gen_ccall_with_frame does)
-    gen_write_jit_frame(asm, state, 0);
+    // The Ruby stack below cfp->sp is stored eagerly here, so the stack map only has to
+    // say where the locals of the frames that keep them off the VM stack are. It is
+    // anchored on cfp->sp: the C frame pushed below runs on its own cfp, so nothing
+    // moves this frame's cfp->sp for the duration of the call.
+    let caller_state = state.with_stack_size(caller_stack_size);
+    let stack_map = build_locals_stack_map(jit, function, &caller_state);
+    let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, caller_stack_size);
     // The receiver and arguments are above the saved cfp->sp: the frame env
     // written by gen_push_frame() overwrites their slots and nothing reads VM
     // stack slots above cfp->sp, so only spill the stack below them.
-    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
-    gen_spill_locals(jit, asm, state);
+    gen_spill_stack(jit, asm, function, &caller_state);
+    gen_spill_locals_unless_mapped(jit, asm, state);
 
     // The receiver is used twice: as the callee frame's self and as the third C argument.
     // Materialize a heap-object constant once so we don't emit two 10-byte movabs.
@@ -1980,6 +1996,9 @@ fn gen_ccall_variadic(
 
     let argv_ptr = gen_push_opnds(jit, asm, &args);
     asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
+    if !stack_map.is_empty() {
+        asm.stack_map(stack_map, jit_frame, state.depth);
+    }
     let result = asm.ccall(cfunc, vec![args.len().into(), argv_ptr, recv]);
 
     asm_comment!(asm, "pop C frame");
@@ -3031,7 +3050,11 @@ fn gen_push_inline_frame(
     gen_write_jit_frame(asm, state, 0);
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    // Nothing can read this frame's locals before the inlined body reaches its own first
+    // call or side exit, and both describe the whole inlined chain: gen_prepare_non_leaf_call
+    // and friends walk `state.caller()` into this frame, and build_caller_stack_map() does
+    // the same for exits. So a frame whose locals live in stack maps writes nothing here.
+    gen_spill_locals_unless_mapped(jit, asm, state);
 
     // This mirrors vm_caller_setup_arg_block(): `blockiseq` is its `blockiseq != NULL` case,
     // and `block_arg` is a `&blk` argument that `type_specialize` already reduced to the
@@ -3190,7 +3213,7 @@ fn gen_send_iseq_direct(
     let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals_unless_mapped(jit, asm, state);
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     // This mirrors vm_caller_setup_arg_block(): `block` is its `blockiseq != NULL` case, and
@@ -3452,7 +3475,7 @@ fn gen_invoke_block_iseq_direct(
     let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
     gen_save_sp(asm, stack_size);
 
-    gen_spill_locals(jit, asm, state);
+    gen_spill_locals_unless_mapped(jit, asm, state);
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     gen_push_frame(asm, args.len(), state, ControlFrame {
@@ -5089,6 +5112,73 @@ fn iseq_may_write_block_code_uncached(iseq: IseqPtr) -> bool {
     false
 }
 
+/// Whether anything outside a frame running `iseq` can read that frame's locals out of
+/// the VM stack while the frame is live in JIT code.
+///
+/// The only way to reach another frame's locals without going through a materialization
+/// point is the EP chain: a frame whose `specval` is `VM_GUARDED_PREV_EP(our_ep)` reads
+/// and writes our local slots directly with `getlocal`/`setlocal` at level > 0, and
+/// `vm_make_env_each` copies them wholesale when such a frame's environment escapes to
+/// the heap. Only instructions that hand a child ISEQ our EP can create such a frame:
+///
+/// * `send`/`sendforward`/`invokesuper`/`invokesuperforward` with a non-NULL `blockiseq`
+///   operand -- the block literal, which covers `lambda {}`, `define_method {}`,
+///   `each {}` and everything else that syntactically writes a block.
+/// * `once`, whose ISEQ operand `vm_once_dispatch` runs as a block of this frame.
+///
+/// `Binding`, `eval` and the debug APIs also read locals, but they all funnel through
+/// `vm_make_env_object`/`rb_vm_make_binding`, which call `rb_zjit_materialize_locals()`
+/// to replay the stack map first, so they need no eager stores.
+///
+/// Memoized on the payload for the same reason as [`iseq_may_write_block_code`].
+pub(crate) fn iseq_may_expose_locals(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    match payload.may_expose_locals {
+        Some(cached) => cached,
+        None => {
+            let result = iseq_may_expose_locals_uncached(iseq);
+            payload.may_expose_locals = Some(result);
+            result
+        }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn iseq_may_expose_locals_uncached(iseq: IseqPtr) -> bool {
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+
+        match opcode {
+            // (CALL_DATA cd, ISEQ blockiseq): a block literal captures this frame's EP.
+            YARVINSN_send | YARVINSN_sendforward |
+            YARVINSN_invokesuper | YARVINSN_invokesuperforward => {
+                let blockiseq = unsafe { *pc.offset(2) };
+                if blockiseq.as_usize() != 0 {
+                    return true;
+                }
+            }
+            // (ISEQ iseq, ISE ise): vm_once_dispatch runs the ISEQ as a block of this frame.
+            YARVINSN_once => return true,
+            // `__builtin_cexpr!`/`__builtin_cstmt!` bodies that name a local compile to a C
+            // function that reads it as `ec->cfp->ep[-N]` (see the `*__ptr` locals
+            // tool/mk_builtin_loader.rb emits), no matter what the instruction's argc says.
+            // That read happens with the frame live, so those locals have to be in memory.
+            YARVINSN_invokebuiltin |
+            YARVINSN_opt_invokebuiltin_delegate |
+            YARVINSN_opt_invokebuiltin_delegate_leave => return true,
+            _ => {}
+        }
+
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+
+    false
+}
+
 /// True if the block ISEQ contains a `throw` opcode (break, non-local return).
 /// `block_call_inlinable_iseq` uses this to keep blocks that can `break` on the generic
 /// `vm_yield` dispatch, which handles the non-local exit in C.
@@ -5222,29 +5312,51 @@ fn gen_save_sp(asm: &mut Assembler, stack_size: usize) {
     asm.mov(cfp_sp, sp_addr);
 }
 
-/// Spill locals onto the stack.
-fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
+/// Store the frame's locals into its environment.
+///
+/// `mapped` says whether this call site attached a JITFrame stack map built by
+/// [`build_stack_map`]; when it did, the slots [`local_in_stack_map`] claims need no
+/// store, because rb_zjit_materialize_frames() writes them from the map instead.
+fn gen_spill_locals_with(jit: &mut JITState, asm: &mut Assembler, state: &FrameState, mapped: bool) {
     gen_incr_counter(asm, Counter::vm_write_locals_count);
     asm_comment!(asm, "spill locals");
 
     // Skip the stores whose slots already hold the very same values. HIR gives a local a
     // fresh InsnId whenever anything could have changed it -- a call that can write it
     // through the EP chain drops the locals from the frame state -- so matching InsnIds
-    // mean the slot the previous spill wrote is still current.
-    let locals: Vec<InsnId> = state.locals().copied().collect();
+    // mean the slot the previous spill wrote is still current. A slot left to the stack
+    // map is recorded as None: memory does not hold it, so a later call site without a
+    // map still has to write it.
     // Frame states for different frames can map to different slots, so only reuse the
     // record when it belongs to the frame we're spilling now.
     let spilled = match jit.frame_caches(asm).spilled_locals.take() {
         Some(prev) if prev.iseq == state.iseq && prev.depth == state.depth => Some(prev.locals),
         _ => None,
     };
-    for (idx, &insn_id) in locals.iter().enumerate() {
-        if spilled.as_ref().and_then(|spilled| spilled.get(idx)) == Some(&insn_id) {
+    let mut locals: Vec<Option<InsnId>> = Vec::with_capacity(state.locals().len());
+    for (idx, &insn_id) in state.locals().enumerate() {
+        if mapped && local_in_stack_map(jit, state.iseq, insn_id) {
+            locals.push(None);
+            continue;
+        }
+        locals.push(Some(insn_id));
+        if spilled.as_ref().and_then(|spilled| spilled.get(idx)) == Some(&Some(insn_id)) {
             continue;
         }
         asm.mov(Opnd::mem(64, SP, (-local_idx_to_ep_offset(state.iseq, idx) - 1) * SIZEOF_VALUE_I32), jit.get_opnd(insn_id));
     }
     jit.frame_caches(asm).spilled_locals = Some(SpilledLocals { iseq: state.iseq, depth: state.depth, locals });
+}
+
+/// Store the frame's locals into its environment at a call site with no stack map.
+fn gen_spill_locals(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
+    gen_spill_locals_with(jit, asm, state, false);
+}
+
+/// Store the frame's locals into its environment at a call site whose JITFrame stack
+/// map was built by [`build_stack_map`], skipping the slots the map already names.
+fn gen_spill_locals_unless_mapped(jit: &mut JITState, asm: &mut Assembler, state: &FrameState) {
+    gen_spill_locals_with(jit, asm, state, true);
 }
 
 /// Spill the virtual stack onto the stack.
@@ -5255,7 +5367,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
     asm_comment!(asm, "spill stack");
 
     let mut offset = state.stack_size() as i32;
-    for entry in build_stack_map(jit, function, state) {
+    for entry in build_stack_map_with(jit, function, state, StackMapContents { stack: true, locals: false }) {
         match entry {
             StackMapEntry::Opnd(opnd) => {
                 offset -= 1;
@@ -5288,29 +5400,146 @@ fn gen_prepare_fallback_call(jit: &mut JITState, asm: &mut Assembler, function: 
     asm.clear_saved_sp();
 }
 
+/// Whether a frame running `iseq` has to keep its locals stored in its environment
+/// at every point where the VM might look, as opposed to letting the JITFrame stack
+/// map say where they live.
+///
+/// See [`iseq_may_expose_locals`] for the analysis. An ISEQ whose EP is (or has ever
+/// been) escaped is excluded too: its locals do not live in the frame's stack slots
+/// at all, HIR reads and writes them through `GetEP`, and the slots this would name
+/// are not where the VM looks.
+pub fn iseq_needs_eager_locals(iseq: IseqPtr) -> bool {
+    iseq_ep_starts_escaped(iseq)
+        || crate::invariants::iseq_seen_ep_escape(iseq)
+        || iseq_may_expose_locals(iseq)
+}
+
+/// Whether the JITFrame stack map describes local slot `idx` of `state`'s frame,
+/// making the store [`gen_spill_locals`] would emit for it unnecessary.
+///
+/// Only immediate values qualify. A stack map can name a register-allocated value too,
+/// but that is not worth doing here: naming one keeps it live across the call, so the
+/// allocator has to park it in a native stack slot -- the same store this was trying to
+/// avoid, minus the run-of-calls dedup [`gen_spill_locals`] does. An immediate, by
+/// contrast, is written into the JITFrame at compile time, so mapping it costs one word
+/// of JITFrame and no code at all.
+///
+/// This has to be a pure function of `(jit, state, idx)`: [`build_stack_map`] asks it
+/// about caller frames it walks into, while [`gen_spill_locals`]'s callers ask it about
+/// the frame they are emitting a call for, and the two must never disagree about who
+/// owns a given local slot.
+fn local_in_stack_map(jit: &JITState, iseq: IseqPtr, local: InsnId) -> bool {
+    if iseq_needs_eager_locals(iseq) {
+        return false;
+    }
+    match jit.get_opnd(local) {
+        Opnd::Value(val) => val.special_const_p(),
+        Opnd::UImm(val) => VALUE(val as usize).special_const_p(),
+        _ => false,
+    }
+}
+
+/// Whether any of `state`'s local slots are described by the stack map.
+fn frame_locals_in_stack_map(jit: &JITState, state: &FrameState) -> bool {
+    state.locals().any(|&local| local_in_stack_map(jit, state.iseq, local))
+}
+
 /// Build entries for Ruby stack values that need materialization. The actual
 /// JITFrame entries are encoded by the register allocator, where VReg locations
 /// on the native stack are known.
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
-    let mut stack = Vec::new();
+    build_stack_map_with(jit, function, state, StackMapContents { stack: true, locals: true })
+}
+
+/// What a stack map has to describe. A caller that already stored some of the frame's
+/// Ruby stack slots itself asks for the rest, so that the map only names values the
+/// register allocator then has to keep reachable.
+#[derive(Clone, Copy)]
+struct StackMapContents {
+    /// Describe the operand stack. False when the caller spilled it eagerly.
+    stack: bool,
+    /// Describe the local tables of the frames that keep their locals off the VM stack.
+    locals: bool,
+}
+
+fn build_stack_map_with(
+    jit: &JITState,
+    function: &Function,
+    state: &FrameState,
+    contents: StackMapContents,
+) -> Vec<StackMapEntry> {
+    let mut stack: Vec<StackMapEntry> = Vec::new();
+    // Adjacent skips collapse into one entry: every entry costs 8 bytes of JITFrame,
+    // and describing locals turns one gap into up to three runs of skipped slots.
+    fn skip(stack: &mut Vec<StackMapEntry>, size: usize) {
+        if size == 0 {
+            return;
+        }
+        match stack.last_mut() {
+            Some(StackMapEntry::Skip(prev)) => *prev += size,
+            _ => stack.push(StackMapEntry::Skip(size)),
+        }
+    }
+
     let mut current_state = state;
     loop {
-        stack.extend(current_state.stack().rev().copied().map(|insn_id| {
-            let opnd = jit.get_opnd(insn_id);
-            assert!(
-                matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }),
-                "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}",
-            );
-            StackMapEntry::Opnd(opnd)
-        }));
+        if contents.stack {
+            stack.extend(current_state.stack().rev().copied().map(|insn_id| {
+                let opnd = jit.get_opnd(insn_id);
+                assert!(
+                    matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }),
+                    "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}",
+                );
+                StackMapEntry::Opnd(opnd)
+            }));
+        } else {
+            skip(&mut stack, current_state.stack().len());
+        }
 
-        let Some(caller) = current_state.caller() else {
+        let caller = current_state.caller();
+        // Below the operand stack sit this frame's VM_ENV_DATA_SIZE environment slots,
+        // then its local table with the highest local index on top, and then -- for an
+        // inlined frame -- the receiver slot the caller pushed below the local table.
+        // `inline_frame_stack_gap` is the whole run; describing the locals splits it.
+        let gap = caller.map(|_| inline_frame_stack_gap(current_state.iseq));
+        let num_locals = current_state.locals().len();
+        if contents.locals && frame_locals_in_stack_map(jit, current_state) {
+            skip(&mut stack, VM_ENV_DATA_SIZE.to_usize());
+            // The local table runs from the highest index at the top down to index 0,
+            // which is the direction the write cursor moves.
+            for &local in current_state.locals().rev() {
+                if local_in_stack_map(jit, current_state.iseq, local) {
+                    stack.push(StackMapEntry::Opnd(jit.get_opnd(local)));
+                } else {
+                    skip(&mut stack, 1);
+                }
+            }
+            if let Some(gap) = gap {
+                skip(&mut stack, gap - VM_ENV_DATA_SIZE.to_usize() - num_locals);
+            }
+        } else {
+            skip(&mut stack, gap.unwrap_or(0));
+        }
+
+        let Some(caller) = caller else {
             break;
         };
-        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq)));
         current_state = function.frame_state_ref(caller);
     }
+
+    // A trailing skip moves the write cursor past the last slot anyone reads.
+    if matches!(stack.last(), Some(StackMapEntry::Skip(_))) {
+        stack.pop();
+    }
     stack
+}
+
+/// Build the locals-only half of a stack map, for a call site that has already stored
+/// every frame's operand stack itself. Returns an empty map when there is nothing left
+/// to describe, in which case the call site can keep its zero-entry JITFrame.
+fn build_locals_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
+    let map = build_stack_map_with(jit, function, state, StackMapContents { stack: false, locals: true });
+    if map.iter().any(|entry| matches!(entry, StackMapEntry::Opnd(_))) { map } else { Vec::new() }
 }
 
 fn inline_frame_stack_gap(iseq: IseqPtr) -> usize {
@@ -5342,8 +5571,10 @@ fn gen_prepare_non_leaf_call(jit: &mut JITState, asm: &mut Assembler, function: 
     // and the interpreter uses the stack for handling the exception
     asm.stack_map(stack_map, jit_frame, state.depth);
 
-    // Spill locals in case the method looks at caller Bindings
-    gen_spill_locals(jit, asm, state);
+    // Spill locals in case the method looks at caller Bindings. The stack map above
+    // covers the frames that keep their locals off the VM stack; vm_make_env_object()
+    // replays it through rb_zjit_materialize_locals() before reading them.
+    gen_spill_locals_unless_mapped(jit, asm, state);
 }
 
 /// Frame metadata written by gen_push_frame()
