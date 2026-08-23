@@ -3365,15 +3365,11 @@ fn direct_invoke_block_adapt(iseq: IseqPtr, argc: usize) -> Result<BlockArgAdapt
         std::cmp::Ordering::Less => BlockArgAdapt::NilFill(lead_num - argc),
         std::cmp::Ordering::Greater => BlockArgAdapt::Truncate(lead_num),
     };
-    // `break` out of a directly-invoked block frame does not unwind correctly:
-    // vm_throw_start() matches the block owner's `cfp->pc` against the CATCH_TYPE_BREAK
-    // entry's `cont`, and the PC the owner's frame reports after this dispatch does not
-    // match, so the break is reported as an orphan ("break from proc-closure").
-    // A plain non-local `return` is looked up by frame type and EP instead of by PC, so
-    // blocks that only throw TAG_RETURN -- what this dispatch is for -- are fine.
-    if crate::codegen::block_iseq_may_throw(iseq) && !block_iseq_throws_only_return(iseq) {
-        return Err(InvokeBlockMayThrow);
-    }
+    // A `throw` out of the block frame this dispatch pushes unwinds like any other: it
+    // longjmps out of every JIT native frame to the enclosing `vm_exec()`, which resumes at
+    // the catch entry the throw resolved to. `break` needed `vm_throw_start()` to read the
+    // throwing frame's ISEQ through `CFP_ISEQ()` rather than the raw `cfp->_iseq` a
+    // JIT-pushed frame never writes; without that it walked off a null ISEQ.
     Ok(adapt)
 }
 
