@@ -1378,6 +1378,7 @@ fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, function.frame_state_ref(*state)),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, function.frame_state_ref(*state), unsafe { &**bf }, *leaf, opnds!(args)),
         Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), function.frame_state_ref(*state)),
+        Insn::InvokeBlockIseqDynamic { cd, captured, args, state, reason } => gen_invoke_block_iseq_dynamic(jit, asm, function, *cd, opnd!(captured), opnds!(args), function.frame_state_ref(*state), *reason),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, function, jit_entry_idx)),
         &Insn::Return { val, pop_inlined_frames } => no_output!(gen_return(asm, opnd!(val), pop_inlined_frames)),
         Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
@@ -1461,6 +1462,7 @@ fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &
         }
         &Insn::GetIvar { self_val, id, ic, state } => gen_getivar(jit, asm, opnd!(self_val), function.type_of(self_val), id, ic, function.frame_state_ref(state)),
         Insn::IvarReprofile { self_val, state } => no_output!(gen_ivar_reprofile(jit, asm, function, opnd!(self_val), function.frame_state_ref(*state))),
+        Insn::BlockReprofile { block_handler, arg0, argc, state } => no_output!(gen_block_reprofile(jit, asm, function, opnd!(block_handler), arg0.map(|arg0| opnd!(arg0)), *argc, function.frame_state_ref(*state))),
         Insn::SetGlobal { id, val, state } => no_output!(gen_setglobal(jit, asm, function, *id, opnd!(val), function.frame_state_ref(*state))),
         Insn::GetGlobal { id, state } => gen_getglobal(jit, asm, function, *id, function.frame_state_ref(*state)),
         &Insn::IsBlockParamModified { flags } => gen_is_block_param_modified(asm, opnd!(flags)),
@@ -2178,6 +2180,50 @@ fn gen_ivar_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Functi
         Opnd::Value(VALUE::from(state.iseq)),
         Opnd::UImm(state.insn_idx() as u64),
         recv);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(join_block);
+    let label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(label);
+}
+
+/// Record a block handler that reached a compiled `yield`'s generic fallback so the site can
+/// earn a recompile that dispatches it. See [`crate::profile::rb_zjit_block_reprofile`].
+fn gen_block_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Function, block_handler: Opnd, arg0: Option<Opnd>, argc: u32, state: &FrameState) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let sample_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let join_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let sample_edge = || Target::Block(Box::new(lir::BranchEdge { target: sample_block, args: vec![] }));
+    let join_edge = || Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+
+    // A dormant site skips this many fallbacks before sampling again, and the hottest yield site
+    // in a lobsters run reaches here 370K times, so the skip has to be inline. The countdown is
+    // written by the callee: 0 keeps a window open, a cooldown closes it. See
+    // `IseqVersion::block_reprofile_countdown` for why this is a cooldown and not a give-up.
+    asm_comment!(asm, "sample the handler once the version's cooldown expires");
+    let version = asm.load(Opnd::const_ptr(jit.version.as_ptr() as *const u8));
+    let countdown = Opnd::mem(32, version, std::mem::offset_of!(crate::payload::IseqVersion, block_reprofile_countdown) as i32);
+    let remaining = asm.load(countdown);
+    asm.cmp(remaining, Opnd::UImm(0));
+    asm.je(jit, sample_edge());
+    let decremented = asm.sub(remaining, Opnd::UImm(1));
+    asm.store(countdown, decremented);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(sample_block);
+    let label = jit.get_label(asm, sample_block, hir_block_id);
+    asm.write_label(label);
+    asm_comment!(asm, "reprofile block handler");
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    use crate::profile::rb_zjit_block_reprofile;
+    asm_ccall!(asm, rb_zjit_block_reprofile,
+        Opnd::const_ptr(jit.version.as_ptr()),
+        Opnd::Value(VALUE::from(state.iseq)),
+        Opnd::UImm(state.insn_idx() as u64),
+        block_handler,
+        Opnd::UImm(argc as u64),
+        arg0.unwrap_or(Qundef.into()));
     asm.jmp(join_edge());
 
     asm.set_current_block(join_block);
@@ -3438,6 +3484,314 @@ fn gen_invokeproc(
         kw_splat_opnd,
         VM_BLOCK_HANDLER_NONE.into()
     )
+}
+
+/// Field offsets and flag masks the run-time block dispatch bakes into JIT code, read once
+/// from C because `rb_iseq_constant_body` is opaque to Rust and its `param.flags` bitfields
+/// have no layout Rust could reproduce. See the declarations in `zjit.h`.
+pub struct BlockDirectLayout {
+    /// `offsetof(struct rb_iseq_struct, body)`
+    pub iseq_body: i32,
+    /// `offsetof(struct rb_iseq_constant_body, param.flags)`
+    pub body_param_flags: i32,
+    /// `offsetof(struct rb_iseq_constant_body, param.lead_num)`
+    pub body_param_lead_num: i32,
+    /// `offsetof(struct rb_iseq_constant_body, local_table_size)`
+    pub body_local_table_size: i32,
+    /// `offsetof(struct rb_iseq_constant_body, stack_max)`
+    pub body_stack_max: i32,
+    /// `offsetof(struct rb_iseq_constant_body, jit_entry)`
+    pub body_jit_entry: i32,
+    /// The `param.flags` bits that make an ISEQ fail `rb_simple_iseq_p()`.
+    pub not_simple_mask: u64,
+    /// The `param.flags.ambiguous_param0` bit, i.e. how `|x|` opts out of the arg0 auto-splat.
+    pub ambiguous_param0_mask: u64,
+    /// `ZJIT_MEGA_DIRECT_MAX_STACK`, reused here as the `stack_max` bound a run-time block ISEQ
+    /// must fit under for the call site's stack overflow check to cover it.
+    pub max_stack: u64,
+}
+
+impl BlockDirectLayout {
+    pub fn get() -> Self {
+        unsafe extern "C" {
+            fn rb_zjit_iseq_body_offset() -> usize;
+            fn rb_zjit_iseq_body_jit_entry_offset() -> usize;
+            fn rb_zjit_iseq_body_param_flags_offset() -> usize;
+            fn rb_zjit_iseq_body_param_lead_num_offset() -> usize;
+            fn rb_zjit_iseq_body_local_table_size_offset() -> usize;
+            fn rb_zjit_iseq_body_stack_max_offset() -> usize;
+            fn rb_zjit_iseq_param_flags_not_simple_mask() -> u32;
+            fn rb_zjit_iseq_param_flags_ambiguous_param0_mask() -> u32;
+            fn rb_zjit_mega_direct_max_stack() -> usize;
+        }
+        unsafe {
+            BlockDirectLayout {
+                iseq_body: rb_zjit_iseq_body_offset() as i32,
+                body_param_flags: rb_zjit_iseq_body_param_flags_offset() as i32,
+                body_param_lead_num: rb_zjit_iseq_body_param_lead_num_offset() as i32,
+                body_local_table_size: rb_zjit_iseq_body_local_table_size_offset() as i32,
+                body_stack_max: rb_zjit_iseq_body_stack_max_offset() as i32,
+                body_jit_entry: rb_zjit_iseq_body_jit_entry_offset() as i32,
+                not_simple_mask: rb_zjit_iseq_param_flags_not_simple_mask() as u64,
+                ambiguous_param0_mask: rb_zjit_iseq_param_flags_ambiguous_param0_mask() as u64,
+                max_stack: rb_zjit_mega_direct_max_stack() as u64,
+            }
+        }
+    }
+}
+
+/// How many locals past its parameters a block may have and still be entered by
+/// [`gen_invoke_block_iseq_dynamic`]. Each one costs a compare, a branch and a store in the
+/// dispatch, and a block with more than a handful of its own locals is rare.
+const MAX_DYNAMIC_BLOCK_EXTRA_LOCALS: usize = 8;
+
+/// Compile `yield` to an ISEQ block that is only identified at run time.
+///
+/// # What this replaces
+///
+/// The guard chains a `yield` site can build only cover the block ISEQs its profile saw, and a
+/// shared iterator does not have a small set of those. `Array#each` in `<internal:array>` is
+/// yielded 328 distinct blocks over a lobsters run, so no chain reaches a useful coverage and
+/// every one of those yields went out through `rb_vm_invokeblock()`: a C call, a generic
+/// `vm_callee_setup_block_arg()`, an interpreter frame push, a `setjmp`, and a trip through
+/// `vm_exec()`, only to arrive at the block's JIT code.
+///
+/// So this does for blocks what [`gen_send_megamorphic_direct`] does for megamorphic sends:
+/// read the callee out of the run-time handler, check *there* that it is simple enough to enter
+/// with a frame this can lay out at compile time, push that frame and call
+/// `ISEQ_BODY(iseq)->jit_entry` through the trampoline. The interpreter entry reads its
+/// parameters back out of the frame, which is exactly where the yielded arguments already are.
+///
+/// # What the run-time checks buy
+///
+/// `rb_simple_iseq_p()` and an exact arity match together mean the yielded arguments already on
+/// the operand stack *are* the head of the callee's local area: no auto-splat, no truncation,
+/// nothing to move. Only the block's own locals past its parameters still have to be nil-filled,
+/// and bounding how many of those there can be is what keeps the frame within reach of a
+/// compile-time stack overflow check. Anything else takes the `rb_vm_invokeblock()` fallback at
+/// the end of this instruction.
+///
+/// # Why a stale entry cannot be wrong
+///
+/// Nothing here is speculated: the ISEQ, its parameters and its entry point are all re-read on
+/// every call. `rb_iseq_reset_jit_func()` clears `jit_entry` whenever the compiled code stops
+/// being valid -- a TracePoint being enabled, a patch point firing, a recompile -- and a null
+/// there sends the call down the fallback. So there is no patch point and no
+/// [`crate::invariants`] entry for this path.
+#[allow(clippy::too_many_arguments)]
+fn gen_invoke_block_iseq_dynamic(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    cd: *const rb_call_data,
+    captured: Opnd,
+    args: Vec<Opnd>,
+    state: &FrameState,
+    reason: SendFallbackReason,
+) -> lir::Opnd {
+    let layout = BlockDirectLayout::get();
+    let argc = args.len();
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let result_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let slow_edge = || Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = |val: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+
+    // Under --zjit-stats each rejected shape gets its own trampoline into the fallback, so the
+    // counters say *why* a site could not dispatch directly. Without stats every check jumps
+    // straight to the fallback and none of these blocks exist.
+    let mut miss_blocks: Vec<(lir::BlockId, Counter)> = vec![];
+    macro_rules! miss_edge {
+        ($counter:expr) => {
+            if get_option!(stats) {
+                let block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+                miss_blocks.push((block, $counter));
+                Target::Block(Box::new(lir::BranchEdge { target: block, args: vec![] }))
+            } else {
+                slow_edge()
+            }
+        };
+    }
+
+    asm_comment!(asm, "check the run-time block ISEQ can be entered directly");
+    let block_iseq = asm.load(Opnd::mem(64, captured, std::mem::offset_of!(rb_captured_block, code) as i32));
+    let body = asm.load(Opnd::mem(64, block_iseq, layout.iseq_body));
+
+    // rb_simple_iseq_p(): no optional, rest, post, keyword, kwrest or block parameter.
+    let param_flags = asm.load(Opnd::mem(32, body, layout.body_param_flags));
+    asm.test(param_flags, Opnd::UImm(layout.not_simple_mask));
+    let miss = miss_edge!(Counter::block_iseq_dynamic_miss_not_simple);
+    asm.jnz(jit, miss);
+
+    // The arg0 auto-splat in `vm_callee_setup_block_arg()` fires for a lone argument yielded to
+    // a block with lead parameters that did not opt out with `|x|`. Whether it splats depends on
+    // the value, so a site that could hit it cannot dispatch directly.
+    if argc == 1 {
+        asm.test(param_flags, Opnd::UImm(layout.ambiguous_param0_mask));
+        let miss = miss_edge!(Counter::block_iseq_dynamic_miss_autosplat);
+        asm.jz(jit, miss);
+    }
+
+    // Exact arity: the yielded arguments on the operand stack already are the head of the
+    // callee's local area, so nothing has to be truncated or nil-filled to reach the parameters.
+    asm.cmp(Opnd::mem(32, body, layout.body_param_lead_num), Opnd::UImm(argc as u64));
+    let miss = miss_edge!(Counter::block_iseq_dynamic_miss_arity);
+    asm.jne(jit, miss);
+
+    // A block routinely has locals of its own past its parameters -- `{ |x| y = f(x); g(y) }`
+    // has two -- and on lobsters that shape is 96% of the ISEQ handlers this instruction sees.
+    // They are nil-filled below, which needs one unconditional store per slot, so bound how many
+    // there can be rather than emitting a loop.
+    let local_table_size = asm.load(Opnd::mem(32, body, layout.body_local_table_size));
+    asm.cmp(local_table_size, Opnd::UImm((argc + MAX_DYNAMIC_BLOCK_EXTRA_LOCALS) as u64));
+    let locals_ok = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    asm.jbe(jit, Target::Block(Box::new(lir::BranchEdge { target: locals_ok, args: vec![] })));
+    let miss = miss_edge!(Counter::block_iseq_dynamic_miss_locals);
+    asm.jmp(miss);
+    asm.set_current_block(locals_ok);
+    let label = jit.get_label(asm, locals_ok, hir_block_id);
+    asm.write_label(label);
+
+    // The stack overflow check below is compiled against this bound in place of the callee's own
+    // `stack_max`, which is not known here.
+    let stack_max_ok = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    asm.cmp(Opnd::mem(32, body, layout.body_stack_max), Opnd::UImm(layout.max_stack));
+    asm.jbe(jit, Target::Block(Box::new(lir::BranchEdge { target: stack_max_ok, args: vec![] })));
+    let miss = miss_edge!(Counter::block_iseq_dynamic_miss_stack_max);
+    asm.jmp(miss);
+    asm.set_current_block(stack_max_ok);
+    let label = jit.get_label(asm, stack_max_ok, hir_block_id);
+    asm.write_label(label);
+
+    let entry = asm.load(Opnd::mem(64, body, layout.body_jit_entry));
+    asm.cmp(entry, 0.into());
+    let miss = miss_edge!(Counter::block_iseq_dynamic_miss_not_compiled);
+    asm.je(jit, miss);
+
+    gen_incr_counter(asm, Counter::block_iseq_dynamic_optimized_send_count);
+
+    // The callee frame is the arguments (already on the stack), up to
+    // MAX_DYNAMIC_BLOCK_EXTRA_LOCALS more locals, the environment, and whatever the callee
+    // pushes -- bounded by `layout.max_stack` in place of its own unknown `stack_max`.
+    let stack_len = state.stack().len();
+    let stack_size = stack_len - argc;
+    let stack_growth = stack_len + MAX_DYNAMIC_BLOCK_EXTRA_LOCALS
+        + VM_ENV_DATA_SIZE.to_usize() + layout.max_stack as usize;
+    gen_stack_overflow_check(jit, asm, function, state, stack_growth);
+
+    let captured_self = asm.load(Opnd::mem(64, captured, 0)); // captured->self
+    let captured_ep = asm.load(Opnd::mem(64, captured, SIZEOF_VALUE_I32)); // captured->ep
+    // specval = VM_GUARDED_PREV_EP(captured->ep) = captured->ep | 0x01
+    let specval = asm.or(captured_ep, Opnd::Imm(0x1));
+
+    // Publish the caller frame before the arguments become the callee's locals. The callee
+    // reads its parameters out of the frame rather than from registers, so the operand stack
+    // has to be spilled: a zero-entry JITFrame and a full spill, the shape
+    // gen_prepare_fallback_call() uses. See gen_send_megamorphic_direct().
+    gen_write_jit_frame(asm, state, 0);
+    gen_save_sp(asm, stack_size);
+    gen_spill_locals(jit, asm, state);
+    gen_spill_stack(jit, asm, function, state);
+
+    // `vm_push_frame()` nil-fills the locals past the arguments. `local_table_size` is only
+    // known now, so unroll the fill and let each slot's store be skipped by the slot before it
+    // deciding the local area has ended. The overwhelmingly common shapes are 0, 1 and 2 extra
+    // locals, so the branch that ends the fill is well predicted and the common case pays a
+    // compare and a not-taken branch per slot.
+    asm_comment!(asm, "nil-fill the block's locals past its parameters");
+    let locals_base = asm.lea(Opnd::mem(64, SP, stack_size as i32 * SIZEOF_VALUE_I32));
+    let locals_done = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let locals_done_edge = || Target::Block(Box::new(lir::BranchEdge { target: locals_done, args: vec![] }));
+    for slot in argc..(argc + MAX_DYNAMIC_BLOCK_EXTRA_LOCALS) {
+        asm.cmp(local_table_size, Opnd::UImm(slot as u64));
+        asm.jbe(jit, locals_done_edge());
+        asm.store(Opnd::mem(64, locals_base, slot as i32 * SIZEOF_VALUE_I32), Qnil.into());
+    }
+    asm.jmp(locals_done_edge());
+    asm.set_current_block(locals_done);
+    let label = jit.get_label(asm, locals_done, hir_block_id);
+    asm.write_label(label);
+
+    // vm_invoke_iseq_block()'s frame. Unlike a method frame this is VM_FRAME_MAGIC_BLOCK with no
+    // VM_ENV_FLAG_LOCAL, ep[-2] is the cref (NULL) rather than a method entry, and ep[-1] points
+    // at the captured block's EP. `ep` sits VM_ENV_DATA_SIZE - 1 words above the local area,
+    // whose length is only known now.
+    asm_comment!(asm, "push cref, specval, frame type");
+    let local_bytes = asm.lshift(local_table_size.with_num_bits(64), Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let local_end = asm.add(locals_base, local_bytes);
+    let ep = asm.add(local_end, Opnd::UImm((VM_ENV_DATA_SIZE as u64 - 1) * SIZEOF_VALUE as u64));
+    asm.store(Opnd::mem(64, ep, -2 * SIZEOF_VALUE_I32), 0.into());
+    asm.store(Opnd::mem(64, ep, -SIZEOF_VALUE_I32), specval);
+    asm.store(Opnd::mem(64, ep, 0), VM_FRAME_MAGIC_BLOCK.into());
+
+    asm_comment!(asm, "push callee control frame");
+    let cfp_opnd = |offset: i32| Opnd::mem(64, CFP, offset - (RUBY_SIZEOF_CONTROL_FRAME as i32));
+    // gen_push_frame() can skip this for callees it knows never read block_code; the callee is
+    // not known here, so always clear it.
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SELF), captured_self);
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+
+    asm_comment!(asm, "switch to new SP register");
+    // The caller's SP is restored from this copy rather than recomputed: the callee frame's size
+    // is not a compile-time constant here.
+    let caller_sp = asm.load(SP);
+    let new_sp = asm.add(ep, Opnd::UImm(SIZEOF_VALUE as u64));
+    asm.mov(SP, new_sp);
+
+    asm_comment!(asm, "switch to new CFP");
+    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, new_cfp); // published at `ec->cfp` by the callee's entry point
+
+    let ret = asm.ccall(ZJITState::get_jit_entry_call_trampoline(), vec![entry]);
+
+    // Qundef means either a side exit from inside the callee, which has published `ec->cfp` and
+    // materialized its frames and only needs propagating, or a `jit_entry` stub that returned
+    // without entering the frame at all. See gen_send_megamorphic_direct() for the full story.
+    asm_comment!(asm, "handle a Qundef return");
+    let entered_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    asm.cmp(ret, Qundef.into());
+    asm.jne(jit, Target::Block(Box::new(lir::BranchEdge { target: entered_block, args: vec![] })));
+
+    asm_comment!(asm, "did the callee's entry point publish its frame?");
+    asm.cmp(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    asm.jbe(jit, ZJITState::get_exit_trampoline().into());
+
+    asm_comment!(asm, "callee never ran: undo the frame push and dispatch through the VM");
+    asm.mov(SP, caller_sp);
+    let unpushed_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, unpushed_cfp);
+    asm.jmp(slow_edge());
+
+    asm.set_current_block(entered_block);
+    let label = jit.get_label(asm, entered_block, hir_block_id);
+    asm.write_label(label);
+    asm_comment!(asm, "restore SP register for the caller");
+    asm.mov(SP, caller_sp);
+    asm.jmp(result_edge(ret));
+
+    for (block, counter) in miss_blocks {
+        asm.set_current_block(block);
+        let label = jit.get_label(asm, block, hir_block_id);
+        asm.write_label(label);
+        gen_incr_counter(asm, counter);
+        asm.jmp(slow_edge());
+    }
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    let ret = gen_invokeblock(jit, asm, function, cd, state, reason);
+    asm.jmp(result_edge(ret));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 /// Compile `yield`. Inlines the block ISEQ frame like `invokeblock` instead of calling vm_yield.
