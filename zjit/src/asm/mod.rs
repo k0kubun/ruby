@@ -246,7 +246,18 @@ impl CodeBlock {
 
         // Move past however many bytes the instruction takes up
         if self.write_pos + num_bytes < self.mem_size {
-            self.write_pos += num_bytes;
+            // Reserve the bytes by writing them rather than by moving the cursor
+            // over them. Pages are mapped on first write, so a cursor bump alone
+            // leaves a page that cannot be mapped -- the memory limit is
+            // reached, say -- to be discovered by link_labels(), which comes
+            // back to fill these in long after `dropped_bytes` has stopped being
+            // read and can only report a short write by tripping its own
+            // assertion. Writing here keeps the failure on the path that already
+            // handles it: `arch_emit` turns `dropped_bytes` into
+            // CompileError::OutOfMemory and the function is retried or dropped.
+            const RESERVED: [u8; 16] = [0; 16];
+            assert!(num_bytes <= RESERVED.len(), "label reference wants {num_bytes} bytes");
+            self.write_bytes(&RESERVED[..num_bytes]);
         } else {
             self.dropped_bytes = true; // retry emitting the Insn after next_page
         }
