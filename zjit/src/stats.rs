@@ -249,6 +249,8 @@ make_counters! {
         exit_splatkw_not_profiled,
         exit_caller_splat_length_mismatch,
         exit_caller_splat_ruby2_keywords,
+        exit_send_forward_callinfo_changed,
+        exit_send_forward_block_given,
         exit_directive_induced,
         exit_send_while_tracing,
         exit_invokeblock_not_ifunc,
@@ -299,6 +301,9 @@ make_counters! {
         send_fallback_invokeblock_polymorphic_miss,
         send_fallback_sendforward_not_specialized,
         send_fallback_sendforward_target_not_specialized,
+        send_fallback_sendforward_recv_type,
+        send_fallback_sendforward_method_type,
+        send_fallback_sendforward_complex_args,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
         send_fallback_uncategorized,
@@ -520,6 +525,24 @@ make_counters! {
     // The site is not inside an inlined forwardable frame, so there is no compile-time callinfo
     // to merge with.
     send_forward_reject_no_context,
+    // Of those, sites the profiler never saw run, saw forwarding more than one callinfo, or saw
+    // forwarding a heap (`imemo_callinfo`) one -- which is what a keyword-carrying caller
+    // produces, and which is neither an immediate to compare against nor safe to hold without a
+    // GC root.
+    send_forward_reject_ci_no_profile,
+    send_forward_reject_ci_polymorphic,
+    send_forward_reject_ci_not_packed,
+    // The site is in a version that may not side-exit, or in an inlined frame whose local EP is
+    // not this compilation's own, so the callinfo guard has nowhere to go.
+    send_forward_reject_ci_no_guard,
+    // `bar(...)` whose target is itself a `def bar(...)`: the merged call has no callinfo object
+    // to hand the callee's `...` local. See `can_direct_send_forwardable`.
+    send_forward_reject_chained,
+    // `bar(...)` sites expanded against a profiled, guarded callinfo rather than an inlined
+    // frame's compile-time one.
+    send_forward_expanded_profiled_count,
+    // Of those, the ones that also had to guard that the frame was given no block.
+    send_forward_expanded_profiled_no_block,
     // `bar(*a, ...)`: the site splats, so the merged argument count is only known at run time.
     send_forward_reject_site_splat,
     send_forward_reject_recv_type,
@@ -683,6 +706,8 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         SplatKwNotProfiled            => exit_splatkw_not_profiled,
         CallerSplatLengthMismatch     => exit_caller_splat_length_mismatch,
         CallerSplatRuby2Keywords      => exit_caller_splat_ruby2_keywords,
+        SendForwardCallInfoChanged    => exit_send_forward_callinfo_changed,
+        SendForwardBlockGiven         => exit_send_forward_block_given,
         DirectiveInduced              => exit_directive_induced,
         PatchPoint(Invariant::BOPRedefined { .. })
                                       => exit_patchpoint_bop_redefined,
@@ -758,6 +783,9 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
+        SendForwardRecvType                       => send_fallback_sendforward_recv_type,
+        SendForwardMethodType                     => send_fallback_sendforward_method_type,
+        SendForwardComplexArgs                    => send_fallback_sendforward_complex_args,
         SendForwardTargetNotSpecialized           => send_fallback_sendforward_target_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,
