@@ -657,6 +657,8 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
 
+        // The ceiling a table may grow to, not the size it starts at. See
+        // crate::send_cache::SEND_CACHE_INITIAL_ENTRIES.
         ("send-cache-entries", _) => match opt_val.parse::<usize>() {
             Ok(n) if n.is_power_of_two() && n >= 8 => options.send_cache_entries = n,
             _ => return None,

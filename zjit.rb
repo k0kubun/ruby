@@ -259,6 +259,8 @@ class << RubyVM::ZJIT
       :mem_root_iseq_bytes,
       :mem_code_block_bytes,
       :mem_stats_counter_bytes,
+      :mem_ivar_cache_bytes,
+      :mem_send_cache_bytes,
       :mem_dead_iseq_version_bytes,
       :mem_method_annotation_bytes,
       :mem_accounted_bytes,

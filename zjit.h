@@ -130,11 +130,15 @@ struct rb_zjit_send_cache_entry {
 };
 
 struct rb_zjit_send_cache {
-    // Number of slots. A power of two.
+    // Number of slots, and what zjit_send_cache_slot() scales the hash by. A
+    // power of two.
     uint32_t len;
-    // 64 - log2(len): the shift that turns the hash product into a slot index.
-    uint32_t shift;
-    // Slot 0.
+    // Evictions since the table was allocated or last grown. Counted here rather
+    // than in Rust because the fill path below still has the evicted slot in
+    // hand; only meaningful while `grow_at` is non-zero.
+    uint32_t evictions;
+    // Slot 0. Moves when the table grows, which is why nothing may hold it
+    // across a call that could reach rb_zjit_send_cache_grow().
     struct rb_zjit_send_cache_entry *slots;
     // The ZJIT hit counter under --zjit-stats, NULL otherwise. Doubles as the
     // flag for whether to report misses to rb_zjit_send_cache_record_miss(), so
@@ -150,6 +154,9 @@ struct rb_zjit_send_cache {
     // The call shape's `vm_ci_flag()`, for the visibility test the fill path
     // runs (a private method is directly callable only from an FCALL site).
     uint32_t direct_flags;
+    // `evictions` at which this table should grow, or 0 for one that will not
+    // grow again. See SendCache::grow in zjit/src/send_cache.rs.
+    uint32_t grow_at;
 };
 
 // Why a probe of a `struct rb_zjit_send_cache` did not produce a callcache.
@@ -164,6 +171,7 @@ struct rb_zjit_send_cache {
 #define ZJIT_SEND_CACHE_HASH_MULT 0x9e3779b97f4a7c15ULL
 
 void rb_zjit_send_cache_record_miss(int kind);
+void rb_zjit_send_cache_grow(struct rb_zjit_send_cache *cache);
 
 // Field offsets and flag masks the inline send-cache probe in JIT code needs.
 // They are functions rather than bindgen constants because the structs they

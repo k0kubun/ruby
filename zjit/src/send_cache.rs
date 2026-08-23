@@ -162,7 +162,52 @@ use crate::state::ZJITState;
 /// which is where the index is taken from.
 pub const SEND_CACHE_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// Default of `--zjit-send-cache-entries`, i.e. 8KiB per call shape.
+/// Index a class maps to in a table of `len` slots: the top `log2(len)` bits of
+/// the hash product, taken with a second multiply rather than with a shift by
+/// `64 - log2(len)`.
+///
+/// The two are the same number -- for a power-of-two `len`, `(t * len) >> 32` is
+/// `t >> (32 - log2(len))` -- but only one of them can be emitted without
+/// knowing `len` when the code is written. Tables are sized adaptively (see
+/// [`SendCache::grow`]), so the length has to come from the table's header at
+/// run time, and a *shift* by a loaded amount needs the count in a fixed
+/// register on x86-64 while a *multiply* by a loaded amount does not.
+///
+/// Masking the product's low bits instead, the way [`crate::ivar_cache`] indexes
+/// its fixed-size tables, is not an option here: it would index a small table on
+/// a narrow window in the middle of the product, and classes are allocated at a
+/// fixed stride from a heap page, so for any such window there is a stride that
+/// collapses it (measured: 40-byte-strided classes reach 4 of 32 slots through
+/// bits 52..57, against 26 through the top 5). Only the top bits are safe for
+/// every stride, which is what this keeps.
+#[inline]
+pub fn slot_of(klass: u64, len: u32) -> usize {
+    let hash = klass.wrapping_mul(SEND_CACHE_HASH_MULT);
+    (((hash >> 32) * len as u64) >> 32) as usize
+}
+
+/// log2 of `size_of::<SendCacheEntry>()`. Asserted against the C `sizeof` in
+/// [`SendCacheLayout::get`].
+pub const SEND_CACHE_ENTRY_SHIFT: u32 = 4;
+
+/// Slots a table starts with, i.e. 512 bytes per call shape.
+///
+/// Almost every call shape a program dispatches megamorphically sees a handful
+/// of classes: on `benchmarks/lobsters` 1607 tables hold 4.3 live entries each
+/// on average, so a fixed 512-slot table left 98% of 13.3MB empty -- memory the
+/// GC then walked as a root on every collection. Starting small and growing the
+/// few shapes that actually thrash (see [`SendCache::grow`]) keeps the hit rate
+/// of a big table at a fraction of the footprint.
+pub const SEND_CACHE_INITIAL_ENTRIES: usize = 32;
+
+/// How much a table grows when it thrashes, and -- multiplied by the current
+/// length -- how many evictions it takes to decide that it does. Four evictions
+/// per slot is well past what a table holding its working set produces and is
+/// reached in the first few thousand calls by one that does not.
+const SEND_CACHE_GROWTH_FACTOR: usize = 4;
+
+/// Default of `--zjit-send-cache-entries`: the size a table is allowed to grow
+/// *to*, i.e. at most 8KiB per call shape.
 ///
 /// A direct-mapped table smaller than a site's class working set thrashes rather
 /// than degrading smoothly: under a cyclic access pattern every slot holding two
@@ -183,9 +228,14 @@ pub const SEND_CACHE_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// not performance.
 pub const DEFAULT_CACHE_ENTRIES: usize = 512;
 
-/// Number of slots in each table, from `--zjit-send-cache-entries`.
+/// Largest a table may grow, from `--zjit-send-cache-entries`.
 pub fn cache_entries() -> usize {
     get_option!(send_cache_entries, DEFAULT_CACHE_ENTRIES)
+}
+
+/// Slots a fresh table gets, never more than the ceiling above.
+fn initial_cache_entries() -> usize {
+    SEND_CACHE_INITIAL_ENTRIES.min(cache_entries())
 }
 
 /// The call shape a table is for: the inputs, other than the receiver class,
@@ -218,13 +268,17 @@ pub struct SendCacheEntry {
 /// `struct rb_zjit_send_cache` in `zjit.h`; keep the two declarations in step.
 #[repr(C)]
 pub struct SendCache {
-    /// Number of slots. A power of two, so `len - 1` is a mask.
+    /// Number of slots, and the multiplier [`slot_of`] scales the hash by. A
+    /// power of two.
+    ///
+    /// Written *after* `slots` when the table grows, so that a reader is never
+    /// handed a length longer than the table it reads from.
     len: u32,
-    /// `64 - log2(len)`: the right shift that turns the hash product into a slot
-    /// index, with no mask needed because the shift keeps only that many bits.
-    shift: u32,
-    /// Address of slot 0. Points into `storage`, which is never reallocated
-    /// because the C helper holds this pointer directly.
+    /// Evictions since the table was allocated or last grown, counted by the C
+    /// fill path. Only meaningful while `grow_at` is non-zero.
+    evictions: u32,
+    /// Address of slot 0. Points into `storage`, which only moves in
+    /// [`SendCache::grow`], and only when no other thread can be mid-probe.
     slots: *mut SendCacheEntry,
     /// `counter_ptr(send_cache_hit)` under `--zjit-stats`, null otherwise. The
     /// C helper uses it both as the counter and as the flag that says whether to
@@ -240,6 +294,10 @@ pub struct SendCache {
     /// The call shape's `vm_ci_flag()`, which the C fill path consults for the
     /// visibility test.
     direct_flags: u32,
+    /// Evictions at which the C fill path calls [`rb_zjit_send_cache_grow`], or
+    /// 0 for a table that will not grow again -- it is already at the ceiling,
+    /// or the program has more than one ractor. See [`SendCache::grow`].
+    grow_at: u32,
 
     /// Backing store for `slots`, all-zero for empty.
     storage: Box<[SendCacheEntry]>,
@@ -249,11 +307,11 @@ pub struct SendCache {
 
 impl SendCache {
     fn new(key: SendCacheKey) -> Box<Self> {
-        let len = cache_entries();
+        let len = initial_cache_entries();
         debug_assert!(len.is_power_of_two());
         let mut cache = Box::new(SendCache {
-            len: len as u32,
-            shift: 64 - len.trailing_zeros(),
+            len: 0,
+            evictions: 0,
             slots: std::ptr::null_mut(),
             hit_counter: if get_option!(stats) {
                 counter_ptr(Counter::send_cache_hit)
@@ -263,13 +321,62 @@ impl SendCache {
             direct_argc: key.argc,
             direct_ok: u32::from(shape_allows_direct(key.flags)),
             direct_flags: key.flags,
-            storage: vec![SendCacheEntry { cc: 0, direct_cme: 0 }; len].into_boxed_slice(),
+            grow_at: 0,
+            storage: empty_storage(len),
             key,
         });
         // Only now that `storage` has its final address: the C helper indexes
         // `slots` without going through the `Box`.
-        cache.slots = cache.storage.as_mut_ptr();
+        cache.publish(len);
         cache
+    }
+
+    /// Point `slots`, `len` and `grow_at` at the current `storage`, whose length
+    /// must be `len`.
+    ///
+    /// `slots` is stored before `len` so that a reader racing with
+    /// [`SendCache::grow`] can only ever pair a length with a table at least
+    /// that large: tables only grow, so an old length against the new table is a
+    /// probe of a prefix, and the new length against the old table -- the
+    /// pairing that would read out of bounds -- is the one this order rules out.
+    /// See `grow` for why the race cannot happen in the first place.
+    fn publish(&mut self, len: usize) {
+        debug_assert_eq!(len, self.storage.len());
+        self.slots = self.storage.as_mut_ptr();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.len = len as u32;
+        self.evictions = 0;
+        self.grow_at = if len >= cache_entries() {
+            0
+        } else {
+            (len * SEND_CACHE_GROWTH_FACTOR) as u32
+        };
+    }
+
+    /// Replace the table with a larger one because it is thrashing: the classes
+    /// this call shape dispatches over do not fit, so slots are being evicted
+    /// rather than hit.
+    ///
+    /// The cached entries are dropped rather than rehashed. They are a memo of a
+    /// search the interpreter can redo, the table refills within a few thousand
+    /// calls, and a table grows at most twice in its life.
+    ///
+    /// Growth frees the old storage, so it must not run while another thread can
+    /// be between loading `slots` and reading the slot. Ruby threads within a
+    /// ractor are serialized and take no interrupt check inside a probe, so the
+    /// only way to have a concurrent reader is a second ractor -- and a table
+    /// simply stops growing once the program has one.
+    fn grow(&mut self) {
+        let max = cache_entries();
+        let len = self.len as usize;
+        if len >= max || unsafe { rb_jit_multi_ractor_p() } {
+            self.grow_at = 0;
+            return;
+        }
+        let new_len = (len * SEND_CACHE_GROWTH_FACTOR).min(max);
+        self.storage = empty_storage(new_len);
+        self.publish(new_len);
+        incr_counter!(send_cache_grow_count);
     }
 
     /// Bytes this table owns on the Rust heap.
@@ -277,14 +384,10 @@ impl SendCache {
         size_of::<SendCache>() + self.storage.len() * size_of::<SendCacheEntry>()
     }
 
-    /// Address of slot 0, for the inline probe JIT code emits.
-    pub fn slots_ptr(&self) -> *const u8 {
-        self.storage.as_ptr() as *const u8
-    }
-
-    /// The right shift the inline probe applies to the hash product.
-    pub fn shift(&self) -> u32 {
-        self.shift
+    /// Address of the table's header, which the inline probe bakes in and reads
+    /// `slots` and `len` out of.
+    pub fn header_ptr(&self) -> *const u8 {
+        self as *const SendCache as *const u8
     }
 
     /// Whether this table's call shape can use the inline direct-dispatch path.
@@ -299,8 +402,9 @@ impl SendCache {
 
     /// Slot a class maps to. Must match `zjit_send_cache_slot` in
     /// `vm_insnhelper.c`, or the helper would fill and probe different slots.
+    #[allow(dead_code)]
     fn slot_of(&self, klass: VALUE) -> usize {
-        ((klass.as_u64().wrapping_mul(SEND_CACHE_HASH_MULT)) >> self.shift) as usize
+        slot_of(klass.as_u64(), self.len)
     }
 
     /// Mark every cached callcache. See the module docs on why this retains
@@ -335,6 +439,20 @@ impl SendCache {
     pub fn occupancy(&self) -> usize {
         self.storage.iter().filter(|slot| slot.cc != 0).count()
     }
+}
+
+/// `len` empty slots. Zeroed rather than filled so that the allocator can hand
+/// back fresh pages it already knows are zero.
+fn empty_storage(len: usize) -> Box<[SendCacheEntry]> {
+    debug_assert!(len.is_power_of_two());
+    vec![SendCacheEntry { cc: 0, direct_cme: 0 }; len].into_boxed_slice()
+}
+
+/// Grow a thrashing table. Called from `zjit_send_cache_search` once its
+/// eviction count reaches `grow_at`; see [`SendCache::grow`].
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_send_cache_grow(cache: *mut SendCache) {
+    unsafe { (*cache).grow() };
 }
 
 /// Table for `key`, creating it on first use. The `Box` is owned by
@@ -393,6 +511,10 @@ pub struct SendCacheLayout {
     pub entry_direct_cme: i32,
     /// `sizeof(struct rb_zjit_send_cache_entry)`
     pub entry_size: usize,
+    /// `offsetof(struct rb_zjit_send_cache, slots)`
+    pub cache_slots: i32,
+    /// `offsetof(struct rb_zjit_send_cache, len)`
+    pub cache_len: i32,
     /// `offsetof(struct rb_callcache, klass)`
     pub cc_klass: i32,
     /// `offsetof(struct rb_callcache, cme_)`
@@ -427,10 +549,18 @@ impl SendCacheLayout {
             fn rb_zjit_method_entry_invalidated_flag() -> VALUE;
             fn rb_zjit_mega_direct_max_stack() -> usize;
         }
+        // The C declaration of a slot has to agree with the Rust one, or the
+        // helper would fill slots the probe never reads.
+        unsafe {
+            assert_eq!(rb_zjit_send_cache_entry_size(), size_of::<SendCacheEntry>());
+            assert_eq!(SEND_CACHE_ENTRY_SHIFT, size_of::<SendCacheEntry>().trailing_zeros());
+        }
         unsafe {
             SendCacheLayout {
                 entry_direct_cme: rb_zjit_send_cache_entry_direct_cme_offset() as i32,
                 entry_size: rb_zjit_send_cache_entry_size(),
+                cache_slots: std::mem::offset_of!(SendCache, slots) as i32,
+                cache_len: std::mem::offset_of!(SendCache, len) as i32,
                 cc_klass: rb_zjit_cc_klass_offset() as i32,
                 cc_cme: rb_zjit_cc_cme_offset() as i32,
                 cme_def: rb_zjit_cme_def_offset() as i32,
@@ -552,45 +682,80 @@ pub type SendCaches = HashMap<SendCacheKey, Box<SendCache>>;
 mod tests {
     use super::*;
 
-    /// The shift has to keep exactly log2(len) bits, or the helper indexes out of
-    /// bounds (too few) or wastes half the table (too many).
+    /// Every table size a program can reach, from the smallest a table starts
+    /// at to the largest `--zjit-send-cache-entries` is ever set to.
+    const SIZES: [u32; 10] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    /// The entry-size constant JIT code shifts by has to be the real one, or the
+    /// probe reads between slots.
     #[test]
-    fn shift_covers_the_whole_table() {
-        for log2 in 3..=12u32 {
-            let len = 1usize << log2;
-            let shift = 64 - len.trailing_zeros();
-            let max = u64::MAX >> shift;
-            assert_eq!(max as usize, len - 1, "len {len}");
-        }
+    fn entry_shift_matches_the_entry_size() {
+        assert_eq!(SEND_CACHE_ENTRY_SHIFT, size_of::<SendCacheEntry>().trailing_zeros());
     }
 
-    /// Every slot index a class address can produce must be in range, including
-    /// for the extreme words a `VALUE` can hold.
+    /// Scaling by the length has to be the shift it replaces: `slot_of` is
+    /// emitted as two multiplies in JIT code because the length is only known at
+    /// run time, and the two have to be the same number at every size.
     #[test]
-    fn slots_are_in_range() {
-        for log2 in 3..=12u32 {
-            let len = 1usize << log2;
+    fn scaling_by_the_length_is_a_shift_by_the_log() {
+        for len in SIZES {
             let shift = 64 - len.trailing_zeros();
-            for klass in [0u64, 8, 0x10, 0xffff_ffff_ffff_fff8, 0x5555_5555_5555_5550] {
-                let slot = (klass.wrapping_mul(SEND_CACHE_HASH_MULT) >> shift) as usize;
-                assert!(slot < len, "len {len} klass {klass:#x} slot {slot}");
+            for klass in [0u64, 8, 0x10, 0xffff_ffff_ffff_fff8, 0x5555_5555_5555_5550, 0x7f00_0000_1000] {
+                let expected = (klass.wrapping_mul(SEND_CACHE_HASH_MULT) >> shift) as usize;
+                assert_eq!(slot_of(klass, len), expected, "len {len} klass {klass:#x}");
             }
         }
     }
 
-    /// Nearby class addresses must not collide: they differ only in bits the
-    /// multiply has to spread into the top of the word.
+    /// Every slot index a class address can produce must be in range, at every
+    /// size a table passes through, including for the extreme words a `VALUE`
+    /// can hold.
     #[test]
-    fn adjacent_addresses_do_not_share_a_slot() {
-        let len = 256usize;
-        let shift = 64 - len.trailing_zeros();
-        let slot = |klass: u64| (klass.wrapping_mul(SEND_CACHE_HASH_MULT) >> shift) as usize;
-        // A heap page of 40-byte slots, which is what classes are allocated from.
-        let slots: std::collections::HashSet<usize> =
-            (0..64u64).map(|i| slot(0x7f00_0000_1000 + i * 40)).collect();
-        // With a mask of the raw address instead of a multiply this would be a
-        // handful of distinct slots; the bar is deliberately loose so the test
-        // does not pin the exact hash.
-        assert!(slots.len() > 48, "only {} distinct slots for 64 classes", slots.len());
+    fn slots_are_in_range() {
+        for len in SIZES {
+            for klass in [0u64, 8, 0x10, 0xffff_ffff_ffff_fff8, 0x5555_5555_5555_5550] {
+                let slot = slot_of(klass, len);
+                assert!(slot < len as usize, "len {len} klass {klass:#x} slot {slot}");
+            }
+        }
+    }
+
+    /// Classes are allocated at a fixed stride from a heap page, so a table has
+    /// to spread a strided run of addresses at *every* size it can be -- a small
+    /// table just as much as a big one, since every table now starts small.
+    #[test]
+    fn strided_addresses_do_not_share_a_slot() {
+        // Sizes of the objects classes are allocated from, and then some.
+        for stride in [40u64, 80, 160, 320] {
+            for len in SIZES {
+                let slots: std::collections::HashSet<usize> = (0..len as u64)
+                    .map(|i| slot_of(0x7f00_0000_1000 + i * stride, len))
+                    .collect();
+                // Filling `len` slots with `len` random keys leaves ~63% of them
+                // distinct, which is the ceiling for a direct-mapped table; the
+                // bar is deliberately well under it so the test does not pin the
+                // exact hash. What it does catch is a index that stops mixing:
+                // masking a middle window of the product instead of taking its
+                // top bits reaches 4 of 32 slots at this stride.
+                assert!(
+                    slots.len() * 5 >= len as usize * 2,
+                    "stride {stride}: only {} distinct slots for {len} classes in {len} slots",
+                    slots.len()
+                );
+            }
+        }
+    }
+
+    /// Every slot of a table has to be reachable at every size it grows through,
+    /// or growing it would buy fewer slots than it paid for.
+    #[test]
+    fn growth_reaches_every_slot_at_every_size() {
+        let mut len = SEND_CACHE_INITIAL_ENTRIES;
+        while len <= 4096 {
+            let reached: std::collections::HashSet<usize> =
+                (0..64u64 * len as u64).map(|k| slot_of(k * 8, len as u32)).collect();
+            assert_eq!(reached.len(), len, "len {len}");
+            len *= SEND_CACHE_GROWTH_FACTOR;
+        }
     }
 }
