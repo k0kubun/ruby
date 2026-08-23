@@ -703,6 +703,13 @@ pub fn set_mem_bytes(mem_bytes: usize) {
     unsafe { OPTIONS.as_mut().unwrap().mem_bytes = mem_bytes; }
 }
 
+/// Update --zjit-inline-budget for testing
+#[cfg(test)]
+pub fn set_inline_budget(inline_budget: InlineBudget) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().inline_budget = inline_budget; }
+}
+
 /// Enable --zjit-stats for testing
 #[cfg(test)]
 pub fn enable_zjit_stats() {
