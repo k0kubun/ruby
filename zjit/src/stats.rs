@@ -449,6 +449,20 @@ make_counters! {
     // compiled (yet, or any more, after an invalidation).
     send_megamorphic_direct_miss,
 
+    // symbol_block_mega_: the megamorphic tier of a `yield` to a Symbol block,
+    // which compiles the send the Symbol stands for and dispatches it through
+    // the class table rather than falling back to rb_vm_invokeblock(). See
+    // crate::hir::Function::push_symbol_block_mega.
+    //
+    // Sites compiled that way, counted once per compile.
+    symbol_block_mega_sites,
+    // Calls that reached the C helper rather than being answered by the inline
+    // probe: an immediate receiver, a table miss, or a target that is not a
+    // simple ISEQ method -- which every cfunc target is, and the attribute
+    // readers a Symbol block usually names are not. Counted next to
+    // send_megamorphic_direct, which counts the calls the probe did answer.
+    symbol_block_mega_indirect,
+
     // compile_error_: Compile error reasons
     compile_error_iseq_version_limit_reached,
     compile_error_iseq_stack_too_large,

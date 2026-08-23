@@ -122,6 +122,12 @@ unsafe extern "C" {
         ci: *const rb_callinfo,
     ) -> *const rb_callable_method_entry_t;
 
+    /// The packed `rb_callinfo` for a call shape ZJIT synthesized rather than read out of the
+    /// bytecode, or 0 when the shape does not fit in one. A packed callinfo is an immediate:
+    /// it needs no allocation and no GC root, which is what lets JIT code bake one in.
+    /// Defined in vm_insnhelper.c.
+    pub fn rb_zjit_packed_ci(mid: ID, flags: u32, argc: u32) -> VALUE;
+
     /// Map `size` bytes of read/write memory below `INT32_MAX`, or return NULL when
     /// the platform cannot. Used for the JITFrame arena; see [`crate::jit_frame`].
     /// Defined in jit.c.

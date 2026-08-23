@@ -11022,6 +11022,240 @@ fn test_megamorphic_direct_disabled_still_dispatches_correctly() {
     assert_snapshot!(result, @"435");
 }
 
+/// A Ruby-level iterator, so its `yield` really is the `invokeblock` instruction rather than
+/// `rb_yield()` -- only the former reaches `vm_invoke_symbol_block()`, whose semantics the
+/// Symbol block arm reproduces. `SYM_MEGA_SETUP` then hands it 60 unrelated receiver classes,
+/// which is more than any guard chain covers, so the arm's send has to be dispatched through
+/// the class table. See crate::hir::Function::push_symbol_block_mega.
+const SYM_MEGA_SETUP: &str = r#"
+    def each_of(a)
+      i = 0
+      out = []
+      while i < a.size
+        out << (yield a[i])
+        i += 1
+      end
+      out
+    end
+    SYM_KLASSES = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+    SYM_OBJS = SYM_KLASSES.map(&:new)
+    def sym_run(a) = each_of(a, &:value)
+    30.times { sym_run(SYM_OBJS) }
+"#;
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_every_class() {
+    // The baseline for the whole feature: a `yield` to `&:sym` over 60 receiver classes reaches
+    // each class's own method, and the dispatch happens inside JIT code rather than through
+    // rb_vm_invokeblock().
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(SYM_MEGA_SETUP);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    let result = inspect(r#"
+        k = Class.new; k.class_eval("def value; 99; end")
+        [sym_run(SYM_OBJS).sum, sym_run(SYM_OBJS + [k.new]).last]
+    "#);
+    let after = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    assert!(after > before,
+        "expected the Symbol block's send to be dispatched out of the class table");
+    assert_snapshot!(result, @"[1770, 99]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_passes_arguments() {
+    // The receiver is the first yielded value and the rest are the send's arguments, which is
+    // the layout the operand stack already has -- a wrong frame layout shows up as a wrong
+    // argument rather than a crash.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of2(a, x, y)
+          i = 0; out = []
+          while i < a.size
+            out << (yield a[i], x, y)
+            i += 1
+          end
+          out
+        end
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def add(a, b) = a + b + #{i}"); k }
+        objs = ks.map(&:new)
+        out = nil
+        30.times { out = each_of2(objs, 1, 20, &:add) }
+        [out.first, out.last, out.size]
+    "#), @"[21, 80, 60]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_rejects_private_and_protected() {
+    // `vm_call_symbol()` reaches public methods only. A private one is not callable because the
+    // `yield`'s call flags never carry VM_CALL_FCALL, and a protected one is rejected outright
+    // -- there is no caller-is-an-instance test the way an ordinary send has, so not even a
+    // receiver of the caller's own class may reach it.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        klass = Class.new do
+          def pub = :pub
+          private def priv = :priv
+          protected def prot = :prot
+          define_method(:from_inside) { |o, sym| each_of([o], &sym) }
+        end
+        def run(a, sym) = (each_of(a, &sym) rescue [$!.class, $!.message])
+        30.times { run([klass.new], :pub) }
+        30.times { run([klass.new], :priv) }
+        30.times { klass.new.from_inside(klass.new, :prot) rescue nil }
+        inside = (klass.new.from_inside(klass.new, :prot) rescue [$!.class, $!.message[0, 14]])
+        [run([klass.new], :pub), run([klass.new], :priv).first, run([klass.new], :prot).first, inside]
+    "#), @"[[:pub], NoMethodError, NoMethodError, [NoMethodError, \"protected meth\"]]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_method_missing() {
+    // A name no receiver defines is not something the table may answer: it has no method entry
+    // to validate, so the call goes to vm_call_symbol(), which builds the method_missing
+    // arguments the way the interpreter does.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        mm = Class.new { def method_missing(n, *a) = [:mm, n, a] }
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+        objs = ks.map(&:new) + [mm.new]
+        out = nil
+        30.times { out = each_of(objs, &:value) }
+        nome = (each_of([Object.new], &:value) rescue $!.class)
+        [out.size, out.last, nome]
+    "#), @"[61, [:mm, :value, []], NoMethodError]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_sees_a_method_redefined_mid_iteration() {
+    // Redefinition invalidates the method entry the table cached, which both the inline probe
+    // and the C helper reject before dispatching -- so the change lands on the very next
+    // element rather than at the next compile.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        REDEF = Class.new { def v = 1 }
+        def each_redef(a)
+          i = 0; out = []
+          while i < a.size
+            out << (yield a[i])
+            REDEF.class_eval("def v = 2") if i == 1
+            i += 1
+          end
+          out
+        end
+        objs = Array.new(4) { REDEF.new }
+        30.times { REDEF.class_eval("def v = 1"); each_redef(objs) { |o| o.v } }
+        REDEF.class_eval("def v = 1")
+        each_redef(objs, &:v)
+    "#), @"[1, 1, 2, 2]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_raises_after_the_method_is_undefined() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        UNDEFD = Class.new { def gone = :here }
+        o = UNDEFD.new
+        30.times { each_of([o, o], &:gone) }
+        before = each_of([o], &:gone)
+        UNDEFD.class_eval { undef_method :gone }
+        [before, (each_of([o], &:gone) rescue $!.class)]
+    "#), @"[[:here], NoMethodError]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_handles_immediate_receivers() {
+    // The inline probe leaves immediates and `false` to the C helper, because CLASS_OF() on one
+    // is a table lookup rather than a field load. They still have to reach the right method.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        out = nil
+        30.times { out = each_of([1, :sym, nil, true, false, 2.0, "s".freeze], &:inspect) }
+        out
+    "#), @r#"["1", ":sym", "nil", "true", "false", "2.0", "\"s\""]"#);
+}
+
+#[test]
+fn test_symbol_block_megamorphic_ignores_refinements() {
+    // A Symbol block never sees a refinement: vm_caller_setup_arg_block() turns `&:sym` written
+    // where one is active into an ifunc lambda instead of a Symbol handler, and
+    // vm_call_symbol() resolves against a nil cref. So the table, whose search does not consult
+    // a cref either, may only answer for a method entry that is not a refined one.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        module Ref
+          refine String do
+            def upcase = "REFINED"
+          end
+        end
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        def plain(a) = each_of(a, &:upcase)
+        eval("using Ref\ndef refined(a) = each_of(a, &:upcase)", TOPLEVEL_BINDING)
+        30.times { plain(["a"]); refined(["a"]) }
+        [plain(["a"]), refined(["a"]), plain(["a"])]
+    "#), @r#"[["A"], ["REFINED"], ["A"]]"#);
+}
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_correctly_under_gc_stress() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+        objs = ks.map(&:new)
+        30.times { each_of(objs, &:value) }
+        GC.stress = true
+        out = each_of(objs, &:value).sum + each_of([1, "a", :b], &:inspect).size
+        GC.stress = false
+        GC.compact
+        [out, each_of(objs, &:value).sum]
+    "#), @"[1773, 1770]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_disabled_falls_back_to_invokeblock() {
+    // --zjit-disable-symbol-block-mega has to leave the site working, since that is what an
+    // A/B measurement compares against.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_symbol_block_mega = true;
+    eval(SYM_MEGA_SETUP);
+    let before = crate::state::ZJITState::get_counters().symbol_block_mega_sites;
+    let result = inspect("sym_run(SYM_OBJS).sum");
+    let after = crate::state::ZJITState::get_counters().symbol_block_mega_sites;
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_symbol_block_mega = false;
+    assert_eq!(before, after, "the megamorphic Symbol block tier should be off");
+    assert_snapshot!(result, @"1770");
+}
+
 #[test]
 fn test_array_aref_out_of_bounds_reads_nil() {
     assert_snapshot!(inspect(r#"
