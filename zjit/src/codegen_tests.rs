@@ -13369,3 +13369,51 @@ fn test_narrowed_test_high_bits() {
          test(1.5), test(1.5e300), test(nil), test(false), test(true)]
     "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
 }
+
+#[test]
+fn test_side_exits_are_emitted_into_the_outlined_region() {
+    // Side exits belong in the outlined half of the code region, so that a
+    // function's body stays contiguous with the next function's. Compile a method
+    // with plenty of guards and check that the bytes landed on the cold side of
+    // the split without leaving a hole in the hot side.
+    set_call_threshold(2);
+    with_rubyvm(|| {
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(cb.has_outlined_region(), "ZJIT's code region should be split");
+        let inlined_before = cb.inlined_code_size();
+        let outlined_before = cb.outlined_code_size();
+
+        // Type guards on an untyped parameter give this a side exit per operation.
+        eval("
+            def guarded(a, b) = a + b + a * b - a
+            guarded(1, 2)
+            guarded(1, 2)
+        ");
+
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(cb.inlined_code_size() > inlined_before,
+            "the function body should have been written to the inlined half");
+        assert!(cb.outlined_code_size() > outlined_before,
+            "the side exits should have been written to the outlined half");
+
+        // The two halves are far enough apart that the exits cannot have been
+        // mistaken for inline code, and close enough for a rel32 branch.
+        let distance = cb.outlined_write_ptr().as_offset() - cb.get_write_ptr().as_offset();
+        assert!(distance > 0, "the outlined half should sit above the inlined half");
+        assert!(distance < i32::MAX as i64,
+            "hot-to-cold branches have to stay in rel32 range, got a gap of {distance}");
+    });
+}
+
+#[test]
+fn test_side_exit_still_reached_from_outlined_region() {
+    // Taking an exit that now lives megabytes away from the guard that jumps to it
+    // must still land the interpreter on the right frame.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def add(a, b) = a + b
+        add(1, 2)
+        add(1, 2)
+        [add(1, 2), add('x', 'y'), add(1.5, 2.5), add(1, 2)]
+    "), @r#"[3, "xy", 4.0, 3]"#);
+}

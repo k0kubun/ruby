@@ -1223,6 +1223,7 @@ fn lower_function(cb: &CodeBlock, iseq: IseqPtr, version: IseqVersionRef, functi
 /// Write a prepared function's machine code into `cb`. Registers patch points and
 /// bakes in object references, so it must run with the GVL held.
 fn emit_function(cb: &mut CodeBlock, iseq: IseqPtr, mut jit: JITState, asm: Assembler) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
+    let outlined_start_ptr = cb.outlined_write_ptr();
     let result = asm.emit_prepared(cb);
     #[cfg(feature = "disasm")]
     if let (Ok((start_ptr, _)), Some(dump_disasm)) = (&result, crate::options::get_option_ref!(dump_disasm)) {
@@ -1230,6 +1231,9 @@ fn emit_function(cb: &mut CodeBlock, iseq: IseqPtr, mut jit: JITState, asm: Asse
         // take the prepare()/emit_prepared() path in gen_function() and would otherwise
         // never be dumped.
         crate::disasm::dump_disasm_addr_range(cb, *start_ptr, cb.get_write_ptr(), dump_disasm);
+        // The body's side exits were emitted into the outlined half, which is a
+        // separate range of the region; dump it too, like Assembler::compile() does.
+        crate::disasm::dump_disasm_addr_range(cb, outlined_start_ptr, cb.outlined_write_ptr(), dump_disasm);
     }
     if let Ok((start_ptr, _)) = result {
         if get_option!(perf) == Some(PerfMap::ISEQ) {
@@ -1237,7 +1241,20 @@ fn emit_function(cb: &mut CodeBlock, iseq: IseqPtr, mut jit: JITState, asm: Asse
             let end_usize = cb.get_write_ptr().raw_addr(cb);
             let code_size = end_usize - start_usize;
             let iseq_name = iseq_get_location(iseq, 0);
-            register_with_perf(iseq_name, start_usize, code_size);
+            register_with_perf(iseq_name.clone(), start_usize, code_size);
+
+            // The function's side exits live in the outlined half, so they need
+            // their own perf map entry; a single range across both halves would
+            // claim the address space in between.
+            let outlined_start_usize = outlined_start_ptr.raw_addr(cb);
+            let outlined_end_usize = cb.outlined_write_ptr().raw_addr(cb);
+            if outlined_end_usize > outlined_start_usize {
+                register_with_perf(
+                    format!("{iseq_name} (exits)"),
+                    outlined_start_usize,
+                    outlined_end_usize - outlined_start_usize,
+                );
+            }
         }
         if ZJITState::should_log_compiled_iseqs() {
             let iseq_name = iseq_get_location(iseq, 0);
@@ -5864,7 +5881,14 @@ fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodeP
     asm.cpush(scratch_reg);
     asm.jmp(ZJITState::get_function_stub_hit_trampoline().into());
 
-    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+    // A stub runs at most once per call site -- the hit patches the call to go
+    // straight to the compiled callee -- so it is cold, and putting it between two
+    // functions' bodies would push them apart for nothing.
+    let was_outlined = cb.set_outlined(true);
+    let result = asm.compile(cb);
+    cb.set_outlined(was_outlined);
+
+    result.map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
         code_ptr
     })
