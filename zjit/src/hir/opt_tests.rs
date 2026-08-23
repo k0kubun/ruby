@@ -4698,10 +4698,10 @@ mod hir_opt_tests {
           v10:Fixnum[10] = Const Value(10)
           v12:CPtr = GetEP 0
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v14:CInt64[3] = Const CInt64(3)
-          v15:CInt64 = IntAnd v13, v14
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CInt64 = IntAnd v13, v15
           v17:CInt64[1] = Const CInt64(1)
-          v18:CBool = IsBitEqual v15, v17
+          v18:CBool = IsBitEqual v16, v17
           CondBranch v18, bb5(), bb6()
         bb5():
           v20:CInt64[-4] = Const CInt64(-4)
@@ -4723,11 +4723,24 @@ mod hir_opt_tests {
         bb10():
           Jump bb6()
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
-        bb4(v16:BasicObject):
+          v34:CPtr = GetEP 0
+          v35:CInt64 = LoadField v34, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v36:CInt64[3] = Const CInt64(3)
+          v37:CInt64 = IntAnd v35, v36
+          v39:CInt64[3] = Const CInt64(3)
+          v40:CBool = IsBitEqual v37, v39
+          CondBranch v40, bb13(), bb12()
+        bb13():
+          v42:BasicObject = InvokeBlockIfunc v35, v10
+          Jump bb11(v42)
+        bb12():
+          v44:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb11(v44)
+        bb11(v38:BasicObject):
+          Jump bb4(v38)
+        bb4(v14:BasicObject):
           CheckInterrupts
-          Return v16
+          Return v14
         ");
     }
 
@@ -4761,19 +4774,29 @@ mod hir_opt_tests {
         bb3(v6:BasicObject):
           v10:Fixnum[10] = Const Value(10)
           v12:CPtr = GetEP 0
-          v14:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v15:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
-          v16:CBool = IsBitEqual v14, v15
-          CondBranch v16, bb6(), bb5()
-        bb6():
-          v27:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: symbol block handler's send did not specialize
-          Jump bb4(v27)
-        bb5():
-          v20:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v14:CInt64[3] = Const CInt64(3)
+          v15:CInt64 = IntAnd v13, v14
+          v17:CInt64[3] = Const CInt64(3)
+          v18:CBool = IsBitEqual v15, v17
+          CondBranch v18, bb7(), bb6()
+        bb7():
+          v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb4(v13:BasicObject):
+        bb6():
+          v22:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v23:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
+          v24:CBool = IsBitEqual v22, v23
+          CondBranch v24, bb8(), bb5()
+        bb8():
+          v35:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: symbol block handler's send did not specialize
+          Jump bb4(v35)
+        bb5():
+          v28:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
+          Jump bb4(v28)
+        bb4(v16:BasicObject):
           CheckInterrupts
-          Return v13
+          Return v16
         ");
     }
 
@@ -4808,10 +4831,10 @@ mod hir_opt_tests {
           v10:Fixnum[10] = Const Value(10)
           v12:CPtr = GetEP 0
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v14:CInt64[3] = Const CInt64(3)
-          v15:CInt64 = IntAnd v13, v14
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CInt64 = IntAnd v13, v15
           v17:CInt64[1] = Const CInt64(1)
-          v18:CBool = IsBitEqual v15, v17
+          v18:CBool = IsBitEqual v16, v17
           CondBranch v18, bb5(), bb6()
         bb5():
           v20:CInt64[-4] = Const CInt64(-4)
@@ -4833,11 +4856,24 @@ mod hir_opt_tests {
         bb10():
           Jump bb6()
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
-        bb4(v16:BasicObject):
+          v34:CPtr = GetEP 0
+          v35:CInt64 = LoadField v34, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v36:CInt64[3] = Const CInt64(3)
+          v37:CInt64 = IntAnd v35, v36
+          v39:CInt64[3] = Const CInt64(3)
+          v40:CBool = IsBitEqual v37, v39
+          CondBranch v40, bb13(), bb12()
+        bb13():
+          v42:BasicObject = InvokeBlockIfunc v35, v10
+          Jump bb11(v42)
+        bb12():
+          v44:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb11(v44)
+        bb11(v38:BasicObject):
+          Jump bb4(v38)
+        bb4(v14:BasicObject):
           CheckInterrupts
-          Return v16
+          Return v14
         ");
     }
 
@@ -4877,22 +4913,27 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb7(), bb6()
+        bb7():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1011
           v23:CPtr[CPtr(0x1012)] = Const CPtr(0x1012)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
+          CondBranch v24, bb8(), bb6()
+        bb8():
           v26:BasicObject = InvokeBlockIseqDirect (0x1012), v21, v10
           Jump bb4(v26)
-        bb8():
-          Jump bb6()
         bb6():
-          v29:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v29)
+          v28:CInt64[3] = Const CInt64(3)
+          v29:CBool = IsBitEqual v15, v28
+          CondBranch v29, bb9(), bb5()
+        bb9():
+          v31:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v31)
+        bb5():
+          v33:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb4(v33)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -21136,33 +21177,33 @@ mod hir_opt_tests {
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v14:CInt64[3] = Const CInt64(3)
           v15:CInt64 = IntAnd v13, v14
-          v16:CInt64[3] = Const CInt64(3)
-          v17:CBool = IsBitEqual v15, v16
-          CondBranch v17, bb5(), bb6()
-        bb5():
+          v17:CInt64[3] = Const CInt64(3)
+          v18:CBool = IsBitEqual v15, v17
+          CondBranch v18, bb6(), bb5()
+        bb6():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb6():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+        bb5():
+          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
           Jump bb4(v22)
-        bb4(v18:BasicObject):
+        bb4(v16:BasicObject):
           v27:Fixnum[2] = Const Value(2)
           v29:CPtr = GetEP 0
           v30:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v31:CInt64[3] = Const CInt64(3)
           v32:CInt64 = IntAnd v30, v31
-          v33:CInt64[3] = Const CInt64(3)
-          v34:CBool = IsBitEqual v32, v33
-          CondBranch v34, bb8(), bb9()
-        bb8():
+          v34:CInt64[3] = Const CInt64(3)
+          v35:CBool = IsBitEqual v32, v34
+          CondBranch v35, bb9(), bb8()
+        bb9():
           v37:BasicObject = InvokeBlockIfunc v30, v27
           Jump bb7(v37)
-        bb9():
-          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
+        bb8():
+          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
           Jump bb7(v39)
-        bb7(v35:BasicObject):
+        bb7(v33:BasicObject):
           CheckInterrupts
-          Return v35
+          Return v33
         ");
     }
 
@@ -21188,7 +21229,7 @@ mod hir_opt_tests {
         bb3(v6:BasicObject):
           v10:Fixnum[1] = Const Value(1)
           v12:Fixnum[2] = Const Value(2)
-          v14:BasicObject = InvokeBlock v10, v12 # SendFallbackReason: InvokeBlock: not yet specialized
+          v14:BasicObject = InvokeBlock v10, v12 # SendFallbackReason: InvokeBlock: splat, keyword, or block argument
           CheckInterrupts
           Return v14
         ");
