@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn entry_roundtrip() {
-        for kind in [EntryKind::Direct, EntryKind::Extended, EntryKind::Nil, EntryKind::Uncacheable] {
+        for kind in [EntryKind::Direct, EntryKind::Extended, EntryKind::Nil, EntryKind::RClass, EntryKind::Uncacheable] {
             let entry = Entry { shape_id: 0x1234_5678, offset: 0x0abc, kind };
             assert_eq!(Entry::unpack(entry.pack()), entry);
         }
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(word & IVAR_CACHE_NOT_INLINE_MASK, 0);
         assert_ne!(word & IVAR_CACHE_NIL_BIT, 0);
 
-        for kind in [EntryKind::Extended, EntryKind::Uncacheable] {
+        for kind in [EntryKind::Extended, EntryKind::RClass, EntryKind::Uncacheable] {
             let entry = Entry { shape_id: 7, offset: 0x18, kind };
             assert_ne!((entry.pack() >> IVAR_CACHE_OFFSET_SHIFT) & IVAR_CACHE_NOT_INLINE_MASK, 0);
         }
