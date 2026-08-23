@@ -1829,19 +1829,6 @@ fn gen_getivar_generic(asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_
     }
 }
 
-/// Record the shape of a receiver that reached a frozen ivar dispatch's fallback path so the
-/// site can earn a recompile that specializes it. See [`crate::profile::rb_zjit_ivar_reprofile`].
-fn gen_ivar_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, state: &FrameState) {
-    asm_comment!(asm, "reprofile ivar shape");
-    gen_prepare_non_leaf_call(jit, asm, function, state);
-    use crate::profile::rb_zjit_ivar_reprofile;
-    asm_ccall!(asm, rb_zjit_ivar_reprofile,
-        Opnd::const_ptr(jit.version.as_ptr()),
-        Opnd::Value(VALUE::from(state.iseq)),
-        Opnd::UImm(state.insn_idx() as u64),
-        recv);
-}
-
 /// Emit the inline half of an ivar shape table lookup: hash the receiver's shape
 /// id into the table, load one entry, and on a hit produce the ivar's value with
 /// no call. Jumps to `miss` for anything else -- an immediate receiver, a shape
@@ -1915,6 +1902,46 @@ fn gen_ivar_cache_probe(
     let nil_slot = Opnd::const_ptr(std::ptr::addr_of!(IVAR_CACHE_NIL_SLOT) as *const u8);
     let load_from = asm.csel_nz(nil_slot, ivar_ptr);
     asm.load(Opnd::mem(VALUE_BITS, load_from, 0))
+}
+
+/// Record the shape of a receiver that reached a frozen ivar dispatch's fallback path so the
+/// site can earn a recompile that specializes it. See [`crate::profile::rb_zjit_ivar_reprofile`].
+fn gen_ivar_reprofile(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, state: &FrameState) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let sample_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let sample_edge = || Target::Block(Box::new(lir::BranchEdge { target: sample_block, args: vec![] }));
+    let join_edge = || Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+
+    // A version that has spent its sampling budget answers every call with the same two loads and
+    // a return, and a shape-polymorphic site keeps reaching here for the rest of the process: on
+    // lobsters this is one of the most-called C functions in the whole run, and all but a few
+    // percent of those calls are the give-up path. Test the budget inline instead. The window
+    // count only ever decreases, so a stale read costs at most one extra call.
+    asm_comment!(asm, "skip reprofiling once the version has spent its windows");
+    let version = asm.load(Opnd::const_ptr(jit.version.as_ptr() as *const u8));
+    let windows = Opnd::mem(8, version, std::mem::offset_of!(crate::payload::IseqVersion, ivar_reprofile_windows) as i32);
+    asm.cmp(windows, Opnd::UImm(0));
+    asm.jne(jit, sample_edge());
+    asm.jmp(join_edge());
+
+    asm.set_current_block(sample_block);
+    let label = jit.get_label(asm, sample_block, hir_block_id);
+    asm.write_label(label);
+    asm_comment!(asm, "reprofile ivar shape");
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    use crate::profile::rb_zjit_ivar_reprofile;
+    asm_ccall!(asm, rb_zjit_ivar_reprofile,
+        Opnd::const_ptr(jit.version.as_ptr()),
+        Opnd::Value(VALUE::from(state.iseq)),
+        Opnd::UImm(state.insn_idx() as u64),
+        recv);
+    asm.jmp(join_edge());
+
+    asm.set_current_block(join_block);
+    let label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(label);
 }
 
 /// Emit an instance variable store with no compile-time shape information.
