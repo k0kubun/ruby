@@ -1073,7 +1073,6 @@ impl IseqProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cruby::*;
 
     /// ZJIT retains one of these per profiled operand of every profiled instruction, and
     /// most stay monomorphic for the life of the process, so their size is the single

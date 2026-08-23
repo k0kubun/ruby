@@ -13950,7 +13950,7 @@ mod union_find_tests {
 
     #[test]
     fn test_find_returns_self() {
-        let mut uf = UnionFind::new();
+        let uf = UnionFind::new();
         assert_eq!(uf.find(3usize), 3);
     }
 
@@ -13963,7 +13963,7 @@ mod union_find_tests {
 
     #[test]
     fn test_find_with_unknown_element_returns_self() {
-        let mut uf = UnionFind::new();
+        let uf = UnionFind::new();
         assert_eq!(uf.find(10usize), 10);
     }
 
