@@ -1388,6 +1388,7 @@ fn gen_insn(cb: &CodeBlock, jit: &mut JITState, asm: &mut Assembler, function: &
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, function.frame_state_ref(*state), unsafe { &**bf }, *leaf, opnds!(args)),
         Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), function.frame_state_ref(*state)),
         Insn::InvokeBlockIseqDynamic { cd, captured, args, state, reason } => gen_invoke_block_iseq_dynamic(jit, asm, function, *cd, opnd!(captured), opnds!(args), function.frame_state_ref(*state), *reason),
+        &Insn::SendSymbolBlockMega { symbol, mid, ci, state, .. } => gen_send_symbol_block_mega(jit, asm, function, symbol, mid, ci, function.frame_state_ref(state)),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, function, jit_entry_idx)),
         &Insn::Return { val, pop_inlined_frames } => no_output!(gen_return(asm, opnd!(val), pop_inlined_frames)),
         Insn::FixnumAdd { left, right, state } => gen_fixnum_add(jit, asm, function, opnd!(left), opnd!(right), function.frame_state_ref(*state)),
@@ -2789,21 +2790,13 @@ fn gen_send_without_block(
     // A site that dispatches over many classes resolves its target out of a
     // class table instead of thrashing cd->cc. See [`crate::send_cache`].
     if let Some(cache) = crate::send_cache::cache_for(cd, reason) {
+        let site = MegaSendSite::CallData(cd);
         // When the shape allows it, probe that table inline and call the callee
         // without leaving JIT code at all.
         if unsafe { (*cache).direct_ok() } && !get_option!(disable_megamorphic_direct) {
-            return gen_send_megamorphic_direct(jit, asm, function, cd, cache, state);
+            return gen_send_megamorphic_direct(jit, asm, function, site, cache, state);
         }
-        gen_prepare_fallback_call(jit, asm, function, state);
-        asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
-        unsafe extern "C" {
-            fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
-        }
-        return asm_ccall!(
-            asm,
-            rb_zjit_send_cached_without_block,
-            EC, CFP, Opnd::const_ptr(cd), Opnd::const_ptr(cache as *const u8)
-        );
+        return gen_send_cached_call(jit, asm, function, site, cache, state);
     }
 
     gen_prepare_fallback_call(jit, asm, function, state);
@@ -2817,6 +2810,116 @@ fn gen_send_without_block(
         rb_vm_opt_send_without_block,
         EC, CFP, Opnd::const_ptr(cd)
     )
+}
+
+/// The call whose target [`gen_send_megamorphic_direct`] resolves out of the class table, and
+/// which the C helper below re-runs when the inline probe does not answer.
+///
+/// The two differ only in where the call shape comes from and what "run this the long way"
+/// means. An ordinary send site has call data in the bytecode, and the interpreter can be
+/// handed it as-is. A `yield` to a Symbol block has none: the `yield`'s own call data names no
+/// method and counts the receiver among its arguments, so the shape is carried as a packed
+/// callinfo, and the long way round is `vm_call_symbol()` -- not the generic send path, whose
+/// visibility and refinement rules for the same name are not the same ones.
+#[derive(Clone, Copy)]
+enum MegaSendSite {
+    /// An ordinary call site, dispatched by `rb_zjit_send_cached_without_block()`.
+    CallData(*const rb_call_data),
+    /// The send a `yield` to a Symbol block stands for, dispatched by
+    /// `rb_zjit_symbol_block_send_cached()`. `symbol` is the handler the arm's comparison has
+    /// already matched, `ci` the packed callinfo naming its method.
+    SymbolBlock { symbol: VALUE, mid: ID, ci: VALUE },
+}
+
+impl MegaSendSite {
+    /// Arguments on the operand stack above the receiver.
+    fn argc(&self) -> u32 {
+        match *self {
+            MegaSendSite::CallData(cd) => unsafe { vm_ci_argc((*cd).ci) },
+            MegaSendSite::SymbolBlock { ci, .. } => unsafe { vm_ci_argc(ci.as_ptr()) },
+        }
+    }
+
+    /// The method being called, for disassembly comments.
+    fn method_name(&self) -> String {
+        match *self {
+            MegaSendSite::CallData(cd) => ruby_call_method_name(cd),
+            MegaSendSite::SymbolBlock { mid, .. } => mid.contents_lossy().to_string(),
+        }
+    }
+}
+
+/// Dispatch a megamorphic send through its class table from C: the probe the inline path makes,
+/// and then the call, in the helper that owns both. This is where a site whose call shape rules
+/// out the inline path goes, and where the inline path itself goes when its probe misses.
+fn gen_send_cached_call(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    site: MegaSendSite,
+    cache: *const crate::send_cache::SendCache,
+    state: &FrameState,
+) -> lir::Opnd {
+    gen_prepare_fallback_call(jit, asm, function, state);
+    asm_comment!(asm, "call #{} with cached dynamic dispatch", site.method_name());
+    match site {
+        MegaSendSite::CallData(cd) => {
+            unsafe extern "C" {
+                fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
+            }
+            asm_ccall!(
+                asm,
+                rb_zjit_send_cached_without_block,
+                EC, CFP, Opnd::const_ptr(cd), Opnd::const_ptr(cache as *const u8)
+            )
+        }
+        MegaSendSite::SymbolBlock { symbol, ci, .. } => {
+            gen_incr_counter(asm, Counter::symbol_block_mega_indirect);
+            unsafe extern "C" {
+                fn rb_zjit_symbol_block_send_cached(ec: EcPtr, cfp: CfpPtr, symbol: VALUE, ci: VALUE, cache: *const u8) -> VALUE;
+            }
+            asm_ccall!(
+                asm,
+                rb_zjit_symbol_block_send_cached,
+                EC, CFP, Opnd::Value(symbol), Opnd::Value(ci), Opnd::const_ptr(cache as *const u8)
+            )
+        }
+    }
+}
+
+/// Compile the send a `yield` to a Symbol block stands for, at a site whose receiver classes
+/// the profile could not pin down. See [`Insn::SendSymbolBlockMega`].
+///
+/// The Symbol comparison that got here is already emitted, and the operand stack already holds
+/// the send's receiver under its arguments -- `vm_invoke_symbol_block()` takes the first
+/// `yield`ed value as the receiver, which is the layout a send wants anyway. So all that is
+/// left is the dispatch, and that is the ordinary megamorphic one: probe the class table for
+/// the receiver's class, and on a hit that names a callee JIT code can enter, call it.
+///
+/// The table is shared with every other site of the same `(method, argc, flags)` shape,
+/// `recv.foo(x)` sites in compiled code included, which is what makes this worth doing at a
+/// site with no receiver class at all: the entries are already warm.
+fn gen_send_symbol_block_mega(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    symbol: VALUE,
+    mid: ID,
+    ci: VALUE,
+    state: &FrameState,
+) -> lir::Opnd {
+    let argc = unsafe { vm_ci_argc(ci.as_ptr()) };
+    let flags = unsafe { vm_ci_flag(ci.as_ptr()) };
+    let key = crate::send_cache::SendCacheKey { mid, argc, flags };
+    let site = MegaSendSite::SymbolBlock { symbol, mid, ci };
+    // HIR only builds this instruction for a shape a table serves, so the lookup cannot fail;
+    // it allocates the table on first use rather than at HIR time, which runs more than once.
+    let cache = crate::send_cache::cache_for_shape(key)
+        .expect("SendSymbolBlockMega built for a shape the send cache refuses");
+    if unsafe { (*cache).direct_ok() } && !get_option!(disable_megamorphic_direct) {
+        return gen_send_megamorphic_direct(jit, asm, function, site, cache, state);
+    }
+    gen_send_cached_call(jit, asm, function, site, cache, state)
 }
 
 /// Compile a megamorphic send that resolves its callee out of the class table
@@ -2872,14 +2975,14 @@ fn gen_send_megamorphic_direct(
     jit: &mut JITState,
     asm: &mut Assembler,
     function: &Function,
-    cd: *const rb_call_data,
+    site: MegaSendSite,
     cache: *const crate::send_cache::SendCache,
     state: &FrameState,
 ) -> lir::Opnd {
     use crate::send_cache::{SEND_CACHE_HASH_MULT, SendCacheLayout};
 
     let layout = SendCacheLayout::get();
-    let argc = unsafe { vm_ci_argc((*cd).ci) }.to_usize();
+    let argc = site.argc().to_usize();
     // The receiver sits under its arguments on the operand stack.
     let recv = jit.get_opnd(*state.stack().nth_back(argc).expect("send has recv below its args"));
 
@@ -2890,7 +2993,7 @@ fn gen_send_megamorphic_direct(
     let slow_edge = || Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
     let result_edge = |val: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
 
-    asm_comment!(asm, "megamorphic table probe for #{}", ruby_call_method_name(cd));
+    asm_comment!(asm, "megamorphic table probe for #{}", site.method_name());
 
     // CLASS_OF() on an immediate is a table lookup rather than a field load, and
     // a megamorphic Rails-style site dispatches over heap objects, so leave
@@ -2965,7 +3068,7 @@ fn gen_send_megamorphic_direct(
     // function holds callees to, in place of the callee's own `stack_max`;
     // checking for more stack than the callee needs can only side-exit a call
     // that would have fit, never let one through that would not.
-    asm_comment!(asm, "call #{} directly out of the table", ruby_call_method_name(cd));
+    asm_comment!(asm, "call #{} directly out of the table", site.method_name());
     let stack_growth = state.stack_size() + argc + layout.direct_max_stack;
     gen_stack_overflow_check(jit, asm, function, state, stack_growth);
 
@@ -3057,16 +3160,7 @@ fn gen_send_megamorphic_direct(
     let label = jit.get_label(asm, slow_block, hir_block_id);
     asm.write_label(label);
     gen_incr_counter(asm, Counter::send_megamorphic_direct_miss);
-    gen_prepare_fallback_call(jit, asm, function, state);
-    asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
-    unsafe extern "C" {
-        fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
-    }
-    let ret = asm_ccall!(
-        asm,
-        rb_zjit_send_cached_without_block,
-        EC, CFP, Opnd::const_ptr(cd), Opnd::const_ptr(cache as *const u8)
-    );
+    let ret = gen_send_cached_call(jit, asm, function, site, cache, state);
     asm.jmp(result_edge(ret));
 
     asm.set_current_block(result_block);
