@@ -1688,11 +1688,15 @@ fn gen_send_without_block(
     gen_incr_send_fallback_counter(asm, reason);
     gen_trace_send_fallback(asm, &reason);
 
-    gen_prepare_fallback_call(jit, asm, function, state);
-
     // A site that dispatches over many classes resolves its target out of a
     // class table instead of thrashing cd->cc. See [`crate::send_cache`].
     if let Some(cache) = crate::send_cache::cache_for(cd, reason) {
+        // When the shape allows it, probe that table inline and call the callee
+        // without leaving JIT code at all.
+        if unsafe { (*cache).direct_ok() } && !get_option!(disable_megamorphic_direct) {
+            return gen_send_megamorphic_direct(jit, asm, function, cd, cache, state);
+        }
+        gen_prepare_fallback_call(jit, asm, function, state);
         asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
         unsafe extern "C" {
             fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
@@ -1704,6 +1708,8 @@ fn gen_send_without_block(
         );
     }
 
+    gen_prepare_fallback_call(jit, asm, function, state);
+
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_opt_send_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE) -> VALUE;
@@ -1713,6 +1719,252 @@ fn gen_send_without_block(
         rb_vm_opt_send_without_block,
         EC, CFP, Opnd::const_ptr(cd)
     )
+}
+
+/// Compile a megamorphic send that resolves its callee out of the class table
+/// and, when that callee is an ISEQ method simple enough to enter directly,
+/// calls its compiled code without leaving JIT code.
+///
+/// # What this replaces
+///
+/// [`crate::send_cache`] made the *lookup* at a megamorphic site cheap, but the
+/// call itself still went out through `rb_zjit_send_cached_without_block()`,
+/// `vm_call_iseq_setup()`, `vm_push_frame()` and `vm_exec()` -- a C call, a
+/// generic argument setup, an interpreter frame push, a `setjmp`, and a trip
+/// through `jit_exec()` and the entry trampoline -- only to arrive at the
+/// callee's JIT code. On lobsters that is the shape of 45% of all megamorphic
+/// sends: an ISEQ method with fixed arity, no locals beyond its parameters and
+/// already-compiled code.
+///
+/// So this emits the probe [`gen_ivar_cache_probe`] emits for ivars, and on a
+/// hit does what [`gen_send_iseq_direct`] does for a statically known callee:
+/// push the frame here and call. The one difference from `gen_send_iseq_direct`
+/// is *which* entry point it calls. A JIT-to-JIT entry takes its arguments in C
+/// registers, and its address only exists inside the compiler's patching
+/// machinery, so it is not reachable from a run-time-resolved callee. The
+/// *interpreter* entry, `ISEQ_BODY(iseq)->jit_entry`, reads its parameters back
+/// out of the frame -- which is exactly where a simple callee's arguments
+/// already are, since its local table is its parameter list and the caller's
+/// operand stack already holds them in order. So the frame push is the whole
+/// calling convention, and the entry address is a field on the ISEQ.
+///
+/// # Why a stale entry cannot be wrong
+///
+/// Everything the fast path trusts, it re-derives per call:
+///
+/// * The callcache validates itself against `CLASS_OF(recv)` and
+///   `METHOD_ENTRY_INVALIDATED()`, the same two checks `vm_cc_hit_p()` makes and
+///   the same two `zjit_send_cache_search()` makes in C. Redefinition, `undef`,
+///   aliasing, visibility changes, `include`/`prepend` and refinements all run
+///   `rb_clear_method_cache()` -> `vm_cme_invalidate()`, and object death sets
+///   `cc->klass = Qundef`, which the class compare rejects before the method
+///   entry is read.
+/// * The slot's `direct_cme` is compared against the method entry that
+///   callcache just produced, so a slot half-written by another ractor reads as
+///   a miss instead of dispatching to the wrong method.
+/// * `body->jit_entry` is loaded fresh on every call. `rb_iseq_reset_jit_func()`
+///   clears it whenever the compiled code stops being valid -- a TracePoint
+///   being enabled, a patch point firing, a recompile -- so a null there sends
+///   the call down the slow path, which is the ordinary interpreter dispatch.
+///
+/// There is nothing durable to invalidate, and so no patch point and no
+/// [`crate::invariants`] entry: this path holds no compile-time assumption about
+/// the callee beyond what it re-checks.
+fn gen_send_megamorphic_direct(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    cd: *const rb_call_data,
+    cache: *const crate::send_cache::SendCache,
+    state: &FrameState,
+) -> lir::Opnd {
+    use crate::send_cache::{SEND_CACHE_HASH_MULT, SendCacheLayout};
+
+    let layout = SendCacheLayout::get();
+    let argc = unsafe { vm_ci_argc((*cd).ci) }.to_usize();
+    // The receiver sits under its arguments on the operand stack.
+    let recv = jit.get_opnd(*state.stack().nth_back(argc).expect("send has recv below its args"));
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_edge = || Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = |val: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+
+    asm_comment!(asm, "megamorphic table probe for #{}", ruby_call_method_name(cd));
+
+    // CLASS_OF() on an immediate is a table lookup rather than a field load, and
+    // a megamorphic Rails-style site dispatches over heap objects, so leave
+    // immediates and `false` to the helper.
+    let recv_reg = asm.load(recv);
+    asm.test(recv_reg, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
+    asm.jnz(jit, slow_edge());
+    asm.cmp(recv_reg, Opnd::Value(Qfalse));
+    asm.je(jit, slow_edge());
+
+    // Two loads of the same word: `Assembler::mul` is destructive, so the
+    // multiplicand's register is gone afterwards and the compare below needs its
+    // own copy. See the same dance in gen_ivar_cache_probe().
+    let klass_to_hash = asm.load(Opnd::mem(64, recv_reg, RUBY_OFFSET_RBASIC_KLASS));
+    let klass = asm.load(Opnd::mem(64, recv_reg, RUBY_OFFSET_RBASIC_KLASS));
+
+    // Fibonacci hash, taking the slot index out of the product's high bits. This
+    // has to agree with `zjit_send_cache_slot()` in vm_insnhelper.c and
+    // `SendCache::slot_of`, or the probe would read slots the helper never fills.
+    let entry_size = layout.entry_size;
+    assert!(entry_size.is_power_of_two(), "send cache entry size must be a power of two");
+    let hash = asm.mul(klass_to_hash, Opnd::UImm(SEND_CACHE_HASH_MULT));
+    let index = asm.urshift(hash, Opnd::UImm(unsafe { (*cache).shift() } as u64));
+    let byte_offset = asm.lshift(index, Opnd::UImm(entry_size.trailing_zeros() as u64));
+    let slot = asm.add(byte_offset, Opnd::const_ptr(unsafe { (*cache).slots_ptr() }));
+
+    asm_comment!(asm, "check the cached callcache against the receiver's class");
+    let cc = asm.load(Opnd::mem(64, slot, 0));
+    asm.cmp(cc, 0.into());
+    asm.je(jit, slow_edge());
+    asm.cmp(Opnd::mem(64, cc, layout.cc_klass), klass);
+    asm.jne(jit, slow_edge());
+
+    asm_comment!(asm, "check the method entry has not been invalidated");
+    let cme = asm.load(Opnd::mem(64, cc, layout.cc_cme));
+    // RBasic::flags is at offset 0 of a method entry.
+    let cme_flags = asm.load(Opnd::mem(64, cme, 0));
+    asm.test(cme_flags, Opnd::UImm(layout.cme_invalidated_flag));
+    asm.jnz(jit, slow_edge());
+
+    asm_comment!(asm, "check the target is one we can call directly");
+    let direct_cme = asm.load(Opnd::mem(64, slot, layout.entry_direct_cme));
+    asm.cmp(direct_cme, cme);
+    asm.jne(jit, slow_edge());
+
+    asm_comment!(asm, "load the callee's compiled entry point");
+    let def = asm.load(Opnd::mem(64, cme, layout.cme_def));
+    let iseq = asm.load(Opnd::mem(64, def, layout.def_iseqptr));
+    let body = asm.load(Opnd::mem(64, iseq, layout.iseq_body));
+    let entry = asm.load(Opnd::mem(64, body, layout.body_jit_entry));
+    asm.cmp(entry, 0.into());
+    asm.je(jit, slow_edge());
+
+    gen_incr_counter(asm, Counter::send_megamorphic_direct);
+
+    // The frame layout below is gen_send_iseq_direct()'s, specialized to the
+    // callee shape zjit_send_cache_direct_cme() accepts: `local_size == argc`,
+    // so every offset is a compile-time constant even though the callee is not.
+    // The stack overflow check uses ZJIT_MEGA_DIRECT_MAX_STACK, the bound that
+    // function holds callees to, in place of the callee's own `stack_max`;
+    // checking for more stack than the callee needs can only side-exit a call
+    // that would have fit, never let one through that would not.
+    asm_comment!(asm, "call #{} directly out of the table", ruby_call_method_name(cd));
+    let stack_growth = state.stack_size() + argc + layout.direct_max_stack;
+    gen_stack_overflow_check(jit, asm, function, state, stack_growth);
+
+    // Publish the caller frame before the arguments become the callee's locals.
+    // Unlike gen_send_iseq_direct(), which hands the arguments over in registers
+    // and leaves the caller's operand stack to a stack map, the callee reads its
+    // parameters out of the frame, so the stack has to be spilled: hence a
+    // zero-entry JITFrame and a full spill, the same shape
+    // gen_prepare_fallback_call() uses.
+    let stack_size = state.stack_size() - argc - 1; // -1 for the receiver
+    gen_write_jit_frame(asm, state, 0);
+    gen_save_sp(asm, stack_size);
+    gen_spill_locals(jit, asm, state);
+    gen_spill_stack(jit, asm, function, state);
+
+    // vm_push_frame(), for a callee whose local table is exactly its parameters:
+    // the arguments spilled above already are the local area, so `ep` lands
+    // VM_ENV_DATA_SIZE words above the last one.
+    let ep_offset = state.stack_size() as i32 + VM_ENV_DATA_SIZE as i32 - 1;
+    asm_comment!(asm, "push cme, specval, frame type");
+    asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), cme);
+    asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), VM_BLOCK_HANDLER_NONE.into());
+    asm.store(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32), (VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL).into());
+
+    asm_comment!(asm, "push callee control frame");
+    let cfp_opnd = |offset: i32| Opnd::mem(64, CFP, offset - (RUBY_SIZEOF_CONTROL_FRAME as i32));
+    // gen_push_frame() can skip this for callees it knows never read block_code;
+    // the callee is not known here, so always clear it.
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SELF), recv);
+    let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+
+    asm_comment!(asm, "switch to new SP register");
+    let sp_offset = (state.stack_size() + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
+    let new_sp = asm.add(SP, sp_offset.into());
+    asm.mov(SP, new_sp);
+
+    asm_comment!(asm, "switch to new CFP");
+    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, new_cfp); // published at `ec->cfp` by the callee's entry point
+
+    let ret = asm.ccall(ZJITState::get_jit_entry_call_trampoline(), vec![entry]);
+
+    asm_comment!(asm, "handle a Qundef return");
+    let entered_block = asm.new_block(hir_block_id, false, rpo_idx);
+    asm.cmp(ret, Qundef.into());
+    asm.jne(jit, Target::Block(Box::new(lir::BranchEdge { target: entered_block, args: vec![] })));
+
+    // Qundef has two meanings here, and they need opposite handling.
+    //
+    // Normally it is a side exit from inside the callee: its entry point
+    // published `ec->cfp` before running a single instruction, and the exit
+    // materialized every JIT frame, so the interpreter is ready to resume in the
+    // callee and all this frame has to do is propagate the Qundef outwards.
+    //
+    // But `body->jit_entry` is not always real compiled code. When an ISEQ fails
+    // to compile under `--zjit-stats`, `finish_entry_point()` installs a stub
+    // that counts the failure and returns Qundef without entering the frame at
+    // all -- `jit_exec()`'s contract, where the interpreter had already pushed
+    // and published the frame. The frame pushed above is *not* published, so
+    // exiting here would strand it. `ec->cfp` tells the two apart: the callee
+    // frame and anything the callee pushed are below the CFP register, while an
+    // unpublished frame leaves `ec->cfp` at the caller, above it.
+    asm_comment!(asm, "did the callee's entry point publish its frame?");
+    asm.cmp(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    asm.jbe(jit, ZJITState::get_exit_trampoline().into());
+
+    // It did not run, so nothing observed the frame: drop it and make the call
+    // the ordinary way, which pushes an interpreter frame the stub can bail out
+    // of. Only the SP and CFP registers moved; the JITFrame and the spilled
+    // stack the slow path wants are already exactly what it would write.
+    asm_comment!(asm, "callee never ran: undo the frame push and dispatch through the VM");
+    let unpushed_sp = asm.sub(SP, sp_offset.into());
+    asm.mov(SP, unpushed_sp);
+    let unpushed_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, unpushed_cfp);
+    asm.jmp(slow_edge());
+
+    asm.set_current_block(entered_block);
+    let label = jit.get_label(asm, entered_block, hir_block_id);
+    asm.write_label(label);
+    asm_comment!(asm, "restore SP register for the caller");
+    let restored_sp = asm.sub(SP, sp_offset.into());
+    asm.mov(SP, restored_sp);
+    asm.jmp(result_edge(ret));
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    gen_incr_counter(asm, Counter::send_megamorphic_direct_miss);
+    gen_prepare_fallback_call(jit, asm, function, state);
+    asm_comment!(asm, "call #{} with cached dynamic dispatch", ruby_call_method_name(cd));
+    unsafe extern "C" {
+        fn rb_zjit_send_cached_without_block(ec: EcPtr, cfp: CfpPtr, cd: VALUE, cache: *const u8) -> VALUE;
+    }
+    let ret = asm_ccall!(
+        asm,
+        rb_zjit_send_cached_without_block,
+        EC, CFP, Opnd::const_ptr(cd), Opnd::const_ptr(cache as *const u8)
+    );
+    asm.jmp(result_edge(ret));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 /// Push an interpreter frame for an inlined callee. This is the same as the frame push
@@ -4205,6 +4457,29 @@ pub fn gen_function_stub_hit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, C
 }
 
 /// Generate a trampoline that is used when a function exits without restoring PC and the stack
+/// Compile a trampoline that jumps to the callee entry point in the first C
+/// argument register.
+///
+/// [`gen_send_megamorphic_direct`] resolves its callee at run time, so it has
+/// the entry address in a value rather than as a link-time constant, and the
+/// backend can only `call` a constant or a fixed register. Passing the address
+/// as an ordinary C argument and tail-jumping to it here keeps the register
+/// allocator out of it: the `jmp` leaves the return address the caller's `call`
+/// pushed untouched (and, on arm64, leaves `lr` alone), so the callee returns
+/// straight past this trampoline to the send site.
+pub fn gen_jit_entry_call_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
+    let mut asm = Assembler::new();
+    asm.new_block_without_id("jit_entry_call_trampoline");
+    asm_comment!(asm, "tail-jump to the callee entry point");
+    asm.jmp_opnd(C_ARG_OPNDS[0]);
+
+    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+        assert_eq!(gc_offsets.len(), 0);
+        register_current_code_range_with_perf(cb, "jit entry call trampoline", code_ptr);
+        code_ptr
+    })
+}
+
 pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
     let mut asm = Assembler::new();
     asm.new_block_without_id("exit_trampoline");

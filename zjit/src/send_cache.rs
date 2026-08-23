@@ -43,6 +43,29 @@
 //! untouched, which is why this is safe to turn on for every megamorphic site
 //! and why it composes with the guard chain rather than replacing it.
 //!
+//! # Dispatching a hit without leaving JIT code
+//!
+//! Finding the target cheaply still left the *call* expensive: a C call, a
+//! generic argument setup in `vm_call_iseq_setup()`, an interpreter frame push,
+//! the `setjmp` in `vm_exec()`, and a trip through `jit_exec()` and the entry
+//! trampoline -- all to arrive at code ZJIT had already compiled. On lobsters
+//! 45% of megamorphic sends resolve to an ISEQ method with fixed arity, no
+//! locals beyond its parameters and compiled code waiting for it.
+//!
+//! For those, [`crate::codegen::gen_send_megamorphic_direct`] does the probe
+//! inline and calls the callee itself. Each slot therefore carries a second
+//! word, the method entry the target resolves to *when the target is one of
+//! those* (`zjit_send_cache_direct_cme()` in `vm_insnhelper.c` decides), and JIT
+//! code checks that word against the method entry it read out of the callcache
+//! before trusting it. That check is what keeps the two-word slot as safe as the
+//! one-word slot was: a reader that catches a fill half-done sees a mismatched
+//! pair and searches, so neither word needs a barrier or an atomic.
+//!
+//! The compiled entry point itself is never cached. JIT code loads
+//! `ISEQ_BODY(iseq)->jit_entry` on every call, which `rb_iseq_reset_jit_func()`
+//! clears whenever that code stops being valid, so an invalidated callee reads
+//! as a null and takes the slow path.
+//!
 //! # What the table is keyed on, and why that is enough
 //!
 //! The table memoizes `vm_lookup_cc(klass, ci)`. That function's answer depends
@@ -139,7 +162,7 @@ use crate::state::ZJITState;
 /// which is where the index is taken from.
 pub const SEND_CACHE_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// Default of `--zjit-send-cache-entries`, i.e. 4KiB per call shape.
+/// Default of `--zjit-send-cache-entries`, i.e. 8KiB per call shape.
 ///
 /// A direct-mapped table smaller than a site's class working set thrashes rather
 /// than degrading smoothly: under a cyclic access pattern every slot holding two
@@ -153,7 +176,7 @@ pub const SEND_CACHE_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// |   512 | 100% / 100% | 100% /  96% |  57% /  94% |
 /// |  1024 | 100% / 100% | 100% / 100% |  87% /  97% |
 ///
-/// 512 is where a few hundred classes stop colliding without spending 8KiB a
+/// 512 is where a few hundred classes stop colliding without spending 16KiB a
 /// shape. Note this is a softer decision than the ivar table's: a miss here runs
 /// exactly the search the site ran before the table existed, so the probe pays
 /// for itself from a hit rate of a few percent up. Undersizing costs the win,
@@ -175,9 +198,23 @@ pub struct SendCacheKey {
     pub flags: u32,
 }
 
+/// One slot: the two words `struct rb_zjit_send_cache_entry` in `zjit.h`
+/// declares. Rust only ever reads word 0 (the callcache, which is the only one
+/// the GC has to hear about); word 1 is written and validated in C and in JIT
+/// code. Keep the two declarations in step.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SendCacheEntry {
+    /// The cached callcache as a raw word, 0 when the slot is empty.
+    cc: usize,
+    /// `vm_cc_cme(cc)` when the target is directly callable from JIT code, 0
+    /// otherwise. Never dereferenced from Rust.
+    direct_cme: usize,
+}
+
 /// One class table, shared by every compiled site with the same call shape.
 ///
-/// The first four fields are read by `vm_insnhelper.c` through
+/// The first seven fields are read by `vm_insnhelper.c` through
 /// `struct rb_zjit_send_cache` in `zjit.h`; keep the two declarations in step.
 #[repr(C)]
 pub struct SendCache {
@@ -188,15 +225,24 @@ pub struct SendCache {
     shift: u32,
     /// Address of slot 0. Points into `storage`, which is never reallocated
     /// because the C helper holds this pointer directly.
-    slots: *mut usize,
+    slots: *mut SendCacheEntry,
     /// `counter_ptr(send_cache_hit)` under `--zjit-stats`, null otherwise. The
     /// C helper uses it both as the counter and as the flag that says whether to
     /// call [`rb_zjit_send_cache_record_miss`] at all, so that a build without
     /// stats pays one never-taken branch per send rather than a call per miss.
     hit_counter: *mut u64,
+    /// `argc` of the call shape, for the arity test the C fill path runs before
+    /// it marks a target directly callable.
+    direct_argc: u32,
+    /// 1 when this call shape may use the inline direct-dispatch path at all,
+    /// 0 when the shape rules it out. See [`shape_allows_direct`].
+    direct_ok: u32,
+    /// The call shape's `vm_ci_flag()`, which the C fill path consults for the
+    /// visibility test.
+    direct_flags: u32,
 
-    /// Backing store for `slots`: one callcache pointer per slot, 0 for empty.
-    storage: Box<[usize]>,
+    /// Backing store for `slots`, all-zero for empty.
+    storage: Box<[SendCacheEntry]>,
     /// The call shape this table is for. Only read by debug output.
     key: SendCacheKey,
 }
@@ -214,7 +260,10 @@ impl SendCache {
             } else {
                 std::ptr::null_mut()
             },
-            storage: vec![0usize; len].into_boxed_slice(),
+            direct_argc: key.argc,
+            direct_ok: u32::from(shape_allows_direct(key.flags)),
+            direct_flags: key.flags,
+            storage: vec![SendCacheEntry { cc: 0, direct_cme: 0 }; len].into_boxed_slice(),
             key,
         });
         // Only now that `storage` has its final address: the C helper indexes
@@ -225,7 +274,22 @@ impl SendCache {
 
     /// Bytes this table owns on the Rust heap.
     pub fn heap_size(&self) -> usize {
-        size_of::<SendCache>() + self.storage.len() * size_of::<usize>()
+        size_of::<SendCache>() + self.storage.len() * size_of::<SendCacheEntry>()
+    }
+
+    /// Address of slot 0, for the inline probe JIT code emits.
+    pub fn slots_ptr(&self) -> *const u8 {
+        self.storage.as_ptr() as *const u8
+    }
+
+    /// The right shift the inline probe applies to the hash product.
+    pub fn shift(&self) -> u32 {
+        self.shift
+    }
+
+    /// Whether this table's call shape can use the inline direct-dispatch path.
+    pub fn direct_ok(&self) -> bool {
+        self.direct_ok != 0
     }
 
     /// The call shape this table serves.
@@ -241,12 +305,15 @@ impl SendCache {
 
     /// Mark every cached callcache. See the module docs on why this retains
     /// nothing but the callcaches themselves.
-    fn mark(&self) {
-        for &slot in self.storage.iter() {
-            if slot != 0 {
-                unsafe { rb_gc_mark_movable(VALUE(slot)) };
+    fn mark(&self) -> usize {
+        let mut marked = 0;
+        for slot in self.storage.iter() {
+            if slot.cc != 0 {
+                marked += 1;
+                unsafe { rb_gc_mark_movable(VALUE(slot.cc)) };
             }
         }
+        marked
     }
 
     /// Drop every entry, because compaction has moved the classes the slots were
@@ -254,17 +321,19 @@ impl SendCache {
     fn clear(&mut self) -> usize {
         let mut dropped = 0;
         for slot in self.storage.iter_mut() {
-            if *slot != 0 {
-                *slot = 0;
+            if slot.cc != 0 {
                 dropped += 1;
             }
+            // Drop the pair together: `direct_cme` is only meaningful next to
+            // the `cc` it was derived from.
+            *slot = SendCacheEntry { cc: 0, direct_cme: 0 };
         }
         dropped
     }
 
     /// Number of occupied slots, for `--zjit-stats`.
     pub fn occupancy(&self) -> usize {
-        self.storage.iter().filter(|&&slot| slot != 0).count()
+        self.storage.iter().filter(|slot| slot.cc != 0).count()
     }
 }
 
@@ -279,6 +348,100 @@ fn send_cache_for(key: SendCacheKey) -> *const SendCache {
         SendCache::new(key)
     });
     cache.as_ref() as *const SendCache
+}
+
+/// Whether a call shape lets a table hit be dispatched with a direct call into
+/// the callee's JIT code, rather than through `vm_cc_call()` and the
+/// interpreter.
+///
+/// [`crate::codegen::gen_send_megamorphic_direct`] pushes the callee frame
+/// itself, with the arguments left exactly where the caller's operand stack
+/// already put them and the frame size fixed at compile time. Every flag here
+/// would move an argument, change `argc`, or replace the frame:
+///
+/// * `ARGS_SPLAT` / `KW_SPLAT` / `KWARG`: `CALLER_SETUP_ARG()` rewrites the
+///   argument list before the arity is known, so the site's `argc` is not the
+///   callee's.
+/// * `ARGS_BLOCKARG`: the block argument has to be popped and converted, which
+///   can run `to_proc`, i.e. arbitrary Ruby.
+/// * `TAILCALL`: dispatches to `vm_call_iseq_setup_tailcall()`, which reuses the
+///   caller's frame instead of pushing one.
+/// * `SUPER` / `ZSUPER` / `FORWARDING`: never reach this helper at all
+///   ([`cache_for`] already refuses them), listed so the set is complete.
+///
+/// A site with a literal block passes no flag of its own, so it can share a
+/// table with a block-less site of the same shape. That is harmless: only
+/// [`crate::codegen::gen_send_without_block`] reads `direct_cme`, and it is
+/// never used for a send that has a block.
+fn shape_allows_direct(flags: u32) -> bool {
+    const REJECTED: u32 = VM_CALL_ARGS_SPLAT
+        | VM_CALL_KW_SPLAT
+        | VM_CALL_KWARG
+        | VM_CALL_ARGS_BLOCKARG
+        | VM_CALL_TAILCALL
+        | VM_CALL_SUPER
+        | VM_CALL_ZSUPER
+        | VM_CALL_FORWARDING;
+    flags & REJECTED == 0
+}
+
+/// Offsets and masks the inline probe bakes into JIT code, read once from C
+/// because the structs they reach into are opaque to Rust. See the declarations
+/// in `zjit.h`.
+pub struct SendCacheLayout {
+    /// `offsetof(struct rb_zjit_send_cache_entry, direct_cme)`
+    pub entry_direct_cme: i32,
+    /// `sizeof(struct rb_zjit_send_cache_entry)`
+    pub entry_size: usize,
+    /// `offsetof(struct rb_callcache, klass)`
+    pub cc_klass: i32,
+    /// `offsetof(struct rb_callcache, cme_)`
+    pub cc_cme: i32,
+    /// `offsetof(rb_callable_method_entry_t, def)`
+    pub cme_def: i32,
+    /// `offsetof(rb_method_definition_t, body.iseq.iseqptr)`
+    pub def_iseqptr: i32,
+    /// `offsetof(struct rb_iseq_struct, body)`
+    pub iseq_body: i32,
+    /// `offsetof(struct rb_iseq_constant_body, jit_entry)`
+    pub body_jit_entry: i32,
+    /// `IMEMO_FL_USER5`, the bit `METHOD_ENTRY_INVALIDATED()` tests
+    pub cme_invalidated_flag: u64,
+    /// `ZJIT_MEGA_DIRECT_MAX_STACK`: the `stack_max` bound the C fill path holds
+    /// directly-callable callees to, which is what the call site's stack
+    /// overflow check is compiled against.
+    pub direct_max_stack: usize,
+}
+
+impl SendCacheLayout {
+    pub fn get() -> Self {
+        unsafe extern "C" {
+            fn rb_zjit_cc_klass_offset() -> usize;
+            fn rb_zjit_cc_cme_offset() -> usize;
+            fn rb_zjit_cme_def_offset() -> usize;
+            fn rb_zjit_def_iseqptr_offset() -> usize;
+            fn rb_zjit_iseq_body_offset() -> usize;
+            fn rb_zjit_iseq_body_jit_entry_offset() -> usize;
+            fn rb_zjit_send_cache_entry_size() -> usize;
+            fn rb_zjit_send_cache_entry_direct_cme_offset() -> usize;
+            fn rb_zjit_method_entry_invalidated_flag() -> VALUE;
+            fn rb_zjit_mega_direct_max_stack() -> usize;
+        }
+        unsafe {
+            SendCacheLayout {
+                entry_direct_cme: rb_zjit_send_cache_entry_direct_cme_offset() as i32,
+                entry_size: rb_zjit_send_cache_entry_size(),
+                cc_klass: rb_zjit_cc_klass_offset() as i32,
+                cc_cme: rb_zjit_cc_cme_offset() as i32,
+                cme_def: rb_zjit_cme_def_offset() as i32,
+                def_iseqptr: rb_zjit_def_iseqptr_offset() as i32,
+                iseq_body: rb_zjit_iseq_body_offset() as i32,
+                body_jit_entry: rb_zjit_iseq_body_jit_entry_offset() as i32,
+                cme_invalidated_flag: rb_zjit_method_entry_invalidated_flag().as_u64(),
+                direct_max_stack: rb_zjit_mega_direct_max_stack(),
+            }
+        }
+    }
 }
 
 /// The table a compiled send site should probe, or `None` to keep calling the
@@ -298,7 +461,7 @@ pub fn cache_for(cd: *const rb_call_data, reason: crate::hir::SendFallbackReason
     // visibility check, no profile at all -- may well be monomorphic, and there
     // `cd->cc` already hits on every call and the table would be pure overhead.
     match reason {
-        SendMegamorphic | SendAncestorGuardFallback | SendPolymorphic => {}
+        SendMegamorphic | SendPolymorphic => {}
         _ => return None,
     }
 
