@@ -102,6 +102,14 @@ fn profile_insn_sample(
             profile_operands(profiler, profile, argc + 1);
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
         }
+        // `sendforward` (`bar(...)`) leaves the receiver, then the site's own arguments, then
+        // the `...` local on the stack. Everything but that top slot is an ordinary operand; the
+        // `...` holds a callinfo pointer, which is not a `VALUE` and must not be read as one.
+        YARVINSN_sendforward => {
+            let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
+            let argc = (unsafe { vm_ci_argc((*cd).ci) }) as usize;
+            profile_operands_below_top(profiler, profile, argc + 2);
+        }
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
         _ => return false,
     }
@@ -156,6 +164,25 @@ pub type SplatLength = u32;
 pub type SplatLengthDistribution = Distribution<Option<SplatLength>, DISTRIBUTION_SIZE>;
 
 pub type SplatLengthDistributionSummary = DistributionSummary<Option<SplatLength>, DISTRIBUTION_SIZE>;
+
+/// Profile the top-`n` stack operands except the topmost one, whose slot is left empty.
+///
+/// For a call site whose top-of-stack slot is not a Ruby object. The empty distribution keeps the
+/// operand indices lined up with the compile-time stack so that
+/// `ProfileOracle::profile_stack` still maps the rest onto the right HIR values.
+fn profile_operands_below_top(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
+    let entry = profile.entry_mut(profiler.insn_idx);
+    if entry.opnd_types.is_empty() {
+        entry.opnd_types.resize(n, TypeDistribution::new());
+    }
+
+    for (i, profile_type) in entry.opnd_types.iter_mut().enumerate().take(n.saturating_sub(1)) {
+        let obj = profiler.peek_at_stack((n - i - 1) as isize);
+        let ty = ProfiledType::new(obj);
+        VALUE::from(profiler.iseq).write_barrier(ty.class());
+        profile_type.observe(ty);
+    }
+}
 
 /// Profile the Type of top-`n` stack operands
 fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {

@@ -16972,9 +16972,12 @@ mod hir_opt_tests {
         bb3(v6:BasicObject):
           PatchPoint MethodRedefined(Object@0x1000, forwardable@0x1008, cme:0x1010)
           v18:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
-          v19:BasicObject = SendDirect v18, 0x0, :forwardable (0x1038)
+          v33:CPtr[CPtr(0x1038)] = ForwardingCallInfo :forwardable
+          PushInlineFrame :forwardable, v18 (0x1040), num_args=0
+          v28:BasicObject = SendForward v18, 0x1060, :itself, v33 # SendFallbackReason: SendForward: merged call not specialized
           CheckInterrupts
-          Return v19
+          PopInlineFrame
+          Return v28
         ");
     }
 
@@ -17002,9 +17005,16 @@ mod hir_opt_tests {
           v15:Fixnum[3] = Const Value(3)
           PatchPoint MethodRedefined(Object@0x1000, forwardable@0x1008, cme:0x1010)
           v24:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
-          v25:BasicObject = SendDirect v24, 0x0, :forwardable (0x1038), v11, v13, v15
+          v39:CPtr[CPtr(0x1038)] = ForwardingCallInfo :forwardable v11, v13, v15
+          PushInlineFrame :forwardable, v24 (0x1040), num_args=3
+          PatchPoint MethodRedefined(Object@0x1000, target@0x1060, cme:0x1068)
+          v65:Fixnum[0] = Const Value(0)
+          PushInlineFrame :target, v24 (0x1090), num_args=3
+          v60:ArrayExact = NewArray v11, v13, v15
           CheckInterrupts
-          Return v25
+          PopInlineFrame
+          PopInlineFrame
+          Return v60
         ");
     }
 
@@ -17070,9 +17080,17 @@ mod hir_opt_tests {
           v29:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v28, Value(VALUE(0x1048))
           v30:RubyValue = LoadField v27, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v31:FalseClass = GuardBitEquals v30, Value(false)
-          v32:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
+          v46:CPtr[CPtr(0x1051)] = ForwardingCallInfo :ID(0) v12, v13
+          PushInlineFrame :run, v11 (0x1058), num_args=2
+          PatchPoint NoSingletonClass(SuperFwdChild@0x1078)
+          PatchPoint MethodRedefined(SuperFwdChild@0x1078, fin@0x1080, cme:0x1088)
+          v53:ObjectSubclass[class_exact:SuperFwdChild] = GuardType v11, ObjectSubclass[class_exact:SuperFwdChild] recompile
+          PushInlineFrame :fin, v53 (0x10b0), num_args=2
+          v65:ArrayExact = NewArray v12, v13
           CheckInterrupts
-          Return v32
+          PopInlineFrame
+          PopInlineFrame
+          Return v65
         ");
     }
 
