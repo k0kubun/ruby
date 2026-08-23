@@ -1464,6 +1464,11 @@ pub enum Insn {
         /// slots below its local table, and the callinfo for its `...` local. See
         /// [`ForwardedArgs`]. `None` for every other callee.
         forwarded: Option<Box<ForwardedArgs>>,
+        /// A `&blk` block handler the call site passed, to be written into this frame's
+        /// specval verbatim: the operand of the SendDirect's [`BlockHandler::BlockArgProc`] (a
+        /// guarded Proc) or [`BlockHandler::BlockParamProxy`] (the caller frame's own handler), both of which `vm_caller_setup_arg_block` would
+        /// have installed unchanged. Mutually exclusive with `blockiseq`.
+        block_arg: Option<InsnId>,
         /// Guarded `struct rb_captured_block *` when this frame is an inlined block.
         captured: Option<InsnId>,
         state: InsnId,
@@ -1887,11 +1892,12 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(args);
                 $visit_one!(*state);
             }
-            Insn::PushInlineFrame { recv, forwarded, captured, state, .. } => {
+            Insn::PushInlineFrame { recv, forwarded, block_arg, captured, state, .. } => {
                 $visit_one!(*recv);
                 if let Some(forwarded) = forwarded {
                     $visit_many!(forwarded.args);
                 }
+                $visit_many!(block_arg);
                 if let Some(captured) = captured {
                     $visit_one!(*captured);
                 }
@@ -2573,9 +2579,12 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 write_separated!(f, ", ", ", ", args);
                 Ok(())
             }
-            Insn::PushInlineFrame { recv, iseq, cme, num_args, captured: None, .. } => {
+            Insn::PushInlineFrame { recv, iseq, cme, num_args, block_arg, captured: None, .. } => {
                 let method_name = unsafe { (**cme).called_id };
                 write!(f, "PushInlineFrame :{method_name}, {recv} ({:?})", self.ptr_map.map_ptr(*iseq))?;
+                if let Some(block_arg) = block_arg {
+                    write!(f, ", &{block_arg}")?;
+                }
                 write!(f, ", num_args={num_args}")?;
                 Ok(())
             }
@@ -4105,7 +4114,7 @@ fn autosplat_direct_dispatch_arity(
     // Mirror the priority of the dispatch selection: a literal block of the frame we are
     // inlined into wins over the profiled one, because dispatching to it needs no guard.
     let inlined_literal = match mode {
-        AddIseqMode::Inlined { blockiseq: Some(bi), .. } if get_lvar_level(yield_iseq) == 0 => Some(bi),
+        AddIseqMode::Inlined { block, .. } if get_lvar_level(yield_iseq) == 0 => block.iseq(),
         _ => None,
     };
     let profiled = block_handler_class.and_then(|obj| {
@@ -4275,7 +4284,7 @@ fn inline_block_at_yield(
         // direct_invoke_block_adapt() checked the block takes the simple callee-setup path,
         // so it has no optionals and only one opt-table entry.
         jit_entry_idx: 0,
-        blockiseq: None,
+        block: InlinedBlock::None,
         // A block ISEQ is never a `def foo(...)` callee, so its frame grows by nothing.
         extra_locals: 0,
         block_return_pops: Some(block_depth as u32),
@@ -4332,6 +4341,7 @@ fn inline_block_at_yield(
         num_args: args.len().try_into().expect("checked in HIR"),
         blockiseq: None,
         forwarded: None,
+        block_arg: None,
         captured: Some(captured),
         // The frame is laid out on top of `call_state`'s stack, which ends in exactly
         // `args`. That is not the interpreter's own stack whenever the yielded arguments
@@ -7994,23 +8004,31 @@ impl Function {
                 };
                 let SendDirectData { recv, cd, cme, iseq, kw_bits, jit_entry_idx, block: call_block, state, .. } = **data;
                 let args_len = data.args.len();
-                // TODO: Inline callees that receive a &proc block handler. The inlined body
-                // only knows a static blockiseq for yield/defined?(yield); it would need to
-                // be taught to dispatch to the runtime Proc instead.
-                // A block param proxy's handler lives in the callee frame's specval the same way,
-                // which inlining never pushes: the callee's `yield` would read the caller's block.
-                if matches!(call_block, Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_))) {
-                    search_start = send_pos + 1;
-                    continue;
-                }
-                // TODO(max): If we accept BlockArg here, we need to change the folding of Defined
-                // in HIR construction for the defined opcode to check the send flags of the method
-                // being inlined, too.
-                let blockiseq: Option<IseqPtr> = call_block.map(|bh| match bh {
-                    BlockHandler::BlockIseq(bi) => bi,
-                    BlockHandler::BlockArg => unreachable!("BlockArg in SendDirect"),
-                    BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_) => unreachable!("skipped above"),
-                });
+                // SendDirect invariant: block is None, BlockIseq, or a `&blk` argument that
+                // reduced to a block handler (BlockArgProc/BlockParamProxy). BlockArg is rejected
+                // upstream during type specialization.
+                let (blockiseq, block_arg): (Option<IseqPtr>, Option<InsnId>) = match call_block {
+                    None => (None, None),
+                    Some(BlockHandler::BlockIseq(bi)) => (Some(bi), None),
+                    Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockParamProxy(id)) => (None, Some(id)),
+                    Some(BlockHandler::BlockArg) => unreachable!("BlockArg in SendDirect"),
+                };
+
+                // The `&blk` handler goes into the inlined frame's specval verbatim, which is
+                // all `vm_caller_setup_arg_block` would have done with it. Everything the
+                // callee does with its block reads that specval through the frame's EP, so
+                // the only thing the callee's own HIR needs to know is whether a fold is
+                // available -- see `InlinedBlock`.
+                let inlined_block = match call_block {
+                    None => InlinedBlock::None,
+                    Some(BlockHandler::BlockIseq(bi)) => InlinedBlock::Iseq(bi),
+                    // The guarded Proc is a block for sure.
+                    Some(BlockHandler::BlockArgProc(_)) => InlinedBlock::Runtime { given: Some(true) },
+                    // A forwarded block-param proxy is the caller's own handler, which may be
+                    // VM_BLOCK_HANDLER_NONE, so nothing is known about it.
+                    Some(BlockHandler::BlockParamProxy(_)) => InlinedBlock::Runtime { given: None },
+                    Some(BlockHandler::BlockArg) => unreachable!("BlockArg in SendDirect"),
+                };
 
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
@@ -8081,7 +8099,7 @@ impl Function {
                     caller: post_send_caller,
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
-                    blockiseq,
+                    block: inlined_block,
                     // A `def foo(...)` callee's frame is grown by the call site's argument
                     // count; see `Insn::PushInlineFrame`'s `forwarded`.
                     extra_locals: if 0 != callee_params.flags.forwardable() {
@@ -8256,7 +8274,7 @@ impl Function {
                     args: args.clone(),
                 }));
                 self.push_insn(block, Insn::PushInlineFrame {
-                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, forwarded, captured: None, state,
+                    iseq, cme, recv, num_args: args.len().try_into().unwrap(), blockiseq, forwarded, block_arg, captured: None, state,
                 });
                 self.count(block, Counter::inline_iseq_optimized_send_count);
                 self.push_insn(block, Insn::Jump(BranchEdge {
@@ -11427,6 +11445,45 @@ pub const SELF_PARAM_IDX: usize = 0;
 /// element costs an array load plus a stack write, so long splats stay on the dynamic path.
 const MAX_SPLAT_EXPANSION: usize = 16;
 
+/// What the call site handed the frame an inlined callee runs in as its block, i.e. what
+/// [`Insn::PushInlineFrame`] writes into that frame's specval.
+///
+/// Everything a callee does with its block -- `yield`, `block_given?`, `defined?(yield)`,
+/// `getblockparam(proxy)` -- reads that specval through the frame's EP, and the inlined frame
+/// is a real VM frame, so those all work unchanged. This only records what is known at
+/// *compile* time, which is what decides whether a fold is available.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InlinedBlock {
+    /// The frame's specval is `VM_BLOCK_HANDLER_NONE`: the callee has no block.
+    None,
+    /// A literal block. Its ISEQ is a compile-time constant, so a `yield` in the callee can
+    /// dispatch to it with no guard at all.
+    Iseq(IseqPtr),
+    /// A `&blk` handler the frame push copies from a run-time value ([`BlockHandler::BlockArgProc`] or
+    /// [`BlockHandler::BlockParamProxy`]).
+    /// `given` is `Some(true)` when the value is statically known to be a real block (a guarded
+    /// Proc), and `None` when it may be `VM_BLOCK_HANDLER_NONE` -- the block-param-proxy case,
+    /// where the caller's own handler is forwarded and the caller may have had no block.
+    Runtime { given: Option<bool> },
+}
+
+impl InlinedBlock {
+    /// The literal block ISEQ, if the block is one. `None` for a run-time handler even
+    /// though it may well be an ISEQ block: nothing here identifies *which* one.
+    fn iseq(self) -> Option<IseqPtr> {
+        match self { InlinedBlock::Iseq(iseq) => Some(iseq), _ => None }
+    }
+
+    /// Whether `block_given?` is known at compile time in the inlined frame.
+    fn given(self) -> Option<bool> {
+        match self {
+            InlinedBlock::None => Some(false),
+            InlinedBlock::Iseq(_) => Some(true),
+            InlinedBlock::Runtime { given } => given,
+        }
+    }
+}
+
 /// Controls how an ISEQ's bytecode is added to HIR.
 #[derive(Clone, Copy)]
 enum AddIseqMode<'a> {
@@ -11442,8 +11499,8 @@ enum AddIseqMode<'a> {
         depth: InlineDepth,
         /// The JIT entry index selected by the call site's argument count.
         jit_entry_idx: usize,
-        /// The literal block the caller passed to this frame, if any.
-        blockiseq: Option<IseqPtr>,
+        /// What the caller passed to this frame as its block.
+        block: InlinedBlock,
         /// Frame slots below the callee's local table; see [`FrameState::extra_locals`]. The
         /// call site's argument count for a `def foo(...)` callee, zero otherwise.
         extra_locals: u16,
@@ -11558,6 +11615,11 @@ fn add_iseq_to_hir(
 ) -> Result<AddIseqResult, ParseError> {
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
+
+    // In a final version there are no recompiles left, so a receiver guard that turns out to be
+    // wrong side-exits on every call forever. Branch on the type instead: a missed branch costs a
+    // dynamic send, which is what the site would have done without the speculation anyway.
+    let branch_monomorphic_sends = fun.policy.no_side_exits;
 
     // Build the initial FrameState for a block being translated. In inlined
     // mode it carries the caller's post-send Snapshot and this frame's depth;
@@ -12022,12 +12084,15 @@ fn add_iseq_to_hir(
                         // Similar to gen_is_block_given
                         Insn::Const { val: Const::Value(Qnil) }
                     } else {
-                        if op_type == DEFINED_YIELD && matches!(mode, AddIseqMode::Inlined { .. }) {
-                            // If we are inlining a method that has a blockiseq handler, we can fold Defined(DEFINED_YIELD).
-                            // TODO(max): If we handle non-blockiseq block arguments such as
-                            // &:symbol or just &block forwarding, we need to revisit this and
-                            // check flags.
-                            let has_block = matches!(mode, AddIseqMode::Inlined { blockiseq: Some(_), .. });
+                        // Fold `defined?(yield)` when the inlined frame's block is known at
+                        // compile time. A `&blk` handler copied from a run-time value is only
+                        // known when it was proved to be a Proc; a forwarded block-param proxy
+                        // may be `VM_BLOCK_HANDLER_NONE`, so that one has to read the specval.
+                        let inlined_block_given = match (op_type, mode) {
+                            (DEFINED_YIELD, AddIseqMode::Inlined { block, .. }) => block.given(),
+                            _ => None,
+                        };
+                        if let Some(has_block) = inlined_block_given {
                             if has_block {
                                 Insn::Const { val: Const::Value(pushval) }
                             } else {
@@ -13018,7 +13083,7 @@ fn add_iseq_to_hir(
                         state.stack_push(join_param);
                     } else if let Some((new_block, result)) = dispatch_on_recv.then(|| emit_polymorphic_send(
                         fun, &mut profiles, block, insn_idx, exit_id, &exit_state,
-                        cd, recv, &args, block_handler, caller_splat_length, opcode.into(), false,
+                        cd, recv, &args, block_handler, caller_splat_length, opcode.into(), branch_monomorphic_sends,
                     )).flatten() {
                         block = new_block;
                         state.stack_push(result);
@@ -13336,7 +13401,10 @@ fn add_iseq_to_hir(
                         }
                     }
 
-                    let inlined_known_block = if let AddIseqMode::Inlined { blockiseq: Some(bi), .. } = mode {
+                    let inlined_known_block = if let Some(bi) = match mode {
+                        AddIseqMode::Inlined { block, .. } => block.iseq(),
+                        _ => None,
+                    } {
                         if can_direct_invoke_block(flags)
                             // Only methods are inlined today, so exit_state.iseq is always a method iseq and this is
                             // always 0. That matters because the emit below is guard-free and bakes in both level 0
