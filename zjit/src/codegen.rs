@@ -1299,7 +1299,7 @@ fn gen_ivar_cache_probe(
     cache: *const crate::ivar_cache::IvarCache,
     miss: Target,
 ) -> Opnd {
-    use crate::ivar_cache::{IVAR_CACHE_HASH_MULT, IVAR_CACHE_INFO_OFFSET, IVAR_CACHE_KEY_OFFSET, IVAR_CACHE_NIL_BIT, IVAR_CACHE_NIL_SLOT, IVAR_CACHE_NOT_INLINE_MASK, cache_byte_mask, cache_hash_shift};
+    use crate::ivar_cache::{IVAR_CACHE_HASH_MULT, IVAR_CACHE_INFO_OFFSET, IVAR_CACHE_KEY_OFFSET, IVAR_CACHE_NIL_BIT, IVAR_CACHE_NIL_SLOT, IVAR_CACHE_NOT_INLINE_MASK, IvarCacheLayout};
 
     asm_comment!(asm, "ivar shape table probe for :{}", id.contents_lossy());
     let recv = asm.load_mem(recv);
@@ -1321,17 +1321,25 @@ fn gen_ivar_cache_probe(
     let shape_to_hash = asm.load(Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_offset));
     let shape = asm.load(Opnd::mem(SHAPE_ID_NUM_BITS as u8, recv, shape_offset));
 
-    // Fibonacci hash, taking the byte offset out of the product's high bits;
-    // this has to agree with `crate::ivar_cache::slot_of` or the helper will fill
-    // slots the probe does not read. Widening the loaded shape id to 64 bits
-    // relies on a 32-bit load zero-extending its destination register, which both
-    // backends do; if one ever did not, the only consequence would be probing a
-    // slot the helper does not fill -- a miss, not a wrong answer.
+    // Fibonacci hash, scaled to the table's length; this has to agree with
+    // `crate::ivar_cache::slot_of` or the helper will fill slots the probe does
+    // not read. Widening the loaded shape id to 64 bits relies on a 32-bit load
+    // zero-extending its destination register, which both backends do; if one
+    // ever did not, the only consequence would be probing a slot the helper does
+    // not fill -- a miss, not a wrong answer.
+    //
+    // The length and the table's address are loaded from the cache's header
+    // rather than baked in: a table that thrashes is replaced by a bigger one
+    // (`IvarCache::grow`) and the probe has to follow it there. Both live in the
+    // header's first cache line, which every site reading this ivar shares.
+    let header = asm.load(Opnd::const_ptr(unsafe { (*cache).header_ptr() }));
+    let len = asm.load(Opnd::mem(32, header, IvarCacheLayout::len_offset()));
     let hash = asm.mul(shape_to_hash.with_num_bits(64), Opnd::UImm(IVAR_CACHE_HASH_MULT));
-    let shifted = asm.urshift(hash, Opnd::UImm(cache_hash_shift()));
-    let slot = asm.and(shifted, Opnd::UImm(cache_byte_mask()));
-    let table = unsafe { (*cache).table_ptr() };
-    let slot_ptr = asm.add(slot, Opnd::const_ptr(table));
+    let top = asm.urshift(hash, Opnd::UImm(32));
+    let scaled = asm.mul(top, len.with_num_bits(64));
+    let index = asm.urshift(scaled, Opnd::UImm(32));
+    let slot = asm.lshift(index, Opnd::UImm(size_of::<u64>().trailing_zeros() as u64));
+    let slot_ptr = asm.add(slot, Opnd::mem(64, header, IvarCacheLayout::table_offset()));
 
     asm_comment!(asm, "check the entry's shape id");
     let key = asm.load(Opnd::mem(32, slot_ptr, IVAR_CACHE_KEY_OFFSET));

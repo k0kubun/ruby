@@ -119,7 +119,8 @@ pub const IVAR_CACHE_NOT_INLINE_MASK: u64 = 0xfffe_0000;
 /// [`EntryKind::Direct`] once [`IVAR_CACHE_NOT_INLINE_MASK`] has passed.
 pub const IVAR_CACHE_NIL_BIT: u64 = 0x0001_0000;
 
-/// Default of `--zjit-ivar-cache-entries`, i.e. 4KiB per ivar name.
+/// Default of `--zjit-ivar-cache-entries`: the size a table may grow *to*, i.e.
+/// at most 4KiB per ivar name.
 ///
 /// This is the one number that decides whether the whole mechanism pays. A
 /// direct-mapped table smaller than the shape working set does not degrade
@@ -132,20 +133,28 @@ pub const IVAR_CACHE_NIL_BIT: u64 = 0x0001_0000;
 /// name.
 pub const DEFAULT_CACHE_ENTRIES: usize = 512;
 
-/// Number of slots in each table, from `--zjit-ivar-cache-entries`.
+/// Slots a table starts with, i.e. 256 bytes per ivar name.
+///
+/// A name read at a *shape-polymorphic* site needs the size above; almost no
+/// name is. On `benchmarks/lobsters` 449 tables hold 1,514 entries between
+/// them -- 3.4 each, in 512 slots -- so a fixed size left 1.87MB spread over
+/// 449 pages to hold 12KB of answers, and every probe of it reached past the
+/// caches to do it. Tables that do thrash grow (see [`IvarCache::grow`]); the
+/// rest stay small and dense.
+pub const INITIAL_CACHE_ENTRIES: usize = 32;
+
+/// How much a table grows when it thrashes, and -- multiplied by the current
+/// length -- how many evictions it takes to decide that it does.
+const GROWTH_FACTOR: usize = 4;
+
+/// Largest a table may grow, from `--zjit-ivar-cache-entries`.
 pub fn cache_entries() -> usize {
     crate::options::get_option!(ivar_cache_entries, DEFAULT_CACHE_ENTRIES)
 }
 
-/// Right shift JIT code applies to the hash product to get a *byte* offset into
-/// the table, before masking with [`cache_byte_mask`].
-pub fn cache_hash_shift() -> u64 {
-    64 - cache_entries().trailing_zeros() as u64 - 3
-}
-
-/// Mask that turns the shifted hash into an in-range byte offset.
-pub fn cache_byte_mask() -> u64 {
-    (cache_entries() as u64 - 1) * 8
+/// Slots a fresh table gets, never more than the ceiling above.
+fn initial_cache_entries() -> usize {
+    INITIAL_CACHE_ENTRIES.min(cache_entries())
 }
 
 /// What an entry says about how to read the ivar.
@@ -208,11 +217,23 @@ impl Entry {
     }
 }
 
-/// Slot a shape id maps to. Must match the arithmetic `gen_ivar_cache_probe`
-/// emits, or JIT code and the helper will fill and probe different slots.
-pub fn slot_of(shape_id: u32) -> usize {
+/// Slot a shape id maps to in a table of `len` slots: the top `log2(len)` bits
+/// of the hash product, taken with a second multiply rather than with a shift by
+/// `64 - log2(len)`.
+///
+/// Must match the arithmetic `gen_ivar_cache_probe` emits, or JIT code and the
+/// helper will fill and probe different slots.
+///
+/// The two are the same number for a power-of-two `len`, but only the multiply
+/// can be emitted without knowing `len` when the code is written -- and it is
+/// not known, because a table that thrashes is replaced by a bigger one (see
+/// [`IvarCache::grow`]). Masking a middle window of the product instead, which
+/// is what a fixed size allowed, stops mixing once the window is narrow: see
+/// `crate::send_cache::slot_of`.
+#[inline]
+pub fn slot_of(shape_id: u32, len: u32) -> usize {
     let hash = (shape_id as u64).wrapping_mul(IVAR_CACHE_HASH_MULT);
-    (((hash >> cache_hash_shift()) & cache_byte_mask()) / 8) as usize
+    (((hash >> 32) * len as u64) >> 32) as usize
 }
 
 /// Word JIT code reads instead of a receiver field when an entry says the shape
@@ -235,27 +256,105 @@ pub static IVAR_CACHE_NIL_SLOT: VALUE = Qnil;
 /// the number of compiled sites; sizing per name multiplies it by the number of
 /// ivar names the program actually reads polymorphically, which is far smaller
 /// and does not grow when an ISEQ is recompiled.
+///
+/// The first two fields are what the inline probe reads out of the header; keep
+/// them where [`IvarCacheLayout`] says they are.
+#[repr(C)]
 pub struct IvarCache {
-    /// Direct-mapped slots, `cache_entries()` of them. JIT code holds
-    /// [`IvarCache::table_ptr`] directly and indexes it with a masked hash, so
-    /// this must never be reallocated.
+    /// Number of slots, and the multiplier [`slot_of`] scales the hash by. A
+    /// power of two.
+    ///
+    /// Written *after* `table` when the table grows, so that a reader is never
+    /// handed a length longer than the table it reads from. See
+    /// [`IvarCache::grow`] for why the race cannot happen in the first place.
+    len: u32,
+    /// Evictions since the table was allocated or last grown. Only meaningful
+    /// while `grow_at` is non-zero.
+    evictions: u32,
+    /// Address of slot 0, which is what the inline probe loads. Points into
+    /// `entries`, which only moves in [`IvarCache::grow`].
+    table: *const AtomicU64,
+    /// `evictions` at which to grow, or 0 for a table that will not grow again.
+    grow_at: u32,
+
+    /// Direct-mapped slots, `len` of them.
     entries: Box<[AtomicU64]>,
     /// The ivar this table is for.
     id: ID,
 }
 
 impl IvarCache {
-    fn new(id: ID) -> Self {
-        let empty = Entry::empty().pack();
-        IvarCache {
-            entries: (0..cache_entries()).map(|_| AtomicU64::new(empty)).collect(),
+    fn new(id: ID) -> Box<Self> {
+        let len = initial_cache_entries();
+        let mut cache = Box::new(IvarCache {
+            len: 0,
+            evictions: 0,
+            table: std::ptr::null(),
+            grow_at: 0,
+            entries: empty_entries(len),
             id,
-        }
+        });
+        // Only now that `entries` has its final address.
+        cache.publish(len);
+        cache
     }
 
-    /// Address of slot 0, which is what JIT code bakes in.
-    pub fn table_ptr(&self) -> *const u8 {
-        self.entries.as_ptr() as *const u8
+    /// Point `table`, `len` and `grow_at` at the current `entries`, whose length
+    /// must be `len`. `table` is stored first: tables only ever grow, so an old
+    /// length against a new table is a probe of a prefix, while the reverse
+    /// pairing would read out of bounds.
+    fn publish(&mut self, len: usize) {
+        debug_assert_eq!(len, self.entries.len());
+        self.table = self.entries.as_ptr();
+        std::sync::atomic::fence(Ordering::Release);
+        self.len = len as u32;
+        self.evictions = 0;
+        self.grow_at = if len >= cache_entries() { 0 } else { (len * GROWTH_FACTOR) as u32 };
+    }
+
+    /// Count an eviction, and replace the table with a larger one once they show
+    /// that the shapes this name is read with do not fit: a table holding its
+    /// working set does not evict at all, so four evictions per slot is well
+    /// past noise.
+    ///
+    /// The cached entries are dropped rather than rehashed -- they are a memo of
+    /// a shape-tree lookup the helper can redo -- and a table grows at most
+    /// twice in its life.
+    ///
+    /// Growth frees the old table, so it must not run while another thread can
+    /// be between loading `table` and reading the slot. Ruby threads within a
+    /// ractor are serialized and take no interrupt check inside a probe, so the
+    /// only way to have a concurrent reader is a second ractor -- and a table
+    /// simply stops growing once the program has one.
+    fn note_eviction(&mut self) {
+        if self.grow_at == 0 {
+            return;
+        }
+        self.evictions += 1;
+        if self.evictions < self.grow_at {
+            return;
+        }
+        let len = self.len as usize;
+        let max = cache_entries();
+        if len >= max || unsafe { rb_jit_multi_ractor_p() } {
+            self.grow_at = 0;
+            return;
+        }
+        let new_len = (len * GROWTH_FACTOR).min(max);
+        self.entries = empty_entries(new_len);
+        self.publish(new_len);
+        incr_counter!(ivar_cache_grow_count);
+    }
+
+    /// Address of the table's header, which the inline probe bakes in and reads
+    /// `table` and `len` out of.
+    pub fn header_ptr(&self) -> *const u8 {
+        self as *const IvarCache as *const u8
+    }
+
+    /// Slot `shape_id` maps to in this table.
+    fn slot_of(&self, shape_id: u32) -> usize {
+        slot_of(shape_id, self.len)
     }
 
     fn load(&self, slot: usize) -> Entry {
@@ -272,6 +371,29 @@ impl IvarCache {
     }
 }
 
+/// `len` empty slots.
+fn empty_entries(len: usize) -> Box<[AtomicU64]> {
+    debug_assert!(len.is_power_of_two());
+    let empty = Entry::empty().pack();
+    (0..len).map(|_| AtomicU64::new(empty)).collect()
+}
+
+/// Offsets of the header fields the inline probe reads. The struct is Rust's, so
+/// unlike the send cache's these need no C counterpart.
+pub struct IvarCacheLayout;
+
+impl IvarCacheLayout {
+    /// `offsetof(IvarCache, len)`
+    pub fn len_offset() -> i32 {
+        std::mem::offset_of!(IvarCache, len) as i32
+    }
+
+    /// `offsetof(IvarCache, table)`
+    pub fn table_offset() -> i32 {
+        std::mem::offset_of!(IvarCache, table) as i32
+    }
+}
+
 /// Table for `id`, creating it on first use. The `Box` is owned by [`ZJITState`]
 /// so that [`crate::mem_stats`] can account for it; the returned pointer is
 /// stable for the life of the process.
@@ -279,7 +401,7 @@ pub fn ivar_cache_for(id: ID) -> *const IvarCache {
     let caches = ZJITState::get_ivar_caches();
     let cache = caches.entry(id).or_insert_with(|| {
         incr_counter!(ivar_cache_alloc_count);
-        Box::new(IvarCache::new(id))
+        IvarCache::new(id)
     });
     cache.as_ref() as *const IvarCache
 }
@@ -349,8 +471,8 @@ unsafe fn load_entry(recv: VALUE, entry: Entry) -> VALUE {
 /// Raises exactly what `rb_ivar_get` raises, and only from the paths that
 /// delegate to it.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache: *const IvarCache) -> VALUE {
-    let cache = unsafe { &*cache };
+pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache_ptr: *const IvarCache) -> VALUE {
+    let cache = unsafe { &*cache_ptr };
     let id = cache.id;
 
     // Immediates have no ivars. `rb_ivar_get` returns nil for them too.
@@ -362,7 +484,7 @@ pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache: *const IvarCache) -
     // Read the shape id field directly rather than calling rb_obj_shape_id():
     // this is the same word, at the same offset, that the inline probe loaded.
     let shape_id = unsafe { *((recv.as_usize() as isize + rb_shape_id_offset() as isize) as *const u32) };
-    let slot = slot_of(shape_id);
+    let slot = cache.slot_of(shape_id);
     let entry = cache.load(slot);
     let entry = if entry.shape_id == shape_id {
         // The inline probe serves Direct and Nil; Extended and Uncacheable land
@@ -370,13 +492,16 @@ pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache: *const IvarCache) -
         count(Counter::getivar_cache_helper_hit);
         entry
     } else {
-        count(if entry.shape_id == IVAR_CACHE_EMPTY_KEY {
-            Counter::getivar_cache_fill
-        } else {
-            Counter::getivar_cache_evict
-        });
+        let evicted = entry.shape_id != IVAR_CACHE_EMPTY_KEY;
+        count(if evicted { Counter::getivar_cache_evict } else { Counter::getivar_cache_fill });
         let entry = resolve(shape_id, id);
         cache.store(slot, entry);
+        // Last, because growing throws the entry just stored away. Nothing
+        // reads `cache` after this, so the exclusive reference is the only one
+        // live; see IvarCache::grow for why no other thread can hold one.
+        if evicted {
+            unsafe { (*cache_ptr.cast_mut()).note_eviction() };
+        }
         entry
     };
 
@@ -401,8 +526,8 @@ pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache: *const IvarCache) -
 ///
 /// Raises exactly what `rb_ivar_set` raises, and only by delegating to it.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_setivar_cached(recv: VALUE, val: VALUE, cache: *const IvarCache) {
-    let cache = unsafe { &*cache };
+pub extern "C" fn rb_zjit_setivar_cached(recv: VALUE, val: VALUE, cache_ptr: *const IvarCache) {
+    let cache = unsafe { &*cache_ptr };
     let id = cache.id;
 
     // Immediates raise FrozenError; let rb_ivar_set do it.
@@ -423,19 +548,20 @@ pub extern "C" fn rb_zjit_setivar_cached(recv: VALUE, val: VALUE, cache: *const 
         return;
     }
 
-    let slot = slot_of(shape_id);
+    let slot = cache.slot_of(shape_id);
     let entry = cache.load(slot);
     let entry = if entry.shape_id == shape_id {
         count(Counter::setivar_cache_hit);
         entry
     } else {
-        count(if entry.shape_id == IVAR_CACHE_EMPTY_KEY {
-            Counter::setivar_cache_fill
-        } else {
-            Counter::setivar_cache_evict
-        });
+        let evicted = entry.shape_id != IVAR_CACHE_EMPTY_KEY;
+        count(if evicted { Counter::setivar_cache_evict } else { Counter::setivar_cache_fill });
         let entry = resolve(shape_id, id);
         cache.store(slot, entry);
+        // See the read path: last, and the only live reference from here on.
+        if evicted {
+            unsafe { (*cache_ptr.cast_mut()).note_eviction() };
+        }
         entry
     };
 
@@ -518,8 +644,39 @@ mod tests {
     // the default is rather than hard-coding a size.
     #[test]
     fn slots_are_in_range() {
-        for shape_id in [0u32, 1, 0x1234, 0x7ffff, 0xffff_ffff, 0x2000_0001] {
-            assert!(slot_of(shape_id) < cache_entries());
+        for len in [8u32, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+            for shape_id in [0u32, 1, 0x1234, 0x7ffff, 0xffff_ffff, 0x2000_0001] {
+                assert!(slot_of(shape_id, len) < len as usize, "len {len} shape {shape_id:#x}");
+            }
+        }
+    }
+
+    /// Scaling by the length has to be the shift it replaces, at every size a
+    /// table grows through: JIT code emits the multiply because the length is
+    /// only known at run time, and the helper must land on the same slot.
+    #[test]
+    fn scaling_by_the_length_is_a_shift_by_the_log() {
+        for len in [8u32, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+            let shift = 64 - len.trailing_zeros();
+            for shape_id in [0u32, 1, 0x1234, 0x7ffff, 0xffff_ffff, 0x2000_0001] {
+                let hash = (shape_id as u64).wrapping_mul(IVAR_CACHE_HASH_MULT);
+                assert_eq!(slot_of(shape_id, len), (hash >> shift) as usize, "len {len}");
+            }
+        }
+    }
+
+    /// Consecutive shape ids are the common case -- shapes are handed out in
+    /// order -- so a small table has to spread them rather than pile them up.
+    #[test]
+    fn consecutive_shape_ids_spread_across_a_small_table() {
+        for len in [INITIAL_CACHE_ENTRIES as u32, 128] {
+            let slots: std::collections::HashSet<usize> =
+                (0..len).map(|i| slot_of(0x400 + i, len)).collect();
+            assert!(
+                slots.len() * 2 >= len as usize,
+                "only {} distinct slots for {len} consecutive shapes",
+                slots.len()
+            );
         }
     }
 }
