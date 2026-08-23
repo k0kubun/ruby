@@ -219,6 +219,7 @@ make_counters! {
         exit_guard_less_failure,
         exit_guard_greater_eq_failure,
         exit_guard_super_method_entry,
+        exit_guard_protected_visibility,
         exit_patchpoint_bop_redefined,
         exit_patchpoint_method_redefined,
         exit_patchpoint_no_method_override,
@@ -544,6 +545,12 @@ make_counters! {
     // Compile-time count of `super` sites that got a method-entry dispatch chain.
     super_chain_sites,
 
+    // Executions of a protected call that passed the caller-`self` ancestry guard, i.e. a
+    // protected method reached with an explicit receiver that no longer needs a dynamic send.
+    send_protected_guard_count,
+    // Compile-time count of protected call sites that got that guard.
+    send_protected_guard_sites,
+
     // Compile-time counts of megamorphic call sites that could not use an ancestor guard.
     send_ancestor_guard_reject_cme_differs,
     send_ancestor_guard_reject_immediate,
@@ -720,6 +727,7 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         GuardLess                     => exit_guard_less_failure,
         GuardGreaterEq                => exit_guard_greater_eq_failure,
         GuardSuperMethodEntry         => exit_guard_super_method_entry,
+        GuardProtectedVisibility      => exit_guard_protected_visibility,
         CalleeSideExit                => exit_callee_side_exit,
         Interrupt                     => exit_interrupt,
         StackOverflow                 => exit_stackoverflow,

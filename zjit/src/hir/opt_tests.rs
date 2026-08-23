@@ -17540,8 +17540,13 @@ mod hir_opt_tests {
         ");
     }
 
+    // A protected method reached with an explicit receiver compiles to a direct call behind one
+    // check on the *caller's* self, which is what `vm_call_method` tests before permitting the
+    // call. Here the caller is a toplevel method, whose self is not a `C`, so the guard fails and
+    // the call raises through the interpreter -- but the shape of the code is the same one a
+    // caller inside `C` gets, where the guard always passes.
     #[test]
-    fn dont_optimize_call_to_protected_method_iseq() {
+    fn guard_caller_self_for_call_to_protected_method_iseq() {
         eval(r#"
             class C
               protected def secret = 42
@@ -17552,6 +17557,46 @@ mod hir_opt_tests {
         "#);
         assert_snapshot!(hir_string("test"), @"
         fn test@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint SingleRactorMode
+          PatchPoint StableConstantNames(0x1000, Obj)
+          v12:ObjectSubclass[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v21:BasicObject = LoadSelf
+          v22:CBool = HasAncestor v21, C
+          v23:CBool[true] = GuardBitEquals v22, CBool(true) recompile
+          PatchPoint NoSingletonClass(C@0x1010)
+          PatchPoint MethodRedefined(C@0x1010, secret@0x1018, cme:0x1020)
+          v27:Fixnum[42] = Const Value(42)
+          CheckInterrupts
+          Return v27
+        ");
+    }
+
+    // A protected call whose defining class is a module has no class to check the caller's self
+    // against, so it keeps the dynamic send.
+    #[test]
+    fn dont_optimize_call_to_protected_method_defined_in_module() {
+        eval(r#"
+            module M
+              protected def secret = 42
+            end
+            class C
+              include M
+            end
+            Obj = C.new
+            def test = Obj.secret rescue $!
+            test
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:9:
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
@@ -17757,22 +17802,28 @@ mod hir_opt_tests {
           CondBranch v31, bb7(), bb8()
         bb7():
           PatchPoint MethodRedefined(SuperChainBase2@0x1010, foo@0x1018, cme:0x1020)
+          PushInlineFrame :foo, v6 (0x1048), num_args=0
           v55:Fixnum[2] = Const Value(2)
+          CheckInterrupts
+          PopInlineFrame
           Jump bb4(v55)
         bb8():
-          v37:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v37:CallableMethodEntry[VALUE(0x1070)] = Const Value(VALUE(0x1070))
           v38:CBool = IsBitEqual v29, v37
           CondBranch v38, bb9(), bb5()
         bb9():
-          PatchPoint MethodRedefined(SuperChainBase1@0x1050, foo@0x1018, cme:0x1058)
+          PatchPoint MethodRedefined(SuperChainBase1@0x1078, foo@0x1018, cme:0x1080)
+          PushInlineFrame :foo, v6 (0x10a8), num_args=0
           v69:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          PopInlineFrame
           Jump bb4(v69)
         bb5():
-          v44:BasicObject = InvokeSuper v6, 0x1080 # SendFallbackReason: super: dispatch chain fallthrough
+          v44:BasicObject = InvokeSuper v6, 0x10d0 # SendFallbackReason: super: dispatch chain fallthrough
           Jump bb4(v44)
         bb4(v22:BasicObject):
           v13:Fixnum[10] = Const Value(10)
-          PatchPoint MethodRedefined(Integer@0x10a8, +@0x10b0, cme:0x10b8)
+          PatchPoint MethodRedefined(Integer@0x10f8, +@0x1100, cme:0x1108)
           v48:Fixnum = GuardType v22, Fixnum recompile
           v49:Fixnum = FixnumAdd v48, v13
           CheckInterrupts
