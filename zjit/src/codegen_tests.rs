@@ -3789,6 +3789,111 @@ fn test_zsuper_stays_dynamic_but_correct() {
     "#), @"[50, 60]");
 }
 
+/// A protected method called with an explicit receiver from an instance of a subclass is
+/// permitted, and one called from an unrelated class still raises.
+#[test]
+fn test_protected_call_permitted_from_subclass_and_refused_elsewhere() {
+    assert_snapshot!(inspect(r#"
+        class ProtBase
+          def initialize(v) = @v = v
+          def combine(other) = secret + other.secret
+          protected
+          def secret = @v
+        end
+        class ProtSub < ProtBase; end
+        class ProtStranger
+          def peek(o) = o.secret
+        end
+        $prot_a = ProtBase.new(1)
+        $prot_b = ProtSub.new(2)
+        def prot_run(n) = n.times { $prot_a.combine($prot_b); $prot_b.combine($prot_a) }
+        prot_run(300)
+        stranger = (ProtStranger.new.peek($prot_a) rescue $!.class)
+        [$prot_a.combine($prot_b), $prot_b.combine($prot_a), stranger]
+    "#), @"[3, 3, NoMethodError]");
+    assert!(crate::state::ZJITState::get_counters().send_protected_guard_sites > 0,
+        "the protected call never got a caller-self guard");
+}
+
+/// A refinement's protected method is defined in the refinement's ICLASS, which is not a class
+/// the caller's `self` can be checked against, so the call keeps its dynamic dispatch -- and
+/// keeps refusing callers the interpreter would refuse.
+#[test]
+fn test_protected_call_under_refinement() {
+    assert_snapshot!(inspect(r#"
+        class RefProt
+          def initialize(v) = @v = v
+        end
+        module RefProtM
+          refine RefProt do
+            def combine(other) = secret + other.secret
+            protected def secret = @v * 2
+          end
+        end
+        using RefProtM
+        $ref_prot_a = RefProt.new(1)
+        $ref_prot_b = RefProt.new(2)
+        def ref_prot_run(n) = n.times { $ref_prot_a.combine($ref_prot_b) }
+        ref_prot_run(300)
+        [$ref_prot_a.combine($ref_prot_b), ($ref_prot_a.secret rescue $!.class)]
+    "#), @"[6, NoMethodError]");
+}
+
+/// `self.foo = x` is a legal call to a private writer, and the bytecode marks it FCALL, so it
+/// specializes with no visibility guard at all.
+#[test]
+fn test_private_writer_through_self_receiver_compiles() {
+    assert_snapshot!(inspect(r#"
+        class PrivWriter
+          def set(x)
+            self.value = x
+            self.value
+          end
+          private
+          attr_accessor :value
+        end
+        $priv_writer = PrivWriter.new
+        def priv_writer_run(n) = n.times { |i| $priv_writer.set(i) }
+        priv_writer_run(300)
+        $priv_writer.set(7)
+    "#), @"7");
+}
+
+/// A private method reached through a receiver that is not literally `self` is still refused,
+/// even when the receiver happens to be the same object at runtime.
+#[test]
+fn test_private_call_with_non_self_receiver_still_raises() {
+    assert_snapshot!(inspect(r#"
+        class PrivRecv
+          def call_through(o) = o.hidden rescue $!.class
+          private
+          def hidden = :nope
+        end
+        $priv_recv = PrivRecv.new
+        def priv_recv_run(n) = n.times { $priv_recv.call_through($priv_recv) }
+        priv_recv_run(300)
+        $priv_recv.call_through($priv_recv)
+    "#), @"NoMethodError");
+}
+
+/// `respond_to?` reports visibility, not callability, and nothing here changes that.
+#[test]
+fn test_respond_to_visibility_unaffected() {
+    assert_snapshot!(inspect(r#"
+        class RespondVis
+          def pub = 1
+          protected def prot = 2
+          private def priv = 3
+        end
+        $respond_vis = RespondVis.new
+        def respond_vis_test(o) = [o.respond_to?(:pub), o.respond_to?(:prot), o.respond_to?(:priv),
+                                   o.respond_to?(:prot, true), o.respond_to?(:priv, true)]
+        def respond_vis_run(n) = n.times { respond_vis_test($respond_vis) }
+        respond_vis_run(300)
+        respond_vis_test($respond_vis)
+    "#), @"[true, false, false, true, true]");
+}
+
 #[test]
 fn test_invokesuper_with_keyword_args() {
     assert_snapshot!(inspect(r#"
