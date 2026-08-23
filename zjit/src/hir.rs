@@ -855,6 +855,11 @@ pub enum SendFallbackReason {
     /// A previous version of this ISEQ guarded the frame's method entry at this `super` and the
     /// guard kept missing, so this version dispatches `super` dynamically instead of exiting.
     SuperMethodEntryUnstable,
+    /// An arm of a `super` dispatch chain whose own target could not be specialized.
+    SuperChainArm,
+    /// The fallthrough of a `super` dispatch chain: the frame is running a method entry no arm
+    /// guards, or it carries a block the arms cannot forward.
+    SuperChainFallback,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
     /// The `invokeblock` call site passes a splat, keyword, or block argument.
@@ -934,6 +939,8 @@ impl Display for SendFallbackReason {
             SuperNotOptimizedMethodType(method_type) => write!(f, "super: unsupported target method type {:?}", method_type),
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
             SuperMethodEntryUnstable => write!(f, "super: frame method entry guard kept missing"),
+            SuperChainArm => write!(f, "super: chain arm not specialized"),
+            SuperChainFallback => write!(f, "super: dispatch chain fallthrough"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
             InvokeBlockComplexArgs => write!(f, "InvokeBlock: splat, keyword, or block argument"),
@@ -2970,6 +2977,12 @@ pub struct Function {
     /// instead of on the receiver's exact class. Keyed by the `Send`'s own instruction ID;
     /// IDs are never reused, so a stale entry can only ever be read back by the same send.
     ancestor_dispatch: HashMap<InsnId, VALUE>,
+    /// `InvokeSuper`s that sit in an arm of a [`Function::emit_super_chain`] dispatch, mapped to
+    /// the frame method entry that arm's branch tested for. `type_specialize` resolves the
+    /// `super` target from that entry rather than from the site's profile, which is what keeps
+    /// an arm from building a chain of its own. Keyed by the `InvokeSuper`'s instruction ID;
+    /// IDs are never reused, so a stale entry can only ever be read back by the same call.
+    super_cme_dispatch: HashMap<InsnId, *const rb_callable_method_entry_t>,
     /// Rough estimate for the number of (actually executable) instructions in the function. Does
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
@@ -3216,6 +3229,51 @@ struct AncestorDispatch {
     /// the receiver is an instance of this class or of a subclass is enough to know which
     /// method the call resolves to.
     klass: VALUE,
+}
+
+/// Which of the facts a specialized `super` depends on still have to be checked where the call
+/// is emitted. See [`Function::emit_super_call_guards`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperGuards {
+    /// Standalone `super`: guard the frame's method entry and its (absent) block.
+    Full,
+    /// One arm of [`Function::emit_super_chain`]: both were established by branches.
+    ChainArm,
+}
+
+/// The most `super` targets one dispatch chain will guard. Each arm carries a whole call setup,
+/// so a wide chain costs code size in the caller; the profiles that motivate the chain at all
+/// are two or three entries wide.
+const SUPER_CHAIN_MAX_ARMS: usize = 4;
+
+/// Pick the method entries a `super` dispatch chain should guard, or `None` when a chain would
+/// not pay for itself.
+///
+/// The buckets are the method entries the profiler saw the frame running. A site with a handful
+/// is a `super` in a body that several classes run -- a module method reached through more than
+/// one includer, most often -- and each entry resolves `super` to a different target, so each
+/// gets an arm. A site with more entries than there are arms only qualifies if the arms it can
+/// afford still serve most of the calls; the rest would take the fallthrough, and a chain whose
+/// fallthrough is the common case is a chain of wasted comparisons.
+fn super_chain_entries(summary: &TypeDistributionSummary) -> Option<Vec<*const rb_callable_method_entry_t>> {
+    let mut buckets: Vec<(usize, u32)> = summary.buckets().iter().enumerate()
+        .filter(|(_, profiled_type)| !profiled_type.is_empty())
+        .map(|(idx, _)| (idx, u32::from(summary.bucket_count(idx))))
+        .collect();
+    if buckets.is_empty() {
+        return None;
+    }
+    // Most frequently seen first, so a chain that cannot hold every entry holds the ones that
+    // matter and the comparisons come in the order that resolves soonest.
+    buckets.sort_by_key(|&(idx, count)| (std::cmp::Reverse(count), idx));
+    buckets.truncate(SUPER_CHAIN_MAX_ARMS);
+    let kept: Vec<usize> = buckets.iter().map(|&(idx, _)| idx).collect();
+    if summary.coverage(|idx, _| kept.contains(&idx)) < CHAIN_COVERAGE_THRESHOLD {
+        return None;
+    }
+    Some(buckets.iter()
+        .map(|&(idx, _)| summary.bucket(idx).class().0 as *const rb_callable_method_entry_t)
+        .collect())
 }
 
 /// How to dispatch a call site whose receiver profile has more than one class in it.
@@ -3682,7 +3740,9 @@ fn inline_block_at_yield(
     args: &[InsnId],
     caller_argc: usize,
     call_state: InsnId,
-    exit_id: InsnId,
+    // Unused here: upstream threads this to PushInlineFrame::guard_state, a field that comes
+    // from an excluded commit and has no consumer on master.
+    _exit_id: InsnId,
     exit_state: &FrameState,
     insn_idx: u32,
 ) -> Option<InsnId> {
@@ -3801,6 +3861,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             ancestor_dispatch: HashMap::default(),
+            super_cme_dispatch: HashMap::default(),
             num_instructions: 0,
         }
     }
@@ -4415,6 +4476,14 @@ impl Function {
     /// Check if the type of `insn` is a subtype of `ty`.
     pub fn is_a(&self, insn: InsnId, ty: Type) -> bool {
         self.type_of(insn).is_subtype(ty)
+    }
+
+    /// Give a freshly inlined instruction a type, for callers that splice instructions in after
+    /// type inference has already run and so would otherwise leave them at `types::Any`.
+    fn infer_inlined_type(&mut self, insn: InsnId) {
+        if !self.type_of(insn).bit_equal(types::Any) { return; }
+        if matches!(self.insns[insn], Insn::Param) { return; }
+        self.insn_types[insn] = self.infer_type(insn);
     }
 
     fn infer_type(&self, insn: InsnId) -> Type {
@@ -5453,10 +5522,7 @@ impl Function {
             let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
             self.blocks[block].insns.extend(insns);
             self.count(block, Counter::inline_cfunc_optimized_send_count);
-            if self.type_of(replacement).bit_equal(types::Any) {
-                // Not set yet; infer type
-                self.insn_types[replacement] = self.infer_type(replacement);
-            }
+            self.infer_inlined_type(replacement);
             self.remove_block(tmp_block);
             return replacement;
         }
@@ -5513,14 +5579,352 @@ impl Function {
         }
     }
 
+    /// Emit the guards a specialized `super` needs before it may call `super_cme` directly.
+    ///
+    /// [`SuperGuards::Full`] is the standalone form: a patch point on the target's definition,
+    /// then a guard that the frame really is running `current_cme` and a guard that it carries
+    /// no block, both of which side-exit and recompile on a miss.
+    ///
+    /// [`SuperGuards::ChainArm`] is the form used inside [`Function::emit_super_chain`], where
+    /// branches have already established both facts for this arm, so only the patch point is
+    /// left to emit.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_super_call_guards(
+        &mut self,
+        block: BlockId,
+        super_cme: *const rb_callable_method_entry_t,
+        current_cme: *const rb_callable_method_entry_t,
+        mid: ID,
+        state: InsnId,
+        local_iseq: IseqPtr,
+        guards: SuperGuards,
+    ) {
+        self.push_insn(block, Insn::PatchPoint {
+            invariant: Invariant::MethodRedefined {
+                klass: unsafe { (*super_cme).defined_class },
+                method: mid,
+                cme: super_cme
+            },
+            state
+        });
+        if guards == SuperGuards::ChainArm {
+            return;
+        }
+
+        // Get the EP of the ISeq of the containing method, or "local level", skipping over block-level EPs.
+        // Equivalent of GET_LEP() macro. The iseq is the FrameState's, not the
+        // outer compilation's, so that an inlined super call walks from the
+        // callee's CFP rather than the caller's.
+        let lep = self.load_super_lep(block, local_iseq);
+        let method_entry = self.load_frame_method_entry(block, lep);
+        // Guard that it matches the expected CME. Recompile on a miss: the
+        // profiled CME is not always the one the frame runs with, and exiting
+        // on every call is far worse than dispatching super dynamically.
+        self.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: Some(Recompile) });
+
+        let block_handler = self.load_super_block_handler(block, lep);
+        self.push_insn(block, Insn::GuardBitEquals {
+            val: block_handler,
+            expected: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)),
+            reason: Box::new(SideExitReason::UnhandledBlockArg),
+            state,
+            recompile: Some(Recompile),
+        });
+    }
+
+    /// The local EP of the frame a `super` resolves against, i.e. `GET_LEP()`.
+    fn load_super_lep(&mut self, block: BlockId, local_iseq: IseqPtr) -> InsnId {
+        let level = get_lvar_level(local_iseq);
+        self.get_ep(block, level)
+    }
+
+    /// Read `rb_vm_frame_method_entry()` out of a local EP.
+    fn load_frame_method_entry(&mut self, block: BlockId, lep: InsnId) -> InsnId {
+        // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
+        let me_cref = self.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
+        // The slot holds an imemo_svar wrapping the method entry once the
+        // frame has touched a special variable, so read through it the same
+        // way rb_vm_frame_method_entry (and so the profile) does.
+        self.push_insn(block, Insn::UnwrapSvar { val: me_cref })
+    }
+
+    /// Read the block handler `super` would forward out of a local EP.
+    fn load_super_block_handler(&mut self, block: BlockId, lep: InsnId) -> InsnId {
+        self.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue)
+    }
+
+    /// Dispatch an `invokesuper` on the method entry the frame is running: one arm per entry in
+    /// `cmes`, each specialized against the `super` target that entry resolves to, and a dynamic
+    /// `super` for everything else. Returns the join block to keep compiling in.
+    ///
+    /// The block handler is tested once, ahead of the chain, rather than per arm: `super`
+    /// forwards the frame's block, and none of the arms can do that, so a frame that has one
+    /// belongs on the dynamic path whichever method entry it is running.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_super_chain(
+        &mut self,
+        block: BlockId,
+        insn_id: InsnId,
+        recv: InsnId,
+        cd: *const rb_call_data,
+        blockiseq: IseqPtr,
+        args: Vec<InsnId>,
+        state: InsnId,
+        cmes: &[*const rb_callable_method_entry_t],
+        frame_state_iseq: IseqPtr,
+    ) -> BlockId {
+        incr_counter!(super_chain_sites);
+        let insn_idx = self.frame_state_insn_idx(state) as u32;
+        let join_block = self.new_block(insn_idx);
+        let join_param = self.push_insn(join_block, Insn::Param);
+        let fallback_block = self.new_block(insn_idx);
+        let edge = |target| BranchEdge { target, args: vec![] };
+
+        let lep = self.load_super_lep(block, frame_state_iseq);
+        let block_handler = self.load_super_block_handler(block, lep);
+        let no_block = self.push_insn(block, Insn::Const { val: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)) });
+        let has_no_block = self.push_insn(block, Insn::IsBitEqual { left: block_handler, right: no_block });
+        let chain_block = self.new_block(insn_idx);
+        self.push_insn(block, Insn::CondBranch { val: has_no_block, if_true: edge(chain_block), if_false: edge(fallback_block) });
+
+        let method_entry = self.load_frame_method_entry(chain_block, lep);
+        let mut compare_block = chain_block;
+        for (idx, &cme) in cmes.iter().enumerate() {
+            let expected = self.push_insn(compare_block, Insn::Const { val: Const::Value(cme.into()) });
+            let matches = self.push_insn(compare_block, Insn::IsBitEqual { left: method_entry, right: expected });
+            let arm_block = self.new_block(insn_idx);
+            let next_block = if idx + 1 == cmes.len() { fallback_block } else { self.new_block(insn_idx) };
+            self.push_insn(compare_block, Insn::CondBranch { val: matches, if_true: edge(arm_block), if_false: edge(next_block) });
+
+            // A fresh instruction per arm, tagged with the entry the branch just proved, so that
+            // `emit_specialized_super` resolves this arm's target without consulting the profile
+            // and without recursing into another chain.
+            let arm_insn = self.new_insn(Insn::InvokeSuper { recv, cd, blockiseq, args: args.clone(), state, reason: SendFallbackReason::SuperChainArm });
+            self.super_cme_dispatch.insert(arm_insn, cme);
+            self.emit_specialized_super(arm_block, arm_insn, recv, cd, args.clone(), state, cme, frame_state_iseq, SuperGuards::ChainArm);
+            self.count(arm_block, Counter::super_chain_arm_count);
+            self.push_insn(arm_block, Insn::Jump(BranchEdge { target: join_block, args: vec![arm_insn] }));
+            compare_block = next_block;
+        }
+
+        self.count(fallback_block, Counter::super_chain_fallback_count);
+        let fallback = self.push_insn(fallback_block, Insn::InvokeSuper { recv, cd, blockiseq, args, state, reason: SendFallbackReason::SuperChainFallback });
+        self.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+
+        self.make_equal_to(insn_id, join_param);
+        join_block
+    }
+
+    /// Rewrite `insn_id`, an `invokesuper`, into a direct call to the `super` target that
+    /// `current_cme` resolves to, emitting it into `block`. Leaves the dynamic `invokesuper` in
+    /// place (with a fallback reason recorded) when the target cannot be called directly.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_specialized_super(
+        &mut self,
+        block: BlockId,
+        insn_id: InsnId,
+        recv: InsnId,
+        cd: *const rb_call_data,
+        args: Vec<InsnId>,
+        state: InsnId,
+        current_cme: *const rb_callable_method_entry_t,
+        frame_state_iseq: IseqPtr,
+        guards: SuperGuards,
+    ) {
+        let ci = unsafe { (*cd).ci };
+        // Get defined_class and method ID from the profiled CME.
+        let current_defined_class = unsafe { (*current_cme).defined_class };
+        let mid = unsafe { get_def_original_id((*current_cme).def) };
+
+        // Compute superclass: RCLASS_SUPER(RCLASS_ORIGIN(defined_class))
+        let superclass = unsafe { rb_class_get_superclass(RCLASS_ORIGIN(current_defined_class)) };
+        if superclass.nil_p() {
+            self.push_insn_id(block, insn_id);
+            self.set_dynamic_send_reason(insn_id, SuperClassNotFound);
+            return;
+        }
+
+        // Look up the super method.
+        let mut super_cme = unsafe { rb_callable_method_entry(superclass, mid) };
+        if super_cme.is_null() {
+            self.push_insn_id(block, insn_id);
+            self.set_dynamic_send_reason(insn_id, SuperTargetNotFound);
+            return;
+        }
+
+        let mut def_type = unsafe { get_cme_def_type(super_cme) };
+        while def_type == VM_METHOD_TYPE_ALIAS {
+            super_cme = unsafe { rb_aliased_callable_method_entry(super_cme) };
+            def_type = unsafe { get_cme_def_type(super_cme) };
+        }
+
+        if def_type == VM_METHOD_TYPE_ISEQ {
+            // Check if the super method's parameters support direct send.
+            // If not, we can't do direct dispatch.
+            let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
+            // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
+            let caller_args = CallerArguments::new(&args, ci);
+            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false)
+                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
+                self.push_insn_id(block, insn_id); return;
+            };
+
+            self.emit_super_call_guards(block, super_cme, current_cme, mid, state, frame_state_iseq, guards);
+
+            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                self.emit_send_direct_args(block, call, &args, state);
+            // Use SendDirect with the super method's CME and ISEQ.
+            let replacement = self.push_insn(block, Insn::SendDirect(Box::new(SendDirectData {
+                recv,
+                cd,
+                cme: super_cme,
+                iseq: super_iseq,
+                args: send_args,
+                kw_bits,
+                jit_entry_idx,
+                state: send_state,
+                block: None,
+            })));
+            self.make_equal_to(insn_id, replacement);
+
+        } else if def_type == VM_METHOD_TYPE_CFUNC {
+            let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
+            let cfunc_argc = unsafe { get_mct_argc(cfunc) };
+            let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
+
+            let props = ZJITState::get_method_annotations().get_cfunc_properties(super_cme);
+            if props.is_none() && get_option!(stats) {
+                self.count_not_annotated_cfunc(block, super_cme);
+            }
+            let props = props.unwrap_or_default();
+
+            match cfunc_argc {
+                // C function with fixed argument count.
+                0.. => {
+                    // Check argc matches
+                    if args.len() != cfunc_argc as usize {
+                        self.push_insn_id(block, insn_id);
+                        self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
+                        return;
+                    }
+                    self.emit_super_call_guards(block, super_cme, current_cme, mid, state, frame_state_iseq, guards);
+
+                    // Try inlining the cfunc into HIR
+                    let tmp_block = self.new_block(u32::MAX);
+                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
+                        // Copy contents of tmp_block to block
+                        assert_ne!(block, tmp_block);
+                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
+                        self.blocks[block].insns.extend(insns);
+                        self.count(block, Counter::inline_cfunc_optimized_send_count);
+                        self.make_equal_to(insn_id, replacement);
+                        self.infer_inlined_type(replacement);
+                        self.remove_block(tmp_block);
+                        return;
+                    }
+
+                    // Use CCallWithFrame for the C function.
+                    let name = unsafe { (*super_cme).called_id };
+                    let owner = unsafe { (*super_cme).owner };
+                    let return_type = props.return_type;
+                    let elidable = props.elidable;
+                    // Filter for a leaf and GC free function
+                    let ccall = if props.leaf && props.no_gc {
+                        self.count(block, Counter::inline_cfunc_optimized_send_count);
+                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
+                    } else {
+                        if get_option!(stats) {
+                            self.count_not_inlined_cfunc(block, super_cme);
+                        }
+                        self.push_insn(block, Insn::CCallWithFrame(Box::new(CCallWithFrameData {
+                            cd,
+                            cfunc: cfunc_ptr,
+                            recv,
+                            args,
+                            cme: super_cme,
+                            name,
+                            state,
+                            return_type,
+                            elidable,
+                            block: None,
+                        })))
+                    };
+                    self.make_equal_to(insn_id, ccall);
+                }
+
+                // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
+                -1 => {
+                    self.emit_super_call_guards(block, super_cme, current_cme, mid, state, frame_state_iseq, guards);
+
+                    // Try inlining the cfunc into HIR
+                    let tmp_block = self.new_block(u32::MAX);
+                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
+                        // Copy contents of tmp_block to block
+                        assert_ne!(block, tmp_block);
+                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
+                        self.blocks[block].insns.extend(insns);
+                        self.count(block, Counter::inline_cfunc_optimized_send_count);
+                        self.make_equal_to(insn_id, replacement);
+                        self.infer_inlined_type(replacement);
+                        self.remove_block(tmp_block);
+                        return;
+                    }
+
+                    // Use CCallVariadic for the variadic C function.
+                    let name = unsafe { (*super_cme).called_id };
+                    let owner = unsafe { (*super_cme).owner };
+                    let return_type = props.return_type;
+                    let elidable = props.elidable;
+                    // Filter for a leaf and GC free function
+                    let ccall = if props.leaf && props.no_gc {
+                        self.count(block, Counter::inline_cfunc_optimized_send_count);
+                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
+                    } else {
+                        if get_option!(stats) {
+                            self.count_not_inlined_cfunc(block, super_cme);
+                        }
+                        self.push_insn(block, Insn::CCallVariadic(Box::new(CCallVariadicData {
+                            cfunc: cfunc_ptr,
+                            recv,
+                            args,
+                            cme: super_cme,
+                            name,
+                            state,
+                            return_type,
+                            elidable,
+                            block: None,
+                        })))
+                    };
+                    self.make_equal_to(insn_id, ccall);
+                }
+
+                // Array-variadic: (self, args_ruby_array).
+                -2 => {
+                    self.push_insn_id(block, insn_id);
+                    self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::Cfunc));
+                    return;
+                }
+                _ => unreachable!("unknown cfunc argc: {}", cfunc_argc)
+            }
+        } else {
+            // Other method types (not ISEQ or CFUNC)
+            self.push_insn_id(block, insn_id);
+            self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::from(def_type)));
+            return;
+        }
+    }
+
     /// Rewrite eligible Send opcodes into SendDirect
     /// opcodes if we know the target ISEQ statically. This removes run-time method lookups and
     /// opens the door for inlining.
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
-        for block in self.reverse_post_order() {
-            let old_insns = std::mem::take(&mut self.blocks[block].insns);
-            assert!(self.blocks[block].insns.is_empty());
+        for entry_block in self.reverse_post_order() {
+            let old_insns = std::mem::take(&mut self.blocks[entry_block].insns);
+            assert!(self.blocks[entry_block].insns.is_empty());
+            // Rewriting an instruction into a branch splits the block: everything after it,
+            // including the original terminator, is emitted into the join block instead.
+            let mut block = entry_block;
             for insn_id in old_insns {
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
@@ -5989,10 +6393,7 @@ impl Function {
                                                 fun.blocks[block].insns.extend(insns);
                                                 fun.count(block, Counter::inline_cfunc_optimized_send_count);
                                                 fun.make_equal_to(send_insn_id, replacement);
-                                                if fun.type_of(replacement).bit_equal(types::Any) {
-                                                    // Not set yet; infer type
-                                                    fun.insn_types[replacement] = fun.infer_type(replacement);
-                                                }
+                                                fun.infer_inlined_type(replacement);
                                                 fun.remove_block(tmp_block);
                                                 return Ok(());
                                             }
@@ -6056,10 +6457,7 @@ impl Function {
                                                 fun.blocks[block].insns.extend(insns);
                                                 fun.count(block, Counter::inline_cfunc_optimized_send_count);
                                                 fun.make_equal_to(send_insn_id, replacement);
-                                                if fun.type_of(replacement).bit_equal(types::Any) {
-                                                    // Not set yet; infer type
-                                                    fun.insn_types[replacement] = fun.infer_type(replacement);
-                                                }
+                                                fun.infer_inlined_type(replacement);
                                                 fun.remove_block(tmp_block);
                                                 return Ok(());
                                             }
@@ -6147,67 +6545,18 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                         };
                     }
+                    Insn::InvokeSuper { reason: SendFallbackReason::SuperChainFallback, .. } => {
+                        // The fallthrough of a dispatch chain a previous pass built. Every method
+                        // entry the profile knows about already has an arm, so the profile has
+                        // nothing left to say about what reaches here; re-specializing it would
+                        // only nest a second copy of the same chain.
+                        self.push_insn_id(block, insn_id);
+                    }
                     &Insn::InvokeSuper { recv, cd, blockiseq, state, .. } => {
-                        // Helper to emit common guards for super call optimization.
-                        fn emit_super_call_guards(
-                            fun: &mut Function,
-                            block: BlockId,
-                            super_cme: *const rb_callable_method_entry_t,
-                            current_cme: *const rb_callable_method_entry_t,
-                            mid: ID,
-                            state: InsnId,
-                            local_iseq: IseqPtr,
-                        ) {
-                            fun.push_insn(block, Insn::PatchPoint {
-                                invariant: Invariant::MethodRedefined {
-                                    klass: unsafe { (*super_cme).defined_class },
-                                    method: mid,
-                                    cme: super_cme
-                                },
-                                state
-                            });
-
-                            // Get the EP of the ISeq of the containing method, or "local level", skipping over block-level EPs.
-                            // Equivalent of GET_LEP() macro. The iseq is the FrameState's, not the
-                            // outer compilation's, so that an inlined super call walks from the
-                            // callee's CFP rather than the caller's.
-                            let level = get_lvar_level(local_iseq);
-                            let lep = fun.get_ep(block, level);
-                            // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
-                            let me_cref = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
-                            // The slot holds an imemo_svar wrapping the method entry once the
-                            // frame has touched a special variable, so read through it the same
-                            // way rb_vm_frame_method_entry (and so the profile) does.
-                            let method_entry = fun.push_insn(block, Insn::UnwrapSvar { val: me_cref });
-                            // Guard that it matches the expected CME. Recompile on a miss: the
-                            // profiled CME is not always the one the frame runs with, and exiting
-                            // on every call is far worse than dispatching super dynamically.
-                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: Some(Recompile) });
-
-                            let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
-                            fun.push_insn(block, Insn::GuardBitEquals {
-                                val: block_handler,
-                                expected: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)),
-                                reason: Box::new(SideExitReason::UnhandledBlockArg),
-                                state,
-                                recompile: Some(Recompile),
-                            });
-                        }
-
                         // Don't handle calls with literal blocks (e.g., super { ... })
                         if !blockiseq.is_null() {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
-                            continue;
-                        }
-
-                        // Specializing `super` requires guarding the frame's method entry against
-                        // one CME. When a previous version's guard kept missing and we have run
-                        // out of versions, stop guessing and dispatch `super` dynamically: staying
-                        // in JIT code costs far less than side-exiting on every call.
-                        if self.policy.no_side_exits {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperMethodEntryUnstable);
                             continue;
                         }
 
@@ -6241,212 +6590,51 @@ impl Function {
                             continue;
                         }
 
-                        // Use frame_state_iseq so that an inlined super call looks up its
-                        // profiled CME against the callee's payload rather than the outer
-                        // compilation's. The runtime guard walks from the live CFP, which is
-                        // the callee's CFP for inlined code, so the profile lookup must agree.
-                        let local_payload = get_or_create_iseq_payload(frame_state_iseq);
-                        let Some(current_cme) = local_payload.profile.get_super_method_entry(frame_state_insn_idx) else {
-                            self.push_insn_id(block, insn_id);
-
-                            // The absence of the super CME could be due to a missing profile, but
-                            // if we've made it this far the value would have been deleted, indicating
-                            // that the call is at least polymorphic and possibly megamorphic.
-                            self.set_dynamic_send_reason(insn_id, SuperPolymorphic);
-                            continue;
-                        };
-
-                        // Get defined_class and method ID from the profiled CME.
-                        let current_defined_class = unsafe { (*current_cme).defined_class };
-                        let mid = unsafe { get_def_original_id((*current_cme).def) };
-
-                        // Compute superclass: RCLASS_SUPER(RCLASS_ORIGIN(defined_class))
-                        let superclass = unsafe { rb_class_get_superclass(RCLASS_ORIGIN(current_defined_class)) };
-                        if superclass.nil_p() {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperClassNotFound);
-                            continue;
-                        }
-
-                        // Look up the super method.
-                        let mut super_cme = unsafe { rb_callable_method_entry(superclass, mid) };
-                        if super_cme.is_null() {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperTargetNotFound);
-                            continue;
-                        }
-
-                        let mut def_type = unsafe { get_cme_def_type(super_cme) };
-                        while def_type == VM_METHOD_TYPE_ALIAS {
-                            super_cme = unsafe { rb_aliased_callable_method_entry(super_cme) };
-                            def_type = unsafe { get_cme_def_type(super_cme) };
-                        }
-
                         let args = match resolved.insn(self) {
                             Insn::InvokeSuper { args, .. } => args.to_vec(),
                             _ => unreachable!("expected InvokeSuper insn"),
                         };
 
-                        if def_type == VM_METHOD_TYPE_ISEQ {
-                            // Check if the super method's parameters support direct send.
-                            // If not, we can't do direct dispatch.
-                            let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-                            // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
-                            let caller_args = CallerArguments::new(&args, ci);
-                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false)
-                                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
-                                self.push_insn_id(block, insn_id); continue;
-                            };
-
-                            emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
-
-                            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
-                                self.emit_send_direct_args(block, call, &args, state);
-                            // Use SendDirect with the super method's CME and ISEQ.
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
-                                recv,
-                                cd,
-                                cme: super_cme,
-                                iseq: super_iseq,
-                                args: send_args,
-                                kw_bits,
-                                jit_entry_idx,
-                                state: send_state,
-                                block: None,
-                            })));
-                            self.make_equal_to(insn_id, replacement);
-
-                        } else if def_type == VM_METHOD_TYPE_CFUNC {
-                            let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
-                            let cfunc_argc = unsafe { get_mct_argc(cfunc) };
-                            let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
-
-                            let props = ZJITState::get_method_annotations().get_cfunc_properties(super_cme);
-                            if props.is_none() && get_option!(stats) {
-                                self.count_not_annotated_cfunc(block, super_cme);
-                            }
-                            let props = props.unwrap_or_default();
-
-                            match cfunc_argc {
-                                // C function with fixed argument count.
-                                0.. => {
-                                    // Check argc matches
-                                    if args.len() != cfunc_argc as usize {
-                                        self.push_insn_id(block, insn_id);
-                                        self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
-                                        continue;
-                                    }
-                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
-
-                                    // Try inlining the cfunc into HIR
-                                    let tmp_block = self.new_block(u32::MAX);
-                                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
-                                        // Copy contents of tmp_block to block
-                                        assert_ne!(block, tmp_block);
-                                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
-                                        self.blocks[block].insns.extend(insns);
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement] = self.infer_type(replacement);
-                                        }
-                                        self.remove_block(tmp_block);
-                                        continue;
-                                    }
-
-                                    // Use CCallWithFrame for the C function.
-                                    let name = unsafe { (*super_cme).called_id };
-                                    let owner = unsafe { (*super_cme).owner };
-                                    let return_type = props.return_type;
-                                    let elidable = props.elidable;
-                                    // Filter for a leaf and GC free function
-                                    let ccall = if props.leaf && props.no_gc {
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
-                                    } else {
-                                        if get_option!(stats) {
-                                            self.count_not_inlined_cfunc(block, super_cme);
-                                        }
-                                        self.push_insn(block, Insn::CCallWithFrame(Box::new(CCallWithFrameData {
-                                            cd,
-                                            cfunc: cfunc_ptr,
-                                            recv,
-                                            args,
-                                            cme: super_cme,
-                                            name,
-                                            state,
-                                            return_type,
-                                            elidable,
-                                            block: None,
-                                        })))
-                                    };
-                                    self.make_equal_to(insn_id, ccall);
-                                }
-
-                                // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
-                                -1 => {
-                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
-
-                                    // Try inlining the cfunc into HIR
-                                    let tmp_block = self.new_block(u32::MAX);
-                                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
-                                        // Copy contents of tmp_block to block
-                                        assert_ne!(block, tmp_block);
-                                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
-                                        self.blocks[block].insns.extend(insns);
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement] = self.infer_type(replacement);
-                                        }
-                                        self.remove_block(tmp_block);
-                                        continue;
-                                    }
-
-                                    // Use CCallVariadic for the variadic C function.
-                                    let name = unsafe { (*super_cme).called_id };
-                                    let owner = unsafe { (*super_cme).owner };
-                                    let return_type = props.return_type;
-                                    let elidable = props.elidable;
-                                    // Filter for a leaf and GC free function
-                                    let ccall = if props.leaf && props.no_gc {
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
-                                    } else {
-                                        if get_option!(stats) {
-                                            self.count_not_inlined_cfunc(block, super_cme);
-                                        }
-                                        self.push_insn(block, Insn::CCallVariadic(Box::new(CCallVariadicData {
-                                            cfunc: cfunc_ptr,
-                                            recv,
-                                            args,
-                                            cme: super_cme,
-                                            name,
-                                            state,
-                                            return_type,
-                                            elidable,
-                                            block: None,
-                                        })))
-                                    };
-                                    self.make_equal_to(insn_id, ccall);
-                                }
-
-                                // Array-variadic: (self, args_ruby_array).
-                                -2 => {
-                                    self.push_insn_id(block, insn_id);
-                                    self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::Cfunc));
-                                    continue;
-                                }
-                                _ => unreachable!("unknown cfunc argc: {}", cfunc_argc)
-                            }
-                        } else {
-                            // Other method types (not ISEQ or CFUNC)
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::from(def_type)));
+                        // An arm of a `super` dispatch chain already knows the method entry its
+                        // branch tested for, so it specializes against that instead of the
+                        // profile and never builds a chain of its own.
+                        if let Some(&arm_cme) = self.super_cme_dispatch.get(&insn_id) {
+                            self.emit_specialized_super(block, insn_id, recv, cd, args, state, arm_cme, frame_state_iseq, SuperGuards::ChainArm);
                             continue;
                         }
+
+                        // Use frame_state_iseq so that an inlined super call looks up its
+                        // profiled CME against the callee's payload rather than the outer
+                        // compilation's. The runtime guard walks from the live CFP, which is
+                        // the callee's CFP for inlined code, so the profile lookup must agree.
+                        let local_payload = get_or_create_iseq_payload(frame_state_iseq);
+                        let summary = local_payload.profile.get_super_method_entries(frame_state_insn_idx);
+
+                        // A site the profile saw run with exactly one method entry, in a version
+                        // that may still recompile, keeps the cheapest shape: guard the frame's
+                        // method entry against that one CME and fall out of JIT code on a miss.
+                        if let Some(summary) = summary.as_ref().filter(|s| s.is_monomorphic() && !self.policy.no_side_exits) {
+                            let current_cme = summary.bucket(0).class().0 as *const rb_callable_method_entry_t;
+                            self.emit_specialized_super(block, insn_id, recv, cd, args, state, current_cme, frame_state_iseq, SuperGuards::Full);
+                            continue;
+                        }
+
+                        // Otherwise dispatch on the frame's method entry: one arm per profiled
+                        // entry, each resolving `super` from its own defining class, with a
+                        // dynamic `super` as the fallthrough. This covers the two cases a single
+                        // guard cannot: a `super` in a method body that more than one class runs
+                        // (a module method reached through several includers is the usual
+                        // source), and a final version that may not side-exit, where the same
+                        // comparison has to branch rather than leave JIT code.
+                        let Some(cmes) = summary.as_ref().and_then(super_chain_entries) else {
+                            self.push_insn_id(block, insn_id);
+                            // Either the site has no profile at all, or it ran with more method
+                            // entries than a chain can cover.
+                            self.set_dynamic_send_reason(insn_id, if self.policy.no_side_exits { SuperMethodEntryUnstable } else { SuperPolymorphic });
+                            continue;
+                        };
+
+                        block = self.emit_super_chain(block, insn_id, recv, cd, blockiseq, args, state, &cmes, frame_state_iseq);
                     }
                     _ => { self.push_insn_id(block, insn_id); }
                 }
