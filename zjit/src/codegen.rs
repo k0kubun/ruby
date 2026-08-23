@@ -25,7 +25,7 @@ use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Co
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
 use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{self, iseq_to_hir, iseq_to_hir_exception, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
-use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
+use crate::hir::{BlockHandler, callee_passes_kw_bits_arg, CCallVariadicData, CCallWithFrameData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
 use crate::options::{get_option, InlineDepth, PerfMap, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
@@ -2843,7 +2843,11 @@ fn gen_send_iseq_direct(
     // We write this to the local table slot at bits_start so that:
     // 1. The interpreter can read it via checkkeyword if we side-exit
     // 2. The JIT entry can read it from the callee frame slot
-    if unsafe { rb_get_iseq_flags_has_kw(iseq) } {
+    // A callee whose `kw_bits` slot is followed by a `**rest` local takes the bitmask as an
+    // ordinary argument instead, which both writes the right frame slot when the arguments
+    // are spilled in local order and lets the JIT entry read it as a parameter. See
+    // `callee_passes_kw_bits_arg`.
+    if unsafe { rb_get_iseq_flags_has_kw(iseq) } && !callee_passes_kw_bits_arg(iseq) {
         let keyword = unsafe { rb_get_iseq_body_param_keyword(iseq) };
         let bits_start = unsafe { (*keyword).bits_start } as usize;
         let unspecified_bits = VALUE::fixnum_from_usize(kw_bits as usize);

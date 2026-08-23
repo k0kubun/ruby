@@ -2998,7 +2998,14 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
                                        { count_failure(complex_arg_pass_param_forwardable) }
     if callee_has_block_param && caller_passes_block_arg
                                        { count_failure(complex_arg_pass_param_block) }
-    if 0 != params.flags.has_kwrest()  { count_failure(complex_arg_pass_param_kwrest) }
+    // A `**rest` parameter collects the caller keywords the callee's keyword table does not
+    // name, which `plan_send_direct_keyword_arguments` can build as one more Hash argument.
+    // `def foo(**)` is left out: `args_setup_kw_rest_parameter` leaves the anonymous slot nil
+    // rather than allocating an empty Hash when no keywords are passed, and `ruby2_keywords`
+    // needs the VM to move RHASH_PASS_AS_KEYWORDS across the call.
+    let has_kwrest = 0 != params.flags.has_kwrest();
+    if has_kwrest && (0 != params.flags.anon_kwrest() || 0 != params.flags.ruby2_keywords())
+                                       { count_failure(complex_arg_pass_param_kwrest) }
 
     // If the caller passes a block (literal or &block), we need to fall back to the
     // interpreter for two cases it handles that we don't:
@@ -3090,9 +3097,12 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
     // After keyword-to-positional-hash, SendDirect receives no keyword slots;
     // the caller keywords are represented by one extra positional Hash.
     let effective_keyword_count = if keywords_as_positional_hash { 0 } else { caller_kw_count };
+    // With `**rest` the caller may name more keywords than the table has; the extras end up
+    // in the Hash. Every required keyword still has to be there, which the planning below
+    // rechecks by name.
     let keyword_ok = c_int::try_from(effective_keyword_count)
         .as_ref()
-        .map(|argc| (kw_req_num..=kw_total_num).contains(argc))
+        .map(|argc| if has_kwrest { (kw_req_num..).contains(argc) } else { (kw_req_num..=kw_total_num).contains(argc) })
         .unwrap_or(false);
     if !keyword_ok {
         return Err(SendDirectFailure::new(ArgcParamMismatch));
@@ -3106,7 +3116,9 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
     // Without *rest, use the converted positional count so the synthesized
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
-    let send_argc = send_positional_argc + kw_total_num as usize;
+    // `callee_passes_kw_bits_arg` adds one more slot for the hidden `kw_bits` local.
+    let send_argc = send_positional_argc + kw_total_num as usize + usize::from(has_kwrest)
+        + usize::from(callee_passes_kw_bits_arg(iseq));
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
@@ -5438,8 +5450,10 @@ impl Function {
         let callee_kw_table = unsafe { (*callee_keyword).table };
         let default_values = unsafe { (*callee_keyword).default_values };
 
-        // Caller can't provide more keywords than callee expects (no **kwrest support yet).
-        if caller_kw_count > callee_kw_count {
+        // A `**rest` parameter soaks up whatever the keyword table does not name, so the
+        // caller is free to pass more keywords than there are slots. Without one, it is not.
+        let has_kwrest = 0 != unsafe { iseq.params() }.flags.has_kwrest();
+        if !has_kwrest && caller_kw_count > callee_kw_count {
             return Err(SendDirectKeywordCountMismatch);
         }
 
@@ -5458,19 +5472,21 @@ impl Function {
 
         // Verify all caller keywords are expected by callee (no unknown keywords).
         // Without **kwrest, unexpected keywords should raise ArgumentError at runtime.
-        for &caller_id in &caller_kw_order {
-            let mut found = false;
-            for i in 0..callee_kw_count {
-                let expected_id = unsafe { *callee_kw_table.add(i) };
-                if caller_id == expected_id {
-                    found = true;
-                    break;
+        if !has_kwrest {
+            for &caller_id in &caller_kw_order {
+                let mut found = false;
+                for i in 0..callee_kw_count {
+                    let expected_id = unsafe { *callee_kw_table.add(i) };
+                    if caller_id == expected_id {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            if !found {
-                // Caller is passing an unknown keyword - this will raise ArgumentError.
-                // Fall back to VM dispatch to handle the error.
-                return Err(SendDirectKeywordMismatch);
+                if !found {
+                    // Caller is passing an unknown keyword - this will raise ArgumentError.
+                    // Fall back to VM dispatch to handle the error.
+                    return Err(SendDirectKeywordMismatch);
+                }
             }
         }
 
@@ -5523,6 +5539,27 @@ impl Function {
 
         // Replace the keyword arguments with the reordered ones.
         processed_args.extend(reordered_kw_args);
+
+        // `**rest` takes the keywords the loop above did not claim, in the order the caller
+        // wrote them, which is what `make_rest_kw_hash` builds from the leftover slots. The
+        // Hash is always allocated, even when nothing is left over.
+        if has_kwrest {
+            let mut leftover = Vec::with_capacity(keyword_values.len() * 2);
+            for (idx, value) in keyword_values.into_iter().enumerate() {
+                let Some(value) = value else { continue };
+                let keyword = unsafe { get_cikw_keywords_idx(kwarg, idx as i32) };
+                leftover.push(SendDirectArg::Constant(keyword));
+                leftover.push(value);
+            }
+            // The hidden `kw_bits` local sits between the keyword slots and `**rest` in the
+            // callee's local table, so it needs an argument of its own to keep the argument
+            // list in local order. See `callee_passes_kw_bits_arg`.
+            if callee_passes_kw_bits_arg(iseq) {
+                processed_args.push(SendDirectArg::Constant(VALUE::fixnum_from_usize(kw_bits as usize)));
+            }
+            processed_args.push(SendDirectArg::KeywordHash(leftover));
+        }
+
         Ok((processed_args, kw_bits))
     }
 
@@ -5548,7 +5585,8 @@ impl Function {
         let lead_num = params.lead_num as usize;
         let opt_num = params.opt_num as usize;
         let post_num = params.post_num as usize;
-        let kw_num = callee_kw_num(iseq);
+        let kw_num = callee_kw_num(iseq) + usize::from(params.flags.has_kwrest() != 0)
+            + usize::from(callee_passes_kw_bits_arg(iseq));
 
         let positional_argc = args.len().checked_sub(kw_num).ok_or(ArgcParamMismatch)?;
         let min_positional_argc = lead_num + post_num;
@@ -7623,6 +7661,12 @@ impl Function {
                 let post_num = callee_params.post_num as usize;
                 let kw_num = callee_kw_num(iseq);
                 let rest_slots = usize::from(callee_params.flags.has_rest() != 0);
+                // `**rest` and, when it follows named keywords, the hidden `kw_bits` slot
+                // take argument slots of their own, so they map to args like any other
+                // parameter local. `can_inline` rejects `**rest` callees today, so these are
+                // zero; they keep the mapping right if it ever stops rejecting them.
+                let kwrest_slots = usize::from(callee_params.flags.has_kwrest() != 0);
+                let kw_bits_arg_slots = usize::from(callee_passes_kw_bits_arg(iseq));
                 let passed_opt_num = jit_entry_idx as usize;
 
                 // Create the continuation block before translating the callee so it
@@ -7696,7 +7740,8 @@ impl Function {
                 debug_assert!(self.is_send_direct(tail[0]));
 
                 let omitted_opt_num = opt_num - passed_opt_num;
-                let positional_kw_end = lead_num + opt_num + rest_slots + post_num + kw_num;
+                let positional_kw_end =
+                    lead_num + opt_num + rest_slots + post_num + kw_num + kw_bits_arg_slots + kwrest_slots;
                 let kw_bits_local_idx = callee_kw_bits_local_idx(iseq);
                 let callee_entry_body_block = add_result.body_entry_block
                     .expect("inlined compilation always produces a body entry block");
@@ -10613,6 +10658,23 @@ fn callee_kw_bits_local_idx(iseq: *const rb_iseq_t) -> Option<usize> {
     Some(unsafe { (*keyword).bits_start } as usize)
 }
 
+/// True when a SendDirect to `iseq` hands the callee's hidden `kw_bits` slot an argument of
+/// its own instead of leaving it out of the argument list.
+///
+/// The parameter locals run `(lead, opt, rest, post, kw..., kw_bits, kwrest)`, so a `**rest`
+/// parameter sits directly above `kw_bits`. Leaving the hidden slot out of the arguments is
+/// only invisible while the arguments stay in registers: every path that lays them out in
+/// local order -- `gen_function_stub`'s spill before exiting to the interpreter, and the
+/// inliner's local mapping -- would put the `**rest` Hash in the `kw_bits` slot and leave the
+/// `**rest` local holding whatever the VM stack already had there. So `kw_bits` becomes a
+/// real argument for these callees, and the caller's separate store into the frame goes away.
+///
+/// A `**rest` callee with no named keywords has no `kw_bits` slot at all, so its `**rest`
+/// Hash is already the argument that lines up with its local.
+pub fn callee_passes_kw_bits_arg(iseq: *const rb_iseq_t) -> bool {
+    callee_kw_bits_local_idx(iseq).is_some() && 0 != unsafe { iseq.params() }.flags.has_kwrest()
+}
+
 /// If we can't handle the type of send (yet), bail out.
 fn unhandled_call_type(flags: u32) -> Result<(), CallType> {
     if (flags & VM_CALL_TAILCALL) != 0 { return Err(CallType::Tailcall); }
@@ -13332,6 +13394,12 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         None
     };
 
+    // A callee with both named keywords and `**rest` takes `kw_bits` as an ordinary
+    // argument instead of reading it back out of the frame; see `callee_passes_kw_bits_arg`.
+    // This has to agree with `gen_send_iseq_direct`, which stops storing the bitmask into
+    // the frame for exactly these callees, or the argument list would be off by one.
+    let kw_bits_is_arg = callee_passes_kw_bits_arg(iseq);
+
     let mut arg_idx: u32 = 0;
     // For `def` methods on classes that can only produce heap (non-immediate)
     // instances, `self` is a HeapBasicObject. See `iseq_self_is_heap_object`.
@@ -13344,7 +13412,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         let local = if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) {
             // Omitted optionals are locals, so they start as nils before their code run
             fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) })
-        } else if Some(local_idx) == kw_bits_idx {
+        } else if Some(local_idx) == kw_bits_idx && !kw_bits_is_arg {
             // Read the kw_bits value written by the caller to the callee frame.
             // This tells us which optional keywords were NOT provided and need their defaults evaluated.
             // Note: The caller writes kw_bits to memory via gen_send_iseq_direct but does NOT pass it
