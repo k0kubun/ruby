@@ -202,6 +202,18 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         StableBucket::Full
     }
 
+    /// Drop every bucket but bucket 0, and forget the items that did not fit in one, leaving the
+    /// distribution as if only bucket 0's item had ever been observed.
+    ///
+    /// [`crate::profile::IseqProfile::observe_ivar_fallback`] is the only caller: a profile whose
+    /// buckets are all spoken for by shapes an ISEQ saw at boot cannot record the shape that would
+    /// fix a site missing now, so the choice is between forgetting the cold ones and never
+    /// specializing the site again.
+    pub fn retain_primary(&mut self) {
+        self.tail = None;
+        self.other = 0;
+    }
+
     /// Every item in a non-empty bucket, bucket 0 first.
     ///
     /// Mirrors [`Self::each_item_mut`] in reaching into the boxed tail once rather
