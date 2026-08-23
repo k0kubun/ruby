@@ -466,24 +466,42 @@ pub fn cache_for(cd: *const rb_call_data, reason: crate::hir::SendFallbackReason
     }
 
     let ci = unsafe { (*cd).ci };
-    let flags = unsafe { vm_ci_flag(ci) };
+    // See the module docs: excluded to keep the keyword count out of the key.
+    if !unsafe { rb_vm_ci_kwarg(ci) }.is_null() {
+        return None;
+    }
 
+    cache_for_shape(SendCacheKey {
+        mid: unsafe { vm_ci_mid(ci) },
+        argc: unsafe { vm_ci_argc(ci) },
+        flags: unsafe { vm_ci_flag(ci) },
+    })
+}
+
+/// Whether a call shape may have a table, independently of whether one exists yet.
+///
+/// Split out of [`cache_for_shape`] so that HIR can decide to compile a send through the table
+/// without allocating one from a pass that may be re-run. See
+/// [`crate::hir::Function::push_symbol_block_mega`].
+pub fn shape_servable(key: SendCacheKey) -> bool {
+    if get_option!(disable_send_cache) {
+        return false;
+    }
     // `super` does not resolve through `vm_search_method_fastpath` at all, and
     // `...` forwarding rewrites the call data before dispatching; neither reaches
     // the helper this table feeds.
-    if flags & (VM_CALL_SUPER | VM_CALL_ZSUPER | VM_CALL_FORWARDING) != 0 {
-        return None;
+    if key.flags & (VM_CALL_SUPER | VM_CALL_ZSUPER | VM_CALL_FORWARDING) != 0 {
+        return false;
     }
     // See the module docs: excluded to keep the keyword count out of the key.
-    if flags & VM_CALL_KWARG != 0 || !unsafe { rb_vm_ci_kwarg(ci) }.is_null() {
-        return None;
-    }
+    key.flags & VM_CALL_KWARG == 0
+}
 
-    Some(send_cache_for(SendCacheKey {
-        mid: unsafe { vm_ci_mid(ci) },
-        argc: unsafe { vm_ci_argc(ci) },
-        flags,
-    }))
+/// The table for a call shape, creating it on first use, or `None` when the shape rules a table
+/// out. Unlike [`cache_for`] this takes the shape directly, for a send ZJIT synthesized rather
+/// than read out of a call site -- see [`crate::codegen::gen_send_symbol_block_mega`].
+pub fn cache_for_shape(key: SendCacheKey) -> Option<*const SendCache> {
+    shape_servable(key).then(|| send_cache_for(key))
 }
 
 /// Mark the callcaches every table holds. Called from
