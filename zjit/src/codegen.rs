@@ -1774,15 +1774,27 @@ fn gen_send_megamorphic_direct(
     let klass_to_hash = asm.load(Opnd::mem(64, recv_reg, RUBY_OFFSET_RBASIC_KLASS));
     let klass = asm.load(Opnd::mem(64, recv_reg, RUBY_OFFSET_RBASIC_KLASS));
 
-    // Fibonacci hash, taking the slot index out of the product's high bits. This
-    // has to agree with `zjit_send_cache_slot()` in vm_insnhelper.c and
-    // `SendCache::slot_of`, or the probe would read slots the helper never fills.
+    // Fibonacci hash, scaled to the table's length. This has to agree with
+    // `crate::send_cache::slot_of` and `zjit_send_cache_slot()` in
+    // vm_insnhelper.c, or the probe would read slots the helper never fills.
+    //
+    // The table's length and address are loaded from its header rather than
+    // baked in, because a table that thrashes is replaced by a bigger one
+    // (`SendCache::grow`) and this probe has to follow it there. Both live in
+    // the header's first cache line, which every site of this call shape shares
+    // and keeps hot. Scaling by a loaded length is why the index comes out of a
+    // second multiply rather than out of a shift: see `slot_of` for why the top
+    // bits, and only the top bits, may be used.
     let entry_size = layout.entry_size;
     assert!(entry_size.is_power_of_two(), "send cache entry size must be a power of two");
+    let header = asm.load(Opnd::const_ptr(unsafe { (*cache).header_ptr() }));
+    let len = asm.load(Opnd::mem(32, header, layout.cache_len));
     let hash = asm.mul(klass_to_hash, Opnd::UImm(SEND_CACHE_HASH_MULT));
-    let index = asm.urshift(hash, Opnd::UImm(unsafe { (*cache).shift() } as u64));
+    let top = asm.urshift(hash, Opnd::UImm(32));
+    let scaled = asm.mul(top, len.with_num_bits(64));
+    let index = asm.urshift(scaled, Opnd::UImm(32));
     let byte_offset = asm.lshift(index, Opnd::UImm(entry_size.trailing_zeros() as u64));
-    let slot = asm.add(byte_offset, Opnd::const_ptr(unsafe { (*cache).slots_ptr() }));
+    let slot = asm.add(byte_offset, Opnd::mem(64, header, layout.cache_slots));
 
     asm_comment!(asm, "check the cached callcache against the receiver's class");
     let cc = asm.load(Opnd::mem(64, slot, 0));
