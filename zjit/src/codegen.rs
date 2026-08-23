@@ -3769,6 +3769,8 @@ fn gen_guard_bit_equals(jit: &mut JITState, asm: &mut Assembler, function: &Func
         hir::Const::CInt64(v) => { v.into() }
         hir::Const::CPtr(v) => { Opnd::const_ptr(v) }
         hir::Const::CShape(v) => { Opnd::UImm(v.0 as u64) }
+        // `Insn::HasAncestor` and friends produce a full-width 0 or 1.
+        hir::Const::CBool(v) => { Opnd::UImm(v as u64) }
         _ => panic!("gen_guard_bit_equals: unexpected hir::Const {expected:?}"),
     };
     asm.cmp(val, expected_opnd);
