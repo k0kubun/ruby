@@ -577,6 +577,171 @@ fn test_forwardable_callee_super() {
 }
 
 #[test]
+fn test_inlined_forwarder_positional_args() {
+    // The forwarder is inlined into its caller, so the `bar(...)` inside it sees the caller's
+    // callinfo at compile time and becomes a direct call to `target`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b) = a - b
+        def fwd(...) = target(...)
+        def entry = fwd(7, 2)
+        200.times { entry }
+        entry
+    ")), @"5");
+}
+
+#[test]
+fn test_inlined_forwarder_keyword_args() {
+    // `vm_caller_setup_fwd_args` gives the merged callinfo the *caller's* keyword table, so the
+    // expanded call has to bind the trailing arguments as keywords, not as positionals.
+    assert_snapshot!(with_inlining(|| assert_inlines(r#"
+        def target(a, b:, c: 3) = [a, b, c]
+        def fwd(...) = target(...)
+        def entry = [fwd(1, b: 2), fwd(1, c: 9, b: 2)]
+        200.times { entry }
+        entry
+    "#)), @"[[1, 2, 3], [1, 2, 9]]");
+}
+
+#[test]
+fn test_inlined_forwarder_site_writes_its_own_args() {
+    // `bar(x, ...)`: the merged argument list is the site's own arguments followed by the
+    // caller's, in that order.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b, c) = [a, b, c]
+        def fwd(x, ...) = target(x, ...)
+        def entry = fwd(1, 2, 3)
+        200.times { entry }
+        entry
+    ")), @"[1, 2, 3]");
+}
+
+#[test]
+fn test_inlined_forwarder_carrying_a_literal_block() {
+    // `bh = VM_ENV_BLOCK_HANDLER(GET_LEP())`: the forwarded call gets the forwarder frame's own
+    // block handler, which the expanded call reads back out of the frame's EP. Re-deriving the
+    // literal block instead would capture the wrong frame, since the block belongs to `entry`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(x) = yield(x)
+        def fwd(...) = target(...)
+        def entry = fwd(4) { |v| v * 2 }
+        200.times { entry }
+        entry
+    ")), @"8");
+}
+
+#[test]
+fn test_inlined_forwarder_block_present_on_some_calls_only() {
+    // A `&blk` handed to the forwarder may be a Proc on one call and nothing on the next, so the
+    // handler the expanded call passes on is only known at run time. `block_given?` in the target
+    // has to see each call for what it was.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        def target(x) = [x, block_given? ? yield(x) : :none]
+        def fwd(...) = target(...)
+        def entry(i, &b) = fwd(i, &b)
+        200.times { |i| i.even? ? entry(i) { |v| v } : entry(i) }
+        [entry(1) { |v| v * 2 }, entry(1)]
+    "#)), @"[[1, 2], [1, :none]]");
+}
+
+#[test]
+fn test_inlined_forwarder_argument_error() {
+    // The argument check belongs to the target, which the inlined forwarder now calls directly.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        def target(a, b) = a + b
+        def fwd(...) = target(...)
+        def entry = (fwd(1) rescue $!.message)
+        200.times { entry }
+        entry
+    "#)), @r#""wrong number of arguments (given 1, expected 2)""#);
+}
+
+#[test]
+fn test_inlined_forwarder_side_exit_resumes_the_sendforward() {
+    // A guard inside the inlined forwarder exits to the `sendforward` instruction, and the
+    // interpreter's `vm_adjust_stack_forwarding` rebuilds the argument list by reading below the
+    // frame at `lep - (local_table_size + argc + 2)`. That only works because the inlined frame
+    // push copied the arguments into those slots and put the callinfo above them, the way
+    // `vm_call_iseq_forwardable` does.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        class A; def m(a, b, c) = [:a, a, b, c]; end
+        class B; def m(a, b, c) = [:b, a, b, c]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def m(...) = @t.m(...)
+        end
+        fa = Fwd.new(A.new)
+        fb = Fwd.new(B.new)
+        # Warm up on A alone so the expanded call guards on A.
+        200.times { fa.m(1, 2, 3) }
+        # B fails that guard mid-forwarder.
+        [fa.m(1, 2, 3), fb.m(4, 5, 6)]
+    "#)), @"[[:a, 1, 2, 3], [:b, 4, 5, 6]]");
+}
+
+#[test]
+fn test_inlined_forwarder_chained_forwarding_falls_back() {
+    // The inner target is itself a `def bar(...)`, whose `...` local has to receive a real
+    // callinfo. No `rb_callinfo` describes the merged call, so the site keeps its `sendforward`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b:) = [a, b]
+        def inner(...) = target(...)
+        def outer(...) = inner(...)
+        def entry = outer(1, b: 2)
+        200.times { entry }
+        entry
+    ")), @"[1, 2]");
+}
+
+#[test]
+fn test_inlined_forwarder_ruby2_keywords() {
+    // A `ruby2_keywords` frame splats into the forwarder, which keeps the call site off the
+    // direct send entirely; the flagged Hash still has to reach the target as keywords.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits("
+        def target(*a, **k) = [a, k]
+        def fwd(...) = target(...)
+        ruby2_keywords def r2k(*a) = fwd(*a)
+        def entry = r2k(1, k: 2)
+        200.times { entry }
+        entry
+    ")), @"[[1], {k: 2}]");
+}
+
+#[test]
+fn test_inlined_forwarder_super_is_unaffected() {
+    // `super` out of a forwardable frame goes through `invokesuperforward`, which
+    // `vm_search_super_method` rebuilds the callinfo for at run time. Inlining the frame must
+    // not disturb it.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        class Base
+          def run(*a, **k) = ["base", a, k]
+        end
+        class Child < Base
+          def run(...) = super
+        end
+        c = Child.new
+        def call_it(c) = c.run(1, k: 2)
+        200.times { call_it(c) }
+        call_it(c)
+    "#)), @r#"["base", [1], {k: 2}]"#);
+}
+
+#[test]
+fn test_inlined_forwarder_with_extra_locals() {
+    // The `...` local is local 0 and the frame extension sits below the whole local table, so a
+    // forwarder with locals of its own still finds its arguments where the interpreter left them.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a) = a * 2
+        def fwd(...)
+          extra = 10
+          extra + target(...)
+        end
+        def entry = fwd(3)
+        200.times { entry }
+        entry
+    ")), @"16");
+}
+
+#[test]
 fn test_kwrest_only_no_caller_keywords() {
     assert_snapshot!(inspect("
         def target(a, **opts) = [a, opts]
