@@ -797,6 +797,59 @@ rb_jit_reserve_addr_space(uint32_t mem_size)
 #endif
 }
 
+// Map read/write memory that lives entirely below INT32_MAX, for ZJIT's JITFrame
+// arena. JIT code stores a JITFrame pointer at every call site; when the pointer
+// survives sign extension from 32 bits, x86-64 encodes the store as
+// `mov qword ptr [mem], imm32` (8 bytes) instead of a `movabs` into a scratch
+// register followed by a store (14 bytes), and arm64 materializes the constant in
+// two instructions instead of four.
+//
+// Returns NULL when the platform cannot satisfy the request. That is not an error:
+// the arena falls back to the ordinary heap and codegen keeps emitting the wide
+// form, so this is purely a code size optimization.
+void *
+rb_jit_reserve_low_addr_space(size_t size)
+{
+#if !defined(_WIN32) && defined(MAP_ANONYMOUS)
+    void *mem_block = MAP_FAILED;
+
+  #ifdef MAP_32BIT
+    // Linux/x86-64 and FreeBSD: maps within the first 2GiB of address space.
+    mem_block = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+  #endif
+
+  #if defined(MAP_FIXED_NOREPLACE) && defined(_SC_PAGESIZE)
+    // Elsewhere on Linux, probe upwards for a free hole below 2GiB.
+    // MAP_FIXED_NOREPLACE fails rather than clobbering an existing mapping.
+    if (mem_block == MAP_FAILED) {
+        const uintptr_t page_size = (uintptr_t)sysconf(_SC_PAGESIZE);
+        const uintptr_t limit = (uintptr_t)INT32_MAX - size;
+        for (uintptr_t addr = 64 * 1024 * 1024; addr < limit; addr += 64 * 1024 * 1024) {
+            void *req = (void *)(addr & ~(page_size - 1));
+            mem_block = mmap(req, size, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (mem_block != MAP_FAILED) break;
+        }
+    }
+  #endif
+
+    if (mem_block == MAP_FAILED) return NULL;
+
+    // MAP_32BIT is advisory on some kernels and a no-op under some sandboxes, so
+    // check the result rather than trusting the flag.
+    if ((uintptr_t)mem_block + size > (uintptr_t)INT32_MAX) {
+        munmap(mem_block, size);
+        return NULL;
+    }
+    ruby_annotate_mmap(mem_block, size, "Ruby:rb_jit_reserve_low_addr_space");
+    return mem_block;
+#else
+    (void)size;
+    return NULL;
+#endif
+}
+
 // Walk all ISEQs in the heap and invoke the callback - shared between YJIT and ZJIT
 void
 rb_jit_for_each_iseq(rb_iseq_callback callback, void *data)
