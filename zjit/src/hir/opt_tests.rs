@@ -17921,8 +17921,13 @@ mod hir_opt_tests {
         ");
     }
 
+    // A protected method reached with an explicit receiver compiles to a direct call behind one
+    // check on the *caller's* self, which is what `vm_call_method` tests before permitting the
+    // call. Here the caller is a toplevel method, whose self is not a `C`, so the guard fails and
+    // the call raises through the interpreter -- but the shape of the code is the same one a
+    // caller inside `C` gets, where the guard always passes.
     #[test]
-    fn dont_optimize_call_to_protected_method_iseq() {
+    fn guard_caller_self_for_call_to_protected_method_iseq() {
         eval(r#"
             class C
               protected def secret = 42
@@ -17933,6 +17938,46 @@ mod hir_opt_tests {
         "#);
         assert_snapshot!(hir_string("test"), @"
         fn test@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint SingleRactorMode
+          PatchPoint StableConstantNames(0x1000, Obj)
+          v12:ObjectSubclass[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v21:BasicObject = LoadSelf
+          v22:CBool = HasAncestor v21, C
+          v23:CBool[true] = GuardBitEquals v22, CBool(true) recompile
+          PatchPoint NoSingletonClass(C@0x1010)
+          PatchPoint MethodRedefined(C@0x1010, secret@0x1018, cme:0x1020)
+          v27:Fixnum[42] = Const Value(42)
+          CheckInterrupts
+          Return v27
+        ");
+    }
+
+    // A protected call whose defining class is a module has no class to check the caller's self
+    // against, so it keeps the dynamic send.
+    #[test]
+    fn dont_optimize_call_to_protected_method_defined_in_module() {
+        eval(r#"
+            module M
+              protected def secret = 42
+            end
+            class C
+              include M
+            end
+            Obj = C.new
+            def test = Obj.secret rescue $!
+            test
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:9:
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
