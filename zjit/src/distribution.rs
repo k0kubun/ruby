@@ -82,6 +82,22 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         self.other = 0;
     }
 
+    /// The item in bucket `idx`. Zero-count buckets hold `T::default()`.
+    pub fn bucket(&self, idx: usize) -> T {
+        assert!(idx < N, "index {idx} out of bounds for buckets[{N}]");
+        self.buckets[idx]
+    }
+
+    /// How many times bucket `idx`'s item was observed.
+    pub fn count(&self, idx: usize) -> NumProfiles {
+        if idx < N { self.counts[idx] } else { 0 }
+    }
+
+    /// Total number of observations, bucketed or not.
+    pub fn num_observed(&self) -> usize {
+        usize::from(self.other) + self.counts.iter().map(|&count| usize::from(count)).sum::<usize>()
+    }
+
     /// Every item in a non-empty bucket, bucket 0 first.
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
         self.buckets.iter().zip(self.counts.iter())
