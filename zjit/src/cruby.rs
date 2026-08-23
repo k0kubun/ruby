@@ -123,6 +123,11 @@ unsafe extern "C" {
         ci: *const rb_callinfo,
     ) -> *const rb_callable_method_entry_t;
 
+    /// Map `size` bytes of read/write memory below `INT32_MAX`, or return NULL when
+    /// the platform cannot. Used for the JITFrame arena; see [`crate::jit_frame`].
+    /// Defined in jit.c.
+    pub fn rb_jit_reserve_low_addr_space(size: usize) -> *mut c_void;
+
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
 
