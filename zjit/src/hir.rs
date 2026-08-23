@@ -1370,6 +1370,37 @@ pub enum Insn {
         reason: SendFallbackReason,
     },
 
+    /// The send a `yield` to a Symbol block stands for, at a site whose receivers are spread
+    /// over more classes than a guard chain can cover. The comparison that proved the handler
+    /// is this Symbol lives in a preceding instruction, exactly as for the arms
+    /// [`Function::push_symbol_block_dispatch`] specializes.
+    ///
+    /// This is the tier below that specialization. `Array#each` yielding to `&:sym` sees every
+    /// string, record and hash in the process as `recv`, so the send behind the arm has no class
+    /// to guard on -- but it does have a fixed *call shape*, which is all
+    /// [`crate::send_cache`] is keyed on. So the send is dispatched the way any megamorphic
+    /// send site is: probe the class table for the receiver's class, and call the target
+    /// directly when it is one JIT code can enter.
+    ///
+    /// The shape cannot come from the `yield`'s call data, which names no method and counts the
+    /// receiver among its arguments, so it travels as a packed callinfo instead. See
+    /// [`crate::codegen::gen_send_symbol_block_mega`].
+    SendSymbolBlockMega {
+        /// The Symbol block handler this arm matched. Static, and so immortal: baking it into
+        /// the generated code keeps nothing alive that would not be alive anyway.
+        symbol: VALUE,
+        /// `rb_sym2id(symbol)`, the method the send resolves.
+        mid: ID,
+        /// Packed `rb_callinfo` for `mid`, the send's `argc`, and the `yield`'s own call
+        /// flags. An immediate, so the GC never sees it.
+        ci: VALUE,
+        /// The first `yield`ed value, which `vm_invoke_symbol_block()` sends to.
+        recv: InsnId,
+        /// The rest of the `yield`ed values.
+        args: Vec<InsnId>,
+        state: InsnId,
+    },
+
     /// Optimized ISEQ call
     SendDirect(Box<SendDirectData>),
 
@@ -1792,6 +1823,11 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(args);
                 $visit_one!(*state);
             }
+            Insn::SendSymbolBlockMega { recv, args, state, .. } => {
+                $visit_one!(*recv);
+                $visit_many!(args);
+                $visit_one!(*state);
+            }
             Insn::InvokeBlockIfunc { block_handler, args, state, .. } => {
                 $visit_one!(*block_handler);
                 $visit_many!(args);
@@ -2129,6 +2165,7 @@ impl Insn {
             Insn::InvokeProc { .. } => effects::Any,
             Insn::InvokeBlockIseqDirect { .. } => effects::Any,
             Insn::InvokeBlockIseqDynamic { .. } => effects::Any,
+            Insn::SendSymbolBlockMega { .. } => effects::Any,
             Insn::RefineType { .. } => effects::Empty,
             Insn::HasType { expected, .. }
                 => Effect::read_write(
@@ -2487,6 +2524,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 write!(f, "InvokeBlockIseqDynamic {captured}")?;
                 write_separated!(f, ", ", ", ", args);
                 write!(f, " # SendFallbackReason: {reason}")?;
+                Ok(())
+            }
+            Insn::SendSymbolBlockMega { mid, recv, args, .. } => {
+                write!(f, "SendSymbolBlockMega {recv}, :{}", mid.contents_lossy())?;
+                write_separated!(f, ", ", ", ", args);
                 Ok(())
             }
             Insn::InvokeBuiltin { bf, args, leaf, .. } => {
@@ -3140,10 +3182,20 @@ pub struct Function {
     /// drops the leading method-name argument) to resolve the call like a direct call.
     send_mid_overrides: HashMap<InsnId, ID>,
     /// For `Send` instructions synthesized for a `yield` whose block handler is a guarded
-    /// Symbol, the method that Symbol names. `type_specialize` resolves the call against it
-    /// (the site's own `cd` names no method at all), and `restore_unspecialized_symbol_blocks`
-    /// turns whatever did not specialize back into a generic `invokeblock`.
-    symbol_block_mids: HashMap<InsnId, ID>,
+    /// Symbol, that Symbol and the method it names. `type_specialize` resolves the call against
+    /// it (the site's own `cd` names no method at all); what it cannot resolve becomes either
+    /// [`Insn::SendSymbolBlockMega`] or, failing that, the generic `invokeblock` the site would
+    /// have made anyway (`restore_unspecialized_symbol_blocks`).
+    symbol_block_mids: HashMap<InsnId, SymbolBlockSend>,
+}
+
+/// The Symbol a `yield`'s Symbol-block arm matched, and the method it sends.
+#[derive(Clone, Copy, Debug)]
+struct SymbolBlockSend {
+    /// The Symbol block handler. Always a static Symbol, and so immortal.
+    symbol: VALUE,
+    /// `rb_sym2id(symbol)`.
+    mid: ID,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3887,18 +3939,23 @@ fn block_autosplat_arity(iseq: IseqPtr) -> Option<usize> {
 /// and the first [`MAX_SYMBOL_BLOCK_ARMS`] static Symbols get one each. Buckets are in frequency
 /// order, so taking the Symbols in bucket order takes the ones the dispatch would.
 ///
-/// A Symbol arm is only worth a version if the send behind it compiles, which needs the
-/// receiver's class to resolve; `symbol_recv` is the distribution of receivers seen while the
-/// handler was a Symbol. Without this the arm is emitted, matches, and then
-/// [`Function::restore_unspecialized_symbol_blocks`] turns it straight back into the
-/// `invokeblock` it was replacing -- a version spent to move the same calls between two counters.
+/// A Symbol arm is only worth a version if the send behind it compiles. With the megamorphic
+/// tier ([`Function::push_symbol_block_mega`]) that no longer needs a receiver class: the class
+/// table is keyed on the call shape and resolves the class at run time, so any Symbol arm
+/// compiles into a real dispatch. Without it the send needs a class to guard on, and
+/// `symbol_recv` -- the receivers seen while the handler was a Symbol -- has to supply one, or
+/// the arm is emitted, matches, and is turned straight back into the `invokeblock` it was
+/// replacing by [`Function::restore_unspecialized_symbol_blocks`]: a version spent to move the
+/// same calls between two counters.
 pub fn block_fallback_specializable_share(
     summary: &TypeDistributionSummary,
     symbol_recv: &TypeDistributionSummary,
     argc: usize,
 ) -> f64 {
-    // What `resolve_receiver_type_from_profile` will accept as a class to guard on.
-    let symbol_recv_resolves = symbol_recv.is_monomorphic()
+    // What `resolve_receiver_type_from_profile` will accept as a class to guard on -- or
+    // anything at all, once the send can be dispatched without one.
+    let symbol_recv_resolves = !get_option!(disable_symbol_block_mega)
+        || symbol_recv.is_monomorphic()
         || symbol_recv.is_skewed_polymorphic()
         || symbol_recv.is_skewed_megamorphic();
     let mut symbol_arms = 0;
@@ -4501,7 +4558,7 @@ impl Function {
                 recv: args[0], cd, block: None, args: args[1..].to_vec(), caller_splat_length: None, state,
                 reason: InvokeBlockSymbolUnspecialized,
             });
-            self.symbol_block_mids.insert(send, unsafe { rb_sym2id(symbol) });
+            self.symbol_block_mids.insert(send, SymbolBlockSend { symbol, mid: unsafe { rb_sym2id(symbol) } });
             self.push_insn(send_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
             compare_block = next_block;
         }
@@ -5052,6 +5109,7 @@ impl Function {
             Insn::InvokeProc { .. } => types::BasicObject,
             Insn::InvokeBlockIseqDirect { .. } => types::BasicObject,
             Insn::InvokeBlockIseqDynamic { .. } => types::BasicObject,
+            Insn::SendSymbolBlockMega { .. } => types::BasicObject,
             Insn::InvokeBuiltin { return_type, .. } => *return_type,
             Insn::Defined { pushval, .. } => Type::from_value(*pushval).union(types::NilClass),
             Insn::DefinedIvar { pushval, .. } => Type::from_value(*pushval).union(types::NilClass),
@@ -6501,17 +6559,23 @@ impl Function {
                             ReceiverTypeResolution::SkewedMegamorphic { .. }
                             | ReceiverTypeResolution::Megamorphic => {
                                 self.set_dynamic_send_reason(insn_id, SendMegamorphic);
-                                self.push_insn_id(block, insn_id);
+                                if !self.push_symbol_block_mega(block, insn_id) {
+                                    self.push_insn_id(block, insn_id);
+                                }
                                 continue;
                             }
                             ReceiverTypeResolution::Polymorphic => {
                                 self.set_dynamic_send_reason(insn_id, SendPolymorphic);
-                                self.push_insn_id(block, insn_id);
+                                if !self.push_symbol_block_mega(block, insn_id) {
+                                    self.push_insn_id(block, insn_id);
+                                }
                                 continue;
                             }
                             ReceiverTypeResolution::NoProfile => {
                                 self.set_dynamic_send_reason(insn_id, SendNoProfiles);
-                                self.push_insn_id(block, insn_id);
+                                if !self.push_symbol_block_mega(block, insn_id) {
+                                    self.push_insn_id(block, insn_id);
+                                }
                                 continue;
                             }
                         } };
@@ -6523,7 +6587,7 @@ impl Function {
                         // call -- the argument count on the stack, the visibility the flags
                         // ask for -- is what `vm_invoke_symbol_block()` passes on to
                         // `vm_call_symbol()`, so only the method name is substituted here.
-                        let symbol_block_mid = self.symbol_block_mids.get(&insn_id).copied();
+                        let symbol_block_mid = self.symbol_block_mids.get(&insn_id).map(|sym| sym.mid);
                         let mut mid = match symbol_block_mid {
                             Some(symbol_mid) => symbol_mid,
                             None => unsafe { vm_ci_mid(ci) },
@@ -6578,8 +6642,15 @@ impl Function {
                         // `NoMethodError`. A site that keeps missing spends its recompiles and
                         // then lands in the final version, which does not emit the guard and goes
                         // back to dispatching the call dynamically.
+                        //
+                        // A `yield` to a Symbol block is the exception: `vm_call_symbol()` sends
+                        // a protected method to `method_missing` outright, with no test of the
+                        // caller at all, so there is nothing here to guard and the call must not
+                        // be let through. (Nor a private one -- but that falls out of the
+                        // `yield`'s flags, which never carry `VM_CALL_FCALL`.)
                         let protected_guard_class = (visibility == METHOD_VISI_PROTECTED
                             && flags & VM_CALL_FCALL == 0
+                            && symbol_block_mid.is_none()
                             && !self.policy.no_side_exits)
                             .then(|| protected_call_guard_class(cme)).flatten();
                         match (visibility, flags & VM_CALL_FCALL != 0) {
@@ -8191,6 +8262,57 @@ impl Function {
         }
     }
 
+    /// Replace a Symbol block dispatch's `Send` with [`Insn::SendSymbolBlockMega`], which
+    /// dispatches it through the megamorphic class table. Returns whether it did.
+    ///
+    /// This is what a Symbol arm falls to when the send behind it has no receiver class to
+    /// guard on. That is the common case for the arm, not a corner of it: the sites that yield
+    /// to `&:sym` are the shared iterators, and `Array#each` sees every class in the process as
+    /// the receiver of the send its Symbol block stands for. The table needs no receiver class
+    /// -- it is keyed on the *call shape* and indexed by the class at run time -- and a Symbol
+    /// arm has a perfectly definite call shape, since the Symbol is already guarded and the
+    /// `yield`'s argument count is fixed. The one thing it does not have is a call site to read
+    /// that shape out of, which is what the packed callinfo stands in for.
+    ///
+    /// Unlike [`crate::send_cache::cache_for`], this takes a site with no profile at all as
+    /// well as a megamorphic one. There the table is not competing with `cd->cc`, which would
+    /// hit on every call at a monomorphic site: it is competing with `vm_call_symbol()`, which
+    /// has no call site to memoize into and searches from scratch on every single call. Any
+    /// answer the table gives beats that.
+    fn push_symbol_block_mega(&mut self, block: BlockId, insn_id: InsnId) -> bool {
+        if get_option!(disable_symbol_block_mega) {
+            return false;
+        }
+        let Some(sym) = self.symbol_block_mids.get(&insn_id).copied() else { return false };
+        let resolved = self.resolve(insn_id);
+        let &Insn::Send { recv, cd, ref args, state, .. } = resolved.insn(self) else { return false };
+        let args = args.to_vec();
+        let argc = args.len() as u32;
+        // The `yield`'s own flags, which is what `vm_invoke_symbol_block()` hands to
+        // `vm_call_symbol()`; only the method name and the argument count differ from the site
+        // the bytecode holds. HIR build only builds a Symbol arm for a `yield` that passes
+        // `can_direct_invoke_block`, so these never carry a splat, keywords or a block
+        // argument, and never `VM_CALL_FCALL` -- the visibility the table's fill path applies.
+        let flags = unsafe { rb_vm_ci_flag((*cd).ci) };
+        let key = crate::send_cache::SendCacheKey { mid: sym.mid, argc, flags };
+        if !crate::send_cache::shape_servable(key) {
+            return false;
+        }
+        // The shape has to fit in a packed callinfo, which is the only kind JIT code can bake
+        // in without giving the GC something to keep alive.
+        let ci = unsafe { rb_zjit_packed_ci(sym.mid, flags, argc) };
+        if ci == VALUE(0) {
+            return false;
+        }
+        let replacement = self.push_insn(block, Insn::SendSymbolBlockMega {
+            symbol: sym.symbol, mid: sym.mid, ci, recv, args, state,
+        });
+        self.insn_types[replacement] = self.infer_type(replacement);
+        self.make_equal_to(insn_id, replacement);
+        incr_counter!(symbol_block_mega_sites);
+        true
+    }
+
     /// Turn a Symbol block dispatch's `Send` back into a generic `invokeblock` when
     /// `type_specialize` did not resolve it.
     ///
@@ -9788,6 +9910,13 @@ impl Function {
                 }
                 for &element in elements {
                     self.assert_subtype(insn_id, element, types::BasicObject)?;
+                }
+                Ok(())
+            }
+            Insn::SendSymbolBlockMega { recv, ref args, .. } => {
+                self.assert_subtype(insn_id, recv, types::BasicObject)?;
+                for &arg in args {
+                    self.assert_subtype(insn_id, arg, types::BasicObject)?;
                 }
                 Ok(())
             }
