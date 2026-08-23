@@ -606,7 +606,10 @@ fn test_getblockparamproxy() {
         test { 1 }
     ");
     assert_contains_opcode("test", YARVINSN_getblockparamproxy);
-    assert_snapshot!(assert_compiles("test { 1 }"), @"1");
+    // `Kernel#then` is Ruby-level and its `yield(self)` compiles to a direct dispatch to the
+    // block it profiled, which is not the one this assertion passes. The guard misses once and
+    // the site respecializes; the getblockparamproxy code under test is unaffected.
+    assert_snapshot!(assert_compiles_allowing_exits("test { 1 }"), @"1");
 }
 
 #[test]
@@ -647,7 +650,9 @@ fn test_getblockparamproxy_polymorphic_none_and_iseq() {
         test { 1 }
     ");
     assert_contains_opcode("test", YARVINSN_getblockparamproxy);
-    assert_snapshot!(assert_compiles("test { 2 }"), @"2");
+    // See test_getblockparamproxy: the `yield(self)` inside `Kernel#then` respecializes on the
+    // block this assertion passes.
+    assert_snapshot!(assert_compiles_allowing_exits("test { 2 }"), @"2");
 }
 
 #[test]
@@ -5308,7 +5313,13 @@ fn test_string_append_codepoint_slow_paths() {
         results << (begin; test(String.new(encoding: Encoding::BINARY), 0x100); rescue RangeError; :range; end)
         base = "y".b * 200
         shared = base[0, 100]
-        10.times { test(shared, 0x42) }
+        # A plain loop, not `10.times`: a second block at `Integer#times`'s `yield i` would
+        # miss the direct block dispatch it specialized on the first one and exit once.
+        i = 0
+        while i < 10
+          test(shared, 0x42)
+          i += 1
+        end
         results << [base == "y".b * 200, shared.bytesize]
         utf8 = +"abc"
         results << test(utf8, 0x3042)
@@ -8990,6 +9001,186 @@ fn test_invokeblock_multiple_yields() {
     ");
     assert_contains_opcode("test", YARVINSN_invokeblock);
     assert_snapshot!(assert_compiles("entry"), @"[1, 2, 3]");
+}
+
+/// `vm_callee_setup_block_arg()` truncates the extra arguments a `yield` passes a block that
+/// takes fewer parameters, so the direct dispatch drops them too instead of falling back.
+#[test]
+fn test_invokeblock_truncates_extra_args() {
+    eval("
+        def test(a, b, c)
+          yield a, b, c
+        end
+        def entry
+          test(1, 2, 3) { |x| x }
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"1");
+}
+
+/// A `yield` of one argument to a block that takes none: `10.times { ... }` in disguise, and
+/// by far the most common arity mismatch.
+#[test]
+fn test_invokeblock_truncates_lone_arg_to_paramless_block() {
+    eval("
+        def test(a)
+          yield a
+        end
+        def entry
+          out = 0
+          test(1) { out += 1 }
+          out
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"1");
+}
+
+/// The other half of the block arity rule: missing parameters are `nil`, not an ArgumentError.
+/// `yield` with no arguments never auto-splats, so this is a static fill.
+#[test]
+fn test_invokeblock_nil_fills_missing_args() {
+    eval("
+        def test
+          yield
+        end
+        def entry
+          test { |a, b| [a, b] }
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"[nil, nil]");
+}
+
+/// A lone `yield`ed value still auto-splats into a multi-parameter block; the nil-fill must
+/// not shadow that rule.
+#[test]
+fn test_invokeblock_lone_arg_still_autosplats() {
+    eval("
+        def test(a)
+          yield a
+        end
+        def entry
+          test([1, 2]) { |x, y| [x, y] }
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"[1, 2]");
+}
+
+/// A shared `yield` site whose blocks need different reshapes: the polymorphic chain has to
+/// adapt per arm, not once for the site.
+#[test]
+fn test_invokeblock_polymorphic_chain_mixed_arities() {
+    set_call_threshold(3);
+    eval("
+        def test(a, b)
+          yield a, b
+        end
+        def entry
+          [test(1, 2) { |x| x },
+           test(1, 2) { |x, y, z| [x, y, z] },
+           test(1, 2) { :none }]
+        end
+        entry
+        entry
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"[1, [1, 2, nil], :none]");
+}
+
+/// `Proc#call` goes through `rb_optimized_call`, not `invokeblock`, and applies the same
+/// arity rules. Both spellings of the same block have to agree.
+#[test]
+fn test_invokeblock_truncate_matches_proc_call() {
+    eval("
+        def test(a, b)
+          yield a, b
+        end
+        def entry(pr)
+          [test(1, 2) { |x| x }, pr.call(1, 2)]
+        end
+        entry(proc { |x| x })
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry(proc { |x| x })"), @"[1, 1]");
+}
+
+/// `break` out of a block the dispatch reshaped still has to unwind to the method that owns
+/// the block, not to the frame that yielded.
+#[test]
+fn test_invokeblock_truncated_block_with_break() {
+    eval("
+        def test(a)
+          yield a
+          :not_reached
+        end
+        def entry
+          test(1) { break :broke }
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @":broke");
+}
+
+/// `next` inside a truncated block returns from the block, and the yielding method keeps
+/// running with that value.
+#[test]
+fn test_invokeblock_truncated_block_with_next() {
+    eval("
+        def test(a)
+          yield(a) + 1
+        end
+        def entry
+          test(1) { next 10 }
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles("entry"), @"11");
+}
+
+/// A non-local `return` out of a reshaped block unwinds past the yielding method.
+#[test]
+fn test_invokeblock_truncated_block_with_return() {
+    eval("
+        def test(a)
+          yield a
+          :not_reached
+        end
+        def entry
+          test(1) { return :returned }
+          :also_not_reached
+        end
+        entry
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @":returned");
+}
+
+/// Replacing the block at a site the dispatch specialized for a reshape has to keep giving
+/// the new block the arity rules it asks for.
+#[test]
+fn test_invokeblock_reshape_respecializes_on_new_block() {
+    set_call_threshold(2);
+    eval("
+        def test(a, b)
+          yield a, b
+        end
+        def one = test(1, 2) { |x| x }
+        def two = test(1, 2) { |x, y, z| [x, y, z] }
+        one
+        one
+    ");
+    assert_contains_opcode("test", YARVINSN_invokeblock);
+    assert_snapshot!(assert_compiles_allowing_exits("[one, two]"), @"[1, [1, 2, nil]]");
 }
 
 #[test]

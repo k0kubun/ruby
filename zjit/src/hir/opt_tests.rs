@@ -4592,7 +4592,7 @@ mod hir_opt_tests {
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
         bb5():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: dispatchable ISEQs cover too little of the profile
           Jump bb4(v22)
         bb4(v16:BasicObject):
           CheckInterrupts
@@ -19819,7 +19819,7 @@ mod hir_opt_tests {
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
         bb5():
-          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
+          v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
           Jump bb4(v22)
         bb4(v16:BasicObject):
           v27:Fixnum[2] = Const Value(2)
@@ -19834,7 +19834,7 @@ mod hir_opt_tests {
           v37:BasicObject = InvokeBlockIfunc v30, v27
           Jump bb7(v37)
         bb8():
-          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
+          v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: profiled handler is not an ISEQ block
           Jump bb7(v39)
         bb7(v33:BasicObject):
           CheckInterrupts
@@ -19864,7 +19864,7 @@ mod hir_opt_tests {
         bb3(v6:BasicObject):
           v10:Fixnum[1] = Const Value(1)
           v12:Fixnum[2] = Const Value(2)
-          v14:BasicObject = InvokeBlock v10, v12 # SendFallbackReason: InvokeBlock: not yet specialized
+          v14:BasicObject = InvokeBlock v10, v12 # SendFallbackReason: InvokeBlock: splat, keyword, or block argument
           CheckInterrupts
           Return v14
         ");
