@@ -3089,9 +3089,9 @@ fn can_direct_invoke_block(flags: u32) -> bool {
 
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
-/// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
-/// non-local return). Anything else falls back to the generic `invokeblock` dispatch,
-/// with the returned reason attached to the fallback instruction.
+/// with an exact arity match and avoid arg0 auto-splat. Anything else falls back to the
+/// generic `invokeblock` dispatch, with the returned reason attached to the fallback
+/// instruction.
 fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
         return Err(InvokeBlockNotSpecialized);
@@ -3103,9 +3103,11 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
         return Err(InvokeBlockNotSpecialized);
     }
-    if crate::codegen::block_iseq_may_throw(iseq) {
-        return Err(InvokeBlockNotSpecialized);
-    }
+    // A `throw` out of the block frame this dispatch pushes unwinds like any other: it
+    // longjmps out of every JIT native frame to the enclosing `vm_exec()`, which resumes at
+    // the catch entry the throw resolved to. `break` needed `vm_throw_start()` to read the
+    // throwing frame's ISEQ through `CFP_ISEQ()` rather than the raw `cfp->_iseq` a
+    // JIT-pushed frame never writes; without that it walked off a null ISEQ.
     Ok(())
 }
 
