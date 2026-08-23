@@ -110,6 +110,11 @@ pub struct Options {
     /// measurement; see [`crate::codegen::gen_send_megamorphic_direct`].
     pub disable_megamorphic_direct: bool,
 
+    /// Turn off the run-time block ISEQ dispatch, so a `yield` whose handler is not one of the
+    /// block ISEQs the site profiled always goes out through `rb_vm_invokeblock()`. Only useful
+    /// for A/B measurement; see [`crate::codegen::gen_invoke_block_iseq_dynamic`].
+    pub disable_block_dynamic_dispatch: bool,
+
     /// Slots in each send class table. Must be a power of two and at least 8;
     /// one table is allocated per `(method name, argc, call flags)` triple that a
     /// compiled megamorphic site dispatches on, so this times 16 bytes times the
@@ -221,6 +226,7 @@ impl Default for Options {
             disable_hir_opt: false,
             disable_send_cache: false,
             disable_megamorphic_direct: false,
+            disable_block_dynamic_dispatch: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
             dump_hir_opt: None,
@@ -556,6 +562,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable-send-cache", "") => options.disable_send_cache = true,
 
         ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
+        ("disable-block-dynamic-dispatch", "") => options.disable_block_dynamic_dispatch = true,
 
         ("send-cache-entries", _) => match opt_val.parse::<usize>() {
             Ok(n) if n.is_power_of_two() && n >= 8 => options.send_cache_entries = n,
