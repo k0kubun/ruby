@@ -901,6 +901,11 @@ pub enum BlockHandler {
     /// guarded Proc value, which becomes the callee frame's block handler
     /// (a Proc VALUE is itself a valid block handler).
     BlockArgProc(InsnId),
+    /// Block arg that is this frame's block param proxy (`def foo(&blk) = bar(&blk)`).
+    /// `vm_caller_setup_arg_block` resolves the proxy to `VM_CF_BLOCK_HANDLER(cfp)`, so the
+    /// InsnId refers to that handler, loaded from the local EP, which becomes the callee
+    /// frame's block handler.
+    BlockParamProxy(InsnId),
 }
 
 /// Identifier used by LoadField/StoreField/LoadArg for HIR dumps. Variants
@@ -1683,7 +1688,7 @@ macro_rules! for_each_operand_impl {
             Insn::SendDirect(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::BlockArgProc(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockParamProxy(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -2310,6 +2315,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 let SendDirectData { recv, cme, iseq, args, block, jit_entry_idx, .. } = &**insn;
                 let block = match block {
                     Some(BlockHandler::BlockArgProc(proc_id)) => format!("&{proc_id}"),
+                    Some(BlockHandler::BlockParamProxy(handler_id)) => format!("&{handler_id}"),
                     Some(BlockHandler::BlockIseq(blockiseq)) => format!("{:p}", self.ptr_map.map_ptr(*blockiseq)),
                     Some(BlockHandler::BlockArg) => unreachable!("BlockArg in SendDirect"),
                     None => format!("{:p}", ptr::null::<u8>()),
@@ -2340,8 +2346,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                         write!(f, "Send {recv}, {:p}, :{}", self.ptr_map.map_ptr(blockiseq), ruby_call_method_name(*cd))?,
                     Some(BlockHandler::BlockArg) =>
                         write!(f, "Send {recv}, &block, :{}", ruby_call_method_name(*cd))?,
-                    Some(BlockHandler::BlockArgProc(_)) =>
-                        unreachable!("BlockArgProc only appears in SendDirect"),
+                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_)) =>
+                        unreachable!("BlockArgProc/BlockParamProxy only appear in SendDirect"),
                     None =>
                         write!(f, "Send {recv}, :{}", ruby_call_method_name(*cd))?,
                 }
@@ -2488,8 +2494,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                         write!(f, ", block={:p}", self.ptr_map.map_ptr(*blockiseq))?,
                     Some(BlockHandler::BlockArg) =>
                         write!(f, ", block=&block")?,
-                    Some(BlockHandler::BlockArgProc(_)) =>
-                        unreachable!("BlockArgProc only appears in SendDirect"),
+                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_)) =>
+                        unreachable!("BlockArgProc/BlockParamProxy only appear in SendDirect"),
                     None => {}
                 }
                 Ok(())
@@ -2796,13 +2802,17 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     | VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG;
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
-fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_block: bool, caller_splat: Option<CallerSplat>) -> Result<(), SendDirectFailure> {
+/// `block_arg_passthrough` says the caller's `&blk` argument was taken out of `args` to become
+/// the callee frame's block handler, so the frame setup reproduces `vm_caller_setup_arg_block`
+/// for it and the call site's block-arg flag no longer blocks a direct send.
+fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_block: bool, caller_splat: Option<CallerSplat>, block_arg_passthrough: bool) -> Result<(), SendDirectFailure> {
     let mut complex_arg_counters = vec![];
     let mut count_failure = |counter| complex_arg_counters.push(counter);
     let params = unsafe { iseq.params() };
 
     let callee_has_block_param = 0 != params.flags.has_block();
-    let caller_passes_block_arg = has_block && (caller_args.flags & VM_CALL_ARGS_BLOCKARG) != 0;
+    let caller_passes_block_arg = has_block && !block_arg_passthrough
+        && (caller_args.flags & VM_CALL_ARGS_BLOCKARG) != 0;
 
     use Counter::*;
     let forwardable = 0 != params.flags.forwardable();
@@ -3227,6 +3237,78 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
     }
 }
 
+/// Emit a receiver-type-specialized dispatch for a send: one `CondBranchHasType` per profiled
+/// receiver type, each with its own `Send` that `type_specialize` can turn into a direct call,
+/// plus a dynamic-send fallthrough. All branches join on a single block parameter.
+///
+/// Returns the block to continue compiling in and the joined result, or `None` when the receiver
+/// is not polymorphic, in which case the caller should emit a single `Send`.
+fn emit_polymorphic_send(
+    fun: &mut Function,
+    profiles: &mut ProfileOracle,
+    mut block: BlockId,
+    insn_idx: u32,
+    exit_id: InsnId,
+    exit_state: &FrameState,
+    cd: *const rb_call_data,
+    recv: InsnId,
+    args: &[InsnId],
+    block_handler: Option<BlockHandler>,
+    caller_splat_length: Option<SplatLength>,
+    opcode: u32,
+    branch_monomorphic: bool,
+) -> Option<(BlockId, InsnId)> {
+    // A monomorphic profile normally becomes a GuardType, which side-exits when the profile turns
+    // out to be wrong. `branch_monomorphic` asks for a branch instead: callers use it where the
+    // alternative is a dynamic send anyway, so a missed branch is no worse than not specializing,
+    // whereas a failed guard is much worse.
+    let summary = match branch_monomorphic.then(|| fun.profile_summary(profiles, recv, exit_id)) {
+        Some(summary) if summary.is_monomorphic() => summary,
+        _ => fun.polymorphic_summary(profiles, recv, exit_id)?,
+    };
+    let join_block = fun.new_block(insn_idx);
+    let join_param = fun.push_insn(join_block, Insn::Param);
+    // Dedup by expected type so immediate/heap variants
+    // under the same Ruby class can still get separate branches.
+    let mut seen_types = Vec::with_capacity(summary.buckets().len());
+    for &profiled_type in summary.buckets() {
+        if profiled_type.is_empty() { break; }
+        let expected = Type::from_profiled_type(profiled_type);
+        if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
+            continue;
+        }
+        seen_types.push(expected);
+        let iftrue_block = fun.new_block(insn_idx);
+        let fall_through = fun.new_block(insn_idx);
+        fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+            val: recv,
+            expected,
+            if_true: BranchEdge { target: iftrue_block, args: vec![] },
+            if_false: BranchEdge { target: fall_through, args: vec![] }
+        })));
+        block = fall_through;
+        // Take a fresh Snapshot rather than reusing exit_id so type specialization resolves the
+        // receiver from this branch's refined, exact type instead of the polymorphic profile that
+        // is keyed at exit_id.
+        let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+        // Keep the other operands' profile entries visible at the fresh Snapshot so the
+        // specialized send can still see argument profiles (e.g. Array#[] needs a Fixnum-profiled
+        // index to be inlined). Only the receiver's entry is dropped: it must resolve from its
+        // refined, exact type, and resolve_receiver_type prefers profiles over types.
+        profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+        let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
+        let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.to_vec(), caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
+        fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    }
+    // In the fallthrough case, do a generic interpreter send and then join. The receiver's
+    // profile entry is dropped so the fallthrough does not re-speculate on a type the branches
+    // above have already ruled out.
+    let fallback_snapshot = fun.push_insn(block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+    profiles.copy_entries_except(exit_id, fallback_snapshot, recv, fun);
+    let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args: args.to_vec(), caller_splat_length, state: fallback_snapshot, reason: SendPolymorphicFallback });
+    fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+    Some((join_block, join_param))
+}
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -4146,8 +4228,8 @@ impl Function {
     }
 
     /// Validate and normalize SendDirect arguments without emitting HIR.
-    fn build_send_direct_args(&self, caller_args: &CallerArguments, caller_splat: Option<CallerSplat>, iseq: IseqPtr, has_block: bool) -> Result<SendDirectCall, SendDirectFailure> {
-        can_direct_send(iseq, caller_args, has_block, caller_splat)?;
+    fn build_send_direct_args(&self, caller_args: &CallerArguments, caller_splat: Option<CallerSplat>, iseq: IseqPtr, has_block: bool, block_arg_passthrough: bool) -> Result<SendDirectCall, SendDirectFailure> {
+        can_direct_send(iseq, caller_args, has_block, caller_splat, block_arg_passthrough)?;
         // A forwardable callee takes the caller's arguments as is.
         if 0 != unsafe { iseq.params() }.flags.forwardable() {
             return Ok(SendDirectCall {
@@ -4978,6 +5060,8 @@ impl Function {
                                 let statically_nil = self.is_a(block_arg, types::NilClass);
                                 let block_arg_profiled_type = self.profiled_type_of_at(block_arg, state);
                                 let profiled_nil = block_arg_profiled_type.map_or(false, |pt| pt.is_nil());
+                                let is_block_param_proxy = !statically_nil
+                                    && self.type_of(block_arg).ruby_object() == Some(unsafe { rb_block_param_proxy });
                                 if statically_nil || profiled_nil {
                                     if !statically_nil {
                                         // Guard needed when relying on profiled type. Uses the original
@@ -5019,6 +5103,20 @@ impl Function {
                                     stripped_block_arg = true;
                                     let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                                } else if is_block_param_proxy {
+                                    // `vm_caller_setup_arg_block` answers the block param proxy with
+                                    // `VM_CF_BLOCK_HANDLER(cfp)`, this frame's own block handler.
+                                    // Load it out of the local EP and install it as the callee's,
+                                    // which is the whole of what the interpreter would have done for
+                                    // a `def foo(&blk) = bar(&blk)` forwarding site.
+                                    let lep_level = get_lvar_level(self.frame_state(state).iseq);
+                                    let lep = self.push_insn(block, Insn::GetEP { level: lep_level });
+                                    let block_handler = self.load_ep_env_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::BasicObject);
+                                    _ = args.pop();
+                                    send_block = Some(BlockHandler::BlockParamProxy(block_handler));
+                                    stripped_block_arg = true;
+                                    let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                                    send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else {
                                     // Can't prove block arg is nil or a Proc
                                     self.set_dynamic_send_reason(insn_id, SendBlockArgNotNil);
@@ -5026,6 +5124,11 @@ impl Function {
                                 }
                             }
                         }
+
+                        // A Proc or block param proxy `&blk` became the callee frame's block handler, so the
+                        // frame setup reproduces `vm_caller_setup_arg_block` for it and the call site's
+                        // block-arg flag no longer blocks a direct send.
+                        let block_arg_passthrough = matches!(send_block, Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_)));
 
                         // If the call site info indicates that the `Function` has overly complex arguments, then do not optimize into a `SendDirect`.
                         // Optimized methods(`VM_METHOD_TYPE_OPTIMIZED`) and C methods handle their own argument constraints (e.g., kw_splat for Proc call).
@@ -5067,7 +5170,7 @@ impl Function {
                             } else {
                                 None
                             };
-                            let Ok(call) = self.build_send_direct_args(&caller_args, caller_splat, iseq, has_block)
+                            let Ok(call) = self.build_send_direct_args(&caller_args, caller_splat, iseq, has_block, block_arg_passthrough)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -5112,7 +5215,7 @@ impl Function {
                             let iseq = unsafe { *capture.code.iseq.as_ref() };
 
                             let caller_args = CallerArguments::new(&args, ci);
-                            let Ok(call) = self.build_send_direct_args(&caller_args, None, iseq, has_block)
+                            let Ok(call) = self.build_send_direct_args(&caller_args, None, iseq, has_block, block_arg_passthrough)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Send)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -5304,7 +5407,7 @@ impl Function {
 
                                 let blockiseq = match send_block {
                                     Some(BlockHandler::BlockArg) => unreachable!("unsupported &block should have been filtered out"),
-                                    Some(BlockHandler::BlockArgProc(_)) => unreachable!("BlockArgProc is only built for ISEQ callees"),
+                                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_)) => unreachable!("BlockArgProc/BlockParamProxy are only built for ISEQ callees"),
                                     Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq),
                                     None => None,
                                 };
@@ -5649,7 +5752,7 @@ impl Function {
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
                             // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
                             let caller_args = CallerArguments::new(&args, ci);
-                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false)
+                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false, false)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -5945,7 +6048,9 @@ impl Function {
                 // TODO: Inline callees that receive a &proc block handler. The inlined body
                 // only knows a static blockiseq for yield/defined?(yield); it would need to
                 // be taught to dispatch to the runtime Proc instead.
-                if matches!(call_block, Some(BlockHandler::BlockArgProc(_))) {
+                // A block param proxy's handler lives in the callee frame's specval the same way,
+                // which inlining never pushes: the callee's `yield` would read the caller's block.
+                if matches!(call_block, Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_))) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -5955,7 +6060,7 @@ impl Function {
                 let blockiseq: Option<IseqPtr> = call_block.map(|bh| match bh {
                     BlockHandler::BlockIseq(bi) => bi,
                     BlockHandler::BlockArg => unreachable!("BlockArg in SendDirect"),
-                    BlockHandler::BlockArgProc(_) => unreachable!("skipped above"),
+                    BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_) => unreachable!("skipped above"),
                 });
 
                 // Apply the cheap optimization heuristics (size, budget, denylist)
@@ -9312,6 +9417,11 @@ fn add_iseq_to_hir(
     let seen_ep_escape = iseq_seen_ep_escape(iseq);
     let ep_escaped = ep_starts_escaped || seen_ep_escape;
 
+    // Values `getblockparamproxy` pushed for this ISEQ's own local EP, i.e. the ones a
+    // `foo(&blk)` site can pass on as this frame's block handler. See the use in
+    // `YARVINSN_send`.
+    let mut block_param_proxy_values: HashSet<InsnId> = HashSet::default();
+
     // Iteratively fill out basic blocks using a queue.
     // TODO(max): Basic block arguments at edges
     let mut queue = VecDeque::new();
@@ -10186,6 +10296,13 @@ fn add_iseq_to_hir(
                     if let Some(local_param) = join_local {
                         state.setlocal(ep_offset, local_param);
                     }
+                    // Remember that this value encodes the block handler of the frame at `level`.
+                    // A `foo(&blk)` site can then pass that handler straight through instead of
+                    // going through the interpreter, but only when the frame it came from is the
+                    // one `VM_CF_BLOCK_HANDLER` would read, i.e. the local EP.
+                    if level == get_lvar_level(iseq) {
+                        block_param_proxy_values.insert(join_result);
+                    }
                     state.stack_push(join_result);
                     block = join_block;
                 }
@@ -10489,54 +10606,139 @@ fn add_iseq_to_hir(
                         None
                     };
                     let caller_splat_length = fun.monomorphic_caller_splat_length(call_info, exit_id);
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    // A block argument that is nil at run time is stripped by type_specialize,
+                    // which is what lets `bar(&block)` become a direct send. Anything else keeps
+                    // the send dynamic, so only branch on the receiver's type when the block
+                    // argument has a chance of being nil.
+                    let block_arg_summary = if block_arg {
+                        args.last().map(|&insn| fun.profile_summary(&profiles, insn, exit_id))
+                    } else {
+                        None
+                    };
+                    let block_arg_can_be_nil = match &block_arg_summary {
+                        None => true,
+                        Some(summary) => summary.buckets().iter().any(|ty| !ty.is_empty() && ty.is_nil()),
+                    };
+                    // `def foo(&block) = bar(&block)` forwarding sites see both nil and non-nil
+                    // block arguments. type_specialize can only turn `bar(&block)` into a direct
+                    // send when it can prove the block argument is nil, so a site that sometimes
+                    // receives a block makes every call dynamic. Branch on nil instead so the
+                    // common no-block case still gets a direct send.
+                    let split_nil_block_arg = blockiseq.is_null() && block_arg_can_be_nil
+                        && block_arg_summary.as_ref().is_some_and(|summary| !summary.is_monomorphic());
+                    // Calls with a literal block get the same receiver chain as block-less sends.
+                    // Blocks are how Ruby iterates, so leaving these on the dynamic send gives up
+                    // on the receiver of every polymorphic `node.each_child_node { ... }`-style
+                    // call. The chain continues from its join block, so the
+                    // reload_locals_modified_by_block below still covers every arm.
+                    let dispatch_on_recv = block_arg_can_be_nil;
+
+                    // `foo(&blk)` where `blk` came straight from `getblockparamproxy`: when the
+                    // value really is the proxy, `vm_caller_setup_arg_block` hands the callee this
+                    // frame's own block handler, which `type_specialize` can write into the callee
+                    // frame without going through the interpreter. Branch on it rather than
+                    // guarding, because the other side of the branch is a block param that
+                    // `setblockparam` materialized, which is a legitimate value to reach here.
+                    //
+                    // The profile filter is exact: `rb_block_param_proxy` carries a singleton
+                    // class (it defines `call` on itself), so no other object profiles with that
+                    // class.
+                    let proxy_class = unsafe { rb_block_param_proxy }.class_of();
+                    let proxy_split = blockiseq.is_null() && block_arg
+                        && !unspecializable_call_type(flags & !VM_CALL_ARGS_BLOCKARG)
+                        && args.last().is_some_and(|arg| block_param_proxy_values.contains(arg))
+                        && block_arg_summary.as_ref().is_some_and(|summary| summary.buckets().iter().any(|profiled_type|
+                            !profiled_type.is_empty() && profiled_type.class() == proxy_class));
+                    let proxy_join = if proxy_split {
+                        let block_arg_insn = *args.last().unwrap();
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
-                        // Dedup by expected type so immediate/heap variants
-                        // under the same Ruby class can still get separate branches.
-                        let mut seen_types = Vec::with_capacity(summary.buckets().len());
-                        for &profiled_type in summary.buckets() {
-                            if profiled_type.is_empty() { break; }
-                            let expected = Type::from_profiled_type(profiled_type);
-                            if seen_types.iter().any(|ty: &Type| ty.bit_equal(expected)) {
-                                continue;
+                        let proxy_block = fun.new_block(insn_idx);
+                        let rest_block = fun.new_block(insn_idx);
+                        let proxy = unsafe { rb_block_param_proxy };
+                        let proxy_const = fun.push_insn(block, Insn::Const { val: Const::Value(proxy) });
+                        let is_proxy = fun.push_insn(block, Insn::IsBitEqual { left: block_arg_insn, right: proxy_const });
+                        fun.push_insn(block, Insn::CondBranch {
+                            val: is_proxy,
+                            if_true: BranchEdge { target: proxy_block, args: vec![] },
+                            if_false: BranchEdge { target: rest_block, args: vec![] },
+                        });
+
+                        // Refine the block argument to the proxy object so that type_specialize
+                        // recognizes it and replaces it with a load of this frame's block handler.
+                        let mut proxy_args = args.clone();
+                        *proxy_args.last_mut().unwrap() = fun.push_insn(proxy_block, Insn::RefineType { val: block_arg_insn, new_type: Type::from_value(proxy) });
+                        let (proxy_block, proxy_send) = match emit_polymorphic_send(
+                            fun, &mut profiles, proxy_block, insn_idx, exit_id, &exit_state,
+                            cd, recv, &proxy_args, block_handler, caller_splat_length, opcode.into(), true,
+                        ) {
+                            Some(result) => result,
+                            None => {
+                                let send = fun.push_insn(proxy_block, Insn::Send { recv, cd, block: block_handler, args: proxy_args, caller_splat_length, state: exit_id, reason: Uncategorized(opcode.into()) });
+                                (proxy_block, send)
                             }
-                            seen_types.push(expected);
-                            let iftrue_block = fun.new_block(insn_idx);
-                            let fall_through = fun.new_block(insn_idx);
-                            fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
-                                val: recv,
-                                expected,
-                                if_true: BranchEdge { target: iftrue_block, args: vec![] },
-                                if_false: BranchEdge { target: fall_through, args: vec![] }
-                            })));
-                            block = fall_through;
-                            // Take a fresh Snapshot rather than
-                            // reusing exit_id so type specialization resolves the receiver from
-                            // its refined, exact type instead of the polymorphic profile that is
-                            // keyed at exit_id.
-                            let snapshot = fun.push_insn(iftrue_block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
-                            // Keep the other operands' profile entries visible at the fresh
-                            // Snapshot so the specialized send can still see argument profiles
-                            // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
-                            // the receiver's entry is dropped: it must resolve from its refined,
-                            // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun);
-                            let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-                            let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: block_handler, args: args.clone(), caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
-                            fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        }
-                        // In the fallthrough case, do a generic interpreter send and then join.
-                        let reason = SendPolymorphicFallback;
-                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: exit_id, reason });
-                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
-                        state.stack_push(join_param);
-                        // Continue compilation from the join block at the next instruction.
+                        };
+                        fun.push_insn(proxy_block, Insn::Jump(BranchEdge { target: join_block, args: vec![proxy_send] }));
+                        block = rest_block;
+                        Some((join_block, join_param))
+                    } else {
+                        None
+                    };
+
+                    if split_nil_block_arg {
+                        let block_arg_insn = *args.last().unwrap();
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        let nil_block = fun.new_block(insn_idx);
+                        let other_block = fun.new_block(insn_idx);
+                        fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+                            val: block_arg_insn,
+                            expected: types::NilClass,
+                            if_true: BranchEdge { target: nil_block, args: vec![] },
+                            if_false: BranchEdge { target: other_block, args: vec![] },
+                        })));
+
+                        // Nil branch: refine the block argument so type_specialize sees it as
+                        // statically nil, strips it, and emits a direct send.
+                        let mut nil_args = args.clone();
+                        *nil_args.last_mut().unwrap() = fun.push_insn(nil_block, Insn::RefineType { val: block_arg_insn, new_type: types::NilClass });
+                        let (nil_block, nil_send) = match emit_polymorphic_send(
+                            fun, &mut profiles, nil_block, insn_idx, exit_id, &exit_state,
+                            cd, recv, &nil_args, block_handler, caller_splat_length, opcode.into(), true,
+                        ) {
+                            Some(result) => result,
+                            None => {
+                                let send = fun.push_insn(nil_block, Insn::Send { recv, cd, block: block_handler, args: nil_args, caller_splat_length, state: exit_id, reason: Uncategorized(opcode.into()) });
+                                (nil_block, send)
+                            }
+                        };
+                        fun.push_insn(nil_block, Insn::Jump(BranchEdge { target: join_block, args: vec![nil_send] }));
+
+                        let other_send = fun.push_insn(other_block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: exit_id, reason: SendBlockArgNotNil });
+                        fun.push_insn(other_block, Insn::Jump(BranchEdge { target: join_block, args: vec![other_send] }));
+
+                        // Continue compilation from the join block at the next instruction, so
+                        // the local reload below covers every arm of the chain.
                         block = join_block;
+                        state.stack_push(join_param);
+                    } else if let Some((new_block, result)) = dispatch_on_recv.then(|| emit_polymorphic_send(
+                        fun, &mut profiles, block, insn_idx, exit_id, &exit_state,
+                        cd, recv, &args, block_handler, caller_splat_length, opcode.into(), false,
+                    )).flatten() {
+                        block = new_block;
+                        state.stack_push(result);
                     } else {
                         // Maybe monomorphic; handled in type_specialize
                         let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: exit_id, reason: Uncategorized(opcode.into()) });
                         state.stack_push(send);
+                    }
+
+                    // Rejoin the block-param-proxy arm emitted above.
+                    if let Some((join_block, join_param)) = proxy_join {
+                        let result = state.stack_pop()?;
+                        fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+                        block = join_block;
+                        state.stack_push(join_param);
                     }
 
                     if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {

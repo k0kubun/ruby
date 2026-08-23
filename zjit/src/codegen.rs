@@ -724,7 +724,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
-        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_)), .. } => unreachable!("BlockArgProc only appears in SendDirect"),
+        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockParamProxy(_)), .. } => unreachable!("BlockArgProc/BlockParamProxy only appear in SendDirect"),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect(insn) => {
             let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
@@ -738,6 +738,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                     );
                     lir::BlockHandler::Proc(opnd!(proc_id))
                 }
+                BlockHandler::BlockParamProxy(handler_id) => lir::BlockHandler::Handler(opnd!(handler_id)),
                 BlockHandler::BlockArg => unreachable!("BlockArg in SendDirect"),
             });
             gen_send_iseq_direct(
@@ -2018,6 +2019,8 @@ fn gen_send_iseq_direct(
         lir::BlockHandler::Iseq(b) => gen_block_handler_specval(asm, b),
         // the VM_CALL_ARGS_BLOCKARG case, where vm_to_proc(block_code) returns the given Proc as is
         lir::BlockHandler::Proc(proc) => proc,
+        // the block param proxy case, where the callee gets VM_CF_BLOCK_HANDLER(cfp) of this frame
+        lir::BlockHandler::Handler(handler) => handler,
     });
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
