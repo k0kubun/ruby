@@ -334,6 +334,7 @@ static void ractor_sched_enq(rb_vm_t *vm, rb_ractor_t *r);
 static void timer_thread_wakeup(void);
 static void timer_thread_wakeup_locked(rb_vm_t *vm);
 static void timer_thread_wakeup_force(void);
+static void timer_thread_wake_fence(struct rb_thread_struct *th);
 static bool ractor_sched_timeout_arm(rb_thread_t *th, const rb_hrtime_t *rel);
 static bool ractor_sched_timeout_disarm(rb_thread_t *th);
 static void thread_sched_switch(rb_thread_t *cth, rb_thread_t *next_th);
@@ -807,7 +808,7 @@ thread_sched_wakeup_running_thread(struct rb_thread_sched *sched, rb_thread_t *n
         if (next_th->nt) {
             if (th_has_dedicated_nt(next_th)) {
                 RUBY_DEBUG_LOG("pinning th:%u", next_th->serial);
-                rb_native_cond_signal(&next_th->nt->cond.readyq);
+                rb_native_cond_signal(&next_th->nt->readyq);
             }
             else {
                 // TODO
@@ -874,6 +875,8 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
     ASSERT_thread_sched_locked(sched, th);
     VM_ASSERT(th == rb_ec_thread_ptr(rb_current_ec_noinline()));
 
+    bool timedout = false;
+
     if (th != sched->running) {
         // TODO: This optimization should also be made to work for MN_THREADS
         if (th->has_dedicated_nt && th == sched->runnable_hot_th && (sched->running == NULL || sched->running->has_dedicated_nt)) {
@@ -923,10 +926,16 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
 
                 thread_sched_set_unlocked(sched, th);
                 {
-                    RUBY_DEBUG_LOG("nt:%d cond:%p", th->nt->serial, &th->nt->cond.readyq);
-                    rb_nativethread_cond_t *cond = &th->nt->cond.readyq;
+                    RUBY_DEBUG_LOG("nt:%d cond:%p", th->nt->serial, &th->nt->readyq);
+                    rb_nativethread_cond_t *cond = &th->nt->readyq;
 
-                    if (end) {
+                    // Once someone has queued this thread the deadline is spent: it
+                    // is waiting for a turn, not for the time, and arming a kernel
+                    // timer for every round of that costs more than the wait.
+                    // Once someone has queued this thread the deadline is spent: it
+                    // is waiting for a turn, not for the time, and arming a kernel
+                    // timer for every round of that costs more than the wait.
+                    if (end && !th->sched.node.is_ready) {
                         rb_hrtime_t abs = *end;
 
                         if (!condattr_monotonic) {
@@ -934,7 +943,7 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
                             rb_hrtime_t now = rb_hrtime_now();
                             abs = native_cond_timeout(cond, *end > now ? *end - now : 0);
                         }
-                        native_cond_timedwait(cond, &sched->lock_, &abs);
+                        timedout = native_cond_timedwait(cond, &sched->lock_, &abs) == ETIMEDOUT;
                     }
                     else {
                         rb_native_cond_wait(cond, &sched->lock_);
@@ -942,7 +951,7 @@ thread_sched_wait_running_turn(struct rb_thread_sched *sched, rb_thread_t *th, b
                 }
                 thread_sched_set_locked(sched, th);
 
-                if (end && rb_hrtime_now() >= *end &&
+                if (timedout &&
                     sched->running != th && !th->sched.node.is_ready) {
                     // the deadline passed and nobody woke this thread: get back in
                     // line for the running turn, then wait for it without a deadline
@@ -1112,6 +1121,9 @@ thread_sched_to_dead_common(struct rb_thread_sched *sched, rb_thread_t *th)
 static void
 thread_sched_to_dead(struct rb_thread_sched *sched, rb_thread_t *th)
 {
+    // wait out any pending wake here, while th's Ractor is still alive
+    timer_thread_wake_fence(th);
+
     thread_sched_lock(sched, th);
     {
         thread_sched_to_dead_common(sched, th);
@@ -1211,11 +1223,21 @@ ubf_waiting(void *ptr)
 
     thread_sched_lock(sched, th);
     {
-        if (sched->running == th) {
-            // not sleeping yet.
+        if (sched->running == th || th->sched.node.is_ready) {
+            // not sleeping yet, or a deadline already put it back in line
         }
         else {
             thread_sched_to_ready_common(sched, th, true, false);
+
+            // If the turn is taken, th stays parked until the running thread yields.
+            // For a timed wait, wake it early anyway: it re-parks at once, but its
+            // wakeup then runs on another core in parallel with the running thread,
+            // off the handoff path.  An untimed wait has no post-wake bookkeeping
+            // worth pipelining, so it skips the extra futex round.
+            if (sched->running != th && th->sched.waiting_timed &&
+                th->nt != NULL && th_has_dedicated_nt(th)) {
+                rb_native_cond_signal(&th->nt->readyq);
+            }
         }
     }
     thread_sched_unlock(sched, th);
@@ -1223,11 +1245,15 @@ ubf_waiting(void *ptr)
 
 // running -> waiting
 //
-// This thread will sleep until other thread wakeup the thread.
+// This thread will sleep until other thread wakeup the thread.  `end` is an
+// absolute deadline, NULL to sleep until woken; only a dedicated native thread,
+// which parks on its own condvar, can take one.
 static void
-thread_sched_to_waiting_until_wakeup(struct rb_thread_sched *sched, rb_thread_t *th)
+thread_sched_to_waiting_until_wakeup(struct rb_thread_sched *sched, rb_thread_t *th, const rb_hrtime_t *end)
 {
     RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
+
+    VM_ASSERT(end == NULL || th_has_dedicated_nt(th));
 
     RB_VM_SAVE_MACHINE_CONTEXT(th);
 
@@ -1242,9 +1268,11 @@ thread_sched_to_waiting_until_wakeup(struct rb_thread_sched *sched, rb_thread_t 
         }
         else {
             bool can_direct_transfer = !th_has_dedicated_nt(th);
+            th->sched.waiting_timed = (end != NULL); // never true here for M:N (end is NULL)
             // NOTE: th->status is set before and after this sleep outside of this function in `sleep_forever`
             thread_sched_wakeup_next_thread(sched, th, can_direct_transfer);
-            thread_sched_wait_running_turn(sched, th, can_direct_transfer, NULL);
+            thread_sched_wait_running_turn(sched, th, can_direct_transfer, end);
+            th->sched.waiting_timed = false;
         }
     }
     thread_sched_unlock(sched, th);
@@ -1454,7 +1482,7 @@ ractor_sched_enq(rb_vm_t *vm, rb_ractor_t *r)
         // With every snt dedicated or retired, only the timer thread's
         // timeout branch can serve the entry or widen the pool: wake it
         // (a no-op unless it sleeps untimed).
-        if (vm->ractor.sched.snt_cnt == 0) {
+        if (RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt) == 0) {
             timer_thread_wakeup_locked(vm);
         }
 
@@ -1500,8 +1528,8 @@ ractor_sched_deq(rb_vm_t *vm, rb_ractor_t *cr)
             RUBY_DEBUG_LOG("wait grq_cnt:%d", (int)vm->ractor.sched.grq_cnt);
 
             if (SNT_IDLE_RETIRE >= 0 && ++idle_streak > SNT_IDLE_RETIRE &&
-                (int)vm->ractor.sched.snt_cnt > SNT_KEEP_MINIMUM) {
-                vm->ractor.sched.snt_cnt--;
+                (int)RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt) > SNT_KEEP_MINIMUM) {
+                RUBY_ATOMIC_DEC(vm->ractor.sched.snt_cnt);
                 RUBY_DEBUG_LOG("retire, snt_cnt:%d", (int)vm->ractor.sched.snt_cnt);
                 break;   // returning NULL ends this nt; see the caller
             }
@@ -1589,10 +1617,12 @@ rb_ractor_sched_wait(rb_execution_context_t *ec, rb_ractor_t *cr, rb_unblock_fun
             bool can_direct_transfer = !dedicated;
             RB_VM_SAVE_MACHINE_CONTEXT(th);
             th->status = THREAD_STOPPED_FOREVER;
+            th->sched.waiting_timed = (end_p != NULL); // never true here for M:N (end_p is NULL)
             RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_SUSPENDED, th);
             thread_sched_wakeup_next_thread(sched, th, can_direct_transfer);
             // sleep
             thread_sched_wait_running_turn(sched, th, can_direct_transfer, end_p);
+            th->sched.waiting_timed = false;
             th->status = THREAD_RUNNABLE;
 
             // whoever woke this thread took the timeout back first
@@ -1832,11 +1862,15 @@ thread_sched_atfork(struct rb_thread_sched *sched)
 
     if (th_has_dedicated_nt(th)) {
         vm->ractor.sched.snt_cnt = 0;
+#if USE_RUBY_DEBUG_LOG
         vm->ractor.sched.dnt_cnt = 1;
+#endif
     }
     else {
         vm->ractor.sched.snt_cnt = 1;
+#if USE_RUBY_DEBUG_LOG
         vm->ractor.sched.dnt_cnt = 0;
+#endif
     }
     vm->ractor.sched.running_cnt = 0;
 
@@ -1999,7 +2033,9 @@ Init_native_thread(rb_thread_t *main_th)
     main_th->nt->vm = vm;
 
     // setup mn
+#if USE_RUBY_DEBUG_LOG
     vm->ractor.sched.dnt_cnt = 1;
+#endif
 }
 
 extern int ruby_mn_threads_enabled;
@@ -2044,18 +2080,21 @@ native_thread_dedicated_inc(rb_vm_t *vm, rb_ractor_t *cr, struct rb_native_threa
     RUBY_DEBUG_LOG("nt:%d %d->%d", nt->serial, nt->dedicated, nt->dedicated + 1);
 
     if (nt->dedicated == 0) {
-        ractor_sched_lock(vm, cr);
-        {
-            vm->ractor.sched.snt_cnt--;
-            vm->ractor.sched.dnt_cnt++;
-
-            // This may have dedicated the last snt away from a pending
-            // entry whose enqueue saw snt_cnt > 0 (see ractor_sched_enq).
-            if (vm->ractor.sched.snt_cnt == 0 && vm->ractor.sched.grq_cnt > 0) {
-                timer_thread_wakeup_locked(vm);
+        // Lock-free; pairs with ractor_sched_enq (enq: grq_cnt up then read
+        // snt_cnt / here: snt_cnt down then read grq_cnt) against lost wakeups.
+        if (RUBY_ATOMIC_FETCH_SUB(vm->ractor.sched.snt_cnt, 1) == 1) {
+            // the last snt went dedicated; pending entries need the timer thread
+            ractor_sched_lock(vm, cr);
+            {
+                if (vm->ractor.sched.grq_cnt > 0) {
+                    timer_thread_wakeup_locked(vm);
+                }
             }
+            ractor_sched_unlock(vm, cr);
         }
-        ractor_sched_unlock(vm, cr);
+#if USE_RUBY_DEBUG_LOG
+        vm->ractor.sched.dnt_cnt++;
+#endif
     }
 
     nt->dedicated++;
@@ -2069,21 +2108,21 @@ native_thread_dedicated_dec(rb_vm_t *vm, rb_ractor_t *cr, struct rb_native_threa
     nt->dedicated--;
 
     if (nt->dedicated == 0) {
-        ractor_sched_lock(vm, cr);
-        {
-            /* max_cpu bounds the shared threads and this is where one rejoins
-             * them, so this is where the cap has to hold.  A thread with no room
-             * to come back to belongs to neither count until it ends. */
-            if (vm->ractor.sched.snt_cnt < vm->ractor.sched.max_cpu ||
-                (int)vm->ractor.sched.snt_cnt <= MINIMUM_SNT) {
-                vm->ractor.sched.snt_cnt++;
+        // Rejoin under the max_cpu cap; with no room this nt retires and
+        // belongs to neither count until it ends.
+        while (1) {
+            rb_atomic_t snt = RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt);
+            if (snt < vm->ractor.sched.max_cpu || (int)snt <= MINIMUM_SNT) {
+                if (RUBY_ATOMIC_CAS(vm->ractor.sched.snt_cnt, snt, snt + 1) == snt) break;
             }
             else {
                 nt->retiring = true;
+                break;
             }
-            vm->ractor.sched.dnt_cnt--;
         }
-        ractor_sched_unlock(vm, cr);
+#if USE_RUBY_DEBUG_LOG
+        vm->ractor.sched.dnt_cnt--;
+#endif
     }
 }
 
@@ -2137,11 +2176,7 @@ static void
 native_thread_destroy(struct rb_native_thread *nt)
 {
     if (nt) {
-        rb_native_cond_destroy(&nt->cond.readyq);
-
-        if (&nt->cond.readyq != &nt->cond.intr) {
-            rb_native_cond_destroy(&nt->cond.intr);
-        }
+        rb_native_cond_destroy(&nt->readyq);
 
         native_thread_destroy_atfork(nt);
     }
@@ -2447,11 +2482,7 @@ static void
 native_thread_setup(struct rb_native_thread *nt)
 {
     // init cond
-    rb_native_cond_initialize(&nt->cond.readyq);
-
-    if (&nt->cond.readyq != &nt->cond.intr) {
-        rb_native_cond_initialize(&nt->cond.intr);
-    }
+    rb_native_cond_initialize(&nt->readyq);
 }
 
 static void
@@ -2667,8 +2698,15 @@ thread_sched_reclaim(struct coroutine_context *dead_co)
 #endif
 
 void
+rb_thread_wake_fence(rb_thread_t *th)
+{
+    timer_thread_wake_fence(th);
+}
+
+void
 rb_threadptr_sched_free(rb_thread_t *th)
 {
+    timer_thread_wake_fence(th);
 #if USE_MN_THREADS
     if (th->sched.malloc_stack) {
         // has dedicated
@@ -2747,64 +2785,6 @@ static int
 native_fd_select(int n, rb_fdset_t *readfds, rb_fdset_t *writefds, rb_fdset_t *exceptfds, struct timeval *timeout, rb_thread_t *th)
 {
     return rb_fd_select(n, readfds, writefds, exceptfds, timeout);
-}
-
-static void
-ubf_pthread_cond_signal(void *ptr)
-{
-    rb_thread_t *th = (rb_thread_t *)ptr;
-    RUBY_DEBUG_LOG("th:%u on nt:%d", rb_th_serial(th), (int)th->nt->serial);
-    rb_native_cond_signal(&th->nt->cond.intr);
-}
-
-static void
-native_cond_sleep(rb_thread_t *th, rb_hrtime_t *rel)
-{
-    rb_nativethread_lock_t *lock = &th->interrupt_lock;
-    rb_nativethread_cond_t *cond = &th->nt->cond.intr;
-
-    /* Solaris cond_timedwait() return EINVAL if an argument is greater than
-     * current_time + 100,000,000.  So cut up to 100,000,000.  This is
-     * considered as a kind of spurious wakeup.  The caller to native_sleep
-     * should care about spurious wakeup.
-     *
-     * See also [Bug #1341] [ruby-core:29702]
-     * http://download.oracle.com/docs/cd/E19683-01/816-0216/6m6ngupgv/index.html
-     */
-    const rb_hrtime_t max = (rb_hrtime_t)100000000 * RB_HRTIME_PER_SEC;
-
-    THREAD_BLOCKING_BEGIN(th);
-    {
-        rb_native_mutex_lock(lock);
-        th->unblock.func = ubf_pthread_cond_signal;
-        th->unblock.arg = th;
-
-        if (RUBY_VM_INTERRUPTED(th->ec)) {
-            /* interrupted.  return immediate */
-            RUBY_DEBUG_LOG("interrupted before sleep th:%u", rb_th_serial(th));
-        }
-        else {
-            if (!rel) {
-                rb_native_cond_wait(cond, lock);
-            }
-            else {
-                rb_hrtime_t end;
-
-                if (*rel > max) {
-                    *rel = max;
-                }
-
-                end = native_cond_timeout(cond, *rel);
-                native_cond_timedwait(cond, lock, &end);
-            }
-        }
-        th->unblock.func = 0;
-
-        rb_native_mutex_unlock(lock);
-    }
-    THREAD_BLOCKING_END(th);
-
-    RUBY_DEBUG_LOG("done th:%u", rb_th_serial(th));
 }
 
 #ifdef USE_UBF_LIST
@@ -3181,6 +3161,9 @@ static struct {
     rb_hrtime_t next_expiry;   // never later than the earliest deadline
     struct ccan_list_head waiting_untimed;
     pthread_mutex_t waiting_lock;
+
+    // signaled when wake_pending clears on a thread; see timer_thread_wake_fence
+    rb_nativethread_cond_t wake_pending_cond;
 #endif
 
 #if (HAVE_SYS_EPOLL_H || HAVE_SYS_EVENT_H) && USE_MN_THREADS
@@ -3405,6 +3388,7 @@ rb_thread_create_timer_thread(void)
         timer_th.next_expiry = TIMER_WHEEL_NO_EXPIRY;
         ccan_list_head_init(&timer_th.waiting_untimed);
         rb_native_mutex_initialize(&timer_th.waiting_lock);
+        rb_native_cond_initialize(&timer_th.wake_pending_cond);
 #endif
 
         // open communication channel
@@ -3556,16 +3540,28 @@ native_sleep(rb_thread_t *th, rb_hrtime_t *rel)
     struct rb_thread_sched *sched = TH_SCHED(th);
 
     RUBY_DEBUG_LOG("rel:%d", rel ? (int)*rel : 0);
-    if (rel) {
-        if (th_has_dedicated_nt(th)) {
-            native_cond_sleep(th, rel);
-        }
-        else {
-            thread_sched_wait_events(sched, th, -1, thread_sched_waiting_timeout, rel);
-        }
+
+    if (rel && !th_has_dedicated_nt(th)) {
+        // an M:N thread has no condvar of its own: the timer thread wakes it
+        thread_sched_wait_events(sched, th, -1, thread_sched_waiting_timeout, rel);
+    }
+    else if (rel) {
+        /* Solaris cond_timedwait() returns EINVAL if an argument is greater than
+         * current_time + 100,000,000.  So cut up to 100,000,000.  This is
+         * considered as a kind of spurious wakeup.  The caller to native_sleep
+         * should care about spurious wakeup.
+         *
+         * See also [Bug #1341] [ruby-core:29702]
+         * http://download.oracle.com/docs/cd/E19683-01/816-0216/6m6ngupgv/index.html
+         */
+        const rb_hrtime_t max = (rb_hrtime_t)100000000 * RB_HRTIME_PER_SEC;
+        if (*rel > max) *rel = max;
+
+        rb_hrtime_t end = rb_hrtime_add(rb_hrtime_now(), *rel);
+        thread_sched_to_waiting_until_wakeup(sched, th, &end);
     }
     else {
-        thread_sched_to_waiting_until_wakeup(sched, th);
+        thread_sched_to_waiting_until_wakeup(sched, th, NULL);
     }
 
     RUBY_DEBUG_LOG("wakeup");

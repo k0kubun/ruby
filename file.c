@@ -2734,21 +2734,27 @@ rb_file_ctime(VALUE obj)
 #if defined(HAVE_STAT_BIRTHTIME)
 /*
  *  call-seq:
- *     File.birthtime(entry_path) -> new_time
+ *    File.birthtime(path) -> time
  *
  * Returns a new Time object containing the create time
- * of the entry at the given +path+:
+ * of the entry at the given +path+;
+ * see {File System Timestamps}[rdoc-ref:file/timestamps.md]:
  *
- *   path = 't.tmp'
- *   File.birthtime(path) # Raises Errno::ENOENT: No such file or directory
- *   File.write(path, 'foo')
- *   File.birthtime(path) # => 2026-04-14 11:10:43.2891695 -0500
- *   File.write(path, 'bar')
- *   File.birthtime(path) # => 2026-04-14 11:10:43.2891695 -0500
- *   File.delete(path)
- *   File.birthtime(path) # Raises Errno::ENOENT: No such file or directory
+ *   filepath = 't.tmp'
+ *   File.birthtime(filepath) # Raises Errno::ENOENT: No such file or directory
+ *   File.write(filepath, 'foo')
+ *   File.birthtime(filepath) # => 2026-04-14 11:10:43.2891695 -0500
+ *   File.write(filepath, 'bar')
+ *   File.birthtime(filepath) # => 2026-04-14 11:10:43.2891695 -0500
+ *   File.delete(filepath)
+ *   File.birthtime(filepath) # Raises Errno::ENOENT: No such file or directory.
  *
- * See {File System Timestamps}[rdoc-ref:file/timestamps.md].
+ *   dirpath = 'tmp'
+ *   Dir.mkdir(dirpath)
+ *   File.birthtime(dirpath) # => 2026-08-21 13:42:19.389324172 -0500
+ *   Dir.rmdir(dirpath)
+ *   File.birthtime(dirpath) # Raises Errno::ENOENT: No such file or directory.
+ *
  */
 
 VALUE
@@ -2873,15 +2879,27 @@ chmod_internal(const char *path, void *mode)
 
 /*
  *  call-seq:
- *     File.chmod(mode_int, file_name, ... )  ->  integer
+ *     File.chmod(mode, *paths) -> integer
  *
- *  Changes permission bits on the named file(s) to the bit pattern
- *  represented by <i>mode_int</i>. Actual effects are operating system
- *  dependent (see the beginning of this section). On Unix systems, see
- *  <code>chmod(2)</code> for details. Returns the number of files
- *  processed.
+ *  Changes the mode (i.e., permissions) of the entries of each the given +paths+;
+ *  see {File Permissions}[rdoc-ref:File@File+Permissions].
+ *  Returns the count of the given +paths+:
  *
- *     File.chmod(0644, "testfile", "out")   #=> 2
+ *    filepath = 't.tmp'
+ *    File.write(filepath, 'foo')
+ *    dirpath = 'tempdir'
+ *    Dir.mkdir(dirpath)
+ *    File::Stat.new(filepath).mode.to_s(8) # => "100664"
+ *    File::Stat.new(dirpath).mode.to_s(8)  # => "40775"
+ *    File.chmod(0775, filepath, dirpath)   # => 2
+ *    File::Stat.new(filepath).mode.to_s(8) # => "100775"
+ *    File::Stat.new(dirpath).mode.to_s(8)  # => "40775"
+ *    File.chmod(0664, filepath, dirpath)   # => 2
+ *    File::Stat.new(filepath).mode.to_s(8) # => "100664"
+ *    File::Stat.new(dirpath).mode.to_s(8)  # => "40664"
+ *    File.delete(filepath)
+ *    Dir.rmdir(dirpath)
+ *
  */
 
 static VALUE
@@ -3041,16 +3059,46 @@ chown_internal(const char *path, void *arg)
 
 /*
  *  call-seq:
- *     File.chown(owner_int, group_int, file_name, ...)  ->  integer
+ *    File.chown(owner_int, group_int, *paths) -> integer
  *
- *  Changes the owner and group of the named file(s) to the given
- *  numeric owner and group id's. Only a process with superuser
- *  privileges may change the owner of a file. The current owner of a
- *  file may change the file's group to any group to which the owner
- *  belongs. A <code>nil</code> or -1 owner or group id is ignored.
- *  Returns the number of files processed.
+ *  Changes the owner and group of the entry at each of the given +paths+;
+ *  returns the count of the given +paths+:
  *
- *     File.chown(nil, 100, "testfile")
+ *    # Super user; all privileges.
+ *    Process.uid                               => 0
+ *    Process.gid                               => 0
+ *    # Create a directory and a file.
+ *    dirpath = 'doc/foo'
+ *    Dir.mkdir(dirpath)
+ *    filepath = 't.tmp'
+ *    File.write(filepath, 'foo')
+ *    # Get their user and group ids.
+ *    dirstat = File::Stat.new(dirpath)
+ *    dirstat.uid                               => 0
+ *    dirstat.gid                               => 0
+ *    filestat = File::Stat.new(filepath)
+ *    filestat.uid                              => 0
+ *    filestat.gid                              => 0
+ *    # Change ownership of both.
+ *    File.chown(1000, 1000, filepath, dirpath) => 2
+ *    dirstat = File::Stat.new(dirpath)
+ *    dirstat.uid                               => 1000
+ *    dirstat.gid                               => 1000
+ *    filestat = File::Stat.new(filepath)
+ *    filestat.uid                              => 1000
+ *    filestat.gid                              => 1000
+ *    # Clean up.
+ *    Dir.rmdir(dirpath)
+ *    File.delete(filepath)
+ *
+ *  Notes:
+ *
+ *  - On Windows, the owner and group are not changed.
+ *  - Only a process with superuser privileges can change the owner of an entry.
+ *  - The owner of an entry can change its group to any group
+ *    to which the owner belongs.
+ *  - A +nil+ or +-1+ owner or group id is ignored.
+ *  - The method follows symbolic links to the target entry.
  *
  */
 
@@ -5364,11 +5412,11 @@ ruby_enc_find_basename(const char *name, long *baselen, long *alllen, rb_encodin
 
 /*
  *  call-seq:
- *    File.basename(path, suffix = '') -> new_string
+ *    File.basename(path, suffix = '') -> string
  *
- *  Returns a new string containing all or part of the last entry of the given +path+.
- *  Entries are delimited by the value of constant File::SEPARATOR
- *  and, if non-nil, the value of constant File::ALT_SEPARATOR.
+ *  Returns a new string containing all or part of the last component of the given +path+.
+ *  Components are delimited by the value of constant File::SEPARATOR
+ *  and, if non-+nil+, the value of constant File::ALT_SEPARATOR.
  *
  *  When +suffix+ is the empty string <tt>''</tt>,
  *  returns all of the last entry:
