@@ -598,6 +598,9 @@ make_counters! {
     inline_reject_compile_failure,
     inline_reject_no_returns,
     inline_reject_budget_exceeded,
+    // Callees inlined past the caller's cumulative budget because inlining them is what lets
+    // a `yield` inside them dispatch directly. See `MAX_YIELD_INLINE_BONUSES`.
+    inline_yield_bonus_count,
 
     // `def foo(...)` callees, whose inlining is what gives a `bar(...)` inside them a
     // compile-time callinfo.
