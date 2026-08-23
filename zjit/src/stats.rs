@@ -160,6 +160,9 @@ make_counters! {
         ivar_respecialize_declined_count,
         ivar_respecialize_giveup_count,
         ivar_profile_evicted_count,
+        block_respecialize_count,
+        block_respecialize_declined_count,
+        block_respecialize_giveup_count,
         skipped_native_stack_full,
         invalidation_recompiles_granted,
 
@@ -410,6 +413,7 @@ make_counters! {
         send_fallback_invokeblock_symbol_unspecialized,
         send_fallback_invokeblock_polymorphic_miss,
         send_fallback_invokeblock_autosplat_miss,
+        send_fallback_invokeblock_dynamic_miss,
         send_fallback_sendforward_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
@@ -425,6 +429,7 @@ make_counters! {
         non_variadic_cfunc_optimized_send_count,
         variadic_cfunc_optimized_send_count,
         block_iseq_direct_optimized_send_count,
+        block_iseq_dynamic_optimized_send_count,
     }
 
     // Ivar fallback counters that are summed as dynamic_setivar_count
@@ -680,6 +685,24 @@ make_counters! {
     invokeblock_handler_megamorphic,
     invokeblock_handler_megamorphic_ifunc,
     invokeblock_handler_no_profiles,
+
+    // Why a run-time block ISEQ could not be entered directly by
+    // gen_invoke_block_iseq_dynamic(), which instead called rb_vm_invokeblock().
+    block_iseq_dynamic_miss_not_simple,
+    block_iseq_dynamic_miss_autosplat,
+    block_iseq_dynamic_miss_arity,
+    block_iseq_dynamic_miss_locals,
+    block_iseq_dynamic_miss_stack_max,
+    block_iseq_dynamic_miss_not_compiled,
+
+    // Handler kinds seen by rb_zjit_block_reprofile()'s sampling windows, i.e. what actually
+    // reaches a compiled `yield`'s generic fallback. Sampling is bounded per version, so these
+    // describe the composition of the fallback traffic, not its volume.
+    block_fallback_sample_iseq,
+    block_fallback_sample_symbol,
+    block_fallback_sample_proc,
+    block_fallback_sample_ifunc,
+    block_fallback_sample_other,
 
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may
@@ -1024,6 +1047,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         InvokeBlockSymbolUnspecialized            => send_fallback_invokeblock_symbol_unspecialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
         InvokeBlockAutosplatMiss                  => send_fallback_invokeblock_autosplat_miss,
+        InvokeBlockDynamicMiss                    => send_fallback_invokeblock_dynamic_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,

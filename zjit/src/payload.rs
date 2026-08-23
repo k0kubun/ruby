@@ -45,6 +45,18 @@ pub struct IseqPayload {
     /// fallback path, so once the evidence says a recompile would not help, later compiles of
     /// this ISEQ leave the sampling out.
     pub ivar_reprofile_giveup: bool,
+    /// Extra compiled versions this ISEQ has been granted so that a frozen `invokeblock`
+    /// dispatch can pick up block handlers its profile never saw. Only
+    /// [`crate::profile::rb_zjit_block_reprofile`] grants these, and only against evidence from
+    /// the generic fallback path. Capped at [`MAX_BLOCK_RESPECIALIZATIONS`].
+    pub block_respecializations: u8,
+    /// Whether a `yield` fallback in this ISEQ has spent a compiled version's worth of
+    /// re-profiling windows without earning a recompile. See [`ivar_reprofile_giveup`]: sampling
+    /// costs a non-leaf call on the fallback path, so once the evidence says a recompile would
+    /// not help, later compiles of this ISEQ leave the sampling out.
+    ///
+    /// [`ivar_reprofile_giveup`]: IseqPayload::ivar_reprofile_giveup
+    pub block_reprofile_giveup: bool,
     /// Number of extra versions granted because a PatchPoint invalidation would
     /// otherwise have left this ISEQ permanently side-exiting. See
     /// [`crate::codegen::invalidate_iseq_version`].
@@ -69,6 +81,16 @@ pub struct IseqPayload {
 /// keep changing shape.
 pub const MAX_IVAR_RESPECIALIZATIONS: u8 = 2;
 
+/// How many extra versions a single ISEQ may earn for `invokeblock` handler respecialization.
+///
+/// The shared core iterators this exists for compile once during boot, from a profile of their
+/// first few yields, and then never see a reason to recompile: their dispatch does not
+/// side-exit, it branches to `rb_vm_invokeblock()`. Three is what it takes to converge on a
+/// Rails boot: one window closes on the loader's traffic, one on the framework's, and one on the
+/// application's. Past that a site is genuinely handler-polymorphic and more versions would not
+/// help.
+pub const MAX_BLOCK_RESPECIALIZATIONS: u8 = 3;
+
 /// Upper bound on the extra versions [`IseqPayload::invalidation_recompiles`] can grant.
 /// Invalidation is an external event (a constant or method was redefined), not a
 /// mis-speculation, so it should not consume the respecialization budget. We still cap
@@ -87,6 +109,8 @@ impl IseqPayload {
             self_is_heap_object: false,
             ivar_respecializations: 0,
             ivar_reprofile_giveup: false,
+            block_respecializations: 0,
+            block_reprofile_giveup: false,
             invalidation_recompiles: 0,
             may_write_block_code: None,
             bg_queued: false,
@@ -111,6 +135,7 @@ impl IseqPayload {
     pub fn version_limit(&self) -> usize {
         crate::codegen::max_iseq_versions()
             + self.ivar_respecializations as usize
+            + self.block_respecializations as usize
             + self.invalidation_recompiles as usize
     }
 
@@ -147,7 +172,37 @@ pub struct IseqVersion {
     /// that is otherwise exit-free, so a version whose fallbacks keep failing to make the case
     /// for a recompile stops paying for the evidence.
     pub ivar_reprofile_windows: u8,
+    /// Re-profiling windows this version's `invokeblock` fallback paths may still close without
+    /// earning a recompile before going dormant. Same trade as [`Self::ivar_reprofile_windows`]:
+    /// sampling is a C call on a path that would otherwise just be a call to
+    /// `rb_vm_invokeblock()`, and a version whose fallbacks keep failing to make the case for a
+    /// recompile stops paying for it.
+    pub block_reprofile_windows: u8,
+    /// Fallback executions this version still has to skip before it samples another block
+    /// handler. Decremented in JIT code; written by
+    /// [`crate::profile::rb_zjit_block_reprofile`], which sets it to 0 while a window is open
+    /// and to [`BLOCK_REPROFILE_COOLDOWN`] when the windows run out.
+    ///
+    /// Unlike the ivar path's one-shot give-up, this goes dormant rather than silent. What a
+    /// shared iterator's `yield` is handed changes completely between boot and steady state --
+    /// `Array#each` spends boot yielding to RubyGems' `&:strip!` and the rest of the process
+    /// yielding to the application's blocks -- so a site that gave up on the first mix it saw
+    /// would stay frozen on it. The cooldown makes each verdict provisional at a cost of one
+    /// sample per [`BLOCK_REPROFILE_COOLDOWN`] fallbacks.
+    ///
+    /// Raced between threads: it is a plain load/store, and a lost decrement only delays or
+    /// duplicates a sample.
+    pub block_reprofile_countdown: u32,
 }
+
+/// How many windows a `yield` fallback may close without earning a recompile before the version
+/// stops sampling until its cooldown expires. See [`MAX_IVAR_REPROFILE_WINDOWS`].
+pub const MAX_BLOCK_REPROFILE_WINDOWS: u8 = 4;
+
+/// Fallback executions a dormant `yield` site skips before it opens another re-profiling window.
+/// Large enough that the sampling call is under a thousandth of the fallbacks at the hottest
+/// site in a lobsters run, small enough that a site notices a new steady state within it.
+pub const BLOCK_REPROFILE_COOLDOWN: u32 = 100_000;
 
 /// How many windows an ivar fallback may close without earning a recompile before the version
 /// stops sampling. A fallback that has handed the same unspecializable mix of shapes to this
@@ -206,6 +261,8 @@ impl IseqVersion {
             outgoing: vec![],
             incoming: vec![],
             ivar_reprofile_windows: MAX_IVAR_REPROFILE_WINDOWS,
+            block_reprofile_windows: MAX_BLOCK_REPROFILE_WINDOWS,
+            block_reprofile_countdown: 0,
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
