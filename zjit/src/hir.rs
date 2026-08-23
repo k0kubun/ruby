@@ -3113,6 +3113,35 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 = VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT
 /// actual `rb_callinfo` for it would need a GC root the compiler has no way to hold. The
 /// method name is not part of the shape: callers resolve that separately, and it never affects
 /// argument setup.
+#[derive(Debug, Clone, Copy)]
+pub struct CallShape {
+    pub flags: u32,
+    pub argc: usize,
+    pub kwarg: *const rb_callinfo_kwarg,
+    /// The callinfo this shape was read from, when the call site has one. `None` for a shape
+    /// synthesized for an expanded `bar(...)`: no `rb_callinfo` object describes the merged
+    /// argument list, which is what keeps a forwardable callee -- whose `...` local has to
+    /// *receive* a callinfo -- from being a direct-send target for such a site.
+    pub ci: Option<*const rb_callinfo>,
+}
+
+impl CallShape {
+    /// The shape an ordinary call site's callinfo describes.
+    pub fn from_ci(ci: *const rb_callinfo) -> Self {
+        CallShape {
+            flags: unsafe { rb_vm_ci_flag(ci) },
+            argc: unsafe { rb_vm_ci_argc(ci) } as usize,
+            kwarg: unsafe { rb_vm_ci_kwarg(ci) },
+            ci: Some(ci),
+        }
+    }
+
+    /// The number of keywords named in the call site's keyword table, zero if it has none.
+    fn kw_count(&self) -> usize {
+        if self.kwarg.is_null() { 0 } else { (unsafe { get_cikw_keyword_len(self.kwarg) }) as usize }
+    }
+}
+
 /// Where the callinfo a `bar(...)` site forwards comes from. See
 /// [`Function::specialize_send_forward`].
 enum ForwardedCallInfo {
@@ -3142,35 +3171,6 @@ impl ForwardedCallInfo {
         match *self {
             ForwardedCallInfo::Inlined { ci, .. } | ForwardedCallInfo::Profiled { ci, .. } => ci,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CallShape {
-    pub flags: u32,
-    pub argc: usize,
-    pub kwarg: *const rb_callinfo_kwarg,
-    /// The callinfo this shape was read from, when the call site has one. `None` for a shape
-    /// synthesized for an expanded `bar(...)`: no `rb_callinfo` object describes the merged
-    /// argument list, which is what keeps a forwardable callee -- whose `...` local has to
-    /// *receive* a callinfo -- from being a direct-send target for such a site.
-    pub ci: Option<*const rb_callinfo>,
-}
-
-impl CallShape {
-    /// The shape an ordinary call site's callinfo describes.
-    pub fn from_ci(ci: *const rb_callinfo) -> Self {
-        CallShape {
-            flags: unsafe { rb_vm_ci_flag(ci) },
-            argc: unsafe { rb_vm_ci_argc(ci) } as usize,
-            kwarg: unsafe { rb_vm_ci_kwarg(ci) },
-            ci: Some(ci),
-        }
-    }
-
-    /// The number of keywords named in the call site's keyword table, zero if it has none.
-    fn kw_count(&self) -> usize {
-        if self.kwarg.is_null() { 0 } else { (unsafe { get_cikw_keyword_len(self.kwarg) }) as usize }
     }
 }
 
