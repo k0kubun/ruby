@@ -113,6 +113,7 @@ fn profile_insn_sample(
             let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
             let argc = (unsafe { vm_ci_argc((*cd).ci) }) as usize;
             profile_operands_below_top(profiler, profile, argc + 2);
+            profile_forwarded_callinfo(profiler, profile);
         }
         YARVINSN_splatarray => profile_operands(profiler, profile, 1),
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
@@ -175,6 +176,20 @@ pub type SplatLengthDistribution = Distribution<Option<SplatLength>, DISTRIBUTIO
 
 pub type SplatLengthDistributionSummary = DistributionSummary<Option<SplatLength>, DISTRIBUTION_SIZE>;
 
+/// The bits of a packed callinfo, or `None` for a heap (`imemo_callinfo`) one. See
+/// [`profile_forwarded_callinfo`]. Holds no object, so GC marking never looks at it.
+///
+/// Two buckets rather than [`DISTRIBUTION_SIZE`]: the only question asked of this distribution is
+/// whether the site ever forwarded more than one callinfo, and a second bucket already answers
+/// it. `Distribution` boxes everything past bucket 0, so the width costs nothing until a site
+/// goes polymorphic -- at which point there is no reason to size the box for six buckets whose
+/// contents would never be read.
+const FORWARDED_CI_DISTRIBUTION_SIZE: usize = 2;
+
+pub type ForwardedCiDistribution = Distribution<Option<usize>, FORWARDED_CI_DISTRIBUTION_SIZE>;
+
+pub type ForwardedCiDistributionSummary = DistributionSummary<Option<usize>, FORWARDED_CI_DISTRIBUTION_SIZE>;
+
 /// Allocate exactly `n` empty operand type distributions.
 fn new_opnd_types(n: usize) -> Box<[TypeDistribution]> {
     // vec![elem; n] allocates exactly n elements, unlike Vec::resize().
@@ -215,6 +230,26 @@ fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize
         VALUE::from(profiler.iseq).write_barrier(ty.class());
         profile_type.observe(ty);
     }
+}
+
+/// Record the callinfo a `bar(...)` site forwards, which the interpreter reads as `TOPN(0)` in
+/// `vm_caller_setup_fwd_args`. It is the `...` local of the enclosing `def foo(...)` frame, i.e.
+/// the callinfo of whoever called that method, so it is a property of the caller rather than of
+/// this call site -- which is exactly why it has to be profiled instead of read off the ISEQ.
+///
+/// Only a *packed* callinfo is recorded as a value. A packed one is an immediate whose bits are
+/// the whole of `(mid, flag, argc)` and whose keyword table is always empty, so a compiled site
+/// can compare against it bit for bit with no GC lifetime to worry about and no object to root.
+/// A heap (`imemo_callinfo`) one, which is what a keyword-carrying caller produces, is recorded
+/// as `None`: the site still learns that it saw something it cannot speculate on, so a mix of
+/// packed and heap callinfos reads as polymorphic rather than as a stable packed one.
+fn profile_forwarded_callinfo(profiler: &mut Profiler, profile: &mut IseqProfile) {
+    let ci = profiler.peek_at_stack(0).as_usize();
+    // Same test as `vm_ci_packed_p()`.
+    let packed = if ci & 0x01 != 0 { Some(ci) } else { None };
+    profile.forwarded_cis_mut()
+        .entry(profiler.insn_idx)
+        .or_insert_with(ForwardedCiDistribution::new).observe(packed);
 }
 
 fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) {
@@ -990,6 +1025,10 @@ pub struct IseqProfile {
     /// the same reason as `super_cme`.
     splat_lengths: Option<Box<HashMap<YarvInsnIdx, SplatLengthDistribution>>>,
 
+    /// Callinfos observed in the `...` local at `sendforward` sites. Boxed for the same reason
+    /// as `super_cme`. Like `splat_lengths` and unlike the tables above, it holds no objects.
+    forwarded_cis: Option<Box<HashMap<YarvInsnIdx, ForwardedCiDistribution>>>,
+
     /// Block handlers observed at `invokeblock` sites (stored as VALUE to be GC-safe).
     /// Kept out of `opnd_types` so that the entry's operand slots profile the yielded
     /// arguments instead: a `yield` to a Symbol block sends to the first argument, and
@@ -1025,6 +1064,7 @@ impl IseqProfile {
             super_cme: None,
             send_mid: None,
             splat_lengths: None,
+            forwarded_cis: None,
             block_handlers: None,
             block_fallbacks: None,
             marked_objects: Vec::new(),
@@ -1085,6 +1125,13 @@ impl IseqProfile {
     /// never looks at it.
     fn splat_lengths_mut(&mut self) -> &mut HashMap<YarvInsnIdx, SplatLengthDistribution> {
         self.splat_lengths.get_or_insert_with(Default::default)
+    }
+
+    /// Mutable access to the forwarded callinfo distributions, creating the table on first
+    /// use. Needs no marking invalidation for the same reason `splat_lengths_mut` does not: a
+    /// packed callinfo is an immediate, not an object, and a heap one is recorded as `None`.
+    fn forwarded_cis_mut(&mut self) -> &mut HashMap<YarvInsnIdx, ForwardedCiDistribution> {
+        self.forwarded_cis.get_or_insert_with(Default::default)
     }
 
     /// Mutable access to the `invokeblock` block-handler distributions, creating the
@@ -1240,6 +1287,12 @@ impl IseqProfile {
         self.send_mid.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
     }
 
+    /// The distribution of callinfos a `sendforward` site was seen forwarding. See
+    /// [`profile_forwarded_callinfo`].
+    pub fn get_forwarded_callinfos(&self, insn_idx: YarvInsnIdx) -> Option<ForwardedCiDistributionSummary> {
+        self.forwarded_cis.as_ref()?.get(&insn_idx).map(ForwardedCiDistributionSummary::new)
+    }
+
     /// The distribution of block handlers observed at an `invokeblock` site.
     pub fn get_block_handlers(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
         self.block_handlers.as_ref()?.get(&insn_idx).map(TypeDistributionSummary::new)
@@ -1290,6 +1343,11 @@ impl IseqProfile {
             out.bytes += size_of::<HashMap<YarvInsnIdx, SplatLengthDistribution>>();
             out.bytes += hash_table_bytes::<(YarvInsnIdx, SplatLengthDistribution)>(splat_lengths.capacity());
             out.bytes += splat_lengths.values().map(SplatLengthDistribution::heap_size).sum::<usize>();
+        }
+        if let Some(forwarded_cis) = self.forwarded_cis.as_ref() {
+            out.bytes += size_of::<HashMap<YarvInsnIdx, ForwardedCiDistribution>>();
+            out.bytes += hash_table_bytes::<(YarvInsnIdx, ForwardedCiDistribution)>(forwarded_cis.capacity());
+            out.bytes += forwarded_cis.values().map(ForwardedCiDistribution::heap_size).sum::<usize>();
         }
         out
     }
