@@ -9523,6 +9523,379 @@ fn test_send_cache_skips_keyword_argument_sites() {
     );
 }
 
+/// Like [`SEND_CACHE_SETUP`], but warmed hard enough that the *callees* are compiled too:
+/// the inline direct dispatch path only takes over once `ISEQ_BODY(iseq)->jit_entry` exists,
+/// so a site whose targets are still interpreted exercises the slow half of the probe.
+/// `value` takes no arguments and has no locals, which is the callee shape
+/// `zjit_send_cache_direct_cme()` accepts.
+const MEGA_DIRECT_SETUP: &str = r#"
+    KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+    OBJS = KLASSES.map(&:new)
+    def test(o) = o.value
+    61.times { OBJS.each { |o| test o } }
+"#;
+
+/// Run `program` and assert JIT code dispatched at least one send without leaving JIT code.
+#[track_caller]
+fn assert_megamorphic_direct_hits(program: &str) -> String {
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    let result = inspect(program);
+    let after = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    assert!(after > before, "expected a megamorphic send to be dispatched directly, but the counter did not move");
+    result
+}
+
+#[test]
+fn test_megamorphic_direct_dispatches_every_class() {
+    // The baseline: every receiver reaches its own class's method through the inline path, and
+    // a class the table has never seen still gets there through the fallback.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        k = Class.new; k.class_eval("def value; 99; end")
+        [OBJS.map { |o| test o }.sum, test(k.new)]
+    "#), @"[435, 99]");
+}
+
+#[test]
+fn test_megamorphic_direct_passes_arguments() {
+    // Arguments are handed over by leaving them where the caller's operand stack already put
+    // them, so a wrong frame layout shows up as a wrong argument value rather than a crash.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        ADD_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def add(a, b, c) = a + b + c + #{i}"); k }
+        ADD_OBJS = ADD_KLASSES.map(&:new)
+        def test_add(o) = o.add(1, 20, 300)
+        61.times { ADD_OBJS.each { |o| test_add o } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_hits(
+        "ADD_OBJS.map { |o| test_add o }"
+    ), @"[321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349, 350]");
+}
+
+#[test]
+fn test_megamorphic_direct_after_redefinition() {
+    // The invalidation path that matters most: the slot still holds the old callcache, whose
+    // method entry rb_clear_method_cache() has flagged. The probe tests that flag before it
+    // ever looks at the ISEQ, so the redefined body runs from the very next call.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each_with_index { |k, i| k.class_eval("def value; #{i * 100}; end") }
+        after = OBJS.map { |o| test o }.sum
+        [before, after, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 43500, 43500]");
+}
+
+#[test]
+fn test_megamorphic_direct_after_prepend() {
+    // prepend changes which method the same receiver class resolves the name to. The direct
+    // path caches no resolution of its own, so this is the callcache's invalidation again.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS.map { |o| test o }.sum
+        pre = Module.new { def value = super + 1000 }
+        KLASSES.each { |k| k.prepend(pre) }
+        [before, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 30435]");
+}
+
+#[test]
+fn test_megamorphic_direct_after_include() {
+    // Including a module ahead of the one a class got the method from changes the resolution
+    // without touching the receiver class, which is the case a class-keyed table could get
+    // wrong if it did not consult the method entry.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        INNER_D = Module.new { def value = 1 }
+        BASES_D = 30.times.map { Class.new { include INNER_D } }
+        OBJS_D = BASES_D.map(&:new)
+        def test_d(o) = o.value
+        61.times { OBJS_D.each { |o| test_d o } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS_D.map { |o| test_d o }.sum
+        outer = Module.new { def value = 7 }
+        BASES_D.each { |k| k.include(outer) }
+        [before, OBJS_D.map { |o| test_d o }.sum]
+    "#), @"[30, 210]");
+}
+
+#[test]
+fn test_megamorphic_direct_respects_a_visibility_change() {
+    // Making the method private must start raising: the direct path skips vm_call_method(),
+    // which is where the permission check lives, so it may only ever take over calls that
+    // function would have let through.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each { |k| k.send(:private, :value) }
+        [before, OBJS.map { |o| begin; test o; rescue NoMethodError; :private; end }.uniq]
+    "#), @"[435, [:private]]");
+}
+
+#[test]
+fn test_megamorphic_direct_declines_protected_methods() {
+    // A protected method's check reads the *caller's* self, which nothing in a class-keyed
+    // table can stand in for, so those targets stay on the slow path and keep raising for a
+    // caller that is not a kind_of the defining class.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        PROT_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end\nprotected :value"); k }
+        PROT_OBJS = PROT_KLASSES.map(&:new)
+        def test_prot(o) = (begin; o.value; rescue NoMethodError; :protected; end)
+        61.times { PROT_OBJS.each { |o| test_prot o } }
+    "#);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    assert_snapshot!(inspect("PROT_OBJS.map { |o| test_prot o }.uniq"), @"[:protected]");
+    assert_eq!(
+        before,
+        crate::state::ZJITState::get_counters().send_megamorphic_direct,
+        "a protected method must not be dispatched directly",
+    );
+}
+
+#[test]
+fn test_megamorphic_direct_after_undef() {
+    // undef_method leaves the name resolving to the empty callcache, which the table refuses
+    // to store, so every later call re-resolves and reaches method_missing.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS.map { |o| test o }.sum
+        KLASSES.each { |k| k.send(:undef_method, :value) }
+        [before, OBJS.map { |o| begin; test o; rescue NoMethodError; :raised; end }.uniq]
+    "#), @"[435, [:raised]]");
+}
+
+#[test]
+fn test_megamorphic_direct_with_a_refinement_activated_after_warmup() {
+    // A refinement call site resolves to a refinement callcache, which the table declines to
+    // store; the unrefined site keeps its direct dispatch and the refined one does not get it.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        before = OBJS.map { |o| test o }.sum
+        refined = Module.new do
+          KLASSES.each { |k| refine(k) { def value = 5 } }
+        end
+        after = OBJS.map { |o| test o }.sum
+        m = Module.new
+        m.module_eval("using refined; def self.call1(o) = o.value", __FILE__, __LINE__)
+        [before, after, m.call1(OBJS[3])]
+    "#), @"[435, 435, 5]");
+}
+
+#[test]
+fn test_megamorphic_direct_sees_a_singleton_method() {
+    // Defining a singleton method moves the receiver to a class the table has never seen,
+    // rather than leaving a stale hit on the original one.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        obj = OBJS.first
+        before = test(obj)
+        obj.define_singleton_method(:value) { 555 }
+        [before, test(obj), test(OBJS[1])]
+    "#), @"[0, 555, 1]");
+}
+
+#[test]
+fn test_megamorphic_direct_under_tracepoint() {
+    // Enabling a TracePoint resets every compiled entry point, and the direct path re-reads
+    // `body->jit_entry` on every call rather than caching it, so the hook has to fire for the
+    // callees too -- 30 of them, once each.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(inspect(r#"
+        seen = []
+        tp = TracePoint.new(:call) { |t| seen << t.method_id }
+        tp.enable
+        sum = OBJS.map { |o| test o }.sum
+        tp.disable
+        [sum, seen.count(:value), OBJS.map { |o| test o }.sum]
+    "#), @"[435, 30, 435]");
+}
+
+#[test]
+fn test_megamorphic_direct_propagates_exceptions() {
+    // The direct path pushes no tag of its own, so a raise in the callee unwinds to whatever
+    // tag the JIT stack was entered under. Both the callee's own rescue and the caller's have
+    // to still find their frame.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(assert_megamorphic_direct_hits(r#"
+        KLASSES[5].class_eval("def value; raise 'inner'; rescue; :rescued_inside; end")
+        KLASSES[7].class_eval("def value; raise 'outer'; end")
+        outer = begin
+          OBJS.map { |o| test o }
+        rescue => e
+          e.message
+        end
+        [test(OBJS[5]), outer, test(OBJS[9])]
+    "#), @r#"[:rescued_inside, "outer", 9]"#);
+}
+
+#[test]
+fn test_megamorphic_direct_declines_complex_callee_shapes() {
+    // Optional parameters, a block parameter and extra locals all take the callee off the
+    // direct path, because the frame it pushes is fixed at compile time: the arguments are the
+    // whole local area and nothing is nil-filled.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        OPT_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval(<<~RUBY); k }
+            def opt(a, b = 10) = a + b + #{i}
+            def blk(a, &b) = a + #{i}
+            def loc(a) = (x = a * 2; y = x + 1; y + #{i})
+        RUBY
+        OPT_OBJS = OPT_KLASSES.map(&:new)
+        def test_opt(o) = o.opt(1)
+        def test_blk(o) = o.blk(1)
+        def test_loc(o) = o.loc(1)
+        61.times { OPT_OBJS.each { |o| test_opt o; test_blk o; test_loc o } }
+    "#);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    assert_snapshot!(inspect(r#"
+        [OPT_OBJS.map { |o| test_opt o }.sum,
+         OPT_OBJS.map { |o| test_blk o }.sum,
+         OPT_OBJS.map { |o| test_loc o }.sum]
+    "#), @"[765, 465, 525]");
+    assert_eq!(
+        before,
+        crate::state::ZJITState::get_counters().send_megamorphic_direct,
+        "callees with optionals, a block parameter or extra locals must not be dispatched directly",
+    );
+}
+
+#[test]
+fn test_megamorphic_direct_recurses_without_corrupting_the_stack() {
+    // Every direct call pushes a frame from JIT code and pops it on return; a wrong SP or CFP
+    // adjustment compounds with depth rather than showing up on the first call.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        REC_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def rec(n) = n <= 0 ? #{i} : rec(n - 1)"); k }
+        REC_OBJS = REC_KLASSES.map(&:new)
+        def test_rec(o, n) = o.rec(n)
+        61.times { REC_OBJS.each { |o| test_rec(o, 3) } }
+    "#);
+    assert_snapshot!(assert_megamorphic_direct_hits(
+        "[REC_OBJS.map { |o| test_rec(o, 200) }.sum, REC_OBJS.map { |o| test_rec(o, 1) }.sum]"
+    ), @"[435, 435]");
+}
+
+#[test]
+fn test_megamorphic_direct_raises_on_stack_overflow() {
+    // The stack overflow check runs before the frame push, against a bound that covers any
+    // callee the fill path accepts. Without it a deep enough chain writes past the VM stack.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(r#"
+        DEEP_KLASSES = 30.times.map { |i| k = Class.new; k.class_eval("def deep(n) = deep(n + 1)"); k }
+        DEEP_OBJS = DEEP_KLASSES.map(&:new)
+        def test_deep(o) = o.deep(0)
+    "#);
+    assert_snapshot!(inspect(r#"
+        DEEP_OBJS.map { |o| begin; test_deep(o); rescue SystemStackError; :stack_error; end }.uniq
+    "#), @"[:stack_error]");
+}
+
+#[test]
+fn test_megamorphic_direct_under_gc_stress() {
+    // The slot's second word is only reached after its callcache validates, so a class or
+    // method entry collected under the probe has to read as a miss, not as a dangling ISEQ.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(inspect(r#"
+        GC.stress = true
+        sums = 2.times.map { OBJS.map { |o| test o }.sum }
+        GC.stress = false
+        sums
+    "#), @"[435, 435]");
+}
+
+#[test]
+fn test_megamorphic_direct_across_compaction() {
+    // Compaction moves the classes the slots are hashed from, so both words are dropped
+    // together and refilled; a slot left half-cleared would pair one class's callcache with
+    // another's method entry.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(MEGA_DIRECT_SETUP);
+    assert_snapshot!(inspect(r#"
+        before = OBJS.map { |o| test o }.sum
+        GC.compact
+        middle = OBJS.map { |o| test o }.sum
+        GC.compact
+        [before, middle, OBJS.map { |o| test o }.sum]
+    "#), @"[435, 435, 435]");
+}
+
+#[test]
+fn test_megamorphic_direct_survives_class_churn_and_redefinition() {
+    // Everything at once, with an undersized table so nearly every call evicts: classes dying
+    // under the site, methods redefined and prepended while it is hot, and a compaction in the
+    // middle. Any slot that ever pairs a stale method entry with a live callcache shows up as
+    // a wrong answer here.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().send_cache_entries = 8;
+    let result = inspect(r#"
+        def test_churn(o) = o.value
+        errors = 0
+        12.times do |round|
+          ks = 20.times.map { |i| k = Class.new; k.class_eval("def value; #{i + round * 1000}; end"); k }
+          objs = ks.map(&:new)
+          4.times { objs.each_with_index { |o, i| errors += 1 unless test_churn(o) == i + round * 1000 } }
+          ks.each_with_index { |k, i| k.class_eval("def value; #{-(i + 1)}; end") }
+          objs.each_with_index { |o, i| errors += 1 unless test_churn(o) == -(i + 1) }
+          ks.each { |k| k.prepend(Module.new { def value = super * 2 }) }
+          objs.each_with_index { |o, i| errors += 1 unless test_churn(o) == -2 * (i + 1) }
+          GC.compact if round == 6
+          GC.start
+        end
+        errors
+    "#);
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().send_cache_entries =
+        crate::send_cache::DEFAULT_CACHE_ENTRIES;
+    assert_snapshot!(result, @"0");
+}
+
+#[test]
+fn test_megamorphic_direct_disabled_still_dispatches_correctly() {
+    // --zjit-disable-megamorphic-direct has to leave the C dispatch intact, since that is what
+    // an A/B measurement compares against.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_megamorphic_direct = true;
+    eval(MEGA_DIRECT_SETUP);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    let result = inspect("OBJS.map { |o| test o }.sum");
+    let after = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_megamorphic_direct = false;
+    assert_eq!(before, after, "the direct path should be off");
+    assert_snapshot!(result, @"435");
+}
+
 #[test]
 fn test_array_aref_out_of_bounds_reads_nil() {
     assert_snapshot!(inspect(r#"
