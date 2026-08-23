@@ -392,9 +392,13 @@ make_counters! {
     setivar_cache_uncacheable,
     setivar_cache_transition,
     // Number of tables allocated, i.e. distinct ivar names read or written by a
-    // compiled site that can reach the generic path. Multiply by
-    // --zjit-ivar-cache-entries * 8 for the memory.
+    // compiled site that can reach the generic path. See mem_ivar_cache_bytes
+    // for what they cost, which is no longer a fixed size per table.
     ivar_cache_alloc_count,
+    // Times a table was replaced by a larger one because it was thrashing. A
+    // count near ivar_cache_alloc_count means the initial size is too small for
+    // this workload. See crate::ivar_cache::IvarCache::grow.
+    ivar_cache_grow_count,
 
     // send_cache_: per-call-shape class table (see crate::send_cache). Every
     // send routed through the table lands in exactly one of send_cache_hit or
