@@ -2313,6 +2313,159 @@ fn test_send_nil_block_arg() {
 }
 
 #[test]
+fn test_attr_reader_two_shapes_per_class_in_polymorphic_arm() {
+    // A polymorphic call site branches on the receiver's class, so one arm can be entered by
+    // objects of that class with different shapes. Each shape the profile saw gets its own ivar
+    // load; the rest still have to read correctly through the C fallback.
+    assert_snapshot!(inspect("
+        class C
+          attr_reader :foo
+          def early = (@foo = 1; @bar = 2)
+          def late  = (@bar = 3; @foo = 4)
+          def third = (@baz = 5; @qux = 6; @foo = 7)
+        end
+        class D
+          attr_reader :foo
+          def initialize = @foo = :d
+        end
+        objs = []
+        200.times do |i|
+          c = C.new
+          case i % 3
+          when 0 then c.early
+          when 1 then c.late
+          else c.third
+          end
+          objs << c
+          objs << D.new
+        end
+        def read(o) = o.foo
+        out = objs.map { |o| read(o) }
+        [out.tally.sort_by(&:to_s), read(C.new)]
+    "), @"[[[1, 67], [4, 67], [7, 66], [:d, 200]], nil]");
+}
+
+#[test]
+fn test_send_mixed_nil_and_non_nil_block_arg() {
+    // A `&block` forwarding site that sees both nil and non-nil blocks is split on nil, so the
+    // no-block calls become direct sends. Both branches must still produce the right answer.
+    assert_snapshot!(inspect("
+        def callee(n, &block)
+          block ? block.call(n) : n
+        end
+        def forward(n, &block) = callee(n, &block)
+        results = []
+        100.times do |i|
+          results << forward(i)
+          results << forward(i) { |n| n * 2 }
+        end
+        [forward(7), forward(7) { |n| n + 1 }, results.last(2)]
+    "), @"[7, 8, [99, 198]]");
+}
+
+#[test]
+fn test_send_nil_block_arg_split_polymorphic_receiver() {
+    // The nil branch of the split dispatches on the receiver type, so a forwarding site shared by
+    // several receiver classes still has to pick the right method for each.
+    assert_snapshot!(inspect("
+        class A; def value(&block) = block ? block.call(1) : 1; end
+        class B; def value(&block) = block ? block.call(2) : 2; end
+        def forward(obj, &block) = obj.value(&block)
+        out = []
+        200.times do |i|
+          obj = i.even? ? A.new : B.new
+          out << forward(obj)
+          out << forward(obj) { |n| n * 10 } if i % 3 == 0
+        end
+        [forward(A.new), forward(B.new), forward(A.new) { |n| n * 10 }, out.sum]
+    "), @"[1, 2, 10, 1300]");
+}
+
+#[test]
+fn test_send_forwards_block_param_proxy() {
+    // `bar(&blk)` where `blk` comes from `getblockparamproxy` passes this frame's own block
+    // handler to the callee, so the callee's `yield` and `&b` parameter have to see the block
+    // the outermost caller gave. Every kind of handler goes through the same site: a literal
+    // block, no block at all, a Proc, and a symbol-to-proc.
+    assert_snapshot!(inspect("
+        def callee(n, &b)
+          [n, block_given? ? yield(n) : nil, b ? b.call(n) : nil]
+        end
+        def forward(n, &blk) = callee(n, &blk)
+        def pass_proc(n, p) = forward(n, &p)
+        out = []
+        200.times do |i|
+          out << forward(i) { |x| x + 1 }
+          out << forward(i)
+          out << pass_proc(i, ->(x) { x * 2 })
+          out << pass_proc(i, nil)
+        end
+        out.last(4)
+    "), @"[[199, 200, 200], [199, nil, nil], [199, 398, 398], [199, nil, nil]]");
+}
+
+#[test]
+fn test_send_forwards_block_param_proxy_after_setblockparam() {
+    // Assigning the block parameter makes `getblockparamproxy` hand back the materialized Proc
+    // instead of the proxy, so the branch on the proxy has to send those calls the other way.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, b ? b.call(n) : nil]
+        def forward(n, replace, &blk)
+          blk = ->(x) { x * 100 } if replace
+          callee(n, &blk)
+        end
+        out = []
+        200.times do |i|
+          out << forward(i, false) { |x| x + 1 }
+          out << forward(i, true) { |x| x + 1 }
+        end
+        out.last(2)
+    "), @"[[199, 200], [199, 19900]]");
+}
+
+#[test]
+fn test_send_proc_block_arg_passes_through() {
+    // A `&blk` argument holding a plain Proc is its own block handler in the interpreter, so the
+    // direct send installs it as the callee frame's specval.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, block_given?, b.call(n)]
+        def entry(n, p) = callee(n, &p)
+        doubler = ->(x) { x * 2 }
+        out = nil
+        200.times { |i| out = entry(i, doubler) }
+        [out, entry(5, proc { |x| x + 1 })]
+    "), @"[[199, true, 398], [5, true, 6]]");
+}
+
+#[test]
+fn test_send_proc_block_arg_guard_rejects_other_block_args() {
+    // The Proc guard has to send a `&:sym` or a Method through the interpreter, which converts it
+    // with `to_proc` rather than using it as the block handler directly.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = b.call(n)
+        def entry(n, p) = callee(n, &p)
+        doubler = ->(x) { x * 2 }
+        200.times { |i| entry(i, doubler) }
+        [entry(5, doubler), entry(-6, :abs), entry(7, 2.method(:+))]
+    "), @"[10, 6, 9]");
+}
+
+#[test]
+fn test_send_block_param_proxy_from_block_body() {
+    // `foo(&blk)` inside a block reads the block parameter of the enclosing method, and
+    // `VM_CF_BLOCK_HANDLER` resolves through the local EP to that same frame.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, b ? b.call(n) : nil]
+        def forward(n, &blk)
+          [1].map { callee(n, &blk) }.first
+        end
+        out = nil
+        200.times { |i| out = forward(i) { |x| x + 3 } }
+        [out, forward(9)]
+    "), @"[[199, 202], [9, nil]]");
+}
+
+#[test]
 fn test_send_symbol_block_arg() {
     assert_snapshot!(inspect("
         def test = [1, 2].map(&:to_s)

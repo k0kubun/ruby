@@ -695,11 +695,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect(insn) => {
-            let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
+            let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, block_arg, state, .. } = &**insn;
+            let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
             gen_send_iseq_direct(
                 cb, jit, asm,
                 function, *cd, *cme, *iseq, opnd!(recv), opnds!(args),
-                *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block,
+                *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block, block_arg,
             )
         }
         Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, captured, state } => {
@@ -2159,6 +2160,7 @@ fn gen_send_iseq_direct(
     jit_entry_idx: u16,
     state: &FrameState,
     block: Option<BlockHandler>,
+    block_arg: Option<lir::Opnd>,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::iseq_optimized_send_count);
 
@@ -2181,11 +2183,16 @@ fn gen_send_iseq_direct(
     gen_spill_locals(jit, asm, state);
     asm.stack_map(stack_map, jit_frame, state.depth);
 
-    // This mirrors vm_caller_setup_arg_block() in for the `blockiseq != NULL` case.
-    // The HIR specialization guards ensure we will only reach here for literal blocks,
-    // not &block forwarding, &:foo, etc. Thise are rejected in `type_specialize` by
-    // `unspecializable_call_type`.
-    let block_handler = block.map(|bh| match bh { BlockHandler::BlockIseq(b) => gen_block_handler_specval(asm, b), BlockHandler::BlockArg => unreachable!("BlockArg in gen_send_iseq_direct") });
+    // This mirrors vm_caller_setup_arg_block(): `block` is its `blockiseq != NULL` case, and
+    // `block_arg` is a `&blk` argument that `type_specialize` reduced to the block handler that
+    // function would have produced -- the Proc itself, or this frame's own handler for the block
+    // param proxy. Every other kind of block argument, `&:foo` or anything with a `to_proc`,
+    // keeps the dynamic send.
+    let block_handler = match block {
+        Some(BlockHandler::BlockIseq(b)) => Some(gen_block_handler_specval(asm, b)),
+        Some(BlockHandler::BlockArg) => unreachable!("BlockArg in gen_send_iseq_direct"),
+        None => block_arg,
+    };
 
     let callee_is_bmethod = VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
