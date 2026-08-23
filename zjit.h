@@ -108,20 +108,48 @@ ZJIT_STACK_MAP_BASE_PTR_STACK_SIZE(VALUE entry)
 
 // Class -> callcache table for a send site that dispatches over too many
 // classes for ZJIT's inline class-guard chain. Allocated and owned by Rust; the
-// layout of these four fields must stay in step with `struct SendCache` in
+// layout of these fields must stay in step with `struct SendCache` in
 // zjit/src/send_cache.rs, which documents what the table caches and why a stale
 // entry cannot be wrong.
+//
+// One slot of the table. Two words so that a hit can answer both questions a
+// megamorphic send asks: which callcache dispatches this class (`cc`), and, when
+// the answer is an ISEQ method JIT code can enter without the interpreter,
+// which method that is (`direct_cme`). See `gen_send_megamorphic_direct()` in
+// zjit/src/codegen.rs for the inline probe that reads both.
+struct rb_zjit_send_cache_entry {
+    // The cached callcache, or NULL when the slot is empty. Validates itself:
+    // see zjit_send_cache_search().
+    const struct rb_callcache *cc;
+    // `vm_cc_cme(cc)` when that method is one JIT code may enter with a direct
+    // call (see zjit_send_cache_direct_cme()), NULL otherwise. JIT code checks
+    // it against the method entry it read out of `cc`, so a slot caught
+    // half-written by another ractor reads as a miss rather than as a call to
+    // the wrong method -- which is what lets both words be plain stores.
+    const rb_callable_method_entry_t *direct_cme;
+};
+
 struct rb_zjit_send_cache {
     // Number of slots. A power of two.
     uint32_t len;
     // 64 - log2(len): the shift that turns the hash product into a slot index.
     uint32_t shift;
-    // Slot 0. One callcache pointer per slot, NULL when the slot is empty.
-    const struct rb_callcache **slots;
+    // Slot 0.
+    struct rb_zjit_send_cache_entry *slots;
     // The ZJIT hit counter under --zjit-stats, NULL otherwise. Doubles as the
     // flag for whether to report misses to rb_zjit_send_cache_record_miss(), so
     // that a build without stats pays a never-taken branch rather than a call.
     uint64_t *hit_counter;
+    // `argc` of the call shape this table serves, and whether that shape lets a
+    // hit be dispatched with a direct JIT-to-JIT call at all. Both are constant
+    // for the life of the table; Rust sets them when it allocates it.
+    uint32_t direct_argc;
+    // Zero when the call shape rules direct dispatch out (a splat, a block
+    // argument, a tail call, ...), so `direct_cme` stays NULL in every slot.
+    uint32_t direct_ok;
+    // The call shape's `vm_ci_flag()`, for the visibility test the fill path
+    // runs (a private method is directly callable only from an FCALL site).
+    uint32_t direct_flags;
 };
 
 // Why a probe of a `struct rb_zjit_send_cache` did not produce a callcache.
@@ -136,6 +164,25 @@ struct rb_zjit_send_cache {
 #define ZJIT_SEND_CACHE_HASH_MULT 0x9e3779b97f4a7c15ULL
 
 void rb_zjit_send_cache_record_miss(int kind);
+
+// Field offsets and flag masks the inline send-cache probe in JIT code needs.
+// They are functions rather than bindgen constants because the structs they
+// reach into (rb_callcache, rb_iseq_constant_body) are opaque to Rust.
+size_t rb_zjit_cc_klass_offset(void);
+size_t rb_zjit_cc_cme_offset(void);
+size_t rb_zjit_iseq_body_offset(void);
+size_t rb_zjit_iseq_body_jit_entry_offset(void);
+size_t rb_zjit_send_cache_entry_size(void);
+size_t rb_zjit_send_cache_entry_direct_cme_offset(void);
+size_t rb_zjit_cme_def_offset(void);
+size_t rb_zjit_def_iseqptr_offset(void);
+VALUE rb_zjit_method_entry_invalidated_flag(void);
+size_t rb_zjit_mega_direct_max_stack(void);
+
+// Largest `stack_max` a callee may have and still be entered by the inline
+// megamorphic dispatch path, which checks for stack overflow against this bound
+// instead of the callee's own (unknown at compile time) requirement.
+#define ZJIT_MEGA_DIRECT_MAX_STACK 64
 
 extern void *rb_zjit_entry;
 extern bool rb_zjit_compiling_p;
