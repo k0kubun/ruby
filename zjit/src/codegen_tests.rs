@@ -9510,6 +9510,56 @@ fn test_send_cache_dispatches_every_class_at_a_megamorphic_site() {
     "#), @"[435, 99]");
 }
 
+/// A site with far more classes than a fresh table has slots, so that it evicts
+/// its way past the growth threshold while the program runs.
+const SEND_CACHE_THRASHING_SETUP: &str = r#"
+    KLASSES = 300.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+    OBJS = KLASSES.map(&:new)
+    def test(o) = o.value
+    3.times { OBJS.each { |o| test o } }
+"#;
+
+/// Run `program` and assert a send class table outgrew its initial size at some
+/// point in this test. The counter is read absolutely rather than as a delta
+/// because the warmup that makes a site megamorphic is itself enough thrashing
+/// to grow the table, and each test here has the counter to itself.
+#[track_caller]
+fn assert_send_cache_grows(program: &str) -> String {
+    let result = inspect(program);
+    let grew = crate::state::ZJITState::get_counters().send_cache_grow_count;
+    assert!(grew > 0, "expected the send class table to grow, but it never did");
+    result
+}
+
+#[test]
+fn test_send_cache_grows_and_keeps_dispatching_every_class() {
+    // A table starts at 32 slots and is replaced by a bigger one when it thrashes, which
+    // moves every slot and drops everything cached in the old table. Both the classes
+    // cached before the swap and the ones cached after must still reach their own method:
+    // the probe reads the length and the address out of the table's header, so it follows
+    // the table rather than reading where the old one used to be.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(SEND_CACHE_THRASHING_SETUP);
+    assert_snapshot!(assert_send_cache_grows(r#"
+        20.times.map { OBJS.map { |o| test o }.sum }.uniq
+    "#), @"[44850]");
+}
+
+#[test]
+fn test_send_cache_invalidates_a_method_redefined_after_the_table_grew() {
+    // Growing the table must not lose the invalidation property: entries in the new table
+    // validate themselves against METHOD_ENTRY_INVALIDATED exactly as the old table's did.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(61);
+    eval(SEND_CACHE_THRASHING_SETUP);
+    assert_snapshot!(assert_send_cache_grows(r#"
+        before = 20.times.map { OBJS.map { |o| test o }.sum }.uniq
+        KLASSES.each { |k| k.class_eval("def value; 1; end") }
+        [before, OBJS.map { |o| test o }.sum]
+    "#), @"[[44850], 300]");
+}
+
 #[test]
 fn test_send_cache_dispatches_a_method_redefined_after_it_was_cached() {
     // The invalidation path. Redefining `value` runs rb_clear_method_cache, which sets
