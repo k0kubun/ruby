@@ -13322,6 +13322,8 @@ fn test_megamorphic_direct_ivar_reads_every_class_and_shape() {
     // ivar's name is a field of the method entry, not something the site knows.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_IVAR_SETUP);
     assert_snapshot!(assert_megamorphic_direct_ivar_hits(
         "IVAR_OBJS.map { |o| test_ivar o }.sum"
@@ -13335,6 +13337,8 @@ fn test_megamorphic_direct_ivar_with_shape_polymorphism_within_a_class() {
     // The answer has to be the same either way.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(r#"
         SHAPY_KLASSES = 30.times.map { Class.new { attr_reader :value } }
         SHAPY_OBJS = SHAPY_KLASSES.flat_map do |k|
@@ -13360,6 +13364,8 @@ fn test_megamorphic_direct_ivar_on_frozen_and_unset_receivers() {
     // ATTR_INDEX_NOT_SET rather than as a miss.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_IVAR_SETUP);
     assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
         frozen = IVAR_KLASSES.map { |k| k.new.freeze }
@@ -13375,6 +13381,8 @@ fn test_megamorphic_direct_ivar_after_redefinition_as_a_method() {
     // the probe tests that flag before it reads the tag.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_IVAR_SETUP);
     assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
         before = IVAR_OBJS.map { |o| test_ivar o }.sum
@@ -13390,6 +13398,8 @@ fn test_megamorphic_direct_ivar_after_becoming_private() {
     // attr_reader turned private has to stop being served here and start raising.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_IVAR_SETUP);
     assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
         before = IVAR_OBJS.map { |o| test_ivar o }.sum
@@ -13404,6 +13414,8 @@ fn test_megamorphic_direct_ivar_survives_gc_stress() {
     // cfp->sp: a stale one would have the GC scan VM stack slots this frame never wrote.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_IVAR_SETUP);
     assert_snapshot!(assert_megamorphic_direct_ivar_hits(r#"
         GC.stress = true
@@ -13437,6 +13449,8 @@ fn test_megamorphic_direct_cfunc_fixed_and_variadic() {
     // both arms: arguments in registers, and arguments through an argv the call site builds.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_CFUNC_SETUP);
     assert_snapshot!(assert_megamorphic_direct_cfunc_hits(r#"
         [CFUNC_OBJS.map { |o| test_size o }.sum, CFUNC_OBJS.map { |o| test_slice o }]
@@ -13451,6 +13465,8 @@ fn test_megamorphic_direct_cfunc_passes_arguments() {
     // itself, which is what keeps the ancestor guard from collapsing it.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_CFUNC_SETUP);
     eval(r#"
         TR_KLASSES = 29.times.map { Class.new(String) } + [Class.new { def tr(a, b) = :ruby }]
@@ -13475,6 +13491,8 @@ fn test_megamorphic_direct_cfunc_propagates_a_raise() {
     // one (Array#fetch and Hash#fetch reject a missing index).
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_CFUNC_SETUP);
     eval(r#"
         def test_raises(o, marker)
@@ -13495,6 +13513,8 @@ fn test_megamorphic_direct_cfunc_survives_gc_stress() {
     // keeps them alive across the call is the C stack the conservative mark walks.
     crate::options::enable_zjit_stats();
     set_call_threshold(61);
+    // These arms are off by default (code-size cost); this test covers their soundness.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(MEGA_CFUNC_SETUP);
     assert_snapshot!(assert_megamorphic_direct_cfunc_hits(r#"
         GC.stress = true
@@ -13670,6 +13690,9 @@ fn test_symbol_block_megamorphic_serves_ivars_and_cfuncs_inline() {
     // method entry -- and because none of them reads call data, which a `yield` has none of.
     crate::options::enable_zjit_stats();
     set_call_threshold(2);
+    // The non-ISEQ arms are off by default (their code-size cost outweighs the dispatch win on
+    // icache-bound workloads); this test is about their soundness from a Symbol-block site.
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().megamorphic_direct_iseq_only = false;
     eval(SYM_MEGA_NON_ISEQ_SETUP);
     let counters = || {
         let c = crate::state::ZJITState::get_counters();

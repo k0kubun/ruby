@@ -163,8 +163,11 @@ pub struct Options {
 
     /// Keep the inline megamorphic dispatch path but restrict it to ISEQ
     /// targets, so an attr_reader or a C method goes back out through
-    /// `rb_zjit_send_cached_without_block`. Only useful for A/B measurement of
-    /// those two arms against the ISEQ-only path that preceded them.
+    /// `rb_zjit_send_cached_without_block`. On by default: the IVAR/CFUNC arms
+    /// buy ~0.3% of steady-state instructions but cost ~11% of code region,
+    /// which measures as a net wall-time loss on icache-bound Rails workloads
+    /// (lobsters). `--zjit-megamorphic-direct-all-types` re-enables the arms
+    /// for A/B measurement.
     pub megamorphic_direct_iseq_only: bool,
 
     /// Turn off the run-time block ISEQ dispatch, so a `yield` whose handler is not one of the
@@ -297,7 +300,7 @@ impl Default for Options {
             ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
             disable_megamorphic_direct: false,
-            megamorphic_direct_iseq_only: false,
+            megamorphic_direct_iseq_only: true,
             disable_block_dynamic_dispatch: false,
             disable_symbol_block_mega: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
@@ -677,6 +680,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
         ("megamorphic-direct-iseq-only", "") => options.megamorphic_direct_iseq_only = true,
+        ("megamorphic-direct-all-types", "") => options.megamorphic_direct_iseq_only = false,
         ("disable-block-dynamic-dispatch", "") => options.disable_block_dynamic_dispatch = true,
         ("disable-symbol-block-mega", "") => options.disable_symbol_block_mega = true,
 
