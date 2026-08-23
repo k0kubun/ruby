@@ -293,6 +293,7 @@ make_counters! {
         send_fallback_super_target_not_found,
         send_fallback_cannot_send_direct,
         send_fallback_invokeblock_not_specialized,
+        send_fallback_invokeblock_symbol_unspecialized,
         send_fallback_invokeblock_polymorphic_miss,
         send_fallback_sendforward_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
@@ -499,7 +500,11 @@ make_counters! {
     invokeblock_handler_monomorphic_ifunc,
     invokeblock_handler_monomorphic_other,
     invokeblock_handler_polymorphic,
+    // A polymorphic/megamorphic site whose handlers are dominated by IFUNCs (blocks
+    // implemented in C), which the tag-only fast path can still serve.
+    invokeblock_handler_polymorphic_ifunc,
     invokeblock_handler_megamorphic,
+    invokeblock_handler_megamorphic_ifunc,
     invokeblock_handler_no_profiles,
 
     // HIR-level method inliner counters. Most rejection counters are incremented
@@ -731,6 +736,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SuperPolymorphic                          => send_fallback_super_polymorphic,
         SuperTargetNotFound                       => send_fallback_super_target_not_found,
         InvokeBlockNotSpecialized                 => send_fallback_invokeblock_not_specialized,
+        InvokeBlockSymbolUnspecialized            => send_fallback_invokeblock_symbol_unspecialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,

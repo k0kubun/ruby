@@ -830,6 +830,9 @@ pub enum SendFallbackReason {
     SuperPolymorphic,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
+    /// A `yield` whose block handler was a guarded Symbol, whose send `type_specialize` could
+    /// not resolve, so the site went back to the generic `invokeblock`.
+    InvokeBlockSymbolUnspecialized,
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
     /// profiled ISEQ candidate, so the site dispatched through the generic fallback.
     InvokeBlockPolymorphicMiss,
@@ -882,6 +885,7 @@ impl Display for SendFallbackReason {
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
+            InvokeBlockSymbolUnspecialized => write!(f, "InvokeBlock: symbol block handler's send did not specialize"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
             InvokeSuperForwardNotSpecialized => write!(f, "InvokeSuperForward: not yet specialized"),
@@ -2917,6 +2921,11 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// For `Send` instructions synthesized for a `yield` whose block handler is a guarded
+    /// Symbol, the method that Symbol names. `type_specialize` resolves the call against it
+    /// (the site's own `cd` names no method at all), and `restore_unspecialized_symbol_blocks`
+    /// turns whatever did not specialize back into a generic `invokeblock`.
+    symbol_block_mids: HashMap<InsnId, ID>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3205,6 +3214,13 @@ fn emit_polymorphic_send(
     fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
     Some((join_block, join_param))
 }
+
+/// How many Symbol block handlers a `yield` site compares against before giving up and
+/// calling `rb_vm_invokeblock()`. A site that yields to `&:sym` blocks sees very few
+/// distinct symbols -- on lobsters the three hottest such sites see one symbol for 99% of
+/// their executions -- so a short chain covers them and a longer one would only add
+/// comparisons in front of the fallback.
+const MAX_SYMBOL_BLOCK_ARMS: usize = 3;
 /// True if the `invokeblock` call flags permit inlining the block dispatch.
 fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
@@ -3250,6 +3266,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            symbol_block_mids: HashMap::default(),
         }
     }
 
@@ -3354,6 +3371,7 @@ impl Function {
         cd: *const rb_call_data,
         args: Vec<InsnId>,
         state: InsnId,
+        symbols: &[VALUE],
     ) -> (BlockId, InsnId) {
         assert!(!iseqs.is_empty());
         let ep = self.get_ep(block, level);
@@ -3365,7 +3383,7 @@ impl Function {
 
         // Monomorphic: guard the tag and the ISEQ, then invoke directly in-place.
         // No need for new HIR blocks.
-        if iseqs.len() == 1 && !self.policy.no_side_exits {
+        if iseqs.len() == 1 && symbols.is_empty() && !self.policy.no_side_exits {
             let block_iseq = iseqs[0];
             self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile) });
             let captured = self.untag_block_handler(block, block_handler);
@@ -3384,13 +3402,16 @@ impl Function {
         let join_param = self.push_insn(join_block, Insn::Param);
         let dispatch_block = self.new_block(insn_idx);
         let fallback_block = self.new_block(insn_idx);
+        // Symbol handlers are tested after the ISEQ and IFUNC kinds, so the block the
+        // handler-kind chain misses into is where the Symbol comparisons start.
+        let chain_end_block = if symbols.is_empty() { fallback_block } else { self.new_block(insn_idx) };
 
         let iseq_tag = self.push_insn(block, Insn::Const { val: Const::CInt64(0x1) });
         let tag_matches = self.push_insn(block, Insn::IsBitEqual { left: tag, right: iseq_tag });
         self.push_insn(block, Insn::CondBranch {
             val: tag_matches,
             if_true: BranchEdge { target: dispatch_block, args: vec![] },
-            if_false: BranchEdge { target: fallback_block, args: vec![] },
+            if_false: BranchEdge { target: chain_end_block, args: vec![] },
         });
 
         let captured = self.untag_block_handler(dispatch_block, block_handler);
@@ -3411,7 +3432,19 @@ impl Function {
             self.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
             compare_block = miss_block;
         }
-        self.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+        self.push_insn(compare_block, Insn::Jump(BranchEdge { target: chain_end_block, args: vec![] }));
+
+        // Symbol block handlers, e.g. the `yield` inside a Ruby-level iterator reached
+        // through `arr.each(&:to_s)`. `vm_invoke_symbol_block()` takes the first argument as
+        // the receiver and sends the Symbol's method to it with the rest, resolving that
+        // method through a stack-allocated call cache -- so the interpreter repeats the
+        // lookup on every single call. A Symbol block handler *is* the Symbol VALUE, so one
+        // comparison identifies it, and what it stands for is an ordinary send that compiles
+        // like any other once the receiver's class is known.
+        if !symbols.is_empty() {
+            self.push_symbol_block_dispatch(
+                chain_end_block, insn_idx, symbols, cd, ep, &args, state, join_block, fallback_block);
+        }
 
         let fallback_result = self.push_insn(fallback_block, Insn::InvokeBlock {
             cd, args, state, reason: InvokeBlockPolymorphicMiss,
@@ -3420,6 +3453,58 @@ impl Function {
 
         (join_block, join_param)
     }
+
+    /// Emit the Symbol half of [`Function::dispatch_invoke_block`] into `block`: compare the
+    /// block handler against each profiled Symbol in turn, and for a match emit the send
+    /// `vm_invoke_symbol_block()` would perform -- the Symbol's method, on the first `yield`ed
+    /// argument, with the rest as arguments. Every path that doesn't match branches to
+    /// `miss_block`; every path that does jumps to `join_block` with its result.
+    ///
+    /// The `Send` carries the site's own `cd`, which names no method at all.
+    /// [`Function::symbol_block_mids`] records the method to resolve instead, and is what
+    /// marks the instruction for [`Function::restore_unspecialized_symbol_blocks`] to turn
+    /// back into a generic `invokeblock` when the resolution did not happen.
+    #[allow(clippy::too_many_arguments)]
+    fn push_symbol_block_dispatch(
+        &mut self,
+        block: BlockId,
+        insn_idx: u32,
+        symbols: &[VALUE],
+        cd: *const rb_call_data,
+        ep: InsnId,
+        args: &[InsnId],
+        state: InsnId,
+        join_block: BlockId,
+        miss_block: BlockId,
+    ) {
+        // Read the handler as a VALUE rather than reusing the untyped copy the tag tests
+        // masked: a Symbol block handler *is* the Symbol, so this is an object identity
+        // comparison, and both the ISEQ and IFUNC kinds -- the two that put something other
+        // than a VALUE in this slot -- have already been branched away from above.
+        let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::BasicObject);
+        let mut compare_block = block;
+        for (idx, &symbol) in symbols.iter().enumerate() {
+            let expected = self.push_insn(compare_block, Insn::Const { val: Const::Value(symbol) });
+            let matches = self.push_insn(compare_block, Insn::IsBitEqual { left: block_handler, right: expected });
+            let send_block = self.new_block(insn_idx);
+            let next_block = if idx + 1 == symbols.len() { miss_block } else { self.new_block(insn_idx) };
+            self.push_insn(compare_block, Insn::CondBranch {
+                val: matches,
+                if_true: BranchEdge { target: send_block, args: vec![] },
+                if_false: BranchEdge { target: next_block, args: vec![] },
+            });
+            // `state`'s stack ends in the `yield`ed arguments, which is already the receiver
+            // followed by the send's arguments, so the frame state needs no reshaping.
+            let send = self.push_insn(send_block, Insn::Send {
+                recv: args[0], cd, block: None, args: args[1..].to_vec(), caller_splat_length: None, state,
+                reason: InvokeBlockSymbolUnspecialized,
+            });
+            self.symbol_block_mids.insert(send, unsafe { rb_sym2id(symbol) });
+            self.push_insn(send_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
+            compare_block = next_block;
+        }
+    }
+
 
     // Add an instruction to an SSA block
     fn push_insn_id(&mut self, block: BlockId, insn_id: InsnId) -> InsnId {
@@ -4843,8 +4928,17 @@ impl Function {
                         let ci = unsafe { (*cd).ci }; // info about the call site
 
                         let flags = unsafe { rb_vm_ci_flag(ci) };
+                        // A `yield` to a Symbol block borrows the yield site's `cd`, whose
+                        // `ci` names no method; the Symbol does. Everything else about the
+                        // call -- the argument count on the stack, the visibility the flags
+                        // ask for -- is what `vm_invoke_symbol_block()` passes on to
+                        // `vm_call_symbol()`, so only the method name is substituted here.
+                        let symbol_block_mid = self.symbol_block_mids.get(&insn_id).copied();
+                        let mid = match symbol_block_mid {
+                            Some(symbol_mid) => symbol_mid,
+                            None => unsafe { vm_ci_mid(ci) },
+                        };
 
-                        let mid = unsafe { vm_ci_mid(ci) };
                         // Do method lookup
                         let mut cme = unsafe { rb_callable_method_entry(klass, mid) };
                         if cme.is_null() {
@@ -4993,6 +5087,14 @@ impl Function {
                             // Only specialize positional-positional calls
                             // TODO(max): Handle other kinds of parameter passing
                             let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+                            // A forwardable callee (`def foo(...)`) is handed the call site's own
+                            // `ci` to store in its `...` local. A Symbol block's `ci` describes the
+                            // `yield`, not the send it stands for, so it would record the wrong
+                            // method and argument count.
+                            if symbol_block_mid.is_some() && 0 != unsafe { iseq.params() }.flags.forwardable() {
+                                self.set_dynamic_send_reason(insn_id, ComplexArgPass);
+                                self.push_insn_id(block, insn_id); continue;
+                            }
                             let caller_args = CallerArguments::new(&args, ci);
                             let caller_splat = if let Some(arg_idx) = caller_args.splat_arg_idx {
                                 // Count the profile shape for every caller-splat execution;
@@ -5434,7 +5536,7 @@ impl Function {
                                 }
                             }
 
-                            if reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme).is_ok() {
+                            if symbol_block_mid.is_none() && reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, args, state, klass, profiled_type, cme).is_ok() {
                                 continue;
                             }
 
@@ -6499,6 +6601,47 @@ impl Function {
                     _ => {
                         self.push_insn_id(block, insn_id);
                     }
+                }
+            }
+        }
+    }
+
+    /// Turn a Symbol block dispatch's `Send` back into a generic `invokeblock` when
+    /// `type_specialize` did not resolve it.
+    ///
+    /// The `Send` [`Function::push_symbol_block_dispatch`] emits is not a call site the
+    /// bytecode contains: it borrows the `yield`'s call data, whose `ci` names no method and
+    /// counts the receiver among its arguments. Only the specialized forms carry the Symbol's
+    /// method with them, so an unspecialized one cannot be left to the interpreter's send path
+    /// -- it has to become the `invokeblock` the site would have made anyway, with the
+    /// receiver put back at the front of the `yield`ed arguments.
+    fn restore_unspecialized_symbol_blocks(&mut self) {
+        if self.symbol_block_mids.is_empty() {
+            return;
+        }
+        for block in self.reverse_post_order() {
+            let old_insns = std::mem::take(&mut self.blocks[block].insns);
+            for insn_id in old_insns {
+                let resolved = self.resolve(insn_id);
+                let restored = match resolved.insn(self) {
+                    &Insn::Send { recv, cd, ref args, state, .. }
+                        if self.symbol_block_mids.contains_key(&insn_id) =>
+                    {
+                        let mut yield_args = Vec::with_capacity(args.len() + 1);
+                        yield_args.push(recv);
+                        yield_args.extend_from_slice(args);
+                        Some((cd, yield_args, state))
+                    }
+                    _ => None,
+                };
+                match restored {
+                    Some((cd, args, state)) => {
+                        let replacement = self.push_insn(block, Insn::InvokeBlock {
+                            cd, args, state, reason: InvokeBlockSymbolUnspecialized,
+                        });
+                        self.make_equal_to(insn_id, replacement);
+                    }
+                    None => { self.push_insn_id(block, insn_id); }
                 }
             }
         }
@@ -7653,6 +7796,7 @@ impl Function {
             // Bucket all strength reduction together
             (type_specialize) => { Counter::compile_hir_strength_reduce_time_ns };
             (convert_no_profile_sends) => { Counter::compile_hir_strength_reduce_time_ns };
+            (restore_unspecialized_symbol_blocks) => { Counter::compile_hir_strength_reduce_time_ns };
             // End strength reduction bucket
             (inline_methods) => { Counter::compile_hir_inline_methods_time_ns };
             (remove_trivial_block_params) => { Counter::compile_hir_remove_trivial_block_params_time_ns };
@@ -7706,6 +7850,7 @@ impl Function {
             } else {
                 false
             };
+            run_pass!(restore_unspecialized_symbol_blocks);
             run_pass!(convert_no_profile_sends);
             run_pass!(remove_trivial_block_params);
             run_pass!(optimize_load_store);
@@ -9230,30 +9375,39 @@ fn add_iseq_to_hir(
             } else if opcode == YARVINSN_definedivar || opcode == YARVINSN_trace_definedivar {
                 profiles.profile_self(exit_id, &exit_state, self_param);
             } else if opcode == YARVINSN_invokeblock || opcode == YARVINSN_trace_invokeblock {
+                // The operand slots hold the `yield`ed arguments; the block handler lives in
+                // its own table. A Symbol block handler sends to the first argument, and this
+                // is what lets that send resolve.
+                profiles.profile_stack(exit_id, &exit_state);
                 if get_option!(stats) {
                     let iseq_insn_idx = exit_state.insn_idx;
-                    if let Some(operand_types) = payload.profile.get_operand_types(iseq_insn_idx) {
-                        if let [self_type_distribution] = &operand_types[..] {
-                            let summary = TypeDistributionSummary::new(&self_type_distribution);
-                            if summary.is_monomorphic() {
-                                let obj = summary.bucket(0).class();
-                                if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
-                                    fun.count(block, Counter::invokeblock_handler_monomorphic_iseq);
-                                } else if unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 } {
-                                    fun.count(block, Counter::invokeblock_handler_monomorphic_ifunc);
-                                } else {
-                                    fun.count(block, Counter::invokeblock_handler_monomorphic_other);
-                                }
-                            } else if summary.is_skewed_polymorphic() || summary.is_polymorphic() {
-                                fun.count(block, Counter::invokeblock_handler_polymorphic);
-                            } else if summary.is_skewed_megamorphic() || summary.is_megamorphic() {
-                                fun.count(block, Counter::invokeblock_handler_megamorphic);
+                    match payload.profile.get_block_handlers(iseq_insn_idx) {
+                        Some(summary) if summary.is_monomorphic() => {
+                            let profiled_type = summary.bucket(0);
+                            let obj = profiled_type.class();
+                            if unsafe { rb_IMEMO_TYPE_P(obj, imemo_ifunc) == 1 } {
+                                fun.count(block, Counter::invokeblock_handler_monomorphic_ifunc);
+                            } else if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
+                                fun.count(block, Counter::invokeblock_handler_monomorphic_iseq);
                             } else {
-                                fun.count(block, Counter::invokeblock_handler_no_profiles);
+                                fun.count(block, Counter::invokeblock_handler_monomorphic_other);
                             }
-                        } else {
-                            fun.count(block, Counter::invokeblock_handler_no_profiles);
                         }
+                        Some(summary) if summary.is_skewed_polymorphic() || summary.is_polymorphic() => {
+                            if summary.buckets().iter().any(|ty| unsafe { rb_IMEMO_TYPE_P(ty.class(), imemo_ifunc) == 1 }) {
+                                fun.count(block, Counter::invokeblock_handler_polymorphic_ifunc);
+                            } else {
+                                fun.count(block, Counter::invokeblock_handler_polymorphic);
+                            }
+                        }
+                        Some(summary) if summary.is_skewed_megamorphic() || summary.is_megamorphic() => {
+                            if summary.buckets().iter().any(|ty| unsafe { rb_IMEMO_TYPE_P(ty.class(), imemo_ifunc) == 1 }) {
+                                fun.count(block, Counter::invokeblock_handler_megamorphic_ifunc);
+                            } else {
+                                fun.count(block, Counter::invokeblock_handler_megamorphic);
+                            }
+                        }
+                        _ => fun.count(block, Counter::invokeblock_handler_no_profiles),
                     }
                 }
             }
@@ -10586,13 +10740,7 @@ fn add_iseq_to_hir(
 
                     // The profiled block handler distribution. All the specializations below
                     // (IFUNC, inline-ISEQ, and polymorphic ISEQ dispatch) key off this summary.
-                    let block_handler_summary = payload.profile.get_operand_types(exit_state.insn_idx).and_then(|types| {
-                        if let [block_handler_distribution] = types {
-                            Some(TypeDistributionSummary::new(block_handler_distribution))
-                        } else {
-                            None
-                        }
-                    });
+                    let block_handler_summary = payload.profile.get_block_handlers(exit_state.insn_idx);
                     // The monomorphic block handler class the profile recorded, if any.
                     let block_handler_class = block_handler_summary.as_ref().and_then(|summary| {
                         if !summary.is_monomorphic() { return None; }
@@ -10628,6 +10776,30 @@ fn add_iseq_to_hir(
                         }
                     }
 
+                    // Symbol block handlers the profile saw, hottest first. A Symbol handler
+                    // is the Symbol VALUE itself, so the dispatch guards it with one compare.
+                    // Restricted to static symbols: they are immortal, so baking one into the
+                    // generated code keeps nothing alive that would not be alive anyway, and
+                    // `rb_sym2id` on one always resolves (`vm_call_symbol` falls back to
+                    // `method_missing` exactly when it does not).
+                    let mut symbol_handlers: Vec<VALUE> = vec![];
+                    if can_direct_invoke_block(flags) && !args.is_empty() {
+                        if let Some(summary) = block_handler_summary.as_ref() {
+                            for &profiled_type in summary.buckets() {
+                                if profiled_type.is_empty() {
+                                    break;
+                                }
+                                let obj = profiled_type.class();
+                                if obj.static_sym_p() && !symbol_handlers.contains(&obj) {
+                                    symbol_handlers.push(obj);
+                                    if symbol_handlers.len() == MAX_SYMBOL_BLOCK_ARMS {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let inlined_known_block = if let AddIseqMode::Inlined { blockiseq: Some(bi), .. } = mode {
                         if can_direct_invoke_block(flags)
                             // Only methods are inlined today, so exit_state.iseq is always a method iseq and this is
@@ -10651,7 +10823,7 @@ fn add_iseq_to_hir(
                         fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, exit_id)
                     } else if !direct_iseqs.is_empty() {
                         let level = get_lvar_level(exit_state.iseq);
-                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, exit_id);
+                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, exit_id, &symbol_handlers);
                         // Continue compilation from the block the dispatch ended in
                         block = continue_block;
                         result
@@ -10697,6 +10869,23 @@ fn add_iseq_to_hir(
                         });
                         fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
 
+                        // Continue compilation from the join block
+                        block = join_block;
+                        join_param
+                    } else if !symbol_handlers.is_empty() {
+                        // Symbol block handlers with no directly-dispatchable ISEQ candidates:
+                        // compare the handler against each profiled Symbol and emit the send it
+                        // stands for, with the generic `invokeblock` as the fallthrough. In
+                        // inlined code the function ISEQ is the caller while `exit_state.iseq`
+                        // is the callee containing this `invokeblock`.
+                        let level = get_lvar_level(exit_state.iseq);
+                        let ep = fun.get_ep(block, level);
+                        let join_block = fun.new_block(insn_idx);
+                        let join_param = fun.push_insn(join_block, Insn::Param);
+                        let fallback_block = fun.new_block(insn_idx);
+                        fun.push_symbol_block_dispatch(block, insn_idx, &symbol_handlers, cd, ep, &args, exit_id, join_block, fallback_block);
+                        let fallback_result = fun.push_insn(fallback_block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason });
+                        fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
                         // Continue compilation from the join block
                         block = join_block;
                         join_param

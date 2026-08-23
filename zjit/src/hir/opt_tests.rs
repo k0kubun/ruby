@@ -4618,29 +4618,37 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
+          CondBranch v18, bb5(), bb7()
         bb5():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
           v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
+          CondBranch v24, bb8(), bb9()
+        bb8():
           v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
           Jump bb4(v26)
-        bb8():
+        bb9():
           v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
           v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
+          CondBranch v29, bb10(), bb11()
+        bb10():
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
-        bb10():
-          Jump bb6()
+        bb11():
+          Jump bb7()
+        bb7():
+          v34:BasicObject = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v35:StaticSymbol[:itself] = Const Value(VALUE(0x1008))
+          v36:CBool = IsBitEqual v34, v35
+          CondBranch v36, bb12(), bb6()
+        bb12():
+          v47:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: symbol block handler's send did not specialize
+          Jump bb4(v47)
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v40:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v40)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
