@@ -9202,8 +9202,9 @@ fn test_inlined_method_that_forwards_block_arg_raise_materializes_stack() {
 
 #[test]
 fn test_inlined_method_that_forwards_block_arg() {
-    // The callee captures a literal block in `&block` and forwards it on to
-    // `inner`. While `callee` is inlined, the forwarded call stays a dynamic send.
+    // The callee captures a literal block in `&block` and forwards it on to `inner`. Both
+    // frames inline: the frame `inner` runs in takes the forwarded handler as its specval,
+    // so its `yield` reaches the block the outermost caller wrote.
     with_inlining(|| {
         assert_snapshot!(assert_inlines("
             def inner(x)
@@ -9220,6 +9221,132 @@ fn test_inlined_method_that_forwards_block_arg() {
             test(10)
             test(10)
         "), @"12");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_yields_to_proc() {
+    // A `&blk` argument holding a plain Proc is the callee's block handler verbatim. The
+    // inlined frame writes it into its specval, so `yield` inside the inlined body finds it.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def callee(x) = yield(x)
+            def test(x, p) = callee(x, &p)
+
+            doubler = ->(v) { v * 2 }
+            200.times { |i| test(i, doubler) }
+            test(21, doubler)
+        "), @"42");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_block_given() {
+    // A forwarded block-param proxy may be `VM_BLOCK_HANDLER_NONE`, so neither
+    // `block_given?` nor `defined?(yield)` may be folded in the inlined callee: both have to
+    // read the specval the frame push installed.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def callee(x)
+              [block_given?, defined?(yield) ? :y : :n, block_given? ? yield(x) : :none]
+            end
+            def test(x, &blk) = callee(x, &blk)
+
+            out = []
+            200.times { |i| out = [test(i) { |v| v + 1 }, test(i)] }
+            out
+        "), @"[[true, :y, 200], [false, :n, :none]]");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_proc_call_on_block_param() {
+    // `getblockparam` inside the inlined callee materializes a Proc out of the frame's
+    // specval and stores it back into the frame, which the `MODIFIED_BLOCK_PARAM` flag then
+    // makes every later read take from the local instead.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            def callee(x, &b) = [b.call(x), b.call(x + 1)]
+            def test(x, &blk) = callee(x, &blk)
+
+            out = nil
+            200.times { |i| out = test(i) { |v| v * 3 } }
+            out
+        "), @"[597, 600]");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_non_local_return() {
+    // A `return` from the forwarded block unwinds past the inlined callee frame and out of
+    // the method the block was written in.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def callee = yield
+            def forward(&b) = callee(&b)
+            def test
+              forward { return :returned }
+              :fell_through
+            end
+
+            200.times { test }
+            test
+        "), @":returned");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_break() {
+    // A `break` out of the forwarded block terminates the call that the block was written
+    // at, skipping the rest of both inlined frames.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def callee = [yield, :not_reached]
+            def forward(&b) = callee(&b)
+            def test = [forward { break :broke }, :after]
+
+            200.times { test }
+            test
+        "), @"[:broke, :after]");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_argument_error() {
+    // An arity error raised inside the inlined callee has to materialize the inlined frames
+    // so the backtrace and the rescue in the caller both see the real frame chain.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def strict(a) = yield(a)
+            def test(&b)
+              strict(1, 2, &b)
+            rescue ArgumentError => e
+              e.class
+            end
+
+            200.times { test { |x| x } }
+            test { |x| x }
+        "), @"ArgumentError");
+    });
+}
+
+#[test]
+fn test_inlined_block_arg_callee_setblockparam() {
+    // Assigning the block parameter inside the inlined callee sets
+    // `VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM` on the inlined frame, so `block_given?` still
+    // reports the original handler while `b` reads the replacement.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def callee(&b)
+              b = proc { :replaced }
+              [block_given?, b.call]
+            end
+            def test(&blk) = callee(&blk)
+
+            out = []
+            200.times { out = [test { :orig }, test] }
+            out
+        "), @"[[true, :replaced], [false, :replaced]]");
     });
 }
 

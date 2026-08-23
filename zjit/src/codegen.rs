@@ -677,9 +677,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block, block_arg,
             )
         }
-        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, captured, state } => {
+        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, block_arg, captured, state } => {
             let captured = captured.map(|captured| opnd!(captured));
-            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, captured))
+            let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
+            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, block_arg, captured))
         },
         Insn::PopInlineFrame { iseq, argc, state } => {
             no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
@@ -1993,6 +1994,7 @@ fn gen_push_inline_frame(
     num_args: u16,
     state: &FrameState,
     blockiseq: Option<IseqPtr>,
+    block_arg: Option<lir::Opnd>,
     captured: Option<Opnd>,
 ) {
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
@@ -2009,11 +2011,18 @@ fn gen_push_inline_frame(
 
     gen_spill_locals(jit, asm, state);
 
-    // This mirrors vm_caller_setup_arg_block() for the `blockiseq != NULL` case.
-    // The HIR specialization guards ensure we will only reach here for literal blocks,
-    // not &block forwarding, &:foo, etc. These are rejected in `type_specialize` by
-    // `unspecializable_call_type`.
-    let block_handler = blockiseq.map(|b| gen_block_handler_specval(asm, b));
+    // This mirrors vm_caller_setup_arg_block(): `blockiseq` is its `blockiseq != NULL` case,
+    // and `block_arg` is a `&blk` argument that `type_specialize` already reduced to the
+    // handler that function would have produced -- a guarded Proc, or the caller frame's own
+    // handler for the block param proxy. The inlined callee reads this specval through its
+    // frame's EP for `yield`, `block_given?` and `getblockparam(proxy)`, exactly as it would
+    // in an out-of-line frame. Everything else (`&:foo`, anything with a `to_proc`) never
+    // reaches a SendDirect and so never reaches here.
+    debug_assert!(blockiseq.is_none() || block_arg.is_none(), "at most one block per frame");
+    let block_handler = match blockiseq {
+        Some(b) => Some(gen_block_handler_specval(asm, b)),
+        None => block_arg,
+    };
 
     let callee_is_bmethod = !cme.is_null() && VM_METHOD_TYPE_BMETHOD == unsafe { get_cme_def_type(cme) };
 
