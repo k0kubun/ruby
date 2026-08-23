@@ -381,8 +381,20 @@ make_counters! {
     send_cache_compaction_drop,
     // Number of tables allocated, i.e. distinct (method name, argc, call flags)
     // triples dispatched by a compiled megamorphic site. Multiply by
-    // --zjit-send-cache-entries * 8 for the memory.
+    // --zjit-send-cache-entries * 16 for the memory.
     send_cache_alloc_count,
+    // A table hit that JIT code answered with a direct call into the callee's
+    // compiled code, pushing the frame itself instead of going through the C
+    // helper, vm_call_iseq_setup() and vm_exec(). A subset of the sends counted
+    // by send_megamorphic (and the other reasons the table serves): those sends
+    // still fall back off the guard chain, they just no longer leave JIT code.
+    // See crate::codegen::gen_send_megamorphic_direct.
+    send_megamorphic_direct,
+    // A megamorphic send whose site was compiled with the inline probe but that
+    // did not take the direct path: an immediate receiver, a table miss, a
+    // target that is not a simple ISEQ method, or one whose code is not
+    // compiled (yet, or any more, after an invalidation).
+    send_megamorphic_direct_miss,
 
     // compile_error_: Compile error reasons
     compile_error_iseq_version_limit_reached,
