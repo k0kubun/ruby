@@ -126,6 +126,12 @@ pub struct Options {
     /// for A/B measurement; see [`crate::codegen::gen_invoke_block_iseq_dynamic`].
     pub disable_block_dynamic_dispatch: bool,
 
+    /// Turn off the megamorphic tier of the Symbol block arm, so a `yield` to `&:sym` whose
+    /// receiver class does not resolve at compile time goes back out through
+    /// `rb_vm_invokeblock()`. Only useful for A/B measurement; see
+    /// [`crate::codegen::gen_send_symbol_block_mega`].
+    pub disable_symbol_block_mega: bool,
+
     /// Slots in each send class table. Must be a power of two and at least 8;
     /// one table is allocated per `(method name, argc, call flags)` triple that a
     /// compiled megamorphic site dispatches on, so this times 16 bytes times the
@@ -240,6 +246,7 @@ impl Default for Options {
             disable_send_cache: false,
             disable_megamorphic_direct: false,
             disable_block_dynamic_dispatch: false,
+            disable_symbol_block_mega: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
             dump_hir_opt: None,
@@ -582,6 +589,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
         ("disable-block-dynamic-dispatch", "") => options.disable_block_dynamic_dispatch = true,
+        ("disable-symbol-block-mega", "") => options.disable_symbol_block_mega = true,
 
         // The ceiling a table may grow to, not the size it starts at. See
         // crate::send_cache::SEND_CACHE_INITIAL_ENTRIES.
