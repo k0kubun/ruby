@@ -5414,7 +5414,7 @@ pub(crate) mod hir_build_tests {
           v70:BasicObject = InvokeBlockIfunc v63, v27
           Jump bb14(v70)
         bb15():
-          v72:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
+          v72:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: no block handler profile
           Jump bb14(v72)
         bb14(v66:BasicObject):
           v76:BasicObject = InvokeBuiltin dir_s_close, v18, v27
@@ -5953,7 +5953,7 @@ pub(crate) mod hir_build_tests {
           v18:BasicObject = InvokeBlockIfunc v11
           Jump bb4(v18)
         bb5():
-          v20:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: not yet specialized
+          v20:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: no block handler profile
           Jump bb4(v20)
         bb4(v14:BasicObject):
           CheckInterrupts
@@ -5995,7 +5995,7 @@ pub(crate) mod hir_build_tests {
           v27:BasicObject = InvokeBlockIfunc v20, v12, v13
           Jump bb4(v27)
         bb5():
-          v29:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: not yet specialized
+          v29:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: no block handler profile
           Jump bb4(v29)
         bb4(v23:BasicObject):
           CheckInterrupts
@@ -6359,7 +6359,7 @@ pub(crate) mod hir_build_tests {
           v87:BasicObject = InvokeBlockIfunc v80, v77
           Jump bb12(v87)
         bb13():
-          v89:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: not yet specialized
+          v89:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: no block handler profile
           Jump bb12(v89)
         bb12(v83:BasicObject):
           v94:Fixnum[1] = Const Value(1)

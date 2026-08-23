@@ -787,6 +787,13 @@ pub fn set_inline_threshold(inline_threshold: InlineThreshold) {
     unsafe { OPTIONS.as_mut().unwrap().inline_threshold = inline_threshold; }
 }
 
+/// Update --zjit-inline-budget for testing
+#[cfg(test)]
+pub fn set_inline_budget(inline_budget: InlineBudget) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().inline_budget = inline_budget; }
+}
+
 /// Enable --zjit-stats for testing
 #[cfg(test)]
 pub fn enable_zjit_stats() {

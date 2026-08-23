@@ -832,6 +832,25 @@ pub enum SendFallbackReason {
     SuperMethodEntryUnstable,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
+    /// The `invokeblock` call site passes a splat, keyword, or block argument.
+    InvokeBlockComplexArgs,
+    /// The `invokeblock` site has no block-handler profile to specialize on.
+    InvokeBlockNoProfile,
+    /// The profiled block handler is not an ISEQ block (Proc, IFUNC, or symbol).
+    InvokeBlockHandlerNotIseqProfile,
+    /// The `invokeblock` site saw too many distinct block handlers to build a chain over.
+    InvokeBlockMegamorphicProfile,
+    /// The profiled block ISEQs that can dispatch directly do not cover enough of the site's
+    /// profile to pay for the comparison chain.
+    InvokeBlockChainCoverage,
+    /// The profiled block ISEQ takes optional, rest, post, keyword, or block parameters, so it
+    /// cannot use the simple callee setup the direct dispatch relies on.
+    InvokeBlockNotSimpleIseq,
+    /// A one-argument `yield` to a `|x,|` block, which auto-splats and then truncates.
+    InvokeBlockAmbiguousParam0,
+    /// The profiled block ISEQ contains a `throw` that is not a plain non-local `return`
+    /// (`break`, `redo`, or `next` out of a rescue).
+    InvokeBlockMayThrow,
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
     /// profiled ISEQ candidate, so the site dispatched through the generic fallback.
     InvokeBlockPolymorphicMiss,
@@ -895,6 +914,14 @@ impl Display for SendFallbackReason {
             SuperMethodEntryUnstable => write!(f, "super: frame method entry guard kept missing"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
+            InvokeBlockComplexArgs => write!(f, "InvokeBlock: splat, keyword, or block argument"),
+            InvokeBlockNoProfile => write!(f, "InvokeBlock: no block handler profile"),
+            InvokeBlockHandlerNotIseqProfile => write!(f, "InvokeBlock: profiled handler is not an ISEQ block"),
+            InvokeBlockMegamorphicProfile => write!(f, "InvokeBlock: megamorphic block handler profile"),
+            InvokeBlockChainCoverage => write!(f, "InvokeBlock: dispatchable ISEQs cover too little of the profile"),
+            InvokeBlockNotSimpleIseq => write!(f, "InvokeBlock: block takes non-lead parameters"),
+            InvokeBlockAmbiguousParam0 => write!(f, "InvokeBlock: |x,| block truncates an auto-splat"),
+            InvokeBlockMayThrow => write!(f, "InvokeBlock: block contains a non-return throw"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             InvokeBlockAutosplatMiss => write!(f, "InvokeBlock: auto-splat expansion miss"),
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
@@ -3194,6 +3221,13 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// How many callees this function has inlined past its cumulative inlining budget because
+    /// doing so let a `yield` inside them dispatch directly. Capped at
+    /// [`MAX_YIELD_INLINE_BONUSES`].
+    yield_inline_bonuses: usize,
+    /// Whether the current [`Self::inline_methods`] pass found the function already past its
+    /// cumulative inlining budget. Only yield-unlocking callees are considered from then on.
+    inline_budget_exhausted: bool,
     /// Set when this function is compiled as an exception handler entry
     /// (`jit_exec_exception`). The interpreter entry block then starts in the
     /// middle of the ISEQ instead of at an opt-table entry. See
@@ -3484,22 +3518,57 @@ fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
 }
 
-/// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
-/// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
-/// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
-/// non-local return). Anything else falls back to the generic `invokeblock` dispatch,
-/// with the returned reason attached to the fallback instruction.
-fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
+/// How a direct block dispatch has to reshape the `yield`ed arguments before the JIT-to-JIT
+/// call, mirroring the `arg_setup_block` tail of `vm_callee_setup_block_arg()`. A block is
+/// never an arity error: extra arguments are dropped and missing ones are `nil`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockArgAdapt {
+    /// The arity already matches; pass the arguments through.
+    Exact,
+    /// Keep only the first `n` arguments and drop the rest.
+    Truncate(usize),
+    /// Append `n` `nil`s.
+    NilFill(usize),
+}
+
+/// How one arm of a polymorphic `invokeblock` chain prepares its arguments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockDispatchArgs {
+    /// Reshape the arguments statically.
+    Adapt(BlockArgAdapt),
+    /// Destructure the lone yielded argument into this many values, branching to the generic
+    /// fallback when it is not an Array of exactly that length.
+    AutoSplat(usize),
+}
+
+/// The reshape needed for `yield` with `argc` positional args to dispatch by inlining the
+/// block ISEQ frame, or the reason it cannot. The block must take the simple callee-setup
+/// path (`rb_simple_iseq_p`), avoid the run-time arg0 auto-splat, and contain no `throw`
+/// (break / non-local return). Anything else falls back to the generic `invokeblock`
+/// dispatch, with the returned reason attached to the fallback instruction.
+///
+/// A mismatched arity is *not* a reason to fall back. `vm_callee_setup_block_arg()` fills the
+/// missing parameters with `nil` and drops the extra arguments, both of which are static once
+/// the block ISEQ is known, so the dispatch can do the same to its register arguments. Only
+/// the auto-splat is dynamic, and that one is modelled separately by
+/// [`block_autosplat_arity`] because it needs a run-time Array check.
+fn direct_invoke_block_adapt(iseq: IseqPtr, argc: usize) -> Result<BlockArgAdapt, SendFallbackReason> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
-        return Err(InvokeBlockNotSpecialized);
+        return Err(InvokeBlockNotSimpleIseq);
     }
     let lead_num = unsafe { rb_get_iseq_body_param_lead_num(iseq) } as usize;
-    if argc != lead_num {
-        return Err(InvokeBlockNotSpecialized);
+    // The `arg_setup_block` auto-splat: a lone argument yielded to a block with lead
+    // parameters that did not opt out with `|x|` is destructured with `rb_check_array_type()`.
+    // Whether it splats at all depends on the run-time value, so this can't be a static
+    // reshape; the callers that can afford the branch go through `block_autosplat_arity`.
+    if argc == 1 && lead_num >= 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
+        return Err(InvokeBlockAmbiguousParam0);
     }
-    if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
-        return Err(InvokeBlockNotSpecialized);
-    }
+    let adapt = match argc.cmp(&lead_num) {
+        std::cmp::Ordering::Equal => BlockArgAdapt::Exact,
+        std::cmp::Ordering::Less => BlockArgAdapt::NilFill(lead_num - argc),
+        std::cmp::Ordering::Greater => BlockArgAdapt::Truncate(lead_num),
+    };
     // `break` out of a directly-invoked block frame does not unwind correctly:
     // vm_throw_start() matches the block owner's `cfp->pc` against the CATCH_TYPE_BREAK
     // entry's `cont`, and the PC the owner's frame reports after this dispatch does not
@@ -3507,9 +3576,9 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     // A plain non-local `return` is looked up by frame type and EP instead of by PC, so
     // blocks that only throw TAG_RETURN -- what this dispatch is for -- are fine.
     if crate::codegen::block_iseq_may_throw(iseq) && !block_iseq_throws_only_return(iseq) {
-        return Err(InvokeBlockNotSpecialized);
+        return Err(InvokeBlockMayThrow);
     }
-    Ok(())
+    Ok(adapt)
 }
 
 /// The number of values a lone `yield`ed argument is auto-splatted into when `iseq` is the
@@ -3567,7 +3636,7 @@ fn autosplat_direct_dispatch_arity(
     });
     for candidate in [inlined_literal, profiled].into_iter().flatten() {
         let Some(splat_num) = block_autosplat_arity(candidate) else { continue };
-        if can_direct_invoke_block_iseq(candidate, splat_num).is_ok() {
+        if direct_invoke_block_adapt(candidate, splat_num).is_ok() {
             return Some(splat_num);
         }
     }
@@ -3584,6 +3653,22 @@ unsafe extern "C" {
 /// (or to 0, which disables inlining) still applies here. The default 30 * 3 = 90 clears the
 /// iterators this shape shows up with: the Ruby-level `Array#each` needs 45.
 const YIELD_INLINE_THRESHOLD_FACTOR: usize = 3;
+
+/// How many callees a compiled function may inline past its cumulative budget because doing so
+/// is what lets a `yield` inside them dispatch directly.
+///
+/// The size threshold above is not the binding constraint for these: `Array#each` and
+/// `Array#map` are called from all over a Rails request, and the methods that call them are
+/// big -- big enough that the caller's budget is spent before the iterator is reached. Every
+/// such site leaves its `yield` on `rb_vm_invokeblock()` for the life of the process, because
+/// the standalone `Array#each` sees hundreds of different blocks and no chain can cover them.
+///
+/// A flat multiple of the budget would be the obvious relaxation, but it scales with the
+/// caller's size, which is backwards: the callers that need this most are the ones already
+/// over budget, and the ones that would abuse it most are the ones with dozens of `.each`
+/// calls. A small fixed allowance instead bounds the extra growth to a few iterator bodies per
+/// function, no matter how big the function is.
+const MAX_YIELD_INLINE_BONUSES: usize = 3;
 
 /// True if the ISEQ contains an `invokeblock`, i.e. a `yield`.
 fn iseq_contains_invokeblock(iseq: IseqPtr) -> bool {
@@ -3683,6 +3768,7 @@ fn inline_block_at_yield(
     block_iseq: IseqPtr,
     args: &[InsnId],
     caller_argc: usize,
+    call_state: InsnId,
     exit_id: InsnId,
     exit_state: &FrameState,
     insn_idx: u32,
@@ -3709,7 +3795,7 @@ fn inline_block_at_yield(
         return_block: continuation,
         caller: post_yield_caller,
         depth: block_depth,
-        // can_direct_invoke_block_iseq() checked the block takes the simple callee-setup path,
+        // direct_invoke_block_adapt() checked the block takes the simple callee-setup path,
         // so it has no optionals and only one opt-table entry.
         jit_entry_idx: 0,
         blockiseq: None,
@@ -3767,10 +3853,11 @@ fn inline_block_at_yield(
         num_args: args.len().try_into().expect("checked in HIR"),
         blockiseq: None,
         captured: Some(captured),
-        state: exit_id,
-        // The direct block dispatch takes the simple callee-setup path with an exact
-        // arity match, so the caller's stack was never rewritten: the call-site state
-        // and the frame state are the same snapshot.
+        // The frame is laid out on top of `call_state`'s stack, which ends in exactly
+        // `args`. That is not the interpreter's own stack whenever the yielded arguments
+        // were reshaped for the block's parameters -- auto-splatted, truncated, or
+        // nil-filled -- which is why the two snapshots are separate.
+        state: call_state,
         guard_state: exit_id,
     });
     fun.push_insn(*block, Insn::Jump(BranchEdge { target: body_entry, args: vec![] }));
@@ -3778,7 +3865,7 @@ fn inline_block_at_yield(
     // Every `leave` in the block body jumps here with its value; a `return` skips this and
     // returns from the compiled function instead.
     let return_val = fun.push_insn(continuation, Insn::Param);
-    fun.push_insn(continuation, Insn::PopInlineFrame { iseq: block_iseq, argc: args.len(), state: exit_id });
+    fun.push_insn(continuation, Insn::PopInlineFrame { iseq: block_iseq, argc: args.len(), state: call_state });
 
     profiles.append(&add_result.profiles);
     *block = continuation;
@@ -3804,6 +3891,8 @@ impl Function {
             guarded_profiled_types: HashMap::default(),
             ancestor_dispatch: HashMap::default(),
             num_instructions: 0,
+            yield_inline_bonuses: 0,
+            inline_budget_exhausted: false,
             exception_entry: None,
             send_mid_overrides: HashMap::default(),
         }
@@ -3881,6 +3970,30 @@ impl Function {
         self.load_field(block, captured, FieldName::code_iseq, offset, types::CPtr)
     }
 
+    /// Reshape `args` the way `vm_callee_setup_block_arg()` would for a block whose parameters
+    /// need `adapt`, and rebuild the frame state the callee frame is pushed on top of.
+    ///
+    /// The direct dispatch passes arguments in registers and derives the caller's saved SP from
+    /// `state.stack().len() - args.len()`, so the state's stack has to end in the reshaped
+    /// arguments even though the interpreter only ever had the original ones there. This is the
+    /// same split the auto-splat expansion makes.
+    fn adapt_block_args(&mut self, block: BlockId, adapt: BlockArgAdapt, args: Vec<InsnId>, state: InsnId) -> (Vec<InsnId>, InsnId) {
+        let original_argc = args.len();
+        let args = match adapt {
+            BlockArgAdapt::Exact => return (args, state),
+            BlockArgAdapt::Truncate(lead_num) => args[..lead_num].to_vec(),
+            BlockArgAdapt::NilFill(num_nils) => {
+                let nil = self.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                let mut args = args;
+                args.resize(original_argc + num_nils, nil);
+                args
+            }
+        };
+        let adapted = self.frame_state(state).with_replaced_args(&args, original_argc);
+        let state = self.push_insn(block, Insn::Snapshot { state: Box::new(adapted) });
+        (args, state)
+    }
+
     /// Untag an ISEQ block handler into its `struct rb_captured_block *`:
     /// captured = block_handler & ~0x3
     fn untag_block_handler(&mut self, block: BlockId, block_handler: InsnId) -> InsnId {
@@ -3896,7 +4009,8 @@ impl Function {
     /// end in `args`. `guard_state` is what the guards below side-exit to, which is the
     /// interpreter's own state at this `invokeblock`; the two differ when a lone yielded Array
     /// was auto-splatted into `args`, because the interpreter still has just the Array.
-    fn push_invoke_block_iseq_direct(&mut self, block: BlockId, block_iseq: IseqPtr, level: u32, args: Vec<InsnId>, state: InsnId, guard_state: InsnId, guarded: bool) -> InsnId {
+    #[allow(clippy::too_many_arguments)]
+    fn push_invoke_block_iseq_direct(&mut self, block: BlockId, block_iseq: IseqPtr, level: u32, adapt: BlockArgAdapt, args: Vec<InsnId>, state: InsnId, guard_state: InsnId, guarded: bool) -> InsnId {
         let ep = self.get_ep(block, level);
         let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
 
@@ -3916,6 +4030,7 @@ impl Function {
             self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::CPtr(block_iseq as *const u8), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state: guard_state, recompile: Some(Recompile) });
         }
 
+        let (args, state) = self.adapt_block_args(block, adapt, args, state);
         self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state })
     }
 
@@ -3938,7 +4053,7 @@ impl Function {
         insn_idx: u32,
         level: u32,
         cd: *const rb_call_data,
-        iseqs: &[IseqPtr],
+        iseqs: &[(IseqPtr, BlockArgAdapt)],
         ifunc_first: bool,
         args: Vec<InsnId>,
         state: InsnId,
@@ -4005,7 +4120,7 @@ impl Function {
         &mut self,
         block: BlockId,
         insn_idx: u32,
-        iseqs: &[IseqPtr],
+        iseqs: &[(IseqPtr, BlockArgAdapt)],
         tag: InsnId,
         block_handler: InsnId,
         args: &[InsnId],
@@ -4028,7 +4143,7 @@ impl Function {
         let captured_iseq = self.load_captured_code_iseq(dispatch_block, captured);
 
         let mut compare_block = dispatch_block;
-        for (idx, &block_iseq) in iseqs.iter().enumerate() {
+        for (idx, &(block_iseq, adapt)) in iseqs.iter().enumerate() {
             let expected = self.push_insn(compare_block, Insn::Const { val: Const::CPtr(block_iseq as *const u8) });
             let iseq_matches = self.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
             let direct_block = self.new_block(insn_idx);
@@ -4038,7 +4153,8 @@ impl Function {
                 if_true: BranchEdge { target: direct_block, args: vec![] },
                 if_false: BranchEdge { target: iseq_miss_block, args: vec![] },
             });
-            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: args.to_vec(), state });
+            let (call_args, call_state) = self.adapt_block_args(direct_block, adapt, args.to_vec(), state);
+            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: call_args, state: call_state });
             self.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
             compare_block = iseq_miss_block;
         }
@@ -6959,7 +7075,7 @@ impl Function {
         if !iseq_contains_invokeblock(callee_iseq) {
             return false;
         }
-        // `can_direct_invoke_block_iseq` is what the yield site tests, and it needs the arity the
+        // `direct_invoke_block_adapt` is what the yield site tests, and it needs the arity the
         // `yield` passes, which is not known here. Test the block at its own parameter count:
         // that is the arity a matching `yield` passes, and the one a lone yielded Array
         // auto-splats into. A `yield` with some other argument count just doesn't take the
@@ -6968,7 +7084,7 @@ impl Function {
             return false;
         }
         let lead_num = unsafe { rb_get_iseq_body_param_lead_num(blockiseq) } as usize;
-        if can_direct_invoke_block_iseq(blockiseq, lead_num).is_err() {
+        if direct_invoke_block_adapt(blockiseq, lead_num).is_err() {
             return false;
         }
         // A block that can `throw` is the one case where inlining the iterator can cost more
@@ -6988,18 +7104,9 @@ impl Function {
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics. `blockiseq` is the literal block the call site passes,
     /// if any.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>) -> bool {
+    fn should_inline(&mut self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
-            return false;
-        }
-
-        // Per-caller cumulative budget. Once that count crosses the budget, every further callee
-        // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
-        // `Options::inline_budget` for the full unit/semantics caveat.
-        let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget {
-            incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
 
@@ -7023,13 +7130,26 @@ impl Function {
             }
         }
 
-        // Check callee bytecode size against threshold. An iterator gets a larger budget when
-        // inlining it is the only thing keeping the `yield` inside it off the direct block
-        // dispatch: leaving it out of line costs an `rb_vm_invokeblock()` per iteration, and
-        // an interpreted unwind per call on top of that when the block has a non-local
-        // `return`.
+        // An iterator gets a larger budget when inlining it is the only thing keeping the
+        // `yield` inside it off the direct block dispatch: leaving it out of line costs an
+        // `rb_vm_invokeblock()` per iteration, and an interpreted unwind per call on top of
+        // that when the block has a non-local `return`.
         let unlocks_yield = self.inlining_unlocks_direct_yield(callee_iseq, blockiseq)
             || self.inlining_unlocks_block_return(callee_iseq, blockiseq);
+
+        // Per-caller cumulative budget. Once that count crosses the budget, every further callee
+        // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
+        // `Options::inline_budget` for the full unit/semantics caveat.
+        let budget = get_option!(inline_budget);
+        let over_budget = self.inline_budget_exhausted
+            || (budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget);
+        let needs_bonus = over_budget && unlocks_yield;
+        if over_budget && (!unlocks_yield || self.yield_inline_bonuses == MAX_YIELD_INLINE_BONUSES) {
+            incr_counter!(inline_reject_budget_exceeded);
+            return false;
+        }
+
+        // Check callee bytecode size against threshold.
         let threshold = if unlocks_yield {
             threshold.saturating_mul(YIELD_INLINE_THRESHOLD_FACTOR)
         } else {
@@ -7041,6 +7161,10 @@ impl Function {
             return false;
         }
 
+        if needs_bonus {
+            self.yield_inline_bonuses += 1;
+            incr_counter!(inline_yield_bonus_count);
+        }
         true
     }
 
@@ -7054,8 +7178,12 @@ impl Function {
 
         // Fail fast if inlining is enabled but we've exhausted our inlining budget.
         // Otherwise, `can_inline` and `should_inline` will make local inlining decisions.
+        // A function this big only has yield-unlocking callees left to consider, and only
+        // while it still has bonuses for them. `should_inline` rejects everything else, so
+        // once the bonuses are gone there is nothing to find and the scan is wasted work.
         let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.insns.len() > budget {
+        self.inline_budget_exhausted = budget != INLINE_BUDGET_UNLIMITED && self.insns.len() > budget;
+        if self.inline_budget_exhausted && self.yield_inline_bonuses == MAX_YIELD_INLINE_BONUSES {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -12647,15 +12775,25 @@ fn add_iseq_to_hir(
                     }
 
                     // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
-                    let mut fallback_reason = InvokeBlockNotSpecialized;
+                    // `fallback_reason` narrows to the specific condition that stopped this site
+                    // from specializing, so `--zjit-stats` can tell the cases apart.
+                    let mut fallback_reason = if !can_direct_invoke_block(flags) {
+                        InvokeBlockComplexArgs
+                    } else if block_handler_summary.is_none() {
+                        InvokeBlockNoProfile
+                    } else {
+                        InvokeBlockNotSpecialized
+                    };
                     let inline_iseq = if can_direct_invoke_block(flags) {
                         block_handler_class.and_then(|obj| {
                             if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                 let iseq = obj.as_iseq();
-                                match can_direct_invoke_block_iseq(iseq, args.len()) {
-                                    Ok(()) => return Some(iseq),
+                                match direct_invoke_block_adapt(iseq, args.len()) {
+                                    Ok(adapt) => return Some((iseq, adapt)),
                                     Err(reason) => fallback_reason = reason,
                                 }
+                            } else {
+                                fallback_reason = InvokeBlockHandlerNotIseqProfile;
                             }
                             None
                         })
@@ -12666,13 +12804,17 @@ fn add_iseq_to_hir(
                     // different block per call site, so requiring a monomorphic profile would
                     // leave every such shared yield site on the generic fallback. Buckets are
                     // ordered by frequency, so the hottest block is compared first below.
-                    // Each candidate carries the arity to auto-splat the lone yielded argument
-                    // into, or None when it takes the arguments as they are. Unlike the
-                    // single-ISEQ dispatches above, a candidate that needs the expansion can be
-                    // mixed in freely here: the expansion's miss joins this site's own generic
+                    // Each candidate carries either the arity to auto-splat the lone yielded
+                    // argument into, or the static reshape that matches its parameters. Unlike
+                    // the single-ISEQ dispatches above, a candidate that needs the expansion can
+                    // be mixed in freely here: the expansion's miss joins this site's own generic
                     // fallback, which still holds the unexpanded argument.
-                    let mut polymorphic_iseqs: Vec<(IseqPtr, Option<usize>)> = vec![];
+                    let mut polymorphic_iseqs: Vec<(IseqPtr, BlockDispatchArgs)> = vec![];
                     if let Some(summary) = block_handler_summary.as_ref() {
+                        if can_direct_invoke_block(flags)
+                            && (summary.is_megamorphic() || summary.is_skewed_megamorphic()) {
+                            fallback_reason = InvokeBlockMegamorphicProfile;
+                        }
                         if can_direct_invoke_block(flags)
                             && (summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
                             for &profiled_type in summary.buckets() {
@@ -12685,12 +12827,12 @@ fn add_iseq_to_hir(
                                     if polymorphic_iseqs.iter().any(|&(seen, _)| seen == iseq) {
                                         continue;
                                     }
-                                    if can_direct_invoke_block_iseq(iseq, args.len()).is_ok() {
-                                        polymorphic_iseqs.push((iseq, None));
+                                    if let Ok(adapt) = direct_invoke_block_adapt(iseq, args.len()) {
+                                        polymorphic_iseqs.push((iseq, BlockDispatchArgs::Adapt(adapt)));
                                     } else if args.len() == 1 {
                                         if let Some(splat_num) = block_autosplat_arity(iseq) {
-                                            if can_direct_invoke_block_iseq(iseq, splat_num).is_ok() {
-                                                polymorphic_iseqs.push((iseq, Some(splat_num)));
+                                            if direct_invoke_block_adapt(iseq, splat_num).is_ok() {
+                                                polymorphic_iseqs.push((iseq, BlockDispatchArgs::AutoSplat(splat_num)));
                                             }
                                         }
                                     }
@@ -12709,6 +12851,9 @@ fn add_iseq_to_hir(
                             });
                             if covered < CHAIN_COVERAGE_THRESHOLD {
                                 polymorphic_iseqs.clear();
+                                if !summary.is_monomorphic() {
+                                    fallback_reason = InvokeBlockChainCoverage;
+                                }
                             }
                         }
                     }
@@ -12722,8 +12867,8 @@ fn add_iseq_to_hir(
                             // (level > 0). To stay guard-free we'd bake in get_lvar_level(...) as the level and fetch
                             // that ancestor's blockiseq from the inline caller chain instead of bi.
                             && get_lvar_level(exit_state.iseq) == 0 {
-                            match can_direct_invoke_block_iseq(bi, args.len()) {
-                                Ok(()) => Some(bi),
+                            match direct_invoke_block_adapt(bi, args.len()) {
+                                Ok(adapt) => Some((bi, adapt)),
                                 Err(reason) => {
                                     fallback_reason = reason;
                                     None
@@ -12739,19 +12884,23 @@ fn add_iseq_to_hir(
                     // the frame the compiled function returns from), inline the block's body
                     // here instead; add_iseq_to_hir turns its `throw` into a plain `Return`.
                     let inlined_block_result = match (inlined_known_block, mode) {
-                        (Some(bi), AddIseqMode::Inlined { depth: 1, .. })
+                        (Some((bi, adapt)), AddIseqMode::Inlined { depth: 1, .. })
                             if block_return_inlinable(bi, iseq, fun.iseq()) =>
                         {
-                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &args, caller_argc, call_state, &exit_state, insn_idx)
+                            // The inlined body aliases its parameters to `args` positionally, and
+                            // the frame it pushes is laid out from the state, so both have to be
+                            // reshaped together the way an out-of-line dispatch arm would.
+                            let (inline_args, inline_state) = fun.adapt_block_args(block, adapt, args.clone(), call_state);
+                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &inline_args, caller_argc, inline_state, exit_id, &exit_state, insn_idx)
                         }
                         _ => None,
                     };
 
                     let result = if let Some(result) = inlined_block_result {
                         result
-                    } else if let Some(block_iseq) = inlined_known_block {
-                        fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, call_state, exit_id, false)
-                    } else if let Some(block_iseq) = inline_iseq {
+                    } else if let Some((block_iseq, adapt)) = inlined_known_block {
+                        fun.push_invoke_block_iseq_direct(block, block_iseq, 0, adapt, args, call_state, exit_id, false)
+                    } else if let Some((block_iseq, adapt)) = inline_iseq {
                         let level = get_lvar_level(exit_state.iseq);
                         if fun.policy.no_side_exits && autosplat_join.is_none() {
                             // This is the ISEQ's final version, so a failing guard would exit to
@@ -12760,11 +12909,11 @@ fn add_iseq_to_hir(
                             // its arguments were expanded for the direct call, so the generic
                             // `invokeblock` there would yield the wrong argument list.
                             let (continue_block, result) = fun.dispatch_invoke_block(
-                                block, insn_idx, level, cd, &[block_iseq], false, args, exit_id, fallback_reason);
+                                block, insn_idx, level, cd, &[(block_iseq, adapt)], false, args, exit_id, fallback_reason);
                             block = continue_block;
                             result
                         } else {
-                            fun.push_invoke_block_iseq_direct(block, block_iseq, level, args, call_state, exit_id, true)
+                            fun.push_invoke_block_iseq_direct(block, block_iseq, level, adapt, args, call_state, exit_id, true)
                         }
                     } else if !polymorphic_iseqs.is_empty() {
                         // Dispatch on the runtime block ISEQ over the profiled candidates, joining
@@ -12797,7 +12946,7 @@ fn add_iseq_to_hir(
                         let captured_iseq = fun.load_captured_code_iseq(dispatch_block, captured);
 
                         let mut compare_block = dispatch_block;
-                        for &(block_iseq, splat_num) in &polymorphic_iseqs {
+                        for &(block_iseq, dispatch_args) in &polymorphic_iseqs {
                             let expected = fun.push_insn(compare_block, Insn::Const { val: Const::CPtr(block_iseq as *const u8) });
                             let iseq_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
                             let direct_block = fun.new_block(insn_idx);
@@ -12811,9 +12960,12 @@ fn add_iseq_to_hir(
                             // value, so destructure it the way arg_setup_block would. Anything
                             // that is not an Array of exactly that length joins the generic
                             // fallback below, which handles every shape.
-                            let (direct_block, call_args, call_state) = match splat_num {
-                                None => (direct_block, args.clone(), exit_id),
-                                Some(splat_num) => {
+                            let (direct_block, call_args, call_state) = match dispatch_args {
+                                BlockDispatchArgs::Adapt(adapt) => {
+                                    let (call_args, call_state) = fun.adapt_block_args(direct_block, adapt, args.clone(), exit_id);
+                                    (direct_block, call_args, call_state)
+                                }
+                                BlockDispatchArgs::AutoSplat(splat_num) => {
                                     let arg0 = args[0];
                                     let length_block = fun.new_block(insn_idx);
                                     let expand_block = fun.new_block(insn_idx);
