@@ -1080,6 +1080,11 @@ pub fn ruby_call_method_name(cd: *const rb_call_data) -> String {
     mid.contents_lossy().to_string()
 }
 
+/// The method name a callinfo names, for HIR printing.
+pub fn ruby_call_info_method_name(ci: *const rb_callinfo) -> String {
+    unsafe { rb_vm_ci_mid(ci) }.contents_lossy().to_string()
+}
+
 /// A location in Rust code for integrating with debugging facilities defined in C.
 /// Use the [src_loc!] macro to crate an instance.
 pub struct SourceLocation {
