@@ -639,6 +639,10 @@ pub enum SideExitReason {
     GuardLess,
     GuardGreaterEq,
     GuardSuperMethodEntry,
+    /// A protected method was called with an explicit receiver from a `self` that turned out not
+    /// to be an instance of the class the method is defined in, which is the one case where the
+    /// interpreter refuses the call.
+    GuardProtectedVisibility,
     PatchPoint(Invariant),
     CalleeSideExit,
     Interrupt,
@@ -3434,6 +3438,39 @@ fn super_chain_entries(summary: &TypeDistributionSummary) -> Option<Vec<*const r
     Some(buckets.iter()
         .map(|&(idx, _)| summary.bucket(idx).class().0 as *const rb_callable_method_entry_t)
         .collect())
+}
+
+/// The class an [`Insn::HasAncestor`] on the caller's `self` has to pass for a protected call to
+/// `cme` to be permitted, or `None` when the check cannot be compiled inline.
+///
+/// `vm_call_method()` tests `rb_obj_is_kind_of(cfp->self, vm_defined_class_for_protected_call(me))`.
+/// [`crate::codegen::gen_has_ancestor`] answers a subset of that question -- it says false for
+/// immediates, for objects with a singleton class, and for anything it cannot resolve -- and a
+/// false answer only costs the guard, so a positive answer is all this has to be sound about.
+///
+/// Only a `T_CLASS` defining class qualifies. That keeps two cases out: a method defined in a
+/// module, whose defining class is the `T_ICLASS` the include created, and a refinement, whose
+/// defining class carries a separate `RCLASS_REFINED_CLASS` that the interpreter substitutes.
+/// Refinement iclasses are the only thing that field is ever set on (see `rb_using_refinement`),
+/// so for a `T_CLASS` the interpreter's check is against the defining class itself.
+fn protected_call_guard_class(cme: *const rb_callable_method_entry_t) -> Option<VALUE> {
+    // The guard reads the prime classext of the caller's class.
+    if invariants::non_root_box_created() {
+        return None;
+    }
+    let defined_class = unsafe { (*cme).defined_class };
+    if defined_class == VALUE(0) || defined_class.special_const_p() {
+        return None;
+    }
+    if defined_class.builtin_type() != RUBY_T_CLASS {
+        return None;
+    }
+    // The guard indexes the cached superclass array, which only identifies a slot for classes
+    // whose depth didn't saturate. See `ancestor_dispatch_target`.
+    if unsafe { rb_zjit_class_superclass_depth(defined_class) } >= u16::MAX as std::os::raw::c_uint {
+        return None;
+    }
+    Some(defined_class)
 }
 
 /// How to dispatch a call site whose receiver profile has more than one class in it.
@@ -6472,10 +6509,40 @@ impl Function {
                         // It allows you to use a faster ISEQ if possible.
                         cme = unsafe { rb_check_overloaded_cme(cme, ci) };
                         let visibility = unsafe { METHOD_ENTRY_VISI(cme) };
+                        // A protected method reached with an explicit receiver is callable exactly
+                        // when the *caller's* `self` is an instance of the class the method is
+                        // defined in, which is the one thing `vm_call_method` checks before
+                        // letting the call through. That is a property of the frame, not of the
+                        // receiver, so it holds for every execution of the site or for none: the
+                        // usual shape is one instance of a class reaching into another
+                        // (`WhereClause#merge` reading `other.predicates`), and there it always
+                        // holds. Compile the check inline and let the call specialize behind it.
+                        //
+                        // Guard rather than branch, because the alternative to passing is
+                        // `NoMethodError`. A site that keeps missing spends its recompiles and
+                        // then lands in the final version, which does not emit the guard and goes
+                        // back to dispatching the call dynamically.
+                        let protected_guard_class = (visibility == METHOD_VISI_PROTECTED
+                            && flags & VM_CALL_FCALL == 0
+                            && !self.policy.no_side_exits)
+                            .then(|| protected_call_guard_class(cme)).flatten();
                         match (visibility, flags & VM_CALL_FCALL != 0) {
                             (METHOD_VISI_PUBLIC, _) => {}
                             (METHOD_VISI_PRIVATE, true) => {}
                             (METHOD_VISI_PROTECTED, true) => {}
+                            (METHOD_VISI_PROTECTED, false) if protected_guard_class.is_some() => {
+                                let self_val = self.load_self(block);
+                                let is_kind_of = self.push_insn(block, Insn::HasAncestor { val: self_val, class: protected_guard_class.unwrap() });
+                                self.push_insn(block, Insn::GuardBitEquals {
+                                    val: is_kind_of,
+                                    expected: Const::CBool(true),
+                                    reason: Box::new(SideExitReason::GuardProtectedVisibility),
+                                    state,
+                                    recompile: Some(Recompile),
+                                });
+                                incr_counter!(send_protected_guard_sites);
+                                self.count(block, Counter::send_protected_guard_count);
+                            }
                             _ => {
                                 self.set_dynamic_send_reason(insn_id, SendNotOptimizedNeedPermission);
                                 self.push_insn_id(block, insn_id); continue;
