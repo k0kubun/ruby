@@ -17996,6 +17996,80 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_invokesuper_polymorphic_builds_a_method_entry_chain() {
+        eval("
+            class SuperChainBase1
+              def foo = 1
+            end
+            class SuperChainBase2
+              def foo = 2
+            end
+            module SuperChainM
+              def foo = super + 10
+            end
+            class SuperChainA < SuperChainBase1
+              prepend SuperChainM
+            end
+            class SuperChainB < SuperChainBase2
+              prepend SuperChainM
+            end
+            a = SuperChainA.new
+            b = SuperChainB.new
+            10.times { a.foo; b.foo }
+        ");
+
+        // Neither includer's method entry can be guarded alone, so the site branches on the one
+        // the frame is running and resolves `super` per arm, with a dynamic `super` for the rest.
+        let hir = hir_string_proc("SuperChainA.new.method(:foo)");
+        assert_eq!(hir.matches("InvokeSuper ").count(), 1, "only the chain fallthrough should stay dynamic:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn foo@<compiled>:9:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          v23:CPtr = GetEP 0
+          v24:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v25:FalseClass = Const Value(false)
+          v26:CBool = IsBitEqual v24, v25
+          CondBranch v26, bb6(), bb5()
+        bb6():
+          v28:RubyValue = LoadField v23, :VM_ENV_DATA_INDEX_ME_CREF@0x1001
+          v29:RubyValue = UnwrapSvar v28
+          v30:CallableMethodEntry[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v31:CBool = IsBitEqual v29, v30
+          CondBranch v31, bb7(), bb8()
+        bb7():
+          PatchPoint MethodRedefined(SuperChainBase2@0x1010, foo@0x1018, cme:0x1020)
+          v55:Fixnum[2] = Const Value(2)
+          Jump bb4(v55)
+        bb8():
+          v37:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v38:CBool = IsBitEqual v29, v37
+          CondBranch v38, bb9(), bb5()
+        bb9():
+          PatchPoint MethodRedefined(SuperChainBase1@0x1050, foo@0x1018, cme:0x1058)
+          v69:Fixnum[1] = Const Value(1)
+          Jump bb4(v69)
+        bb5():
+          v44:BasicObject = InvokeSuper v6, 0x1080 # SendFallbackReason: super: dispatch chain fallthrough
+          Jump bb4(v44)
+        bb4(v22:BasicObject):
+          v13:Fixnum[10] = Const Value(10)
+          PatchPoint MethodRedefined(Integer@0x10a8, +@0x10b0, cme:0x10b8)
+          v48:Fixnum = GuardType v22, Fixnum recompile
+          v49:Fixnum = FixnumAdd v48, v13
+          CheckInterrupts
+          Return v49
+        ");
+    }
+
+    #[test]
     fn test_invokesuper_from_a_block() {
         _ = eval("
             define_method(:itself) { super() }
