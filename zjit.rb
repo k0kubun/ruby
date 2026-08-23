@@ -150,6 +150,8 @@ class << RubyVM::ZJIT
       :send_megamorphic_direct_cfunc,
       :send_megamorphic_direct_cfunc_variadic,
       :send_megamorphic_direct_miss,
+      :symbol_block_mega_sites,
+      :symbol_block_mega_indirect,
     ], buf:, stats:, right_align: true)
     print_counters([
       :dynamic_setivar_count,
