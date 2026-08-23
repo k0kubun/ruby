@@ -3594,6 +3594,7 @@ fn inline_block_at_yield(
     block_iseq: IseqPtr,
     args: &[InsnId],
     caller_argc: usize,
+    call_state: InsnId,
     exit_id: InsnId,
     exit_state: &FrameState,
     insn_idx: u32,
@@ -3678,14 +3679,18 @@ fn inline_block_at_yield(
         num_args: args.len().try_into().expect("checked in HIR"),
         blockiseq: None,
         captured: Some(captured),
-        state: exit_id,
+        // The frame is laid out on top of `call_state`'s stack, which ends in exactly
+        // `args`. That is not the interpreter's own stack whenever the yielded arguments
+        // were reshaped for the block's parameters -- auto-splatted, truncated, or
+        // nil-filled, which is why the reshaped snapshot is threaded in separately.
+        state: call_state,
     });
     fun.push_insn(*block, Insn::Jump(BranchEdge { target: body_entry, args: vec![] }));
 
     // Every `leave` in the block body jumps here with its value; a `return` skips this and
     // returns from the compiled function instead.
     let return_val = fun.push_insn(continuation, Insn::Param);
-    fun.push_insn(continuation, Insn::PopInlineFrame { iseq: block_iseq, argc: args.len(), state: exit_id });
+    fun.push_insn(continuation, Insn::PopInlineFrame { iseq: block_iseq, argc: args.len(), state: call_state });
 
     profiles.append(&add_result.profiles);
     *block = continuation;
@@ -11235,14 +11240,11 @@ fn add_iseq_to_hir(
                         (Some((bi, adapt)), AddIseqMode::Inlined { depth: 1, .. })
                             if block_return_inlinable(bi, iseq, fun.iseq()) =>
                         {
-                            // The inlined body aliases its parameters to `args` positionally and
-                            // fills the leftovers with nil, so a nil-fill needs nothing here;
-                            // extra arguments would land on non-parameter locals, so drop them.
-                            let inline_args = match adapt {
-                                BlockArgAdapt::Truncate(lead_num) => &args[..lead_num],
-                                _ => &args[..],
-                            };
-                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, inline_args, caller_argc, call_state, &exit_state, insn_idx)
+                            // The inlined body aliases its parameters to `args` positionally, and
+                            // the frame it pushes is laid out from the state, so both have to be
+                            // reshaped together the way an out-of-line dispatch arm would.
+                            let (inline_args, inline_state) = fun.adapt_block_args(block, adapt, args.clone(), call_state);
+                            inline_block_at_yield(fun, &mut profiles, &mut block, bi, &inline_args, caller_argc, inline_state, exit_id, &exit_state, insn_idx)
                         }
                         _ => None,
                     };
