@@ -2876,7 +2876,7 @@ fn gen_send_megamorphic_direct(
     cache: *const crate::send_cache::SendCache,
     state: &FrameState,
 ) -> lir::Opnd {
-    use crate::send_cache::{SEND_CACHE_HASH_MULT, SendCacheLayout};
+    use crate::send_cache::{MEGA_DIRECT_ISEQ, MEGA_DIRECT_IVAR, SEND_CACHE_HASH_MULT, SendCacheLayout};
 
     let layout = SendCacheLayout::get();
     let argc = unsafe { vm_ci_argc((*cd).ci) }.to_usize();
@@ -2943,10 +2943,40 @@ fn gen_send_megamorphic_direct(
     asm.test(cme_flags, Opnd::UImm(layout.cme_invalidated_flag));
     asm.jnz(jit, slow_edge());
 
-    asm_comment!(asm, "check the target is one we can call directly");
-    let direct_cme = asm.load(Opnd::mem(64, slot, layout.entry_direct_cme));
-    asm.cmp(direct_cme, cme);
-    asm.jne(jit, slow_edge());
+    // Which of the non-ISEQ arms this site emits at all. An attr_reader is only
+    // ever reached from a site that passes no arguments, and a C method's
+    // address has to travel in an argument register past its last one, so a site
+    // wider than the fill path's bound has nowhere to put it. Both are
+    // compile-time properties of the site, so a site that cannot use an arm does
+    // not carry its code.
+    let iseq_only = get_option!(megamorphic_direct_iseq_only);
+    let emit_ivar = argc == 0 && !iseq_only;
+    let emit_cfunc = argc <= layout.max_cfunc_argc && !iseq_only;
+
+    let other_block = if emit_ivar || emit_cfunc {
+        Some(jit.new_block(asm, hir_block_id, false, rpo_idx))
+    } else {
+        None
+    };
+    let after_iseq = match other_block {
+        Some(block) => Target::Block(Box::new(lir::BranchEdge { target: block, args: vec![] })),
+        None => slow_edge(),
+    };
+
+    // One XOR does the work of two checks. The slot's word is the method entry
+    // with a ZJIT_MEGA_DIRECT_* tag in its low three bits, which a method entry
+    // -- a heap object -- never has set of its own. So XORing it against the
+    // method entry the callcache just produced leaves exactly the tag when the
+    // two agree, and a value at least 8 when they do not: a slot filled for
+    // another class, a slot half-written by another ractor, or an empty slot's
+    // zero, which XORs to the (non-null, aligned) method entry itself. Every arm
+    // below therefore only has to compare this against its own tag, and anything
+    // that matches none of them is a miss.
+    asm_comment!(asm, "check the target is one we can serve, and how");
+    let tagged = asm.load(Opnd::mem(64, slot, layout.entry_direct_cme));
+    let kind = asm.xor(tagged, cme);
+    asm.cmp(kind, Opnd::UImm(MEGA_DIRECT_ISEQ));
+    asm.jne(jit, after_iseq);
 
     asm_comment!(asm, "load the callee's compiled entry point");
     let def = asm.load(Opnd::mem(64, cme, layout.cme_def));
@@ -3053,6 +3083,73 @@ fn gen_send_megamorphic_direct(
     asm.mov(SP, restored_sp);
     asm.jmp(result_edge(ret));
 
+    // Everything that is not an ISEQ method.
+    if let Some(other_block) = other_block {
+        asm.set_current_block(other_block);
+        let label = jit.get_label(asm, other_block, hir_block_id);
+        asm.write_label(label);
+        // Both arms below run the callee without firing C_CALL/C_RETURN, which
+        // the interpreter does fire for both: VM_CALL_METHOD_ATTR wraps
+        // vm_call_ivar() in them, and vm_call_cfunc_with_frame_() runs
+        // EXEC_EVENT_HOOK around the C function. Rather than hold a TracePoint
+        // assumption and invalidate, read the counter VM_CALL_METHOD_ATTR itself
+        // reads and hand the call back to the interpreter while any hook wants
+        // those events. Enabling a TracePoint is rare and this is one load and a
+        // never-taken branch; being wrong here would silently drop events.
+        asm_comment!(asm, "no C_CALL/C_RETURN hook may be waiting for this call");
+        let events = asm.load(Opnd::const_ptr(layout.c_events_enabled));
+        asm.cmp(Opnd::mem(32, events, 0), Opnd::UImm(0));
+        asm.jne(jit, slow_edge());
+    }
+
+    if emit_ivar {
+        // An attr_reader, served the way vm_call_ivar() serves it: no frame, no
+        // argument setup, just the read. Which means no spills either -- the
+        // helper cannot raise, allocate or run Ruby (see rb_zjit_mega_ivar_get),
+        // so the only thing the VM could want from this frame is cfp->sp for a
+        // conservative mark, which gen_prepare_leaf_call_with_gc() writes.
+        //
+        // The read itself stays in C. The ivar's *name* is a field of the method
+        // entry, so it is not known when this code is compiled, which rules out
+        // the per-name shape table gen_ivar_cache_probe() uses. What is left is
+        // the attribute cache on the callcache -- one shape id and one index per
+        // class, since each of a megamorphic site's classes has its own
+        // callcache -- and that is exactly the cache vm_getivar() consults, so
+        // the helper is a shape check and a load in the common case.
+        let cfunc_block = if emit_cfunc {
+            Some(jit.new_block(asm, hir_block_id, false, rpo_idx))
+        } else {
+            None
+        };
+        let after_ivar = match cfunc_block {
+            Some(block) => Target::Block(Box::new(lir::BranchEdge { target: block, args: vec![] })),
+            None => slow_edge(),
+        };
+        asm.cmp(kind, Opnd::UImm(MEGA_DIRECT_IVAR));
+        asm.jne(jit, after_ivar);
+
+        asm_comment!(asm, "read #{}'s ivar out of the table", ruby_call_method_name(cd));
+        gen_prepare_leaf_call_with_gc(asm, state);
+        let ret = asm_ccall!(asm, rb_zjit_mega_ivar_get, recv, cc);
+        // Qundef is the helper declining, which it only does off the main
+        // ractor, where the read the interpreter would do can raise and this
+        // frame has spilled nothing to unwind with. See rb_zjit_mega_ivar_get.
+        asm.cmp(ret, Qundef.into());
+        asm.je(jit, slow_edge());
+        gen_incr_counter(asm, Counter::send_megamorphic_direct_ivar);
+        asm.jmp(result_edge(ret));
+
+        if let Some(cfunc_block) = cfunc_block {
+            asm.set_current_block(cfunc_block);
+            let label = jit.get_label(asm, cfunc_block, hir_block_id);
+            asm.write_label(label);
+        }
+    }
+
+    if emit_cfunc {
+        gen_mega_direct_cfunc(jit, asm, function, cd, state, &layout, recv, cme, kind, slow_block, result_block);
+    }
+
     asm.set_current_block(slow_block);
     let label = jit.get_label(asm, slow_block, hir_block_id);
     asm.write_label(label);
@@ -3075,6 +3172,187 @@ fn gen_send_megamorphic_direct(
     let param = asm.new_block_param(VALUE_BITS);
     asm.current_block().add_parameter(param);
     param
+}
+
+unsafe extern "C" {
+    /// vm_call_ivar() with no frame: see the definition in vm_insnhelper.c.
+    fn rb_zjit_mega_ivar_get(recv: VALUE, cc: *const u8) -> VALUE;
+}
+
+/// Call a C method resolved out of the megamorphic table, pushing its frame here.
+///
+/// This is [`gen_ccall_with_frame`] and [`gen_ccall_variadic`] for a callee that
+/// is not known until the call runs: the frame layout is the same, the argument
+/// passing is the same, and the two differences both come from the callee being
+/// a run-time value.
+///
+/// The first is the frame's method entry, which is a register here rather than a
+/// baked-in pointer, so the frame push is written out instead of going through
+/// [`gen_push_frame`].
+///
+/// The second is reaching the function at all. The backend can only `call` a
+/// link-time constant, and the address is a field on the method entry, so the
+/// call goes through [`gen_arg_reg_call_trampoline`]: the address rides in the
+/// first C argument register past the callee's own arguments -- which it does
+/// not read, and which is what bounds this path to
+/// `ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC` -- and the trampoline tail-jumps to it, so
+/// the callee returns straight back here.
+///
+/// Fixed-arity and variadic callees differ only in that last step, and the frame
+/// push either would need is several times its size, so they share one: the two
+/// tags are adjacent, a range check admits both, and the arms split again just
+/// before the call.
+///
+/// The caller has already established that no C_CALL/C_RETURN hook is waiting,
+/// which is the one thing `vm_call_cfunc_with_frame_()` does that this does not.
+/// Everything else it does -- the frame flags, `ec->cfp`, the arity check
+/// (settled when the slot was filled) -- is here or is a compile-time constant.
+fn gen_mega_direct_cfunc(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    cd: *const rb_call_data,
+    state: &FrameState,
+    layout: &crate::send_cache::SendCacheLayout,
+    recv: Opnd,
+    cme: Opnd,
+    kind: Opnd,
+    slow_block: lir::BlockId,
+    result_block: lir::BlockId,
+) {
+    use crate::send_cache::{MEGA_DIRECT_CFUNC, MEGA_DIRECT_CFUNC_VARIADIC};
+    const { assert!(MEGA_DIRECT_CFUNC_VARIADIC == MEGA_DIRECT_CFUNC + 1, "the range check below needs the two cfunc tags adjacent"); }
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_edge = || Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = |val: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+    let argc = unsafe { vm_ci_argc((*cd).ci) }.to_usize();
+
+    // Admit both cfunc tags and nothing else. Everything the probe did not
+    // recognize lands here as a value well past the tags -- see the XOR in
+    // gen_send_megamorphic_direct() -- so the upper bound is what rejects a
+    // stale or foreign slot, and the lower bound covers the tags this site did
+    // not emit an arm for.
+    let push_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    let variadic_block = jit.new_block(asm, hir_block_id, false, rpo_idx);
+    asm.cmp(kind, Opnd::UImm(MEGA_DIRECT_CFUNC));
+    asm.jb(jit, slow_edge());
+    asm.cmp(kind, Opnd::UImm(MEGA_DIRECT_CFUNC_VARIADIC));
+    asm.jbe(jit, Target::Block(Box::new(lir::BranchEdge { target: push_block, args: vec![] })));
+    asm.jmp(slow_edge());
+
+    asm.set_current_block(push_block);
+    let label = jit.get_label(asm, push_block, hir_block_id);
+    asm.write_label(label);
+
+    asm_comment!(asm, "call C method #{} directly out of the table", ruby_call_method_name(cd));
+    gen_stack_overflow_check(jit, asm, function, state, state.stack_size());
+
+    // The receiver is used twice, as the callee frame's self and as an argument.
+    let recv = gen_materialize_value(asm, recv);
+
+    // The arguments stay in registers: the frame env written below lands on
+    // their VM stack slots, exactly as it does in gen_ccall_with_frame(), and
+    // nothing reads slots above cfp->sp. They are still reachable for a
+    // conservative mark, off the C stack, while the callee runs.
+    let args: Vec<Opnd> = (0..argc)
+        .map(|idx| jit.get_opnd(*state.stack().nth_back(argc - 1 - idx).expect("send has its args above recv")))
+        .collect();
+
+    // gen_ccall_with_frame()'s preparation, for the same reasons: the Ruby stack
+    // below cfp->sp is stored eagerly, so the stack map only has to name the
+    // locals of frames that keep them off the VM stack, and it is anchored on
+    // cfp->sp because the C frame runs on its own cfp and nothing moves this
+    // frame's while it does.
+    let caller_stack_size = state.stack_size() - argc - 1; // -1 for the receiver
+    let caller_state = state.with_stack_size(caller_stack_size);
+    let stack_map = build_locals_stack_map(jit, function, &caller_state);
+    let jit_frame = gen_write_jit_frame(asm, state, stack_map.len());
+    gen_save_sp(asm, caller_stack_size);
+    gen_spill_stack(jit, asm, function, &caller_state);
+    gen_spill_locals_unless_mapped(jit, asm, state);
+
+    // vm_push_frame() for a C frame: no locals, so the env words start on the
+    // receiver's slot and overwrite it and the first arguments.
+    let ep_offset = caller_stack_size as i32 + VM_ENV_DATA_SIZE as i32 - 1;
+    asm_comment!(asm, "push cme, specval, frame type");
+    asm.store(Opnd::mem(64, SP, (ep_offset - 2) * SIZEOF_VALUE_I32), cme);
+    asm.store(Opnd::mem(64, SP, (ep_offset - 1) * SIZEOF_VALUE_I32), VM_BLOCK_HANDLER_NONE.into());
+    asm.store(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32),
+              (VM_FRAME_MAGIC_CFUNC | VM_FRAME_FLAG_CFRAME | VM_ENV_FLAG_LOCAL).into());
+
+    asm_comment!(asm, "push callee control frame");
+    let cfp_opnd = |offset: i32| Opnd::mem(64, CFP, offset - (RUBY_SIZEOF_CONTROL_FRAME as i32));
+    if let Some(pc) = PC_POISON {
+        asm.mov(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(pc));
+    }
+    let callee_sp = asm.lea(Opnd::mem(64, SP, (ep_offset + 1) * SIZEOF_VALUE_I32));
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SP), callee_sp);
+    // Cleared for the same reason gen_push_frame() clears it: the interpreter
+    // reads captured->code.ifunc straight out of cfp->block_code, so a stale
+    // word left by whatever last occupied this control frame is a wild pointer.
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_BLOCK_CODE), 0.into());
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), (ZJIT_JIT_RETURN_C_FRAME as usize).into());
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_SELF), recv);
+    let ep = asm.lea(Opnd::mem(64, SP, ep_offset * SIZEOF_VALUE_I32));
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_EP), ep);
+
+    // Like gen_ccall_with_frame(), leave the SP and CFP registers on the caller
+    // frame -- the C function uses neither -- and only move ec->cfp.
+    asm_comment!(asm, "set ec->cfp to the callee CFP");
+    let callee_cfp = asm.lea(Opnd::mem(64, CFP, -(RUBY_SIZEOF_CONTROL_FRAME as i32)));
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), callee_cfp);
+
+    asm_comment!(asm, "load the C function out of the method entry");
+    let def = asm.load(Opnd::mem(64, cme, layout.cme_def));
+    let func = asm.load(Opnd::mem(64, def, layout.def_cfunc_func));
+
+    asm.cmp(kind, Opnd::UImm(MEGA_DIRECT_CFUNC_VARIADIC));
+    asm.je(jit, Target::Block(Box::new(lir::BranchEdge { target: variadic_block, args: vec![] })));
+
+    // f(recv, arg...), the arguments already in registers.
+    gen_incr_counter(asm, Counter::send_megamorphic_direct_cfunc);
+    let mut fixed_args = vec![recv];
+    fixed_args.extend(args.iter().copied());
+    let ret = gen_mega_direct_cfunc_call(asm, fixed_args, func, &stack_map, jit_frame, state);
+    asm.jmp(result_edge(ret));
+
+    // f(argc, argv, recv), with argv in the scratch space gen_push_opnds()
+    // reserves -- the arguments' own VM stack slots are under the frame env by
+    // now, so they cannot be pointed at.
+    asm.set_current_block(variadic_block);
+    let label = jit.get_label(asm, variadic_block, hir_block_id);
+    asm.write_label(label);
+    gen_incr_counter(asm, Counter::send_megamorphic_direct_cfunc_variadic);
+    let argv = gen_push_opnds(jit, asm, &args);
+    let ret = gen_mega_direct_cfunc_call(asm, vec![argc.into(), argv, recv], func, &stack_map, jit_frame, state);
+    asm.jmp(result_edge(ret));
+}
+
+/// Emit the call itself for [`gen_mega_direct_cfunc`]: hand `cfunc_args` to the C
+/// function in `func` through the trampoline that reads it out of the first
+/// argument register past them, then put `ec->cfp` back on the caller.
+fn gen_mega_direct_cfunc_call(
+    asm: &mut Assembler,
+    cfunc_args: Vec<Opnd>,
+    func: Opnd,
+    stack_map: &[StackMapEntry],
+    jit_frame: *const zjit_jit_frame,
+    state: &FrameState,
+) -> lir::Opnd {
+    let trampoline = ZJITState::get_arg_reg_call_trampoline(cfunc_args.len());
+    let mut trampoline_args = cfunc_args;
+    trampoline_args.push(func);
+    asm.count_call_to("megamorphic direct cfunc");
+    if !stack_map.is_empty() {
+        asm.stack_map(stack_map.to_vec(), jit_frame, state.depth);
+    }
+    let result = asm.ccall(trampoline, trampoline_args);
+
+    asm_comment!(asm, "pop C frame");
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    result
 }
 
 /// Push an interpreter frame for an inlined callee. This is the same as the frame push
@@ -6597,7 +6875,15 @@ pub fn gen_function_stub_hit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, C
 }
 
 /// Generate a trampoline that is used when a function exits without restoring PC and the stack
-/// Compile a trampoline that jumps to the callee entry point in the first C
+/// How many of [`gen_arg_reg_call_trampoline`] to generate: one for each C
+/// argument register a run-time callee address may arrive in. Index 0 serves an
+/// ISEQ's `jit_entry`, which reads no arguments at all; indices 1 through
+/// `ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC + 1` serve a C method called with `recv`
+/// plus up to that many arguments, whose address therefore has to sit one
+/// register past its last one.
+pub const ARG_REG_CALL_TRAMPOLINES: usize = 6;
+
+/// Compile a trampoline that jumps to the callee address in the `idx`th C
 /// argument register.
 ///
 /// [`gen_send_megamorphic_direct`] resolves its callee at run time, so it has
@@ -6607,15 +6893,21 @@ pub fn gen_function_stub_hit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, C
 /// allocator out of it: the `jmp` leaves the return address the caller's `call`
 /// pushed untouched (and, on arm64, leaves `lr` alone), so the callee returns
 /// straight past this trampoline to the send site.
-pub fn gen_jit_entry_call_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
+///
+/// Which register the address travels in is the whole reason there is a family
+/// of these. A callee that reads its arguments out of its frame -- an ISEQ's
+/// `jit_entry` -- leaves every argument register free, so index 0 will do. A C
+/// function reads registers 0..n, so its own address has to ride in register n,
+/// and n varies with the site's argc.
+pub fn gen_arg_reg_call_trampoline(cb: &mut CodeBlock, idx: usize) -> Result<CodePtr, CompileError> {
     let mut asm = Assembler::new();
-    asm.new_block_without_id("jit_entry_call_trampoline");
-    asm_comment!(asm, "tail-jump to the callee entry point");
-    asm.jmp_opnd(C_ARG_OPNDS[0]);
+    asm.new_block_without_id("arg_reg_call_trampoline");
+    asm_comment!(asm, "tail-jump to the callee address in C argument {idx}");
+    asm.jmp_opnd(C_ARG_OPNDS[idx]);
 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
-        register_current_code_range_with_perf(cb, "jit entry call trampoline", code_ptr);
+        register_current_code_range_with_perf(cb, "arg reg call trampoline", code_ptr);
         code_ptr
     })
 }

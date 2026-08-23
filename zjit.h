@@ -114,20 +114,41 @@ ZJIT_STACK_MAP_BASE_PTR_STACK_SIZE(VALUE entry)
 //
 // One slot of the table. Two words so that a hit can answer both questions a
 // megamorphic send asks: which callcache dispatches this class (`cc`), and, when
-// the answer is an ISEQ method JIT code can enter without the interpreter,
-// which method that is (`direct_cme`). See `gen_send_megamorphic_direct()` in
-// zjit/src/codegen.rs for the inline probe that reads both.
+// the answer is a target JIT code can serve without the interpreter, which
+// method that is and how to serve it (`direct_cme`). See
+// `gen_send_megamorphic_direct()` in zjit/src/codegen.rs for the inline probe
+// that reads both.
 struct rb_zjit_send_cache_entry {
     // The cached callcache, or NULL when the slot is empty. Validates itself:
     // see zjit_send_cache_search().
     const struct rb_callcache *cc;
-    // `vm_cc_cme(cc)` when that method is one JIT code may enter with a direct
-    // call (see zjit_send_cache_direct_cme()), NULL otherwise. JIT code checks
-    // it against the method entry it read out of `cc`, so a slot caught
-    // half-written by another ractor reads as a miss rather than as a call to
-    // the wrong method -- which is what lets both words be plain stores.
-    const rb_callable_method_entry_t *direct_cme;
+    // `vm_cc_cme(cc)`, tagged in its low bits with one of the
+    // ZJIT_MEGA_DIRECT_* kinds, when that method is one JIT code may serve
+    // itself (see zjit_send_cache_direct_cme()); 0 otherwise. JIT code masks
+    // the tag off and checks the pointer against the method entry it read out
+    // of `cc`, so a slot caught half-written by another ractor reads as a miss
+    // rather than as a call to the wrong method -- which is what lets both
+    // words be plain stores. A method entry is a heap object and so at least
+    // 8-byte aligned, which is what leaves the low three bits free.
+    uintptr_t direct_cme;
 };
+
+// How JIT code serves a table hit whose `direct_cme` names it, tagged into that
+// word's low bits. 0 means "not one of these": either the slot is empty or the
+// target is one only the interpreter can dispatch. Must match the
+// MEGA_DIRECT_* constants in zjit/src/send_cache.rs.
+#define ZJIT_MEGA_DIRECT_TAG_MASK 0x7
+// A simple ISEQ method: push the frame and call ISEQ_BODY(iseq)->jit_entry.
+#define ZJIT_MEGA_DIRECT_ISEQ 0x1
+// An attr_reader: read the ivar with no frame at all, the way vm_call_ivar()
+// does.
+#define ZJIT_MEGA_DIRECT_IVAR 0x2
+// A C method of the site's exact arity: push the cfunc frame and call
+// `cme->def->body.cfunc.func` with (recv, arg...).
+#define ZJIT_MEGA_DIRECT_CFUNC 0x3
+// A variadic (`argc == -1`) C method: push the cfunc frame and call the
+// function with (argc, argv, recv).
+#define ZJIT_MEGA_DIRECT_CFUNC_VARIADIC 0x4
 
 struct rb_zjit_send_cache {
     // Number of slots, and what zjit_send_cache_slot() scales the hash by. A
@@ -186,6 +207,18 @@ size_t rb_zjit_cme_def_offset(void);
 size_t rb_zjit_def_iseqptr_offset(void);
 VALUE rb_zjit_method_entry_invalidated_flag(void);
 size_t rb_zjit_mega_direct_max_stack(void);
+size_t rb_zjit_def_cfunc_func_offset(void);
+size_t rb_zjit_mega_direct_max_cfunc_argc(void);
+// `&ruby_vm_c_events_enabled`, the counter VM_CALL_METHOD_ATTR tests before it
+// fires C_CALL/C_RETURN around an attr_reader, and the one that is non-zero
+// whenever any hook wants those events. The inline megamorphic IVAR and CFUNC
+// paths fire no events, so they read it and hand the call back to the
+// interpreter while it is set.
+unsigned int *rb_zjit_c_events_enabled_ptr(void);
+
+// vm_call_ivar() with no frame and no calling info: read the attr_reader's
+// ivar off `recv`, through the attribute cache on `cc`.
+VALUE rb_zjit_mega_ivar_get(VALUE recv, const struct rb_callcache *cc);
 
 // Field offsets and flag masks the inline block dispatch in JIT code needs to
 // decide, from a run-time block ISEQ, whether it may push the block frame
@@ -202,6 +235,14 @@ uint32_t rb_zjit_iseq_param_flags_ambiguous_param0_mask(void);
 // megamorphic dispatch path, which checks for stack overflow against this bound
 // instead of the callee's own (unknown at compile time) requirement.
 #define ZJIT_MEGA_DIRECT_MAX_STACK 64
+
+// Largest argc the inline megamorphic dispatch will call a C method with. The
+// function pointer is resolved at run time, and the only way to `call` it is to
+// pass it in an argument register the callee does not read, so a fixed-arity
+// callee needs `recv` plus its arguments to leave one of the six (x86-64) or
+// eight (arm64) argument registers free. Variadic callees are held to the same
+// bound for the scratch space the call site reserves for their argv.
+#define ZJIT_MEGA_DIRECT_MAX_CFUNC_ARGC 4
 
 extern void *rb_zjit_entry;
 extern const zjit_jit_frame_t rb_zjit_c_frame;

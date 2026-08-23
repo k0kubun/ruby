@@ -541,10 +541,19 @@ make_counters! {
     // still fall back off the guard chain, they just no longer leave JIT code.
     // See crate::codegen::gen_send_megamorphic_direct.
     send_megamorphic_direct,
+    // A table hit on an attr_reader that JIT code answered with the ivar read
+    // and no frame at all, the way vm_call_ivar() does.
+    send_megamorphic_direct_ivar,
+    // A table hit on a C method of the site's exact arity that JIT code answered
+    // by pushing the cfunc frame itself and calling the function.
+    send_megamorphic_direct_cfunc,
+    // The same, for a variadic (`argc == -1`) C method.
+    send_megamorphic_direct_cfunc_variadic,
     // A megamorphic send whose site was compiled with the inline probe but that
-    // did not take the direct path: an immediate receiver, a table miss, a
-    // target that is not a simple ISEQ method, or one whose code is not
-    // compiled (yet, or any more, after an invalidation).
+    // did not take any direct path: an immediate receiver, a table miss, a
+    // target of a kind none of the arms serve, an ISEQ whose code is not
+    // compiled (yet, or any more, after an invalidation), or a C_CALL TracePoint
+    // being enabled.
     send_megamorphic_direct_miss,
 
     // compile_error_: Compile error reasons

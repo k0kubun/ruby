@@ -161,6 +161,12 @@ pub struct Options {
     /// measurement; see [`crate::codegen::gen_send_megamorphic_direct`].
     pub disable_megamorphic_direct: bool,
 
+    /// Keep the inline megamorphic dispatch path but restrict it to ISEQ
+    /// targets, so an attr_reader or a C method goes back out through
+    /// `rb_zjit_send_cached_without_block`. Only useful for A/B measurement of
+    /// those two arms against the ISEQ-only path that preceded them.
+    pub megamorphic_direct_iseq_only: bool,
+
     /// Turn off the run-time block ISEQ dispatch, so a `yield` whose handler is not one of the
     /// block ISEQs the site profiled always goes out through `rb_vm_invokeblock()`. Only useful
     /// for A/B measurement; see [`crate::codegen::gen_invoke_block_iseq_dynamic`].
@@ -285,6 +291,7 @@ impl Default for Options {
             ivar_cache_entries: crate::ivar_cache::DEFAULT_CACHE_ENTRIES,
             disable_send_cache: false,
             disable_megamorphic_direct: false,
+            megamorphic_direct_iseq_only: false,
             disable_block_dynamic_dispatch: false,
             send_cache_entries: crate::send_cache::DEFAULT_CACHE_ENTRIES,
             dump_hir_init: None,
@@ -662,6 +669,7 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("disable-send-cache", "") => options.disable_send_cache = true,
 
         ("disable-megamorphic-direct", "") => options.disable_megamorphic_direct = true,
+        ("megamorphic-direct-iseq-only", "") => options.megamorphic_direct_iseq_only = true,
         ("disable-block-dynamic-dispatch", "") => options.disable_block_dynamic_dispatch = true,
 
         // The ceiling a table may grow to, not the size it starts at. See
