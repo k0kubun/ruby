@@ -855,7 +855,6 @@ pub enum SendFallbackReason {
     InvokeBlockAmbiguousParam0,
     /// The profiled block ISEQ contains a `throw` that is not a plain non-local `return`
     /// (`break`, `redo`, or `next` out of a rescue).
-    InvokeBlockMayThrow,
     /// A `yield` whose block handler was a guarded Symbol, whose send `type_specialize` could
     /// not resolve, so the site went back to the generic `invokeblock`.
     InvokeBlockSymbolUnspecialized,
@@ -931,7 +930,6 @@ impl Display for SendFallbackReason {
             InvokeBlockChainCoverage => write!(f, "InvokeBlock: dispatchable ISEQs cover too little of the profile"),
             InvokeBlockNotSimpleIseq => write!(f, "InvokeBlock: block takes non-lead parameters"),
             InvokeBlockAmbiguousParam0 => write!(f, "InvokeBlock: |x,| block truncates an auto-splat"),
-            InvokeBlockMayThrow => write!(f, "InvokeBlock: block contains a non-return throw"),
             InvokeBlockSymbolUnspecialized => write!(f, "InvokeBlock: symbol block handler's send did not specialize"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             InvokeBlockAutosplatMiss => write!(f, "InvokeBlock: auto-splat expansion miss"),
