@@ -5853,7 +5853,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn dont_specialize_call_to_iseq_with_kwrest() {
+    fn specialize_call_to_iseq_with_kwrest() {
         enable_zjit_stats();
         eval("
             def foo(**args) = 1
@@ -5878,12 +5878,15 @@ mod hir_opt_tests {
           IncrCounter zjit_insn_count
           v15:Fixnum[1] = Const Value(1)
           IncrCounter zjit_insn_count
-          IncrCounter complex_arg_pass_param_kwrest
-          IncrCounter send_direct_fallback_context_send
-          v18:BasicObject = Send v8, :foo, v15 # SendFallbackReason: Complex argument passing
+          PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
+          v26:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          v27:StaticSymbol[:a] = Const Value(VALUE(0x1038))
+          v28:HashExact = NewHash v27: v15
+          IncrCounter inline_iseq_optimized_send_count
+          v31:Fixnum[1] = Const Value(1)
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v18
+          Return v31
         ");
     }
 
@@ -6010,7 +6013,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn dont_specialize_call_to_iseq_with_param_kwrest() {
+    fn specialize_call_to_iseq_with_param_kwrest() {
         enable_zjit_stats();
         eval("
             def foo(**kwargs) = kwargs.keys
@@ -6033,12 +6036,13 @@ mod hir_opt_tests {
         bb3(v8:BasicObject):
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          IncrCounter complex_arg_pass_param_kwrest
-          IncrCounter send_direct_fallback_context_send
-          v15:BasicObject = Send v8, :foo # SendFallbackReason: Complex argument passing
+          PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
+          v23:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          v24:HashExact = NewHash
+          v26:BasicObject = SendDirect v23, 0x0, :foo (0x1038), v24
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v15
+          Return v26
         ");
     }
 
@@ -16937,7 +16941,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn counting_complex_feature_use_for_fallback() {
+    fn specialize_bmethod_with_kwrest_and_block_param() {
         eval("
             define_method(:fancy) { |_a, *_b, kw: 100, **kw_rest, &block| }
             def test = fancy(1)
@@ -16955,9 +16959,12 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v11:Fixnum[1] = Const Value(1)
-          v13:BasicObject = Send v6, :fancy, v11 # SendFallbackReason: Complex argument passing
+          PatchPoint SingleRactorMode
+          PatchPoint MethodRedefined(Object@0x1000, fancy@0x1008, cme:0x1010)
+          v21:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          v26:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v13
+          Return v26
         ");
     }
 

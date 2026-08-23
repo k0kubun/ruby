@@ -588,6 +588,70 @@ fn test_zsuper_to_forwardable_callee() {
 }
 
 #[test]
+fn test_kwrest_only_no_caller_keywords() {
+    assert_snapshot!(inspect("
+        def target(a, **opts) = [a, opts]
+        5.times.map { target(1) }.uniq
+    "), @"[[1, {}]]");
+}
+
+#[test]
+fn test_kwrest_only_with_caller_keywords() {
+    assert_snapshot!(inspect("
+        def target(a, **opts) = [a, opts]
+        5.times.map { target(1, x: 2, y: 3) }.uniq
+    "), @"[[1, {x: 2, y: 3}]]");
+}
+
+#[test]
+fn test_kwrest_with_named_keywords() {
+    assert_snapshot!(inspect("
+        def target(a, b: 1, **opts) = [a, b, opts]
+        5.times.flat_map { [target(1), target(1, b: 2), target(1, z: 3, b: 2)] }.uniq
+    "), @"[[1, 1, {}], [1, 2, {}], [1, 2, {z: 3}]]");
+}
+
+#[test]
+fn test_kwrest_with_required_keyword_missing() {
+    assert_snapshot!(inspect(r#"
+        def target(a, b:, **opts) = [a, b, opts]
+        5.times.map { (target(1, q: 5) rescue $!.message) }.uniq
+    "#), @r#"["missing keyword: :b"]"#);
+}
+
+#[test]
+fn test_kwrest_with_rest_and_optional() {
+    assert_snapshot!(inspect("
+        def target(a, b = 9, *r, c:, d: 4, **opts) = [a, b, r, c, d, opts]
+        5.times.map { target(1, 2, 3, 4, c: 5, e: 6) }.uniq
+    "), @"[[1, 2, [3, 4], 5, 4, {e: 6}]]");
+}
+
+#[test]
+fn test_kwrest_only_kwrest_param() {
+    assert_snapshot!(inspect("
+        def target(**opts) = opts
+        5.times.flat_map { [target, target(k: 1)] }.uniq
+    "), @"[{}, {k: 1}]");
+}
+
+#[test]
+fn test_kwrest_anonymous_stays_dynamic() {
+    assert_snapshot!(inspect("
+        def target(**) = :anon
+        5.times.map { target }.uniq
+    "), @"[:anon]");
+}
+
+#[test]
+fn test_kwrest_splat_and_kwrest() {
+    assert_snapshot!(inspect("
+        def target(*a, **opts) = [a, opts]
+        5.times.flat_map { [target, target(1, 2, k: 3)] }.uniq
+    "), @"[[[], {}], [[1, 2], {k: 3}]]");
+}
+
+#[test]
 fn test_setlocal_on_eval() {
     assert_snapshot!(inspect("
         @b = binding
