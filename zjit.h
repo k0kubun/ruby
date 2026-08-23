@@ -187,6 +187,17 @@ size_t rb_zjit_def_iseqptr_offset(void);
 VALUE rb_zjit_method_entry_invalidated_flag(void);
 size_t rb_zjit_mega_direct_max_stack(void);
 
+// Field offsets and flag masks the inline block dispatch in JIT code needs to
+// decide, from a run-time block ISEQ, whether it may push the block frame
+// itself. Same reason as above: rb_iseq_constant_body is opaque to Rust, and
+// the `param.flags` bitfields have no layout Rust could reproduce.
+size_t rb_zjit_iseq_body_param_flags_offset(void);
+size_t rb_zjit_iseq_body_param_lead_num_offset(void);
+size_t rb_zjit_iseq_body_local_table_size_offset(void);
+size_t rb_zjit_iseq_body_stack_max_offset(void);
+uint32_t rb_zjit_iseq_param_flags_not_simple_mask(void);
+uint32_t rb_zjit_iseq_param_flags_ambiguous_param0_mask(void);
+
 // Largest `stack_max` a callee may have and still be entered by the inline
 // megamorphic dispatch path, which checks for stack overflow against this bound
 // instead of the callee's own (unknown at compile time) requirement.
