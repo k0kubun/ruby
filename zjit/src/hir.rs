@@ -893,9 +893,6 @@ pub enum SendFallbackReason {
     InvokeBlockArityMismatch,
     /// A one-argument `yield` to a `|x,|` block, which auto-splats and then truncates.
     InvokeBlockAmbiguousParam0,
-    /// The profiled block ISEQ contains a `throw` that is not a plain non-local `return`
-    /// (`break`, `redo`, or `next` out of a rescue).
-    InvokeBlockMayThrow,
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
     /// profiled ISEQ candidate, so the site dispatched through the generic fallback.
     InvokeBlockPolymorphicMiss,
@@ -980,7 +977,6 @@ impl Display for SendFallbackReason {
             InvokeBlockNotSimpleIseq => write!(f, "InvokeBlock: block takes non-lead parameters"),
             InvokeBlockArityMismatch => write!(f, "InvokeBlock: yield arity does not match the block"),
             InvokeBlockAmbiguousParam0 => write!(f, "InvokeBlock: |x,| block truncates an auto-splat"),
-            InvokeBlockMayThrow => write!(f, "InvokeBlock: block contains a non-return throw"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             InvokeBlockAutosplatMiss => write!(f, "InvokeBlock: auto-splat expansion miss"),
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
