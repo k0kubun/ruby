@@ -1685,7 +1685,10 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
     else if (state == TAG_BREAK) {
         int is_orphan = 1;
         const VALUE *ep = GET_EP();
-        const rb_iseq_t *base_iseq = GET_ISEQ();
+        // CFP_ISEQ(), not GET_ISEQ(): a frame pushed by ZJIT code leaves cfp->_iseq
+        // unwritten and reports its ISEQ through the JITFrame instead. The rest of
+        // this search already goes through CFP_ISEQ()/CFP_PC() for the same reason.
+        const rb_iseq_t *base_iseq = CFP_ISEQ(reg_cfp);
         escape_cfp = reg_cfp;
 
         while (ISEQ_BODY(base_iseq)->type != ISEQ_TYPE_BLOCK) {
