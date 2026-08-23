@@ -2498,6 +2498,90 @@ fn test_send_nil_block_arg_split_polymorphic_receiver() {
 }
 
 #[test]
+fn test_send_forwards_block_param_proxy() {
+    // `bar(&blk)` where `blk` comes from `getblockparamproxy` passes this frame's own block
+    // handler to the callee, so the callee's `yield` and `&b` parameter have to see the block
+    // the outermost caller gave. Every kind of handler goes through the same site: a literal
+    // block, no block at all, a Proc, and a symbol-to-proc.
+    assert_snapshot!(inspect("
+        def callee(n, &b)
+          [n, block_given? ? yield(n) : nil, b ? b.call(n) : nil]
+        end
+        def forward(n, &blk) = callee(n, &blk)
+        def pass_proc(n, p) = forward(n, &p)
+        out = []
+        200.times do |i|
+          out << forward(i) { |x| x + 1 }
+          out << forward(i)
+          out << pass_proc(i, ->(x) { x * 2 })
+          out << pass_proc(i, nil)
+        end
+        out.last(4)
+    "), @"[[199, 200, 200], [199, nil, nil], [199, 398, 398], [199, nil, nil]]");
+}
+
+#[test]
+fn test_send_forwards_block_param_proxy_after_setblockparam() {
+    // Assigning the block parameter makes `getblockparamproxy` hand back the materialized Proc
+    // instead of the proxy, so the branch on the proxy has to send those calls the other way.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, b ? b.call(n) : nil]
+        def forward(n, replace, &blk)
+          blk = ->(x) { x * 100 } if replace
+          callee(n, &blk)
+        end
+        out = []
+        200.times do |i|
+          out << forward(i, false) { |x| x + 1 }
+          out << forward(i, true) { |x| x + 1 }
+        end
+        out.last(2)
+    "), @"[[199, 200], [199, 19900]]");
+}
+
+#[test]
+fn test_send_proc_block_arg_passes_through() {
+    // A `&blk` argument holding a plain Proc is its own block handler in the interpreter, so the
+    // direct send installs it as the callee frame's specval.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, block_given?, b.call(n)]
+        def entry(n, p) = callee(n, &p)
+        doubler = ->(x) { x * 2 }
+        out = nil
+        200.times { |i| out = entry(i, doubler) }
+        [out, entry(5, proc { |x| x + 1 })]
+    "), @"[[199, true, 398], [5, true, 6]]");
+}
+
+#[test]
+fn test_send_proc_block_arg_guard_rejects_other_block_args() {
+    // The Proc guard has to send a `&:sym` or a Method through the interpreter, which converts it
+    // with `to_proc` rather than using it as the block handler directly.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = b.call(n)
+        def entry(n, p) = callee(n, &p)
+        doubler = ->(x) { x * 2 }
+        200.times { |i| entry(i, doubler) }
+        [entry(5, doubler), entry(-6, :abs), entry(7, 2.method(:+))]
+    "), @"[10, 6, 9]");
+}
+
+#[test]
+fn test_send_block_param_proxy_from_block_body() {
+    // `foo(&blk)` inside a block reads the block parameter of the enclosing method, and
+    // `VM_CF_BLOCK_HANDLER` resolves through the local EP to that same frame.
+    assert_snapshot!(inspect("
+        def callee(n, &b) = [n, b ? b.call(n) : nil]
+        def forward(n, &blk)
+          [1].map { callee(n, &blk) }.first
+        end
+        out = nil
+        200.times { |i| out = forward(i) { |x| x + 3 } }
+        [out, forward(9)]
+    "), @"[[199, 202], [9, nil]]");
+}
+
+#[test]
 fn test_send_symbol_block_arg() {
     assert_snapshot!(inspect("
         def test = [1, 2].map(&:to_s)
