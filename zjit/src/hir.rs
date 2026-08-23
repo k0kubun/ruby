@@ -2868,6 +2868,52 @@ pub enum ValidationError {
     MiscValidationError(InsnId, String),
 }
 
+/// Call-site features that keep a `def foo(...)` callee on the interpreter's argument setup.
+///
+/// Everything here changes what the callee's `...` local has to describe, so passing the
+/// call site's own callinfo through would misrepresent the arguments we copied:
+/// `VM_CALL_FORWARDING` means the caller is itself forwarding and the callinfo to hand over
+/// lives in *its* `...` local rather than at this call site, `VM_CALL_ARGS_BLOCKARG` puts a
+/// block on the stack that `vm_caller_setup_arg_block` pops before argument setup, splats
+/// and `**kwrest` mean the stack does not hold `vm_ci_argc(ci)` plain values, and
+/// super/`__send__`/tailcall reach the callee through a different setup path entirely.
+const FORWARDABLE_CALLEE_BLOCKERS: u32 = VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT
+    | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING | VM_CALL_TAILCALL
+    | VM_CALL_OPT_SEND | VM_CALL_SUPER | VM_CALL_ZSUPER;
+
+/// Check if we can emit SendDirect to a `def foo(...)` (forwardable) ISEQ.
+///
+/// `vm_call_iseq_forwardable` does not run `setup_parameters_complex` at all: it grows the
+/// callee frame by `vm_ci_argc(ci)`, leaves the caller's arguments where they already are,
+/// and stores the call site's callinfo in the `...` local so a later `sendforward` can
+/// replay the call. [`super::codegen::gen_send_iseq_direct`] can do the same, because the
+/// argument count is a property of the call site and therefore known at compile time.
+///
+/// A literal block needs no check of its own: `optimized_forward` in `iseq_set_arguments`
+/// gives a forwardable ISEQ no block parameter and always sets `use_block`, so the frame's
+/// specval that SendDirect already writes is the whole of it.
+fn can_direct_send_forwardable(ci: *const rb_callinfo, args: &[InsnId]) -> Result<(), SendDirectFailure> {
+    use Counter::*;
+    let ci_flags = unsafe { rb_vm_ci_flag(ci) };
+    if ci_flags & FORWARDABLE_CALLEE_BLOCKERS != 0 {
+        return Err(SendDirectFailure::with_counters(
+            ComplexArgPass,
+            vec![complex_arg_pass_param_forwardable],
+        ));
+    }
+    // The frame is grown by exactly the call site's argument count, so the HIR argument
+    // list has to be the whole of it. Keyword arguments count here: they stay on the stack
+    // as plain values and the callinfo records their names.
+    if args.len() != unsafe { rb_vm_ci_argc(ci) } as usize {
+        return Err(SendDirectFailure::new(ArgcParamMismatch));
+    }
+    // `IseqCall` stores argc as u16, and the callee frame has to fit the copied arguments.
+    if u16::try_from(args.len()).is_err() {
+        return Err(SendDirectFailure::new(OperandTooLarge));
+    }
+    Ok(())
+}
+
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
 /// `block_arg_passthrough` says the caller's `&blk` argument was taken out of `args` to become
 /// the callee frame's block handler, so the frame setup reproduces `vm_caller_setup_arg_block`
@@ -2882,10 +2928,18 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
         && (unsafe { rb_vm_ci_flag(ci) } & VM_CALL_ARGS_BLOCKARG) != 0;
 
     use Counter::*;
-    if 0 != params.flags.forwardable() { count_failure(complex_arg_pass_param_forwardable) }
+    if 0 != params.flags.forwardable() {
+        return can_direct_send_forwardable(ci, args);
+    }
     if callee_has_block_param && caller_passes_block_arg
                                        { count_failure(complex_arg_pass_param_block) }
-    if 0 != params.flags.has_kwrest()  { count_failure(complex_arg_pass_param_kwrest) }
+    // A `**rest` parameter collects the caller keywords the callee's keyword table does not
+    // name, which `plan_send_direct_keyword_arguments` can build as one more Hash argument.
+    // `ruby2_keywords` is left out: it needs the VM to move RHASH_PASS_AS_KEYWORDS across
+    // the call.
+    let has_kwrest = 0 != params.flags.has_kwrest();
+    if has_kwrest && 0 != params.flags.ruby2_keywords()
+                                       { count_failure(complex_arg_pass_param_kwrest) }
 
     // If the caller passes a block (literal or &block), we need to fall back to the
     // interpreter for two cases it handles that we don't:
@@ -2956,9 +3010,12 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
     // After keyword-to-positional-hash, SendDirect receives no keyword slots;
     // the caller keywords are represented by one extra positional Hash.
     let effective_keyword_count = if keywords_as_positional_hash { 0 } else { caller_kw_count };
+    // With `**rest` the caller may name more keywords than the table has; the extras end up
+    // in the Hash. Every required keyword still has to be there, which the planning below
+    // rechecks by name.
     let keyword_ok = c_int::try_from(effective_keyword_count)
         .as_ref()
-        .map(|argc| (kw_req_num..=kw_total_num).contains(argc))
+        .map(|argc| if has_kwrest { (kw_req_num..).contains(argc) } else { (kw_req_num..=kw_total_num).contains(argc) })
         .unwrap_or(false);
     if !keyword_ok {
         return Err(SendDirectFailure::new(ArgcParamMismatch));
@@ -2972,7 +3029,7 @@ fn can_direct_send(iseq: *const rb_iseq_t, ci: *const rb_callinfo, args: &[InsnI
     // Without *rest, use the converted positional count so the synthesized
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
-    let send_argc = send_positional_argc + kw_total_num as usize;
+    let send_argc = send_positional_argc + kw_total_num as usize + usize::from(has_kwrest);
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
@@ -4756,6 +4813,20 @@ impl Function {
     /// Array where the callee expects it, so the repacking below has to be skipped.
     fn build_send_direct_args(&self, args: &[InsnId], ci: *const rb_callinfo, iseq: IseqPtr, has_block: bool, block_arg_passthrough: bool, rest_prepacked: bool) -> Result<SendDirectCall, SendDirectFailure> {
         can_direct_send(iseq, ci, args, has_block, block_arg_passthrough)?;
+        // A forwardable callee takes the caller's arguments verbatim: no reordering, no
+        // synthesized keyword Hash, no rest packing. `gen_send_iseq_direct` copies them into
+        // the callee frame and stores the callinfo in the `...` local.
+        //
+        // `can_direct_send_forwardable` has already rejected `VM_CALL_ARGS_BLOCKARG` call
+        // sites, so a `&blk` passthrough never reaches here: the block argument is still on
+        // the stack at this point and the callinfo we would store in `...` counts it out.
+        if 0 != unsafe { iseq.params() }.flags.forwardable() {
+            return Ok(SendDirectCall {
+                args: args.iter().copied().map(SendDirectArg::Existing).collect(),
+                kw_bits: 0,
+                jit_entry_idx: 0,
+            });
+        }
         let args = args.iter().copied().map(SendDirectArg::Existing).collect();
         let (args, kw_bits) = Self::plan_send_direct_keyword_arguments(args, ci, iseq)
             .map_err(SendDirectFailure::new)?;
@@ -4888,8 +4959,10 @@ impl Function {
         let callee_kw_table = unsafe { (*callee_keyword).table };
         let default_values = unsafe { (*callee_keyword).default_values };
 
-        // Caller can't provide more keywords than callee expects (no **kwrest support yet).
-        if caller_kw_count > callee_kw_count {
+        // A `**rest` parameter soaks up whatever the keyword table does not name, so the
+        // caller is free to pass more keywords than there are slots. Without one, it is not.
+        let has_kwrest = 0 != unsafe { iseq.params() }.flags.has_kwrest();
+        if !has_kwrest && caller_kw_count > callee_kw_count {
             return Err(SendDirectKeywordCountMismatch);
         }
 
@@ -4908,19 +4981,21 @@ impl Function {
 
         // Verify all caller keywords are expected by callee (no unknown keywords).
         // Without **kwrest, unexpected keywords should raise ArgumentError at runtime.
-        for &caller_id in &caller_kw_order {
-            let mut found = false;
-            for i in 0..callee_kw_count {
-                let expected_id = unsafe { *callee_kw_table.add(i) };
-                if caller_id == expected_id {
-                    found = true;
-                    break;
+        if !has_kwrest {
+            for &caller_id in &caller_kw_order {
+                let mut found = false;
+                for i in 0..callee_kw_count {
+                    let expected_id = unsafe { *callee_kw_table.add(i) };
+                    if caller_id == expected_id {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            if !found {
-                // Caller is passing an unknown keyword - this will raise ArgumentError.
-                // Fall back to VM dispatch to handle the error.
-                return Err(SendDirectKeywordMismatch);
+                if !found {
+                    // Caller is passing an unknown keyword - this will raise ArgumentError.
+                    // Fall back to VM dispatch to handle the error.
+                    return Err(SendDirectKeywordMismatch);
+                }
             }
         }
 
@@ -4973,6 +5048,31 @@ impl Function {
 
         // Replace the keyword arguments with the reordered ones.
         processed_args.extend(reordered_kw_args);
+
+        // `**rest` takes the keywords the loop above did not claim, in the order the caller
+        // wrote them, which is what `make_rest_kw_hash` builds from the leftover slots.
+        if has_kwrest {
+            let mut leftover = Vec::with_capacity(keyword_values.len() * 2);
+            for (idx, value) in keyword_values.into_iter().enumerate() {
+                let Some(value) = value else { continue };
+                let keyword = unsafe { get_cikw_keywords_idx(kwarg, idx as i32) };
+                leftover.push(SendDirectArg::Constant(keyword));
+                leftover.push(value);
+            }
+            // A callee with no named keywords goes through `args_setup_kw_rest_parameter`
+            // instead of `args_setup_kw_parameters`, and that one skips the allocation for
+            // an anonymous `**` with nothing to collect: the slot is left nil, not `{}`.
+            let params = unsafe { iseq.params() };
+            let nil_anon_kwrest = leftover.is_empty()
+                && 0 == params.flags.has_kw()
+                && 0 != params.flags.anon_kwrest();
+            processed_args.push(if nil_anon_kwrest {
+                SendDirectArg::Constant(Qnil)
+            } else {
+                SendDirectArg::KeywordHash(leftover)
+            });
+        }
+
         Ok((processed_args, kw_bits))
     }
 
@@ -4998,7 +5098,7 @@ impl Function {
         let lead_num = params.lead_num as usize;
         let opt_num = params.opt_num as usize;
         let post_num = params.post_num as usize;
-        let kw_num = callee_kw_num(iseq);
+        let kw_num = callee_kw_num(iseq) + usize::from(params.flags.has_kwrest() != 0);
 
         let positional_argc = args.len().checked_sub(kw_num).ok_or(ArgcParamMismatch)?;
         let min_positional_argc = lead_num + post_num;
