@@ -456,6 +456,12 @@ enum FusedCond {
     /// operands preserves the fixnum order because tagging is monotonic.
     /// Replaces a single-use fixnum compare feeding a single-use `Test`.
     Cmp(FusedCmpKind, InsnId, InsnId),
+    /// Branch on a raw pointer comparison: `cmp left, right; je/jne`. Replaces a
+    /// single-use `IsBitEqual`/`IsBitNotEqual` whose CBool output fed the CondBranch.
+    BitCmp(FusedCmpKind, InsnId, InsnId),
+    /// Branch on a type test: the checks that [`gen_has_type`] performs jump straight
+    /// to the CondBranch's targets instead of merging into a 0/1 the branch re-tests.
+    HasType(InsnId, Type),
 }
 
 /// Codegen plan that folds `FixnumLt`-style compares and `Test` instructions into the
@@ -488,14 +494,41 @@ fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> Br
         let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
         let Some(&branch_id) = insns.last() else { continue };
         let branch_id = function.find_id(branch_id);
-        let Insn::CondBranch { val, .. } = function.find(branch_id) else { continue };
+        // `Function::find` rather than `find_ref`: it resolves the instruction's operands
+        // through the union-find, which is what `use_count` above is keyed by and what
+        // `jit.get_opnd` needs at codegen. `find_ref` leaves them stale.
+        let Insn::CondBranch { val, if_false, .. } = function.find(branch_id) else { continue };
+        let in_this_block = |insn_id: InsnId| insns.iter().any(|&id| function.find_id(id) == insn_id);
+
+        // A CBool-producing instruction can drive the branch's flags directly instead of
+        // being materialized into 0/1 that the branch then re-tests. The same
+        // single-use/same-block rules as the Test case below apply.
+        //
+        // The type test's failure paths jump to the false target from more than one
+        // place, so only fuse it when that target takes no block arguments and the
+        // duplicated edges are plain jumps.
+        if use_count[val] == 1 && in_this_block(val) {
+            let fused_cbool = match function.find(val) {
+                Insn::IsBitEqual { left, right } => Some(FusedCond::BitCmp(FusedCmpKind::Eq, left, right)),
+                Insn::IsBitNotEqual { left, right } => Some(FusedCond::BitCmp(FusedCmpKind::Ne, left, right)),
+                Insn::HasType { val: tested, expected }
+                    if if_false.args.is_empty() && has_type_is_fusable(expected) =>
+                    Some(FusedCond::HasType(tested, expected)),
+                _ => None,
+            };
+            if let Some(fused) = fused_cbool {
+                fusion.elided[val] = true;
+                fusion.fused.insert(branch_id, fused);
+                continue;
+            }
+        }
+
         // The Test must be exclusively consumed by this CondBranch, and must live in the
         // same block so that its operands are still in scope at the branch. (The compare
         // may be separated from the branch by flag-clobbering code like CheckInterrupts,
         // which is why the flags test is re-emitted at the branch instead of reused.)
         let Insn::Test { val: cond } = function.find(val) else { continue };
         if use_count[val] != 1 { continue; }
-        let in_this_block = |insn_id: InsnId| insns.iter().any(|&id| function.find_id(id) == insn_id);
         if !in_this_block(val) { continue; }
         fusion.elided[val] = true;
 
@@ -624,8 +657,24 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                             args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
                         };
 
-                        let true_target = Target::Block(Box::new(true_branch));
+                        let true_target = Target::Block(Box::new(true_branch.clone()));
                         match fusion.fused.get(&function.find_id(insn_id)) {
+                            Some(&FusedCond::BitCmp(kind, left, right)) => {
+                                asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
+                                asm.push_insn(match kind {
+                                    FusedCmpKind::Eq => lir::Insn::Je(true_target),
+                                    _ => lir::Insn::Jne(true_target),
+                                });
+                            }
+                            Some(&FusedCond::HasType(tested, expected)) => {
+                                // The false target takes no block arguments (checked in
+                                // plan_branch_fusion), so every failing check can jump
+                                // straight at it as a plain jump.
+                                let false_target = || Target::Block(Box::new(false_branch.clone()));
+                                let val_type = function.type_of(tested);
+                                let tested = jit.get_opnd(tested);
+                                gen_has_type_branch(&mut jit, &mut asm, tested, val_type, expected, true_target, &false_target);
+                            }
                             Some(&FusedCond::Truthy(cond)) => {
                                 // Branch on truthiness like gen_test, without materializing 0/1.
                                 asm.test(jit.get_opnd(cond), Opnd::Imm(!Qnil.as_i64()));
@@ -4316,6 +4365,98 @@ fn gen_test(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
     // See RB_TEST(), include/ruby/internal/special_consts.h
     asm.test(val, Opnd::Imm(!Qnil.as_i64()));
     asm.csel_e(0.into(), 1.into())
+}
+
+/// Compile a type test straight into the branch that consumes it.
+///
+/// This is [`gen_has_type`] with the 0/1 result removed: instead of merging every check
+/// into a value that a following `test`/`jnz` picks apart again, each check jumps at the
+/// CondBranch's own targets. That drops a diamond, a block parameter and a redundant
+/// flags test from every type-dispatched call site, which is where the bulk of ZJIT's
+/// polymorphic sends start.
+///
+/// On return, control reaches `if_true` exactly when `val` has type `ty`. Every other
+/// path either jumped to `false_target()` already or falls out of the bottom, which the
+/// caller terminates with its own jump to the false edge.
+///
+/// `false_target` is a closure because failure can be detected at up to three points and
+/// each needs its own copy of the edge. Callers only fuse when that edge carries no block
+/// arguments, so the copies are plain jumps.
+fn gen_has_type_branch(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    val: lir::Opnd,
+    val_type: Type,
+    ty: Type,
+    if_true: Target,
+    false_target: &dyn Fn() -> Target,
+) {
+    // Immediate types: one compare, and failure is the fallthrough.
+    if ty.is_subtype(types::Fixnum) {
+        asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
+        asm.push_insn(lir::Insn::Jnz(if_true));
+        return;
+    } else if ty.is_subtype(types::Flonum) {
+        let masked = asm.and(val, Opnd::UImm(RUBY_FLONUM_MASK as u64));
+        asm.cmp(masked, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::StaticSymbol) {
+        // Static symbols have (val & 0xff) == RUBY_SYMBOL_FLAG; compare 8 bits like YJIT.
+        let val = asm.load_imm(val);
+        asm.cmp(val.with_num_bits(8), Opnd::UImm(RUBY_SYMBOL_FLAG as u64));
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::NilClass) {
+        asm.cmp(val, Qnil.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::TrueClass) {
+        asm.cmp(val, Qtrue.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::FalseClass) {
+        asm.cmp(val, Qfalse.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    }
+    assert!(!ty.is_immediate(), "unexpected immediate guard type: {ty}");
+
+    // Heap types: rule out immediates and Qfalse, then check the class or the T_ tag.
+    // If val isn't in a register, load it to use it as the base of Opnd::mem later.
+    let val = asm.load_mem(val);
+    if !val_type.is_subtype(types::HeapBasicObject) {
+        asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
+        asm.jnz(jit, false_target());
+        asm.cmp(val, Qfalse.into());
+        asm.je(jit, false_target());
+    }
+
+    if let Some(expected_class) = ty.runtime_exact_ruby_class() {
+        let klass = asm.load(Opnd::mem(64, val, RUBY_OFFSET_RBASIC_KLASS));
+        asm.cmp(klass, Opnd::Value(expected_class));
+    } else if let Some(builtin_type) = ty.builtin_type_equivalent() {
+        let flags = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS));
+        let tag = asm.and(flags, Opnd::UImm(RUBY_T_MASK as u64));
+        asm.cmp(tag, Opnd::UImm(builtin_type as u64));
+    } else {
+        unimplemented!("unsupported type: {ty}");
+    }
+    asm.push_insn(lir::Insn::Je(if_true));
+}
+
+/// Whether [`gen_has_type_branch`] knows how to compile a test for `ty`. Mirrors the
+/// arms of [`gen_has_type`]; anything else keeps the unfused codegen, which panics on
+/// the same set of types.
+fn has_type_is_fusable(ty: Type) -> bool {
+    ty.is_subtype(types::Fixnum)
+        || ty.is_subtype(types::Flonum)
+        || ty.is_subtype(types::StaticSymbol)
+        || ty.is_subtype(types::NilClass)
+        || ty.is_subtype(types::TrueClass)
+        || ty.is_subtype(types::FalseClass)
+        || (!ty.is_immediate()
+            && (ty.runtime_exact_ruby_class().is_some() || ty.builtin_type_equivalent().is_some()))
 }
 
 fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_type: Type, ty: Type) -> lir::Opnd {
