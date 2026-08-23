@@ -245,7 +245,9 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
 /// Samples an ivar site's fallback path has to see before it decides whether the shapes
 /// arriving there are worth a recompile. Small enough that a site which was frozen on the
 /// wrong shape recovers almost immediately, large enough that a brief detour through an
-/// unusual receiver does not spend a version.
+/// unusual receiver does not spend a version. Kept under `u8::MAX` so the per-instruction window
+/// counters fit in a byte each; [`ProfileEntry`] is allocated once per profiled instruction and
+/// its size is asserted on.
 const IVAR_REPROFILE_WINDOW: u32 = 64;
 
 /// Share of a window that the shapes a recompile would add an arm for must account for,
@@ -258,6 +260,18 @@ const IVAR_REPROFILE_WINDOW: u32 = 64;
 /// not a per-shape threshold -- a window split evenly between three missing shapes is a good
 /// bet, and a window with one missing shape in it is not.
 const IVAR_REPROFILE_MIN_SHARE_PERCENT: u32 = 50;
+
+/// Share of a window that has to be shapes the profile has no bucket left to hold before the
+/// cold buckets are dropped to make room. Set to the same share a recompile needs: a window this
+/// full of shapes nothing can record is one where the profile, not the dispatch, is what stands
+/// between the site and a specialization.
+const IVAR_EVICT_MIN_CROWDED_PERCENT: u32 = 50;
+
+/// How many times one site may drop its cold profile buckets. Each eviction is followed by a
+/// window that refills them from live traffic and, if the refill holds up, a recompile; two
+/// rounds are enough to converge, and more would let a site with a long shape tail trade versions
+/// for buckets indefinitely.
+const MAX_IVAR_PROFILE_EVICTIONS: u8 = 2;
 
 /// Result of [`IseqProfile::observe_ivar_fallback`].
 #[derive(PartialEq, Eq, Debug)]
@@ -308,25 +322,49 @@ impl IseqProfile {
             }
             match bucket {
                 StableBucket::Existing(index) | StableBucket::Inserted(index) => index >= dispatch_shapes as usize,
-                // No bucket left to record this shape in, so no recompile can specialize it.
-                // It argues against spending a version on this site, not for one.
-                StableBucket::Full => false,
+                // No bucket left to record this shape in, so no recompile can specialize it
+                // until one is freed below.
+                StableBucket::Full => {
+                    entry.ivar_fallback_crowded = entry.ivar_fallback_crowded.saturating_add(1);
+                    false
+                }
             }
         };
         entry.ivar_fallback_samples = entry.ivar_fallback_samples.saturating_add(1);
         if fixable {
             entry.ivar_fallback_fixable = entry.ivar_fallback_fixable.saturating_add(1);
         }
-        if entry.ivar_fallback_samples < IVAR_REPROFILE_WINDOW {
+        if u32::from(entry.ivar_fallback_samples) < IVAR_REPROFILE_WINDOW {
             return IvarReprofiled::Sampled;
         }
         entry.ivar_fallback_samples = 0;
-        let fixable = std::mem::take(&mut entry.ivar_fallback_fixable);
+        let fixable = u32::from(std::mem::take(&mut entry.ivar_fallback_fixable));
+        let crowded = u32::from(std::mem::take(&mut entry.ivar_fallback_crowded));
         if fixable * 100 >= IVAR_REPROFILE_WINDOW * IVAR_REPROFILE_MIN_SHARE_PERCENT {
             // The recompile rebuilds the dispatch from the whole profile, so start the next
             // window measuring against all of it.
             entry.ivar_dispatch_shapes = None;
             IvarReprofiled::Recompile
+        } else if crowded * 100 >= IVAR_REPROFILE_WINDOW * IVAR_EVICT_MIN_CROWDED_PERCENT
+            && entry.ivar_profile_evictions < MAX_IVAR_PROFILE_EVICTIONS
+            && Self::insn_profiles_self_shape(iseq, insn_idx)
+        {
+            // Most of this window was shapes with nowhere to go. The profile is a sample of the
+            // ISEQ's first executions, and on a long-lived process that is the least
+            // representative sample there is: on lobsters, ActiveRecord's `@attributes` read is
+            // compiled against eight boot-time shapes and then hands three steady-state shapes,
+            // none of them recordable, to the fallback 570K times.
+            //
+            // Drop everything but the most-observed bucket and let the next window refill the
+            // rest from live traffic. Keeping bucket 0 keeps the arm most likely to still be
+            // taking hits, so this gives up at most the arms the site is demonstrably not
+            // hitting -- it only runs at all once a window's worth of receivers has missed
+            // every one of them.
+            entry.ivar_profile_evictions += 1;
+            entry.opnd_types[0].retain_primary();
+            entry.ivar_dispatch_shapes = Some(1);
+            crate::stats::incr_counter!(ivar_profile_evicted_count);
+            IvarReprofiled::Sampled
         } else {
             // Most of what the fallback handles is something a recompile cannot take away: a
             // shape already in the dispatch (whose arm was dropped, or which is unspecializable),
@@ -335,6 +373,24 @@ impl IseqProfile {
             crate::stats::incr_counter!(ivar_respecialize_declined_count);
             IvarReprofiled::Declined
         }
+    }
+
+    /// Whether the instruction at `insn_idx` profiles `self` into `opnd_types[0]`, so that
+    /// distribution is a shape profile this fallback path may rewrite.
+    ///
+    /// `dispatch_ivar` also serves an inlined `attr_reader` whose shape guard could not exit, and
+    /// there the frame state names the *call site*, whose `opnd_types[0]` is the receiver
+    /// distribution the send specialization is built from: evicting buckets out of that would
+    /// change which method the call compiles to, not which shapes an ivar chain covers. A
+    /// `setinstancevariable` does profile `self`, but its arms have to survive
+    /// `prepare_optimized_setivar` as well as a shape match, so a refill is a worse bet there and
+    /// measurably lost ground on lobsters.
+    fn insn_profiles_self_shape(iseq: IseqPtr, insn_idx: YarvInsnIdx) -> bool {
+        let opcode = unsafe {
+            let pc = rb_iseq_pc_at_idx(iseq, insn_idx as u32);
+            rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(iseq, pc))
+        };
+        opcode as u32 == YARVINSN_getinstancevariable
     }
 }
 
@@ -661,9 +717,14 @@ pub struct ProfileEntry {
     profiles_remaining: NumProfiles,
     /// Receivers seen on this ivar site's fallback path in the current re-profiling window.
     /// See [`rb_zjit_ivar_reprofile`].
-    ivar_fallback_samples: u32,
+    ivar_fallback_samples: u8,
     /// How many of those a recompile would give an arm of its own.
-    ivar_fallback_fixable: u32,
+    ivar_fallback_fixable: u8,
+    /// How many of those named a shape the profile has no bucket left to record.
+    ivar_fallback_crowded: u8,
+    /// How many times this site has dropped its cold profile buckets to make room for the shapes
+    /// its fallback is seeing. Capped at [`MAX_IVAR_PROFILE_EVICTIONS`].
+    ivar_profile_evictions: u8,
     /// Number of shapes the dispatch now running was compiled from, i.e. how many buckets of
     /// `opnd_types[0]` it has arms for. `None` until the first sample after a compile.
     ivar_dispatch_shapes: Option<u8>,
@@ -721,6 +782,8 @@ impl IseqProfile {
                     profiles_remaining: get_option!(num_profiles),
                     ivar_fallback_samples: 0,
                     ivar_fallback_fixable: 0,
+                    ivar_fallback_crowded: 0,
+                    ivar_profile_evictions: 0,
                     ivar_dispatch_shapes: None,
                 });
                 &mut self.entries[i]
