@@ -756,6 +756,54 @@ impl Assembler {
             }
         }
 
+        /// Shrink `test reg/mem, imm` to the narrowest operand size that still covers
+        /// every set bit of the immediate.
+        ///
+        /// The bits above the immediate's width are masked off by the `and` that `test`
+        /// performs, so they cannot change the result: `test rdi, 7` and `test dil, 7`
+        /// agree on ZF. The narrow form saves up to three bytes -- no REX.W prefix and a
+        /// 1-byte immediate instead of a 4-byte one -- and ZJIT emits this exact shape
+        /// for the `RB_SPECIAL_CONST_P`/`FIXNUM_P` checks that head nearly every type
+        /// guard and polymorphic dispatch arm.
+        ///
+        /// Only ZF is preserved: SF and PF describe the truncated result, and OF/CF are
+        /// cleared either way. So the narrowing is applied only when the next instruction
+        /// to look at flags is one that reads ZF alone.
+        fn narrow_test_operands(left: Opnd, right: Opnd, rest: &[Insn]) -> (Opnd, Opnd) {
+            if !matches!(left, Opnd::Reg(_) | Opnd::Mem(_)) {
+                return (left, right);
+            }
+            // split_64bit_immediate() hands 32-bit-representable unsigned immediates over
+            // as signed ones, so accept both. A negative immediate has bits set above the
+            // narrow window and cannot be truncated.
+            let imm: u64 = match right {
+                Opnd::UImm(imm) => imm,
+                Opnd::Imm(imm) if imm >= 0 => imm as u64,
+                _ => return (left, right),
+            };
+            let needed_bits: u8 = if imm <= 0xff { 8 }
+                else if imm <= 0xffff { 16 }
+                else if imm <= 0xffff_ffff { 32 }
+                else { 64 };
+            if needed_bits >= left.rm_num_bits() {
+                return (left, right);
+            }
+            // Comments and position markers emit no code and leave flags alone; anything
+            // else is either the consumer or something that could observe the flags.
+            let next = rest.iter().find(|insn| !matches!(insn, Insn::Comment(_) | Insn::PosMarker(_)));
+            let zf_only = matches!(next, Some(
+                Insn::Je(_) | Insn::Jne(_) | Insn::Jz(_) | Insn::Jnz(_)
+                | Insn::CSelE { .. } | Insn::CSelNE { .. }
+                | Insn::CSelZ { .. } | Insn::CSelNZ { .. }
+            ));
+            if zf_only {
+                // UImm carries its own width, which is what test() encodes against.
+                (left.with_num_bits(needed_bits), Opnd::UImm(imm))
+            } else {
+                (left, right)
+            }
+        }
+
         fn emit_load_gc_value(cb: &mut CodeBlock, gc_offsets: &mut Vec<CodePtr>, dest_reg: X86Opnd, value: VALUE) {
             // Using movabs because mov might write value in 32 bits
             movabs(cb, dest_reg, value.0 as _);
@@ -984,6 +1032,7 @@ impl Assembler {
 
                 // Test and set flags
                 Insn::Test { left, right } => {
+                    let (left, right) = narrow_test_operands(*left, *right, &insns[insn_idx + 1..]);
                     test(cb, left.into(), right.into());
                 }
 
