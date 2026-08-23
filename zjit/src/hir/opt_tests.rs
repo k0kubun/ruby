@@ -5845,10 +5845,11 @@ mod hir_opt_tests {
           v25:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v7, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v26:StaticSymbol[:a] = Const Value(VALUE(0x1038))
           v27:HashExact = NewHash v26: v14
-          v29:BasicObject = SendDirect v25, 0x0, :foo (0x1040), v27
+          IncrCounter inline_iseq_optimized_send_count
+          v30:Fixnum[1] = Const Value(1)
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v29
+          Return v30
         ");
     }
 
@@ -16366,10 +16367,7 @@ mod hir_opt_tests {
           PatchPoint SingleRactorMode
           PatchPoint MethodRedefined(Object@0x1000, fancy@0x1008, cme:0x1010)
           v21:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
-          v22:ArrayExact = NewArray
-          v23:Fixnum[100] = Const Value(100)
-          v24:HashExact = NewHash
-          v26:BasicObject = SendDirect v21, 0x0, :fancy (0x1038), v11, v22, v23, v24
+          v26:NilClass = Const Value(nil)
           CheckInterrupts
           Return v26
         ");
@@ -16452,9 +16450,7 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :args@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:ArrayExact = GuardType v10, ArrayExact recompile
-          v24:CInt64 = ArrayLength v16
-          v25:CInt64[0] = GuardBitEquals v24, CInt64(0) recompile
+          v16:ArrayExact = ToArray v10
           v18:BasicObject = Send v9, :forwardable, v16 # SendFallbackReason: Complex argument passing
           CheckInterrupts
           Return v18
