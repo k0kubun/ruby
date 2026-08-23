@@ -126,6 +126,11 @@ unsafe extern "C" {
     // the destination starts past the end of the source string's bytes.
     pub fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
 
+    /// Map `size` bytes of read/write memory below `INT32_MAX`, or return NULL when
+    /// the platform cannot. Used for the JITFrame arena; see [`crate::jit_frame`].
+    /// Defined in jit.c.
+    pub fn rb_jit_reserve_low_addr_space(size: usize) -> *mut c_void;
+
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
 

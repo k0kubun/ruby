@@ -13161,3 +13161,211 @@ fn test_spill_elision_ensure_reads_locals_under_gc_stress() {
         out
     "#), @"[[2, 1, 1], [3, 1, 2], [4, 1, 3]]");
 }
+
+// --- JITFrame low-address arena -------------------------------------------------
+//
+// JITFrames are bump-allocated out of memory mapped below INT32_MAX so that the
+// store at each call site can encode the pointer as a 32-bit immediate. Nothing
+// about how a frame is *used* changed, but the frames now share pages with each
+// other instead of coming from the Rust heap, so these exercise the readers:
+// backtraces, GC marking of the frame's ISEQ, and materialization on unwind.
+
+// Kernel#caller walks the CFP chain and reads each JIT frame's pc/iseq through
+// CFP_ZJIT_FRAME. A frame allocated in the arena has to answer exactly as before.
+#[test]
+fn test_jit_frame_arena_caller_sees_every_frame() {
+    // Compare two chains that differ by exactly two frames rather than asserting an
+    // absolute depth, which depends on how the test harness evals the program.
+    assert_snapshot!(inspect(r#"
+        def depth = caller.length
+        def short = depth
+        def long1 = short
+        def long2 = long1
+        def test_short = short
+        def test_long = long2
+        5.times { test_short; test_long }
+        [test_long - test_short, test_short.positive?]
+    "#), @"[2, true]");
+}
+
+// Marking reaches a JITFrame's ISEQ through the root set, not by walking the
+// arena, so a GC in the middle of a deep JIT-to-JIT chain must keep every
+// frame's ISEQ alive. Compaction additionally rewrites the iseq field in place.
+#[test]
+fn test_jit_frame_arena_gc_stress_deep_chain() {
+    assert_snapshot!(inspect(r#"
+        def d0(n) = n * 2
+        def d1(n) = d0(n) + 1
+        def d2(n) = d1(n) + 1
+        def d3(n) = d2(n) + 1
+        def d4(n) = d3(n) + 1
+        def test(n) = d4(n)
+        5.times { |i| test(i) }
+        GC.stress = true
+        out = 5.times.map { |i| test(i) }
+        GC.stress = false
+        GC.compact
+        out << test(10)
+        out
+    "#), @"[4, 6, 8, 10, 12, 24]");
+}
+
+// Unwinding through JIT frames materializes each caller from its JITFrame before
+// the interpreter runs the handler, which reads the frame out of the arena.
+#[test]
+fn test_jit_frame_arena_raise_through_jit_frames() {
+    assert_snapshot!(inspect(r#"
+        def boom = raise(ArgumentError, "deep")
+        def m1 = boom
+        def m2 = m1
+        def m3 = m2
+        def test
+          m3
+        rescue ArgumentError => e
+          [e.message, e.backtrace.length > 3]
+        end
+        5.times { test }
+        GC.stress = true
+        out = test
+        GC.stress = false
+        out
+    "#), @r#"["deep", true]"#);
+}
+
+// --- HasType fused into the branch that consumes it -----------------------------
+//
+// A CondBranch on a HasType now jumps out of the type checks directly instead of
+// merging them into a 0/1 that the branch re-tests. These cover each arm of
+// gen_has_type_branch() and, importantly, the values that must take the *false*
+// path out of the heap-object arm: immediates and Qfalse, which are rejected
+// before the class field is ever loaded.
+
+// Every kind of receiver through one polymorphic call site. nil/false/true and
+// the immediates must not have their RBasic read.
+#[test]
+fn test_has_type_branch_polymorphic_receivers() {
+    assert_snapshot!(inspect(r#"
+        class Wrapped; def kind = :obj; end
+        def dispatch(o) = o.kind
+        class Integer; def kind = :int; end
+        class Symbol; def kind = :sym; end
+        class Float; def kind = :float; end
+        class NilClass; def kind = :nil; end
+        class FalseClass; def kind = :false; end
+        class TrueClass; def kind = :true; end
+        class String; def kind = :str; end
+        class Array; def kind = :ary; end
+        vals = [1, :s, 1.5, nil, false, true, "x", [1], Wrapped.new]
+        20.times { vals.each { |v| dispatch(v) } }
+        vals.map { |v| dispatch(v) }
+    "#), @"[:int, :sym, :float, :nil, :false, :true, :str, :ary, :obj]");
+}
+
+// A class-check arm whose receiver turns out to be an immediate or `false` must
+// take the false edge. This is the case the fused form rules out with the
+// `test`/`cmp` pair before touching RBASIC(val)->klass; getting it wrong reads a
+// class field out of a tagged integer.
+#[test]
+fn test_has_type_branch_rejects_immediates_and_false() {
+    assert_snapshot!(inspect(r#"
+        class Box; def val = 1; end
+        def dispatch(o) = o.val
+        class Integer; def val = 2; end
+        # Train the site on Box only, so Box is the single guarded class and every
+        # other receiver has to fall out of the class check.
+        b = Box.new
+        20.times { dispatch(b) }
+        [dispatch(b), dispatch(7), dispatch(-1)]
+    "#), @"[1, 2, 2]");
+}
+
+// The builtin-type arm (T_ tag rather than an exact class) with a subclass
+// receiver, plus the same immediate/false rejection.
+#[test]
+fn test_has_type_branch_builtin_type_arm() {
+    assert_snapshot!(inspect(r#"
+        class MyStr < String; end
+        def sizeof(o) = o.size
+        vals = ["abc", MyStr.new("wxyz"), [1, 2], {a: 1}]
+        20.times { vals.each { |v| sizeof(v) } }
+        vals.map { |v| sizeof(v) }
+    "#), @"[3, 4, 2, 1]");
+}
+
+// The fused branch keeps the tested value live across the checks; a guard that
+// fails on a later arm still has to be able to side-exit with correct state.
+#[test]
+fn test_has_type_branch_side_exit_state() {
+    assert_snapshot!(inspect(r#"
+        class A; def go(x) = x + 1; end
+        class B; def go(x) = x + 2; end
+        def test(o, x)
+          y = x * 10
+          z = o.go(x)
+          [y, z, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new, i) }
+        # C was never profiled: the call site falls out of every fused type check.
+        class C; def go(x) = x + 3; end
+        [test(A.new, 1), test(B.new, 1), test(C.new, 1)]
+    "#), @r#"[[10, 2, "A"], [10, 3, "B"], [10, 4, "C"]]"#);
+}
+
+// Fusing must not fire when the HasType result is used by something other than
+// the branch, or the second consumer would read a value that was never
+// materialized.
+#[test]
+fn test_has_type_branch_multi_use_not_fused() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = 1; end
+        class B; def go = 2; end
+        def test(o)
+          # `o.go` builds the fused type dispatch; storing the receiver keeps
+          # other values from the same block live past the branch.
+          r = o.go
+          [r, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        [test(A.new), test(B.new)]
+    "#), @r#"[[1, "A"], [2, "B"]]"#);
+}
+
+// Under GC stress with a moving collector, the guarded class VALUE baked into the
+// fused compare has to be updated like the unfused one was.
+#[test]
+fn test_has_type_branch_gc_compact() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = :a; end
+        class B; def go = :b; end
+        def test(o) = o.go
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        GC.compact
+        [test(A.new), test(B.new), test(A.new)]
+    "#), @"[:a, :b, :a]");
+}
+
+// --- Narrowed `test reg, imm` ---------------------------------------------------
+
+// `test rdi, 7` is emitted as `test dil, 7` when only ZF is read. The bits above
+// the immediate are masked off either way, so a receiver whose pointer has plenty
+// of high bits set must still be classified as a heap object, and an immediate
+// whose payload sets high bits must still be classified as one.
+#[test]
+fn test_narrowed_test_high_bits() {
+    assert_snapshot!(inspect(r#"
+        class Big; def go = :heap; end
+        class Integer; def go = :int; end
+        class Symbol; def go = :sym; end
+        class Float; def go = :float; end
+        class NilClass; def go = :nil; end
+        class FalseClass; def go = :false; end
+        class TrueClass; def go = :true; end
+        def test(o) = o.go
+        objs = 200.times.map { Big.new }
+        20.times { test(objs.sample); test(1); test(:s) }
+        # Large fixnums and negative ones set bits well above the tag byte; 1e300 is
+        # outside the flonum range, so it is a heap Float.
+        [test(objs.last), test(1 << 40), test(-(1 << 40)), test(0), test(:zz),
+         test(1.5), test(1.5e300), test(nil), test(false), test(true)]
+    "#), @"[:heap, :int, :int, :int, :sym, :float, :float, :nil, :false, :true]");
+}

@@ -191,7 +191,7 @@ pub fn memory_breakdown() -> MemoryBreakdown {
     let jit_frames = ZJITState::get_jit_frames();
     out.jit_frame_count = jit_frames.len();
     out.jit_frame_bytes = jit_frames.capacity() * size_of::<*mut crate::jit_frame::JITFrame>()
-        + jit_frames.iter().map(|&frame| unsafe { &*frame }.heap_size()).sum::<usize>();
+        + crate::jit_frame::allocated_bytes();
 
     // Side-exit metadata, one record per distinct exit.
     let exit_metas = ZJITState::get_exit_metas();
