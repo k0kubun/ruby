@@ -889,8 +889,6 @@ pub enum SendFallbackReason {
     /// The profiled block ISEQ takes optional, rest, post, keyword, or block parameters, so it
     /// cannot use the simple callee setup the direct dispatch relies on.
     InvokeBlockNotSimpleIseq,
-    /// The number of `yield`ed arguments does not match the block's parameter count.
-    InvokeBlockArityMismatch,
     /// A one-argument `yield` to a `|x,|` block, which auto-splats and then truncates.
     InvokeBlockAmbiguousParam0,
     /// The profiled block ISEQ contains a `throw` that is not a plain non-local `return`
@@ -983,7 +981,6 @@ impl Display for SendFallbackReason {
             InvokeBlockMegamorphicProfile => write!(f, "InvokeBlock: megamorphic block handler profile"),
             InvokeBlockChainCoverage => write!(f, "InvokeBlock: dispatchable ISEQs cover too little of the profile"),
             InvokeBlockNotSimpleIseq => write!(f, "InvokeBlock: block takes non-lead parameters"),
-            InvokeBlockArityMismatch => write!(f, "InvokeBlock: yield arity does not match the block"),
             InvokeBlockAmbiguousParam0 => write!(f, "InvokeBlock: |x,| block truncates an auto-splat"),
             InvokeBlockSymbolUnspecialized => write!(f, "InvokeBlock: symbol block handler's send did not specialize"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
