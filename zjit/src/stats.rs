@@ -542,6 +542,9 @@ make_counters! {
     inline_reject_compile_failure,
     inline_reject_no_returns,
     inline_reject_budget_exceeded,
+    // Callees inlined past the caller's cumulative budget because inlining them is what lets
+    // a `yield` inside them dispatch directly. See `MAX_YIELD_INLINE_BONUSES`.
+    inline_yield_bonus_count,
 
     getblockparamproxy_handler_iseq,
     getblockparamproxy_handler_ifunc,

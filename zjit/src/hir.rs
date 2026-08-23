@@ -2920,6 +2920,13 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// How many callees this function has inlined past its cumulative inlining budget because
+    /// doing so let a `yield` inside them dispatch directly. Capped at
+    /// [`MAX_YIELD_INLINE_BONUSES`].
+    yield_inline_bonuses: usize,
+    /// Whether the current [`Self::inline_methods`] pass found the function already past its
+    /// cumulative inlining budget. Only yield-unlocking callees are considered from then on.
+    inline_budget_exhausted: bool,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3473,6 +3480,22 @@ unsafe extern "C" {
 /// iterators this shape shows up with: the Ruby-level `Array#each` needs 45.
 const YIELD_INLINE_THRESHOLD_FACTOR: usize = 3;
 
+/// How many callees a compiled function may inline past its cumulative budget because doing so
+/// is what lets a `yield` inside them dispatch directly.
+///
+/// The size threshold above is not the binding constraint for these: `Array#each` and
+/// `Array#map` are called from all over a Rails request, and the methods that call them are
+/// big -- big enough that the caller's budget is spent before the iterator is reached. Every
+/// such site leaves its `yield` on `rb_vm_invokeblock()` for the life of the process, because
+/// the standalone `Array#each` sees hundreds of different blocks and no chain can cover them.
+///
+/// A flat multiple of the budget would be the obvious relaxation, but it scales with the
+/// caller's size, which is backwards: the callers that need this most are the ones already
+/// over budget, and the ones that would abuse it most are the ones with dozens of `.each`
+/// calls. A small fixed allowance instead bounds the extra growth to a few iterator bodies per
+/// function, no matter how big the function is.
+const MAX_YIELD_INLINE_BONUSES: usize = 3;
+
 /// True if the ISEQ contains an `invokeblock`, i.e. a `yield`.
 fn iseq_contains_invokeblock(iseq: IseqPtr) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
@@ -3687,6 +3710,8 @@ impl Function {
             profiles: None,
             ancestor_dispatch: HashMap::default(),
             num_instructions: 0,
+            yield_inline_bonuses: 0,
+            inline_budget_exhausted: false,
         }
     }
 
@@ -6296,19 +6321,11 @@ impl Function {
     }
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
-    /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t) -> bool {
+    /// function based on heuristics. `blockiseq` is the literal block the call site passes,
+    /// if any.
+    fn should_inline(&mut self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
-            return false;
-        }
-
-        // Per-caller cumulative budget. Once that count crosses the budget, every further callee
-        // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
-        // `Options::inline_budget` for the full unit/semantics caveat.
-        let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget {
-            incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
 
@@ -6332,13 +6349,41 @@ impl Function {
             }
         }
 
+        // An iterator gets a larger budget when inlining it is the only thing keeping the
+        // `yield` inside it off the direct block dispatch: leaving it out of line costs an
+        // `rb_vm_invokeblock()` per iteration, and an interpreted unwind per call on top of
+        // that when the block has a non-local `return`.
+        let unlocks_yield = self.inlining_unlocks_direct_yield(callee_iseq, blockiseq)
+            || self.inlining_unlocks_block_return(callee_iseq, blockiseq);
+
+        // Per-caller cumulative budget. Once that count crosses the budget, every further callee
+        // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
+        // `Options::inline_budget` for the full unit/semantics caveat.
+        let budget = get_option!(inline_budget);
+        let over_budget = self.inline_budget_exhausted
+            || (budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget);
+        let needs_bonus = over_budget && unlocks_yield;
+        if over_budget && (!unlocks_yield || self.yield_inline_bonuses == MAX_YIELD_INLINE_BONUSES) {
+            incr_counter!(inline_reject_budget_exceeded);
+            return false;
+        }
+
         // Check callee bytecode size against threshold.
+        let threshold = if unlocks_yield {
+            threshold.saturating_mul(YIELD_INLINE_THRESHOLD_FACTOR)
+        } else {
+            threshold
+        };
         let callee_size = unsafe { get_iseq_encoded_size(callee_iseq) } as usize;
         if callee_size > threshold {
             incr_counter!(inline_reject_too_large);
             return false;
         }
 
+        if needs_bonus {
+            self.yield_inline_bonuses += 1;
+            incr_counter!(inline_yield_bonus_count);
+        }
         true
     }
 
@@ -6352,8 +6397,12 @@ impl Function {
 
         // Fail fast if inlining is enabled but we've exhausted our inlining budget.
         // Otherwise, `can_inline` and `should_inline` will make local inlining decisions.
+        // A function this big only has yield-unlocking callees left to consider, and only
+        // while it still has bonuses for them. `should_inline` rejects everything else, so
+        // once the bonuses are gone there is nothing to find and the scan is wasted work.
         let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.insns.len() > budget {
+        self.inline_budget_exhausted = budget != INLINE_BUDGET_UNLIMITED && self.insns.len() > budget;
+        if self.inline_budget_exhausted && self.yield_inline_bonuses == MAX_YIELD_INLINE_BONUSES {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -6414,7 +6463,7 @@ impl Function {
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
-                if !self.should_inline(iseq, cme) || !Self::can_inline(iseq) {
+                if !self.should_inline(iseq, cme, blockiseq) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
