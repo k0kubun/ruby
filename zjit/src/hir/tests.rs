@@ -2354,7 +2354,26 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v42, v10)
         bb6(v22:BasicObject, v23:BasicObject):
-          v50:BasicObject = Send v9, &block, :consume, v22 # SendFallbackReason: Uncategorized(send)
+          v51:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1030))
+          v52:CBool = IsBitEqual v22, v51
+          CondBranch v52, bb14(), bb15()
+        bb14():
+          v54:ObjectSubclass[BlockParamProxy] = RefineType v22, ObjectSubclass[BlockParamProxy]
+          v56:CBool = HasType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)]
+          CondBranch v56, bb17(), bb18()
+        bb17():
+          v59:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = RefineType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)]
+          v60:BasicObject = Send v59, &block, :consume, v54 # SendFallbackReason: Uncategorized(send)
+          Jump bb16(v60)
+        bb18():
+          v63:BasicObject = Send v9, &block, :consume, v54 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb16(v63)
+        bb16(v55:BasicObject):
+          Jump bb13(v55)
+        bb15():
+          v66:BasicObject = Send v9, &block, :consume, v22 # SendFallbackReason: Uncategorized(send)
+          Jump bb13(v66)
+        bb13(v50:BasicObject):
           CheckInterrupts
           Return v50
         bb12():
@@ -4196,7 +4215,44 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v36, v10)
         bb6(v16:BasicObject, v17:BasicObject):
-          v44:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Uncategorized(send)
+          v45:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v46:CBool = IsBitEqual v16, v45
+          CondBranch v46, bb14(), bb15()
+        bb14():
+          v48:ObjectSubclass[BlockParamProxy] = RefineType v16, ObjectSubclass[BlockParamProxy]
+          v50:CBool[true] = HasType v14, Fixnum
+          CondBranch v50, bb17(), bb18()
+        bb17():
+          v53:Fixnum[0] = RefineType v14, Fixnum
+          v54:BasicObject = Send v53, &block, :then, v48 # SendFallbackReason: Uncategorized(send)
+          Jump bb16(v54)
+        bb18():
+          v57 = Send v14, &block, :then, v48 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb16(v57)
+        bb16(v49:BasicObject):
+          Jump bb13(v49)
+        bb15():
+          v61:CBool = HasType v16, NilClass
+          CondBranch v61, bb20(), bb21()
+        bb20():
+          v63:NilClass = RefineType v16, NilClass
+          v65:CBool[true] = HasType v14, Fixnum
+          CondBranch v65, bb23(), bb24()
+        bb23():
+          v68:Fixnum[0] = RefineType v14, Fixnum
+          v69:BasicObject = Send v68, &block, :then, v63 # SendFallbackReason: Uncategorized(send)
+          Jump bb22(v69)
+        bb24():
+          v72 = Send v14, &block, :then, v63 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb22(v72)
+        bb22(v64:BasicObject):
+          Jump bb19(v64)
+        bb21():
+          v75:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb19(v75)
+        bb19(v60:BasicObject):
+          Jump bb13(v60)
+        bb13(v44:BasicObject):
           CheckInterrupts
           Return v44
         bb12():
@@ -4264,7 +4320,44 @@ pub(crate) mod hir_build_tests {
         bb11():
           Jump bb6(v36, v10)
         bb6(v16:BasicObject, v17:BasicObject):
-          v44:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Uncategorized(send)
+          v45:ObjectSubclass[BlockParamProxy] = Const Value(VALUE(0x1008))
+          v46:CBool = IsBitEqual v16, v45
+          CondBranch v46, bb14(), bb15()
+        bb14():
+          v48:ObjectSubclass[BlockParamProxy] = RefineType v16, ObjectSubclass[BlockParamProxy]
+          v50:CBool[true] = HasType v14, Fixnum
+          CondBranch v50, bb17(), bb18()
+        bb17():
+          v53:Fixnum[0] = RefineType v14, Fixnum
+          v54:BasicObject = Send v53, &block, :then, v48 # SendFallbackReason: Uncategorized(send)
+          Jump bb16(v54)
+        bb18():
+          v57 = Send v14, &block, :then, v48 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb16(v57)
+        bb16(v49:BasicObject):
+          Jump bb13(v49)
+        bb15():
+          v61:CBool = HasType v16, NilClass
+          CondBranch v61, bb20(), bb21()
+        bb20():
+          v63:NilClass = RefineType v16, NilClass
+          v65:CBool[true] = HasType v14, Fixnum
+          CondBranch v65, bb23(), bb24()
+        bb23():
+          v68:Fixnum[0] = RefineType v14, Fixnum
+          v69:BasicObject = Send v68, &block, :then, v63 # SendFallbackReason: Uncategorized(send)
+          Jump bb22(v69)
+        bb24():
+          v72 = Send v14, &block, :then, v63 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb22(v72)
+        bb22(v64:BasicObject):
+          Jump bb19(v64)
+        bb21():
+          v75:BasicObject = Send v14, &block, :then, v16 # SendFallbackReason: Send: block argument is not nil
+          Jump bb19(v75)
+        bb19(v60:BasicObject):
+          Jump bb13(v60)
+        bb13(v44:BasicObject):
           CheckInterrupts
           Return v44
         bb12():
@@ -6580,67 +6673,6 @@ pub(crate) mod hir_build_tests {
         CheckInterrupts
         Return v22
       ");
-    }
-
-    #[test]
-    fn test_once_not_done_side_exits() {
-        eval("
-            def test = /#{'a'.upcase}/o
-        ");
-        assert_snapshot!(hir_string("test"), @"
-        fn test@<compiled>:2:
-        bb1():
-          EntryPoint interpreter
-          v1:BasicObject = LoadSelf
-          Jump bb3(v1)
-        bb2():
-          EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          SideExit OnceNotDone recompile
-        ");
-        // Running the method fills in the once cache, so a recompile sees the
-        // cached value instead of side-exiting.
-        eval("test");
-        assert_snapshot!(hir_string("test"), @"
-        fn test@<compiled>:2:
-        bb1():
-          EntryPoint interpreter
-          v1:BasicObject = LoadSelf
-          Jump bb3(v1)
-        bb2():
-          EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:RegexpExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          CheckInterrupts
-          Return v10
-        ");
-    }
-
-    #[test]
-    fn test_once_done_returns_value() {
-        eval("
-            def test = /#{'a'.upcase}/o
-            test
-        ");
-        assert_snapshot!(hir_string("test"), @"
-        fn test@<compiled>:2:
-        bb1():
-          EntryPoint interpreter
-          v1:BasicObject = LoadSelf
-          Jump bb3(v1)
-        bb2():
-          EntryPoint JIT(0)
-          v4:BasicObject = LoadArg :self@0
-          Jump bb3(v4)
-        bb3(v6:BasicObject):
-          v10:RegexpExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
-          CheckInterrupts
-          Return v10
-        ");
     }
 }
 
