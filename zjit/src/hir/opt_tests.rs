@@ -17220,6 +17220,40 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn call_method_forwardable_param_with_block_arg() {
+        // A `&blk` call site keeps a forwardable callee on the interpreter's argument setup:
+        // `vm_caller_setup_arg_block` pops the block argument before the callee frame is grown
+        // by `vm_ci_argc(ci)`, so the callinfo stored in the `...` local would misdescribe the
+        // arguments we copied. The block-arg passthrough does not override that.
+        eval("
+           def target(a) = a
+           def forwardable(...) = target(...)
+           def call_forwardable(blk) = forwardable(1, &blk)
+           call_forwardable(proc {})
+        ");
+        assert_snapshot!(hir_string("call_forwardable"), @"
+        fn call_forwardable@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :blk@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :blk@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Fixnum[1] = Const Value(1)
+          v24:ObjectSubclass[class_exact:Proc] = GuardType v10, ObjectSubclass[class_exact:Proc] recompile
+          v18:BasicObject = Send v9, &block, :forwardable, v15, v24 # SendFallbackReason: Complex argument passing
+          CheckInterrupts
+          Return v18
+        ");
+    }
+
+    #[test]
     fn call_method_forwardable_param_with_splat() {
         eval("
            def forwardable(...) = itself(...)

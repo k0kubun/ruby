@@ -501,6 +501,25 @@ fn test_forwardable_callee_literal_block() {
 }
 
 #[test]
+fn test_forwardable_callee_block_arg_call_site_stays_dynamic() {
+    // `vm_caller_setup_arg_block` pops a `&blk` argument off the stack before the forwardable
+    // callee's frame is grown by `vm_ci_argc(ci)`, so the callinfo we would store in the `...`
+    // local counts an argument that is no longer there. `can_direct_send_forwardable` lists
+    // `VM_CALL_ARGS_BLOCKARG` in `FORWARDABLE_CALLEE_BLOCKERS` and declines the call site --
+    // including when `&blk` holds a plain Proc, which would otherwise be handed straight to the
+    // callee as its block handler by the block-arg passthrough.
+    assert_snapshot!(inspect("
+        def target(x) = [x, block_given? ? yield(x) : nil]
+        def fwd(...) = target(...)
+        def entry(x, p) = fwd(x, &p)
+        doubler = ->(v) { v * 2 }
+        out = nil
+        200.times { |i| out = entry(i, doubler) }
+        [out, entry(5, nil)]
+    "), @"[[199, 398], [5, nil]]");
+}
+
+#[test]
 fn test_forwardable_callee_splat_call_site_stays_dynamic() {
     assert_snapshot!(inspect("
         def target(*a, **k) = [a, k]
