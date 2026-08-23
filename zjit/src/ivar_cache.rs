@@ -167,10 +167,18 @@ pub enum EntryKind {
     /// Reads take it (like the shape-specialized path in
     /// [`crate::hir::Function::load_ivar`]); writes do not.
     Extended = 2,
-    /// Complex (hash-backed) shapes, classes and modules, immediates, and
-    /// anything else this module declines to model. Serve with `rb_ivar_get`,
+    /// A class or module. Its fields live behind a writable-fields indirection
+    /// that depends on the current namespace, so the location is an *index* into
+    /// the fields object rather than a byte offset off the receiver, and reads go
+    /// through `rb_ivar_get_at_no_ractor_check` -- the same helper the
+    /// shape-specialized path uses (see
+    /// [`crate::hir::Function::load_ivar_c_call`]) -- rather than being loaded
+    /// here. Writes do not take it.
+    RClass = 3,
+    /// Complex (hash-backed) shapes, immediates, `T_STRUCT`, generic-ivar objects,
+    /// and anything else this module declines to model. Serve with `rb_ivar_get`,
     /// but remember the decision so we do not re-derive it.
-    Uncacheable = 3,
+    Uncacheable = 4,
 }
 
 /// One decoded table entry.
@@ -194,6 +202,7 @@ impl Entry {
             0 => EntryKind::Direct,
             1 => EntryKind::Nil,
             2 => EntryKind::Extended,
+            3 => EntryKind::RClass,
             _ => EntryKind::Uncacheable,
         };
         Entry {
@@ -296,14 +305,17 @@ fn resolve(shape_id: u32, id: ID) -> Entry {
         return uncacheable;
     }
 
-    // Classes and modules keep going through `rb_ivar_get`: their fields live
-    // behind a ractor-aware writable-fields indirection, and skipping it would
-    // drop the RactorIsolationError they are supposed to raise. So do
-    // T_STRUCT/geniv objects, which are not worth another kind.
+    // T_STRUCT and generic-ivar objects are not worth another kind. Classes and
+    // modules are: on a Rails workload they are most of what reaches this helper
+    // at all -- reading `@abstract_class`, `@primary_key` and friends off model
+    // classes accounted for 761K of the 800K calls to it on lobsters -- and
+    // caching their index turns each of those from a shape-tree lookup into an
+    // indexed load.
     let kind = match ShapeId(shape_id).layout() {
         ShapeLayout::RObject => EntryKind::Direct,
         ShapeLayout::Extended => EntryKind::Extended,
-        ShapeLayout::RClass | ShapeLayout::Other => return uncacheable,
+        ShapeLayout::RClass => EntryKind::RClass,
+        ShapeLayout::Other => return uncacheable,
     };
 
     // Plain rb_shape_get_iv_index, not rb_shape_get_iv_index_with_hint. The
@@ -383,7 +395,16 @@ pub extern "C" fn rb_zjit_getivar_cached(recv: VALUE, cache: *const IvarCache) -
     match entry.kind {
         EntryKind::Direct | EntryKind::Extended => unsafe { load_entry(recv, entry) },
         EntryKind::Nil => Qnil,
-        EntryKind::Uncacheable => {
+        // `rb_ivar_get_at_no_ractor_check` skips the `RactorIsolationError` that reading a
+        // class's unshareable ivar raises off the main ractor. That check can only fire once a
+        // second ractor exists, so testing for one is exactly as strict as `rb_ivar_get` -- and
+        // strictly stricter than the shape-specialized path, which reads the fields object
+        // inline under nothing but the `SingleRactorMode` patch point.
+        EntryKind::RClass if !unsafe { rb_jit_multi_ractor_p() } => {
+            let index = (entry.offset as usize - ROBJECT_OFFSET_AS_ARY as usize) / SIZEOF_VALUE;
+            unsafe { rb_ivar_get_at_no_ractor_check(recv, index as attr_index_t) }
+        }
+        EntryKind::RClass | EntryKind::Uncacheable => {
             count(Counter::getivar_cache_uncacheable);
             unsafe { rb_ivar_get(recv, id) }
         }
@@ -449,9 +470,11 @@ pub extern "C" fn rb_zjit_setivar_cached(recv: VALUE, val: VALUE, cache: *const 
         // Nil means the shape does not have this ivar yet, so the write is a
         // shape transition and possibly a reallocation. Extended means the
         // fields live in a separate object which may be a T_DATA needing
-        // `rb_ivar_set`'s type dispatch. Neither is worth modelling here: both
-        // are far off the hot path this table exists for.
-        EntryKind::Nil | EntryKind::Extended | EntryKind::Uncacheable => {
+        // `rb_ivar_set`'s type dispatch, and RClass a writable-fields
+        // indirection that copies on write in a non-root namespace. None is
+        // worth modelling here: all are far off the hot path this table exists
+        // for.
+        EntryKind::Nil | EntryKind::Extended | EntryKind::RClass | EntryKind::Uncacheable => {
             count(Counter::setivar_cache_transition);
             unsafe { rb_ivar_set(recv, id, val); }
         }
