@@ -192,6 +192,30 @@ impl BasicBlock {
         }
     }
 
+    /// Like [`Self::edges`], but borrows the edges instead of cloning them. `edges()`
+    /// clones each `BranchEdge`, including its argument vector, which shows up as real
+    /// allocator traffic in passes that only want to read the arguments.
+    pub fn edge_refs(&self) -> impl DoubleEndedIterator<Item = &BranchEdge> + '_ {
+        // Stub blocks (from new_block_without_id) have no real CFG structure.
+        if self.rpo_index == DUMMY_RPO_INDEX {
+            return None.into_iter().chain(None.into_iter());
+        }
+        assert!(self.insns.last().unwrap().is_terminator());
+        fn extract_edge(insn: &Insn) -> Option<&BranchEdge> {
+            match insn.target() {
+                Some(Target::Block(edge)) => Some(&**edge),
+                _ => None,
+            }
+        }
+
+        let (edge1, edge2) = match self.insns.as_slice() {
+            [] => panic!("empty block"),
+            [.., second_last, last] => (extract_edge(second_last), extract_edge(last)),
+            [.., last] => (extract_edge(last), None),
+        };
+        edge1.into_iter().chain(edge2.into_iter())
+    }
+
     pub fn successors(&self) -> impl DoubleEndedIterator<Item = BlockId> + '_ {
         // Stub blocks (from new_block_without_id) have no real CFG structure.
         if self.rpo_index == DUMMY_RPO_INDEX {
@@ -2797,19 +2821,15 @@ impl Assembler
         }
         let mut parent: Vec<usize> = (0..self.num_vregs).collect();
 
-        // Every block's incoming edges, for the checks below.
+        // Union every (branch argument, block parameter) pair. The edges are read in
+        // place: `BasicBlock::edges()` clones the argument vectors, and nothing here needs
+        // an owned copy.
         let block_order = self.block_order();
-        let mut incoming: HashMap<BlockId, Vec<BranchEdge>> = HashMap::default();
+        let mut num_params = 0;
         for &block_id in &block_order {
-            let EdgePair(edge1, edge2) = self.basic_blocks[block_id.0].edges();
-            for edge in [edge1, edge2].into_iter().flatten() {
-                incoming.entry(edge.target).or_default().push(edge);
-            }
-        }
-
-        // Union every (branch argument, block parameter) pair.
-        for edges in incoming.values() {
-            for edge in edges {
+            let block = &self.basic_blocks[block_id.0];
+            num_params += block.parameters.len();
+            for edge in block.edge_refs() {
                 let params = &self.basic_blocks[edge.target.0].parameters;
                 for (arg, param) in edge.args.iter().zip(params.iter()) {
                     if let (Opnd::VReg { idx: arg_idx, .. }, Opnd::VReg { idx: param_idx, .. }) = (arg, param) {
@@ -2819,6 +2839,12 @@ impl Assembler
                     }
                 }
             }
+        }
+
+        // Nothing to coalesce without block parameters, which is the common case for the
+        // straight-line ISEQs that make up most of a program.
+        if num_params == 0 {
+            return (0..self.num_vregs).collect();
         }
 
         // Group into webs, keeping only the ones with something to coalesce.
@@ -2839,48 +2865,76 @@ impl Assembler
         }
         webs.retain(|_, members| members.len() > 1);
 
-        // Every block's parameter VRegs, and the set of all of them.
-        let block_params: Vec<(BlockId, Vec<usize>)> = block_order.iter()
-            .map(|&block_id| {
-                let params = self.basic_blocks[block_id.0].parameters.iter()
-                    .filter_map(|param| match param {
-                        Opnd::VReg { idx, .. } => Some(idx.to_usize()),
-                        _ => None,
-                    })
-                    .collect();
-                (block_id, params)
-            })
-            .collect();
-        let param_vregs: HashSet<usize> = block_params.iter()
-            .flat_map(|(_, params)| params.iter().copied())
-            .collect();
+        // Which VRegs are block parameters, and which web each VReg belongs to. `web_of`
+        // is the inverse of `webs`, so a block's live-in set can be turned into web hits
+        // directly instead of asking every web about every block.
+        let mut is_param_vreg = BitSet::with_capacity(self.num_vregs);
+        for &block_id in &block_order {
+            for param in self.basic_blocks[block_id.0].parameters.iter() {
+                if let Opnd::VReg { idx, .. } = param {
+                    is_param_vreg.insert(idx.to_usize());
+                }
+            }
+        }
+        let mut web_of: Vec<Option<usize>> = vec![None; self.num_vregs];
+        for (&web_root, members) in webs.iter() {
+            for &member in members {
+                web_of[member] = Some(web_root);
+            }
+        }
+
+        // A web is rejected when two of its members are live at the same block entry: a
+        // block's parameters are all written at once by the parallel copy on each incoming
+        // edge, so two members that are parameters of the same block hold two different
+        // values there -- that is the loop-carried swap -- and a member that is merely live
+        // into the block would have its value clobbered by the parameter write.
+        //
+        // Counting per block instead of per (web, block) pair keeps this proportional to
+        // the liveness information itself rather than to webs x blocks, which is what made
+        // it quadratic in ISEQ size. `hits` is stamped with the block's index so it never
+        // has to be cleared.
+        let mut rejected: HashSet<usize> = HashSet::default();
+        let mut hit_stamp: Vec<usize> = vec![usize::MAX; self.num_vregs];
+        let mut hit_count: Vec<u32> = vec![0; self.num_vregs];
+        for (stamp, &block_id) in block_order.iter().enumerate() {
+            let mut bump = |web_root: usize, rejected: &mut HashSet<usize>| {
+                if hit_stamp[web_root] != stamp {
+                    hit_stamp[web_root] = stamp;
+                    hit_count[web_root] = 1;
+                } else {
+                    hit_count[web_root] += 1;
+                    if hit_count[web_root] > 1 {
+                        rejected.insert(web_root);
+                    }
+                }
+            };
+            for member in live_in[block_id.0].iter_set_bits() {
+                if let Some(web_root) = web_of[member] {
+                    bump(web_root, &mut rejected);
+                }
+            }
+            for param in self.basic_blocks[block_id.0].parameters.iter() {
+                if let Opnd::VReg { idx, .. } = param {
+                    if let Some(web_root) = web_of[idx.to_usize()] {
+                        bump(web_root, &mut rejected);
+                    }
+                }
+            }
+        }
 
         let mut roots: Vec<usize> = (0..self.num_vregs).collect();
-        'web: for members in webs.values() {
+        'web: for (&web_root, members) in webs.iter() {
+            if rejected.contains(&web_root) {
+                continue;
+            }
             // Own the web with a member that has a range, not necessarily the union-find
             // root, which may have been filtered out above.
             let root = members[0];
-            let member_set: HashSet<usize> = members.iter().copied().collect();
-
-            // At most one member may be live at any block's entry. A block's parameters
-            // are all written at once by the parallel copy on each incoming edge, so two
-            // members that are parameters of the same block hold two different values
-            // there -- that is the loop-carried swap. A member that is merely live into
-            // the block would have its value clobbered by the parameter write.
-            for (block_id, params) in &block_params {
-                let live_at_entry = members.iter()
-                    .filter(|&&member| live_in[block_id.0].get(member))
-                    .count()
-                    + params.iter().filter(|param| member_set.contains(param)).count();
-                if live_at_entry > 1 {
-                    continue 'web;
-                }
-            }
 
             // A member defined by a regular instruction writes a value from outside the
             // web into the shared location, so no other member may be live across it.
             for &member in members {
-                if param_vregs.contains(&member) {
+                if is_param_vreg.get(member) {
                     continue;
                 }
                 let def = intervals[member].start();
