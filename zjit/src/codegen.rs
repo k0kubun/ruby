@@ -5,6 +5,7 @@
 mod gc_fastpath;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
@@ -409,6 +410,125 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
     Ok(iseq_code_ptrs)
 }
 
+/// Comparison kind of a fixnum compare instruction folded into a CondBranch.
+#[derive(Clone, Copy)]
+enum FusedCmpKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// How to emit a CondBranch whose condition computation is folded into the branch.
+#[derive(Clone, Copy)]
+enum FusedCond {
+    /// Branch on the truthiness of a Ruby VALUE: `test val, !Qnil; jnz`.
+    /// Replaces a single-use `Test` whose CBool output fed the CondBranch.
+    Truthy(InsnId),
+    /// Branch on a fixnum comparison: `cmp left, right; jcc`. Comparing the boxed
+    /// operands preserves the fixnum order because tagging is monotonic.
+    /// Replaces a single-use fixnum compare feeding a single-use `Test`.
+    Cmp(FusedCmpKind, InsnId, InsnId),
+    /// Branch on a raw pointer comparison: `cmp left, right; je/jne`. Replaces a
+    /// single-use `IsBitEqual`/`IsBitNotEqual` whose CBool output fed the CondBranch.
+    BitCmp(FusedCmpKind, InsnId, InsnId),
+    /// Branch on a type test: the checks that [`gen_has_type`] performs jump straight
+    /// to the CondBranch's targets instead of merging into a 0/1 the branch re-tests.
+    HasType(InsnId, Type),
+}
+
+/// Codegen plan that folds `FixnumLt`-style compares and `Test` instructions into the
+/// CondBranch that consumes them, so their results are branched on directly from CPU
+/// flags instead of being materialized into Qtrue/Qfalse and then 0/1.
+struct BranchFusion {
+    /// Instructions whose only consumer is a fused CondBranch; their codegen is skipped.
+    /// Indexed by resolved InsnId.
+    elided: Vec<bool>,
+    /// CondBranch (by resolved InsnId) -> how to emit its condition.
+    fused: HashMap<InsnId, FusedCond>,
+}
+
+/// Decide which Test/compare instructions can be folded into the CondBranch that uses
+/// them. A candidate must be in the same block as the CondBranch and have exactly one
+/// use, counting side-exit snapshots: a value captured by a snapshot must stay
+/// materialized for the interpreter, so it cannot be elided.
+fn plan_branch_fusion(function: &Function, reverse_post_order: &[BlockId]) -> BranchFusion {
+    let mut use_count = vec![0u32; function.num_insns()];
+    for &block_id in reverse_post_order {
+        for &insn_id in function.block(block_id).insns() {
+            function.find(insn_id).for_each_operand(|operand| {
+                use_count[operand.to_usize()] += 1;
+            });
+        }
+    }
+
+    let mut fusion = BranchFusion { elided: vec![false; function.num_insns()], fused: HashMap::new() };
+    for &block_id in reverse_post_order {
+        let insns: Vec<InsnId> = function.block(block_id).insns().copied().collect();
+        let Some(&branch_id) = insns.last() else { continue };
+        let branch_id = function.find_id(branch_id);
+        // `Function::find` rather than `find_ref`: it resolves the instruction's operands
+        // through the union-find, which is what `use_count` above is keyed by and what
+        // `jit.get_opnd` needs at codegen. `find_ref` leaves them stale.
+        let Insn::CondBranch { val, if_false, .. } = function.find(branch_id) else { continue };
+        let in_this_block = |insn_id: InsnId| insns.iter().any(|&id| function.find_id(id) == insn_id);
+
+        // A CBool-producing instruction can drive the branch's flags directly instead of
+        // being materialized into 0/1 that the branch then re-tests. The same
+        // single-use/same-block rules as the Test case below apply.
+        //
+        // The type test's failure paths jump to the false target from more than one
+        // place, so only fuse it when that target takes no block arguments and the
+        // duplicated edges are plain jumps.
+        if use_count[val.to_usize()] == 1 && in_this_block(val) {
+            let fused_cbool = match function.find(val) {
+                Insn::IsBitEqual { left, right } => Some(FusedCond::BitCmp(FusedCmpKind::Eq, left, right)),
+                Insn::IsBitNotEqual { left, right } => Some(FusedCond::BitCmp(FusedCmpKind::Ne, left, right)),
+                Insn::HasType { val: tested, expected }
+                    if if_false.args.is_empty() && has_type_is_fusable(expected) =>
+                    Some(FusedCond::HasType(tested, expected)),
+                _ => None,
+            };
+            if let Some(fused) = fused_cbool {
+                fusion.elided[val.to_usize()] = true;
+                fusion.fused.insert(branch_id, fused);
+                continue;
+            }
+        }
+
+        // The Test must be exclusively consumed by this CondBranch, and must live in the
+        // same block so that its operands are still in scope at the branch. (The compare
+        // may be separated from the branch by flag-clobbering code like CheckInterrupts,
+        // which is why the flags test is re-emitted at the branch instead of reused.)
+        let Insn::Test { val: cond } = function.find(val) else { continue };
+        if use_count[val.to_usize()] != 1 { continue; }
+        if !in_this_block(val) { continue; }
+        fusion.elided[val.to_usize()] = true;
+
+        let fused_cmp = match function.find(cond) {
+            Insn::FixnumLt  { left, right } => Some((FusedCmpKind::Lt, left, right)),
+            Insn::FixnumLe  { left, right } => Some((FusedCmpKind::Le, left, right)),
+            Insn::FixnumGt  { left, right } => Some((FusedCmpKind::Gt, left, right)),
+            Insn::FixnumGe  { left, right } => Some((FusedCmpKind::Ge, left, right)),
+            Insn::FixnumEq  { left, right } => Some((FusedCmpKind::Eq, left, right)),
+            Insn::FixnumNeq { left, right } => Some((FusedCmpKind::Ne, left, right)),
+            _ => None,
+        };
+        match fused_cmp {
+            Some((kind, left, right)) if use_count[cond.to_usize()] == 1 && in_this_block(cond) => {
+                fusion.elided[cond.to_usize()] = true;
+                fusion.fused.insert(branch_id, FusedCond::Cmp(kind, left, right));
+            }
+            _ => {
+                fusion.fused.insert(branch_id, FusedCond::Truthy(cond));
+            }
+        }
+    }
+    fusion
+}
+
 /// Compile a function
 fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     let (mut jit, asm) = trace_compile_phase("codegen", || {
@@ -432,6 +552,9 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         let mut hir_to_lir: Vec<Option<lir::BlockId>> = vec![None; function.num_blocks()];
 
         let reverse_post_order = function.reverse_post_order();
+
+        // Fold single-use Test/compare instructions into the CondBranch that consumes them.
+        let fusion = plan_branch_fusion(function, &reverse_post_order);
 
         // Create all LIR basic blocks corresponding to HIR basic blocks
         for (rpo_idx, &block_id) in reverse_post_order.iter().enumerate() {
@@ -487,12 +610,15 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
             // Compile all instructions
             for (insn_idx, &insn_id) in block.insns().enumerate() {
+                // Skip instructions that a fused CondBranch emits as part of its branch.
+                if fusion.elided[function.find_id(insn_id).to_usize()] {
+                    continue;
+                }
                 let insn = function.find(insn_id);
                 let perf_symbol = hir_perf_symbol_range_start(&mut asm, &insn);
 
                 let result = match &insn {
                     Insn::CondBranch { val, if_true, if_false } => {
-                        let val_opnd = jit.get_opnd(*val);
                         let true_target = hir_to_lir[if_true.target.to_usize()].unwrap();
                         let false_target = hir_to_lir[if_false.target.to_usize()].unwrap();
 
@@ -506,8 +632,48 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                             args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
                         };
 
-                        asm.test(val_opnd, val_opnd);
-                        asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(true_branch))));
+                        let true_target = Target::Block(Box::new(true_branch.clone()));
+                        match fusion.fused.get(&function.find_id(insn_id)) {
+                            Some(&FusedCond::BitCmp(kind, left, right)) => {
+                                asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
+                                asm.push_insn(match kind {
+                                    FusedCmpKind::Eq => lir::Insn::Je(true_target),
+                                    _ => lir::Insn::Jne(true_target),
+                                });
+                            }
+                            Some(&FusedCond::HasType(tested, expected)) => {
+                                // The false target takes no block arguments (checked in
+                                // plan_branch_fusion), so every failing check can jump
+                                // straight at it as a plain jump.
+                                let false_target = || Target::Block(Box::new(false_branch.clone()));
+                                let val_type = function.type_of(tested);
+                                let tested = jit.get_opnd(tested);
+                                gen_has_type_branch(&mut jit, &mut asm, tested, val_type, expected, true_target, &false_target);
+                            }
+                            Some(&FusedCond::Truthy(cond)) => {
+                                // Branch on truthiness like gen_test, without materializing 0/1.
+                                asm.test(jit.get_opnd(cond), Opnd::Imm(!Qnil.as_i64()));
+                                asm.push_insn(lir::Insn::Jnz(true_target));
+                            }
+                            Some(&FusedCond::Cmp(kind, left, right)) => {
+                                // Branch on the comparison directly, without materializing
+                                // Qtrue/Qfalse and then 0/1.
+                                asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
+                                asm.push_insn(match kind {
+                                    FusedCmpKind::Lt => lir::Insn::Jl(true_target),
+                                    FusedCmpKind::Le => lir::Insn::Jle(true_target),
+                                    FusedCmpKind::Gt => lir::Insn::Jg(true_target),
+                                    FusedCmpKind::Ge => lir::Insn::Jge(true_target),
+                                    FusedCmpKind::Eq => lir::Insn::Je(true_target),
+                                    FusedCmpKind::Ne => lir::Insn::Jne(true_target),
+                                });
+                            }
+                            None => {
+                                let val_opnd = jit.get_opnd(*val);
+                                asm.test(val_opnd, val_opnd);
+                                asm.push_insn(lir::Insn::Jnz(true_target));
+                            }
+                        }
                         asm.jmp(Target::Block(Box::new(false_branch)));
 
                         assert!(asm.current_block().insns.last().unwrap().is_terminator());
@@ -624,6 +790,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::Comment { .. } => return Ok(()), // comment instruction, no code generation
         &Insn::Const { val: Const::Value(val) } => gen_const_value(val),
         &Insn::Const { val: Const::CPtr(val) } => gen_const_cptr(val),
+        // The `...` local of an inlined forwardable frame is just the caller's callinfo
+        // pointer. `gen_push_inline_frame` already stored the same value in the frame slot.
+        // Materialized into a register rather than left as an immediate because `getlocal ...`
+        // puts it on the modeled VM stack, and a JITFrame stack map can only reconstruct a slot
+        // from a register or an immediate `VALUE` -- which a callinfo pointer is not.
+        &Insn::ForwardingCallInfo { ci, .. } => asm.load(gen_const_cptr(ci as *const u8)),
         &Insn::Const { val: Const::CInt64(val) } => gen_const_long(val),
         &Insn::Const { val: Const::CUInt16(val) } => gen_const_uint16(val),
         &Insn::Const { val: Const::CUInt32(val) } => gen_const_uint32(val),
@@ -677,10 +849,13 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), *block, block_arg,
             )
         }
-        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, block_arg, captured, state } => {
+        Insn::PushInlineFrame { cme, iseq, recv, num_args, blockiseq, block_arg, captured, forwarded, state } => {
             let captured = captured.map(|captured| opnd!(captured));
             let block_arg = block_arg.map(|block_arg| opnd!(block_arg));
-            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, block_arg, captured))
+            let forwarded = forwarded.as_ref().map(|forwarded| {
+                (forwarded.ci, forwarded.args.iter().map(|&arg| opnd!(arg)).collect::<Vec<_>>())
+            });
+            no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), *blockiseq, block_arg, captured, forwarded))
         },
         Insn::PopInlineFrame { iseq, argc, state } => {
             no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
@@ -2339,8 +2514,20 @@ fn gen_push_inline_frame(
     blockiseq: Option<IseqPtr>,
     block_arg: Option<lir::Opnd>,
     captured: Option<Opnd>,
+    forwarded: Option<(*const rb_callinfo, Vec<Opnd>)>,
 ) {
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    // A `def foo(...)` callee keeps the caller's arguments in the frame instead of binding them
+    // to parameters, so the frame is `argc` slots taller than the local table, exactly as
+    // `vm_call_iseq_forwardable` makes it. See `gen_send_iseq_direct`, which builds the same
+    // frame for the out-of-line call.
+    let forwarded_argc = forwarded.as_ref().map_or(0, |(_, args)| args.len());
+    debug_assert_eq!(
+        forwarded.is_some(),
+        unsafe { rb_get_iseq_flags_forwardable(iseq) },
+        "forwarded arguments are set exactly for a forwardable callee",
+    );
+    debug_assert!(forwarded.is_none() || forwarded_argc == num_args.to_usize());
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, state, stack_growth);
 
@@ -2396,8 +2583,27 @@ fn gen_push_inline_frame(
         frame_type,
         specval,
         write_block_code: iseq_may_write_block_code(iseq),
-        extra_locals: 0,
+        extra_locals: forwarded_argc,
     });
+
+    // A forwardable callee reads its arguments out of the frame rather than out of parameter
+    // locals, so they have to be in memory: a side exit lands the interpreter on a `sendforward`
+    // whose `vm_adjust_stack_forwarding` copies them back out from below the frame, the GC scans
+    // them there once this frame's `cfp->sp` is published above them, and a `getlocal ...` reads
+    // the callinfo from the slot directly above them. This mirrors the same block in
+    // `gen_send_iseq_direct`; the inlined body reads none of it, because the `...` local is an
+    // `Insn::ForwardingCallInfo` constant and the arguments are the caller's own SSA values.
+    if let Some((ci, args)) = forwarded {
+        asm_comment!(asm, "copy forwarded arguments and callinfo to inlined callee frame");
+        let locals_base = state.stack().len() - args.len();
+        for (idx, &arg) in args.iter().enumerate() {
+            asm.store(Opnd::mem(64, SP, ((locals_base + idx) * SIZEOF_VALUE) as i32), arg);
+        }
+        asm.store(
+            Opnd::mem(64, SP, ((locals_base + forwarded_argc) * SIZEOF_VALUE) as i32),
+            Opnd::const_ptr(ci as *const u8),
+        );
+    }
 
     // Publish the inlined callee's entry JITFrame before the inlined body runs.
     // Frame walking functions such as rb_profile_frames can inspect the new
@@ -2463,7 +2669,10 @@ fn gen_pop_inline_frame(
     argc: usize,
     state: &FrameState,
 ) {
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    // Undo `gen_push_inline_frame`'s SP math, including the extension a forwardable callee's
+    // frame was grown by.
+    let forwarded_argc = if unsafe { rb_get_iseq_flags_forwardable(iseq) } { argc } else { 0 };
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let sp_offset = (state.stack().len() + local_size - argc + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
 
     asm_comment!(asm, "restore caller SP after inline");
@@ -4147,6 +4356,98 @@ fn gen_test(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
     asm.csel_e(0.into(), 1.into())
 }
 
+/// Compile a type test straight into the branch that consumes it.
+///
+/// This is [`gen_has_type`] with the 0/1 result removed: instead of merging every check
+/// into a value that a following `test`/`jnz` picks apart again, each check jumps at the
+/// CondBranch's own targets. That drops a diamond, a block parameter and a redundant
+/// flags test from every type-dispatched call site, which is where the bulk of ZJIT's
+/// polymorphic sends start.
+///
+/// On return, control reaches `if_true` exactly when `val` has type `ty`. Every other
+/// path either jumped to `false_target()` already or falls out of the bottom, which the
+/// caller terminates with its own jump to the false edge.
+///
+/// `false_target` is a closure because failure can be detected at up to three points and
+/// each needs its own copy of the edge. Callers only fuse when that edge carries no block
+/// arguments, so the copies are plain jumps.
+fn gen_has_type_branch(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    val: lir::Opnd,
+    val_type: Type,
+    ty: Type,
+    if_true: Target,
+    false_target: &dyn Fn() -> Target,
+) {
+    // Immediate types: one compare, and failure is the fallthrough.
+    if ty.is_subtype(types::Fixnum) {
+        asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
+        asm.push_insn(lir::Insn::Jnz(if_true));
+        return;
+    } else if ty.is_subtype(types::Flonum) {
+        let masked = asm.and(val, Opnd::UImm(RUBY_FLONUM_MASK as u64));
+        asm.cmp(masked, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::StaticSymbol) {
+        // Static symbols have (val & 0xff) == RUBY_SYMBOL_FLAG; compare 8 bits like YJIT.
+        let val = asm.load_imm(val);
+        asm.cmp(val.with_num_bits(8), Opnd::UImm(RUBY_SYMBOL_FLAG as u64));
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::NilClass) {
+        asm.cmp(val, Qnil.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::TrueClass) {
+        asm.cmp(val, Qtrue.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    } else if ty.is_subtype(types::FalseClass) {
+        asm.cmp(val, Qfalse.into());
+        asm.push_insn(lir::Insn::Je(if_true));
+        return;
+    }
+    assert!(!ty.is_immediate(), "unexpected immediate guard type: {ty}");
+
+    // Heap types: rule out immediates and Qfalse, then check the class or the T_ tag.
+    // If val isn't in a register, load it to use it as the base of Opnd::mem later.
+    let val = asm.load_mem(val);
+    if !val_type.is_subtype(types::HeapBasicObject) {
+        asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
+        asm.jnz(jit, false_target());
+        asm.cmp(val, Qfalse.into());
+        asm.je(jit, false_target());
+    }
+
+    if let Some(expected_class) = ty.runtime_exact_ruby_class() {
+        let klass = asm.load(Opnd::mem(64, val, RUBY_OFFSET_RBASIC_KLASS));
+        asm.cmp(klass, Opnd::Value(expected_class));
+    } else if let Some(builtin_type) = ty.builtin_type_equivalent() {
+        let flags = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_FLAGS));
+        let tag = asm.and(flags, Opnd::UImm(RUBY_T_MASK as u64));
+        asm.cmp(tag, Opnd::UImm(builtin_type as u64));
+    } else {
+        unimplemented!("unsupported type: {ty}");
+    }
+    asm.push_insn(lir::Insn::Je(if_true));
+}
+
+/// Whether [`gen_has_type_branch`] knows how to compile a test for `ty`. Mirrors the
+/// arms of [`gen_has_type`]; anything else keeps the unfused codegen, which panics on
+/// the same set of types.
+fn has_type_is_fusable(ty: Type) -> bool {
+    ty.is_subtype(types::Fixnum)
+        || ty.is_subtype(types::Flonum)
+        || ty.is_subtype(types::StaticSymbol)
+        || ty.is_subtype(types::NilClass)
+        || ty.is_subtype(types::TrueClass)
+        || ty.is_subtype(types::FalseClass)
+        || (!ty.is_immediate()
+            && (ty.runtime_exact_ruby_class().is_some() || ty.builtin_type_equivalent().is_some()))
+}
+
 fn gen_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::Opnd, val_type: Type, ty: Type) -> lir::Opnd {
     if ty.is_subtype(types::Fixnum) {
         asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
@@ -4692,6 +4993,9 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
 /// on the native stack are known.
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
     let mut stack = Vec::new();
+    // Owned rather than borrowed: `Function::frame_state` resolves the state's operands through
+    // the union-find, which `jit.get_opnd` below needs. `frame_state_ref` would hand back the
+    // stored state with stale operand ids.
     let mut current_state = state.clone();
     loop {
         stack.extend(current_state.stack().rev().copied().map(|insn_id| {
@@ -4706,17 +5010,19 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         let Some(caller) = current_state.caller() else {
             break;
         };
-        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq)));
+        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq, current_state.extra_locals)));
         current_state = function.frame_state(caller);
     }
     stack
 }
 
-fn inline_frame_stack_gap(iseq: IseqPtr) -> usize {
+fn inline_frame_stack_gap(iseq: IseqPtr, extra_locals: u16) -> usize {
     // The extra slot is for the callee's receiver below its local table.
     // We currently never map out the stack for `invokeblock`, which doesn't
     // put a receiver on cfp->sp stack.
-    1 + unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + VM_ENV_DATA_SIZE.to_usize()
+    // `extra_locals` is the frame extension a `def foo(...)` callee's arguments live in, which
+    // makes the frame that much taller. See `FrameState::extra_locals`.
+    1 + unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + extra_locals as usize + VM_ENV_DATA_SIZE.to_usize()
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.

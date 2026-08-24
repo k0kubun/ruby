@@ -576,6 +576,458 @@ fn test_forwardable_callee_super() {
     "#), @r#"[["base", [1], {k: 2}]]"#);
 }
 
+/// Run `program` and assert that `counter` moved by the end of it. Forwarding tests need this:
+/// the dynamic `sendforward` computes the same answer as the expansion, so without an assertion
+/// on what the compiler actually did they would all pass with the specialization switched off.
+#[track_caller]
+fn assert_forward_counter(program: &str, name: &str, counter: impl Fn(&crate::stats::Counters) -> u64) -> String {
+    with_rubyvm(|| {
+        let counters = crate::state::ZJITState::get_counters();
+        let before = counter(counters);
+        let result = assert_compiles_allowing_exits(program);
+        let counters = crate::state::ZJITState::get_counters();
+        assert!(counter(counters) > before, "expected {name} to increase, but it did not");
+        result
+    })
+}
+
+/// Assert that a `bar(...)` site in a standalone-compiled forwardable ISEQ expanded against a
+/// profiled, guarded callinfo.
+#[track_caller]
+fn assert_expands_standalone_forward(program: &str) -> String {
+    assert_forward_counter(program, "send_forward_expanded_profiled_count",
+        |c| c.send_forward_expanded_profiled_count)
+}
+
+/// The inverse: the site had to stay on the dynamic `sendforward`, for the reason `counter`
+/// names. Checking the reason and not just the absence of an expansion is what keeps these tests
+/// from passing vacuously if the site stops being compiled at all.
+#[track_caller]
+fn assert_keeps_standalone_forward(program: &str, name: &str, counter: impl Fn(&crate::stats::Counters) -> u64) -> String {
+    let expanded_before = with_rubyvm(||
+        crate::state::ZJITState::get_counters().send_forward_expanded_profiled_count);
+    let result = assert_forward_counter(program, name, counter);
+    let expanded_after = with_rubyvm(||
+        crate::state::ZJITState::get_counters().send_forward_expanded_profiled_count);
+    assert_eq!(expanded_after, expanded_before,
+        "expected the `bar(...)` site to stay dynamic, but it expanded");
+    result
+}
+
+// A forwardable ISEQ that is *entered* megamorphically is never inlined, so its `bar(...)` has no
+// compile-time callinfo. The profiler records the packed one the `...` local held every time and
+// the compiled site guards it, reading the forwarded arguments back out of the frame extension.
+#[test]
+fn test_standalone_forwarder_megamorphic_entry() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a, b) = a + b; end
+        module Delegate
+          def fwd(...) = @t.bar(...)
+        end
+        target = Target.new
+        objs = 40.times.map do
+          klass = Class.new do
+            include Delegate
+            define_method(:initialize) { |t| @t = t }
+          end
+          klass.new(target)
+        end
+        total = 0
+        50.times { objs.each { |o| total += o.fwd(1, 2) } }
+        total
+    "#), @"6000");
+}
+
+// The same site reached with a different number of forwarded arguments fails the callinfo guard.
+// The exit lands on the `sendforward` itself, where `vm_adjust_stack_forwarding` rebuilds the
+// argument list from the frame extension, so the interpreter finishes the call unaided.
+#[test]
+fn test_standalone_forwarder_guard_miss_on_a_different_call_shape() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(*a) = a.sum; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(1, 2) }
+        [f.fwd(1, 2), f.fwd(1, 2, 3), f.fwd, f.fwd(4, 5)]
+    "#), @"[3, 6, 0, 9]");
+    assert!(crate::state::ZJITState::get_counters().exit_send_forward_callinfo_changed > 0,
+        "expected the callinfo guard to have missed at least once");
+}
+
+// Same, but the callinfo changes because the *method name* did: two forwarders reaching the same
+// packed callinfo would compare equal, so the guard has to see the whole word.
+#[test]
+fn test_standalone_forwarder_guard_miss_on_a_different_caller_name() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a) = a * 2; end
+        class Fwd
+          def initialize(t) = @t = t
+          def one(...) = @t.bar(...)
+          def two(...) = one(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.one(3) }
+        [f.one(3), f.two(4)]
+    "#), @"[6, 8]");
+}
+
+// A keyword-carrying caller needs a keyword table, which no packed callinfo has, so the `...`
+// local holds a heap `imemo_callinfo`. Holding one across a compilation would need a GC root, so
+// the site stays on the dynamic path.
+#[test]
+fn test_standalone_forwarder_kwargs_caller_stays_dynamic() {
+    assert_snapshot!(assert_keeps_standalone_forward(r#"
+        class Target; def bar(a, b:) = [a, b]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(1, b: 2) }
+        f.fwd(1, b: 2)
+    "#, "send_forward_reject_ci_not_packed", |c| c.send_forward_reject_ci_not_packed), @"[1, 2]");
+}
+
+// Chained forwarding: the target is itself a `def bar(...)`, whose `...` local has to *receive* a
+// callinfo. No `rb_callinfo` describes the merged argument list, so the site is rejected outright
+// rather than expanded into a call that could not fill the callee's `...`.
+#[test]
+fn test_standalone_forwarder_chained_forwarding_stays_dynamic() {
+    assert_snapshot!(assert_forward_counter(r#"
+        class Target; def bar(a, b) = a - b; end
+        class Fwd
+          def initialize(t) = @t = t
+          def inner(...) = @t.bar(...)
+          def outer(...) = inner(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.outer(9, 4) }
+        f.outer(9, 4)
+    "#, "send_forward_reject_chained", |c| c.send_forward_reject_chained), @"5");
+}
+
+// `bh = VM_ENV_BLOCK_HANDLER(GET_LEP())`: a block given to the forwardable frame goes on to the
+// target. A standalone site cannot know statically whether there is one, so it either passes the
+// frame's handler through or -- when the target would reject or warn about an unused block --
+// guards that there is none.
+#[test]
+fn test_standalone_forwarder_carries_a_block() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(x) = yield(x); end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(4) { |v| v * 2 } }
+        f.fwd(4) { |v| v + 1 }
+    "#), @"5");
+}
+
+// The blockless case takes the other branch: the target neither yields nor takes a block
+// parameter, so passing the frame's handler on would keep it off the direct send. The site guards
+// that the frame has no block instead, and a call that does have one exits to the interpreter.
+//
+// The block has to arrive through `public_send` for the guard to be the thing that catches it. A
+// literal block written at the call site clears `VM_CALL_ARGS_SIMPLE` in that site's callinfo, so
+// the *callinfo* guard already tells the two calls apart; `public_send` builds one callinfo for
+// both and carries the block beside it.
+#[test]
+fn test_standalone_forwarder_block_guard_miss() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a) = a * 3; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.public_send(:fwd, 2) }
+        [f.public_send(:fwd, 2), f.public_send(:fwd, 2) { :ignored }]
+    "#), @"[6, 6]");
+    assert!(crate::state::ZJITState::get_counters().exit_send_forward_block_given > 0,
+        "expected the block-handler guard to have missed at least once");
+}
+
+// A literal block at the call site changes the caller's callinfo, so a forwarder warmed up
+// without one and then called with one misses the callinfo guard rather than reaching the target
+// with a block the expansion did not plan for.
+#[test]
+fn test_standalone_forwarder_literal_block_appearing_late() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a) = block_given? ? yield(a) : a * 3; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(2) }
+        [f.fwd(2), f.fwd(2) { |v| v + 1 }]
+    "#), @"[6, 3]");
+}
+
+// A guard *inside* the expansion -- here the receiver class guard on `@t` -- exits to the
+// `sendforward` with the site's original stack, `[recv, ...]`, still on it. That is what
+// `vm_adjust_stack_forwarding` expects: it clobbers the `...` slot with the forwarded arguments
+// it copies back out of the frame extension.
+#[test]
+fn test_standalone_forwarder_side_exit_resumes_the_sendforward() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class A; def m(a, b, c) = [:a, a, b, c]; end
+        class B; def m(a, b, c) = [:b, a, b, c]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def m(...) = @t.m(...)
+        end
+        fa = Fwd.new(A.new)
+        fb = Fwd.new(B.new)
+        200.times { fa.m(1, 2, 3) }
+        [fa.m(1, 2, 3), fb.m(4, 5, 6)]
+    "#), @"[[:a, 1, 2, 3], [:b, 4, 5, 6]]");
+}
+
+// A `ruby2_keywords` frame splats a flagged Hash into the forwarder, which makes the caller's
+// callinfo carry `VM_CALL_ARGS_SPLAT`. That is unspecializable, and the flag still has to reach
+// the target as keywords.
+#[test]
+fn test_standalone_forwarder_ruby2_keywords() {
+    assert_snapshot!(assert_keeps_standalone_forward(r#"
+        class Target; def bar(*a, **k) = [a, k]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(...)
+          ruby2_keywords def r2k(*a) = fwd(*a)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.r2k(1, k: 2) }
+        f.r2k(1, k: 2)
+    "#, "send_forward_reject_complex_args", |c| c.send_forward_reject_complex_args), @"[[1], {k: 2}]");
+}
+
+// The site's own arguments come first in the merged list, and the forwarded ones are read out of
+// the frame extension in call order after them. (`def fwd(x, ...)` is not a forwardable ISEQ at
+// all -- Ruby compiles it to `*rest, **kwrest, &block` -- so the site's own arguments have to be
+// written at the call rather than declared as parameters.)
+#[test]
+fn test_standalone_forwarder_site_writes_its_own_args() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a, b, c) = [a, b, c]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...) = @t.bar(:first, ...)
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(2, 3) }
+        f.fwd(2, 3)
+    "#), @"[:first, 2, 3]");
+}
+
+// `vm_adjust_stack_forwarding` measures the frame extension from the *local* ISEQ's table, so a
+// forwarder with body locals of its own has to read the arguments from further down.
+#[test]
+fn test_standalone_forwarder_with_extra_locals() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a, b) = a + b; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...)
+            extra = 10
+            spare = 5
+            extra + spare + @t.bar(...)
+          end
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd(1, 2) }
+        f.fwd(1, 2)
+    "#), @"18");
+}
+
+// The forwarded arguments stay live in the frame extension across a GC, which is what makes
+// reading them back out of it after arbitrary work in the same frame safe.
+#[test]
+fn test_standalone_forwarder_arguments_survive_a_gc() {
+    assert_snapshot!(assert_expands_standalone_forward(r#"
+        class Target; def bar(a, b) = a + b; end
+        class Fwd
+          def initialize(t) = @t = t
+          def fwd(...)
+            GC.start
+            @t.bar(...)
+          end
+        end
+        f = Fwd.new(Target.new)
+        200.times { f.fwd("x", "y") }
+        f.fwd("a", "b")
+    "#), @r#""ab""#);
+}
+
+#[test]
+fn test_inlined_forwarder_positional_args() {
+    // The forwarder is inlined into its caller, so the `bar(...)` inside it sees the caller's
+    // callinfo at compile time and becomes a direct call to `target`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b) = a - b
+        def fwd(...) = target(...)
+        def entry = fwd(7, 2)
+        200.times { entry }
+        entry
+    ")), @"5");
+}
+
+#[test]
+fn test_inlined_forwarder_keyword_args() {
+    // `vm_caller_setup_fwd_args` gives the merged callinfo the *caller's* keyword table, so the
+    // expanded call has to bind the trailing arguments as keywords, not as positionals.
+    assert_snapshot!(with_inlining(|| assert_inlines(r#"
+        def target(a, b:, c: 3) = [a, b, c]
+        def fwd(...) = target(...)
+        def entry = [fwd(1, b: 2), fwd(1, c: 9, b: 2)]
+        200.times { entry }
+        entry
+    "#)), @"[[1, 2, 3], [1, 2, 9]]");
+}
+
+#[test]
+fn test_inlined_forwarder_site_writes_its_own_args() {
+    // `bar(x, ...)`: the merged argument list is the site's own arguments followed by the
+    // caller's, in that order.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b, c) = [a, b, c]
+        def fwd(x, ...) = target(x, ...)
+        def entry = fwd(1, 2, 3)
+        200.times { entry }
+        entry
+    ")), @"[1, 2, 3]");
+}
+
+#[test]
+fn test_inlined_forwarder_carrying_a_literal_block() {
+    // `bh = VM_ENV_BLOCK_HANDLER(GET_LEP())`: the forwarded call gets the forwarder frame's own
+    // block handler, which the expanded call reads back out of the frame's EP. Re-deriving the
+    // literal block instead would capture the wrong frame, since the block belongs to `entry`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(x) = yield(x)
+        def fwd(...) = target(...)
+        def entry = fwd(4) { |v| v * 2 }
+        200.times { entry }
+        entry
+    ")), @"8");
+}
+
+#[test]
+fn test_inlined_forwarder_block_present_on_some_calls_only() {
+    // A `&blk` handed to the forwarder may be a Proc on one call and nothing on the next, so the
+    // handler the expanded call passes on is only known at run time. `block_given?` in the target
+    // has to see each call for what it was.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        def target(x) = [x, block_given? ? yield(x) : :none]
+        def fwd(...) = target(...)
+        def entry(i, &b) = fwd(i, &b)
+        200.times { |i| i.even? ? entry(i) { |v| v } : entry(i) }
+        [entry(1) { |v| v * 2 }, entry(1)]
+    "#)), @"[[1, 2], [1, :none]]");
+}
+
+#[test]
+fn test_inlined_forwarder_argument_error() {
+    // The argument check belongs to the target, which the inlined forwarder now calls directly.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        def target(a, b) = a + b
+        def fwd(...) = target(...)
+        def entry = (fwd(1) rescue $!.message)
+        200.times { entry }
+        entry
+    "#)), @r#""wrong number of arguments (given 1, expected 2)""#);
+}
+
+#[test]
+fn test_inlined_forwarder_side_exit_resumes_the_sendforward() {
+    // A guard inside the inlined forwarder exits to the `sendforward` instruction, and the
+    // interpreter's `vm_adjust_stack_forwarding` rebuilds the argument list by reading below the
+    // frame at `lep - (local_table_size + argc + 2)`. That only works because the inlined frame
+    // push copied the arguments into those slots and put the callinfo above them, the way
+    // `vm_call_iseq_forwardable` does.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        class A; def m(a, b, c) = [:a, a, b, c]; end
+        class B; def m(a, b, c) = [:b, a, b, c]; end
+        class Fwd
+          def initialize(t) = @t = t
+          def m(...) = @t.m(...)
+        end
+        fa = Fwd.new(A.new)
+        fb = Fwd.new(B.new)
+        # Warm up on A alone so the expanded call guards on A.
+        200.times { fa.m(1, 2, 3) }
+        # B fails that guard mid-forwarder.
+        [fa.m(1, 2, 3), fb.m(4, 5, 6)]
+    "#)), @"[[:a, 1, 2, 3], [:b, 4, 5, 6]]");
+}
+
+#[test]
+fn test_inlined_forwarder_chained_forwarding_falls_back() {
+    // The inner target is itself a `def bar(...)`, whose `...` local has to receive a real
+    // callinfo. No `rb_callinfo` describes the merged call, so the site keeps its `sendforward`.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a, b:) = [a, b]
+        def inner(...) = target(...)
+        def outer(...) = inner(...)
+        def entry = outer(1, b: 2)
+        200.times { entry }
+        entry
+    ")), @"[1, 2]");
+}
+
+#[test]
+fn test_inlined_forwarder_ruby2_keywords() {
+    // A `ruby2_keywords` frame splats into the forwarder, which keeps the call site off the
+    // direct send entirely; the flagged Hash still has to reach the target as keywords.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits("
+        def target(*a, **k) = [a, k]
+        def fwd(...) = target(...)
+        ruby2_keywords def r2k(*a) = fwd(*a)
+        def entry = r2k(1, k: 2)
+        200.times { entry }
+        entry
+    ")), @"[[1], {k: 2}]");
+}
+
+#[test]
+fn test_inlined_forwarder_super_is_unaffected() {
+    // `super` out of a forwardable frame goes through `invokesuperforward`, which
+    // `vm_search_super_method` rebuilds the callinfo for at run time. Inlining the frame must
+    // not disturb it.
+    assert_snapshot!(with_inlining(|| assert_inlines_allowing_exits(r#"
+        class Base
+          def run(*a, **k) = ["base", a, k]
+        end
+        class Child < Base
+          def run(...) = super
+        end
+        c = Child.new
+        def call_it(c) = c.run(1, k: 2)
+        200.times { call_it(c) }
+        call_it(c)
+    "#)), @r#"["base", [1], {k: 2}]"#);
+}
+
+#[test]
+fn test_inlined_forwarder_with_extra_locals() {
+    // The `...` local is local 0 and the frame extension sits below the whole local table, so a
+    // forwarder with locals of its own still finds its arguments where the interpreter left them.
+    assert_snapshot!(with_inlining(|| assert_inlines("
+        def target(a) = a * 2
+        def fwd(...)
+          extra = 10
+          extra + target(...)
+        end
+        def entry = fwd(3)
+        200.times { entry }
+        entry
+    ")), @"16");
+}
+
 #[test]
 fn test_kwrest_only_no_caller_keywords() {
     assert_snapshot!(inspect("
@@ -6322,6 +6774,54 @@ fn test_if_else() {
         test(3)
         [test(3), test(7)]
     "), @"[0, 1]");
+}
+
+#[test]
+fn test_if_fixnum_compare_kinds() {
+    // Each fixnum compare fused into its CondBranch must still branch correctly
+    // in both directions.
+    assert_snapshot!(inspect("
+        def lt(a, b)  = a <  b ? 1 : 0
+        def le(a, b)  = a <= b ? 1 : 0
+        def gt(a, b)  = a >  b ? 1 : 0
+        def ge(a, b)  = a >= b ? 1 : 0
+        def eq(a, b)  = a == b ? 1 : 0
+        def neq(a, b) = a != b ? 1 : 0
+        r = []
+        2.times do
+          r = [lt(1, 2), lt(2, 1), le(1, 1), le(2, 1), gt(2, 1), gt(1, 2),
+               ge(1, 1), ge(1, 2), eq(1, 1), eq(1, 2), neq(1, 2), neq(1, 1)]
+        end
+        r
+    "), @"[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]");
+}
+
+#[test]
+fn test_if_compare_result_also_used() {
+    // The comparison result is both branched on and returned, so it cannot be
+    // folded away into the branch and must still be materialized.
+    assert_snapshot!(inspect("
+        def test(a, b)
+          x = a < b
+          if x
+            x
+          else
+            :nope
+          end
+        end
+        test(1, 2)
+        [test(1, 2), test(2, 1)]
+    "), @"[true, :nope]");
+}
+
+#[test]
+fn test_if_truthiness_of_non_boolean() {
+    // Branching on an arbitrary VALUE: nil and false are falsy, everything else truthy.
+    assert_snapshot!(inspect("
+        def test(x) = x ? 1 : 0
+        test(1)
+        [test(1), test(true), test(:sym), test(nil), test(false), test(0)]
+    "), @"[1, 1, 1, 0, 0, 1]");
 }
 
 #[test]
@@ -12336,4 +12836,116 @@ fn test_block_respecialization_declines_unservable_handlers() {
     let after = crate::state::ZJITState::get_counters().block_respecialize_count;
     assert_eq!(before, after,
         "a fallback that only ever sees Proc handlers must not earn a respecialization");
+}
+
+// --- HasType fused into the branch that consumes it -----------------------------
+//
+// A CondBranch on a HasType now jumps out of the type checks directly instead of
+// merging them into a 0/1 that the branch re-tests. These cover each arm of
+// gen_has_type_branch() and, importantly, the values that must take the *false*
+// path out of the heap-object arm: immediates and Qfalse, which are rejected
+// before the class field is ever loaded.
+
+// Every kind of receiver through one polymorphic call site. nil/false/true and
+// the immediates must not have their RBasic read.
+#[test]
+fn test_has_type_branch_polymorphic_receivers() {
+    assert_snapshot!(inspect(r#"
+        class Wrapped; def kind = :obj; end
+        def dispatch(o) = o.kind
+        class Integer; def kind = :int; end
+        class Symbol; def kind = :sym; end
+        class Float; def kind = :float; end
+        class NilClass; def kind = :nil; end
+        class FalseClass; def kind = :false; end
+        class TrueClass; def kind = :true; end
+        class String; def kind = :str; end
+        class Array; def kind = :ary; end
+        vals = [1, :s, 1.5, nil, false, true, "x", [1], Wrapped.new]
+        20.times { vals.each { |v| dispatch(v) } }
+        vals.map { |v| dispatch(v) }
+    "#), @"[:int, :sym, :float, :nil, :false, :true, :str, :ary, :obj]");
+}
+
+// A class-check arm whose receiver turns out to be an immediate or `false` must
+// take the false edge. This is the case the fused form rules out with the
+// `test`/`cmp` pair before touching RBASIC(val)->klass; getting it wrong reads a
+// class field out of a tagged integer.
+#[test]
+fn test_has_type_branch_rejects_immediates_and_false() {
+    assert_snapshot!(inspect(r#"
+        class Box; def val = 1; end
+        def dispatch(o) = o.val
+        class Integer; def val = 2; end
+        # Train the site on Box only, so Box is the single guarded class and every
+        # other receiver has to fall out of the class check.
+        b = Box.new
+        20.times { dispatch(b) }
+        [dispatch(b), dispatch(7), dispatch(-1)]
+    "#), @"[1, 2, 2]");
+}
+
+// The builtin-type arm (T_ tag rather than an exact class) with a subclass
+// receiver, plus the same immediate/false rejection.
+#[test]
+fn test_has_type_branch_builtin_type_arm() {
+    assert_snapshot!(inspect(r#"
+        class MyStr < String; end
+        def sizeof(o) = o.size
+        vals = ["abc", MyStr.new("wxyz"), [1, 2], {a: 1}]
+        20.times { vals.each { |v| sizeof(v) } }
+        vals.map { |v| sizeof(v) }
+    "#), @"[3, 4, 2, 1]");
+}
+
+// The fused branch keeps the tested value live across the checks; a guard that
+// fails on a later arm still has to be able to side-exit with correct state.
+#[test]
+fn test_has_type_branch_side_exit_state() {
+    assert_snapshot!(inspect(r#"
+        class A; def go(x) = x + 1; end
+        class B; def go(x) = x + 2; end
+        def test(o, x)
+          y = x * 10
+          z = o.go(x)
+          [y, z, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new, i) }
+        # C was never profiled: the call site falls out of every fused type check.
+        class C; def go(x) = x + 3; end
+        [test(A.new, 1), test(B.new, 1), test(C.new, 1)]
+    "#), @r#"[[10, 2, "A"], [10, 3, "B"], [10, 4, "C"]]"#);
+}
+
+// Fusing must not fire when the HasType result is used by something other than
+// the branch, or the second consumer would read a value that was never
+// materialized.
+#[test]
+fn test_has_type_branch_multi_use_not_fused() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = 1; end
+        class B; def go = 2; end
+        def test(o)
+          # `o.go` builds the fused type dispatch; storing the receiver keeps
+          # other values from the same block live past the branch.
+          r = o.go
+          [r, o.class.name]
+        end
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        [test(A.new), test(B.new)]
+    "#), @r#"[[1, "A"], [2, "B"]]"#);
+}
+
+// Under GC stress with a moving collector, the guarded class VALUE baked into the
+// fused compare has to be updated like the unfused one was.
+#[test]
+fn test_has_type_branch_gc_compact() {
+    assert_snapshot!(inspect(r#"
+        class A; def go = :a; end
+        class B; def go = :b; end
+        def test(o) = o.go
+        20.times { |i| test(i.even? ? A.new : B.new) }
+        GC.compact
+        [test(A.new), test(B.new), test(A.new)]
+    "#), @"[:a, :b, :a]");
 }
