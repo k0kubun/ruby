@@ -1571,6 +1571,12 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                Insn::BeginOutlined => {
+                    cb.set_outlined(true);
+                    // The last patch point is in the other half of the region; no
+                    // amount of padding here would ever be next to it.
+                    last_patch_pos = None;
+                },
                 Insn::IncrCounter { mem, value } => {
                     // Get the status register allocated by arm64_scratch_split
                     let Some(Insn::Cmp {

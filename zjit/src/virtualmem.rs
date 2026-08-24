@@ -25,6 +25,18 @@ pub struct VirtualMemory<A: Allocator> {
     /// Size of this virtual memory region in bytes.
     region_size_bytes: usize,
 
+    /// Offset at which the outlined (cold) arena starts. The region is one
+    /// reservation split into two independently growing arenas: hot code is
+    /// written into `[0, outlined_start_bytes)` and cold code -- side exits,
+    /// function stubs -- into `[outlined_start_bytes, region_size_bytes)`.
+    /// Keeping them in one reservation is what lets a [`CodePtr`] stay a single
+    /// offset from one base, and what keeps every hot-to-cold branch inside
+    /// rel32 range.
+    ///
+    /// Equal to `region_size_bytes` when the region is not split, which makes
+    /// the outlined arena empty and everything behave as it did before.
+    outlined_start_bytes: usize,
+
     /// mapped_region_bytes + zjit_alloc_size may not increase beyond this limit.
     memory_limit_bytes: Option<usize>,
 
@@ -33,8 +45,13 @@ pub struct VirtualMemory<A: Allocator> {
     page_size_bytes: usize,
 
     /// Number of bytes that have we have allocated physical memory for starting at
-    /// [Self::region_start].
+    /// [Self::region_start]. Covers the inlined arena only.
     mapped_region_bytes: usize,
+
+    /// Number of bytes we have allocated physical memory for starting at
+    /// `region_start + outlined_start_bytes`. The two arenas map pages
+    /// independently, so the address space between them stays unmapped.
+    outlined_mapped_bytes: usize,
 
     /// Keep track of the address of the last written to page.
     /// Used for changing protection to implement W^X.
@@ -107,6 +124,17 @@ pub enum WriteError {
 use WriteError::*;
 
 impl VirtualMem {
+    /// Allocate a VirtualMem instance with a requested size, split into an inlined
+    /// (hot) arena and an outlined (cold) arena of equal size. See
+    /// [`VirtualMemory::outlined_start_bytes`].
+    pub fn alloc_split(exec_mem_bytes: usize, mem_bytes: Option<usize>) -> Self {
+        let mut mem = Self::alloc(exec_mem_bytes, mem_bytes);
+        // The requested size is a whole number of MiB, so half of it is a whole
+        // number of 512 KiB and page-aligned for any page size we support.
+        mem.split_arena(exec_mem_bytes / 2);
+        mem
+    }
+
     /// Allocate a VirtualMem insntace with a requested size
     pub fn alloc(exec_mem_bytes: usize, mem_bytes: Option<usize>) -> Self {
         let virt_block: *mut u8 = unsafe { rb_jit_reserve_addr_space(exec_mem_bytes as u32) };
@@ -151,12 +179,27 @@ impl<A: Allocator> VirtualMemory<A> {
         Self {
             region_start: virt_region_start,
             region_size_bytes,
+            outlined_start_bytes: region_size_bytes,
             memory_limit_bytes,
             page_size_bytes,
             mapped_region_bytes: 0,
+            outlined_mapped_bytes: 0,
             current_write_page: None,
             allocator,
         }
+    }
+
+    /// Split the region into an inlined (hot) arena at `[0, outlined_start_bytes)`
+    /// and an outlined (cold) arena at `[outlined_start_bytes, region_size_bytes)`.
+    /// See [`VirtualMemory::outlined_start_bytes`].
+    fn split_arena(&mut self, outlined_start_bytes: usize) {
+        assert!(outlined_start_bytes <= self.region_size_bytes, "outlined arena should start inside the region");
+        // The two arenas must never share a page, so that their protections and
+        // mappings can be managed independently.
+        assert_eq!(0, outlined_start_bytes % self.page_size_bytes,
+            "the arena split should be page-aligned so the two arenas never share a page");
+        assert_eq!(0, self.mapped_region_size(), "the region should be split before it is written to");
+        self.outlined_start_bytes = outlined_start_bytes;
     }
 
     /// Return the start of the region as a raw pointer. Note that it could be a dangling
@@ -173,9 +216,16 @@ impl<A: Allocator> VirtualMemory<A> {
         self.start_ptr().add_bytes(self.region_size_bytes)
     }
 
-    /// Size of the region in bytes that we have allocated physical memory for.
+    /// Offset at which the outlined arena starts, or `virtual_region_size()` when
+    /// the region is not split.
+    pub fn outlined_start_bytes(&self) -> usize {
+        self.outlined_start_bytes
+    }
+
+    /// Size of the region in bytes that we have allocated physical memory for,
+    /// counting both arenas.
     pub fn mapped_region_size(&self) -> usize {
-        self.mapped_region_bytes
+        self.mapped_region_bytes + self.outlined_mapped_bytes
     }
 
     /// Size of the region in bytes where writes could be attempted.
@@ -198,14 +248,27 @@ impl<A: Allocator> VirtualMemory<A> {
         if self.current_write_page == Some(page_addr) {
             // Writing within the last written to page, nothing to do
         } else {
-            // Switching to a different and potentially new page
-            let start = self.region_start.as_ptr();
-            let mapped_region_end = start.wrapping_add(self.mapped_region_bytes);
-            let whole_region_end = start.wrapping_add(self.region_size_bytes);
+            // Switching to a different and potentially new page.
+            //
+            // Pick the arena this address belongs to. The two arenas grow
+            // independently, so `start` is the arena's own base and
+            // `whole_region_end` its own end; the address space belonging to the
+            // other arena is out of bounds from here.
+            let region_start = self.region_start.as_ptr();
+            let split = region_start.wrapping_add(self.outlined_start_bytes);
+            let outlined = raw >= split;
+            let (start, whole_region_end, arena_mapped_bytes) = if outlined {
+                (split, region_start.wrapping_add(self.region_size_bytes), self.outlined_mapped_bytes)
+            } else {
+                (region_start, split, self.mapped_region_bytes)
+            };
+            let mapped_region_end = start.wrapping_add(arena_mapped_bytes);
+            let other_arena_mapped_bytes = self.mapped_region_size() - arena_mapped_bytes;
             let alloc = &mut self.allocator;
 
             // Ignore zjit_alloc_size() if self.memory_limit_bytes is None for testing
-            let mut required_region_bytes = page_addr + page_size - start as usize;
+            let mut required_region_bytes =
+                other_arena_mapped_bytes + (page_addr + page_size - start as usize);
             if self.memory_limit_bytes.is_some() {
                 required_region_bytes += zjit_alloc_bytes();
             }
@@ -252,7 +315,11 @@ impl<A: Allocator> VirtualMemory<A> {
                         unreachable!("unknown arch");
                     }
                 }
-                self.mapped_region_bytes += alloc_size;
+                if outlined {
+                    self.outlined_mapped_bytes += alloc_size;
+                } else {
+                    self.mapped_region_bytes += alloc_size;
+                }
 
                 self.current_write_page = Some(page_addr);
             } else {
@@ -268,7 +335,7 @@ impl<A: Allocator> VirtualMemory<A> {
 
     /// Return true if write_byte() can allocate a new page
     pub fn can_allocate(&self) -> bool {
-        let memory_usage_bytes = self.mapped_region_bytes + zjit_alloc_bytes();
+        let memory_usage_bytes = self.mapped_region_size() + zjit_alloc_bytes();
         let memory_limit_bytes = self.memory_limit_bytes.unwrap_or(self.region_size_bytes);
         memory_usage_bytes + self.page_size_bytes < memory_limit_bytes
     }
@@ -278,12 +345,11 @@ impl<A: Allocator> VirtualMemory<A> {
     pub fn mark_all_writable(&mut self) {
         self.current_write_page = None;
 
-        let region_start = self.region_start;
-        let mapped_region_bytes: u32 = self.mapped_region_bytes.try_into().unwrap();
-
-        // Make mapped region writable
-        if mapped_region_bytes > 0 {
-            if !self.allocator.mark_writable(region_start.as_ptr(), mapped_region_bytes) {
+        // Both arenas, and only the pages each of them has actually mapped: the
+        // address space between them was never committed.
+        for (start, bytes) in self.mapped_arenas() {
+            let bytes: u32 = bytes.try_into().unwrap();
+            if !self.allocator.mark_writable(start, bytes) {
                 panic!("Cannot make JIT memory region writable");
             }
         }
@@ -294,11 +360,25 @@ impl<A: Allocator> VirtualMemory<A> {
     pub fn mark_all_executable(&mut self) {
         self.current_write_page = None;
 
-        let region_start = self.region_start;
-        let mapped_region_bytes: u32 = self.mapped_region_bytes.try_into().unwrap();
+        for (start, bytes) in self.mapped_arenas() {
+            self.allocator.mark_executable(start, bytes.try_into().unwrap());
+        }
+    }
 
-        // Make mapped region executable
-        self.allocator.mark_executable(region_start.as_ptr(), mapped_region_bytes);
+    /// The `(start, len)` of each arena's mapped pages, skipping arenas that have
+    /// none. Protection changes have to cover both, and must not cover the
+    /// uncommitted gap in between.
+    fn mapped_arenas(&self) -> Vec<(*const u8, usize)> {
+        let region_start = self.region_start.as_ptr();
+        let mut arenas = Vec::with_capacity(2);
+        if self.mapped_region_bytes > 0 {
+            arenas.push((region_start as *const u8, self.mapped_region_bytes));
+        }
+        if self.outlined_mapped_bytes > 0 {
+            let outlined_start = region_start.wrapping_add(self.outlined_start_bytes);
+            arenas.push((outlined_start as *const u8, self.outlined_mapped_bytes));
+        }
+        arenas
     }
 
     /// Free a range of bytes. start_ptr must be memory page-aligned.
@@ -448,6 +528,12 @@ pub mod tests {
         )
     }
 
+    fn new_dummy_virt_mem_split(outlined_start: usize) -> VirtualMemory<TestingAllocator> {
+        let mut virt = new_dummy_virt_mem();
+        virt.split_arena(outlined_start);
+        virt
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn new_memory_is_initialized() {
@@ -514,5 +600,57 @@ pub mod tests {
                 ]
             ),
         );
+    }
+
+    #[test]
+    fn split_arenas_map_pages_independently() {
+        // The outlined arena starts halfway in. Writing to it must not commit the
+        // address space in between, which is what a single bump watermark would do.
+        const HALF: usize = PAGE_SIZE * 5;
+        let mut virt = new_dummy_virt_mem_split(HALF);
+
+        virt.write_byte(virt.start_ptr(), 1).unwrap();
+        virt.write_byte(virt.start_ptr().add_bytes(HALF), 1).unwrap();
+
+        assert_eq!(PAGE_SIZE, virt.mapped_region_bytes);
+        assert_eq!(PAGE_SIZE, virt.outlined_mapped_bytes);
+        assert_eq!(PAGE_SIZE * 2, virt.mapped_region_size());
+
+        // Both arenas' pages get protection changes, and nothing in between does.
+        virt.mark_all_executable();
+        assert!(
+            matches!(
+                virt.allocator.requests[..],
+                [
+                    MarkWritable { start_idx: 0, length: PAGE_SIZE },
+                    MarkWritable { start_idx: HALF, length: PAGE_SIZE },
+                    MarkExecutable { start_idx: 0, length: PAGE_SIZE },
+                    MarkExecutable { start_idx: HALF, length: PAGE_SIZE },
+                ]
+            ),
+            "unexpected requests: {:?}", virt.allocator.requests,
+        );
+    }
+
+    #[test]
+    fn inlined_arena_cannot_grow_into_the_outlined_arena() {
+        use super::WriteError::*;
+        const HALF: usize = PAGE_SIZE * 5;
+        let mut virt = new_dummy_virt_mem_split(HALF);
+
+        // The last byte of the inlined arena is fine...
+        virt.write_byte(virt.start_ptr().add_bytes(HALF - 1), 1).unwrap();
+        assert_eq!(HALF, virt.mapped_region_bytes);
+        assert_eq!(0, virt.outlined_mapped_bytes);
+
+        // ...but the byte after it belongs to the outlined arena, so it starts that
+        // arena's mapping rather than extending the inlined one.
+        virt.write_byte(virt.start_ptr().add_bytes(HALF), 1).unwrap();
+        assert_eq!(HALF, virt.mapped_region_bytes);
+        assert_eq!(PAGE_SIZE, virt.outlined_mapped_bytes);
+
+        // Past the end of the whole region is still out of bounds.
+        let one_past_end = virt.start_ptr().add_bytes(virt.virtual_region_size());
+        assert_eq!(Err(OutOfBounds), virt.write_byte(one_past_end, 0));
     }
 }
