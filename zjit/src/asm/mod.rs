@@ -181,6 +181,12 @@ impl CodeBlock {
         if self.outlined { self.mem_size } else { self.outlined_start }
     }
 
+    /// Whether an offset falls in the outlined half. Used to aim the write limit at
+    /// the half a patch site is in, which is not always the half emission is on.
+    fn is_outlined_pos(&self, pos: usize) -> bool {
+        pos >= self.outlined_start
+    }
+
     /// Add an assembly comment if the feature is on.
     pub fn add_comment(&mut self, comment: &str) {
         if !self.keep_comments {
@@ -256,6 +262,18 @@ impl CodeBlock {
 
     /// Write a single byte at the current position.
     pub fn write_byte(&mut self, byte: u8) {
+        // Stop at the end of the half being written rather than running into the
+        // other one. [`VirtualMem`] bounds-checks the whole region, which is no
+        // longer the same thing: a write one byte past the inlined half is a
+        // perfectly good address in the outlined half, and would overwrite cold
+        // code that the outlined write position still thinks it owns. Dropping the
+        // byte instead reports the half as full the way running out of region used
+        // to, and `arch_emit` turns that into CompileError::OutOfMemory.
+        if self.write_pos >= self.write_limit() {
+            self.dropped_bytes = true;
+            return;
+        }
+
         let write_ptr = self.get_write_ptr();
         // TODO: check has_capacity()
         if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
@@ -361,6 +379,7 @@ impl CodeBlock {
     // Link internal label references
     pub fn link_labels(&mut self) -> Result<(), ()> {
         let orig_pos = self.write_pos;
+        let orig_outlined = self.outlined;
         let mut link_result = Ok(());
 
         // For each label reference
@@ -373,6 +392,10 @@ impl CodeBlock {
             assert!(label_addr < self.mem_size);
 
             self.write_pos = ref_pos;
+            // A reference from cold code is filled in after emission has been put
+            // back on the hot half, so name the half the reference is really in:
+            // otherwise its writes look like hot code running past its end.
+            self.outlined = self.is_outlined_pos(ref_pos);
             let encode_result = (label_ref.encode.as_ref())(self, (ref_pos + label_ref.num_bytes) as i64, label_addr as i64);
             link_result = link_result.and(encode_result);
 
@@ -384,6 +407,7 @@ impl CodeBlock {
         }
 
         self.write_pos = orig_pos;
+        self.outlined = orig_outlined;
 
         // Clear the label positions and references
         self.label_addrs.clear();
@@ -595,6 +619,28 @@ mod tests
         cb.write_byte(4);
         assert_eq!(2, cb.inlined_code_size());
         assert_eq!(2, cb.outlined_code_size());
+    }
+
+    #[test]
+    fn test_inlined_half_stops_at_the_boundary_instead_of_overwriting_cold_code() {
+        let mut cb = CodeBlock::new_dummy_split();
+        let half = cb.virtual_region_size() / 2;
+
+        // Put a byte in the outlined half...
+        cb.set_outlined(true);
+        cb.write_byte(0x11);
+        cb.set_outlined(false);
+
+        // ...then run the inlined half up to the boundary and one byte past it.
+        cb.set_write_ptr(cb.get_ptr(half - 1));
+        cb.write_byte(0x22);
+        assert!(!cb.has_dropped_bytes(), "the last byte of the inlined half is writable");
+        assert_eq!(half, cb.get_write_pos());
+
+        cb.write_byte(0x33);
+        assert!(cb.has_dropped_bytes(), "a write past the inlined half should be dropped");
+        assert_eq!(half, cb.get_write_pos(), "the dropped byte should not advance the position");
+        assert_eq!(1, cb.outlined_code_size(), "cold code should not have been overwritten");
     }
 
     #[test]
