@@ -637,8 +637,15 @@ pub fn cache_for_shape(key: SendCacheKey) -> Option<*const SendCache> {
 /// Mark the callcaches every table holds. Called from
 /// [`crate::gc::rb_zjit_root_mark`].
 pub fn mark_all() {
+    let mut marked = 0u64;
+    let mut probed = 0u64;
     for cache in ZJITState::get_send_caches().values() {
-        cache.mark();
+        marked += cache.mark() as u64;
+        probed += cache.storage.len() as u64;
+    }
+    if get_option!(stats, /*default=*/false) {
+        incr_counter_by(Counter::gc_mark_send_cache_slot_count, marked);
+        incr_counter_by(Counter::gc_mark_send_cache_probe_count, probed);
     }
 }
 
