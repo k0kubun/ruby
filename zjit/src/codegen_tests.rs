@@ -1514,6 +1514,82 @@ fn test_inline_block_non_local_return_keeps_frames_walkable() {
 }
 
 #[test]
+fn test_inline_block_non_local_return_restores_the_callers_sp() {
+    // A non-local `return` out of an inlined block returns with the inlined frames still
+    // pushed, and it has to hand the SP register back the way it received it: a direct
+    // JIT-to-JIT caller restores its own SP with a fixed `sub` after the call. `find`
+    // below is padded past the inline threshold so `test` really does call it directly,
+    // and `test` then spills `hit` and `count` for the block to read out of its EP, which
+    // only lands in the right slots if SP survived the call.
+    set_call_threshold(2);
+    eval("
+        def each3
+          yield 1
+          yield 2
+        end
+        def find(key)
+          pad0 = key.to_s
+          pad1 = pad0.size
+          pad2 = pad1 + 1
+          pad3 = pad2 * 2
+          pad4 = pad3 - 1
+          each3 { |v| return [v, key, pad4] if v == 2 }
+          [pad0, pad1, pad2, pad3, pad4]
+        end
+        def test(key)
+          hit = find(key)
+          count = 0
+          [1, 2].each { count += hit.size }
+          [hit, count]
+        end
+        test(:a)
+        test(:a)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test(:ab)"), @r#"[[2, :ab, 5], 6]"#);
+}
+
+#[test]
+fn test_inline_block_non_local_return_keeps_the_callers_frame_intact() {
+    // Distilled from tool/lib/leakchecker.rb, which crashed with `vm_get_cref:
+    // unreachable`. `find_fds` returns non-locally out of a block inlined at the `yield`
+    // in `each2`, so it left its direct JIT-to-JIT caller's SP too high by the inlined
+    // frames' offsets. `check` then wrote the frame for its own next call over its frame's
+    // flags, zeroing the frame magic, and `setclassvariable` walked the resulting ep chain
+    // looking for a cref that was no longer there. `find_fds` is padded past the inline
+    // threshold so that `check` really does call it directly rather than inline it, and
+    // the `each` block below both reads a local `check` spilled for it and writes the
+    // class variable through its cref.
+    set_call_threshold(2);
+    eval("
+        class Leaks
+          @@leaked = nil
+          def each2
+            yield 1
+            yield 2
+          end
+          def find_fds(dirs)
+            pad0 = dirs.to_s
+            pad1 = pad0.size
+            pad2 = pad1 + 1
+            pad3 = pad2 * 2
+            pad4 = pad3 - 1
+            each2 { |v| return [v, pad4] if v == 2 }
+            [pad0, pad1, pad2, pad3, pad4]
+          end
+          def check(name)
+            live = find_fds(name)
+            @@leaked = 0
+            [1, 2].each { @@leaked += live.size }
+            [live, @@leaked]
+          end
+        end
+        Leaks.new.check('ab')
+        Leaks.new.check('ab')
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("Leaks.new.check('abc')"), @r#"[[2, 7], 4]"#);
+}
+
+#[test]
 fn test_inline_block_raise_unwinds_through_inlined_frames() {
     set_call_threshold(2);
     eval("
