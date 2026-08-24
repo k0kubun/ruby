@@ -83,6 +83,10 @@ pub struct ZJITState {
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
 
+    /// The distinct ISEQs `jit_frames` points at, which is what the GC mark phase
+    /// walks instead of that table. See [`crate::gc::RootIseqs`].
+    root_iseqs: crate::gc::RootIseqs,
+
     /// Shape tables for ivar accesses that miss their inline guard chain, one
     /// per ivar name. Owned here because the addresses are baked into JIT code, so
     /// the `Box`es must never move.
@@ -173,6 +177,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            root_iseqs: Default::default(),
             ivar_caches: HashMap::new(),
             send_caches: crate::send_cache::SendCaches::new(),
         };
@@ -216,6 +221,11 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Owner of the deduplicated root ISEQ set. See [`crate::gc::RootIseqs`].
+    pub fn get_root_iseqs() -> &'static mut crate::gc::RootIseqs {
+        &mut ZJITState::get_instance().root_iseqs
     }
 
     /// Owner of every per-ivar-name shape table. See [`crate::ivar_cache`].
