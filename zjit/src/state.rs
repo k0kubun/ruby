@@ -86,6 +86,10 @@ pub struct ZJITState {
 
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
+
+    /// The distinct ISEQs `jit_frames` points at, which is what the GC mark phase
+    /// walks instead of that table. See [`crate::gc::RootIseqs`].
+    root_iseqs: crate::gc::RootIseqs,
 }
 
 /// Tracks the initialization progress
@@ -166,6 +170,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            root_iseqs: Default::default(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -207,6 +212,11 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Owner of the deduplicated root ISEQ set. See [`crate::gc::RootIseqs`].
+    pub fn get_root_iseqs() -> &'static mut crate::gc::RootIseqs {
+        &mut ZJITState::get_instance().root_iseqs
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {

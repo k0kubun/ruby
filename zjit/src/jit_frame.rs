@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::mem::{align_of, size_of};
 use std::ptr;
 
-use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_mark_movable, rb_gc_location, rb_jit_reserve_low_addr_space};
+use crate::cruby::{__IncompleteArrayField, IseqPtr, VALUE, rb_gc_location, rb_jit_reserve_low_addr_space};
 use crate::cruby::zjit_jit_frame;
 use crate::codegen::iseq_may_write_block_code;
 use crate::state::ZJITState;
@@ -140,6 +140,10 @@ impl JITFrame {
                 stack: __IncompleteArrayField::new(),
             });
         }
+        // The frame's ISEQ has to stay alive for as long as the frame does, which is
+        // forever; the mark phase reaches it through this set rather than by walking
+        // every frame. See [`crate::gc::RootIseqs`].
+        crate::gc::register_root_iseq(iseq);
         ZJITState::get_jit_frames().push(raw_ptr);
         raw_ptr as *const _
     }
@@ -148,13 +152,6 @@ impl JITFrame {
     pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr, stack_size: usize) -> *const Self {
         let materialize_block_code = !iseq_may_write_block_code(iseq);
         Self::alloc(pc, iseq, materialize_block_code, stack_size)
-    }
-
-    /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
-    pub fn mark(&self) {
-        if !self.iseq.is_null() {
-            unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
-        }
     }
 
     /// Update the iseq pointer after GC compaction.
