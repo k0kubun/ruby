@@ -1571,6 +1571,12 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                Insn::BeginOutlined => {
+                    cb.set_outlined(true);
+                    // The last patch point is in the other half of the region; no
+                    // amount of padding here would ever be next to it.
+                    last_patch_pos = None;
+                },
                 Insn::IncrCounter { mem, value } => {
                     // Get the status register allocated by arm64_scratch_split
                     let Some(Insn::Cmp {
@@ -1744,8 +1750,17 @@ impl Assembler {
                 assert_eq!(label, Label(idx));
             }
 
+            let entry_outlined = cb.is_outlined();
             let start_ptr = cb.get_write_ptr();
-            let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
+            // `Insn::BeginOutlined` may leave emission pointed at the outlined half.
+            // Everything after this -- the next compile, a patch, the caller reading
+            // `cb.get_write_ptr()` for the end of the function body -- expects the
+            // half we came in on, so put it back however this turns out. The
+            // pos_marker callbacks that arm64_emit fires do run in the outlined half,
+            // which is what lets the side-exit size counter measure the right range.
+            let gc_offsets = asm.arm64_emit(cb)
+                .inspect_err(|_| { cb.set_outlined(entry_outlined); cb.clear_labels() })?;
+            cb.set_outlined(entry_outlined);
             assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
 
             cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
