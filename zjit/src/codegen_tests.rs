@@ -12972,3 +12972,105 @@ fn test_has_type_branch_gc_compact() {
         [test(A.new), test(B.new), test(A.new)]
     "#), @"[:a, :b, :a]");
 }
+
+#[test]
+fn test_side_exits_are_emitted_into_the_outlined_region() {
+    // Side exits belong in the outlined half of the code region, so that a
+    // function's body stays contiguous with the next function's. Compile a method
+    // with plenty of guards and check that the bytes landed on the cold side of
+    // the split without leaving a hole in the hot side.
+    set_call_threshold(2);
+    with_rubyvm(|| {
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(cb.has_outlined_region(), "ZJIT's code region should be split");
+        let inlined_before = cb.inlined_code_size();
+        let outlined_before = cb.outlined_code_size();
+
+        // Type guards on an untyped parameter give this a side exit per operation.
+        eval("
+            def guarded(a, b) = a + b + a * b - a
+            guarded(1, 2)
+            guarded(1, 2)
+        ");
+
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(cb.inlined_code_size() > inlined_before,
+            "the function body should have been written to the inlined half");
+        assert!(cb.outlined_code_size() > outlined_before,
+            "the side exits should have been written to the outlined half");
+
+        // The two halves are far enough apart that the exits cannot have been
+        // mistaken for inline code, and close enough for a rel32 branch.
+        let distance = cb.outlined_write_ptr().as_offset() - cb.get_write_ptr().as_offset();
+        assert!(distance > 0, "the outlined half should sit above the inlined half");
+        assert!(distance < i32::MAX as i64,
+            "hot-to-cold branches have to stay in rel32 range, got a gap of {distance}");
+    });
+}
+
+#[test]
+fn test_side_exit_still_reached_from_outlined_region() {
+    // Taking an exit that now lives megabytes away from the guard that jumps to it
+    // must still land the interpreter on the right frame.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def add(a, b) = a + b
+        add(1, 2)
+        add(1, 2)
+        [add(1, 2), add('x', 'y'), add(1.5, 2.5), add(1, 2)]
+    "), @r#"[3, "xy", 4.0, 3]"#);
+}
+
+#[test]
+fn test_outlined_side_exit_survives_compaction() {
+    // A side exit bakes the VALUEs that were on the VM stack into its own code, so
+    // GC compaction has to rewrite those in the outlined half too. That means
+    // mark_all_writable has to cover the outlined arena: without it the write goes
+    // to a page that is executable and not writable.
+    set_call_threshold(2);
+    with_rubyvm(|| {
+        let out = inspect("
+            BAKED_IN_EXIT = 'baked'
+            def stacked(a) = [BAKED_IN_EXIT, a + 1]
+            stacked(1)
+            stacked(1)
+            GC.compact
+            [stacked(1), stacked(2.5)]
+        ");
+        assert_eq!(r#"[["baked", 2], ["baked", 3.5]]"#, out);
+
+        // Make sure that had something to survive: the exit captures the constant
+        // that was on the VM stack, so the ISEQ owns GC offsets that point into the
+        // outlined half. Nothing is mapped between the end of the inlined code and
+        // the start of the outlined half, so an offset past the inlined write
+        // position is an offset in the outlined half.
+        let cb = crate::state::ZJITState::get_code_block();
+        let inlined_end = cb.get_write_ptr().as_offset();
+        let iseq = get_method_iseq("self", "stacked");
+        let outlined_gc_offsets = get_or_create_iseq_payload(iseq).versions.iter()
+            .flat_map(|version| unsafe { version.as_ref() }.gc_offsets.iter())
+            .filter(|offset| offset.as_offset() >= inlined_end)
+            .count();
+        assert!(outlined_gc_offsets > 0,
+            "the side exit should have baked VALUEs into the outlined half");
+    });
+}
+
+#[test]
+fn test_invalidation_jumps_from_the_inlined_to_the_outlined_half() {
+    // Invalidation overwrites a patch point in the hot half with a jump to the
+    // patch point's side exit, which now lives in the cold half. The jump has to
+    // reach it, and with_write_ptr has to hand back the range it really wrote so
+    // that remove_gc_offsets drops the right offsets.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        INVALIDATED_CONST = 1
+        def read_const = INVALIDATED_CONST + 1
+        read_const
+        read_const
+        before = read_const
+        Object.send(:remove_const, :INVALIDATED_CONST)
+        INVALIDATED_CONST = 10
+        [before, read_const]
+    "), @"[2, 11]");
+}

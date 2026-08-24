@@ -1090,9 +1090,16 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, &counter.name(), unsafe { *counter_ptr(counter) });
     }
 
-    // Memory usage stats
-    let code_region_bytes = ZJITState::get_code_block().mapped_region_size();
+    // Memory usage stats. The code region is split into an inlined (hot) half and
+    // an outlined (cold) half; report each so the density of the hot half is
+    // visible on its own.
+    let cb = ZJITState::get_code_block();
+    let code_region_bytes = cb.mapped_region_size();
     set_stat_usize!(hash, "code_region_bytes", code_region_bytes);
+    set_stat_usize!(hash, "inlined_code_region_bytes", cb.inlined_mapped_size());
+    set_stat_usize!(hash, "outlined_code_region_bytes", cb.outlined_mapped_size());
+    set_stat_usize!(hash, "inlined_code_bytes", cb.inlined_code_size());
+    set_stat_usize!(hash, "outlined_code_bytes", cb.outlined_code_size());
     set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
     set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + zjit_alloc_bytes());
 

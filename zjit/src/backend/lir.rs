@@ -958,6 +958,22 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Zero-width marker: everything after it in this Assembler is cold, and is
+    /// emitted into the outlined half of the code region instead of after the
+    /// function body. Emitted once, as the first instruction of the block
+    /// [`Assembler::compile_exits`] builds.
+    ///
+    /// This is what makes hot code contiguous: without it a function's side-exit
+    /// stubs -- around a third of the bytes ZJIT emits -- sit between one
+    /// function's body and the next one's, so every instruction cache line and
+    /// every page a hot loop touches is part exit stub.
+    ///
+    /// Jumps across the boundary need nothing special. A label is an offset from
+    /// the one region base either way, and both halves of the region are inside
+    /// rel32 of each other, so a hot-to-cold branch is the same near jump it was
+    /// when the exit was ten bytes below.
+    BeginOutlined,
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -1046,6 +1062,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::BeginOutlined |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1191,6 +1208,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::BeginOutlined => "BeginOutlined",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::Comment(_) => "Comment",
@@ -3031,6 +3049,8 @@ impl Assembler
     pub fn compile(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
+        #[cfg(feature = "disasm")]
+        let outlined_start_addr = cb.outlined_write_ptr();
         let alloc_regs = Self::get_alloc_regs();
         let had_dropped_bytes = cb.has_dropped_bytes();
         let ret = self.compile_with_regs(cb, alloc_regs).inspect_err(|err| {
@@ -3046,6 +3066,10 @@ impl Assembler
         if let Some(dump_disasm) = crate::options::get_option_ref!(dump_disasm).filter(|_| ret.is_ok()) {
             let end_addr = cb.get_write_ptr();
             crate::disasm::dump_disasm_addr_range(cb, start_addr, end_addr, dump_disasm);
+            // The cold code this compile appended lives elsewhere in the region, so
+            // dump it as its own range rather than losing it from the dump.
+            let outlined_end_addr = cb.outlined_write_ptr();
+            crate::disasm::dump_disasm_addr_range(cb, outlined_start_addr, outlined_end_addr, dump_disasm);
         }
         ret
     }
@@ -3241,6 +3265,12 @@ impl Assembler
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> = HashMap::with_capacity(targets.len());
+
+        // Everything from here on is cold, so send it to the outlined half of the
+        // code region rather than letting it split the hot code in two.
+        if !targets.is_empty() {
+            self.push_insn(Insn::BeginOutlined);
+        }
 
         // Start a new perf range for side exits
         let perf_symbol = if get_option!(perf) == Some(PerfMap::HIR) {
