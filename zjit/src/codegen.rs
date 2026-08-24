@@ -3415,9 +3415,26 @@ fn gen_entry_point(jit: &mut JITState, asm: &mut Assembler, jit_entry_idx: Optio
 ///
 /// `pop_inlined_frames` counts inlined callee frames that are still pushed on top of
 /// this function's own frame, which happens for a non-local `return` out of an inlined
-/// block. They are discarded together with our frame in a single `cfp` adjustment; the
-/// SP register does not need restoring because nothing reads it after the return.
+/// block. They are discarded together with our frame in a single `cfp` adjustment.
+///
+/// Those frames each advanced the SP register when [`gen_push_inline_frame`] pushed them,
+/// and this path never runs the matching [`gen_pop_inline_frame`], so SP has to be put
+/// back by hand: a direct JIT-to-JIT caller restores its own SP with a fixed `sub` after
+/// the call and so requires SP back exactly as it handed it over. That value is our own
+/// frame's `ep + 1`, which is what SP holds at every entry point of this function and
+/// everywhere else at inlining depth 0.
 fn gen_return(asm: &mut Assembler, val: lir::Opnd, pop_inlined_frames: u32) {
+    // Read our own frame's EP before the CFP register moves. The inlined frames sit
+    // below us in memory (the CFP stack grows down), so ours is `pop_inlined_frames`
+    // control frames further up.
+    let restored_sp = (pop_inlined_frames > 0).then(|| {
+        asm_comment!(asm, "restore the caller's SP register: our frame's EP + 1");
+        let our_cfp_ep = RUBY_OFFSET_CFP_EP
+            + (pop_inlined_frames as i32) * (RUBY_SIZEOF_CONTROL_FRAME as i32);
+        let ep = asm.load(Opnd::mem(64, CFP, our_cfp_ep));
+        asm.add(ep, SIZEOF_VALUE.into())
+    });
+
     // Pop the current frame (ec->cfp++), plus any inlined frames above it
     // Note: the return PC is already in the previous CFP
     asm_comment!(asm, "pop stack frame");
@@ -3429,6 +3446,10 @@ fn gen_return(asm: &mut Assembler, val: lir::Opnd, pop_inlined_frames: u32) {
     // Order here is important. Because we're about to tear down the frame,
     // we need to load the return value, which might be part of the frame.
     asm.load_into(C_RET_OPND, val);
+
+    if let Some(sp) = restored_sp {
+        asm.mov(SP, sp);
+    }
 
     // Return from the function
     asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
