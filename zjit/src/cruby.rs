@@ -136,6 +136,13 @@ unsafe extern "C" {
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
 
+    /// Mark a contiguous array of `VALUE`s movably, i.e. `rb_gc_mark_movable` for
+    /// each element but with the per-element work inlined into one C loop instead
+    /// of one FFI call per object. ZJIT's GC callbacks walk arrays of hundreds of
+    /// thousands of `VALUE`s on every collection, where the call overhead is a
+    /// measurable share of the pause. Declared in `internal/gc.h`.
+    pub fn rb_gc_mark_values(n: c_long, values: *const VALUE);
+
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
     pub fn rb_float_new(d: f64) -> VALUE;
