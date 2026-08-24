@@ -3015,6 +3015,10 @@ unsafe extern "C" {
     fn rb_simple_iseq_p(iseq: IseqPtr) -> bool;
 }
 
+/// A sibling shape needs at least this fraction (1/N) of a dispatch arm's samples to earn an arm
+/// of its own. See the polymorphic dispatch chain in `add_iseq_to_hir`.
+const ARM_SHAPE_MIN_SHARE: u32 = 4;
+
 /// Return the ISEQ's return value if it consists of one simple instruction and leave.
 fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags: u32) -> Option<IseqReturn> {
     // Expect only two instructions and one possible operand
@@ -4327,6 +4331,32 @@ impl Function {
         }
     }
 
+    /// Every profiled type recorded for `recv` at `state` that shares `profiled_type`'s class,
+    /// most frequent first and de-duplicated by shape. A polymorphic dispatch arm branches on the
+    /// class alone, so its profile can hold several shapes for that class; an ivar dispatch wants
+    /// an arm for each of them rather than sending all but one to the C fallback. Shapes an ivar
+    /// dispatch cannot index (too-complex, immediates) are dropped, and `profiled_type` itself is
+    /// always first so callers keep the type they already validated.
+    fn profiled_shape_variants(&self, recv: InsnId, state: InsnId, profiled_type: ProfiledType) -> Vec<ProfiledType> {
+        let mut variants = vec![profiled_type];
+        let Some(profiles) = self.profiles.as_ref() else { return variants };
+        let Some(entries) = profiles.get(state) else { return variants };
+        let expected = Type::from_profiled_type(profiled_type);
+        let recv = self.chase_insn(recv);
+        for (entry_insn, summary) in entries {
+            if self.chase_insn(*entry_insn) != recv { continue; }
+            for &other in summary.buckets() {
+                if other.is_empty() { continue; }
+                if other.flags().is_immediate() || other.shape().is_complex() { continue; }
+                if !Type::from_profiled_type(other).bit_equal(expected) { continue; }
+                if variants.iter().any(|kept| kept.shape() == other.shape()) { continue; }
+                variants.push(other);
+            }
+            break;
+        }
+        variants
+    }
+
     fn profile_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> TypeDistributionSummary {
         let Some(entries) = profiles.get(state) else {
             return TypeDistributionSummary::empty();
@@ -4716,7 +4746,9 @@ impl Function {
     /// opens the door for inlining.
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
-        for block in self.reverse_post_order() {
+        // `block` is reassigned when a rewrite ends in a join block: the rest of the original
+        // block's instructions have to continue there.
+        for mut block in self.reverse_post_order() {
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
@@ -4965,10 +4997,45 @@ impl Function {
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_profiled_type(block, recv, profiled_type, state);
 
-                                let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point: the arm's type test only pins the class, and the shape is
+                                // whatever the profiler happened to see for that class at the
+                                // unrefined call site. Branch on the shape rather than guarding it,
+                                // so a receiver of the right class but another shape takes
+                                // rb_ivar_get instead of side-exiting and recompiling the ISEQ
+                                // around a shape the arm never promised.
+                                let branch_on_shape = profiled_type.flags().is_polymorphic_arm()
+                                    && !profiled_type.shape().is_complex()
+                                    && !profiled_type.flags().is_immediate();
+                                let replacement = if branch_on_shape {
+                                    let insn_idx = self.frame_state(state).insn_idx() as u32;
+                                    let shapes = self.profiled_shape_variants(recv, state, profiled_type);
+                                    // covers_profile: false is what asks dispatch_ivar for the
+                                    // branchy form; reprofile_on_miss: false keeps the miss from
+                                    // making the ISEQ re-profile, which would throw away the type
+                                    // profile the dispatch arms were built from.
+                                    let (join_block, result) = self.dispatch_getivar_branchy(&shapes, true, block, insn_idx, recv, id, std::ptr::null(), state)
+                                        .expect("dispatch_getivar with a profiled shape never side-exits unconditionally");
+                                    block = join_block;
+                                    result
+                                } else { match self.try_emit_optimized_getivar(block, recv, id, profiled_type, state) {
+                                    Ok(replacement) => replacement,
+                                    // The final version of an ISEQ may not speculate with a guard
+                                    // that side-exits, but it can still branch on the shape the
+                                    // way getinstancevariable does, so the common shape reads
+                                    // inline instead of calling rb_ivar_get every time.
+                                    Err(Counter::getivar_fallback_no_side_exits) => {
+                                        let insn_idx = self.frame_state(state).insn_idx() as u32;
+                                        let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, insn_idx, recv, id, std::ptr::null(), state)
+                                            .expect("dispatch_getivar only side-exits without a profiled shape");
+                                        block = join_block;
+                                        result
+                                    }
+                                    Err(counter) => {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                    }
+                                } };
                                 self.make_equal_to(insn_id, replacement);
                             } else {
                                 // No shape information, just static class information
@@ -4993,11 +5060,40 @@ impl Function {
                                 // operand other than CFP self. Support it with a reprofile strategy that
                                 // profiles the receiver operand even after the send insn has finished profiling.
                                 recv = self.guard_profiled_type(block, recv, profiled_type, state);
-                                let recompile = None;
-                                self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
-                                });
+                                // A polymorphic-arm profile is not a prediction for this program
+                                // point: the arm's type test only pins the class, and the shape is
+                                // whatever the profiler happened to see for that class at the
+                                // unrefined call site. Guarding it with a side exit measurably
+                                // pushes the call site megamorphic, so branch on the shape instead
+                                // and let rb_ivar_set handle every other shape. That also gives
+                                // the final version of an ISEQ a fast path it is otherwise denied.
+                                //
+                                // The shape transition itself is not speculative: the destination
+                                // shape is a function of the source shape and the ivar, and the
+                                // branch has already established the source shape.
+                                let branch_on_shape = profiled_type.flags().is_polymorphic_arm()
+                                    || self.policy.no_side_exits;
+                                match self.prepare_optimized_setivar(id, profiled_type) {
+                                    Ok(spec) if branch_on_shape => {
+                                        let insn_idx = self.frame_state(state).insn_idx() as u32;
+                                        let recv = self.guard_heap(block, recv, state);
+                                        block = self.dispatch_setivar(&[spec], None, true, block, insn_idx, recv, id, std::ptr::null(), val, state)
+                                            .expect("dispatch_setivar with a spec never side-exits unconditionally");
+                                    }
+                                    Ok(spec) => {
+                                        // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
+                                        // operand other than CFP self. Support it with a reprofile strategy that
+                                        // profiles the receiver operand even after the send insn has finished profiling.
+                                        let recv = self.guard_heap(block, recv, state);
+                                        let shape = self.load_shape(block, recv);
+                                        self.guard_shape(block, shape, profiled_type.shape(), state, None);
+                                        self.emit_optimized_setivar(block, recv, id, val, spec);
+                                    }
+                                    Err(counter) => {
+                                        self.count(block, counter);
+                                        self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
+                                    }
+                                }
                             } else {
                                 // No shape information, just static class information
                                 self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
@@ -6210,19 +6306,6 @@ impl Function {
             }
             self.push_insn(block, Insn::StoreField { recv: self_val, id: FieldName::shape_id, offset: shape_id_offset, val: shape_id, num_bits: types::CShape.num_bits() });
         }
-    }
-
-    fn try_emit_optimized_setivar(&mut self, block: BlockId, self_val: InsnId, id: ID, val: InsnId, profiled_type: ProfiledType, state: InsnId, recompile: Option<Recompile>) -> Result<(), Counter> {
-        if self.policy.no_side_exits {
-            // On the final version, don't add a shape guard without a fallback.
-            return Err(Counter::setivar_fallback_no_side_exits);
-        }
-        let spec = self.prepare_optimized_setivar(id, profiled_type)?;
-        let self_val = self.guard_heap(block, self_val, state);
-        let shape = self.load_shape(block, self_val);
-        self.guard_shape(block, shape, profiled_type.shape(), state, recompile);
-        self.emit_optimized_setivar(block, self_val, id, val, spec);
-        Ok(())
     }
 
     fn gen_patch_points_for_optimized_ccall(&mut self, block: BlockId, recv_class: VALUE, method_id: ID, cme: *const rb_callable_method_entry_struct, state: InsnId) {
@@ -8122,9 +8205,16 @@ impl Function {
 
     /// Dispatch an ivar access to profiled shapes. Callbacks generate the optimized access and
     /// generic fallback, optionally returning a value to pass through the join block.
+    ///
+    /// `branch_on_miss` asks for the branchy form of the last arm even when the policy would
+    /// allow a side exit: the profiled shapes were never a prediction for this program point (a
+    /// polymorphic dispatch arm only pinned the class), so a receiver with another shape should
+    /// take the generic C fallback instead of exiting and recompiling the ISEQ around a shape the
+    /// arm never promised.
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
+        branch_on_miss: bool,
         mut block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -8149,7 +8239,7 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        if profiles.len() == 1 && !self.policy.no_side_exits && !branch_on_miss {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -8171,8 +8261,9 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
-                    // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
+                if self.policy.no_side_exits || branch_on_miss {
+                    // If the policy doesn't allow exits, or the caller asked to branch, make a
+                    // fallback block and jump to it if the shape doesn't match.
                     let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
                     let fallback_block = self.new_block(insn_idx);
@@ -8212,8 +8303,25 @@ impl Function {
         ic: *const iseq_inline_iv_cache_entry,
         exit_id: InsnId,
     ) -> Option<(BlockId, InsnId)> {
+        self.dispatch_getivar_branchy(profiled_types, false, block, insn_idx, self_param, id, ic, exit_id)
+    }
+
+    /// [`Self::dispatch_getivar`], with control over whether the last arm's miss branches to the
+    /// generic fallback instead of side-exiting. See `branch_on_miss` in [`Self::dispatch_ivar`].
+    fn dispatch_getivar_branchy(
+        &mut self,
+        profiled_types: &[ProfiledType],
+        branch_on_miss: bool,
+        block: BlockId,
+        insn_idx: u32,
+        self_param: InsnId,
+        id: ID,
+        ic: *const iseq_inline_iv_cache_entry,
+        exit_id: InsnId,
+    ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
+            branch_on_miss,
             block,
             insn_idx,
             self_param,
@@ -8234,6 +8342,7 @@ impl Function {
         &mut self,
         specs: &[SetIvarSpec],
         unoptimized_reason: Option<Counter>,
+        branch_on_miss: bool,
         block: BlockId,
         insn_idx: u32,
         self_param: InsnId,
@@ -8251,6 +8360,7 @@ impl Function {
         }
         let (block, result) = self.dispatch_ivar(
             specs,
+            branch_on_miss,
             block,
             insn_idx,
             self_param,
@@ -10211,19 +10321,35 @@ fn add_iseq_to_hir(
                             // receiver reaches `type_specialize` as a bare class -- and a class without a shape turns
                             // every ivar read on it into an `rb_ivar_get` call (`getivar_fallback_no_profile_missing_ic`).
                             //
-                            // Hand the shape over, but only when every bucket profiled for this class agrees on it.
-                            // Then it is a real prediction for the values that reach this arm, and a consumer may
-                            // guard it with the same confidence as at a monomorphic site. When the buckets disagree,
-                            // the shape would be whatever the unrefined call site happened to profile first, and a
-                            // guard on it would side-exit out of a version that never promised it.
-                            let agreed_type = summary.buckets().iter()
-                                .filter(|other| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
-                                .try_fold(None::<ProfiledType>, |agreed, &other| match agreed {
-                                    None => Ok(Some(other)),
-                                    Some(agreed) if agreed == other => Ok(Some(agreed)),
-                                    Some(_) => Err(()),
+                            // Hand it over anyway, tagged as a polymorphic arm: consumers branch on a polymorphic
+                            // arm's shape rather than guarding it (see the VM_METHOD_TYPE_IVAR/ATTRSET cases in
+                            // type_specialize), so a receiver with another shape takes the C fallback instead of
+                            // side-exiting out of a version that never promised the shape. Dropping it instead would
+                            // leave the branch with only the refined class, and a class without a shape turns every
+                            // ivar read on it into an rb_ivar_get call.
+                            //
+                            // Hand over *every* bucket for this class, not just the one that named the arm. The arm
+                            // is entered by any receiver of the class, so a sibling bucket's shape is just as likely
+                            // to show up as this one's, and an ivar dispatch that only knows one of them sends the
+                            // rest to rb_ivar_get. Rare shapes are not worth an arm though: the arms live in the
+                            // caller and share its inline budget, so a dispatch that grows for a shape almost nobody
+                            // has can push a hot callee out of the budget and cost more in dynamic sends than it
+                            // saves in ivar reads.
+                            let class_samples: u32 = summary.buckets().iter().enumerate()
+                                .filter(|(_, other)| !other.is_empty() && Type::from_profiled_type(**other).bit_equal(expected))
+                                .map(|(idx, _)| u32::from(summary.bucket_count(idx)))
+                                .sum();
+                            let recv_profile: Vec<ProfiledType> = summary.buckets().iter().enumerate()
+                                .filter(|(idx, other)| {
+                                    !other.is_empty()
+                                        && Type::from_profiled_type(**other).bit_equal(expected)
+                                        // The bucket that named the arm always earns its place; a sibling has to
+                                        // carry a real share of the class's traffic.
+                                        && (**other == profiled_type
+                                            || u32::from(summary.bucket_count(*idx)) * ARM_SHAPE_MIN_SHARE >= class_samples)
                                 })
-                                .unwrap_or(None);
+                                .map(|(_, other)| other.as_polymorphic_arm())
+                                .collect();
                             let has_type = fun.push_insn(block, Insn::HasType { val: recv, expected });
                             let iftrue_block = fun.new_block(insn_idx);
                             let fall_through = fun.new_block(insn_idx);
@@ -10243,11 +10369,9 @@ fn add_iseq_to_hir(
                             // (e.g. Array#[] needs a Fixnum-profiled index to be inlined). Only
                             // the receiver's entry is dropped: it must resolve from its refined,
                             // exact type, and resolve_receiver_type prefers profiles over types.
-                            profiles.copy_entries_except(exit_id, snapshot, recv, fun, agreed_type.map(TypeDistributionSummary::monomorphic));
+                            profiles.copy_entries_except(exit_id, snapshot, recv, fun, Some(TypeDistributionSummary::monomorphic_variants(&recv_profile)));
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
-                            if let Some(agreed_type) = agreed_type {
-                                fun.record_profiled_type(refined_recv, agreed_type);
-                            }
+                            fun.record_profiled_type(refined_recv, recv_profile[0]);
                             let send = fun.push_insn(iftrue_block, Insn::Send { recv: refined_recv, cd, block: None, args: args.clone(), caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
                             fun.push_insn(iftrue_block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
                         }
@@ -10633,6 +10757,7 @@ fn add_iseq_to_hir(
                     let Some(new_block) = fun.dispatch_setivar(
                         &specs,
                         unoptimized_reason,
+                        false,
                         block,
                         insn_idx,
                         self_param,

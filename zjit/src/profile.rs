@@ -269,6 +269,10 @@ impl Flags {
     const IS_STRUCT_EMBEDDED: u32 = 1 << 3;
     /// Set if the ProfiledType is used for profiling specific objects, not just classes/shapes
     const IS_OBJECT_PROFILING: u32 = 1 << 4;
+    /// Set if the ProfiledType was synthesized for one arm of a polymorphic dispatch rather
+    /// than observed at that program point. The class is guaranteed by the arm's type test,
+    /// but the shape is only a shape the profiler happened to see for that class.
+    const IS_POLYMORPHIC_ARM: u32 = 1 << 7;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -278,6 +282,7 @@ impl Flags {
     pub fn is_t_object(self) -> bool { (self.0 & Self::IS_T_OBJECT) != 0 }
     pub fn is_struct_embedded(self) -> bool { (self.0 & Self::IS_STRUCT_EMBEDDED) != 0 }
     pub fn is_object_profiling(self) -> bool { (self.0 & Self::IS_OBJECT_PROFILING) != 0 }
+    pub fn is_polymorphic_arm(self) -> bool { (self.0 & Self::IS_POLYMORPHIC_ARM) != 0 }
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -337,6 +342,12 @@ impl ProfiledType {
 
     pub fn empty() -> Self {
         Self { class: VALUE(0), shape: INVALID_SHAPE_ID, flags: Flags::none() }
+    }
+
+    /// Return a copy marked as belonging to one arm of a polymorphic dispatch.
+    pub fn as_polymorphic_arm(mut self) -> Self {
+        self.flags.0 |= Flags::IS_POLYMORPHIC_ARM;
+        self
     }
 
     pub fn is_empty(&self) -> bool {

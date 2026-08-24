@@ -75,6 +75,10 @@ enum DistributionKind {
 pub struct DistributionSummary<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> {
     kind: DistributionKind,
     buckets: [T; N],
+    /// How many samples each bucket collected, parallel to `buckets`. A consumer that has to pick
+    /// among the buckets (e.g. deciding which shapes are worth a dispatch arm) needs to know how
+    /// much of the site's traffic each one accounts for.
+    counts: [NumProfiles; N],
     // TODO(max): Determine if we need some notion of stability
 }
 
@@ -82,23 +86,38 @@ const SKEW_THRESHOLD: f64 = 0.75;
 
 impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> DistributionSummary<T, N> {
     pub fn empty() -> Self {
-        Self { kind: DistributionKind::Empty, buckets: [Default::default(); N] }
+        Self { kind: DistributionKind::Empty, buckets: [Default::default(); N], counts: [0; N] }
     }
 
     /// Build a summary that claims too many types were seen to be worth specializing. Used for
     /// the fallthrough of a type-dispatch chain: every profiled type already has its own branch,
     /// so whatever reaches the fallthrough is by construction a type the profile never saw.
     pub fn megamorphic() -> Self {
-        Self { kind: DistributionKind::Megamorphic, buckets: [Default::default(); N] }
+        Self { kind: DistributionKind::Megamorphic, buckets: [Default::default(); N], counts: [0; N] }
     }
 
     /// Build a summary that claims exactly one type was seen. Used when a polymorphic site has
     /// already been split into per-type branches: within a branch, the receiver is known to have
     /// one specific profiled type, so downstream specialization can treat it as monomorphic.
     pub fn monomorphic(profiled_type: T) -> Self {
+        Self::monomorphic_variants(&[profiled_type])
+    }
+
+    /// Build a monomorphic summary out of several items that a consumer treats as one. Dispatch
+    /// arms use this: the arm has already branched on the Ruby class, so every item in it is the
+    /// same class as far as method lookup is concerned (hence `Monomorphic`), but the items still
+    /// differ in the shape they carry, and a consumer that specializes on shape wants all of them.
+    /// `items` beyond the bucket count are dropped, most significant first.
+    pub fn monomorphic_variants(items: &[T]) -> Self {
+        assert!(N > 0);
+        assert!(!items.is_empty(), "a monomorphic summary needs at least one item");
         let mut buckets = [Default::default(); N];
-        buckets[0] = profiled_type;
-        Self { kind: DistributionKind::Monomorphic, buckets }
+        let mut counts = [0; N];
+        for (i, &item) in items.iter().take(N).enumerate() {
+            buckets[i] = item;
+            counts[i] = 1;
+        }
+        Self { kind: DistributionKind::Monomorphic, buckets, counts }
     }
 
     pub fn new(dist: &Distribution<T, N>) -> Self {
@@ -129,7 +148,7 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
                 DistributionKind::Megamorphic
             }
         };
-        Self { kind, buckets: dist.buckets }
+        Self { kind, buckets: dist.buckets, counts: dist.counts }
     }
 
     pub fn is_monomorphic(&self) -> bool {
@@ -159,6 +178,12 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
 
     pub fn buckets(&self) -> &[T] {
         &self.buckets
+    }
+
+    /// How many samples `buckets()[idx]` collected. Zero for a bucket that was never filled.
+    pub fn bucket_count(&self, idx: usize) -> NumProfiles {
+        assert!(idx < N, "index {idx} out of bounds for buckets[{N}]");
+        self.counts[idx]
     }
 }
 
