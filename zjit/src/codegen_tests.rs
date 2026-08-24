@@ -13138,7 +13138,7 @@ fn test_outlined_side_exit_survives_compaction() {
         let inlined_end = cb.get_write_ptr().as_offset();
         let iseq = get_method_iseq("self", "stacked");
         let outlined_gc_offsets = get_or_create_iseq_payload(iseq).versions.iter()
-            .flat_map(|version| unsafe { version.as_ref() }.gc_offsets.iter())
+            .flat_map(|version| unsafe { version.as_ref() }.gc_offsets.offsets().iter())
             .filter(|offset| offset.as_offset() >= inlined_end)
             .count();
         assert!(outlined_gc_offsets > 0,

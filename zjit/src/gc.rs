@@ -1,10 +1,251 @@
 //! This module is responsible for marking/moving objects on GC.
 
+use std::collections::HashSet;
 use std::ptr::null;
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
 use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
-use crate::stats::Counter::gc_time_ns;
+use crate::options::get_option;
+use crate::stats::{Counter, incr_counter, incr_counter_by};
+use crate::stats::Counter::*;
+
+/// The `VALUE`s ZJIT baked into one compiled version's machine code, and where in
+/// the code region each one sits.
+///
+/// Two parallel arrays rather than an array of pairs, because the mark phase only
+/// needs the objects: it hands `objects` to [`rb_gc_mark_values`] in a single call
+/// and never touches the code region at all. It used to read every baked `VALUE`
+/// back out of the code, which is a cache miss per object per major GC, scattered
+/// over tens of megabytes of executable memory -- by far the most expensive thing
+/// per object that ZJIT's GC hooks did.
+///
+/// The shadow copies are safe to mark in place of the code's because a baked `VALUE`
+/// is only ever written twice: once by codegen, before [`GcOffsets::append`] records
+/// it, and once by [`GcOffsets::update_references`] on a compacting GC, which writes
+/// the shadow and the code from the same `rb_gc_location` result. Invalidation drops
+/// entries from both arrays together ([`GcOffsets::remove_overlapping`]). Debug
+/// builds re-read the code on every mark and assert the two still agree.
+#[derive(Debug, Default)]
+pub struct GcOffsets {
+    /// Addresses of the baked `VALUE`s inside the code region.
+    offsets: Vec<CodePtr>,
+    /// The `VALUE` at each of those addresses, in the same order.
+    objects: Vec<VALUE>,
+}
+
+impl GcOffsets {
+    /// Record the `VALUE`s the backend baked into `offsets`, and write-barrier them
+    /// against `iseq` (the payload that owns this version hangs off it, so the ISEQ
+    /// is the old object that now points at them).
+    fn append(&mut self, iseq: IseqPtr, offsets: &[CodePtr]) {
+        let cb = ZJITState::get_code_block();
+        self.offsets.extend(offsets);
+        self.objects.reserve_exact(offsets.len());
+        for &offset in offsets.iter() {
+            // Creating an unaligned pointer is well defined unlike in C.
+            let value_ptr = offset.raw_ptr(cb) as *const VALUE;
+            let object = unsafe { value_ptr.read_unaligned() };
+            self.objects.push(object);
+            VALUE::from(iseq).write_barrier(object);
+        }
+        // These tables are written once per version and then only read, so hand back
+        // whatever Vec's growth strategy over-reserved.
+        self.offsets.shrink_to_fit();
+        self.objects.shrink_to_fit();
+    }
+
+    /// Keep every baked object alive. One FFI call for the whole array, reading only
+    /// this version's own dense array rather than the code region.
+    fn mark(&self) {
+        if self.objects.is_empty() {
+            return;
+        }
+        self.debug_assert_shadow_matches_code();
+        unsafe { rb_gc_mark_values(self.objects.len() as std::ffi::c_long, self.objects.as_ptr()) };
+    }
+
+    /// Follow every baked object to its new address after a compacting GC, writing
+    /// the result to both the shadow array and the code.
+    ///
+    /// The code region is already writable because rb_zjit_mark_all_writable() was
+    /// called before the GC update_references phase. We write directly to avoid
+    /// per-page mprotect calls.
+    fn update_references(&mut self) {
+        let cb = ZJITState::get_code_block();
+        for (&offset, object) in self.offsets.iter().zip(self.objects.iter_mut()) {
+            let new_addr = unsafe { rb_gc_location(*object) };
+            // Only write when the VALUE moves, to be copy-on-write friendly.
+            if new_addr != *object {
+                *object = new_addr;
+                let value_ptr = offset.raw_ptr(cb) as *mut VALUE;
+                unsafe { value_ptr.write_unaligned(new_addr) };
+            }
+        }
+    }
+
+    /// Drop the entries whose `VALUE` lands inside `removed_range`, which
+    /// invalidation has just overwritten with a jump.
+    fn remove_overlapping(&mut self, removed_range: &Range<CodePtr>) {
+        debug_assert_eq!(self.offsets.len(), self.objects.len());
+        let mut kept = 0;
+        for index in 0..self.offsets.len() {
+            let gc_offset = self.offsets[index];
+            let offset_range = gc_offset..(gc_offset.add_bytes(SIZEOF_VALUE));
+            if ranges_overlap(&offset_range, removed_range) {
+                continue;
+            }
+            self.offsets[kept] = gc_offset;
+            self.objects[kept] = self.objects[index];
+            kept += 1;
+        }
+        self.offsets.truncate(kept);
+        self.objects.truncate(kept);
+    }
+
+    /// Where in the code region the baked objects sit. For tests that care which
+    /// half of a split code region an object landed in.
+    #[cfg(test)]
+    pub fn offsets(&self) -> &[CodePtr] {
+        &self.offsets
+    }
+
+    /// Number of baked objects this version has.
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Bytes the two arrays own on the Rust heap.
+    pub fn heap_size(&self) -> usize {
+        self.offsets.capacity() * size_of::<CodePtr>()
+            + self.objects.capacity() * size_of::<VALUE>()
+    }
+
+    /// Catch any future path that writes a baked `VALUE` without telling us, which
+    /// would leave the mark phase marking a stale object. Debug builds only: this
+    /// reads the code region, which is exactly what marking no longer does.
+    #[inline(always)]
+    fn debug_assert_shadow_matches_code(&self) {
+        if cfg!(debug_assertions) {
+            let cb = ZJITState::get_code_block();
+            for (&offset, &object) in self.offsets.iter().zip(self.objects.iter()) {
+                let value_ptr = offset.raw_ptr(cb) as *const VALUE;
+                let in_code = unsafe { value_ptr.read_unaligned() };
+                debug_assert_eq!(in_code, object,
+                    "baked VALUE at {offset:?} changed without updating the GC shadow copy");
+            }
+        }
+    }
+}
+
+/// The ISEQs the process-wide, append-only [`crate::jit_frame::JITFrame`] table keeps
+/// raw pointers to, deduplicated: one entry per distinct ISEQ rather than one per
+/// table entry.
+///
+/// [`rb_zjit_root_mark`] has to keep every one of those ISEQs alive on *every*
+/// collection, minor ones included, because they are roots and no write barrier
+/// covers them. Marking them frame by frame is what that used to mean: on a large
+/// application the table holds hundreds of thousands of frames, pointing at only as
+/// many distinct ISEQs as ZJIT has compiled -- a factor of twenty or more of pure
+/// repetition, paid on every GC, plus a cache miss per frame because each one is its
+/// own allocation.
+///
+/// So the table registers its ISEQ with this set when it is appended to, and the mark
+/// phase walks the set instead. That is sound because it marks exactly what walking
+/// the entries would: frames are never removed from the table and their `iseq` field
+/// is never overwritten, so an ISEQ that ever entered the set has to stay alive for
+/// as long as the process does either way. Retention is therefore unchanged; only the
+/// walk is smaller.
+///
+/// Compaction is handled in [`RootIseqs::update_references`]: the pointers here move
+/// with the ISEQs, and the individual frames are still fixed up one by one (that
+/// phase runs only on a compacting GC, not on every collection).
+#[derive(Default, Debug)]
+pub struct RootIseqs {
+    /// The distinct ISEQs, as `VALUE` so that the mark phase can hand the whole
+    /// array to [`rb_gc_mark_values`] in one call.
+    iseqs: Vec<VALUE>,
+    /// Membership index over `iseqs`, so registering stays O(1) while compiling.
+    /// Rebuilt from `iseqs` after compaction.
+    seen: HashSet<VALUE>,
+}
+
+impl RootIseqs {
+    /// Note that some root table now points at `iseq`. Cheap and idempotent; called
+    /// once per table append.
+    pub fn register(&mut self, iseq: IseqPtr) {
+        if iseq.is_null() {
+            return;
+        }
+        let value = VALUE::from(iseq);
+        if self.seen.insert(value) {
+            self.iseqs.push(value);
+        }
+    }
+
+    /// Keep every ISEQ in the set alive. One FFI call for the whole array.
+    fn mark(&self) {
+        if self.iseqs.is_empty() {
+            return;
+        }
+        unsafe { rb_gc_mark_values(self.iseqs.len() as std::ffi::c_long, self.iseqs.as_ptr()) };
+    }
+
+    /// Follow the ISEQs to their new addresses after a compacting GC and reindex.
+    fn update_references(&mut self) {
+        for iseq in self.iseqs.iter_mut() {
+            *iseq = unsafe { rb_gc_location(*iseq) };
+        }
+        self.seen.clear();
+        self.seen.extend(self.iseqs.iter().copied());
+    }
+
+    /// Number of distinct ISEQs the root tables reference.
+    pub fn len(&self) -> usize {
+        self.iseqs.len()
+    }
+}
+
+/// Note that a root table entry now points at `iseq`. See [`RootIseqs`].
+pub fn register_root_iseq(iseq: IseqPtr) {
+    ZJITState::get_root_iseqs().register(iseq);
+}
+
+/// Whether the GC callbacks should account for their own time and the objects they
+/// visit. `rb_zjit_iseq_mark` runs once per live ISEQ payload per collection --
+/// tens of thousands of calls per GC on a large application -- so an unconditional
+/// `Instant::now()` pair plus a counter bump per callback is itself a measurable
+/// slice of the GC pause we are trying to shrink. Under `--zjit-stats` we pay it to
+/// get the breakdown; otherwise the hooks run untimed.
+#[inline(always)]
+fn gc_stats_p() -> bool {
+    get_option!(stats, /*default=*/false)
+}
+
+/// [`with_time_stat`], but only when `--zjit-stats` asked for the numbers, and
+/// charging the elapsed time to `gc_time_ns` as well as to `counter` so that the
+/// per-callback breakdown always sums to the total.
+#[inline(always)]
+fn time_gc_hook<F, R>(counter: Counter, func: F) -> R where F: FnOnce() -> R {
+    if !gc_stats_p() {
+        return func();
+    }
+    let start = std::time::Instant::now();
+    let ret = func();
+    let nanos = start.elapsed().as_nanos() as u64;
+    incr_counter_by(counter, nanos);
+    incr_counter_by(gc_time_ns, nanos);
+    ret
+}
+
+/// Like [`time_gc_hook`] but charges only `counter`, for a phase nested inside a
+/// callback that `time_gc_hook` already charged to `gc_time_ns`.
+#[inline(always)]
+fn time_gc_phase<F, R>(counter: Counter, func: F) -> R where F: FnOnce() -> R {
+    if !gc_stats_p() {
+        return func();
+    }
+    with_time_stat(counter, func)
+}
 
 /// GC callback for marking GC objects in the per-ISEQ payload.
 #[unsafe(no_mangle)]
@@ -17,12 +258,19 @@ pub extern "C" fn rb_zjit_iseq_mark(payload: *mut c_void) {
         //
         // For aliasing, having the VM lock hopefully also implies that no one
         // else has an overlapping &mut IseqPayload.
+        // A mutable borrow, unlike the name "mark" suggests: the profile caches the
+        // dense array of objects it references (see
+        // [`crate::profile::IseqProfile::marked_objects`]) and rebuilds it here when
+        // a mutation invalidated it. The aliasing argument is the same as for
+        // `rb_zjit_iseq_update_references` below, and nothing this callback reaches
+        // runs Ruby code or re-enters ZJIT.
         unsafe {
             rb_assert_holding_vm_lock();
-            &*(payload as *const IseqPayload)
+            &mut *(payload as *mut IseqPayload)
         }
     };
-    with_time_stat(gc_time_ns, || iseq_mark(payload));
+    if gc_stats_p() { incr_counter!(gc_iseq_mark_count); }
+    time_gc_hook(gc_iseq_mark_time_ns, || iseq_mark(payload));
 }
 
 /// GC callback for updating GC objects in the per-ISEQ payload.
@@ -41,7 +289,8 @@ pub extern "C" fn rb_zjit_iseq_update_references(payload: *mut c_void) {
             &mut *(payload as *mut IseqPayload)
         }
     };
-    with_time_stat(gc_time_ns, || iseq_update_references(payload));
+    if gc_stats_p() { incr_counter!(gc_iseq_update_count); }
+    time_gc_hook(gc_iseq_update_time_ns, || iseq_update_references(payload));
 }
 
 /// GC callback for finalizing an ISEQ
@@ -87,8 +336,16 @@ pub extern "C" fn rb_zjit_root_update_references() {
     if !ZJITState::has_instance() {
         return;
     }
+    if gc_stats_p() { incr_counter!(gc_root_update_count); }
+    time_gc_hook(gc_root_update_time_ns, root_update_references);
+}
+
+fn root_update_references() {
     let invariants = ZJITState::get_invariants();
     invariants.update_references();
+
+    // The deduplicated set the mark phase walks, and then the table it summarizes.
+    ZJITState::get_root_iseqs().update_references();
 
     // Update iseq pointers in all JITFrames for GC compaction.
     // rb_execution_context_update only updates JITFrames currently on the stack,
@@ -103,26 +360,27 @@ pub extern "C" fn rb_zjit_root_update_references() {
     crate::send_cache::update_references();
 }
 
-fn iseq_mark(payload: &IseqPayload) {
+fn iseq_mark(payload: &mut IseqPayload) {
     // Mark objects retained by profiling instructions
-    payload.profile.each_object(|object| {
-        unsafe { rb_gc_mark_movable(object); }
+    let profile = &mut payload.profile;
+    time_gc_phase(gc_iseq_mark_profile_time_ns, || {
+        let objects = profile.marked_objects();
+        if !objects.is_empty() {
+            unsafe { rb_gc_mark_values(objects.len() as std::ffi::c_long, objects.as_ptr()) };
+        }
+        if gc_stats_p() { incr_counter_by(gc_mark_profile_object_count, objects.len() as u64); }
     });
 
     // Mark objects baked in JIT code
-    let cb = ZJITState::get_code_block();
-    for version in payload.versions.iter() {
-        for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
-            let value_ptr: *const u8 = offset.raw_ptr(cb);
-            // Creating an unaligned pointer is well defined unlike in C.
-            let value_ptr = value_ptr as *const VALUE;
-
-            unsafe {
-                let object = value_ptr.read_unaligned();
-                rb_gc_mark_movable(object);
-            }
+    time_gc_phase(gc_iseq_mark_offsets_time_ns, || {
+        let mut marked = 0u64;
+        for version in payload.versions.iter() {
+            let gc_offsets = &unsafe { version.as_ref() }.gc_offsets;
+            marked += gc_offsets.len() as u64;
+            gc_offsets.mark();
         }
-    }
+        if gc_stats_p() { incr_counter_by(gc_mark_offset_object_count, marked); }
+    });
 }
 
 /// This is a mirror of [iseq_mark].
@@ -162,40 +420,13 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
         }
     }
 
-    // Move objects baked in JIT code.
-    // The code region is already writable because rb_zjit_mark_all_writable() was called
-    // before the GC update_references phase. We write directly to avoid per-page mprotect calls.
-    let cb = ZJITState::get_code_block();
-    for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
-        let value_ptr: *const u8 = offset.raw_ptr(cb);
-        // Creating an unaligned pointer is well defined unlike in C.
-        let value_ptr = value_ptr as *const VALUE;
-
-        let object = unsafe { value_ptr.read_unaligned() };
-        let new_addr = unsafe { rb_gc_location(object) };
-
-        // Only write when the VALUE moves, to be copy-on-write friendly.
-        if new_addr != object {
-            let value_ptr = value_ptr as *mut VALUE;
-            unsafe { value_ptr.write_unaligned(new_addr) };
-        }
-    }
+    // Move objects baked in JIT code
+    unsafe { version.as_mut() }.gc_offsets.update_references();
 }
 
 /// Append a set of gc_offsets to the iseq's payload
 pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
-    unsafe { version.as_mut() }.gc_offsets.extend(offsets);
-
-    // Call writebarrier on each newly added value
-    let cb = ZJITState::get_code_block();
-    for &offset in offsets.iter() {
-        let value_ptr: *const u8 = offset.raw_ptr(cb);
-        let value_ptr = value_ptr as *const VALUE;
-        unsafe {
-            let object = value_ptr.read_unaligned();
-            VALUE::from(iseq).write_barrier(object);
-        }
-    }
+    unsafe { version.as_mut() }.gc_offsets.append(iseq, offsets);
 }
 
 /// Remove GC offsets that overlap with a given removed_range.
@@ -203,10 +434,7 @@ pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &V
 /// and GC offsets are corrupted by the rewrite, assuming no on-stack code
 /// will step into the instruction with the GC offsets after invalidation.
 pub fn remove_gc_offsets(mut version: IseqVersionRef, removed_range: &Range<CodePtr>) {
-    unsafe { version.as_mut() }.gc_offsets.retain(|&gc_offset| {
-        let offset_range = gc_offset..(gc_offset.add_bytes(SIZEOF_VALUE));
-        !ranges_overlap(&offset_range, removed_range)
-    });
+    unsafe { version.as_mut() }.gc_offsets.remove_overlapping(removed_range);
 }
 
 /// Return true if given `Range<CodePtr>` ranges overlap with each other
@@ -236,17 +464,24 @@ pub extern "C" fn rb_zjit_mark_all_executable() {
 /// Callback for marking GC objects inside [crate::invariants::Invariants].
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_root_mark() {
-    // Mark iseq pointers in all JITFrames. JITFrames that are currently on the
-    // stack are also marked via rb_execution_context_mark, but JITFrames not on
-    // the stack still need their iseqs kept alive because JIT code will reuse them.
     if !ZJITState::has_instance() {
         return;
     }
-    for &jit_frame in ZJITState::get_jit_frames().iter() {
-        unsafe { &*jit_frame }.mark();
-    }
-    // Keep alive the callcaches megamorphic send sites dispatch through. Nothing
-    // else roots them: the class's own callcache table drops one as soon as the
-    // method is invalidated. See [`crate::send_cache`].
-    crate::send_cache::mark_all();
+    if gc_stats_p() { incr_counter!(gc_root_mark_count); }
+    time_gc_hook(gc_root_mark_time_ns, || {
+        // Keep alive the ISEQ of every JITFrame. JITFrames that are currently on the
+        // stack are also marked via rb_execution_context_mark, but JITFrames not on
+        // the stack still need their iseqs kept alive because JIT code will reuse
+        // them. The table registers into [`RootIseqs`] as it grows, so this marks one
+        // entry per distinct ISEQ instead of one per frame.
+        time_gc_phase(gc_root_mark_iseq_time_ns, || {
+            let root_iseqs = ZJITState::get_root_iseqs();
+            root_iseqs.mark();
+            if gc_stats_p() { incr_counter_by(gc_mark_root_iseq_count, root_iseqs.len() as u64); }
+        });
+        // Keep alive the callcaches megamorphic send sites dispatch through. Nothing
+        // else roots them: the class's own callcache table drops one as soon as the
+        // method is invalidated. See [`crate::send_cache`].
+        time_gc_phase(gc_root_mark_send_cache_time_ns, crate::send_cache::mark_all);
+    });
 }
