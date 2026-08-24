@@ -171,6 +171,39 @@ make_counters! {
         gc_time_ns,
         invalidation_time_ns,
 
+        // Breakdown of `gc_time_ns` by callback and by the structure walked. See
+        // [`crate::gc`]. The four `*_time_ns` totals sum to `gc_time_ns`; the
+        // `_count`s are exact (they are plain increments, not sampled).
+        //
+        // Only collected under `--zjit-stats`: the per-payload callbacks run tens
+        // of thousands of times per collection on a large application, where an
+        // unconditional `Instant::now()` pair is itself a measurable slice of GC
+        // time. `gc_time_ns` has the same caveat for the same reason.
+        gc_iseq_mark_time_ns,
+        gc_iseq_mark_profile_time_ns,
+        gc_iseq_mark_offsets_time_ns,
+        gc_iseq_update_time_ns,
+        gc_root_mark_time_ns,
+        gc_root_mark_iseq_time_ns,
+        gc_root_mark_send_cache_time_ns,
+        gc_root_update_time_ns,
+        // Callback invocations. `gc_root_mark_count` is one per GC that ran a ZJIT
+        // hook at all, so `gc_iseq_mark_count / gc_root_mark_count` is the number of
+        // payloads walked per collection.
+        gc_iseq_mark_count,
+        gc_iseq_update_count,
+        gc_root_mark_count,
+        gc_root_update_count,
+        // Objects handed to `rb_gc_mark_movable` by each subsystem, summed over all
+        // collections.
+        gc_mark_profile_object_count,
+        gc_mark_offset_object_count,
+        gc_mark_root_iseq_count,
+        gc_mark_send_cache_slot_count,
+        // Slots walked to find the callcaches above. The gap against
+        // `gc_mark_send_cache_slot_count` is how much of the walk is empty slots.
+        gc_mark_send_cache_probe_count,
+
         compiled_side_exit_count,
         side_exit_size,
         compile_side_exit_time_ns,

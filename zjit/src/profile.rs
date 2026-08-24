@@ -139,6 +139,7 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
 pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
     let num_profiles = get_option!(num_profiles);
+    // Only touches counters, never a distribution, so `marked_objects` stays valid.
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
     }
@@ -256,7 +257,7 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     } else {
         None
     };
-    profile.splat_lengths.entry(profiler.insn_idx)
+    profile.splat_lengths_mut().entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
 }
 
@@ -286,7 +287,7 @@ fn profile_send_method_name(profiler: &mut Profiler, profile: &mut IseqProfile, 
     if !name.static_sym_p() {
         return;
     }
-    profile.send_mid.entry(profiler.insn_idx)
+    profile.send_mid_mut().entry(profiler.insn_idx)
         .or_insert_with(TypeDistribution::new).observe(ProfiledType::object(name));
 }
 
@@ -718,7 +719,7 @@ fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let cme = unsafe { rb_vm_frame_method_entry(profiler.cfp) };
     let cme_value = VALUE(cme as usize);  // CME is a T_IMEMO, which is a VALUE
 
-    profile.super_cme.entry(profiler.insn_idx)
+    profile.super_cme_mut().entry(profiler.insn_idx)
         .or_insert_with(|| TypeDistribution::new()).observe(ProfiledType::object(cme_value));
 
     unsafe { rb_gc_writebarrier(profiler.iseq.into(), cme_value) };
@@ -975,6 +976,22 @@ pub struct IseqProfile {
     /// Live-traffic re-profiling windows for `invokeblock` sites whose compiled dispatch keeps
     /// reaching `rb_vm_invokeblock()`.
     block_fallbacks: HashMap<YarvInsnIdx, BlockFallbackEntry>,
+
+    /// Dense copy of every object the distributions above reference, which is what
+    /// GC marking actually walks. See [`IseqProfile::marked_objects`].
+    ///
+    /// Duplicates are dropped while building it, so this is a set, not a multiset;
+    /// marking an object once or twice is the same thing to the GC.
+    marked_objects: Vec<VALUE>,
+
+    /// Whether `marked_objects` still describes the distributions. Every method that
+    /// can hand out a mutable distribution sets it: `entry_mut`, `super_cme_mut`,
+    /// `send_mid_mut`, `block_handlers_mut`, `block_fallbacks_mut` and
+    /// `each_object_mut`. Nothing else in this file may touch `entries`, `super_cme`,
+    /// `send_mid`, `block_handlers` or `block_fallbacks` mutably without going
+    /// through one of those -- a mutation that failed to set this flag would leave
+    /// marking blind to a newly recorded object, i.e. a use-after-free.
+    marked_objects_stale: bool,
 }
 
 impl IseqProfile {
@@ -987,11 +1004,17 @@ impl IseqProfile {
             forwarded_cis: HashMap::new(),
             block_handlers: HashMap::new(),
             block_fallbacks: HashMap::new(),
+            marked_objects: Vec::new(),
+            // Nothing recorded yet, so the (empty) dense copy is already accurate.
+            marked_objects_stale: false,
         }
     }
 
     /// Get or create a mutable profile entry for the given instruction index.
     pub fn entry_mut(&mut self, insn_idx: YarvInsnIdx) -> &mut ProfileEntry {
+        // The caller may be about to record an object into this entry's
+        // distributions. Just a store; the dense copy keeps its allocation.
+        self.marked_objects_stale = true;
         let idx = insn_idx as u32;
         match self.entries.binary_search_by_key(&idx, |e| e.insn_idx) {
             Ok(i) => &mut self.entries[i],
@@ -1011,17 +1034,24 @@ impl IseqProfile {
         }
     }
 
-    /// Mutable access to the `invokesuper` method-entry distributions.
+    /// Mutable access to the `invokesuper` method-entry distributions. Goes through
+    /// here so that recording a CME cannot skip invalidating the dense copy GC
+    /// marking walks.
     fn super_cme_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
+        self.marked_objects_stale = true;
         &mut self.super_cme
     }
 
-    /// Mutable access to the `send`/`__send__` method-name distributions.
+    /// Mutable access to the `send`/`__send__` method-name distributions. Same reason
+    /// as [`Self::super_cme_mut`].
     fn send_mid_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
+        self.marked_objects_stale = true;
         &mut self.send_mid
     }
 
-    /// Mutable access to the splat length distributions.
+    /// Mutable access to the splat length distributions. Unlike the two above this
+    /// needs no invalidation: a `SplatLengthDistribution` holds array lengths, not
+    /// objects, so GC marking never looks at it.
     fn splat_lengths_mut(&mut self) -> &mut HashMap<YarvInsnIdx, SplatLengthDistribution> {
         &mut self.splat_lengths
     }
@@ -1033,16 +1063,25 @@ impl IseqProfile {
         &mut self.forwarded_cis
     }
 
-    /// Mutable access to the `invokeblock` block-handler distributions.
+    /// Mutable access to the `invokeblock` block-handler distributions. Same reason
+    /// as [`Self::super_cme_mut`].
     fn block_handlers_mut(&mut self) -> &mut HashMap<YarvInsnIdx, TypeDistribution> {
+        self.marked_objects_stale = true;
         &mut self.block_handlers
+    }
+
+    /// Mutable access to the `invokeblock` re-profiling windows. Same reason as
+    /// [`Self::super_cme_mut`]: the windows hold block handlers, which are objects.
+    fn block_fallbacks_mut(&mut self) -> &mut HashMap<YarvInsnIdx, BlockFallbackEntry> {
+        self.marked_objects_stale = true;
+        &mut self.block_fallbacks
     }
 
     /// Record one block handler that reached a compiled `yield`'s generic fallback, and say
     /// whether the window it closed makes the case for recompiling the site.
     /// See [`rb_zjit_block_reprofile`].
     fn observe_block_fallback(&mut self, iseq: IseqPtr, insn_idx: YarvInsnIdx, handler: VALUE, argc: usize, arg0: VALUE) -> BlockReprofiled {
-        let entry = self.block_fallbacks
+        let entry = self.block_fallbacks_mut()
             .entry(insn_idx).or_insert_with(|| BlockFallbackEntry {
                 dist: TypeDistribution::new(), symbol_recv: TypeDistribution::new(),
                 samples: 0, refreshes: 0,
@@ -1113,7 +1152,7 @@ impl IseqProfile {
             }
         }
 
-        let handlers = self.block_handlers
+        let handlers = self.block_handlers_mut()
             .entry(insn_idx).or_insert_with(TypeDistribution::new);
         handlers.retain_primary();
         replay_into(handlers, &window);
@@ -1193,7 +1232,7 @@ impl IseqProfile {
     }
 
     /// Run a given callback with every object in IseqProfile
-    pub fn each_object(&self, callback: impl Fn(VALUE)) {
+    pub fn each_object(&self, mut callback: impl FnMut(VALUE)) {
         for entry in &self.entries {
             for distribution in &entry.opnd_types {
                 for profiled_type in distribution.each_item() {
@@ -1228,8 +1267,60 @@ impl IseqProfile {
         }
     }
 
+    /// Every object this profile references, as one dense array the GC can be handed
+    /// directly.
+    ///
+    /// Walking the distributions to find them is what marking used to do on every
+    /// major collection, for every live payload. That walk is a pointer chase through
+    /// the whole profile -- the `entries` vector, an operand-type slice per entry, and
+    /// four hash tables -- so it touches tens of megabytes and takes a cache miss per
+    /// object found, even though the answer only changes when something is profiled.
+    /// So the answer is cached here and rebuilt only after a mutation, which in steady
+    /// state (every hot ISEQ compiled, its instructions done profiling) is never.
+    ///
+    /// The cached array is exactly the set [`Self::each_object`] would yield, so
+    /// marking it retains neither more nor less than before.
+    ///
+    /// A rebuild can allocate, and this runs inside the GC's mark phase. That is
+    /// safe: ZJIT's Rust allocator goes to the system allocator, not to
+    /// `ruby_xmalloc`, so it cannot re-enter the GC. (`GC.stress` over a workload
+    /// with live payloads exercises exactly this.)
+    pub fn marked_objects(&mut self) -> &[VALUE] {
+        if self.marked_objects_stale {
+            self.rebuild_marked_objects();
+        }
+        &self.marked_objects
+    }
+
+    /// Recompute [`Self::marked_objects`] from the distributions.
+    #[cold]
+    fn rebuild_marked_objects(&mut self) {
+        // Reuse the allocation: this runs once per mutation-then-GC, and on a warming
+        // application that is once per payload per collection.
+        let mut objects = std::mem::take(&mut self.marked_objects);
+        objects.clear();
+        self.each_object(|object| {
+            // Deduplicate by linear scan. These arrays hold a handful of classes in
+            // practice, so a scan beats a hash set (which would allocate per
+            // payload); past DEDUP_LIMIT the scan would cost more than the duplicate
+            // marks it saves, so stop looking and just append.
+            const DEDUP_LIMIT: usize = 64;
+            if objects.len() < DEDUP_LIMIT && objects.contains(&object) {
+                return;
+            }
+            objects.push(object);
+        });
+        objects.shrink_to_fit();
+        self.marked_objects = objects;
+        self.marked_objects_stale = false;
+    }
+
     /// Run a given callback with a mutable reference to every object in IseqProfile.
-    pub fn each_object_mut(&mut self, callback: impl Fn(&mut VALUE)) {
+    pub fn each_object_mut(&mut self, mut callback: impl FnMut(&mut VALUE)) {
+        // Compaction rewrites the objects in place, so the dense copy is now stale.
+        // Rebuilding lazily rather than rewriting it here keeps the two ways of
+        // producing it down to one.
+        self.marked_objects_stale = true;
         for entry in &mut self.entries {
             for distribution in &mut entry.opnd_types {
                 for ref mut profiled_type in distribution.each_item_mut() {
