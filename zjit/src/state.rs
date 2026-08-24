@@ -91,6 +91,10 @@ pub struct ZJITState {
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
     jit_frame_allocator: Option<JITFrameAllocator>,
+
+    /// The distinct ISEQs `jit_frames` points at, which is what the GC mark phase
+    /// walks instead of that table. See [`crate::gc::RootIseqs`].
+    root_iseqs: crate::gc::RootIseqs,
 }
 
 /// Tracks the initialization progress
@@ -172,6 +176,7 @@ impl ZJITState {
             perfetto_tracer,
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
+            root_iseqs: Default::default(),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -218,6 +223,11 @@ impl ZJITState {
     /// Get a mutable reference to the JITFrame allocator
     pub fn get_jit_frame_allocator() -> Option<&'static mut JITFrameAllocator> {
         ZJITState::get_instance().jit_frame_allocator.as_mut()
+    }
+
+    /// Owner of the deduplicated root ISEQ set. See [`crate::gc::RootIseqs`].
+    pub fn get_root_iseqs() -> &'static mut crate::gc::RootIseqs {
+        &mut ZJITState::get_instance().root_iseqs
     }
 
     pub fn get_method_annotations() -> &'static cruby_methods::Annotations {
