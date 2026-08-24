@@ -47,8 +47,19 @@ pub struct CodeBlock {
     // Memory block size
     mem_size: usize,
 
-    // Current writing position
+    /// Offset where the outlined (cold) half of the region begins, or `mem_size`
+    /// when the region is not split. See [`crate::virtualmem::VirtualMemory`].
+    outlined_start: usize,
+
+    // Current writing position, in whichever half `outlined` names
     write_pos: usize,
+
+    /// Write position of the half that is *not* current. [`Self::set_outlined`]
+    /// swaps it with `write_pos`.
+    other_write_pos: usize,
+
+    /// Whether `write_pos` currently points into the outlined half.
+    outlined: bool,
 
     // Table of registered label addresses
     label_addrs: Vec<usize>,
@@ -74,11 +85,17 @@ pub struct CodeBlock {
 impl CodeBlock {
     /// Make a new CodeBlock
     pub fn new(mem_block: Rc<RefCell<VirtualMem>>, keep_comments: bool) -> Self {
-        let mem_size = mem_block.borrow().virtual_region_size();
+        let (mem_size, outlined_start) = {
+            let mem_block = mem_block.borrow();
+            (mem_block.virtual_region_size(), mem_block.outlined_start_bytes())
+        };
         Self {
             mem_block,
             mem_size,
+            outlined_start,
             write_pos: 0,
+            other_write_pos: outlined_start,
+            outlined: false,
             label_addrs: Vec::new(),
             label_names: Vec::new(),
             label_refs: Vec::new(),
@@ -93,9 +110,80 @@ impl CodeBlock {
         self.mem_block.borrow().mapped_region_size()
     }
 
+    /// Physical memory backing the inlined (hot) half of the region.
+    pub fn inlined_mapped_size(&self) -> usize {
+        self.mem_block.borrow().inlined_mapped_size()
+    }
+
+    /// Physical memory backing the outlined (cold) half of the region.
+    pub fn outlined_mapped_size(&self) -> usize {
+        self.mem_block.borrow().outlined_mapped_size()
+    }
+
+    /// Bytes of machine code written into the inlined (hot) half.
+    pub fn inlined_code_size(&self) -> usize {
+        self.write_pos_for(false)
+    }
+
+    /// Bytes of machine code written into the outlined (cold) half.
+    pub fn outlined_code_size(&self) -> usize {
+        self.write_pos_for(true) - self.outlined_start
+    }
+
     /// Size of the region in bytes where writes could be attempted.
     pub fn virtual_region_size(&self) -> usize {
         self.mem_size
+    }
+
+    /// True when the region has an outlined half to emit cold code into.
+    pub fn has_outlined_region(&self) -> bool {
+        self.outlined_start < self.mem_size
+    }
+
+    /// Whether writes currently go to the outlined half.
+    pub fn is_outlined(&self) -> bool {
+        self.outlined
+    }
+
+    /// Direct the next writes at the outlined (cold) half of the region, or back at
+    /// the inlined half. Each half keeps its own write position, so switching back
+    /// and forth appends to whichever one is named.
+    ///
+    /// Returns the previous setting, so a caller that borrowed the outlined half can
+    /// put it back. On a region with no outlined half this is a no-op that always
+    /// reports `false`, which is what keeps the unit tests on the old single-arena
+    /// layout.
+    pub fn set_outlined(&mut self, outlined: bool) -> bool {
+        let was_outlined = self.outlined;
+        if !self.has_outlined_region() || outlined == was_outlined {
+            return was_outlined;
+        }
+        std::mem::swap(&mut self.write_pos, &mut self.other_write_pos);
+        self.outlined = outlined;
+        was_outlined
+    }
+
+    /// The write position of the given half, whether or not it is the current one.
+    fn write_pos_for(&self, outlined: bool) -> usize {
+        if outlined == self.outlined { self.write_pos } else { self.other_write_pos }
+    }
+
+    /// A pointer to the outlined half's write position, wherever emission is
+    /// pointed right now. Used to report the range a compile appended there.
+    pub fn outlined_write_ptr(&self) -> CodePtr {
+        self.get_ptr(self.write_pos_for(true))
+    }
+
+    /// One past the last offset the current half accepts writes at. Hot code stops
+    /// at the start of the outlined half rather than running into it.
+    fn write_limit(&self) -> usize {
+        if self.outlined { self.mem_size } else { self.outlined_start }
+    }
+
+    /// Whether an offset falls in the outlined half. Used to aim the write limit at
+    /// the half a patch site is in, which is not always the half emission is on.
+    fn is_outlined_pos(&self, pos: usize) -> bool {
+        pos >= self.outlined_start
     }
 
     /// Add an assembly comment if the feature is on.
@@ -140,6 +228,14 @@ impl CodeBlock {
 
     /// Invoke a callback with write_ptr temporarily adjusted to a given address
     pub fn with_write_ptr(&mut self, code_ptr: CodePtr, callback: impl Fn(&mut CodeBlock)) -> Range<CodePtr> {
+        // The callback overwrites existing code in place, so it must not be one that
+        // switches halves: a `set_outlined` in the middle would carry `code_ptr` off
+        // into the other half's saved position and hand back an empty written range,
+        // which remove_gc_offsets reads.
+        // Everything that patches (invalidation jumps, call-site regeneration) emits
+        // a single jump or call and has no side exits, so there is nothing to switch.
+        debug_assert!(!self.outlined, "with_write_ptr patches the half it is already on");
+
         // Temporarily update the write_pos. Ignore the dropped_bytes flag at the old address.
         let old_write_pos = self.write_pos;
         let old_dropped_bytes = self.dropped_bytes;
@@ -165,6 +261,18 @@ impl CodeBlock {
 
     /// Write a single byte at the current position.
     pub fn write_byte(&mut self, byte: u8) {
+        // Stop at the end of the half being written rather than running into the
+        // other one. [`VirtualMem`] bounds-checks the whole region, which is no
+        // longer the same thing: a write one byte past the inlined half is a
+        // perfectly good address in the outlined half, and would overwrite cold
+        // code that the outlined write position still thinks it owns. Dropping the
+        // byte instead reports the half as full the way running out of region used
+        // to, and `arch_emit` turns that into CompileError::OutOfMemory.
+        if self.write_pos >= self.write_limit() {
+            self.dropped_bytes = true;
+            return;
+        }
+
         let write_ptr = self.get_write_ptr();
         // TODO: check has_capacity()
         if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
@@ -245,7 +353,7 @@ impl CodeBlock {
         self.label_refs.push(LabelRef { pos: self.write_pos, label, num_bytes, encode: Box::new(encode) });
 
         // Move past however many bytes the instruction takes up
-        if self.write_pos + num_bytes < self.mem_size {
+        if self.write_pos + num_bytes < self.write_limit() {
             // Reserve the bytes by writing them rather than by moving the cursor
             // over them. Pages are mapped on first write, so a cursor bump alone
             // leaves a page that cannot be mapped -- the memory limit is
@@ -266,6 +374,7 @@ impl CodeBlock {
     // Link internal label references
     pub fn link_labels(&mut self) -> Result<(), ()> {
         let orig_pos = self.write_pos;
+        let orig_outlined = self.outlined;
         let mut link_result = Ok(());
 
         // For each label reference
@@ -278,6 +387,10 @@ impl CodeBlock {
             assert!(label_addr < self.mem_size);
 
             self.write_pos = ref_pos;
+            // A reference from cold code is filled in after emission has been put
+            // back on the hot half, so name the half the reference is really in:
+            // otherwise its writes look like hot code running past its end.
+            self.outlined = self.is_outlined_pos(ref_pos);
             let encode_result = (label_ref.encode.as_ref())(self, (ref_pos + label_ref.num_bytes) as i64, label_addr as i64);
             link_result = link_result.and(encode_result);
 
@@ -289,6 +402,7 @@ impl CodeBlock {
         }
 
         self.write_pos = orig_pos;
+        self.outlined = orig_outlined;
 
         // Clear the label positions and references
         self.label_addrs.clear();
@@ -399,6 +513,17 @@ impl CodeBlock {
         let virt_mem = VirtualMem::alloc(mem_size, None);
         Self::new(Rc::new(RefCell::new(virt_mem)), false)
     }
+
+    /// Stubbed CodeBlock whose region is split into an inlined and an outlined
+    /// half, like the one ZJIT runs with. [`Self::new_dummy`] deliberately is not,
+    /// so that the backend's disassembly snapshots keep seeing one contiguous
+    /// stream.
+    pub fn new_dummy_split() -> Self {
+        use crate::virtualmem::*;
+        const DEFAULT_MEM_SIZE: usize = 1024 * 1024;
+        let virt_mem = VirtualMem::alloc_split(DEFAULT_MEM_SIZE, None);
+        Self::new(Rc::new(RefCell::new(virt_mem)), false)
+    }
 }
 
 impl crate::virtualmem::CodePtrBase for CodeBlock {
@@ -460,6 +585,70 @@ mod tests
 
         assert_eq!(imm_num_bits(i64::MIN), 64);
         assert_eq!(imm_num_bits(i64::MAX), 64);
+    }
+
+    #[test]
+    fn test_set_outlined_keeps_a_write_position_per_half() {
+        let mut cb = CodeBlock::new_dummy_split();
+        assert!(cb.has_outlined_region());
+        let outlined_start = cb.outlined_write_ptr().as_offset();
+        assert!(outlined_start > 0);
+
+        cb.write_byte(1);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(0, cb.outlined_code_size());
+
+        // Switching halves parks the inlined write position rather than losing it.
+        let was_outlined = cb.set_outlined(true);
+        assert!(!was_outlined);
+        assert!(cb.is_outlined());
+        cb.write_bytes(&[2, 3]);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(2, cb.outlined_code_size());
+        assert_eq!(outlined_start + 2, cb.outlined_write_ptr().as_offset());
+
+        // And switching back appends to the inlined half where it left off.
+        cb.set_outlined(was_outlined);
+        assert!(!cb.is_outlined());
+        assert_eq!(1, cb.get_write_pos());
+        cb.write_byte(4);
+        assert_eq!(2, cb.inlined_code_size());
+        assert_eq!(2, cb.outlined_code_size());
+    }
+
+    #[test]
+    fn test_inlined_half_stops_at_the_boundary_instead_of_overwriting_cold_code() {
+        let mut cb = CodeBlock::new_dummy_split();
+        let half = cb.virtual_region_size() / 2;
+
+        // Put a byte in the outlined half...
+        cb.set_outlined(true);
+        cb.write_byte(0x11);
+        cb.set_outlined(false);
+
+        // ...then run the inlined half up to the boundary and one byte past it.
+        cb.set_write_ptr(cb.get_ptr(half - 1));
+        cb.write_byte(0x22);
+        assert!(!cb.has_dropped_bytes(), "the last byte of the inlined half is writable");
+        assert_eq!(half, cb.get_write_pos());
+
+        cb.write_byte(0x33);
+        assert!(cb.has_dropped_bytes(), "a write past the inlined half should be dropped");
+        assert_eq!(half, cb.get_write_pos(), "the dropped byte should not advance the position");
+        assert_eq!(1, cb.outlined_code_size(), "cold code should not have been overwritten");
+    }
+
+    #[test]
+    fn test_unsplit_code_block_ignores_set_outlined() {
+        // The backends' disassembly snapshots run on an unsplit region, where
+        // asking for the outlined half has to be a no-op.
+        let mut cb = CodeBlock::new_dummy();
+        assert!(!cb.has_outlined_region());
+        assert!(!cb.set_outlined(true));
+        assert!(!cb.is_outlined());
+        cb.write_byte(1);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(0, cb.outlined_code_size());
     }
 
     #[test]
