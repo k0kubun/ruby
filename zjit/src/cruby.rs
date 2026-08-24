@@ -132,6 +132,13 @@ unsafe extern "C" {
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
 
+    /// Mark a contiguous array of `VALUE`s movably, i.e. `rb_gc_mark_movable` for
+    /// each element but with the per-element work inlined into one C loop instead
+    /// of one FFI call per object. ZJIT's GC callbacks walk arrays of hundreds of
+    /// thousands of `VALUE`s on every collection, where the call overhead is a
+    /// measurable share of the pause. Declared in `internal/gc.h`.
+    pub fn rb_gc_mark_values(n: c_long, values: *const VALUE);
+
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
     pub fn rb_float_new(d: f64) -> VALUE;
@@ -1229,9 +1236,6 @@ mod manual_defs {
     pub const VM_CALL_SUPER : u32 = 1 << VM_CALL_SUPER_bit;
     pub const VM_CALL_ZSUPER : u32 = 1 << VM_CALL_ZSUPER_bit;
     pub const VM_CALL_OPT_SEND : u32 = 1 << VM_CALL_OPT_SEND_bit;
-
-    // From internal/struct.h - in anonymous enum, so we can't easily import it
-    pub const RSTRUCT_EMBED_LEN_MASK: usize = (RUBY_FL_USER7 | RUBY_FL_USER6 | RUBY_FL_USER5 | RUBY_FL_USER4 | RUBY_FL_USER3 |RUBY_FL_USER2 | RUBY_FL_USER1) as usize;
 
     // From iseq.h - via a different constant, which seems to confuse bindgen
     pub const ISEQ_TRANSLATED: usize = RUBY_FL_USER8 as usize;
