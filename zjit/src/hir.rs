@@ -3510,12 +3510,13 @@ impl Function {
     /// Array was auto-splatted into `args`.
     fn dispatch_invoke_block_iseqs(
         &mut self,
-        iseqs: &[IseqPtr],
+        iseqs: &[(IseqPtr, Option<usize>)],
         block: BlockId,
         insn_idx: u32,
         level: u32,
         cd: *const rb_call_data,
         args: Vec<InsnId>,
+        caller_argc: usize,
         state: InsnId,
         guard_state: InsnId,
     ) -> (BlockId, InsnId) {
@@ -3529,8 +3530,7 @@ impl Function {
 
         // Monomorphic: guard the tag and the ISEQ, then invoke directly in-place.
         // No need for new HIR blocks.
-        if iseqs.len() == 1 && !self.policy.no_side_exits {
-            let block_iseq = iseqs[0];
+        if let (1, false, Some(&(block_iseq, None))) = (iseqs.len(), self.policy.no_side_exits, iseqs.first()) {
             self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state: guard_state, recompile: Some(Recompile) });
             let captured = self.untag_block_handler(block, block_handler);
 
@@ -3561,7 +3561,7 @@ impl Function {
         let captured_iseq = self.load_captured_code_iseq(dispatch_block, captured);
 
         let mut compare_block = dispatch_block;
-        for &block_iseq in iseqs {
+        for &(block_iseq, splat_num) in iseqs {
             let expected = self.push_insn(compare_block, Insn::Const { val: Const::CPtr(block_iseq as *const u8) });
             let iseq_matches = self.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
             let direct_block = self.new_block(insn_idx);
@@ -3571,7 +3571,43 @@ impl Function {
                 if_true: BranchEdge { target: direct_block, args: vec![] },
                 if_false: BranchEdge { target: miss_block, args: vec![] },
             });
-            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: args.clone(), state });
+            // This candidate takes several parameters from the one yielded value, so
+            // destructure it the way arg_setup_block would. Anything that is not an Array of
+            // exactly that length joins the generic fallback below, which handles every shape.
+            let (direct_block, call_args, call_state) = match splat_num {
+                None => (direct_block, args.clone(), state),
+                Some(splat_num) => {
+                    let arg0 = args[0];
+                    let length_block = self.new_block(insn_idx);
+                    let expand_block = self.new_block(insn_idx);
+                    let is_array = self.push_insn(direct_block, Insn::HasType { val: arg0, expected: types::ArrayExact });
+                    self.push_insn(direct_block, Insn::CondBranch {
+                        val: is_array,
+                        if_true: BranchEdge { target: length_block, args: vec![] },
+                        if_false: BranchEdge { target: fallback_block, args: vec![] },
+                    });
+                    let array = self.push_insn(length_block, Insn::RefineType { val: arg0, new_type: types::ArrayExact });
+                    let length = self.push_insn(length_block, Insn::ArrayLength { array });
+                    let expected_length = self.push_insn(length_block, Insn::Const { val: Const::CInt64(splat_num as i64) });
+                    let length_matches = self.push_insn(length_block, Insn::IsBitEqual { left: length, right: expected_length });
+                    self.push_insn(length_block, Insn::CondBranch {
+                        val: length_matches,
+                        if_true: BranchEdge { target: expand_block, args: vec![] },
+                        if_false: BranchEdge { target: fallback_block, args: vec![] },
+                    });
+                    let expanded: Vec<InsnId> = (0..splat_num).map(|idx| {
+                        let index = self.push_insn(expand_block, Insn::Const { val: Const::CInt64(idx as i64) });
+                        self.push_insn(expand_block, Insn::ArrayAref { array, index })
+                    }).collect();
+                    // See the single-ISEQ expansion at the yield site: the dispatch reads the
+                    // caller's saved SP off this state, so its stack has to end in the
+                    // expanded arguments.
+                    let expanded_state = self.frame_state(state).with_replaced_args(&expanded, caller_argc);
+                    let expanded_state = self.push_insn(expand_block, Insn::Snapshot { state: Box::new(expanded_state) });
+                    (expand_block, expanded, expanded_state)
+                }
+            };
+            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: call_args, state: call_state });
             self.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
             compare_block = miss_block;
         }
@@ -10766,7 +10802,12 @@ fn add_iseq_to_hir(
                     // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
                     let mut fallback_reason = InvokeBlockNotSpecialized;
                     // The first entry of buckets is the most common type, so it will be inserted to direct_iseqs first too.
-                    let mut direct_iseqs: Vec<IseqPtr> = vec![];
+                    // Each candidate carries the arity to auto-splat the lone yielded argument
+                    // into, or None when it takes the arguments as they are. Unlike the
+                    // single-ISEQ dispatch above, a candidate that needs the expansion can be
+                    // mixed in freely here: the expansion's miss joins this site's own generic
+                    // fallback, which still holds the unexpanded argument.
+                    let mut direct_iseqs: Vec<(IseqPtr, Option<usize>)> = vec![];
                     if let Some(summary) = block_handler_summary.as_ref() {
                         if can_direct_invoke_block(flags)
                             && (summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
@@ -10777,12 +10818,24 @@ fn add_iseq_to_hir(
                                 let obj = profiled_type.class();
                                 if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                     let iseq = obj.as_iseq();
+                                    // Deduplicate direct_iseqs.
+                                    if direct_iseqs.iter().any(|&(seen, _)| seen == iseq) {
+                                        continue;
+                                    }
                                     match can_direct_invoke_block_iseq(iseq, args.len()) {
-                                        // Push an ISEQ that can be dispatched directly, deduplicating direct_iseqs.
-                                        Ok(()) => if !direct_iseqs.contains(&iseq) {
-                                            direct_iseqs.push(iseq);
+                                        Ok(()) => direct_iseqs.push((iseq, None)),
+                                        Err(reason) => {
+                                            fallback_reason = reason;
+                                            // A lone yielded value destructures into a block that
+                                            // takes several parameters; dispatch that shape too.
+                                            if args.len() == 1 {
+                                                if let Some(splat_num) = block_autosplat_arity(iseq) {
+                                                    if can_direct_invoke_block_iseq(iseq, splat_num).is_ok() {
+                                                        direct_iseqs.push((iseq, Some(splat_num)));
+                                                    }
+                                                }
+                                            }
                                         }
-                                        Err(reason) => fallback_reason = reason,
                                     }
                                 }
                             }
@@ -10795,7 +10848,7 @@ fn add_iseq_to_hir(
                             let covered = summary.coverage(|_, profiled_type| {
                                 !profiled_type.is_empty()
                                     && unsafe { rb_IMEMO_TYPE_P(profiled_type.class(), imemo_iseq) == 1 }
-                                    && direct_iseqs.contains(&profiled_type.class().as_iseq())
+                                    && direct_iseqs.iter().any(|&(i, _)| i == profiled_type.class().as_iseq())
                             });
                             if covered < CHAIN_COVERAGE_THRESHOLD {
                                 direct_iseqs.clear();
@@ -10843,7 +10896,7 @@ fn add_iseq_to_hir(
                         fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, call_state)
                     } else if !direct_iseqs.is_empty() {
                         let level = get_lvar_level(exit_state.iseq);
-                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, call_state, exit_id);
+                        let (continue_block, result) = fun.dispatch_invoke_block_iseqs(&direct_iseqs, block, insn_idx, level, cd, args, caller_argc, call_state, exit_id);
                         // Continue compilation from the block the dispatch ended in
                         block = continue_block;
                         result
