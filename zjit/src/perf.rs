@@ -37,6 +37,15 @@ pub(crate) fn register_current_iseq_range(cb: &CodeBlock, iseq: IseqPtr, start: 
     }
 }
 
+/// Register the range an ISEQ's side exits occupy in the outlined half of the
+/// code region when ISEQ perf output is enabled.
+pub(crate) fn register_current_iseq_exits_range(cb: &CodeBlock, iseq: IseqPtr, start: CodePtr) {
+    if get_option!(perf) == Some(PerfMap::ISEQ) {
+        let symbol_name = format!("{} (exits)", iseq_get_location(iseq, 0));
+        register_range(cb, symbol_name, start, cb.outlined_write_ptr());
+    }
+}
+
 /// Start a HIR symbol range when HIR perf output is enabled.
 pub(crate) fn hir_symbol_range_start(asm: &mut Assembler, insn: &Insn) -> Option<SymbolRange> {
     let symbol_range = new_hir_symbol_range()?;
