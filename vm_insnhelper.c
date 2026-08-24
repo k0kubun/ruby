@@ -6396,9 +6396,18 @@ zjit_send_cache_direct_cme(const struct rb_zjit_send_cache *cache, const struct 
  * -- a cache whose class or method entry was collected has had cc->klass set to
  * Qundef by vm_cc_invalidate(), and no live class is Qundef, so the class
  * compare rejects it before the method entry (which must not be read after
- * invalidation) is touched. */
+ * invalidation) is touched.
+ *
+ * `cd` is the bytecode call site's call data, or NULL for a call ZJIT synthesized
+ * that no bytecode instruction owns -- the send a `yield` to a Symbol block stands
+ * for (see rb_zjit_symbol_block_send_cached()). A miss then searches from `ci`
+ * alone rather than through vm_search_method_fastpath(): that function memoizes
+ * into cd->cc, which only a call site whose ISEQ marks it may hold, and it
+ * write-barriers the result against the *running* ISEQ, which does not own the
+ * synthesized cd either. Both callers pass the ci the search must use. */
 static inline const struct rb_callcache *
 zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
+                       const struct rb_callinfo *ci,
                        struct rb_zjit_send_cache *cache, VALUE recv)
 {
     VALUE klass = CLASS_OF(recv);
@@ -6414,7 +6423,9 @@ zjit_send_cache_search(rb_control_frame_t *reg_cfp, struct rb_call_data *cd,
     }
 
     /* Exactly what the old code path did, via rb_vm_opt_send_without_block(). */
-    const struct rb_callcache *cc = vm_search_method_fastpath(reg_cfp, cd, klass);
+    const struct rb_callcache *cc = cd != NULL
+        ? vm_search_method_fastpath(reg_cfp, cd, klass)
+        : rb_vm_search_method_slowpath(ci, klass);
     bool evicted = cached != NULL && cached->klass != klass;
     bool cacheable = zjit_send_cache_cacheable_p(cc);
     if (LIKELY(cacheable)) {
@@ -6467,7 +6478,7 @@ rb_zjit_send_cached_without_block(rb_execution_context_t *ec, rb_control_frame_t
         .argc = argc,
         .cd = cd,
     };
-    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, cache, recv);
+    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, ci, cache, recv);
     calling.cc = cc;
     VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling);
     VM_EXEC(ec, val);
@@ -6494,11 +6505,108 @@ rb_zjit_send_cached(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
         .argc = argc,
         .cd = cd,
     };
-    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, cache, recv);
+    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, cd, ci, cache, recv);
     calling.cc = cc;
     VALUE val = vm_cc_call(cc)(ec, GET_CFP(), &calling);
     VM_EXEC(ec, val);
     return val;
+}
+
+/* Whether a callcache the table produced may be dispatched in place of the
+ * lookup vm_call_symbol() would have done for a Symbol block handler.
+ *
+ * The two searches differ in exactly one way. vm_call_symbol() resolves the
+ * method with rb_callable_method_entry_with_refinements(klass, mid, NULL), which
+ * differs from the ordinary rb_callable_method_entry() the table's search runs
+ * only for a VM_METHOD_TYPE_REFINED entry -- there it resolves the refinement
+ * away against a nil cref, while an ordinary send keeps the refined entry and
+ * lets vm_call_refined() pick a refinement out of the *caller's* cref. A Symbol
+ * block never sees the caller's refinements (vm_caller_setup_arg_block() turns
+ * `&:sym` into an ifunc lambda when any are active), so a refined entry has to go
+ * back to vm_call_symbol().
+ *
+ * And having found the entry, vm_call_symbol() dispatches only a public one
+ * through vm_call_method_each_type() -- which is what vm_cc_call() reaches for a
+ * public method too. A private or protected one it turns into method_missing,
+ * unconditionally: unlike an ordinary send, there is no receiver-less form that
+ * reaches a private method and no caller-is-an-instance test that reaches a
+ * protected one, so neither may be dispatched from here.
+ *
+ * Everything this rejects is rare (a refinement, a visibility error, a name that
+ * is not defined at all) and lands in vm_call_symbol() itself rather than in an
+ * approximation of it. */
+static inline bool
+zjit_symbol_block_servable_p(const struct rb_callcache *cc)
+{
+    const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
+    return cme != NULL
+        && METHOD_ENTRY_VISI(cme) == METHOD_VISI_PUBLIC
+        && cme->def->type != VM_METHOD_TYPE_REFINED;
+}
+
+/* Table-backed dispatch for a `yield` whose block handler is a Symbol.
+ *
+ * `vm_invoke_symbol_block()` takes the first yielded value as a receiver and
+ * sends the Symbol's method to it with the rest -- and resolves that method from
+ * scratch on every single call, because vm_call_symbol() builds its callcache on
+ * the stack and there is no call site to memoize into. ZJIT compiles the Symbol
+ * arm of a `yield` into that send, and where the receiver's class does not
+ * resolve at compile time this is what dispatches it: the same class table an
+ * ordinary megamorphic send site probes, on a call shape synthesized from the
+ * Symbol.
+ *
+ * `ci_value` is that shape, a packed (immediate, GC-free) callinfo naming the
+ * Symbol's method with the send's own argc -- the `yield`'s call data names no
+ * method and counts the receiver among its arguments, so it cannot be used here.
+ * `symbol` is the handler JIT code has already compared the site's block handler
+ * against, and is what the fallback needs to reproduce vm_call_symbol() exactly,
+ * method_missing and its "inadvertent symbol creation" rules included. */
+VALUE
+rb_zjit_symbol_block_send_cached(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
+                                 VALUE symbol, VALUE ci_value, struct rb_zjit_send_cache *cache)
+{
+    stack_check(ec);
+    const struct rb_callinfo *ci = (const struct rb_callinfo *)ci_value;
+    int argc = vm_ci_argc(ci);
+    VALUE recv = TOPN(argc);
+    struct rb_calling_info calling = {
+        .block_handler = VM_BLOCK_HANDLER_NONE,
+        .kw_splat = false,
+        .recv = recv,
+        .argc = argc,
+        .cd = NULL,
+        .cc = NULL,
+    };
+
+    const struct rb_callcache *cc = zjit_send_cache_search(reg_cfp, NULL, ci, cache, recv);
+    VALUE val;
+    if (LIKELY(zjit_symbol_block_servable_p(cc))) {
+        /* A call data on the machine stack, the way invokesuper and
+         * vm_call_symbol() itself dispatch: `ci` is packed and `cc` came from the
+         * table, so there is nothing here for an ISEQ to own or for the GC to
+         * hear about beyond this frame. */
+        struct rb_call_data cd = { .ci = ci, .cc = cc };
+        calling.cd = &cd;
+        calling.cc = cc;
+        val = vm_cc_call(cc)(ec, GET_CFP(), &calling);
+    }
+    else {
+        val = vm_call_symbol(ec, GET_CFP(), &calling, ci, symbol, vm_ci_flag(ci));
+    }
+    VM_EXEC(ec, val);
+    return val;
+}
+
+/* The packed callinfo for a call shape ZJIT synthesized, or 0 when the shape does
+ * not fit in one. A packed callinfo is an immediate: no allocation, no GC root,
+ * and safe for JIT code to bake in. See rb_zjit_symbol_block_send_cached(). */
+VALUE
+rb_zjit_packed_ci(ID mid, unsigned int flags, unsigned int argc)
+{
+    if (!USE_EMBED_CI || !VM_CI_EMBEDDABLE_P(mid, flags, argc, NULL)) {
+        return 0;
+    }
+    return (VALUE)vm_ci_new_id(mid, flags, argc, NULL);
 }
 
 /* Field offsets and flag masks that the inline send-cache probe bakes into JIT
@@ -6513,6 +6621,53 @@ size_t rb_zjit_cme_def_offset(void) { return offsetof(rb_callable_method_entry_t
 size_t rb_zjit_def_iseqptr_offset(void) { return offsetof(rb_method_definition_t, body.iseq.iseqptr); }
 VALUE rb_zjit_method_entry_invalidated_flag(void) { return IMEMO_FL_USER5; }
 size_t rb_zjit_mega_direct_max_stack(void) { return ZJIT_MEGA_DIRECT_MAX_STACK; }
+
+/* Field offsets and flag masks the inline *block* dispatch bakes into JIT code.
+ * See rb_zjit_block_direct_layout() in zjit.h: the dispatch resolves the block
+ * ISEQ at run time, so it has to re-derive there what rb_simple_iseq_p() and
+ * vm_callee_setup_block_arg() decide in C. */
+size_t rb_zjit_iseq_body_param_flags_offset(void) { return offsetof(struct rb_iseq_constant_body, param.flags); }
+size_t rb_zjit_iseq_body_param_lead_num_offset(void) { return offsetof(struct rb_iseq_constant_body, param.lead_num); }
+size_t rb_zjit_iseq_body_local_table_size_offset(void) { return offsetof(struct rb_iseq_constant_body, local_table_size); }
+size_t rb_zjit_iseq_body_stack_max_offset(void) { return offsetof(struct rb_iseq_constant_body, stack_max); }
+
+/* The bitfields in `param.flags` have no portable layout, so build each mask by
+ * setting the bits in a zeroed body and reading the storage unit back out. */
+static uint32_t
+zjit_param_flags_word(const struct rb_iseq_constant_body *body)
+{
+    uint32_t word = 0;
+    STATIC_ASSERT(zjit_param_flags_fit_in_u32, sizeof(body->param.flags) == sizeof(uint32_t));
+    memcpy(&word, &body->param.flags, sizeof(word));
+    return word;
+}
+
+uint32_t
+rb_zjit_iseq_param_flags_not_simple_mask(void)
+{
+    struct rb_iseq_constant_body body;
+    memset(&body, 0, sizeof(body));
+    /* Keep in sync with rb_simple_iseq_p(). */
+    body.param.flags.has_opt = TRUE;
+    body.param.flags.has_rest = TRUE;
+    body.param.flags.has_post = TRUE;
+    body.param.flags.has_kw = TRUE;
+    body.param.flags.has_kwrest = TRUE;
+    body.param.flags.accepts_no_kwarg = TRUE;
+    body.param.flags.forwardable = TRUE;
+    body.param.flags.has_block = TRUE;
+    body.param.flags.accepts_no_block = TRUE;
+    return zjit_param_flags_word(&body);
+}
+
+uint32_t
+rb_zjit_iseq_param_flags_ambiguous_param0_mask(void)
+{
+    struct rb_iseq_constant_body body;
+    memset(&body, 0, sizeof(body));
+    body.param.flags.ambiguous_param0 = TRUE;
+    return zjit_param_flags_word(&body);
+}
 
 #endif // USE_ZJIT
 

@@ -5321,20 +5321,31 @@ pub(crate) mod hir_build_tests {
           v56:CInt64 = IntAnd v54, v55
           v58:CInt64[3] = Const CInt64(3)
           v59:CBool = IsBitEqual v56, v58
-          CondBranch v59, bb12(), bb11()
+          CondBranch v59, bb12(), bb13()
         bb12():
           v61:BasicObject = InvokeBlockIfunc v54, v27
           Jump bb10(v61)
+        bb13():
+          v63:CInt64[1] = Const CInt64(1)
+          v64:CBool = IsBitEqual v56, v63
+          CondBranch v64, bb14(), bb11()
+        bb14():
+          v66:CInt64[-4] = Const CInt64(-4)
+          v67:CInt64 = IntAnd v54, v66
+          v68:CPtr = LoadField v67, :code_iseq@0x1010
+          v69:BasicObject = InvokeBlockIseqDynamic v67, v27 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb10(v69)
         bb11():
-          v63:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: no block handler profile
-          Jump bb10(v63)
+          BlockReprofile v54
+          v72:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: no block handler profile
+          Jump bb10(v72)
         bb10(v57:BasicObject):
-          v67:BasicObject = InvokeBuiltin dir_s_close, v18, v27
+          v76:BasicObject = InvokeBuiltin dir_s_close, v18, v27
           CheckInterrupts
           Return v57
-        bb4(v73:BasicObject, v74:BasicObject, v75:BasicObject, v76:BasicObject, v77:BasicObject, v78:BasicObject):
+        bb4(v82:BasicObject, v83:BasicObject, v84:BasicObject, v85:BasicObject, v86:BasicObject, v87:BasicObject):
           CheckInterrupts
-          Return v78
+          Return v87
         ");
     }
 
@@ -5858,13 +5869,24 @@ pub(crate) mod hir_build_tests {
           v13:CInt64 = IntAnd v11, v12
           v15:CInt64[3] = Const CInt64(3)
           v16:CBool = IsBitEqual v13, v15
-          CondBranch v16, bb6(), bb5()
+          CondBranch v16, bb6(), bb7()
         bb6():
           v18:BasicObject = InvokeBlockIfunc v11
           Jump bb4(v18)
+        bb7():
+          v20:CInt64[1] = Const CInt64(1)
+          v21:CBool = IsBitEqual v13, v20
+          CondBranch v21, bb8(), bb5()
+        bb8():
+          v23:CInt64[-4] = Const CInt64(-4)
+          v24:CInt64 = IntAnd v11, v23
+          v25:CPtr = LoadField v24, :code_iseq@0x1001
+          v26:BasicObject = InvokeBlockIseqDynamic v24 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v26)
         bb5():
-          v20:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: no block handler profile
-          Jump bb4(v20)
+          BlockReprofile v11
+          v29:BasicObject = InvokeBlock # SendFallbackReason: InvokeBlock: no block handler profile
+          Jump bb4(v29)
         bb4(v14:BasicObject):
           CheckInterrupts
           Return v14
@@ -5900,13 +5922,24 @@ pub(crate) mod hir_build_tests {
           v22:CInt64 = IntAnd v20, v21
           v24:CInt64[3] = Const CInt64(3)
           v25:CBool = IsBitEqual v22, v24
-          CondBranch v25, bb6(), bb5()
+          CondBranch v25, bb6(), bb7()
         bb6():
           v27:BasicObject = InvokeBlockIfunc v20, v12, v13
           Jump bb4(v27)
+        bb7():
+          v29:CInt64[1] = Const CInt64(1)
+          v30:CBool = IsBitEqual v22, v29
+          CondBranch v30, bb8(), bb5()
+        bb8():
+          v32:CInt64[-4] = Const CInt64(-4)
+          v33:CInt64 = IntAnd v20, v32
+          v34:CPtr = LoadField v33, :code_iseq@0x1003
+          v35:BasicObject = InvokeBlockIseqDynamic v33, v12, v13 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb4(v35)
         bb5():
-          v29:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: no block handler profile
-          Jump bb4(v29)
+          BlockReprofile v20
+          v38:BasicObject = InvokeBlock v12, v13 # SendFallbackReason: InvokeBlock: no block handler profile
+          Jump bb4(v38)
         bb4(v23:BasicObject):
           CheckInterrupts
           Return v23
@@ -6200,18 +6233,29 @@ pub(crate) mod hir_build_tests {
           v82:CInt64 = IntAnd v80, v81
           v84:CInt64[3] = Const CInt64(3)
           v85:CBool = IsBitEqual v82, v84
-          CondBranch v85, bb14(), bb13()
+          CondBranch v85, bb14(), bb15()
         bb14():
           v87:BasicObject = InvokeBlockIfunc v80, v77
           Jump bb12(v87)
+        bb15():
+          v89:CInt64[1] = Const CInt64(1)
+          v90:CBool = IsBitEqual v82, v89
+          CondBranch v90, bb16(), bb13()
+        bb16():
+          v92:CInt64[-4] = Const CInt64(-4)
+          v93:CInt64 = IntAnd v80, v92
+          v94:CPtr = LoadField v93, :code_iseq@0x1001
+          v95:BasicObject = InvokeBlockIseqDynamic v93, v77 # SendFallbackReason: InvokeBlock: run-time block ISEQ is not directly callable
+          Jump bb12(v95)
         bb13():
-          v89:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: no block handler profile
-          Jump bb12(v89)
+          BlockReprofile v80
+          v98:BasicObject = InvokeBlock v77 # SendFallbackReason: InvokeBlock: no block handler profile
+          Jump bb12(v98)
         bb12(v83:BasicObject):
-          v94:Fixnum[1] = Const Value(1)
-          v95:Fixnum = FixnumAdd v71, v94
+          v103:Fixnum[1] = Const Value(1)
+          v104:Fixnum = FixnumAdd v71, v103
           PatchPoint NoEPEscape(each)
-          Jump bb8(v70, v95)
+          Jump bb8(v70, v104)
         bb4(v23:BasicObject, v24:NilClass):
           v28:BasicObject = InvokeBuiltin <inline_expr>, v23
           Jump bb5(v23, v24, v28)

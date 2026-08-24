@@ -5264,7 +5264,7 @@ fn test_new_hash_dynamic_sym_keys_gc_stress() {
         ensure
           GC.stress = false
         end
-    "#), @r#"[Hash, 2, [3], [3]]"#);
+    "#), @"[Hash, 2, [3], [3]]");
 }
 
 // The NewHash inline-alloc fast path must bake the slot-size shape_id into the
@@ -5954,7 +5954,7 @@ fn test_new_array_embedded_memcpy_gc_stress() {
         ensure
           GC.stress = false
         end
-    "#), @r#"[false, 17, Array]"#);
+    "#), @"[false, 17, Array]");
 }
 
 #[test]
@@ -5982,7 +5982,7 @@ fn test_array_dup_embedded_gc_stress() {
         ensure
           GC.stress = false
         end
-    "#), @r#"[false, Array, [1, 100000000000000000000, :sym, :extra]]"#);
+    "#), @"[false, Array, [1, 100000000000000000000, :sym, :extra]]");
 }
 
 #[test]
@@ -11098,6 +11098,240 @@ fn test_megamorphic_direct_disabled_still_dispatches_correctly() {
     assert_snapshot!(result, @"435");
 }
 
+/// A Ruby-level iterator, so its `yield` really is the `invokeblock` instruction rather than
+/// `rb_yield()` -- only the former reaches `vm_invoke_symbol_block()`, whose semantics the
+/// Symbol block arm reproduces. `SYM_MEGA_SETUP` then hands it 60 unrelated receiver classes,
+/// which is more than any guard chain covers, so the arm's send has to be dispatched through
+/// the class table. See crate::hir::Function::push_symbol_block_mega.
+const SYM_MEGA_SETUP: &str = r#"
+    def each_of(a)
+      i = 0
+      out = []
+      while i < a.size
+        out << (yield a[i])
+        i += 1
+      end
+      out
+    end
+    SYM_KLASSES = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+    SYM_OBJS = SYM_KLASSES.map(&:new)
+    def sym_run(a) = each_of(a, &:value)
+    30.times { sym_run(SYM_OBJS) }
+"#;
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_every_class() {
+    // The baseline for the whole feature: a `yield` to `&:sym` over 60 receiver classes reaches
+    // each class's own method, and the dispatch happens inside JIT code rather than through
+    // rb_vm_invokeblock().
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(SYM_MEGA_SETUP);
+    let before = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    let result = inspect(r#"
+        k = Class.new; k.class_eval("def value; 99; end")
+        [sym_run(SYM_OBJS).sum, sym_run(SYM_OBJS + [k.new]).last]
+    "#);
+    let after = crate::state::ZJITState::get_counters().send_megamorphic_direct;
+    assert!(after > before,
+        "expected the Symbol block's send to be dispatched out of the class table");
+    assert_snapshot!(result, @"[1770, 99]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_passes_arguments() {
+    // The receiver is the first yielded value and the rest are the send's arguments, which is
+    // the layout the operand stack already has -- a wrong frame layout shows up as a wrong
+    // argument rather than a crash.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of2(a, x, y)
+          i = 0; out = []
+          while i < a.size
+            out << (yield a[i], x, y)
+            i += 1
+          end
+          out
+        end
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def add(a, b) = a + b + #{i}"); k }
+        objs = ks.map(&:new)
+        out = nil
+        30.times { out = each_of2(objs, 1, 20, &:add) }
+        [out.first, out.last, out.size]
+    "#), @"[21, 80, 60]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_rejects_private_and_protected() {
+    // `vm_call_symbol()` reaches public methods only. A private one is not callable because the
+    // `yield`'s call flags never carry VM_CALL_FCALL, and a protected one is rejected outright
+    // -- there is no caller-is-an-instance test the way an ordinary send has, so not even a
+    // receiver of the caller's own class may reach it.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        klass = Class.new do
+          def pub = :pub
+          private def priv = :priv
+          protected def prot = :prot
+          define_method(:from_inside) { |o, sym| each_of([o], &sym) }
+        end
+        def run(a, sym) = (each_of(a, &sym) rescue [$!.class, $!.message])
+        30.times { run([klass.new], :pub) }
+        30.times { run([klass.new], :priv) }
+        30.times { klass.new.from_inside(klass.new, :prot) rescue nil }
+        inside = (klass.new.from_inside(klass.new, :prot) rescue [$!.class, $!.message[0, 14]])
+        [run([klass.new], :pub), run([klass.new], :priv).first, run([klass.new], :prot).first, inside]
+    "#), @"[[:pub], NoMethodError, NoMethodError, [NoMethodError, \"protected meth\"]]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_method_missing() {
+    // A name no receiver defines is not something the table may answer: it has no method entry
+    // to validate, so the call goes to vm_call_symbol(), which builds the method_missing
+    // arguments the way the interpreter does.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        mm = Class.new { def method_missing(n, *a) = [:mm, n, a] }
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+        objs = ks.map(&:new) + [mm.new]
+        out = nil
+        30.times { out = each_of(objs, &:value) }
+        nome = (each_of([Object.new], &:value) rescue $!.class)
+        [out.size, out.last, nome]
+    "#), @"[61, [:mm, :value, []], NoMethodError]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_sees_a_method_redefined_mid_iteration() {
+    // Redefinition invalidates the method entry the table cached, which both the inline probe
+    // and the C helper reject before dispatching -- so the change lands on the very next
+    // element rather than at the next compile.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        REDEF = Class.new { def v = 1 }
+        def each_redef(a)
+          i = 0; out = []
+          while i < a.size
+            out << (yield a[i])
+            REDEF.class_eval("def v = 2") if i == 1
+            i += 1
+          end
+          out
+        end
+        objs = Array.new(4) { REDEF.new }
+        30.times { REDEF.class_eval("def v = 1"); each_redef(objs) { |o| o.v } }
+        REDEF.class_eval("def v = 1")
+        each_redef(objs, &:v)
+    "#), @"[1, 1, 2, 2]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_raises_after_the_method_is_undefined() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        UNDEFD = Class.new { def gone = :here }
+        o = UNDEFD.new
+        30.times { each_of([o, o], &:gone) }
+        before = each_of([o], &:gone)
+        UNDEFD.class_eval { undef_method :gone }
+        [before, (each_of([o], &:gone) rescue $!.class)]
+    "#), @"[[:here], NoMethodError]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_handles_immediate_receivers() {
+    // The inline probe leaves immediates and `false` to the C helper, because CLASS_OF() on one
+    // is a table lookup rather than a field load. They still have to reach the right method.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        out = nil
+        30.times { out = each_of([1, :sym, nil, true, false, 2.0, "s".freeze], &:inspect) }
+        out
+    "#), @r#"["1", ":sym", "nil", "true", "false", "2.0", "\"s\""]"#);
+}
+
+#[test]
+fn test_symbol_block_megamorphic_ignores_refinements() {
+    // A Symbol block never sees a refinement: vm_caller_setup_arg_block() turns `&:sym` written
+    // where one is active into an ifunc lambda instead of a Symbol handler, and
+    // vm_call_symbol() resolves against a nil cref. So the table, whose search does not consult
+    // a cref either, may only answer for a method entry that is not a refined one.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        module Ref
+          refine String do
+            def upcase = "REFINED"
+          end
+        end
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        def plain(a) = each_of(a, &:upcase)
+        eval("using Ref\ndef refined(a) = each_of(a, &:upcase)", TOPLEVEL_BINDING)
+        30.times { plain(["a"]); refined(["a"]) }
+        [plain(["a"]), refined(["a"]), plain(["a"])]
+    "#), @r#"[["A"], ["REFINED"], ["A"]]"#);
+}
+
+#[test]
+fn test_symbol_block_megamorphic_dispatches_correctly_under_gc_stress() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def each_of(a)
+          i = 0; out = []
+          while i < a.size; out << (yield a[i]); i += 1; end
+          out
+        end
+        ks = 60.times.map { |i| k = Class.new; k.class_eval("def value; #{i}; end"); k }
+        objs = ks.map(&:new)
+        30.times { each_of(objs, &:value) }
+        GC.stress = true
+        out = each_of(objs, &:value).sum + each_of([1, "a", :b], &:inspect).size
+        GC.stress = false
+        GC.compact
+        [out, each_of(objs, &:value).sum]
+    "#), @"[1773, 1770]");
+}
+
+#[test]
+fn test_symbol_block_megamorphic_disabled_falls_back_to_invokeblock() {
+    // --zjit-disable-symbol-block-mega has to leave the site working, since that is what an
+    // A/B measurement compares against.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    crate::options::rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_symbol_block_mega = true;
+    eval(SYM_MEGA_SETUP);
+    let before = crate::state::ZJITState::get_counters().symbol_block_mega_sites;
+    let result = inspect("sym_run(SYM_OBJS).sum");
+    let after = crate::state::ZJITState::get_counters().symbol_block_mega_sites;
+    unsafe { crate::options::OPTIONS.as_mut() }.unwrap().disable_symbol_block_mega = false;
+    assert_eq!(before, after, "the megamorphic Symbol block tier should be off");
+    assert_snapshot!(result, @"1770");
+}
+
 #[test]
 fn test_array_aref_out_of_bounds_reads_nil() {
     assert_snapshot!(inspect(r#"
@@ -11837,4 +12071,269 @@ fn test_send_nested_is_not_specialized() {
         20.times { entry(C8) }
     ");
     assert_snapshot!(assert_compiles("entry(C8)"), @":a");
+}
+
+
+/// A shared iterator whose `yield` is handed a different block ISEQ by every one of its callers,
+/// which is what `gen_invoke_block_iseq_dynamic` exists for: no guard chain can cover 120
+/// distinct blocks, so without it every one of these yields calls `rb_vm_invokeblock`.
+///
+/// `each_of` is padded past the inline threshold on purpose. That is the shape the optimization
+/// is for -- `Array#each` is called from methods whose inline budget is long spent -- and an
+/// inlined copy would resolve the `yield` to its caller's literal block instead.
+const DYNAMIC_BLOCK_SETUP: &str = r#"
+    PAD = (0...60).map { |k| "pad += #{k}" }.join("\n  ")
+    eval(<<~RUBY)
+      def each_of(a)
+        i = 0
+        n = a.size
+        pad = 0
+        #{PAD}
+        while i < n
+          yield a[i]
+          i += 1
+        end
+        a
+      end
+    RUBY
+
+    # Each caller closes over a literal block of its own, so the yield site above sees 120
+    # different `captured->code.iseq` values.
+    CALLERS = (0...120).map do |i|
+      eval("proc { |arr, acc| each_of(arr) { |x| acc << x + #{i} } }")
+    end
+
+    def drive(times)
+      acc = []
+      times.times { CALLERS.each { |c| c.call([100], acc) } }
+      acc
+    end
+"#;
+
+#[test]
+fn test_block_dynamic_dispatch_over_many_distinct_blocks() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval("drive(6)");
+    let before = crate::state::ZJITState::get_counters().block_iseq_dynamic_optimized_send_count;
+    assert_snapshot!(inspect("
+        acc = drive(2)
+        [acc.size, acc.first, acc.last, acc.uniq.size]
+    "), @"[240, 100, 219, 120]");
+    let after = crate::state::ZJITState::get_counters().block_iseq_dynamic_optimized_send_count;
+    assert!(after > before,
+        "expected the yield site to enter blocks it has no chain arm for, but the counter did not move");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_nil_fills_block_locals() {
+    // `local_table_size > param.lead_num`: the dispatch has to nil-fill the block's own locals
+    // the way `vm_push_frame` does, at an offset it only learns at run time. Each block declares
+    // its locals with an assignment that never runs, so a slot left holding whatever was on the
+    // VM stack shows up as a wrong value rather than as nil.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval(r#"
+        LOCAL_CALLERS = (0...10).map do |n|
+          decls = (0...n).map { |j| "l#{j} = x if false" }.join("; ")
+          reads = "[" + (0...n).map { |j| "l#{j}" }.join(", ") + "]"
+          eval("proc { |arr, acc| each_of(arr) { |x| #{decls}; acc << #{reads} } }")
+        end
+
+        def drive_locals(times)
+          acc = []
+          times.times { LOCAL_CALLERS.each { |c| c.call([1], acc) } }
+          acc
+        end
+    "#);
+    eval("drive_locals(6)");
+    let before = crate::state::ZJITState::get_counters().block_iseq_dynamic_optimized_send_count;
+    assert_snapshot!(inspect("
+        acc = drive_locals(2)
+        [acc.size, acc[0], acc[3], acc[9]]
+    "), @"[20, [], [nil, nil, nil], [nil, nil, nil, nil, nil, nil, nil, nil, nil]]");
+    let after = crate::state::ZJITState::get_counters().block_iseq_dynamic_optimized_send_count;
+    assert!(after > before, "expected blocks with their own locals to be entered directly");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_arity_mismatch_falls_back() {
+    // Only an exact arity match dispatches directly. Everything else has to reach
+    // `rb_vm_invokeblock`, which nil-fills, truncates and auto-splats.
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval("drive(6)");
+    assert_snapshot!(inspect("
+        out = []
+        each_of([1, 2]) { |a, b| out << [a, b] }
+        each_of([[3, 4]]) { |a, b| out << [a, b] }
+        each_of([5]) { out << :none }
+        each_of([6]) { |a, b, c| out << [a, b, c] }
+        out
+    "), @"[[1, nil], [2, nil], [3, 4], :none, [6, nil, nil]]");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_break_next_and_return() {
+    // A `throw` out of a frame this dispatch pushed unwinds through every JIT native frame back
+    // to the enclosing `vm_exec`, which has to find a usable ISEQ on the pushed frame.
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval("drive(6)");
+    assert_snapshot!(inspect("
+        def with_break(arr) = each_of(arr) { |x| break x * 10 if x > 1 }
+        def with_next(arr)
+          out = []
+          each_of(arr) { |x| next if x.even?; out << x }
+          out
+        end
+        def with_return(arr)
+          each_of(arr) { |x| return x * 100 if x > 1 }
+          :fell_through
+        end
+        [with_break([1, 2, 3]), with_next([1, 2, 3, 4]), with_return([1, 2, 3]), with_return([0])]
+    "), @"[20, [1, 3], 200, :fell_through]");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_under_gc_stress() {
+    // The frame this pushes is not published at `ec->cfp` until the callee's entry point runs,
+    // so a collection anywhere across the push has to still see a walkable stack.
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval("drive(6)");
+    assert_snapshot!(inspect("
+        GC.stress = true
+        acc = drive(1)
+        GC.stress = false
+        [acc.size, acc.first, acc.last]
+    "), @"[120, 100, 219]");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_flushed_by_tracepoint() {
+    // Enabling a TracePoint clears every `jit_entry`, which is the only thing this path trusts
+    // about the callee, so the dispatch has to fall back rather than enter stale code.
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval("drive(6)");
+    assert_snapshot!(inspect("
+        seen = 0
+        tp = TracePoint.new(:b_call) { |_| seen += 1 }
+        traced = tp.enable { drive(1) }
+        after = drive(1)
+        [traced.size, seen > 0, after.size, after.last]
+    "), @"[120, true, 120, 219]");
+}
+
+#[test]
+fn test_block_dynamic_dispatch_survives_method_redefinition_mid_iteration() {
+    // Redefining a method the blocks call, from inside one of them, invalidates compiled code
+    // while frames this dispatch pushed are still on the stack.
+    set_call_threshold(2);
+    eval(DYNAMIC_BLOCK_SETUP);
+    eval(r#"
+        def tag(x) = x * 2
+        REDEF_CALLERS = (0...40).map do |i|
+          eval("proc { |arr, acc| each_of(arr) { |x| acc << tag(x) + #{i} } }")
+        end
+        def drive_redef(times)
+          acc = []
+          times.times { REDEF_CALLERS.each { |c| c.call([1], acc) } }
+          acc
+        end
+    "#);
+    eval("drive_redef(6)");
+    assert_snapshot!(inspect("
+        before = drive_redef(1)
+        each_of([1]) { |_| def tag(x) = x * 1000 }
+        after = drive_redef(1)
+        [before.first, before.last, after.first, after.last]
+    "), @"[2, 41, 1000, 1039]");
+}
+
+/// A `yield` site compiled from a profile that only ever saw ISEQ block handlers, which is then
+/// handed `&:sym` handlers for the rest of the process. Nothing about the compiled dispatch
+/// fails -- it branches to `rb_vm_invokeblock` rather than side-exiting -- so only
+/// `rb_zjit_block_reprofile` can notice that it is serving the wrong traffic.
+const BLOCK_RESPECIALIZE_SETUP: &str = r#"
+    RPAD = (0...60).map { |k| "pad += #{k}" }.join("\n  ")
+    eval(<<~RUBY)
+      def each_of(a)
+        i = 0
+        n = a.size
+        pad = 0
+        #{RPAD}
+        while i < n
+          yield a[i]
+          i += 1
+        end
+        a
+      end
+    RUBY
+
+    BOOT_BLOCKS = (0...4).map do |i|
+      eval("proc { |arr, acc| each_of(arr) { |x| acc << x + #{i} } }")
+    end
+
+    def boot(times)
+      acc = []
+      times.times { BOOT_BLOCKS.each { |c| c.call([1], acc) } }
+      acc
+    end
+
+    def live(times)
+      out = nil
+      times.times { out = each_of(["a", "b", "c"].map(&:dup), &:upcase!) }
+      out
+    end
+"#;
+
+#[test]
+fn test_block_respecialization_converges() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(BLOCK_RESPECIALIZE_SETUP);
+    // Freeze the yield site on a profile of ISEQ block handlers.
+    eval("boot(20)");
+    let before = crate::state::ZJITState::get_counters().block_respecialize_count;
+    // Then give it nothing but Symbol handlers over a monomorphic receiver.
+    eval("live(2000)");
+    let after = crate::state::ZJITState::get_counters().block_respecialize_count;
+    assert!(after > before,
+        "expected the frozen yield site to earn a respecialization from its fallback traffic");
+    assert!(after - before <= crate::payload::MAX_BLOCK_RESPECIALIZATIONS as u64,
+        "expected at most {} respecializations, got {}",
+        crate::payload::MAX_BLOCK_RESPECIALIZATIONS, after - before);
+
+    // Stable from here: the respecialized dispatch serves the traffic, so no further windows
+    // close and no further versions are asked for.
+    let steady = crate::state::ZJITState::get_counters().block_respecialize_count;
+    eval("live(20000)");
+    assert_eq!(steady, crate::state::ZJITState::get_counters().block_respecialize_count,
+        "a respecialized site must stop asking for versions once it stops falling back");
+
+    assert_snapshot!(inspect("[live(1), boot(1).last]"), @r#"[["A", "B", "C"], 4]"#);
+}
+
+#[test]
+fn test_block_respecialization_declines_unservable_handlers() {
+    // A `yield` handed Proc block handlers has nothing a rebuilt dispatch could add an arm for,
+    // so it must not spend versions rebuilding itself.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval(BLOCK_RESPECIALIZE_SETUP);
+    eval("boot(20)");
+    let before = crate::state::ZJITState::get_counters().block_respecialize_count;
+    assert_snapshot!(inspect(r#"
+        blk = proc { |x| x.to_s }
+        out = nil
+        2000.times { out = each_of([1, 2], &blk) }
+        out
+    "#), @"[1, 2]");
+    let after = crate::state::ZJITState::get_counters().block_respecialize_count;
+    assert_eq!(before, after,
+        "a fallback that only ever sees Proc handlers must not earn a respecialization");
 }
