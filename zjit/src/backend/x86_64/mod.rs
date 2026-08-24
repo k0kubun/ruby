@@ -1201,6 +1201,12 @@ impl Assembler {
                     mov(cb, SCRATCH0_OPND.into(), uimm_opnd(*idx as u64));
                 },
 
+                Insn::BeginOutlined => {
+                    cb.set_outlined(true);
+                    // The last patch point is in the other half of the region. No amount of padding here would ever be next to it.
+                    last_patch_pos = None;
+                },
+
                 // Atomically increment a counter at a given memory location
                 Insn::IncrCounter { mem, value } => {
                     assert!(matches!(mem, Opnd::Mem(_)));
@@ -1355,7 +1361,9 @@ impl Assembler {
         // Exit code is compiled into a separate list of instructions that we append
         // to the last reachable block before scratch_split, so it gets linearized and split.
         trace_compile_phase("compile_exits", || {
-            let exit_insns = asm.compile_exits();
+            // Conditional jumps to labels take a rel32, which always reaches the
+            // outlined half of the code region, so exit islands are not needed.
+            let exit_insns = asm.compile_exits(false);
 
             // Append exit instructions to the last reachable block so they are
             // included in linearize_instructions and processed by scratch_split.

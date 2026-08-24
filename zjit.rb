@@ -214,6 +214,8 @@ class << RubyVM::ZJIT
       :jit_frame_heap_bytes,
       :jit_frame_region_bytes,
       :code_region_bytes,
+      :inlined_code_bytes,
+      :outlined_code_bytes,
       :zjit_alloc_bytes,
       :mem_profile_bytes,
       :mem_iseq_payload_bytes,

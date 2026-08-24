@@ -1594,6 +1594,12 @@ impl Assembler {
                 Insn::ExitMetaIndex(idx) => {
                     emit_load_value(cb, SCRATCH0_OPND.into(), *idx as u64);
                 },
+
+                Insn::BeginOutlined => {
+                    cb.set_outlined(true);
+                    // The last patch point is in the other half of the region. No amount of padding here would ever be next to it.
+                    last_patch_pos = None;
+                },
                 Insn::IncrCounter { mem, value } => {
                     // Get the status register allocated by arm64_scratch_split
                     let Some(Insn::Cmp {
@@ -1756,7 +1762,10 @@ impl Assembler {
         // Exit code is compiled into a separate list of instructions that we append
         // to the last reachable block before scratch_split, so it gets linearized and split.
         trace_compile_phase("compile_exits", || {
-            let exit_insns = asm.compile_exits();
+            // B.cond reaches only ±1MiB, which cannot span the distance from a guard
+            // to the outlined half of the code region, so route guards through exit
+            // islands: B at the end of the function body reaches the exits' ±128MiB.
+            let exit_insns = asm.compile_exits(cb.has_outlined_region());
 
             // Append exit instructions to the last reachable block so they are
             // included in linearize_instructions and processed by scratch_split.
@@ -1786,14 +1795,26 @@ impl Assembler {
             }
 
             let start_ptr = cb.get_write_ptr();
+            let inlined_start_ptr = cb.get_ptr(cb.inlined_code_size());
+            let outlined_start_ptr = cb.outlined_write_ptr();
             let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
             assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
 
             cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
 
             trace_compile_phase("invalidate_icache", || {
-                // Invalidate icache for newly written out region so we don't run stale code.
-                unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
+                // Invalidate icache for newly written out regions so we don't run stale code.
+                // The emit may have written to both halves of a split code region, and the
+                // address space between the halves is never mapped, so invalidate the range
+                // written to each half separately.
+                for (range_start, range_end) in [
+                    (inlined_start_ptr, cb.get_ptr(cb.inlined_code_size())),
+                    (outlined_start_ptr, cb.outlined_write_ptr()),
+                ] {
+                    if range_start != range_end {
+                        unsafe { rb_jit_icache_invalidate(range_start.raw_ptr(cb) as _, range_end.raw_ptr(cb) as _) };
+                    }
+                }
             });
 
             if crate::state::ZJITState::has_instance() {
