@@ -11425,7 +11425,17 @@ mod hir_opt_tests {
         bb5():
           v23:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
+          v38:CShape = LoadField v23, :shape_id@0x1040
+          v39:CShape[0x1041] = Const CShape(0x1041)
+          v40:CBool = IsBitEqual v38, v39
+          CondBranch v40, bb8(), bb9()
+        bb8():
+          StoreField v23, :@foo@0x1042, v17
+          Jump bb7()
+        bb9():
           SetIvar v23, :@foo, v17
+          Jump bb7()
+        bb7():
           Jump bb4(v17)
         bb6():
           v27:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
@@ -12126,8 +12136,25 @@ mod hir_opt_tests {
           v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v31:BasicObject = GetIvar v18, :@foo
-          Jump bb4(v31)
+          v32:CShape = LoadField v18, :shape_id@0x1040
+          v34:CShape[0x1041] = Const CShape(0x1041)
+          v35:CBool = IsBitEqual v32, v34
+          CondBranch v35, bb8(), bb9()
+        bb8():
+          v37:BasicObject = LoadField v18, :@foo@0x1042
+          Jump bb7(v37)
+        bb9():
+          v39:CShape[0x1043] = Const CShape(0x1043)
+          v40:CBool = IsBitEqual v32, v39
+          CondBranch v40, bb10(), bb11()
+        bb10():
+          v44:BasicObject = LoadField v18, :@foo@0x1044
+          Jump bb7(v44)
+        bb11():
+          v42:BasicObject = GetIvar v18, :@foo
+          Jump bb7(v42)
+        bb7(v33:BasicObject):
+          Jump bb4(v33)
         bb6():
           v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
           Jump bb4(v22)
@@ -20912,8 +20939,8 @@ mod hir_opt_tests {
         bb5():
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v37:Fixnum[3] = Const Value(3)
-          Jump bb4(v37)
+          v38:Fixnum[3] = Const Value(3)
+          Jump bb4(v38)
         bb6():
           v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
           Jump bb4(v22)
