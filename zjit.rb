@@ -186,6 +186,10 @@ class << RubyVM::ZJIT
 
       :side_exit_size,
       :code_region_bytes,
+      :inlined_code_region_bytes,
+      :outlined_code_region_bytes,
+      :inlined_code_bytes,
+      :outlined_code_bytes,
       :side_exit_size_ratio,
       :zjit_alloc_bytes,
       :total_mem_bytes,

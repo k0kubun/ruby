@@ -130,7 +130,7 @@ impl ZJITState {
             use std::rc::Rc;
             use std::cell::RefCell;
 
-            let mem_block = VirtualMem::alloc(get_option!(exec_mem_bytes), Some(get_option!(mem_bytes)));
+            let mem_block = VirtualMem::alloc_split(get_option!(exec_mem_bytes), Some(get_option!(mem_bytes)));
             let mem_block = Rc::new(RefCell::new(mem_block));
 
             CodeBlock::new(mem_block.clone(), get_option_ref!(dump_disasm).is_some())
