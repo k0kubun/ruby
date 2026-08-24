@@ -949,6 +949,12 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Zero-width marker. Everything after it in this Assembler is cold, and is
+    /// emitted into the outlined half of the code region instead of after the
+    /// function body. This is used as the first instruction of the block
+    /// [`Assembler::compile_exits`] builds.
+    BeginOutlined,
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -1036,6 +1042,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::BeginOutlined |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1180,6 +1187,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::BeginOutlined => "BeginOutlined",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::Comment(_) => "Comment",
@@ -2979,8 +2987,11 @@ impl Assembler
     pub fn compile(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
+        #[cfg(feature = "disasm")]
+        let outlined_start_addr = cb.outlined_write_ptr();
         let alloc_regs = Self::get_alloc_regs();
         let had_dropped_bytes = cb.has_dropped_bytes();
+        let was_outlined = cb.is_outlined();
         let ret = self.compile_with_regs(cb, alloc_regs).inspect_err(|err| {
             // If we use too much memory to compile the Assembler, it would set cb.dropped_bytes = true.
             // To avoid failing future compilation by cb.has_dropped_bytes(), attempt to reset dropped_bytes with
@@ -2989,11 +3000,16 @@ impl Assembler
                 cb.update_dropped_bytes();
             }
         });
+        // Put back the original state of the CodeBlock. `Insn::BeginOutlined` moves the cursor to
+        // the outlined half, but we want to write to the inlined half in the next compilation.
+        cb.set_outlined(was_outlined);
 
         #[cfg(feature = "disasm")]
         if let Some(dump_disasm) = crate::options::get_option_ref!(dump_disasm).filter(|_| ret.is_ok()) {
             let end_addr = cb.get_write_ptr();
             crate::disasm::dump_disasm_addr_range(cb, start_addr, end_addr, dump_disasm);
+            let outlined_end_addr = cb.outlined_write_ptr();
+            crate::disasm::dump_disasm_addr_range(cb, outlined_start_addr, outlined_end_addr, dump_disasm);
         }
         ret
     }
@@ -3009,7 +3025,14 @@ impl Assembler
     /// Compile Target::SideExit and convert it into Target::Label for all instructions.
     /// Returns the exit code as a list of instructions to be appended after the main
     /// code is linearized and split.
-    pub fn compile_exits(&mut self) -> Vec<Insn> {
+    ///
+    /// With `exit_islands`, each guard branches to a near "island" at the end of the
+    /// function body, which then jumps into the outlined half where the exit code
+    /// lives. arm64 needs this on a split region: its conditional branches reach only
+    /// ±1MiB, which cannot span the distance to the outlined half, while its
+    /// unconditional branch reaches ±128MiB. x86_64 conditional jumps take a rel32
+    /// either way, so it reaches the exit code directly.
+    pub fn compile_exits(&mut self, exit_islands: bool) -> Vec<Insn> {
         fn immediate_stack_map_value(opnd: Opnd) -> Option<VALUE> {
             let value = match opnd {
                 Opnd::Value(value) => value,
@@ -3184,6 +3207,15 @@ impl Assembler
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> = HashMap::with_capacity(targets.len());
 
+        // Islands for `exit_islands`, and the island each exit label already has.
+        let mut islands: Vec<Insn> = Vec::new();
+        let mut island_labels: HashMap<Label, Label> = HashMap::new();
+
+        // Every side-exit code should be written in the outlined (cold) region.
+        if !targets.is_empty() {
+            self.push_insn(Insn::BeginOutlined);
+        }
+
         // Start a new perf range for side exits.
         let symbol_range = perf::symbol_range_start(self, "side exit");
 
@@ -3254,7 +3286,18 @@ impl Assembler
                     }
                 };
 
-                *self.basic_blocks[block_id].insns[idx].target_mut().unwrap() = counted_exit.unwrap_or(compiled_exit);
+                let mut exit_target = counted_exit.unwrap_or(compiled_exit);
+                if exit_islands {
+                    let exit_label = exit_target.unwrap_label();
+                    let island_label = *island_labels.entry(exit_label).or_insert_with(|| {
+                        let island = self.new_label("exit_island");
+                        islands.push(Insn::Label(island.clone()));
+                        islands.push(Insn::Jmp(Target::Label(exit_label)));
+                        island.unwrap_label()
+                    });
+                    exit_target = Target::Label(island_label);
+                }
+                *self.basic_blocks[block_id].insns[idx].target_mut().unwrap() = exit_target;
             }
         }
 
@@ -3273,7 +3316,16 @@ impl Assembler
         // Extract exit instructions and restore the previous current block
         let exit_insns = take(&mut self.basic_blocks[exit_block.0].insns);
         self.set_current_block(saved_block);
-        exit_insns
+
+        // Islands go in front of Insn::BeginOutlined, so they land at the end of the
+        // function body in the inlined half, within conditional-branch range of
+        // every guard that targets them.
+        if islands.is_empty() {
+            exit_insns
+        } else {
+            islands.extend(exit_insns);
+            islands
+        }
     }
 
     /// Return a traversal of the block graph in reverse post-order.
