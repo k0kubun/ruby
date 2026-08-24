@@ -2394,12 +2394,12 @@ pub(crate) mod hir_build_tests {
           CondBranch v60, bb15(), bb16()
         bb15():
           v62:ObjectSubclass[BlockParamProxy] = RefineType v22, ObjectSubclass[BlockParamProxy]
-          CondBranchHasType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1038)], bb18(), bb19()
-        bb18():
+          CondBranchHasType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1038)], bb19(), bb18()
+        bb19():
           v66:ObjectSubclass[class_exact*:Object@VALUE(0x1038)] = RefineType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1038)]
           v67:BasicObject = Send v66, &block, :consume, v62 # SendFallbackReason: Uncategorized(send)
           Jump bb17(v67)
-        bb19():
+        bb18():
           v70:BasicObject = Send v9, &block, :consume, v62 # SendFallbackReason: Send: polymorphic fallback
           Jump bb17(v70)
         bb17(v63:BasicObject):
@@ -4307,12 +4307,12 @@ pub(crate) mod hir_build_tests {
           CondBranch v54, bb15(), bb16()
         bb15():
           v56:ObjectSubclass[BlockParamProxy] = RefineType v16, ObjectSubclass[BlockParamProxy]
-          CondBranchHasType v14, Fixnum, bb18(), bb19()
-        bb18():
+          CondBranchHasType v14, Fixnum, bb19(), bb18()
+        bb19():
           v60:Fixnum[0] = RefineType v14, Fixnum
           v61:BasicObject = Send v60, &block, :then, v56 # SendFallbackReason: Uncategorized(send)
           Jump bb17(v61)
-        bb19():
+        bb18():
           v64 = Send v14, &block, :then, v56 # SendFallbackReason: Send: polymorphic fallback
           Jump bb17(v64)
         bb17(v57:BasicObject):
@@ -4321,12 +4321,12 @@ pub(crate) mod hir_build_tests {
           CondBranchHasType v16, NilClass, bb21(), bb22()
         bb21():
           v69:NilClass = RefineType v16, NilClass
-          CondBranchHasType v14, Fixnum, bb24(), bb25()
-        bb24():
+          CondBranchHasType v14, Fixnum, bb25(), bb24()
+        bb25():
           v73:Fixnum[0] = RefineType v14, Fixnum
           v74:BasicObject = Send v73, &block, :then, v69 # SendFallbackReason: Uncategorized(send)
           Jump bb23(v74)
-        bb25():
+        bb24():
           v77 = Send v14, &block, :then, v69 # SendFallbackReason: Send: polymorphic fallback
           Jump bb23(v77)
         bb23(v70:BasicObject):
@@ -4418,12 +4418,12 @@ pub(crate) mod hir_build_tests {
           CondBranch v54, bb15(), bb16()
         bb15():
           v56:ObjectSubclass[BlockParamProxy] = RefineType v16, ObjectSubclass[BlockParamProxy]
-          CondBranchHasType v14, Fixnum, bb18(), bb19()
-        bb18():
+          CondBranchHasType v14, Fixnum, bb19(), bb18()
+        bb19():
           v60:Fixnum[0] = RefineType v14, Fixnum
           v61:BasicObject = Send v60, &block, :then, v56 # SendFallbackReason: Uncategorized(send)
           Jump bb17(v61)
-        bb19():
+        bb18():
           v64 = Send v14, &block, :then, v56 # SendFallbackReason: Send: polymorphic fallback
           Jump bb17(v64)
         bb17(v57:BasicObject):
@@ -4432,12 +4432,12 @@ pub(crate) mod hir_build_tests {
           CondBranchHasType v16, NilClass, bb21(), bb22()
         bb21():
           v69:NilClass = RefineType v16, NilClass
-          CondBranchHasType v14, Fixnum, bb24(), bb25()
-        bb24():
+          CondBranchHasType v14, Fixnum, bb25(), bb24()
+        bb25():
           v73:Fixnum[0] = RefineType v14, Fixnum
           v74:BasicObject = Send v73, &block, :then, v69 # SendFallbackReason: Uncategorized(send)
           Jump bb23(v74)
-        bb25():
+        bb24():
           v77 = Send v14, &block, :then, v69 # SendFallbackReason: Send: polymorphic fallback
           Jump bb23(v77)
         bb23(v70:BasicObject):
