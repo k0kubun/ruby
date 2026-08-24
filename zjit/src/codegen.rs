@@ -629,9 +629,14 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
     });
 
     // Generate code if everything can be compiled
+    let outlined_start_ptr = cb.outlined_write_ptr();
     let result = asm.compile(cb);
     if let Ok((start_ptr, _)) = result {
         perf::register_current_iseq_range(cb, iseq, start_ptr);
+        // The function's side exits live in the outlined half of the code region,
+        // so they need their own perf map entry; a single range across both halves
+        // would claim the address space in between.
+        perf::register_current_iseq_exits_range(cb, iseq, outlined_start_ptr);
         if ZJITState::should_log_compiled_iseqs() {
             let iseq_name = iseq_get_location(iseq, 0);
             ZJITState::log_compile(iseq_name);
@@ -4100,7 +4105,14 @@ fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodeP
     asm.cpush(scratch_reg);
     asm.jmp(ZJITState::get_function_stub_hit_trampoline().into());
 
-    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+    // A stub runs at most once per call site -- the hit patches the call to go
+    // straight to the compiled callee -- so it is cold, and putting it between two
+    // functions' bodies would push them apart for nothing.
+    let was_outlined = cb.set_outlined(true);
+    let result = asm.compile(cb);
+    cb.set_outlined(was_outlined);
+
+    result.map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
         code_ptr
     })
