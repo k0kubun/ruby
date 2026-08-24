@@ -5866,11 +5866,10 @@ mod hir_opt_tests {
           v25:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v7, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v26:StaticSymbol[:a] = Const Value(VALUE(0x1038))
           v27:HashExact = NewHash v26: v14
-          IncrCounter inline_iseq_optimized_send_count
-          v30:Fixnum[1] = Const Value(1)
+          v29:BasicObject = SendDirect v25, 0x0, :foo (0x1040), v27
           IncrCounter zjit_insn_count
           CheckInterrupts
-          Return v30
+          Return v29
         ");
     }
 
@@ -15038,12 +15037,10 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
           v37:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
           v38:ArrayExact = NewArray v34
-          PushInlineFrame :foo, v37 (0x1040), num_args=1
+          IncrCounter empty_inline_frame_count
           IncrCounter inline_iseq_optimized_send_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          CheckInterrupts
-          PopInlineFrame
           IncrCounter zjit_insn_count
           Return v38
         ");
@@ -15090,12 +15087,10 @@ mod hir_opt_tests {
           v35:ArrayExact = ArrayDup v20
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1010, cme:0x1018)
           v38:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v10, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
-          PushInlineFrame :foo, v38 (0x1040), num_args=1
+          IncrCounter empty_inline_frame_count
           IncrCounter inline_iseq_optimized_send_count
           IncrCounter zjit_insn_count
           IncrCounter zjit_insn_count
-          CheckInterrupts
-          PopInlineFrame
           IncrCounter zjit_insn_count
           Return v35
         ");
@@ -16610,7 +16605,10 @@ mod hir_opt_tests {
           PatchPoint SingleRactorMode
           PatchPoint MethodRedefined(Object@0x1000, fancy@0x1008, cme:0x1010)
           v21:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
-          v26:NilClass = Const Value(nil)
+          v22:ArrayExact = NewArray
+          v23:Fixnum[100] = Const Value(100)
+          v24:HashExact = NewHash
+          v26:BasicObject = SendDirect v21, 0x0, :fancy (0x1038), v11, v22, v23, v24
           CheckInterrupts
           Return v26
         ");
@@ -17670,9 +17668,8 @@ mod hir_opt_tests {
           v23:CBool[true] = GuardBitEquals v22, CBool(true) recompile
           PatchPoint NoSingletonClass(C@0x1010)
           PatchPoint MethodRedefined(C@0x1010, secret@0x1018, cme:0x1020)
-          v27:Fixnum[42] = Const Value(42)
-          CheckInterrupts
-          Return v27
+          v33:Fixnum[42] = Const Value(42)
+          Return v33
         ");
     }
 
@@ -17898,28 +17895,22 @@ mod hir_opt_tests {
           CondBranch v31, bb7(), bb8()
         bb7():
           PatchPoint MethodRedefined(SuperChainBase2@0x1010, foo@0x1018, cme:0x1020)
-          PushInlineFrame :foo, v6 (0x1048), num_args=0
           v55:Fixnum[2] = Const Value(2)
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v55)
         bb8():
-          v37:CallableMethodEntry[VALUE(0x1070)] = Const Value(VALUE(0x1070))
+          v37:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
           v38:CBool = IsBitEqual v29, v37
           CondBranch v38, bb9(), bb5()
         bb9():
-          PatchPoint MethodRedefined(SuperChainBase1@0x1078, foo@0x1018, cme:0x1080)
-          PushInlineFrame :foo, v6 (0x10a8), num_args=0
+          PatchPoint MethodRedefined(SuperChainBase1@0x1050, foo@0x1018, cme:0x1058)
           v69:Fixnum[1] = Const Value(1)
-          CheckInterrupts
-          PopInlineFrame
           Jump bb4(v69)
         bb5():
-          v44:BasicObject = InvokeSuper v6, 0x10d0 # SendFallbackReason: super: dispatch chain fallthrough
+          v44:BasicObject = InvokeSuper v6, 0x1080 # SendFallbackReason: super: dispatch chain fallthrough
           Jump bb4(v44)
         bb4(v22:BasicObject):
           v13:Fixnum[10] = Const Value(10)
-          PatchPoint MethodRedefined(Integer@0x10f8, +@0x1100, cme:0x1108)
+          PatchPoint MethodRedefined(Integer@0x10a8, +@0x10b0, cme:0x10b8)
           v48:Fixnum = GuardType v22, Fixnum recompile
           v49:Fixnum = FixnumAdd v48, v13
           CheckInterrupts
@@ -19106,8 +19097,8 @@ mod hir_opt_tests {
         bb5():
           PatchPoint NoMethodOverride(Base@0x1008, foo@0x1010, cme:0x1018)
           PatchPoint MethodRedefined(Base@0x1008, foo@0x1010, cme:0x1018)
-          v31:Fixnum[1] = Const Value(1)
-          Jump bb4(v31)
+          v37:Fixnum[1] = Const Value(1)
+          Jump bb4(v37)
         bb6():
           v22:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
           Jump bb4(v22)
@@ -19161,64 +19152,64 @@ mod hir_opt_tests {
         bb5():
           PatchPoint NoSingletonClass(C1@0x1008)
           PatchPoint MethodRedefined(C1@0x1008, foo@0x1010, cme:0x1018)
-          v73:Fixnum[1] = Const Value(1)
-          Jump bb4(v73)
+          v100:Fixnum[1] = Const Value(1)
+          Jump bb4(v100)
         bb6():
           v22:CBool = HasType v10, ObjectSubclass[class_exact:C7]
           CondBranch v22, bb7(), bb8()
         bb7():
           PatchPoint NoSingletonClass(C7@0x1040)
           PatchPoint MethodRedefined(C7@0x1040, foo@0x1010, cme:0x1048)
-          v76:Fixnum[7] = Const Value(7)
-          Jump bb4(v76)
+          v114:Fixnum[7] = Const Value(7)
+          Jump bb4(v114)
         bb8():
           v28:CBool = HasType v10, ObjectSubclass[class_exact:C5]
           CondBranch v28, bb9(), bb10()
         bb9():
           PatchPoint NoSingletonClass(C5@0x1070)
           PatchPoint MethodRedefined(C5@0x1070, foo@0x1010, cme:0x1078)
-          v79:Fixnum[5] = Const Value(5)
-          Jump bb4(v79)
+          v128:Fixnum[5] = Const Value(5)
+          Jump bb4(v128)
         bb10():
           v34:CBool = HasType v10, ObjectSubclass[class_exact:C0]
           CondBranch v34, bb11(), bb12()
         bb11():
           PatchPoint NoSingletonClass(C0@0x10a0)
           PatchPoint MethodRedefined(C0@0x10a0, foo@0x1010, cme:0x10a8)
-          v82:Fixnum[0] = Const Value(0)
-          Jump bb4(v82)
+          v142:Fixnum[0] = Const Value(0)
+          Jump bb4(v142)
         bb12():
           v40:CBool = HasType v10, ObjectSubclass[class_exact:C2]
           CondBranch v40, bb13(), bb14()
         bb13():
           PatchPoint NoSingletonClass(C2@0x10d0)
           PatchPoint MethodRedefined(C2@0x10d0, foo@0x1010, cme:0x10d8)
-          v85:Fixnum[2] = Const Value(2)
-          Jump bb4(v85)
+          v156:Fixnum[2] = Const Value(2)
+          Jump bb4(v156)
         bb14():
           v46:CBool = HasType v10, ObjectSubclass[class_exact:C3]
           CondBranch v46, bb15(), bb16()
         bb15():
           PatchPoint NoSingletonClass(C3@0x1100)
           PatchPoint MethodRedefined(C3@0x1100, foo@0x1010, cme:0x1108)
-          v88:Fixnum[3] = Const Value(3)
-          Jump bb4(v88)
+          v170:Fixnum[3] = Const Value(3)
+          Jump bb4(v170)
         bb16():
           v52:CBool = HasType v10, ObjectSubclass[class_exact:C4]
           CondBranch v52, bb17(), bb18()
         bb17():
           PatchPoint NoSingletonClass(C4@0x1130)
           PatchPoint MethodRedefined(C4@0x1130, foo@0x1010, cme:0x1138)
-          v91:Fixnum[4] = Const Value(4)
-          Jump bb4(v91)
+          v184:Fixnum[4] = Const Value(4)
+          Jump bb4(v184)
         bb18():
           v58:CBool = HasType v10, ObjectSubclass[class_exact:C6]
           CondBranch v58, bb19(), bb20()
         bb19():
           PatchPoint NoSingletonClass(C6@0x1160)
           PatchPoint MethodRedefined(C6@0x1160, foo@0x1010, cme:0x1168)
-          v94:Fixnum[6] = Const Value(6)
-          Jump bb4(v94)
+          v198:Fixnum[6] = Const Value(6)
+          Jump bb4(v198)
         bb20():
           v64:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
           Jump bb4(v64)
