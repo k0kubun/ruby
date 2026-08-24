@@ -763,6 +763,10 @@ impl Flags {
     const IS_BLOCK_IFUNC: u32 = 1 << 5;
     /// Block handler is a Proc
     const IS_BLOCK_PROC: u32 = 1 << 6;
+    /// Set if the ProfiledType was synthesized for one arm of a polymorphic dispatch rather
+    /// than observed at that program point. The class is guaranteed by the arm's type test,
+    /// but the shape is only a shape the profiler happened to see for that class.
+    const IS_POLYMORPHIC_ARM: u32 = 1 << 7;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -774,6 +778,7 @@ impl Flags {
     pub fn is_object_profiling(self) -> bool { (self.0 & Self::IS_OBJECT_PROFILING) != 0 }
     pub fn is_block_ifunc(self) -> bool { (self.0 & Self::IS_BLOCK_IFUNC) != 0 }
     pub fn is_block_proc(self) -> bool { (self.0 & Self::IS_BLOCK_PROC) != 0 }
+    pub fn is_polymorphic_arm(self) -> bool { (self.0 & Self::IS_POLYMORPHIC_ARM) != 0 }
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -865,6 +870,12 @@ impl ProfiledType {
 
     pub fn empty() -> Self {
         Self { class: VALUE(0), shape: INVALID_SHAPE_ID, flags: Flags::none() }
+    }
+
+    /// Return a copy marked as belonging to one arm of a polymorphic dispatch.
+    pub fn as_polymorphic_arm(mut self) -> Self {
+        self.flags.0 |= Flags::IS_POLYMORPHIC_ARM;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
