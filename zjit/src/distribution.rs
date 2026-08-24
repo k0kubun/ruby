@@ -166,10 +166,23 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
     /// already been split into per-type branches: within a branch, the receiver is known to have
     /// one specific profiled type, so downstream specialization can treat it as monomorphic.
     pub fn monomorphic(profiled_type: T) -> Self {
+        Self::monomorphic_variants(&[profiled_type])
+    }
+
+    /// Build a monomorphic summary out of several items that a consumer treats as one. Dispatch
+    /// arms use this: the arm has already branched on the Ruby class, so every item in it is the
+    /// same class as far as method lookup is concerned (hence `Monomorphic`), but the items still
+    /// differ in the shape they carry, and a consumer that specializes on shape wants all of them.
+    /// `items` beyond the bucket count are dropped, most significant first.
+    pub fn monomorphic_variants(items: &[T]) -> Self {
+        assert!(N > 0);
+        assert!(!items.is_empty(), "a monomorphic summary needs at least one item");
         let mut buckets = [Default::default(); N];
-        buckets[0] = profiled_type;
         let mut counts = [0; N];
-        counts[0] = 1;
+        for (i, &item) in items.iter().take(N).enumerate() {
+            buckets[i] = item;
+            counts[i] = 1;
+        }
         Self { kind: DistributionKind::Monomorphic, buckets, counts, other: 0 }
     }
 

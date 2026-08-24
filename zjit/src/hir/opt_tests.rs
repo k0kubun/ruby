@@ -10841,7 +10841,17 @@ mod hir_opt_tests {
         bb5():
           v24:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
+          v39:CShape = LoadField v24, :shape_id@0x1040
+          v40:CShape[0x1041] = Const CShape(0x1041)
+          v41:CBool = IsBitEqual v39, v40
+          CondBranch v41, bb8(), bb9()
+        bb8():
+          StoreField v24, :@foo@0x1042, v17
+          Jump bb7()
+        bb9():
           SetIvar v24, :@foo, v17
+          Jump bb7()
+        bb7():
           Jump bb4(v17)
         bb6():
           v28:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: megamorphic call site
@@ -11452,8 +11462,25 @@ mod hir_opt_tests {
           v19:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v32:BasicObject = GetIvar v19, :@foo
-          Jump bb4(v32)
+          v33:CShape = LoadField v19, :shape_id@0x1040
+          v35:CShape[0x1041] = Const CShape(0x1041)
+          v36:CBool = IsBitEqual v33, v35
+          CondBranch v36, bb8(), bb9()
+        bb8():
+          v38:BasicObject = LoadField v19, :@foo@0x1042
+          Jump bb7(v38)
+        bb9():
+          v40:CShape[0x1043] = Const CShape(0x1043)
+          v41:CBool = IsBitEqual v33, v40
+          CondBranch v41, bb10(), bb11()
+        bb10():
+          v45:BasicObject = LoadField v19, :@foo@0x1044
+          Jump bb7(v45)
+        bb11():
+          v43:BasicObject = GetIvar v19, :@foo
+          Jump bb7(v43)
+        bb7(v34:BasicObject):
+          Jump bb4(v34)
         bb6():
           v23:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
           Jump bb4(v23)
@@ -19767,8 +19794,8 @@ mod hir_opt_tests {
         bb5():
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v38:Fixnum[3] = Const Value(3)
-          Jump bb4(v38)
+          v39:Fixnum[3] = Const Value(3)
+          Jump bb4(v39)
         bb6():
           v23:BasicObject = Send v10, :foo # SendFallbackReason: Send: megamorphic call site
           Jump bb4(v23)
