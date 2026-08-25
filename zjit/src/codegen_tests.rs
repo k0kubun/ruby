@@ -676,6 +676,25 @@ fn test_yield_polymorphic_ifunc_handler_falls_back() {
 }
 
 #[test]
+fn test_yield_repeated_ifunc_handlers_dispatch_directly() {
+    // Every Enumerator call allocates a fresh ifunc, so profiling block handlers by object
+    // identity used to make a yield site that only ever yields to C blocks look megamorphic.
+    // Handlers are profiled by kind instead, so the site stays monomorphic and takes the
+    // ifunc fast path while still returning the right result.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def via_enum = to_enum(:invoke).to_a
+        via_enum; via_enum
+    ");
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        eval("via_enum");
+    }
+    assert_snapshot!(assert_compiles("via_enum"), @"[10]");
+}
+
+#[test]
 fn test_yield_megamorphic_mixed_block_handlers() {
     // A yield site that sees ISEQ, proc, symbol, and ifunc handlers mixed together goes
     // megamorphic (each to_enum call profiles a distinct ifunc), so it compiles to the
