@@ -4372,29 +4372,34 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb7(), bb6()
+        bb7():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
           v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
+          CondBranch v24, bb8(), bb9()
+        bb8():
           v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
           Jump bb4(v26)
-        bb8():
+        bb9():
           v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
           v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
+          CondBranch v29, bb10(), bb6()
+        bb10():
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
-        bb10():
-          Jump bb6()
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v33:CInt64[3] = Const CInt64(3)
+          v34:CBool = IsBitEqual v15, v33
+          CondBranch v34, bb11(), bb5()
+        bb11():
+          v36:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v36)
+        bb5():
+          v38:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v38)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -4404,8 +4409,8 @@ mod hir_opt_tests {
     #[test]
     fn test_yield_mixed_iseq_proc_symbol_profile_dispatches_on_iseqs() {
         // A yield site whose profile mixes ISEQ blocks with proc and symbol handlers still
-        // dispatches directly on the ISEQ candidates; the non-ISEQ handlers fail the tag
-        // check and take the generic fallback in-line.
+        // dispatches directly on the ISEQ candidates; the proc and symbol handlers fail
+        // both handler-kind tests and take the generic fallback in-line.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4413,9 +4418,8 @@ mod hir_opt_tests {
             def via_proc(l) = invoke(&l)
             def via_sym = invoke(&:itself)
             pr = proc { |x| x * 3 }
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
-            add_one; double; via_proc(pr); via_sym
+            add_one; double
+            3.times { via_proc(pr); via_sym }
             add_one + double + via_proc(pr) + via_sym
         ");
         assert_eq!(VALUE::fixnum_from_usize(71), result);
@@ -4437,29 +4441,34 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb7(), bb6()
+        bb7():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1001
           v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
+          CondBranch v24, bb8(), bb9()
+        bb8():
           v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
           Jump bb4(v26)
-        bb8():
+        bb9():
           v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
           v29:CBool = IsBitEqual v22, v28
-          CondBranch v29, bb9(), bb10()
-        bb9():
+          CondBranch v29, bb10(), bb6()
+        bb10():
           v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
           Jump bb4(v31)
-        bb10():
-          Jump bb6()
         bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v33:CInt64[3] = Const CInt64(3)
+          v34:CBool = IsBitEqual v15, v33
+          CondBranch v34, bb11(), bb5()
+        bb11():
+          v36:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v36)
+        bb5():
+          v38:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v38)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -4467,10 +4476,13 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_yield_mixed_iseq_ifunc_profile_dispatches_on_iseqs() {
-        // Like the above, but the non-ISEQ handler in the profile is an ifunc block
-        // (Enumerator#each yields to the enumerator's C block). The ifunc handler fails
-        // the ISEQ tag check and takes the generic fallback in-line.
+    fn test_yield_mixed_iseq_ifunc_profile_dispatches_directly() {
+        // A yield site whose profile mixes ISEQ blocks with an ifunc handler
+        // (Enumerator#each yields to the enumerator's C block) dispatches both kinds
+        // without the generic fallback: the ISEQ candidates cover enough of the profile
+        // to keep their comparison chain, and the ifunc handler takes the tag-checked
+        // InvokeBlockIfunc arm, which comes first here because the ifunc holds the
+        // profile's hottest bucket.
         let result = eval("
             def invoke = yield(10)
             def add_one = invoke { |x| x + 1 }
@@ -4499,31 +4511,36 @@ mod hir_opt_tests {
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v14:CInt64[3] = Const CInt64(3)
           v15:CInt64 = IntAnd v13, v14
-          v17:CInt64[1] = Const CInt64(1)
+          v17:CInt64[3] = Const CInt64(3)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
-          v20:CInt64[-4] = Const CInt64(-4)
-          v21:CInt64 = IntAnd v13, v20
-          v22:CPtr = LoadField v21, :code_iseq@0x1001
-          v23:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
-          v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
+          CondBranch v18, bb6(), bb7()
+        bb6():
+          v20:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v20)
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1002), v21, v10
-          Jump bb4(v26)
+          v22:CInt64[1] = Const CInt64(1)
+          v23:CBool = IsBitEqual v15, v22
+          CondBranch v23, bb8(), bb5()
         bb8():
-          v28:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
-          v29:CBool = IsBitEqual v22, v28
+          v25:CInt64[-4] = Const CInt64(-4)
+          v26:CInt64 = IntAnd v13, v25
+          v27:CPtr = LoadField v26, :code_iseq@0x1001
+          v28:CPtr[CPtr(0x1002)] = Const CPtr(0x1002)
+          v29:CBool = IsBitEqual v27, v28
           CondBranch v29, bb9(), bb10()
         bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1003), v21, v10
+          v31:BasicObject = InvokeBlockIseqDirect (0x1002), v26, v10
           Jump bb4(v31)
         bb10():
-          Jump bb6()
-        bb6():
-          v34:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v34)
+          v33:CPtr[CPtr(0x1003)] = Const CPtr(0x1003)
+          v34:CBool = IsBitEqual v27, v33
+          CondBranch v34, bb11(), bb5()
+        bb11():
+          v36:BasicObject = InvokeBlockIseqDirect (0x1003), v26, v10
+          Jump bb4(v36)
+        bb5():
+          v38:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v38)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -4566,22 +4583,27 @@ mod hir_opt_tests {
           v15:CInt64 = IntAnd v13, v14
           v17:CInt64[1] = Const CInt64(1)
           v18:CBool = IsBitEqual v15, v17
-          CondBranch v18, bb5(), bb6()
-        bb5():
+          CondBranch v18, bb7(), bb6()
+        bb7():
           v20:CInt64[-4] = Const CInt64(-4)
           v21:CInt64 = IntAnd v13, v20
           v22:CPtr = LoadField v21, :code_iseq@0x1011
           v23:CPtr[CPtr(0x1012)] = Const CPtr(0x1012)
           v24:CBool = IsBitEqual v22, v23
-          CondBranch v24, bb7(), bb8()
-        bb7():
+          CondBranch v24, bb8(), bb6()
+        bb8():
           v26:BasicObject = InvokeBlockIseqDirect (0x1012), v21, v10
           Jump bb4(v26)
-        bb8():
-          Jump bb6()
         bb6():
-          v29:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb4(v29)
+          v28:CInt64[3] = Const CInt64(3)
+          v29:CBool = IsBitEqual v15, v28
+          CondBranch v29, bb9(), bb5()
+        bb9():
+          v31:BasicObject = InvokeBlockIfunc v13, v10
+          Jump bb4(v31)
+        bb5():
+          v33:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb4(v33)
         bb4(v16:BasicObject):
           CheckInterrupts
           Return v16
@@ -19139,33 +19161,33 @@ mod hir_opt_tests {
           v13:CInt64 = LoadField v12, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v14:CInt64[3] = Const CInt64(3)
           v15:CInt64 = IntAnd v13, v14
-          v16:CInt64[3] = Const CInt64(3)
-          v17:CBool = IsBitEqual v15, v16
-          CondBranch v17, bb5(), bb6()
-        bb5():
+          v17:CInt64[3] = Const CInt64(3)
+          v18:CBool = IsBitEqual v15, v17
+          CondBranch v18, bb6(), bb5()
+        bb6():
           v20:BasicObject = InvokeBlockIfunc v13, v10
           Jump bb4(v20)
-        bb6():
+        bb5():
           v22:BasicObject = InvokeBlock v10 # SendFallbackReason: InvokeBlock: not yet specialized
           Jump bb4(v22)
-        bb4(v18:BasicObject):
+        bb4(v16:BasicObject):
           v27:Fixnum[2] = Const Value(2)
           v29:CPtr = GetEP 0
           v30:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v31:CInt64[3] = Const CInt64(3)
           v32:CInt64 = IntAnd v30, v31
-          v33:CInt64[3] = Const CInt64(3)
-          v34:CBool = IsBitEqual v32, v33
-          CondBranch v34, bb8(), bb9()
-        bb8():
+          v34:CInt64[3] = Const CInt64(3)
+          v35:CBool = IsBitEqual v32, v34
+          CondBranch v35, bb9(), bb8()
+        bb9():
           v37:BasicObject = InvokeBlockIfunc v30, v27
           Jump bb7(v37)
-        bb9():
+        bb8():
           v39:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
           Jump bb7(v39)
-        bb7(v35:BasicObject):
+        bb7(v33:BasicObject):
           CheckInterrupts
-          Return v35
+          Return v33
         ");
     }
 
