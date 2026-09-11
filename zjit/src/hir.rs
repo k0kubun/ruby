@@ -665,6 +665,11 @@ pub enum SideExitReason {
     SplatKwNotProfiled,
     CallerSplatLengthMismatch,
     CallerSplatRuby2Keywords,
+    /// A `bar(...)` site compiled standalone was handed a callinfo other than the one the
+    /// profiler saw in the `...` local. See [`Function::specialize_send_forward`].
+    SendForwardCallInfoChanged,
+    /// A `bar(...)` site compiled standalone for a frame that was given no block was given one.
+    SendForwardBlockGiven,
     DirectiveInduced,
     SendWhileTracing,
     NoProfileSend,
@@ -845,6 +850,14 @@ pub enum SendFallbackReason {
     /// A `sendforward` inside an inlined `def foo(...)` frame whose merged call
     /// [`Function::specialize_send_forward`] declined to compile.
     SendForwardTargetNotSpecialized,
+    /// A `bar(...)` whose merged call resolved a callinfo but not a receiver class.
+    SendForwardRecvType,
+    /// A `bar(...)` whose merged call found no ISEQ method to call: the name resolves to a C
+    /// function, an attribute accessor, a `method_missing`, or nothing at all.
+    SendForwardMethodType,
+    /// A `bar(...)` whose merged argument list does not fit the callee's parameters, or whose
+    /// target is itself a `def bar(...)` (chained forwarding).
+    SendForwardComplexArgs,
     /// The `invokesuperforward` instruction (super with forwarding `...`) is not yet optimized in
     /// `type_specialize`.
     InvokeSuperForwardNotSpecialized,
@@ -895,6 +908,9 @@ impl Display for SendFallbackReason {
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
             SendForwardNotSpecialized => write!(f, "SendForward: not yet specialized"),
             SendForwardTargetNotSpecialized => write!(f, "SendForward: merged call not specialized"),
+            SendForwardRecvType => write!(f, "SendForward: merged call receiver class unknown"),
+            SendForwardMethodType => write!(f, "SendForward: merged call target is not an ISEQ"),
+            SendForwardComplexArgs => write!(f, "SendForward: merged call arguments do not fit"),
             InvokeSuperForwardNotSpecialized => write!(f, "InvokeSuperForward: not yet specialized"),
             SingleRactorModeRequired => write!(f, "Single-ractor mode required"),
             Uncategorized(insn) => write!(f, "Uncategorized({})", insn_name(insn.to_usize())),
@@ -2801,6 +2817,38 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     VM_CALL_FORWARDING
     // We only support `def foo(...)` cases for now.
     | VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG;
+
+/// Where the callinfo a `bar(...)` site forwards comes from. See
+/// [`Function::specialize_send_forward`].
+enum ForwardedCallInfo {
+    /// The enclosing `def foo(...)` frame was inlined, so its `...` local is the
+    /// [`Insn::ForwardingCallInfo`] the inliner aliased it to and both the callinfo and the
+    /// argument values it describes are compile-time constants.
+    Inlined {
+        ci: *const rb_callinfo,
+        /// The caller's argument values, in call order.
+        args: Vec<InsnId>,
+        /// Whether the call site that pushed the frame passed a block.
+        has_block: bool,
+    },
+    /// The frame was not inlined, so the callinfo exists only at run time. This is the packed one
+    /// the profiler saw the site forward every time, which a `GuardBitEquals` pins down; the
+    /// arguments it describes live in the frame extension rather than in any HIR value.
+    Profiled {
+        ci: *const rb_callinfo,
+        /// Local table size of the frame's *local* ISEQ, which is what
+        /// `vm_adjust_stack_forwarding` measures the frame extension from.
+        local_table_size: usize,
+    },
+}
+
+impl ForwardedCallInfo {
+    fn ci(&self) -> *const rb_callinfo {
+        match *self {
+            ForwardedCallInfo::Inlined { ci, .. } | ForwardedCallInfo::Profiled { ci, .. } => ci,
+        }
+    }
+}
 
 /// Everything the SendDirect argument planning needs to know about a call site's arguments:
 /// how many plain values are on the stack, which of them are keywords, and the flags that say
@@ -5122,7 +5170,7 @@ impl Function {
         }
     }
 
-    /// Turn a `bar(...)` inside an inlined `def foo(...)` frame into a direct call.
+    /// Turn a `bar(...)` into a direct call.
     ///
     /// `vm_caller_setup_fwd_args` builds this call at run time out of two callinfos: the site's
     /// own, which names the method and counts the arguments written out at the site, and the
@@ -5131,16 +5179,16 @@ impl Function {
     /// caller's, and the caller's keyword table -- and drops `VM_CALL_ARGS_SIMPLE`, because the
     /// merged list is no longer a plain one unless both halves were.
     ///
-    /// Inlining the forwardable callee makes both halves compile-time constants: the caller's
-    /// callinfo is the [`Insn::ForwardingCallInfo`] the inliner aliased the `...` local to, and
-    /// that instruction carries the caller's argument values as operands. So the merged call can
-    /// be planned exactly like an ordinary send's.
+    /// The site's half is always a compile-time constant. Where the caller's half comes from is
+    /// what [`ForwardedCallInfo`] distinguishes: inlining the forwardable callee makes it one
+    /// too, and otherwise it is a value the profiler saw and a run-time guard pins down. Either
+    /// way the merged call can then be planned exactly like an ordinary send's.
     ///
     /// The replacement is a `SendDirect` or nothing at all. It is deliberately never an
     /// `Insn::Send`: no `rb_call_data` describes the merged call, and handing the generic
     /// fallback the site's own one would tell it the wrong argument count. A site left alone
     /// keeps its `Insn::SendForward`, which `rb_vm_sendforward` still completes correctly by
-    /// reading the arguments back out of the frame extension `Insn::PushInlineFrame` wrote.
+    /// reading the arguments back out of the frame extension.
     ///
     /// Returns whether the call site was replaced.
     fn specialize_send_forward(&mut self, block: BlockId, insn_id: InsnId) -> bool {
@@ -5161,26 +5209,20 @@ impl Function {
         // exactly when this frame was inlined from a call site we know; otherwise this ISEQ was
         // compiled standalone and the callinfo only exists at run time.
         let Some((&forwarded, site_args)) = args.split_last() else { return false };
-        let (caller_ci, caller_args, frame_has_block) = {
+        let forwarding = {
             let resolved = self.resolve(forwarded);
             match resolved.insn(self) {
-                Insn::ForwardingCallInfo { ci, args, has_block } => (*ci, args.clone(), *has_block),
-                _ => { incr_counter!(send_forward_reject_no_context); return false; }
+                Insn::ForwardingCallInfo { ci, args, has_block } =>
+                    ForwardedCallInfo::Inlined { ci: *ci, args: args.clone(), has_block: *has_block },
+                _ => match self.profiled_forwarded_callinfo(state) {
+                    Some(profiled) => profiled,
+                    None => { incr_counter!(send_forward_reject_no_context); return false; }
+                }
             }
         };
-        // `bh = VM_ENV_BLOCK_HANDLER(GET_LEP())`: the forwarded call is handed whatever block
-        // this frame was given. Upstream reads that handler back out of the frame's EP and
-        // installs it as the merged call's `block_arg`; on this branch `SendDirectData` has no
-        // `block_arg` and `BlockHandler::BlockArg` is unreachable in a `SendDirect`, so there is
-        // no way to pass a run-time handler on. A forwarder that was given a block therefore
-        // keeps its `SendForward`, which the interpreter still completes out of the frame
-        // extension. See the `[reorder port note]` on this commit.
-        if frame_has_block {
-            incr_counter!(send_forward_reject_complex_args);
-            return false;
-        }
-        // Everything from here on had a compile-time callinfo, so a fallback is a property of the
-        // merged call rather than of the frame. Separate the two so the counters say which.
+        let caller_ci = forwarding.ci();
+        // Everything from here on has a callinfo for both halves, so a fallback is a property of
+        // the merged call rather than of the frame. Separate the two so the counters say which.
         self.set_dynamic_send_reason(insn_id, SendForwardTargetNotSpecialized);
         let site_ci = unsafe { (*cd).ci };
         let site_flags = unsafe { rb_vm_ci_flag(site_ci) };
@@ -5196,7 +5238,9 @@ impl Function {
 
         let caller_flags = unsafe { rb_vm_ci_flag(caller_ci) };
         let caller_argc = unsafe { rb_vm_ci_argc(caller_ci) } as usize;
-        if caller_args.len() != caller_argc { return false; }
+        if let ForwardedCallInfo::Inlined { args, .. } = &forwarding {
+            if args.len() != caller_argc { return false; }
+        }
 
         let shape = CallShape {
             // The merged flags of `vm_caller_setup_fwd_args`, minus `VM_CALL_FORWARDING`. That
@@ -5210,6 +5254,7 @@ impl Function {
         };
         if unspecializable_call_type(shape.flags) {
             incr_counter!(send_forward_reject_complex_args);
+            self.set_dynamic_send_reason(insn_id, SendForwardComplexArgs);
             return false;
         }
 
@@ -5217,12 +5262,17 @@ impl Function {
             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
             ReceiverTypeResolution::Monomorphic { profiled_type }
             | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
-            _ => { incr_counter!(send_forward_reject_recv_type); return false; }
+            _ => {
+                incr_counter!(send_forward_reject_recv_type);
+                self.set_dynamic_send_reason(insn_id, SendForwardRecvType);
+                return false;
+            }
         };
 
         let mut cme = unsafe { rb_callable_method_entry(klass, site_mid) };
         if cme.is_null() {
             incr_counter!(send_forward_reject_method_type);
+            self.set_dynamic_send_reason(insn_id, SendForwardMethodType);
             return false;
         }
         // `rb_check_overloaded_cme` is deliberately not consulted. It only substitutes an
@@ -5233,6 +5283,7 @@ impl Function {
             (METHOD_VISI_PUBLIC, _) | (METHOD_VISI_PRIVATE, true) | (METHOD_VISI_PROTECTED, true) => {}
             _ => {
                 incr_counter!(send_forward_reject_method_type);
+                self.set_dynamic_send_reason(insn_id, SendForwardMethodType);
                 return false;
             }
         }
@@ -5243,38 +5294,151 @@ impl Function {
         }
         if def_type != VM_METHOD_TYPE_ISEQ {
             incr_counter!(send_forward_reject_method_type);
+            self.set_dynamic_send_reason(insn_id, SendForwardMethodType);
             return false;
         }
         let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+        // Chained forwarding: `bar(...)` whose target is itself a `def bar(...)`. Such a callee
+        // does not bind parameters, it receives a callinfo in its `...` local -- and no
+        // `rb_callinfo` describes the merged argument list. The interpreter has one because
+        // `vm_caller_setup_fwd_args` builds it on the C stack and `vm_callee_setup_arg` copies
+        // it to the heap; a compiled site would have to synthesize and root one, which is not
+        // worth it for how rarely chains show up. `can_direct_send_forwardable` refuses these
+        // anyway (`shape.ci` is `None`); rejecting here just gives the reason its own counter.
+        if 0 != unsafe { iseq.params() }.flags.forwardable() {
+            incr_counter!(send_forward_reject_chained);
+            self.set_dynamic_send_reason(insn_id, SendForwardComplexArgs);
+            return false;
+        }
 
-        let mut merged_args = site_args.to_vec();
-        merged_args.extend_from_slice(&caller_args);
-        // Two things this settles:
+        // Whether the merged call passes this frame's block on.
         //
-        // A forwardable target is rejected, because `shape.ci` is `None` and such a callee's
-        // `...` local has to *receive* a callinfo. That is the chained `def bar(...)` case.
+        // `bh = VM_ENV_BLOCK_HANDLER(GET_LEP())`: whatever block this frame was given goes
+        // straight to the callee. Upstream asks for the conservative answer first -- "was given
+        // a block", passing the handler on as the merged call's `block_arg` -- and only then
+        // falls back to the blockless form. On this branch `SendDirectData` has no `block_arg`
+        // and `BlockHandler::BlockArg` is `unreachable!()` in `gen_send_iseq_direct`, so there
+        // is no way to hand a run-time handler on and `true` is never a candidate:
         //
-        // `has_block` is `false`: a frame that was handed a block was rejected above.
-        let merged_caller_args = CallerArguments::new(&merged_args, shape);
-        let Ok(call) = self.build_send_direct_args(&merged_caller_args, None, iseq, /* has_block */ false, /* block_arg_passthrough */ false) else {
+        // * An inlined frame that was given a block has no candidate at all and keeps its
+        //   `SendForward`, which the interpreter still completes out of the frame extension.
+        // * A standalone frame does not know statically whether it was given one, so it takes
+        //   the blockless form and guards at run time that the frame has no block. That is what
+        //   makes the common blockless delegator specializable, and it is not redundant with
+        //   the callinfo guard: a literal block at the call site clears `VM_CALL_ARGS_SIMPLE`
+        //   and so shows up in the callinfo, but a block arriving through `public_send` does
+        //   not.
+        //
+        // See the `[reorder port note]` on this commit.
+        let candidates: &[bool] = match forwarding {
+            ForwardedCallInfo::Inlined { has_block, .. } => if has_block { &[] } else { &[false] },
+            ForwardedCallInfo::Profiled { .. } => &[false],
+        };
+        // Validate the merged call before emitting the guards it needs. `build_send_direct_args`
+        // reads only the *shape* of the argument list -- its length and which slots the callee's
+        // keyword table names -- never the values, so a placeholder list of the right length
+        // answers the question for the standalone case, where the real values are loads that
+        // have to come after the guard.
+        let mut probe = site_args.to_vec();
+        probe.resize(site_argc + caller_argc, recv);
+        let Some(frame_has_block) = candidates.iter().copied().find(|&has_block|
+            self.build_send_direct_args(&CallerArguments::new(&probe, shape), None, iseq, has_block, /* block_arg_passthrough */ false).is_ok()
+        ) else {
             incr_counter!(send_forward_reject_complex_args);
+            self.set_dynamic_send_reason(insn_id, SendForwardComplexArgs);
             return false;
         };
 
         // Past here we commit: everything below only appends.
         if !self.assume_no_singleton_classes(block, klass, state) {
             incr_counter!(send_forward_reject_recv_type);
+            self.set_dynamic_send_reason(insn_id, SendForwardRecvType);
             return false;
         }
         self.push_insn(block, Insn::PatchPoint {
             invariant: Invariant::MethodRedefined { klass, method: site_mid, cme },
             state,
         });
+
+        // The frame's local EP, emitted at most once: the forwarded arguments and the
+        // block-handler guard both read through it.
+        let mut lep_insn = None;
+        let mut lep = |fun: &mut Self| *lep_insn.get_or_insert_with(|| {
+            let lep_level = get_lvar_level(fun.frame_state_ref(state).iseq);
+            fun.push_insn(block, Insn::GetEP { level: lep_level })
+        });
+
+        let is_profiled = matches!(forwarding, ForwardedCallInfo::Profiled { .. });
+        let merged_args = match forwarding {
+            ForwardedCallInfo::Inlined { args: caller_args, .. } => {
+                let mut merged_args = site_args.to_vec();
+                merged_args.extend_from_slice(&caller_args);
+                merged_args
+            }
+            ForwardedCallInfo::Profiled { ci, local_table_size } => {
+                // Pin the callinfo down before anything downstream depends on what it says.
+                //
+                // The comparison is bit-for-bit against a packed callinfo, which carries
+                // `RUBY_FIXNUM_FLAG` and so is an immediate rather than a pointer: there is
+                // nothing here for the GC to keep alive and nothing to root, which is the whole
+                // reason only packed callinfos are speculated on. That is also why the constant
+                // is a `Const::Value` -- the `...` local is typed as a Ruby object, because a
+                // local slot is, and an immediate is the one kind of callinfo that really is one.
+                //
+                // The guard's result is deliberately dropped rather than substituted for the
+                // local: past the guard its type would read `Fixnum`, which is true of the bits
+                // and false of the value. The site keeps using the original, which the fallback
+                // `Insn::SendForward` and every side exit still need.
+                self.push_insn(block, Insn::GuardBitEquals {
+                    val: forwarded,
+                    expected: Const::Value(VALUE(ci as usize)),
+                    reason: Box::new(SideExitReason::SendForwardCallInfoChanged),
+                    state,
+                    recompile: Some(Recompile),
+                });
+                // The forwarded arguments are not values this compilation produced: they sit in
+                // the frame extension `vm_call_iseq_forwardable` grew the frame by, directly
+                // below the local table, which is exactly where `vm_adjust_stack_forwarding`
+                // reads them from. Nothing writes those slots for the life of the frame, and the
+                // count is fixed by the callinfo the guard above just pinned down.
+                let ep = lep(self);
+                let base = -((local_table_size + caller_argc + VM_ENV_DATA_SIZE.to_usize() - 1) as i32);
+                let mut merged_args = site_args.to_vec();
+                for i in 0..caller_argc {
+                    merged_args.push(self.load_field(block, ep, FieldName::Stack(i as u16),
+                        SIZEOF_VALUE_I32 * (base + i as i32), types::BasicObject));
+                }
+                incr_counter!(send_forward_expanded_profiled_count);
+                merged_args
+            }
+        };
+
+        // A standalone frame's block is not a compile-time fact, and there is no `block_arg` on
+        // this branch to pass a run-time handler on with (see the comment on `candidates`), so
+        // the merged call was planned as blockless: make sure at run time that it really is.
+        debug_assert!(!frame_has_block, "`candidates` never offers the block-passthrough form here");
+        if is_profiled {
+            let ep = lep(self);
+            let handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
+            self.push_insn(block, Insn::GuardBitEquals {
+                val: handler,
+                expected: Const::CInt64(VM_BLOCK_HANDLER_NONE as i64),
+                reason: Box::new(SideExitReason::SendForwardBlockGiven),
+                state,
+                recompile: Some(Recompile),
+            });
+            incr_counter!(send_forward_expanded_profiled_no_block);
+        }
+
         let recv = match profiled_type {
             Some(profiled_type) => self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile),
             None => recv,
         };
 
+        let merged_caller_args = CallerArguments::new(&merged_args, shape);
+        let Ok(call) = self.build_send_direct_args(&merged_caller_args, None, iseq, frame_has_block, /* block_arg_passthrough */ false) else {
+            unreachable!("the probe list above validated a call of the same shape");
+        };
         // The site's stack slots are its own arguments plus the `...` above them; the merged
         // argument list replaces all of it. `state` stays the guard state, so a guard that fails
         // re-runs the original `sendforward` in the interpreter, which reconstructs the same
@@ -5288,6 +5452,55 @@ impl Function {
         self.make_equal_to(insn_id, replacement);
         incr_counter!(send_forward_expanded_count);
         true
+    }
+
+    /// The callinfo a standalone-compiled `bar(...)` site forwards, when the profiler saw the
+    /// same packed one every time and the site is in a position where a guard can pin it down.
+    ///
+    /// A packed callinfo is an immediate whose bits *are* `(mid, flag, argc)` and whose keyword
+    /// table is always empty, so guarding it is one comparison against a constant and keeps
+    /// nothing alive. A heap (`imemo_callinfo`) one -- what a keyword-carrying caller produces --
+    /// would need a GC root to hold and is left to the dynamic path; see
+    /// [`crate::profile::profile_forwarded_callinfo`].
+    fn profiled_forwarded_callinfo(&self, state: InsnId) -> Option<ForwardedCallInfo> {
+        let frame_state = self.frame_state_ref(state);
+        let (iseq, insn_idx) = (frame_state.iseq, frame_state.insn_idx);
+        // A guard has to be able to leave. A final version that may not side-exit keeps the
+        // dynamic `sendforward`, which is always correct.
+        //
+        // The frame also has to be this compilation's own. The arguments are read relative to the
+        // frame's local EP, and only the outermost frame is guaranteed to be the one the running
+        // `def foo(...)` method actually owns -- an inlined frame reaches its local EP through
+        // whatever frames the inliner did or did not push.
+        if self.policy.no_side_exits || iseq != self.iseq {
+            incr_counter!(send_forward_reject_ci_no_guard);
+            return None;
+        }
+        let Some(summary) = get_or_create_iseq_payload(iseq).profile.get_forwarded_callinfos(insn_idx) else {
+            incr_counter!(send_forward_reject_ci_no_profile);
+            return None;
+        };
+        if !summary.is_monomorphic() {
+            incr_counter!(send_forward_reject_ci_polymorphic);
+            return None;
+        }
+        let Some(ci) = *summary.buckets().first()? else {
+            incr_counter!(send_forward_reject_ci_not_packed);
+            return None;
+        };
+        // `vm_adjust_stack_forwarding` sizes the frame extension from the local ISEQ's table, not
+        // from the ISEQ the `bar(...)` is written in, which differ when the site is inside a
+        // block.
+        let local_iseq = unsafe { rb_get_iseq_body_local_iseq(iseq) };
+        let local_table_size = num_locals(local_iseq);
+        // The arguments are addressed as a byte offset from the EP, which is an `i32`. A packed
+        // callinfo caps `argc` at 15 bits, so only an absurd local table could get near the
+        // limit, but the offset arithmetic below should not be the thing that finds out.
+        if local_table_size > u16::MAX as usize {
+            incr_counter!(send_forward_reject_ci_no_guard);
+            return None;
+        }
+        Some(ForwardedCallInfo::Profiled { ci: ci as *const rb_callinfo, local_table_size })
     }
 
     /// Rewrite eligible Send opcodes into SendDirect
