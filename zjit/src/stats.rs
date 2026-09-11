@@ -302,6 +302,7 @@ make_counters! {
         send_fallback_invokeblock_symbol_unspecialized,
         send_fallback_invokeblock_polymorphic_miss,
         send_fallback_sendforward_not_specialized,
+        send_fallback_sendforward_target_not_specialized,
         send_fallback_invokesuperforward_not_specialized,
         send_fallback_single_ractor_mode_required,
         send_fallback_uncategorized,
@@ -527,6 +528,23 @@ make_counters! {
     inline_reject_no_returns,
     inline_reject_budget_exceeded,
 
+    // `def foo(...)` callees, whose inlining is what gives a `bar(...)` inside them a
+    // compile-time callinfo.
+    inline_forwardable_count,
+    inline_reject_forwardable,
+
+    // `bar(...)` sites merged with the callinfo of an inlined `def foo(...)` frame. See
+    // `Function::specialize_send_forward`.
+    send_forward_expanded_count,
+    // The site is not inside an inlined forwardable frame, so there is no compile-time callinfo
+    // to merge with.
+    send_forward_reject_no_context,
+    // `bar(*a, ...)`: the site splats, so the merged argument count is only known at run time.
+    send_forward_reject_site_splat,
+    send_forward_reject_recv_type,
+    send_forward_reject_method_type,
+    send_forward_reject_complex_args,
+
     total_native_stack_bytes,
 }
 
@@ -746,6 +764,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         InvokeBlockSymbolUnspecialized            => send_fallback_invokeblock_symbol_unspecialized,
         InvokeBlockPolymorphicMiss                => send_fallback_invokeblock_polymorphic_miss,
         SendForwardNotSpecialized                 => send_fallback_sendforward_not_specialized,
+        SendForwardTargetNotSpecialized           => send_fallback_sendforward_target_not_specialized,
         InvokeSuperForwardNotSpecialized          => send_fallback_invokesuperforward_not_specialized,
         SingleRactorModeRequired                  => send_fallback_single_ractor_mode_required,
         Uncategorized(_)                          => send_fallback_uncategorized,
