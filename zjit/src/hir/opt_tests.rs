@@ -18144,7 +18144,7 @@ mod hir_opt_tests {
           v18:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v33:CPtr[CPtr(0x1038)] = ForwardingCallInfo :forwardable
           PushInlineFrame :forwardable, v18 (0x1040), num_args=0
-          v28:BasicObject = SendForward v18, 0x1060, :itself, v33 # SendFallbackReason: SendForward: merged call not specialized
+          v28:BasicObject = SendForward v18, 0x1060, :itself, v33 # SendFallbackReason: SendForward: merged call target is not an ISEQ
           PopInlineFrame
           CheckInterrupts
           Return v28
@@ -18215,7 +18215,7 @@ mod hir_opt_tests {
           v20:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v35:CPtr[CPtr(0x1038)] = ForwardingCallInfo :forwardable with_block v11
           PushInlineFrame :forwardable, v20 (0x1040), num_args=1
-          v30:BasicObject = SendForward v20, 0x1060, :target, v35 # SendFallbackReason: SendForward: not yet specialized
+          v30:BasicObject = SendForward v20, 0x1060, :target, v35 # SendFallbackReason: SendForward: merged call arguments do not fit
           PopInlineFrame
           CheckInterrupts
           Return v30
