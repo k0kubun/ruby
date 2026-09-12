@@ -17671,10 +17671,11 @@ mod hir_opt_tests {
           v21:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           v22:ArrayExact = NewArray
           v23:Fixnum[100] = Const Value(100)
-          v24:HashExact = NewHash
-          v26:BasicObject = SendDirect v21, 0x0, :fancy (0x1038), v11, v22, v23, v24
+          v24:Fixnum[0] = Const Value(0)
+          v25:HashExact = NewHash
+          v27:BasicObject = SendDirect v21, 0x0, :fancy (0x1038), v11, v22, v23, v24, v25
           CheckInterrupts
-          Return v26
+          Return v27
         ");
     }
 

@@ -1093,6 +1093,40 @@ fn test_kwrest_with_rest_and_optional() {
 }
 
 #[test]
+fn test_send_exit_with_kwrest_callee() {
+    // The callee never compiles, so the direct send's function stub spills the caller's
+    // arguments into the callee frame in local order and exits to the interpreter with that
+    // frame. The callee's locals run (lead, opt, rest, post, kw..., kw_bits, kwrest), so the
+    // arguments only line up with them if the hidden `kw_bits` slot takes an argument of its
+    // own; without it the `**rest` Hash lands in `kw_bits`, the resuming `checkkeyword` reads
+    // a Hash as its bitmask and skips the default, and the `**rest` local keeps whatever the
+    // VM stack already held there.
+    assert_snapshot!(inspect("
+        def default_k = 11
+        def target(a, b = 9, *r, c, k: default_k, **opts)
+          ::RubyVM::ZJIT.induce_compile_failure!
+          [a, b, r, c, k, opts]
+        end
+        5.times.map { target(1, 2, 3, 4, 5, z: 7) }.uniq
+    "), @"[[1, 2, [3, 4], 5, 11, {z: 7}]]");
+}
+
+#[test]
+fn test_send_exit_with_kwrest_callee_defaulted_keyword() {
+    // As above with only the parameters the bug needs: one named keyword whose default is not
+    // a constant, so the caller passes a placeholder plus a set `kw_bits` bit and the callee
+    // has to evaluate the default itself after resuming in the interpreter.
+    assert_snapshot!(inspect("
+        def default_k = 11
+        def target(a, k: default_k, **opts)
+          ::RubyVM::ZJIT.induce_compile_failure!
+          [a, k, opts]
+        end
+        5.times.map { target(1, z: 7) }.uniq
+    "), @"[[1, 11, {z: 7}]]");
+}
+
+#[test]
 fn test_kwrest_only_kwrest_param() {
     assert_snapshot!(inspect("
         def target(**opts) = opts

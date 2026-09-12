@@ -3301,7 +3301,9 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
     // Without *rest, use the converted positional count so the synthesized
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
-    let send_argc = send_positional_argc + kw_total_num as usize + usize::from(has_kwrest);
+    // `callee_passes_kw_bits_arg` adds one more slot for the hidden `kw_bits` local.
+    let send_argc = send_positional_argc + kw_total_num as usize + usize::from(has_kwrest)
+        + usize::from(callee_passes_kw_bits_arg(iseq));
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
@@ -5861,6 +5863,12 @@ impl Function {
             let nil_anon_kwrest = leftover.is_empty()
                 && 0 == params.flags.has_kw()
                 && 0 != params.flags.anon_kwrest();
+            // The hidden `kw_bits` local sits between the keyword slots and `**rest` in the
+            // callee's local table, so it needs an argument of its own to keep the argument
+            // list in local order. See `callee_passes_kw_bits_arg`.
+            if callee_passes_kw_bits_arg(iseq) {
+                processed_args.push(SendDirectArg::Constant(VALUE::fixnum_from_usize(kw_bits as usize)));
+            }
             processed_args.push(if nil_anon_kwrest {
                 SendDirectArg::Constant(Qnil)
             } else {
@@ -5893,7 +5901,8 @@ impl Function {
         let lead_num = params.lead_num as usize;
         let opt_num = params.opt_num as usize;
         let post_num = params.post_num as usize;
-        let kw_num = callee_kw_num(iseq) + usize::from(params.flags.has_kwrest() != 0);
+        let kw_num = callee_kw_num(iseq) + usize::from(params.flags.has_kwrest() != 0)
+            + usize::from(callee_passes_kw_bits_arg(iseq));
 
         let positional_argc = args.len().checked_sub(kw_num).ok_or(ArgcParamMismatch)?;
         let min_positional_argc = lead_num + post_num;
@@ -8349,6 +8358,12 @@ impl Function {
                 let post_num = callee_params.post_num as usize;
                 let kw_num = callee_kw_num(iseq);
                 let rest_slots = usize::from(callee_params.flags.has_rest() != 0);
+                // `**rest` and, when it follows named keywords, the hidden `kw_bits` slot
+                // take argument slots of their own, so they map to args like any other
+                // parameter local. `can_inline` rejects `**rest` callees today, so these are
+                // zero; they keep the mapping right if it ever stops rejecting them.
+                let kwrest_slots = usize::from(callee_params.flags.has_kwrest() != 0);
+                let kw_bits_arg_slots = usize::from(callee_passes_kw_bits_arg(iseq));
                 let passed_opt_num = jit_entry_idx as usize;
 
                 // Create the continuation block before translating the callee so it
@@ -8422,7 +8437,8 @@ impl Function {
                 debug_assert!(self.is_send_direct(tail[0]));
 
                 let omitted_opt_num = opt_num - passed_opt_num;
-                let positional_kw_end = lead_num + opt_num + rest_slots + post_num + kw_num;
+                let positional_kw_end =
+                    lead_num + opt_num + rest_slots + post_num + kw_num + kw_bits_arg_slots + kwrest_slots;
                 let kw_bits_local_idx = callee_kw_bits_local_idx(iseq);
                 let callee_entry_body_block = add_result.body_entry_block
                     .expect("inlined compilation always produces a body entry block");
@@ -11637,6 +11653,23 @@ fn callee_kw_bits_local_idx(iseq: *const rb_iseq_t) -> Option<usize> {
     Some(unsafe { (*keyword).bits_start } as usize)
 }
 
+/// True when a SendDirect to `iseq` hands the callee's hidden `kw_bits` slot an argument of
+/// its own instead of leaving it out of the argument list.
+///
+/// The parameter locals run `(lead, opt, rest, post, kw..., kw_bits, kwrest)`, so a `**rest`
+/// parameter sits directly above `kw_bits`. Leaving the hidden slot out of the arguments is
+/// only invisible while the arguments stay in registers: every path that lays them out in
+/// local order -- `gen_function_stub`'s spill before exiting to the interpreter, and the
+/// inliner's local mapping -- would put the `**rest` Hash in the `kw_bits` slot and leave the
+/// `**rest` local holding whatever the VM stack already had there. So `kw_bits` becomes a
+/// real argument for these callees, and the caller's separate store into the frame goes away.
+///
+/// A `**rest` callee with no named keywords has no `kw_bits` slot at all, so its `**rest`
+/// Hash is already the argument that lines up with its local.
+pub fn callee_passes_kw_bits_arg(iseq: *const rb_iseq_t) -> bool {
+    callee_kw_bits_local_idx(iseq).is_some() && 0 != unsafe { iseq.params() }.flags.has_kwrest()
+}
+
 /// True if `splatarray`'s operand has only ever been an Array at this bytecode index, so the
 /// conversion can be replaced with a type guard.
 fn splat_operand_is_array(payload: &crate::payload::IseqPayload, insn_idx: YarvInsnIdx) -> bool {
@@ -14527,6 +14560,12 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         None
     };
 
+    // A callee with both named keywords and `**rest` takes `kw_bits` as an ordinary
+    // argument instead of reading it back out of the frame; see `callee_passes_kw_bits_arg`.
+    // This has to agree with `gen_send_iseq_direct`, which stops storing the bitmask into
+    // the frame for exactly these callees, or the argument list would be off by one.
+    let kw_bits_is_arg = callee_passes_kw_bits_arg(iseq);
+
     let mut arg_idx: u32 = 0;
     // For `def` methods on classes that can only produce heap (non-immediate)
     // instances, `self` is a HeapBasicObject. See `iseq_self_is_heap_object`.
@@ -14539,7 +14578,7 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
         let local = if (lead_num + passed_opt_num..lead_num + opt_num).contains(&local_idx) {
             // Omitted optionals are locals, so they start as nils before their code run
             fun.push_insn(jit_entry_block, Insn::Const { val: Const::Value(Qnil) })
-        } else if Some(local_idx) == kw_bits_idx {
+        } else if Some(local_idx) == kw_bits_idx && !kw_bits_is_arg {
             // Read the kw_bits value written by the caller to the callee frame.
             // This tells us which optional keywords were NOT provided and need their defaults evaluated.
             // Note: The caller writes kw_bits to memory via gen_send_iseq_direct but does NOT pass it
