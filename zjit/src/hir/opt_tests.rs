@@ -22026,7 +22026,7 @@ mod hir_opt_tests {
           v5:BasicObject = LoadArg :self@0
           Jump bb3(v5)
         bb3(v8:BasicObject):
-          v97:NilClass = Const Value(nil)
+          v98:NilClass = Const Value(nil)
           v13:NilClass = Const Value(nil)
           v15:TrueClass|NilClass = Defined yield, v13
           CondBranchTest v15, bb9(), bb4()
@@ -22055,10 +22055,10 @@ mod hir_opt_tests {
           v84:Iseq = LoadField v83, :code_iseq@0x1001
           v85:Iseq[VALUE(0x1008)] = GuardBitEquals v84, Value(VALUE(0x1008)) recompile
           v86:BasicObject = InvokeBlockIseqDirect (0x1008), v83, v75
-          v90:Fixnum[1] = Const Value(1)
-          v91:Fixnum = FixnumAdd v48, v90
+          v91:Fixnum[1] = Const Value(1)
+          v92:Fixnum = FixnumAdd v48, v91
           PatchPoint NoEPEscape(each)
-          Jump bb8(v91)
+          Jump bb8(v92)
         bb4():
           v27:BasicObject = InvokeBuiltin <inline_expr>, v8
           CheckInterrupts
@@ -22159,10 +22159,10 @@ mod hir_opt_tests {
           v93:CInt64[-4] = Const CInt64(-4)
           v94:CInt64 = IntAnd v92, v93
           v95:BasicObject = InvokeBlockIseqDirect (0x1068), v94, v89
-          v99:Fixnum[1] = Const Value(1)
-          v100:Fixnum = FixnumAdd v63, v99
+          v100:Fixnum[1] = Const Value(1)
+          v101:Fixnum = FixnumAdd v63, v100
           PatchPoint NoEPEscape(each)
-          Jump bb10(v100)
+          Jump bb10(v101)
         ");
     }
 

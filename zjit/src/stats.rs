@@ -162,6 +162,7 @@ make_counters! {
         ivar_respecialize_declined_count,
         ivar_respecialize_giveup_count,
         skipped_native_stack_full,
+        skipped_exceptional_entry_escaped_env,
 
         compile_time_ns,
         profile_time_ns,

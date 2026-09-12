@@ -11,7 +11,7 @@ use crate::asm::LabelName;
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, get_option};
-use crate::payload::IseqVersionRef;
+use crate::payload::{IseqVersion, IseqVersionRef};
 use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
@@ -641,16 +641,16 @@ pub struct SideExit {
     /// side exit. The current frame's stack and locals are still handled by
     /// `stack` and `locals` above.
     pub stack_map: Option<StackMap>,
-    /// If set, the side exit will invalidate the compiled ISEQ for recompilation.
+    /// If set, the side exit will invalidate the compiled version for recompilation.
     pub recompile: Option<SideExitRecompile>,
 }
 
 /// Metadata for the recompile callback on side exit.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SideExitRecompile {
-    /// The compiled unit whose version must be invalidated to force a recompile. For inlined
-    /// methods, this will be the outer function it was inlined into.
-    pub compiled_iseq: Opnd,
+    /// The compiled version that must be invalidated to force a recompile. For inlined
+    /// methods, this version belongs to the outer function it was inlined into.
+    pub compiled_version: Opnd,
 }
 
 /// Payload of `Target::SideExit`, boxed to keep `Target` (and every `Insn`
@@ -3144,9 +3144,9 @@ impl Assembler
             let extra = (stack_map.is_some() || trace_reason.is_some())
                 .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
             let recompile = match recompile {
-                Some(SideExitRecompile { compiled_iseq: Opnd::Value(compiled_iseq) }) => compiled_iseq.as_iseq(),
-                Some(recompile) => unreachable!("recompile target should be an ISEQ VALUE, got {:?}", recompile.compiled_iseq),
-                None => std::ptr::null(),
+                Some(SideExitRecompile { compiled_version: Opnd::UImm(compiled_version) }) => *compiled_version as *mut IseqVersion,
+                Some(recompile) => unreachable!("recompile target should be a constant IseqVersion pointer, got {:?}", recompile.compiled_version),
+                None => std::ptr::null_mut(),
             };
             let Opnd::UImm(pc) = *pc else {
                 unreachable!("side exit PC should be a constant pointer, got {pc:?}")

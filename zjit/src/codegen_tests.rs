@@ -341,7 +341,7 @@ fn test_getglobal_with_warning() {
         test
     "#);
     assert_contains_opcode("test", YARVINSN_getglobal);
-    assert_snapshot!(assert_compiles(r#"test"#), @r#""rescued""#);
+    assert_snapshot!(assert_compiles_allowing_exits(r#"test"#), @r#""rescued""#);
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn test_setglobal_with_trace_var_exception() {
         test
     "#);
     assert_contains_opcode("test", YARVINSN_setglobal);
-    assert_snapshot!(assert_compiles(r#"test"#), @r#""rescued""#);
+    assert_snapshot!(assert_compiles_allowing_exits(r#"test"#), @r#""rescued""#);
 }
 
 #[test]
@@ -2059,7 +2059,7 @@ fn test_send_no_kwarg_to_positional_hash_fallback() {
         end
         entry
     ");
-    assert_snapshot!(assert_compiles("entry"), @":argument_error");
+    assert_snapshot!(assert_compiles_allowing_exits("entry"), @":argument_error");
 }
 
 #[test]
@@ -3865,7 +3865,8 @@ fn test_exit_descriptor_recompile() {
     ");
     let iseq = get_method_iseq("self", "exit_desc_recompile");
     let descs = crate::exit_desc::descriptors_of(iseq);
-    assert!(descs.iter().any(|desc| desc.recompile == iseq), "expected an exit that recompiles the method");
+    let version = get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ptr();
+    assert!(descs.iter().any(|desc| desc.recompile == version), "expected an exit that recompiles the method's version");
 
     assert_eq!(Qtrue, eval("exit_desc_recompile(1.5, 2.5) == 4.0"));
     let payload = get_or_create_iseq_payload(iseq);
@@ -3982,7 +3983,8 @@ fn test_lazy_exit_recompile() {
     ");
     let iseq = get_method_iseq("self", "lazy_exit_recompile");
     let descs = crate::exit_desc::descriptors_of(iseq);
-    assert!(descs.iter().any(|desc| desc.recompile == iseq), "expected an exit that recompiles the method");
+    let version = get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ptr();
+    assert!(descs.iter().any(|desc| desc.recompile == version), "expected an exit that recompiles the method's version");
 
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(Qtrue, eval("lazy_exit_recompile(1.5, 2.5) == 4.0"));
@@ -6879,7 +6881,7 @@ fn test_defined_with_method_call() {
         test
     "#);
     assert_contains_opcode("test", YARVINSN_defined);
-    assert_snapshot!(assert_compiles(r#"test"#), @r#"["method", nil]"#);
+    assert_snapshot!(assert_compiles_allowing_exits(r#"test"#), @r#"["method", nil]"#);
 }
 
 #[test]
@@ -7399,7 +7401,12 @@ fn test_profile_frames_during_direct_block_entry() {
         "#);
 
         let profiler = signal_profiler::Profiler::start(10);
-        assert_snapshot!(assert_compiles("profiled_yield_loop(1_000_000)"), @"1000000");
+        // Enter the loop through Method#call so it runs under its own vm_exec. The `return` out
+        // of the block in profiled_yield_deep is a throw, and once its handler returns, exception
+        // OSR resumes the caller frames in JIT code up to the nearest finished frame. Without the
+        // FINISH frame that would include this unprofiled test harness frame, whose `.inspect`
+        // side-exits.
+        assert_snapshot!(assert_compiles("method(:profiled_yield_loop).call(1_000_000)"), @"1000000");
         assert!(profiler.samples() > 0, "rb_profile_frames was not called from SIGPROF handler");
     });
 }
@@ -7967,8 +7974,6 @@ fn test_checkmatch_when_splat_array() {
 
 #[test]
 fn test_checkmatch_rescue() {
-    // Rescue behavior is tested functionally here. It still side-exits because
-    // JIT exception handling is not supported yet.
     eval(r#"
         def test
           begin
@@ -8142,7 +8147,7 @@ fn test_ccall_variadic_with_no_args_causing_argument_error() {
         test
     ");
     assert_contains_opcode("test", YARVINSN_opt_send_without_block);
-    assert_snapshot!(assert_compiles("test"), @":error");
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @":error");
 }
 
 #[test]
@@ -9275,7 +9280,7 @@ fn test_inlined_method_with_rescue_caught_in_callee() {
     // callee. The runtime exception walker must find the rescue clause via the
     // inlined callee's CFP.
     with_inlining(|| {
-        assert_snapshot!(assert_inlines(r#"
+        assert_snapshot!(assert_inlines_allowing_exits(r#"
             def callee(x)
               begin
                 raise "boom" if x.negative?
@@ -9297,7 +9302,7 @@ fn test_inlined_method_with_rescue_caught_in_caller() {
     // The callee re-raises and the caller catches the exception after unwinding
     // the inlined callee frame.
     with_inlining(|| {
-        assert_snapshot!(assert_inlines(r#"
+        assert_snapshot!(assert_inlines_allowing_exits(r#"
             def callee(x)
               raise "boom" if x.negative?
               0
@@ -9319,7 +9324,8 @@ fn test_inlined_method_with_rescue_caught_in_caller() {
 #[test]
 fn test_inlined_method_with_ensure_runs_on_propagation() {
     with_inlining(|| {
-        assert_snapshot!(assert_inlines(r##"
+        // The newly compiled ensure and rescue entries can exit on code without profiles.
+        assert_snapshot!(assert_inlines_allowing_exits(r##"
             $log = []
             def callee(x)
               begin
@@ -9350,7 +9356,7 @@ fn test_inlined_method_with_retry_resumes_begin_block() {
     // The begin/rescue/retry callee is larger than the default test inline budget,
     // so raise the threshold enough for it to be inlined.
     with_inlining_threshold(100, || {
-        assert_snapshot!(assert_inlines(r#"
+        assert_snapshot!(assert_inlines_allowing_exits(r#"
             def callee(counter)
               begin
                 counter[0] += 1

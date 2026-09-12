@@ -38,7 +38,7 @@ use crate::virtualmem::CodePtr;
 use crate::asm::CodeBlock;
 use crate::backend::lir::{Assembler, Opnd, Target, asm_comment, C_RET_OPND};
 use crate::options::get_option;
-use crate::payload::IseqVersionRef;
+use crate::payload::{IseqVersion, IseqVersionRef};
 
 /// Where a side exit finds one 64-bit value when it runs.
 ///
@@ -93,9 +93,10 @@ pub struct ExitDescriptor {
     pub pc: *const VALUE,
     /// `cfp->iseq` of the exiting frame
     pub iseq: IseqPtr,
-    /// If not null, the compiled ISEQ to pass to exit_recompile(). For an exit out
-    /// of inlined code, this is the outer ISEQ, not `iseq`.
-    pub recompile: IseqPtr,
+    /// If not null, the compiled version to pass to exit_recompile(). For an exit
+    /// out of inlined code, this is the outer function's version. It is not a GC
+    /// object: IseqVersions are never freed.
+    pub recompile: *mut IseqVersion,
     /// Ruby stack slots (the first `num_stack`) followed by locals
     locs: Vec<ExitLoc>,
     num_stack: usize,
@@ -124,17 +125,16 @@ impl ExitImms {
 // Descriptor encoding. All multi-byte integers are little-endian; "varint" is
 // LEB128 and signed values are zigzag-encoded varints.
 //
-//   u64 pc, u64 iseq, u8 flags, u8 hits, [u64 recompile], varint num_stack, varint num_locals,
+//   u64 pc, u64 iseq, u8 flags, u8 hits, [u64 recompile version], varint num_stack, varint num_locals,
 //   loc * (num_stack + num_locals),
 //   [u64 jit_frame, svarint jit_frame_slot, varint num_captures, (loc, svarint slot) * num_captures],
 //   [u64 trace_reason]
 //
 // Each loc starts with a byte whose low 3 bits are a tag and high 5 bits a payload.
 // `hits` is updated in place by the handler, see [`lazy_exit_hit`].
-const FLAG_RECOMPILE: u8 = 1 << 0; // a u64 recompile ISEQ follows
-const FLAG_RECOMPILE_SELF: u8 = 1 << 1; // recompile the exiting ISEQ itself
-const FLAG_STACK_MAP: u8 = 1 << 2;
-const FLAG_TRACE: u8 = 1 << 3;
+const FLAG_RECOMPILE: u8 = 1 << 0; // a u64 IseqVersion pointer to recompile follows
+const FLAG_STACK_MAP: u8 = 1 << 1;
+const FLAG_TRACE: u8 = 1 << 2;
 
 const TAG_REG: u8 = 0; // payload: reg_no. A 64-bit register.
 const TAG_SLOT: u8 = 1; // svarint disp. A 64-bit native stack slot.
@@ -286,13 +286,13 @@ enum DecodedLoc {
     Value(*mut u64),
 }
 
-/// Header of an encoded descriptor. `iseq` and `recompile` point at their 8-byte
-/// fields so that the GC can update them in place.
+/// Header of an encoded descriptor. `iseq` points at its 8-byte field so that
+/// the GC can update it in place.
 struct DecodedHeader {
     pc: *const VALUE,
     iseq: *mut u64,
     /// Null if the exit doesn't recompile
-    recompile: *mut u64,
+    recompile: *mut IseqVersion,
     flags: u8,
     /// Hit counter and lazy compilation state, updated in place. See [`lazy_exit_hit`].
     hits: *mut u8,
@@ -309,9 +309,7 @@ impl Decoder {
         let hits = self.ptr;
         self.u8();
         let recompile = if flags & FLAG_RECOMPILE != 0 {
-            self.u64_ptr()
-        } else if flags & FLAG_RECOMPILE_SELF != 0 {
-            iseq
+            self.u64() as *mut IseqVersion
         } else {
             std::ptr::null_mut()
         };
@@ -365,9 +363,8 @@ impl Decoder {
         let trace_reason = (header.flags & FLAG_TRACE != 0).then(|| self.u64() as *const c_char);
         let extra = (stack_map.is_some() || trace_reason.is_some())
             .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
-        let recompile = if header.recompile.is_null() { std::ptr::null() } else { unsafe { header.recompile.read_unaligned() as IseqPtr } };
         let iseq = unsafe { header.iseq.read_unaligned() as IseqPtr };
-        ExitDescriptor::new(header.pc, iseq, stack, locals, imms, recompile, extra)
+        ExitDescriptor::new(header.pc, iseq, stack, locals, imms, header.recompile, extra)
     }
 }
 
@@ -378,7 +375,7 @@ impl ExitDescriptor {
         stack: Vec<ExitLoc>,
         locals: Vec<ExitLoc>,
         imms: ExitImms,
-        recompile: IseqPtr,
+        recompile: *mut IseqVersion,
         extra: Option<Box<ExitDescriptorExtra>>,
     ) -> Self {
         let num_stack = stack.len();
@@ -409,9 +406,7 @@ impl ExitDescriptor {
         enc.u64(self.pc as u64);
         enc.u64(self.iseq as u64);
         let mut flags = 0;
-        if self.recompile == self.iseq {
-            flags |= FLAG_RECOMPILE_SELF;
-        } else if !self.recompile.is_null() {
+        if !self.recompile.is_null() {
             flags |= FLAG_RECOMPILE;
         }
         if self.stack_map().is_some() {
@@ -534,9 +529,6 @@ impl ExitDescriptorTable {
     fn each_object_field(base: *mut u8, range: &Range<u32>, mut f: impl FnMut(*mut u64)) {
         Self::each_descriptor(base, range, |header, decoder| {
             f(header.iseq);
-            if header.flags & FLAG_RECOMPILE != 0 {
-                f(header.recompile);
-            }
             decoder.visit_rest(header, |field| {
                 if !VALUE(unsafe { field.read_unaligned() } as usize).special_const_p() {
                     f(field);
@@ -748,12 +740,7 @@ pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usi
         }
 
         let trace_reason = (header.flags & FLAG_TRACE != 0).then(|| decoder.u64() as *const c_char);
-        let recompile = if header.recompile.is_null() {
-            std::ptr::null()
-        } else {
-            unsafe { header.recompile.read_unaligned() as IseqPtr }
-        };
-        (trace_reason, recompile, table.materialize_exit_addr)
+        (trace_reason, header.recompile, table.materialize_exit_addr)
     };
 
     if trace_reason.is_some() || !recompile.is_null() {
@@ -766,7 +753,7 @@ pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usi
         rb_zjit_record_exit_stack(reason);
     }
     if !recompile.is_null() {
-        exit_recompile(VALUE::from(recompile));
+        exit_recompile(recompile);
     }
 
     materialize_exit_addr as *const u8
@@ -892,7 +879,7 @@ fn gen_lazy_exit(desc: &ExitDescriptor) -> Assembler {
     }
     if !desc.recompile.is_null() {
         asm_comment!(asm, "call exit_recompile");
-        asm.ccall_into(C_RET_OPND, exit_recompile as *const u8, vec![VALUE::from(desc.recompile).into()]);
+        asm.ccall_into(C_RET_OPND, exit_recompile as *const u8, vec![Opnd::const_ptr(desc.recompile)]);
     }
 
     asm_comment!(asm, "exit to the interpreter");
@@ -944,7 +931,7 @@ pub fn descriptors_of(iseq: IseqPtr) -> Vec<ExitDescriptor> {
     let payload = crate::payload::get_or_create_iseq_payload(iseq);
     let table = read_table();
     let mut descs = vec![];
-    for version in payload.versions.iter() {
+    for version in payload.all_versions() {
         let range = unsafe { version.as_ref() }.exit_descs.clone();
         ExitDescriptorTable::each_descriptor(table.bytes.as_ptr().cast_mut(), &range, |header, decoder| {
             descs.push(decoder.descriptor(header));
@@ -1002,7 +989,7 @@ mod tests {
         assert!(matches!(locs[8], ExitLoc::Imm(_)));
         assert!(matches!(locs[9], ExitLoc::Value(_)));
         let stack_map = ExitStackMap { captures: vec![(ExitLoc::Reg { reg: 1, bits: 64 }, -40)].into_boxed_slice(), jit_frame: 0x1000 as *const _, jit_frame_slot: -16 };
-        let desc = ExitDescriptor::new(0x5000 as *const VALUE, 0x6000 as IseqPtr, locs[..4].to_vec(), locs[4..].to_vec(), imms, 0x7000 as IseqPtr,
+        let desc = ExitDescriptor::new(0x5000 as *const VALUE, 0x6000 as IseqPtr, locs[..4].to_vec(), locs[4..].to_vec(), imms, 0x7000 as *mut IseqVersion,
             Some(Box::new(ExitDescriptorExtra { stack_map: Some(stack_map), trace_reason: Some(0x8000 as *const c_char) })));
         let mut encoded = desc.encode().into_vec();
         encoded.extend_from_slice(&desc.encode());
@@ -1013,7 +1000,7 @@ mod tests {
             let header = decoder.header();
             assert_eq!(header.pc, desc.pc);
             assert_eq!(unsafe { header.iseq.read_unaligned() }, 0x6000);
-            assert_eq!(unsafe { header.recompile.read_unaligned() }, 0x7000);
+            assert_eq!(header.recompile as usize, 0x7000);
             assert_eq!((header.num_stack, header.num_locals), (4, 6));
             for &expected in &locs {
                 let actual = match decoder.loc() {
