@@ -1,8 +1,9 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use crate::codegen::IseqCallRef;
+use crate::codegen::{ExceptionEntryGuardRef, IseqCallRef};
 use crate::options::{get_option, NumExits};
 use crate::stats::CompileError;
+use crate::hir_type::Type;
 use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
 
 pub use crate::jit_frame::JITFrame;
@@ -14,6 +15,10 @@ pub struct IseqPayload {
     pub profile: IseqProfile,
     /// JIT code versions. Different versions should have different assumptions.
     pub versions: Vec<IseqVersionRef>,
+    /// JIT entries for observed exception PCs. Entries from one compilation share a version.
+    pub exception_entries: Vec<ExceptionEntry>,
+    /// Patchable checks that dispatch jit_exec_exception() by program counter.
+    pub exception_entry_guards: Vec<ExceptionEntryGuardRef>,
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
     pub was_invalidated_for_singleton_class_creation: bool,
@@ -45,16 +50,54 @@ pub struct IseqPayload {
 /// keep changing shape.
 pub const MAX_IVAR_RESPECIALIZATIONS: u8 = 2;
 
+/// The interpreter state observed at one exception-handler entry.
+#[derive(Clone, Debug)]
+pub struct ExceptionEntrySpec {
+    pub insn_idx: u16,
+    pub stack_size: u8,
+    pub value_types: Vec<Type>,
+}
+
+/// A compiled exception entry for one bytecode instruction.
+#[derive(Debug)]
+pub struct ExceptionEntry {
+    pub spec: ExceptionEntrySpec,
+    pub target: Option<CodePtr>,
+    pub version: IseqVersionRef,
+}
+
 impl IseqPayload {
     fn new() -> Self {
         Self {
             profile: IseqProfile::new(),
             versions: vec![],
+            exception_entries: vec![],
+            exception_entry_guards: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
             ivar_respecializations: 0,
             ivar_reprofile_giveup: false,
+        }
+    }
+
+    /// Iterate over normal and exception-entry versions.
+    pub fn all_versions(&self) -> impl Iterator<Item = IseqVersionRef> + '_ {
+        self.versions.iter().copied().chain(
+            self.exception_entries.iter().enumerate()
+                .filter(|(idx, entry)| !self.exception_entries[..*idx].iter()
+                    .any(|previous| previous.version == entry.version))
+                .map(|(_, entry)| entry.version),
+        )
+    }
+
+    /// Return the version count for the entry represented by `version`.
+    pub fn version_count_for(&self, version: IseqVersionRef) -> usize {
+        match self.exception_entries.iter().find(|entry| entry.version == version) {
+            Some(exception_entry) => self.exception_entries.iter()
+                .filter(|entry| entry.spec.insn_idx == exception_entry.spec.insn_idx)
+                .count(),
+            None => self.versions.len(),
         }
     }
 
@@ -124,10 +167,12 @@ impl IseqVersion {
 /// Set of CodePtrs for an ISEQ
 #[derive(Clone, Debug, PartialEq)]
 pub struct IseqCodePtrs {
-    /// Entry for the interpreter
+    /// Entry for the interpreter.
     pub start_ptr: CodePtr,
     /// Entries for JIT-to-JIT calls
     pub jit_entry_ptrs: Vec<CodePtr>,
+    /// Entries for observed exception-handler PCs.
+    pub exception_entry_ptrs: Vec<(u16, CodePtr)>,
 }
 
 #[derive(Debug, PartialEq)]

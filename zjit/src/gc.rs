@@ -316,7 +316,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     // points in `Invariants` hold raw pointers to them and are only dropped when
     // the assumption they guard is broken. Dropping the payload below frees the
     // `Vec` of pointers, not the pointees.
-    for &version in payload.versions.iter() {
+    for version in payload.all_versions() {
         unsafe { (*version.as_ptr()).iseq = null() };
     }
 
@@ -387,7 +387,7 @@ fn iseq_mark(payload: &mut IseqPayload) {
     // Mark objects baked in JIT code
     time_gc_phase(gc_iseq_mark_offsets_time_ns, || {
         let mut marked = 0u64;
-        for version in payload.versions.iter() {
+        for version in payload.all_versions() {
             let gc_offsets = &unsafe { version.as_ref() }.gc_offsets;
             marked += gc_offsets.len() as u64;
             gc_offsets.mark();
@@ -406,7 +406,7 @@ fn iseq_update_references(payload: &mut IseqPayload) {
         }
     });
 
-    for &version in payload.versions.iter() {
+    for version in payload.all_versions() {
         iseq_version_update_references(version);
     }
 }
