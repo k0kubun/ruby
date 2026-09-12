@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use crate::codegen::IseqCallRef;
+use crate::options::get_option;
 use crate::stats::CompileError;
 use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
 
@@ -24,6 +25,9 @@ pub struct IseqPayload {
     /// `BasicObject`) when the owner is unknown.
     /// See [`crate::cruby::iseq_self_is_heap_object`].
     pub self_is_heap_object: bool,
+    /// Remaining recompile side exits before the current compiled version is
+    /// invalidated. See `exit_recompile`.
+    pub num_exits_until_invalidate: u32,
 }
 
 impl IseqPayload {
@@ -33,6 +37,7 @@ impl IseqPayload {
             versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
+            num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
         }
     }
 }

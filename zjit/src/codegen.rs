@@ -388,6 +388,8 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         Ok(code_ptrs) => {
             unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
             incr_counter!(compiled_iseq_count);
+            // Give the new version a fresh budget of recompile exits. See exit_recompile().
+            payload.num_exits_until_invalidate = get_option!(num_exits_until_invalidate);
         }
         Err(err) => {
             unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());
@@ -3779,11 +3781,11 @@ c_callable! {
     /// the outer ISEQ's version holds the failing guard and must be invalidated to
     /// force a recompile. For non-inlined code, it is the same as the frame ISEQ.
     ///
-    /// The first exit invalidates the version right away. Invalidation resets the
+    /// Each compiled version gets a budget of `--zjit-num-exits-until-invalidate`
+    /// recompile exits; the exit that exhausts the budget invalidates the version,
+    /// so with a budget of N, the Nth exit invalidates it. Invalidation resets the
     /// ISEQ's call counter and re-stubs incoming JIT-to-JIT calls, so every entry
     /// runs the profiling window in the interpreter before the next compile.
-    ///
-    /// TODO: Allow waiting for a configured number of exits before invalidating the ISEQ.
     pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE) {
         // Fast check before taking the VM lock: skip if the compiled unit is already
         // invalidated or at the version limit. This avoids expensive lock acquisition
@@ -3798,6 +3800,18 @@ c_callable! {
             if already_done {
                 return;
             }
+
+            // Wait for the configured number of exits before invalidating: a single stray
+            // exit should not throw away a hot compiled version. Until the budget runs out,
+            // the compiled code keeps running and the interpreter tail after each exit keeps
+            // collecting fresh profiles at the exiting instruction. The countdown is
+            // unsynchronized like the checks above; a lost decrement only delays
+            // invalidation by one exit.
+            if payload.num_exits_until_invalidate > 1 {
+                payload.num_exits_until_invalidate -= 1;
+                return;
+            }
+            payload.num_exits_until_invalidate = 0;
         }
 
         with_vm_lock(src_loc!(), || {

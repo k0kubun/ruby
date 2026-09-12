@@ -10459,6 +10459,10 @@ mod hir_opt_tests {
     #[test]
     fn test_setivar_shape_guard_recompile() {
         set_max_versions(2);
+        // The `100.times { d.foo }` block below compiles and inlines `foo` early in
+        // the loop, so `foo`'s own version only takes a couple of shape guard exits.
+        // Invalidate it on the first exit to keep the recompilation deterministic.
+        set_num_exits_until_invalidate(1);
         // Call with one shape to compile, then call with a different shape to
         // trigger shape guard exits and recompilation. The recompiled version
         // specializes both profiled shapes.
