@@ -650,7 +650,6 @@ pub enum SideExitReason {
     PatchPoint(Invariant),
     CalleeSideExit,
     Interrupt,
-    BlockParamProxyUnknownHandler,
     InvokeBlockHandlerNotIseq,
     InvokeBlockIseqChanged,
     BlockParamWbRequired,
@@ -9708,8 +9707,9 @@ fn add_iseq_to_hir(
                     let original_local = if level == 0 { Some(state.getlocal(ep_offset)) } else { None };
                     // `block_handler & 1 == 1` accepts both ISEQ (0b01) and ifunc
                     // (0b11) handlers. Keep a compile-time check that this shortcut
-                    // does not accidentally accept symbol block handlers.
-                    const _: () = assert!(RUBY_SYMBOL_FLAG & 1 == 0, "guard below rejects symbol block handlers");
+                    // does not accidentally accept symbol block handlers, which must
+                    // be converted to a Proc rather than given the proxy.
+                    const _: () = assert!(RUBY_SYMBOL_FLAG & 1 == 0, "branch below rejects symbol block handlers");
 
                     let jump_to_join_block = |fun: &mut Function, from: BlockId, val: InsnId| {
                         let mut args = vec![val];
@@ -9740,41 +9740,27 @@ fn add_iseq_to_hir(
 
                     // Handle VM_BLOCK_HANDLER_NONE: the block param is nil.
                     let nil_block = fun.new_block(branch_insn_idx);
-                    let proc_check_block = fun.new_block(branch_insn_idx);
+                    let proc_block = fun.new_block(branch_insn_idx);
                     let none_handler = fun.push_insn(nil_check_block, Insn::Const { val: Const::CInt64(VM_BLOCK_HANDLER_NONE.into()) });
                     let is_none = fun.push_insn(nil_check_block, Insn::IsBitEqual { left: block_handler, right: none_handler });
                     fun.push_insn(nil_check_block, Insn::CondBranch {
                         val: is_none,
                         if_true: BranchEdge { target: nil_block, args: vec![] },
-                        if_false: BranchEdge { target: proc_check_block, args: vec![] },
+                        if_false: BranchEdge { target: proc_block, args: vec![] },
                     });
                     let nil_val = fun.push_insn(nil_block, Insn::Const { val: Const::Value(Qnil) });
                     jump_to_join_block(fun, nil_block, nil_val);
 
-                    // Handle a Proc block handler.
-                    let proc_block = fun.new_block(branch_insn_idx);
-                    let unknown_block = fun.new_block(branch_insn_idx);
-                    let proc_val = fun.load_ep_env_field(proc_check_block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::BasicObject);
-                    let proc_result = fun.push_insn(proc_check_block, Insn::CCall {
-                        cfunc: rb_obj_is_proc as *const u8,
-                        recv: proc_val,
-                        args: vec![],
-                        name: ID!(rb_obj_is_proc),
-                        owner: Qnil,
-                        return_type: types::BoolExact,
-                        elidable: true,
-                    });
-                    let true_val = fun.push_insn(proc_check_block, Insn::Const { val: Const::Value(Qtrue) });
-                    let is_proc = fun.push_insn(proc_check_block, Insn::IsBitEqual { left: proc_result, right: true_val });
-                    fun.push_insn(proc_check_block, Insn::CondBranch {
-                        val: is_proc,
-                        if_true: BranchEdge { target: proc_block, args: vec![] },
-                        if_false: BranchEdge { target: unknown_block, args: vec![] },
-                    });
-                    jump_to_join_block(fun, proc_block, proc_val);
-
-                    // Otherwise, exit to the interpreter.
-                    fun.push_insn(unknown_block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::BlockParamProxyUnknownHandler), recompile: None });
+                    // Everything left is a symbol or a Proc block handler, since
+                    // vm_block_handler_type() only asserts rb_obj_is_proc() once it has ruled
+                    // out ISEQ, ifunc and symbol handlers. The interpreter converts both to a
+                    // Proc and memoizes it in the EP, which is what getblockparam does, so
+                    // reuse that instead of telling the two apart.
+                    let proc_val = fun.push_insn(proc_block, Insn::GetBlockParam { ep_offset, level, state: exit_id });
+                    // Unlike the branches above, this wrote the Proc to the EP local.
+                    let mut proc_args = vec![proc_val];
+                    if level == 0 { proc_args.push(proc_val); }
+                    fun.push_insn(proc_block, Insn::Jump(BranchEdge { target: join_block, args: proc_args }));
 
                     if let Some(local_param) = join_local {
                         state.setlocal(ep_offset, local_param);
