@@ -4708,6 +4708,16 @@ impl Function {
                         let mut has_block = send_block.is_some();
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
+                            // A skewed-polymorphic receiver fails its guard by construction:
+                            // the profile only promises the majority class. On the final
+                            // version the guard can no longer be recompiled away, so
+                            // dispatch dynamically rather than side-exit on the minority
+                            // class for the rest of the process.
+                            ReceiverTypeResolution::SkewedPolymorphic { .. } if self.policy.no_side_exits => {
+                                self.set_dynamic_send_reason(insn_id, SendPolymorphic);
+                                self.push_insn_id(block, insn_id);
+                                continue;
+                            }
                             ReceiverTypeResolution::Monomorphic { profiled_type }
                             | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
                             ReceiverTypeResolution::SkewedMegamorphic { .. }
@@ -4774,8 +4784,13 @@ impl Function {
                             // The block arg is the last element in args
                             if let Some(&block_arg) = args.last() {
                                 let statically_nil = self.is_a(block_arg, types::NilClass);
-                                let profiled_nil = self.profiled_type_of_at(block_arg, state)
-                                    .map_or(false, |pt| pt.is_nil());
+                                // On the final version the guard below can no longer be
+                                // recompiled away, so speculating on a profiled nil block
+                                // arg would side-exit for the rest of the process. Fall
+                                // back to a dynamic send instead.
+                                let profiled_nil = !self.policy.no_side_exits
+                                    && self.profiled_type_of_at(block_arg, state)
+                                        .map_or(false, |pt| pt.is_nil());
                                 if statically_nil || profiled_nil {
                                     if !statically_nil {
                                         // Guard needed when relying on profiled type. Uses the original

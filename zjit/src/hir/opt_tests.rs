@@ -21370,7 +21370,7 @@ mod hir_opt_tests {
           v8:BasicObject = LoadArg :x@1
           Jump bb3(v7, v8)
         bb3(v11:HeapBasicObject, v12:BasicObject):
-          v94:NilClass = Const Value(nil)
+          v90:NilClass = Const Value(nil)
           v17:Fixnum[1] = Const Value(1)
           PatchPoint SingleRactorMode
           v21:CShape = LoadField v11, :shape_id@0x1001
@@ -21411,11 +21411,9 @@ mod hir_opt_tests {
           v89:Float = FloatAdd v57, v44
           Jump bb9(v89)
         bb13():
-          PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
-          v92:Fixnum = GuardType v12, Fixnum recompile
-          v93:Fixnum = FixnumAdd v92, v44
-          Jump bb9(v93)
-        bb9(v47:Float|Fixnum):
+          v60:BasicObject = Send v12, :+, v44 # SendFallbackReason: Send: polymorphic call site
+          Jump bb9(v60)
+        bb9(v47:BasicObject):
           PatchPoint SingleRactorMode
           v69:CShape = LoadField v11, :shape_id@0x1001
           v70:CShape[0x1002] = Const CShape(0x1002)
