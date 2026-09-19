@@ -1538,6 +1538,9 @@ impl Assembler {
                 Insn::Jl(target) => {
                     emit_conditional_jump::<{Condition::LT}>(self, cb, target.clone());
                 },
+                Insn::Jle(target) => {
+                    emit_conditional_jump::<{Condition::LE}>(self, cb, target.clone());
+                },
                 Insn::Jg(target) => {
                     emit_conditional_jump::<{Condition::GT}>(self, cb, target.clone());
                 },

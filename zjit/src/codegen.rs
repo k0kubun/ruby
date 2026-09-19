@@ -25,7 +25,7 @@ use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Co
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
 use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
-use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
+use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchFixnumCmpData, CondBranchHasTypeData, Const, FieldName, FixnumCmpOp, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
 use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
@@ -537,6 +537,44 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                         assert!(asm.current_block().insns.last().unwrap().is_terminator());
                         Ok(())
                     }
+                    Insn::CondBranchTest { val, if_true, if_false } => {
+                        let val_opnd = jit.get_opnd(*val);
+
+                        let true_branch = lir::BranchEdge {
+                            target: hir_to_lir[if_true.target].unwrap(),
+                            args: if_true.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
+                        };
+
+                        let false_branch = lir::BranchEdge {
+                            target: hir_to_lir[if_false.target].unwrap(),
+                            args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
+                        };
+
+                        gen_cond_branch_test(&mut asm, val_opnd, true_branch, false_branch);
+
+                        assert!(asm.current_block().insns.last().unwrap().is_terminator());
+                        Ok(())
+                    }
+                    Insn::CondBranchFixnumCmp(cond_branch) => {
+                        let CondBranchFixnumCmpData { op, left, right, if_true, if_false } = &**cond_branch;
+                        let left_opnd = jit.get_opnd(*left);
+                        let right_opnd = jit.get_opnd(*right);
+
+                        let true_branch = lir::BranchEdge {
+                            target: hir_to_lir[if_true.target].unwrap(),
+                            args: if_true.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
+                        };
+
+                        let false_branch = lir::BranchEdge {
+                            target: hir_to_lir[if_false.target].unwrap(),
+                            args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
+                        };
+
+                        gen_cond_branch_fixnum_cmp(&mut asm, *op, left_opnd, right_opnd, true_branch, false_branch);
+
+                        assert!(asm.current_block().insns.last().unwrap().is_terminator());
+                        Ok(())
+                    }
                     Insn::Jump(target) => {
                         let lir_target = hir_to_lir[target.target].unwrap();
                         let branch_edge = lir::BranchEdge {
@@ -834,7 +872,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), &function.frame_state(state))),
-        &Insn::CondBranch { .. } | &Insn::CondBranchHasType { .. }
+        &Insn::CondBranch { .. } | &Insn::CondBranchHasType { .. } | &Insn::CondBranchTest { .. } | &Insn::CondBranchFixnumCmp { .. }
         | &Insn::Jump { .. } | Insn::Entries { .. } => unreachable!(),
     };
 
@@ -3068,6 +3106,34 @@ fn gen_test(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
     // See RB_TEST(), include/ruby/internal/special_consts.h
     asm.test(val, Opnd::Imm(!Qnil.as_i64()));
     asm.csel_e(0.into(), 1.into())
+}
+
+/// Branch to `if_true` if `val` is truthy (neither nil nor false) and to `if_false` otherwise,
+/// using only the condition flags like gen_test does, without materializing 0/1 and testing it
+/// again. Terminates the current block.
+fn gen_cond_branch_test(asm: &mut Assembler, val: lir::Opnd, if_true: lir::BranchEdge, if_false: lir::BranchEdge) {
+    // Test if any bit (outside of the Qnil bit) is on. See RB_TEST().
+    asm.test(val, Opnd::Imm(!Qnil.as_i64()));
+    asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(if_true))));
+    asm.jmp(Target::Block(Box::new(if_false)));
+}
+
+/// Branch to `if_true` if `left op right` holds for two fixnums and to `if_false` otherwise.
+/// Comparing the boxed operands preserves the fixnum order because tagging is monotonic, so
+/// this is a single `cmp` + conditional jump with no Qtrue/Qfalse materialization. Terminates
+/// the current block.
+fn gen_cond_branch_fixnum_cmp(asm: &mut Assembler, op: FixnumCmpOp, left: lir::Opnd, right: lir::Opnd, if_true: lir::BranchEdge, if_false: lir::BranchEdge) {
+    let true_target = Target::Block(Box::new(if_true));
+    asm.cmp(left, right);
+    asm.push_insn(match op {
+        FixnumCmpOp::Lt => lir::Insn::Jl(true_target),
+        FixnumCmpOp::Le => lir::Insn::Jle(true_target),
+        FixnumCmpOp::Gt => lir::Insn::Jg(true_target),
+        FixnumCmpOp::Ge => lir::Insn::Jge(true_target),
+        FixnumCmpOp::Eq => lir::Insn::Je(true_target),
+        FixnumCmpOp::Ne => lir::Insn::Jne(true_target),
+    });
+    asm.jmp(Target::Block(Box::new(if_false)));
 }
 
 /// Branch to `if_true` if `val` has type `ty` and to `if_false` otherwise, using only the

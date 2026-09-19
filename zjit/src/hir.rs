@@ -980,6 +980,47 @@ pub struct CondBranchHasTypeData {
     pub if_false: BranchEdge,
 }
 
+/// Comparison performed by [`Insn::CondBranchFixnumCmp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixnumCmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl FixnumCmpOp {
+    /// Evaluate the comparison on two unboxed fixnum values.
+    pub fn eval(self, left: i64, right: i64) -> bool {
+        match self {
+            FixnumCmpOp::Lt => left < right,
+            FixnumCmpOp::Le => left <= right,
+            FixnumCmpOp::Gt => left > right,
+            FixnumCmpOp::Ge => left >= right,
+            FixnumCmpOp::Eq => left == right,
+            FixnumCmpOp::Ne => left != right,
+        }
+    }
+}
+
+impl std::fmt::Display for FixnumCmpOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// Payload of [`Insn::CondBranchFixnumCmp`]. Boxed in the enum to keep `Insn` small.
+#[derive(Debug, Clone)]
+pub struct CondBranchFixnumCmpData {
+    pub op: FixnumCmpOp,
+    pub left: InsnId,
+    pub right: InsnId,
+    pub if_true: BranchEdge,
+    pub if_false: BranchEdge,
+}
+
 /// Payload of [`Insn::CCallVariadic`]. Boxed in the enum to keep `Insn` small.
 #[derive(Debug, Clone)]
 pub struct CCallVariadicData {
@@ -1170,6 +1211,15 @@ pub enum Insn {
     /// Conditional branch on a type test: branch to if_true if val has type expected and to
     /// if_false otherwise.
     CondBranchHasType(Box<CondBranchHasTypeData>),
+
+    /// Conditional branch on Ruby truthiness: branch to if_true if val is neither nil nor false
+    /// and to if_false otherwise. Fuses what used to be `Test` + `CondBranch`.
+    CondBranchTest { val: InsnId, if_true: BranchEdge, if_false: BranchEdge },
+
+    /// Conditional branch on a fixnum comparison: branch to if_true if `left op right` holds and
+    /// to if_false otherwise. Fuses a single-use `FixnumLt`-style compare into the
+    /// `CondBranchTest` that consumed it, so codegen branches on the compare's flags directly.
+    CondBranchFixnumCmp(Box<CondBranchFixnumCmpData>),
 
     /// Call a C function without pushing a frame
     /// `name` and `owner` are for printing purposes only
@@ -1565,6 +1615,17 @@ macro_rules! for_each_operand_impl {
                 $visit_many!(insn.if_true.args);
                 $visit_many!(insn.if_false.args);
             }
+            Insn::CondBranchTest { val, if_true: BranchEdge { args: true_args, .. }, if_false: BranchEdge { args: false_args, .. } } => {
+                $visit_one!(*val);
+                $visit_many!(true_args);
+                $visit_many!(false_args);
+            }
+            Insn::CondBranchFixnumCmp(insn) => {
+                $visit_one!(insn.left);
+                $visit_one!(insn.right);
+                $visit_many!(insn.if_true.args);
+                $visit_many!(insn.if_false.args);
+            }
             Insn::ArrayDup { val, state }
             | Insn::Throw { val, state, .. }
             | Insn::HashDup { val, state } => {
@@ -1724,7 +1785,8 @@ impl Insn {
             Insn::Comment { .. }
             | Insn::Jump(_)
             | Insn::Entries { .. }
-            | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::EntryPoint { .. } | Insn::Return { .. }
+            | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
+            | Insn::EntryPoint { .. } | Insn::Return { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
@@ -1739,7 +1801,8 @@ impl Insn {
     /// Return true if the instruction ends a basic block and false otherwise.
     pub fn is_terminator(&self) -> bool {
         match self {
-            Insn::Unreachable | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::Jump(_) | Insn::Entries { .. } | Insn::Return { .. } | Insn::SideExit { .. } | Insn::Throw { .. } => true,
+            Insn::Unreachable | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
+            | Insn::Jump(_) | Insn::Entries { .. } | Insn::Return { .. } | Insn::SideExit { .. } | Insn::Throw { .. } => true,
             _ => false,
         }
     }
@@ -1747,7 +1810,8 @@ impl Insn {
     /// Return true if the instruction is a jump (has successor blocks in the CFG).
     pub fn is_jump(&self) -> bool {
         match self {
-            Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::Jump(_) | Insn::Entries { .. } => true,
+            Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
+            | Insn::Jump(_) | Insn::Entries { .. } => true,
             _ => false,
         }
     }
@@ -1881,6 +1945,8 @@ impl Insn {
                     if insn.expected.is_subtype(types::Immediate) { abstract_heaps::Empty } else { abstract_heaps::Memory },
                     abstract_heaps::Control
                 ),
+            Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp(_)
+                => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::CCall { elidable, .. } => {
                 if *elidable {
                     Effect::write(abstract_heaps::Allocator)
@@ -2231,6 +2297,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FixnumAref { recv, index } => write!(f, "FixnumAref {recv}, {index}"),
             Insn::Jump(target) => { write!(f, "Jump {target}") }
             Insn::CondBranch { val, if_true, if_false } => { write!(f, "CondBranch {val}, {if_true}, {if_false}") },
+            Insn::CondBranchTest { val, if_true, if_false } => { write!(f, "CondBranchTest {val}, {if_true}, {if_false}") },
+            Insn::CondBranchFixnumCmp(insn) => {
+                let CondBranchFixnumCmpData { op, left, right, if_true, if_false } = &**insn;
+                write!(f, "CondBranchFixnumCmp {op}, {left}, {right}, {if_true}, {if_false}")
+            }
             Insn::CondBranchHasType(insn) => {
                 let CondBranchHasTypeData { val, expected, if_true, if_false } = &**insn;
                 write!(f, "CondBranchHasType {val}, {}, {if_true}, {if_false}", expected.print(self.ptr_map))
@@ -3469,6 +3540,8 @@ impl Function {
         let (first, second, rest): (Option<BlockId>, Option<BlockId>, &[BlockId]) = match terminator {
             Insn::CondBranch { if_true, if_false, .. } => (Some(if_true.target), Some(if_false.target), &[]),
             Insn::CondBranchHasType(insn) => (Some(insn.if_true.target), Some(insn.if_false.target), &[]),
+            Insn::CondBranchTest { if_true, if_false, .. } => (Some(if_true.target), Some(if_false.target), &[]),
+            Insn::CondBranchFixnumCmp(insn) => (Some(insn.if_true.target), Some(insn.if_false.target), &[]),
             Insn::Jump(edge) => (Some(edge.target), None, &[]),
             Insn::Entries { targets } => (None, None, targets.as_slice()),
 
@@ -3682,7 +3755,8 @@ impl Function {
             Insn::LoadArg { val_type, .. } => *val_type,
             Insn::SetGlobal { .. } | Insn::Jump(_) | Insn::Entries { .. } | Insn::EntryPoint { .. }
             | Insn::Comment { .. }
-            | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::Return { .. } | Insn::Throw { .. }
+            | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
+            | Insn::Return { .. } | Insn::Throw { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
@@ -3932,29 +4006,29 @@ impl Function {
                     }
                     // Instructions without output, including branch instructions, can't be targets
                     // of make_equal_to, so we don't need find() here.
+                    // Mark an edge reachable and flow the edge's arg types into the target's params.
+                    // Snapshot arg types before any param updates so phi-style updates happen in
+                    // parallel (the args of a self-loop may name params of `target` itself).
+                    macro_rules! mark_reachable {
+                        ($edge:expr) => {{
+                            let edge = $edge;
+                            reachable.insert(edge.target);
+                            let arg_types: Vec<Type> = edge.args.iter().map(|a| self.type_of(*a)).collect();
+                            for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                                let param = self.blocks[edge.target].params[idx];
+                                changed |= set_type!(param, self.type_of(param).union(arg_type));
+                            }
+                            traversed_back_edge |= rpo_order[edge.target] <= rpo_index;
+                        }};
+                    }
                     let insn_type = match &self.insns[insn_id] {
                         Insn::CondBranch { val, if_true, if_false } => {
                             assert!(!self.type_of(*val).bit_equal(types::Empty));
                             if self.type_of(*val).could_be(Type::from_cbool(true)) {
-                                reachable.insert(if_true.target);
-                                // Snapshot arg types before any param updates so phi-style
-                                // updates happen in parallel (the args of a self-loop may name
-                                // params of `target` itself).
-                                let arg_types: Vec<Type> = if_true.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
-                                    let param = self.blocks[if_true.target].params[idx];
-                                    changed |= set_type!(param, self.type_of(param).union(arg_type));
-                                }
-                                traversed_back_edge |= rpo_order[if_true.target] <= rpo_index;
+                                mark_reachable!(if_true);
                             }
                             if self.type_of(*val).could_be(Type::from_cbool(false)) {
-                                reachable.insert(if_false.target);
-                                let arg_types: Vec<Type> = if_false.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
-                                    let param = self.blocks[if_false.target].params[idx];
-                                    changed |= set_type!(param, self.type_of(param).union(arg_type));
-                                }
-                                traversed_back_edge |= rpo_order[if_false.target] <= rpo_index;
+                                mark_reachable!(if_false);
                             }
                             continue;
                         }
@@ -3980,22 +4054,40 @@ impl Function {
                             // * if v could be a T, then if_true is reachable
                             // * (not else!) if v is not a T, then if_false is reachable
                             if val_type.could_be(*expected) {
-                                reachable.insert(if_true.target);
-                                let arg_types: Vec<Type> = if_true.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
-                                    let param = self.blocks[if_true.target].params[idx];
-                                    changed |= set_type!(param, self.type_of(param).union(arg_type));
-                                }
-                                traversed_back_edge |= rpo_order[if_true.target] <= rpo_index;
+                                mark_reachable!(if_true);
                             }
                             if !val_type.is_subtype(*expected) {
-                                reachable.insert(if_false.target);
-                                let arg_types: Vec<Type> = if_false.args.iter().map(|a| self.type_of(*a)).collect();
-                                for (idx, arg_type) in arg_types.into_iter().enumerate() {
-                                    let param = self.blocks[if_false.target].params[idx];
-                                    changed |= set_type!(param, self.type_of(param).union(arg_type));
+                                mark_reachable!(if_false);
+                            }
+                            continue;
+                        }
+                        Insn::CondBranchTest { val, if_true, if_false } => {
+                            // An Empty val makes neither edge reachable; fold_constants turns
+                            // such a branch into Unreachable.
+                            let val_type = self.type_of(*val);
+                            if val_type.could_be(types::Truthy) {
+                                mark_reachable!(if_true);
+                            }
+                            if val_type.could_be(types::Falsy) {
+                                mark_reachable!(if_false);
+                            }
+                            continue;
+                        }
+                        Insn::CondBranchFixnumCmp(insn) => {
+                            let CondBranchFixnumCmpData { op, left, right, if_true, if_false } = &**insn;
+                            let left_type = self.type_of(*left);
+                            let right_type = self.type_of(*right);
+                            // Like CondBranchHasType, an Empty operand makes neither edge reachable.
+                            if !left_type.bit_equal(types::Empty) && !right_type.bit_equal(types::Empty) {
+                                match (left_type.fixnum_value(), right_type.fixnum_value()) {
+                                    (Some(l), Some(r)) => {
+                                        if op.eval(l, r) { mark_reachable!(if_true); } else { mark_reachable!(if_false); }
+                                    }
+                                    _ => {
+                                        mark_reachable!(if_true);
+                                        mark_reachable!(if_false);
+                                    }
                                 }
-                                traversed_back_edge |= rpo_order[if_false.target] <= rpo_index;
                             }
                             continue;
                         }
@@ -6515,6 +6607,8 @@ impl Function {
                     Insn::Jump(edge) => [Some(edge), None],
                     Insn::CondBranch { if_true, if_false, .. } => [Some(if_true), Some(if_false)],
                     Insn::CondBranchHasType(insn) => [Some($($borrow)+ insn.if_true), Some($($borrow)+ insn.if_false)],
+                    Insn::CondBranchTest { if_true, if_false, .. } => [Some(if_true), Some(if_false)],
+                    Insn::CondBranchFixnumCmp(insn) => [Some($($borrow)+ insn.if_true), Some($($borrow)+ insn.if_false)],
                     _ => [None, None],
                 }.into_iter().flatten()
             };
@@ -7127,6 +7221,39 @@ impl Function {
                     Insn::CondBranchHasType(insn) if !self.type_of(insn.val).could_be(insn.expected) => {
                         self.new_insn(Insn::Jump(insn.if_false.clone()))
                     }
+                    // Same as CondBranchHasType: a Bottom val is an impossible value, so this
+                    // program point is dead. Check it first since Empty is also known truthy/falsy.
+                    Insn::CondBranchTest { val, .. } if self.type_of(*val).is_subtype(types::Empty) => {
+                        self.new_insn(Insn::Unreachable)
+                    }
+                    &Insn::CondBranchTest { val, ref if_true, .. } if self.type_of(val).is_known_truthy() => {
+                        self.new_insn(Insn::Jump(if_true.clone()))
+                    }
+                    &Insn::CondBranchTest { val, ref if_false, .. } if self.type_of(val).is_known_falsy() => {
+                        self.new_insn(Insn::Jump(if_false.clone()))
+                    }
+                    &Insn::CondBranchTest { val, ref if_true, ref if_false } => {
+                        // Testing a boxed CBool is the same as branching on the CBool itself.
+                        let (if_true, if_false) = (if_true.clone(), if_false.clone());
+                        if let &Insn::BoxBool { val: bool_val } = self.resolve(val).insn(self) {
+                            self.new_insn(Insn::CondBranch { val: bool_val, if_true, if_false })
+                        } else {
+                            insn_id
+                        }
+                    }
+                    Insn::CondBranchFixnumCmp(insn)
+                        if self.type_of(insn.left).is_subtype(types::Empty) || self.type_of(insn.right).is_subtype(types::Empty) => {
+                        self.new_insn(Insn::Unreachable)
+                    }
+                    Insn::CondBranchFixnumCmp(insn) => {
+                        match (self.type_of(insn.left).fixnum_value(), self.type_of(insn.right).fixnum_value()) {
+                            (Some(l), Some(r)) => {
+                                let edge = if insn.op.eval(l, r) { &insn.if_true } else { &insn.if_false };
+                                self.new_insn(Insn::Jump(edge.clone()))
+                            }
+                            _ => insn_id,
+                        }
+                    }
                     _ => insn_id,
                 };
                 // If we're adding a new instruction, mark the two equivalent in the union-find and
@@ -7148,6 +7275,49 @@ impl Function {
 
     /// Remove instructions that do not have side effects and are not referenced by any other
     /// instruction.
+    /// Fuse a fixnum compare into the `CondBranchTest` that consumes it, so codegen can branch on
+    /// the compare's condition flags directly (`cmp left, right; jcc`) instead of materializing
+    /// Qtrue/Qfalse and then testing it again. The compare must be defined in the same block as
+    /// the branch and have no other use. Uses are counted across every instruction, including
+    /// `Snapshot` operands: a compare that a side exit needs (e.g. a `while` condition still on
+    /// the stack at the `CheckInterrupts` before the branch) stays materialized.
+    ///
+    /// Runs after `eliminate_dead_code`, so that the dead `Snapshot` of the branch instruction
+    /// itself (which has the compare on its stack) is already gone and does not count as a use.
+    /// The fused compare is dropped from its block here since nothing else uses it anymore.
+    fn fuse_fixnum_compare_branches(&mut self) {
+        let rpo = self.reverse_post_order();
+        let mut use_count = vec![0u32; self.insns.len()];
+        for &block_id in &rpo {
+            for &insn_id in &self.blocks[block_id].insns {
+                self.find_ref(insn_id).for_each_operand(|operand| {
+                    use_count[self.find_id(operand)] += 1;
+                });
+            }
+        }
+        for &block_id in &rpo {
+            // Terminators are never unioned, so the block's last insn id is the branch itself.
+            let Some(&branch_id) = self.blocks[block_id].insns.last() else { continue };
+            let Insn::CondBranchTest { val, if_true, if_false } = self.find(branch_id) else { continue };
+            let cmp_id = self.find_id(val);
+            if use_count[cmp_id] != 1 { continue; }
+            if !self.blocks[block_id].insns.iter().any(|&insn_id| self.find_id(insn_id) == cmp_id) { continue; }
+            let (op, left, right) = match self.find(cmp_id) {
+                Insn::FixnumLt  { left, right } => (FixnumCmpOp::Lt, left, right),
+                Insn::FixnumLe  { left, right } => (FixnumCmpOp::Le, left, right),
+                Insn::FixnumGt  { left, right } => (FixnumCmpOp::Gt, left, right),
+                Insn::FixnumGe  { left, right } => (FixnumCmpOp::Ge, left, right),
+                Insn::FixnumEq  { left, right } => (FixnumCmpOp::Eq, left, right),
+                Insn::FixnumNeq { left, right } => (FixnumCmpOp::Ne, left, right),
+                _ => continue,
+            };
+            self.insns[branch_id] = Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData { op, left, right, if_true, if_false }));
+            // The compare had exactly one use and no side effects, so it is dead now.
+            let union_find = self.union_find.borrow();
+            self.blocks[block_id].insns.retain(|&insn_id| union_find.find_const(insn_id) != cmp_id);
+        }
+    }
+
     fn eliminate_dead_code(&mut self) {
         let rpo = self.reverse_post_order();
         let mut worklist = VecDeque::new();
@@ -7628,6 +7798,7 @@ impl Function {
             (optimize_load_store) => { Counter::compile_hir_optimize_load_store_time_ns };
             (canonicalize) => { Counter::compile_hir_canonicalize_time_ns };
             (fold_constants) => { Counter::compile_hir_fold_constants_time_ns };
+            (fuse_fixnum_compare_branches) => { Counter::compile_hir_fuse_fixnum_compare_branches_time_ns };
             (clean_cfg) => { Counter::compile_hir_clean_cfg_time_ns };
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
             (remove_duplicate_check_interrupts) => { Counter::compile_hir_remove_duplicate_check_interrupts_time_ns };
@@ -7685,6 +7856,9 @@ impl Function {
             run_pass!(remove_duplicate_check_interrupts);
             run_pass!(eliminate_empty_inline_frames);
             run_pass!(eliminate_dead_code);
+            // After DCE so that dead Snapshots (one per YARV instruction) no longer count as
+            // uses of the compare; only side exits that actually need it keep it alive.
+            run_pass!(fuse_fixnum_compare_branches);
 
             if !did_inline {
                 break;
@@ -7763,6 +7937,14 @@ impl Function {
                         check_edge(block_id, if_false)?;
                     }
                     Insn::CondBranchHasType(insn) => {
+                        check_edge(block_id, &insn.if_true)?;
+                        check_edge(block_id, &insn.if_false)?;
+                    }
+                    Insn::CondBranchTest { if_true, if_false, .. } => {
+                        check_edge(block_id, if_true)?;
+                        check_edge(block_id, if_false)?;
+                    }
+                    Insn::CondBranchFixnumCmp(insn) => {
                         check_edge(block_id, &insn.if_true)?;
                         check_edge(block_id, &insn.if_false)?;
                     }
@@ -7859,6 +8041,14 @@ impl Function {
                         propagate(if_false.target)?;
                     }
                     Insn::CondBranchHasType(insn) => {
+                        propagate(insn.if_true.target)?;
+                        propagate(insn.if_false.target)?;
+                    }
+                    Insn::CondBranchTest { if_true, if_false, .. } => {
+                        propagate(if_true.target)?;
+                        propagate(if_false.target)?;
+                    }
+                    Insn::CondBranchFixnumCmp(insn) => {
                         propagate(insn.if_true.target)?;
                         propagate(insn.if_false.target)?;
                     }
@@ -8260,6 +8450,11 @@ impl Function {
             }
             Insn::RefineType { .. } => Ok(()),
             Insn::CondBranchHasType(ref insn) => self.assert_subtype(insn_id, insn.val, types::BasicObject),
+            Insn::CondBranchTest { val, .. } => self.assert_subtype(insn_id, val, types::BasicObject),
+            Insn::CondBranchFixnumCmp(ref insn) => {
+                self.assert_subtype(insn_id, insn.left, types::Fixnum)?;
+                self.assert_subtype(insn_id, insn.right, types::Fixnum)
+            }
             Insn::IsBlockParamModified { flags } => self.assert_subtype(insn_id, flags, types::CUInt64),
             // Frame instructions have no output to validate; their operands
             // are validated by the recv+args group (PushLightweightFrame)
@@ -9640,7 +9835,6 @@ fn add_iseq_to_hir(
                         fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     }
                     let val = state.stack_pop()?;
-                    let test_id = fun.push_insn(block, Insn::Test { val });
                     let target_idx = insn_idx_at_offset(insn_idx, offset);
                     let target = insn_idx_to_block[&target_idx];
                     let nil_false_type = types::Falsy;
@@ -9649,8 +9843,8 @@ fn add_iseq_to_hir(
                     iffalse_state.replace(val, nil_false);
                     let fall_through = fun.new_block(insn_idx);
 
-                    fun.push_insn(block, Insn::CondBranch {
-                        val: test_id,
+                    fun.push_insn(block, Insn::CondBranchTest {
+                        val,
                         if_true: BranchEdge { target: fall_through, args: vec![] },
                         if_false: BranchEdge { target, args: iffalse_state.as_args(self_param) }
                     });
@@ -9668,7 +9862,6 @@ fn add_iseq_to_hir(
                         fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     }
                     let val = state.stack_pop()?;
-                    let test_id = fun.push_insn(block, Insn::Test { val });
                     let target_idx = insn_idx_at_offset(insn_idx, offset);
                     let target = insn_idx_to_block[&target_idx];
                     let not_nil_false_type = types::Truthy;
@@ -9678,8 +9871,8 @@ fn add_iseq_to_hir(
 
                     let fall_through = fun.new_block(insn_idx);
 
-                    fun.push_insn(block, Insn::CondBranch {
-                        val: test_id,
+                    fun.push_insn(block, Insn::CondBranchTest {
+                        val,
                         if_true: BranchEdge { target, args: iftrue_state.as_args(self_param) },
                         if_false: BranchEdge { target: fall_through, args: vec![] }
                     });
@@ -11683,6 +11876,175 @@ mod validation_tests {
             assert!(function.type_of(p_false).bit_equal(types::Empty),
                 "if_false param should be Empty, got {}", function.type_of(p_false));
             // The dead branch folds to Unreachable, agreeing with infer_types.
+            function.fold_constants();
+            let last = *function.blocks[entry].insns.last().unwrap();
+            assert!(matches!(function.find_ref(last), Insn::Unreachable),
+                "expected entry terminator to fold to Unreachable");
+        });
+    }
+
+    // `CondBranchTest` on a Bottom val is dead like `CondBranchHasType`: neither
+    // edge is reachable and the branch folds to `Unreachable`.
+    #[test]
+    fn condbranchtest_bottom_val_folds_to_unreachable() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let if_true = function.new_block(0);
+        let if_false = function.new_block(0);
+        let p_true = function.push_insn(if_true, Insn::Param);
+        function.push_insn(if_true, Insn::Return { val: p_true });
+        let p_false = function.push_insn(if_false, Insn::Param);
+        function.push_insn(if_false, Insn::Return { val: p_false });
+        let nil = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        let bottom = function.push_insn(entry, Insn::RefineType { val: nil, new_type: types::Fixnum });
+        let arg = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
+        function.push_insn(entry, Insn::CondBranchTest {
+            val: bottom,
+            if_true: BranchEdge { target: if_true, args: vec![arg] },
+            if_false: BranchEdge { target: if_false, args: vec![arg] },
+        });
+        function.seal_entries();
+        crate::cruby::with_rubyvm(|| {
+            function.infer_types();
+            assert!(function.type_of(p_true).bit_equal(types::Empty),
+                "if_true param should be Empty, got {}", function.type_of(p_true));
+            assert!(function.type_of(p_false).bit_equal(types::Empty),
+                "if_false param should be Empty, got {}", function.type_of(p_false));
+            function.fold_constants();
+            let last = *function.blocks[entry].insns.last().unwrap();
+            assert!(matches!(function.find_ref(last), Insn::Unreachable),
+                "expected entry terminator to fold to Unreachable");
+        });
+    }
+
+    // `CondBranchTest` on a statically known truthy/falsy val folds to a `Jump`
+    // to the corresponding edge, and `infer_types` marks only that edge reachable.
+    #[test]
+    fn condbranchtest_known_val_folds_to_jump() {
+        for (val, expect_true) in [(Qtrue, true), (Qnil, false), (Qfalse, false)] {
+            let mut function = Function::new(std::ptr::null());
+            let entry = function.entry_block;
+            let if_true = function.new_block(0);
+            let if_false = function.new_block(0);
+            let p_true = function.push_insn(if_true, Insn::Param);
+            function.push_insn(if_true, Insn::Return { val: p_true });
+            let p_false = function.push_insn(if_false, Insn::Param);
+            function.push_insn(if_false, Insn::Return { val: p_false });
+            let cond = function.push_insn(entry, Insn::Const { val: Const::Value(val) });
+            let arg = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
+            function.push_insn(entry, Insn::CondBranchTest {
+                val: cond,
+                if_true: BranchEdge { target: if_true, args: vec![arg] },
+                if_false: BranchEdge { target: if_false, args: vec![arg] },
+            });
+            function.seal_entries();
+            crate::cruby::with_rubyvm(|| {
+                function.infer_types();
+                let (taken, not_taken) = if expect_true { (p_true, p_false) } else { (p_false, p_true) };
+                assert!(function.type_of(taken).is_subtype(types::Fixnum), "taken edge param should be Fixnum");
+                assert!(function.type_of(not_taken).bit_equal(types::Empty), "untaken edge param should be Empty");
+                function.fold_constants();
+                let last = *function.blocks[entry].insns.last().unwrap();
+                let expected_target = if expect_true { if_true } else { if_false };
+                assert!(matches!(function.find_ref(last), Insn::Jump(BranchEdge { target, .. }) if *target == expected_target),
+                    "expected entry terminator to fold to Jump {expected_target}");
+            });
+        }
+    }
+
+    // `CondBranchTest` on a `BoxBool` folds to a `CondBranch` on the CBool itself,
+    // mirroring the old `Test(BoxBool(x))` => `x` fold.
+    #[test]
+    fn condbranchtest_of_boxbool_folds_to_condbranch() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let if_true = function.new_block(0);
+        let if_false = function.new_block(0);
+        function.push_insn(if_true, Insn::Unreachable);
+        function.push_insn(if_false, Insn::Unreachable);
+        let left = function.push_insn(entry, Insn::Const { val: Const::CInt64(1) });
+        let right = function.push_insn(entry, Insn::Const { val: Const::CInt64(2) });
+        // IsBitEqual is not constant-folded, so the CondBranchTest sees a BoxBool of a CBool.
+        let cbool = function.push_insn(entry, Insn::IsBitEqual { left, right });
+        let boxed = function.push_insn(entry, Insn::BoxBool { val: cbool });
+        function.push_insn(entry, Insn::CondBranchTest {
+            val: boxed,
+            if_true: BranchEdge { target: if_true, args: vec![] },
+            if_false: BranchEdge { target: if_false, args: vec![] },
+        });
+        function.seal_entries();
+        crate::cruby::with_rubyvm(|| {
+            function.infer_types();
+            function.fold_constants();
+            let last = *function.blocks[entry].insns.last().unwrap();
+            match function.find_ref(last) {
+                Insn::CondBranch { val, .. } => assert_eq!(function.find_id(*val), function.find_id(cbool)),
+                Insn::Jump(_) => {} // Also acceptable if the compare folded to a constant first.
+                other => panic!("expected CondBranch on the CBool, got {other}"),
+            }
+        });
+    }
+
+    // `CondBranchFixnumCmp` on two constant fixnums folds to a `Jump`, and an
+    // Empty operand folds it to `Unreachable`, matching `infer_types`.
+    #[test]
+    fn condbranchfixnumcmp_folds() {
+        use FixnumCmpOp::*;
+        let cases: [(FixnumCmpOp, i64, i64, bool); 8] = [
+            (Lt, 1, 2, true), (Lt, 2, 2, false),
+            (Le, 2, 2, true), (Gt, 2, 1, true),
+            (Ge, 1, 2, false), (Eq, 5, 5, true),
+            (Ne, 5, 5, false), (Ne, 5, 6, true),
+        ];
+        for (op, l, r, expect_true) in cases {
+            let mut function = Function::new(std::ptr::null());
+            let entry = function.entry_block;
+            let if_true = function.new_block(0);
+            let if_false = function.new_block(0);
+            let p_true = function.push_insn(if_true, Insn::Param);
+            function.push_insn(if_true, Insn::Return { val: p_true });
+            let p_false = function.push_insn(if_false, Insn::Param);
+            function.push_insn(if_false, Insn::Return { val: p_false });
+            let left = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_isize(l as isize)) });
+            let right = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_isize(r as isize)) });
+            let arg = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
+            function.push_insn(entry, Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData {
+                op, left, right,
+                if_true: BranchEdge { target: if_true, args: vec![arg] },
+                if_false: BranchEdge { target: if_false, args: vec![arg] },
+            })));
+            function.seal_entries();
+            crate::cruby::with_rubyvm(|| {
+                function.infer_types();
+                let (taken, not_taken) = if expect_true { (p_true, p_false) } else { (p_false, p_true) };
+                assert!(function.type_of(taken).is_subtype(types::Fixnum), "{op}: taken edge param should be Fixnum");
+                assert!(function.type_of(not_taken).bit_equal(types::Empty), "{op}: untaken edge param should be Empty");
+                function.fold_constants();
+                let last = *function.blocks[entry].insns.last().unwrap();
+                let expected_target = if expect_true { if_true } else { if_false };
+                assert!(matches!(function.find_ref(last), Insn::Jump(BranchEdge { target, .. }) if *target == expected_target),
+                    "{op} {l} {r}: expected entry terminator to fold to Jump {expected_target}");
+            });
+        }
+
+        // Empty operand
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let if_true = function.new_block(0);
+        let if_false = function.new_block(0);
+        function.push_insn(if_true, Insn::Unreachable);
+        function.push_insn(if_false, Insn::Unreachable);
+        let nil = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
+        let bottom = function.push_insn(entry, Insn::RefineType { val: nil, new_type: types::Fixnum });
+        let right = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(1)) });
+        function.push_insn(entry, Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData {
+            op: Lt, left: bottom, right,
+            if_true: BranchEdge { target: if_true, args: vec![] },
+            if_false: BranchEdge { target: if_false, args: vec![] },
+        })));
+        function.seal_entries();
+        crate::cruby::with_rubyvm(|| {
+            function.infer_types();
             function.fold_constants();
             let last = *function.blocks[entry].insns.last().unwrap();
             assert!(matches!(function.find_ref(last), Insn::Unreachable),
