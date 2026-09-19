@@ -158,6 +158,7 @@ class << RubyVM::ZJIT
       :compile_hir_optimize_load_store_time_ns,
       :compile_hir_canonicalize_time_ns,
       :compile_hir_fold_constants_time_ns,
+      :compile_hir_fuse_fixnum_compare_branches_time_ns,
       :compile_hir_clean_cfg_time_ns,
       :compile_hir_remove_redundant_patch_points_time_ns,
       :compile_hir_remove_duplicate_check_interrupts_time_ns,
