@@ -11376,6 +11376,8 @@ mod hir_opt_tests {
             extend Reader
             @a = :a
           end
+          # Let ARGF survive GCs so that its singleton class is profiled as a long-lived object
+          4.times { GC.start }
 
           Ractor.new {}.value
           A.test
@@ -11613,6 +11615,8 @@ mod hir_opt_tests {
             extend Reader
             @a = :a
           end
+          # Let ARGF survive GCs so that its singleton class is profiled as a long-lived object
+          4.times { GC.start }
 
           A.test
           ARGF.test

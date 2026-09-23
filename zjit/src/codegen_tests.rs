@@ -6859,6 +6859,30 @@ fn test_profile_frames_during_direct_block_entry() {
 }
 
 #[test]
+fn test_profiled_singleton_class_does_not_retain_young_object() {
+    // Unlike test_profiled_singleton_classes_are_not_retained, this compiles
+    // profiled_singleton_send. The profile holds classes weakly, but JIT code marks the
+    // classes it embeds, so this checks that young singleton classes aren't specialized on.
+    assert_snapshot!(inspect("
+        def profiled_singleton_send(obj) = obj.profiled_singleton_method
+
+        PROFILED_SINGLETON_OBJECTS = ObjectSpace::WeakMap.new
+        def profiled_singleton_make(i)
+          obj = Object.new
+          obj.define_singleton_method(:profiled_singleton_method) { i }
+          PROFILED_SINGLETON_OBJECTS[i] = obj
+          profiled_singleton_send(obj)
+          nil
+        end
+
+        100.times { |i| profiled_singleton_make(i) }
+        4.times { GC.start(full_mark: true, immediate_sweep: true) }
+        # Allow one object kept alive by conservative stack scanning
+        PROFILED_SINGLETON_OBJECTS.keys.size <= 1
+    "), @"true");
+}
+
+#[test]
 fn test_profile_under_nested_jit_call() {
     assert_snapshot!(inspect("
         def profile
