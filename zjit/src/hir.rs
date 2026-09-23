@@ -6716,6 +6716,27 @@ impl Function {
         crate::stats::trace_compile_phase("infer_types", || self.infer_types());
     }
 
+    /// Return true if reading a VALUE at `offset` of a known object `obj` at compile time yields
+    /// a valid VALUE.
+    ///
+    /// A LoadField is emitted for the layout of a profiled shape and dominated by a guard for that
+    /// shape, but the guard doesn't stop fold_constants from folding the load when a known object
+    /// with another shape flows into it, e.g. after inlining a callee that was profiled with other
+    /// objects. The folded code is dead at run-time, but reading the object with the wrong layout
+    /// can produce a non-VALUE, such as the out-of-line fields object of a T_OBJECT whose ivars
+    /// aren't embedded, which crashes when the compiler inspects it.
+    fn can_fold_load_field(obj: VALUE, offset: usize) -> bool {
+        if obj.builtin_type() != RUBY_T_OBJECT || offset < ROBJECT_OFFSET_AS_ARY as usize {
+            return true;
+        }
+        let shape_id = obj.shape_id_of();
+        if shape_id.layout() != ShapeLayout::RObject {
+            return false;
+        }
+        let capacity = unsafe { rb_jit_shape_capacity(shape_id.0) } as usize;
+        (offset - ROBJECT_OFFSET_AS_ARY as usize) / SIZEOF_VALUE < capacity
+    }
+
     /// Use type information left by `infer_types` to fold away operations that can be evaluated at compile-time.
     ///
     /// It can fold fixnum math, truthiness tests, and branches with constant conditionals.
@@ -6749,7 +6770,7 @@ impl Function {
                         let offset = (offset as u32).to_usize();
                         let recv_type = self.type_of(recv);
                         match recv_type.ruby_object() {
-                            Some(recv_obj) if recv_obj.is_frozen() => {
+                            Some(recv_obj) if recv_obj.is_frozen() && Self::can_fold_load_field(recv_obj, offset) => {
                                 let recv_ptr = recv_obj.as_ptr() as *const VALUE;
                                 let val = unsafe { recv_ptr.byte_add(offset).read() };
                                 self.new_insn(Insn::Const { val: Const::Value(val) })
