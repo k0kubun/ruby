@@ -1205,6 +1205,49 @@ impl Assembler {
         ret(cb);
     }
 
+    /// Emit function_stub_hit_trampoline. See [`crate::codegen::gen_function_stub_hit_trampoline`].
+    /// A JIT-to-JIT call to a callee that isn't compiled yet calls this directly, so the
+    /// return address of the call site is at [rsp] and stack-passed arguments are above it.
+    pub fn emit_function_stub_hit_trampoline(cb: &mut CodeBlock, handler: *const u8) {
+        const NUM_REGS: i32 = 16;
+        const SAVE_AREA_BYTES: i32 = NUM_REGS * SIZEOF_VALUE_I32;
+        let reg = |reg_no: u8| X86Opnd::Reg(X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no });
+
+        cb.add_comment("function_stub_hit trampoline");
+        cb.add_comment("save all registers, indexed by reg_no");
+        sub(cb, RSP, uimm_opnd(SAVE_AREA_BYTES as u64));
+        for reg_no in 0..NUM_REGS as u8 {
+            if reg_no != RSP_REG.reg_no {
+                mov(cb, mem_opnd(64, RSP, reg_no as i32 * SIZEOF_VALUE_I32), reg(reg_no));
+            }
+        }
+        // Save RSP as of the call site, i.e. where the stack-passed arguments start
+        lea(cb, R11, mem_opnd(64, RSP, SAVE_AREA_BYTES + SIZEOF_VALUE_I32));
+        mov(cb, mem_opnd(64, RSP, RSP_REG.reg_no as i32 * SIZEOF_VALUE_I32), R11);
+
+        cb.add_comment("function_stub_hit(regs, return address)");
+        mov(cb, C_ARG_OPNDS[0].into(), RSP);
+        mov(cb, C_ARG_OPNDS[1].into(), mem_opnd(64, RSP, SAVE_AREA_BYTES));
+        // Remember the save area in RBP, which the handler preserves and which is
+        // restored from the save area below, and align the stack for the call.
+        mov(cb, RBP, RSP);
+        and(cb, RSP, imm_opnd(-16));
+        call_ptr(cb, R11, handler);
+        mov(cb, RSP, RBP);
+
+        // Jump to the returned address with the registers and the stack as of the
+        // call site, as if the call site had called it directly.
+        cb.add_comment("restore registers and jump to the returned address");
+        mov(cb, R11, RAX);
+        for reg_no in 0..NUM_REGS as u8 {
+            if reg_no != RSP_REG.reg_no && reg_no != R11_REG.reg_no {
+                mov(cb, reg(reg_no), mem_opnd(64, RSP, reg_no as i32 * SIZEOF_VALUE_I32));
+            }
+        }
+        add(cb, RSP, uimm_opnd(SAVE_AREA_BYTES as u64));
+        jmp_rm(cb, R11);
+    }
+
     /// Optimize and compile the stored instructions
     pub fn compile_with_regs(self, cb: &mut CodeBlock, regs: Vec<Reg>) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         // The backend is allowed to use scratch registers only if it has not accepted them so far.

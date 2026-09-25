@@ -187,6 +187,8 @@ class << RubyVM::ZJIT
       :side_exit_size_ratio,
       :exit_descriptor_count,
       :exit_descriptor_bytes,
+      :function_stub_call_site_count,
+      :function_stub_hit_count,
       :jit_frame_heap_bytes,
       :jit_frame_region_bytes,
       :code_region_bytes,

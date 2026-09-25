@@ -1688,6 +1688,54 @@ impl Assembler {
         ret(cb, X30);
     }
 
+    /// Emit function_stub_hit_trampoline. See [`crate::codegen::gen_function_stub_hit_trampoline`].
+    /// A JIT-to-JIT call to a callee that isn't compiled yet calls this directly with `bl`,
+    /// so the return address of the call site is in X30 and stack-passed arguments are at SP.
+    pub fn emit_function_stub_hit_trampoline(cb: &mut CodeBlock, handler: *const u8) {
+        // x0..x30 plus the SP as of the call site at index 31
+        const NUM_REGS: i32 = 32;
+        const SAVE_AREA_BYTES: i32 = NUM_REGS * SIZEOF_VALUE_I32;
+        let reg = |reg_no: u8| A64Opnd::Reg(A64Reg { num_bits: 64, reg_no });
+        let slot = |reg_no: u8| A64Opnd::new_mem(64, C_SP_REG, reg_no as i32 * SIZEOF_VALUE_I32);
+        let pair_slot = |reg_no: u8| A64Opnd::new_mem(128, C_SP_REG, reg_no as i32 * SIZEOF_VALUE_I32);
+
+        cb.add_comment("function_stub_hit trampoline");
+        cb.add_comment("save all registers, indexed by reg_no");
+        sub(cb, C_SP_REG, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        for reg_no in (0..30u8).step_by(2) {
+            stp(cb, reg(reg_no), reg(reg_no + 1), pair_slot(reg_no));
+        }
+        // X30 (the return address) and the SP as of the call site, where the
+        // stack-passed arguments start
+        add(cb, Self::EMIT_OPND, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        stp(cb, X30, Self::EMIT_OPND, pair_slot(30));
+
+        cb.add_comment("function_stub_hit(regs, return address)");
+        mov(cb, C_ARG_OPNDS[0].into(), C_SP_REG);
+        mov(cb, C_ARG_OPNDS[1].into(), X30);
+        let src_addr = cb.get_write_ptr().raw_ptr(cb) as i64;
+        let dst_addr = handler as i64;
+        if b_offset_fits_bits((dst_addr - src_addr) / 4) {
+            bl(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
+        } else {
+            emit_load_value(cb, Self::EMIT_OPND, dst_addr as u64);
+            blr(cb, Self::EMIT_OPND);
+        }
+
+        // Jump to the returned address with the registers and the stack as of the
+        // call site, as if the call site had called it directly. The handler
+        // preserves the callee-saved X19..X29, and X16 is not used for arguments.
+        cb.add_comment("restore registers and jump to the returned address");
+        mov(cb, Self::EMIT_OPND, C_RET_OPND.into());
+        for reg_no in (0..16u8).step_by(2) {
+            ldp(cb, reg(reg_no), reg(reg_no + 1), pair_slot(reg_no));
+        }
+        ldur(cb, reg(17), slot(17));
+        ldur(cb, X30, slot(30));
+        add(cb, C_SP_REG, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        br(cb, Self::EMIT_OPND);
+    }
+
     /// Optimize and compile the stored instructions
     pub fn compile_with_regs(self, cb: &mut CodeBlock, regs: Vec<Reg>) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         // The backend is allowed to use scratch registers only if it has not accepted them so far.

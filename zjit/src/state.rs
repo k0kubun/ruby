@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ptr::null;
 use std::sync::RwLock;
 use crate::exit_desc::ExitDescriptorTable;
+use crate::codegen::IseqCallTable;
 
 /// Shared trampoline to enter ZJIT. Not null when ZJIT is enabled.
 #[allow(non_upper_case_globals)]
@@ -71,8 +72,11 @@ pub struct ZJITState {
     /// Trampoline every side exit calls. See [`crate::exit_desc`].
     exit_descriptor_trampoline: CodePtr,
 
-    /// Trampoline to call function_stub_hit
+    /// Trampoline called by JIT-to-JIT calls whose callee isn't compiled yet
     function_stub_hit_trampoline: CodePtr,
+
+    /// Veneer that jumps to function_stub_hit_trampoline for call sites out of its range
+    function_stub_veneer: Option<CodePtr>,
 
     /// Counter pointers for full frame C functions
     full_frame_cfunc_counter_pointers: HashMap<String, Box<u64>>,
@@ -100,6 +104,10 @@ pub struct ZJITState {
     /// Descriptors of compiled side exits, keyed by the return address of their
     /// call to exit_descriptor_trampoline. See [`crate::exit_desc`].
     exit_descriptors: RwLock<ExitDescriptorTable>,
+
+    /// JIT-to-JIT call sites, keyed by the return address of their call.
+    /// See [`crate::codegen::IseqCallTable`].
+    iseq_calls: RwLock<IseqCallTable>,
 }
 
 /// Tracks the initialization progress
@@ -176,6 +184,7 @@ impl ZJITState {
             materialize_exit_trampoline_with_counter: materialize_exit_trampoline,
             exit_descriptor_trampoline,
             function_stub_hit_trampoline,
+            function_stub_veneer: None,
             full_frame_cfunc_counter_pointers: HashMap::new(),
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
             ccall_counter_pointers: HashMap::new(),
@@ -184,6 +193,7 @@ impl ZJITState {
             jit_frames: vec![],
             jit_frame_allocator: JITFrameAllocator::new(),
             exit_descriptors: RwLock::new(ExitDescriptorTable::default()),
+            iseq_calls: RwLock::new(IseqCallTable::default()),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -233,6 +243,28 @@ impl ZJITState {
     pub fn get_exit_descriptors_unlocked() -> &'static ExitDescriptorTable {
         let lock = &mut ZJITState::get_instance().exit_descriptors;
         lock.get_mut().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Get the table of JIT-to-JIT call sites
+    pub fn get_iseq_calls() -> &'static RwLock<IseqCallTable> {
+        &ZJITState::get_instance().iseq_calls
+    }
+
+    /// Get the table of JIT-to-JIT call sites without locking. Only for when no
+    /// other Ractor can be running.
+    pub fn get_iseq_calls_unlocked() -> &'static IseqCallTable {
+        let lock = &mut ZJITState::get_instance().iseq_calls;
+        lock.get_mut().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Get the veneer to function_stub_hit_trampoline generated last, if any
+    pub fn get_function_stub_veneer() -> Option<CodePtr> {
+        ZJITState::get_instance().function_stub_veneer
+    }
+
+    /// Set the veneer to function_stub_hit_trampoline for later call sites
+    pub fn set_function_stub_veneer(veneer: CodePtr) {
+        ZJITState::get_instance().function_stub_veneer = Some(veneer);
     }
 
     /// Return a code pointer to the trampoline every side exit calls
