@@ -169,6 +169,10 @@ make_counters! {
         compile_side_exit_time_ns,
         side_exit_descriptor_count,
         side_exit_descriptor_bytes,
+        side_exit_descriptor_taken_count,
+        lazy_exit_compiled_count,
+        lazy_exit_compiled_bytes,
+        lazy_exit_compile_failure_count,
         function_stub_call_site_count,
         function_stub_hit_count,
 
