@@ -169,6 +169,10 @@ make_counters! {
         compile_side_exit_time_ns,
         exit_descriptor_count,
         exit_descriptor_bytes,
+        exit_descriptor_taken_count,
+        lazy_exit_compiled_count,
+        lazy_exit_compiled_bytes,
+        lazy_exit_compile_failure_count,
 
         compile_hir_time_ns,
         compile_hir_build_time_ns,

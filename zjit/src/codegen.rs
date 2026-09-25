@@ -577,6 +577,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
     if result.is_ok() {
         let exit_descs = exit_descs_start..crate::exit_desc::next_offset();
         crate::exit_desc::write_barrier(iseq, &exit_descs);
+        crate::exit_desc::register_version(&exit_descs, version);
         unsafe { version.as_mut() }.exit_descs = exit_descs;
     }
     if let Ok((start_ptr, _)) = result {
@@ -4174,12 +4175,13 @@ pub fn gen_materialize_exit_trampoline(cb: &mut CodeBlock, exit_trampoline: Code
 
 /// Generate the trampoline every side exit calls. It saves all general-purpose
 /// registers, calls [`crate::exit_desc::rb_zjit_side_exit_descriptor`] with them
-/// and the return address of the exit's call, and jumps to materialize_exit_trampoline.
-/// The save area and the return address are discarded by the frame teardown there.
-pub fn gen_exit_descriptor_trampoline(cb: &mut CodeBlock, materialize_exit_trampoline: CodePtr) -> Result<CodePtr, CompileError> {
+/// and the return address of the exit's call, restores them, and jumps to the
+/// address the handler returns: materialize_exit_trampoline, or the exit's lazily
+/// compiled code.
+pub fn gen_exit_descriptor_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
     let start_ptr = cb.get_write_ptr();
     let handler = crate::exit_desc::rb_zjit_side_exit_descriptor as *const u8;
-    lir::Assembler::emit_exit_descriptor_trampoline(cb, handler, materialize_exit_trampoline);
+    lir::Assembler::emit_exit_descriptor_trampoline(cb, handler);
     if cb.has_dropped_bytes() {
         return Err(CompileError::OutOfMemory);
     }

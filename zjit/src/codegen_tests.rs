@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lazy_exit_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -3557,6 +3557,176 @@ fn test_exit_descriptor_trace_side_exits() {
 
     let descs = exit_descriptors_of("exit_desc_trace");
     assert!(descs.iter().any(|desc| desc.has_trace_reason()), "expected a traced exit");
+}
+
+/// Number of side exits compiled lazily from their descriptors so far
+fn lazy_exit_compiled_count() -> u64 {
+    crate::state::ZJITState::get_counters().lazy_exit_compiled_count
+}
+
+/// Keep exits from invalidating their version, so that a test can take the same
+/// exit many times, and compile exits on the given hit.
+fn setup_lazy_exits(threshold: usize) {
+    rb_zjit_prepare_options();
+    set_lazy_exit_threshold(threshold);
+    set_num_exits_until_invalidate(1000);
+}
+
+#[test]
+fn test_lazy_exit_registers_spills_and_immediates() {
+    // Hits 1 and 2 are materialized from the descriptor, hit 2 compiles the exit, and
+    // the rest run the compiled code, which reads registers, spill slots and immediates.
+    setup_lazy_exits(1);
+    assert_snapshot!(inspect("
+        def lazy_exit_many(a, b)
+          l1 = a + 1; l2 = a + 2; l3 = a + 3; l4 = a + 4; l5 = a + 5; l6 = a + 6
+          l7 = a + 7; l8 = a + 8; l9 = a + 9; l10 = a + 10; l11 = a + 11; l12 = a + 12
+          [nil, :lazy_exit_sym, 1099511627776, (1..2), l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, b + 1]
+        end
+        lazy_exit_many(0, 1) # profile
+        lazy_exit_many(0, 1) # compile
+        (0..4).map { |i| r = lazy_exit_many(i * 10, i + 0.5); [*r[0, 5], r[15], r[16]] }
+    "), @"[[nil, :lazy_exit_sym, 1099511627776, 1..2, 1, 12, 1.5], [nil, :lazy_exit_sym, 1099511627776, 1..2, 11, 22, 2.5], [nil, :lazy_exit_sym, 1099511627776, 1..2, 21, 32, 3.5], [nil, :lazy_exit_sym, 1099511627776, 1..2, 31, 42, 4.5], [nil, :lazy_exit_sym, 1099511627776, 1..2, 41, 52, 5.5]]");
+    assert_snapshot!(inspect("[lazy_exit_many(0, 1), lazy_exit_many(10, 1.5)]"),
+        @"[[nil, :lazy_exit_sym, 1099511627776, 1..2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 2], [nil, :lazy_exit_sym, 1099511627776, 1..2, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 2.5]]");
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+
+    use crate::exit_desc::ExitLoc;
+    let locs: Vec<ExitLoc> = exit_descriptors_of("lazy_exit_many").iter().flat_map(|desc| desc.all_locs()).collect();
+    assert!(locs.iter().any(|loc| matches!(loc, ExitLoc::Reg { .. })), "expected a register location: {locs:?}");
+    assert!(locs.iter().any(|loc| matches!(loc, ExitLoc::NativeSlot { .. })), "expected a spilled location: {locs:?}");
+    assert!(locs.iter().any(|loc| matches!(loc, ExitLoc::Value(_))), "expected a heap object: {locs:?}");
+}
+
+#[test]
+fn test_lazy_exit_locals() {
+    setup_lazy_exits(0);
+    assert_snapshot!(inspect("
+        def lazy_exit_locals(a, b)
+          c = a * 2
+          d = [a, c]
+          e = b + 1
+          [a, b, c, d, e]
+        end
+        lazy_exit_locals(1, 2) # profile
+        lazy_exit_locals(1, 2) # compile
+        [lazy_exit_locals(3, 4), lazy_exit_locals(5, 6.5), lazy_exit_locals(7, 8.5), lazy_exit_locals(9, 10.5)]
+    "), @"[[3, 4, 6, [3, 6], 5], [5, 6.5, 10, [5, 10], 7.5], [7, 8.5, 14, [7, 14], 9.5], [9, 10.5, 18, [9, 18], 11.5]]");
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+}
+
+#[test]
+fn test_lazy_exit_stack_map() {
+    // The compiled exit out of the inlined callee also has to materialize the
+    // caller's frame, whose stack holds `a` and `x` at the call.
+    setup_lazy_exits(1);
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        def lazy_exit_callee(n) = n + 1
+        def lazy_exit_caller(a, n)
+          x = a * 2
+          [a, x, lazy_exit_callee(n)]
+        end
+        lazy_exit_caller(1, 1)
+        lazy_exit_caller(1, 1)
+        lazy_exit_caller(1, 1)
+        [lazy_exit_caller(2, 1), lazy_exit_caller(3, 1.5), lazy_exit_caller(4, 2.5), lazy_exit_caller(5, 3.5), lazy_exit_caller(6, 4.5)]
+    "));
+    assert_snapshot!(result, @"[[2, 4, 2], [3, 6, 2.5], [4, 8, 3.5], [5, 10, 4.5], [6, 12, 5.5]]");
+    assert!(exit_descriptors_of("lazy_exit_caller").iter().any(|desc| desc.has_stack_map()), "expected an exit with a stack map");
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+}
+
+#[test]
+fn test_lazy_exit_recompile() {
+    // Every hit after the first runs the compiled exit, which calls exit_recompile()
+    // and invalidates the method on the third exit.
+    setup_lazy_exits(0);
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(3);
+    eval("
+        def lazy_exit_recompile(a, b) = a + b
+        lazy_exit_recompile(1, 2)
+        lazy_exit_recompile(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "lazy_exit_recompile");
+    let descs = crate::exit_desc::descriptors_of(iseq);
+    assert!(descs.iter().any(|desc| desc.recompile == iseq), "expected an exit that recompiles the method");
+
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(Qtrue, eval("lazy_exit_recompile(1.5, 2.5) == 4.0"));
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+    assert_eq!(Qtrue, eval("lazy_exit_recompile(2.5, 2.5) == 5.0"));
+    assert!(!unsafe { payload.versions.first().unwrap().as_ref() }.is_invalidated());
+    assert_eq!(Qtrue, eval("lazy_exit_recompile(3.5, 2.5) == 6.0"));
+    assert!(unsafe { payload.versions.first().unwrap().as_ref() }.is_invalidated());
+    assert_eq!(Qtrue, eval("lazy_exit_recompile(4.5, 2.5) == 7.0"));
+}
+
+#[test]
+fn test_lazy_exit_survives_compaction() {
+    // The ISEQ and the heap object baked into the compiled exit must be marked and
+    // moved by compaction like the ones in the descriptor.
+    setup_lazy_exits(0);
+    assert_snapshot!(inspect(r#"
+        def lazy_exit_compact(a) = [(1..2), "lazy_exit_compact".freeze, a + 1]
+        lazy_exit_compact(1) # profile
+        lazy_exit_compact(1) # compile
+        before = lazy_exit_compact(1.5) # compile the exit
+        GC.start
+        begin
+          GC.verify_compaction_references(expand_heap: true, toward: :empty)
+        rescue NotImplementedError
+        end
+        [before, lazy_exit_compact(2.5), lazy_exit_compact(3.5)]
+    "#), @r#"[[1..2, "lazy_exit_compact", 2.5], [1..2, "lazy_exit_compact", 3.5], [1..2, "lazy_exit_compact", 4.5]]"#);
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+}
+
+#[test]
+fn test_lazy_exit_trace_side_exits() {
+    setup_lazy_exits(0);
+    unsafe { crate::options::OPTIONS.as_mut().unwrap().trace_side_exits = Some(crate::options::TraceExits::All); }
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def lazy_exit_trace(a, b)
+          c = a + 1
+          [c, b + 1]
+        end
+        lazy_exit_trace(1, 2)
+        lazy_exit_trace(1, 2)
+        [lazy_exit_trace(1, 2.5), lazy_exit_trace(2, 3.5), lazy_exit_trace(3, 4.5)]
+    "), @"[[2, 3.5], [3, 4.5], [4, 5.5]]");
+    assert!(lazy_exit_compiled_count() > 0, "expected the exit to be compiled");
+}
+
+#[test]
+fn test_lazy_exit_threshold() {
+    // With a threshold of 3, the exit is materialized from its descriptor 3 times
+    // and compiled on the 4th hit. Above LAZY_EXIT_MAX_HITS, it's never compiled.
+    setup_lazy_exits(3);
+    eval("
+        def lazy_exit_threshold(a) = a + 1
+        lazy_exit_threshold(1) # profile
+        lazy_exit_threshold(1) # compile
+    ");
+    for i in 0..3 {
+        assert_eq!(Qtrue, eval(&format!("lazy_exit_threshold({i}.5) == {}.5", i + 1)));
+        assert_eq!(0, lazy_exit_compiled_count());
+    }
+    assert_eq!(Qtrue, eval("lazy_exit_threshold(3.5) == 4.5"));
+    assert_eq!(1, lazy_exit_compiled_count());
+    assert_eq!(Qtrue, eval("lazy_exit_threshold(4.5) == 5.5"));
+    assert_eq!(1, lazy_exit_compiled_count());
+
+    set_lazy_exit_threshold(crate::exit_desc::LAZY_EXIT_MAX_HITS as usize + 1);
+    eval("
+        def lazy_exit_never(a) = a + 1
+        lazy_exit_never(1) # profile
+        lazy_exit_never(1) # compile
+        300.times { |i| lazy_exit_never(i + 0.5) }
+    ");
+    assert_eq!(Qtrue, eval("lazy_exit_never(1.5) == 2.5"));
+    assert_eq!(1, lazy_exit_compiled_count());
 }
 
 #[test]

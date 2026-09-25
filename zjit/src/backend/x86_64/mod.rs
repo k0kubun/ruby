@@ -18,6 +18,11 @@ pub fn mem_base_reg(reg_no: u8) -> Reg {
     Reg { num_bits: 64, reg_type: RegType::GP, reg_no }
 }
 
+/// Convert a GP register number and a size into Reg
+pub fn gp_reg(reg_no: u8, num_bits: u8) -> Reg {
+    Reg { num_bits, reg_type: RegType::GP, reg_no }
+}
+
 // Callee-saved registers
 pub const CFP: Opnd = Opnd::Reg(R13_REG);
 pub const EC: Opnd = Opnd::Reg(R12_REG);
@@ -110,6 +115,11 @@ const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 /// A scratch register available for use by resolve_ssa to break register copy cycles.
 /// Must not overlap with ALLOC_REGS or other preserved registers.
 pub const SCRATCH_REG: Reg = R11_REG;
+
+/// Register that lazily compiled side exits load a spilled memory base into. Side-exit
+/// operands never live in it, and x86_scratch_split uses SCRATCH0_OPND for a memory
+/// source operand of a Store based on it.
+pub const LAZY_EXIT_BASE_OPND: Opnd = SCRATCH1_OPND;
 
 impl Assembler {
     // This keeps frame growth below the +/-4096-byte displacement range we rely
@@ -1171,7 +1181,7 @@ impl Assembler {
 
     /// Emit exit_descriptor_trampoline. See [`crate::codegen::gen_exit_descriptor_trampoline`].
     /// A side exit calls this, so the return address is at [rsp] on entry.
-    pub fn emit_exit_descriptor_trampoline(cb: &mut CodeBlock, handler: *const u8, materialize_exit_trampoline: CodePtr) {
+    pub fn emit_exit_descriptor_trampoline(cb: &mut CodeBlock, handler: *const u8) {
         const NUM_REGS: i32 = 16;
         const SAVE_AREA_BYTES: i32 = NUM_REGS * SIZEOF_VALUE_I32;
         let reg = |reg_no: u8| X86Opnd::Reg(X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no });
@@ -1191,18 +1201,60 @@ impl Assembler {
         cb.add_comment("rb_zjit_side_exit_descriptor(regs, return address)");
         mov(cb, C_ARG_OPNDS[0].into(), RSP);
         mov(cb, C_ARG_OPNDS[1].into(), mem_opnd(64, RSP, SAVE_AREA_BYTES));
-        // Align the stack for the call. The handler returns the save area.
+        // Keep the save area in a callee-saved register and align the stack for the call
+        mov(cb, RBX, RSP);
         and(cb, RSP, imm_opnd(-16));
         call_ptr(cb, R11, handler);
 
-        // Go to materialize_exit_trampoline by returning to it rather than jumping, so
-        // that the exit's call is paired with a ret. An unpaired call would leave the
-        // return stack buffer misaligned and mispredict every return up the stack.
-        cb.add_comment("return to materialize_exit_trampoline");
-        lea(cb, RSP, mem_opnd(64, RAX, SAVE_AREA_BYTES));
-        mov(cb, R11, const_ptr_opnd(materialize_exit_trampoline.raw_ptr(cb)));
-        mov(cb, mem_opnd(64, RSP, 0), R11);
+        // The handler returns where to go: materialize_exit_trampoline, or the exit's
+        // lazily compiled code, which needs every register as of the exit. Go there by
+        // returning to it rather than jumping, so that the exit's call is paired with a
+        // ret. An unpaired call would leave the return stack buffer misaligned and
+        // mispredict every return up the stack.
+        cb.add_comment("restore all registers and return to the handler's result");
+        mov(cb, RSP, RBX);
+        mov(cb, mem_opnd(64, RSP, SAVE_AREA_BYTES), RAX);
+        for reg_no in 0..NUM_REGS as u8 {
+            if reg_no != RSP_REG.reg_no {
+                mov(cb, reg(reg_no), mem_opnd(64, RSP, reg_no as i32 * SIZEOF_VALUE_I32));
+            }
+        }
+        lea(cb, RSP, mem_opnd(64, RSP, SAVE_AREA_BYTES));
         ret(cb);
+    }
+
+    /// Return true if the side-exit call that ends at `call_end` is a `call rel32`,
+    /// which [`Self::patch_exit_call`] can turn into a jump.
+    pub fn exit_call_patchable(cb: &CodeBlock, call_end: CodePtr) -> bool {
+        let opcode = unsafe { *call_end.sub_bytes(5).raw_ptr(cb) };
+        opcode == 0xe8
+    }
+
+    /// Patch the side exit's `call rel32` that ends at `call_end` into a `jmp rel32`
+    /// to `target`. They have the same size. Returns false if the target is out of range.
+    pub fn patch_exit_call(cb: &mut CodeBlock, call_end: CodePtr, target: CodePtr) -> bool {
+        let Ok(rel32) = i32::try_from(target.as_offset() - call_end.as_offset()) else {
+            return false;
+        };
+        let call_start = call_end.sub_bytes(5);
+        let patched = cb.with_write_ptr(call_start, |cb| jmp32(cb, rel32));
+        patched.end == call_end
+    }
+
+    /// Compile instructions that use only machine registers, register-based memory
+    /// operands and immediates, like the side-exit code compile_exits() appends after
+    /// register allocation. Only scratch_split runs before emitting them.
+    pub fn compile_exit_code(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
+        let mut asm = self.x86_scratch_split();
+        asm_dump!(asm, scratch_split);
+        for (idx, name) in asm.label_names.iter().enumerate() {
+            let label = cb.new_label(name.to_string());
+            assert_eq!(label, Label(idx));
+        }
+        let start_ptr = cb.get_write_ptr();
+        let gc_offsets = asm.x86_emit(cb).inspect_err(|_| cb.clear_labels())?;
+        cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
+        Ok((start_ptr, gc_offsets))
     }
 
     /// Optimize and compile the stored instructions
