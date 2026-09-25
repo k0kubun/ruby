@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
 
-use crate::backend::current::ALLOC_REGS;
 use crate::invariants::{
     track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_no_trace_point_assumption,
     track_single_ractor_assumption, track_stable_constant_names_assumption, track_no_singleton_class_assumption,
@@ -278,40 +277,61 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
     }
 }
 
-/// Stub a branch for a JIT-to-JIT call
+/// Point a JIT-to-JIT call at function_stub_hit_trampoline, which compiles the callee
+/// on the first call and patches the call to call it directly. There is no stub per call
+/// site: the trampoline identifies the call site by its return address, which is
+/// registered here along with the IseqCall. This is used both for a new call site and
+/// for a call site whose callee has been invalidated.
 pub fn gen_iseq_call(cb: &mut CodeBlock, iseq_call: &IseqCallRef) -> Result<(), CompileError> {
     trace_compile_phase("compile_stub", || {
-        // Compile a function stub
-        let stub_ptr = match iseq_call.stub_addr.get() {
-            // When gen_iseq_call() is called from invalidation and therefore this IseqCall has been
-            // compiled before, reuse the address of the previously-compiled stub.
-            Some(stub_ptr) => {
-                // gen_function_stub leaked one Rc reference into the stub's baked IseqCall pointer,
-                // and the previous function_stub_hit consumed it. Restore one leaked reference for
-                // the next stub hit's Rc::from_raw to reclaim.
-                unsafe { Rc::increment_strong_count(Rc::as_ptr(iseq_call)); }
-                stub_ptr
-            }
-            // When gen_iseq_call() is called from gen_iseq_body() and this IseqCall is compiled for
-            // the first time, generate a function stub and remember the address in the IseqCall.
-            None => {
-                let stub_ptr = gen_function_stub(cb, iseq_call.clone()).inspect_err(|err| {
-                    debug!("{err:?}: gen_function_stub failed: {}", iseq_get_location(iseq_call.iseq.get(), 0));
-                })?;
-                iseq_call.stub_addr.set(Some(stub_ptr));
-                stub_ptr
-            }
-        };
+        let call_start = iseq_call.start_addr.get().expect("expected a start address");
+        let ret_addr = iseq_call.end_addr.get().expect("expected an end address");
+        register_iseq_call(cb, ret_addr, iseq_call);
 
-        // Update the JIT-to-JIT call to call the stub
-        let stub_addr = stub_ptr.raw_ptr(cb);
+        // Update the JIT-to-JIT call to call the trampoline
+        let target_addr = function_stub_target(cb, call_start).inspect_err(|err| {
+            debug!("{err:?}: function_stub_target failed: {}", iseq_get_location(iseq_call.iseq.get(), 0));
+        })?.raw_ptr(cb);
         let iseq = iseq_call.iseq.get();
         iseq_call.regenerate(cb, |asm| {
-            asm_comment!(asm, "call function stub: {}", iseq_get_location(iseq, 0));
-            asm.ccall_into(C_RET_OPND, stub_addr, vec![]);
+            asm_comment!(asm, "call function_stub_hit trampoline: {}", iseq_get_location(iseq, 0));
+            asm.ccall_into(C_RET_OPND, target_addr, vec![]);
         });
         Ok(())
     })
+}
+
+/// Return what a call instruction at `call_start` should call to reach
+/// function_stub_hit_trampoline. The call site was assembled as a short call, and it
+/// has to stay the same size when it's patched, so when the trampoline is out of
+/// range (only with --zjit-exec-mem-size above 128 MiB on arm64 or 2 GiB on x86_64),
+/// go through a veneer that jumps to the trampoline without touching the return
+/// address or any argument register. Veneers are shared by call sites within range.
+fn function_stub_target(cb: &mut CodeBlock, call_start: CodePtr) -> Result<CodePtr, CompileError> {
+    fn reaches(cb: &CodeBlock, from: CodePtr, to: CodePtr) -> bool {
+        // Leave some margin for the instructions before the call itself
+        const MARGIN: u64 = 1024 * 1024;
+        let range: u64 = if cfg!(target_arch = "aarch64") { 1 << 27 } else { 1 << 31 };
+        (to.raw_addr(cb) as i64 - from.raw_addr(cb) as i64).unsigned_abs() < range - MARGIN
+    }
+
+    let trampoline = ZJITState::get_function_stub_hit_trampoline();
+    if reaches(cb, call_start, trampoline) {
+        return Ok(trampoline);
+    }
+    if let Some(veneer) = ZJITState::get_function_stub_veneer() {
+        if reaches(cb, call_start, veneer) {
+            return Ok(veneer);
+        }
+    }
+    let mut asm = Assembler::new();
+    asm.new_block_without_id("function_stub_veneer");
+    asm_comment!(asm, "jump to function_stub_hit trampoline");
+    asm.jmp(trampoline.into());
+    let (veneer, gc_offsets) = asm.compile(cb)?;
+    assert!(gc_offsets.is_empty());
+    ZJITState::set_function_stub_veneer(veneer);
+    Ok(veneer)
 }
 
 /// Compile a shared JIT entry trampoline
@@ -3812,17 +3832,60 @@ c_callable! {
 }
 
 c_callable! {
-    /// Generated code calls this function with the SysV calling convention. See [gen_function_stub].
-    /// This function is expected to be called repeatedly when ZJIT fails to compile the stub.
-    /// We should be able to compile most (if not all) function stubs by side-exiting at unsupported
+    /// Called by function_stub_hit_trampoline when JIT code calls an ISEQ that isn't compiled yet.
+    /// See [gen_function_stub_hit_trampoline].
+    ///
+    /// `regs` is the trampoline's save area, holding every general-purpose register as of the
+    /// call, indexed by machine register number, with the native SP as of the call (where
+    /// stack-passed arguments start) at the index of NATIVE_STACK_PTR. `ret_addr` is the return
+    /// address of the call, which identifies the call site's IseqCall. Returns the address to
+    /// jump to with the registers restored: the compiled callee, or an exit to the interpreter.
+    ///
+    /// This function is expected to be called repeatedly when ZJIT fails to compile the callee.
+    /// We should be able to compile most (if not all) callees by side-exiting at unsupported
     /// instructions, so this should be used primarily for cb.has_dropped_bytes() situations.
-    fn function_stub_hit(iseq_call_ptr: *const c_void, cfp: CfpPtr, sp: *mut VALUE, ec: EcPtr) -> *const u8 {
+    fn function_stub_hit(regs: *const usize, ret_addr: *const u8) -> *const u8 {
+        let reg = |opnd: Opnd| unsafe { *regs.add(opnd.unwrap_reg().reg_no as usize) };
+        let cfp = reg(CFP) as CfpPtr;
+        let sp = reg(SP) as *mut VALUE;
+        let ec = reg(EC) as EcPtr;
+        let iseq_call_ptr = lookup_iseq_call(ret_addr as usize)
+            .unwrap_or_else(|| panic!("no IseqCall for return address {ret_addr:p}"));
+        incr_counter!(function_stub_hit_count);
+
         // Make sure cfp is ready to be scanned by other Ractors and GC before taking the barrier
         {
-            unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
-            let iseq_call = unsafe { Rc::from_raw(iseq_call_ptr as *const IseqCall) };
+            // The IseqCall table keeps a strong reference to it
+            let iseq_call = unsafe { &*iseq_call_ptr };
             let iseq = iseq_call.iseq.get();
             let params = unsafe { iseq.params() };
+
+            // If the callee fails to compile, we exit to the interpreter with the callee frame.
+            // Direct JIT-to-JIT calls pass arguments in C argument registers and the rest on the
+            // native stack, so spill the packed argument locals first. prepare_for_exit() will
+            // reshape these around any optional positional gaps.
+            //
+            // Mirror the argument layout of gen_send_direct: self, then the packed
+            // positional arguments, and the block handler if it exists.
+            // TODO: Unify the argument order to avoid having to manually keep in sync
+            let argc = iseq_call.argc.to_usize();
+            let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+            let block_spill = (params.flags.has_block() != 0).then(|| {
+                let block_local_idx: usize = params.block_start.try_into()
+                    .expect("ISEQ block_start should be non-negative");
+                (argc + 1, block_local_idx) // +1 for self
+            });
+            let spills = (0..argc).map(|arg_idx| (arg_idx + 1, arg_idx)) // +1 for self
+                .chain(block_spill);
+            let native_sp = reg(NATIVE_STACK_PTR) as *const VALUE;
+            for (c_arg_idx, local_idx) in spills {
+                let value = match lir::c_arg_location(c_arg_idx) {
+                    CArgLocation::Reg(opnd) => VALUE(reg(opnd)),
+                    CArgLocation::StackSlot(slot) => unsafe { native_sp.add(slot).read() },
+                };
+                unsafe { sp.offset(-local_size_and_idx_to_bp_offset(local_size, local_idx) as isize).write(value) };
+            }
+
             let entry_idx = iseq_call.jit_entry_idx.to_usize();
             let entry_insn_idx = params.opt_table_slice().get(entry_idx)
                 .unwrap_or_else(|| panic!("function_stub: opt_table out of bounds. {params:#?}, entry_idx={entry_idx}"))
@@ -3841,10 +3904,14 @@ c_callable! {
             unsafe { rb_set_cfp_sp(cfp, sp) };
         }
 
+        let iseq_call_ptr = iseq_call_ptr as *const c_void;
         with_vm_lock(src_loc!(), || {
-            // Re-create the Rc inside the VM lock because IseqCall's interior
-            // mutability (Cell<IseqPtr>) requires exclusive access.
-            let iseq_call = unsafe { Rc::from_raw(iseq_call_ptr as *const IseqCall) };
+            // Make an owned reference inside the VM lock because IseqCall's interior
+            // mutability (Cell<IseqPtr>) and its reference count require exclusive access.
+            let iseq_call = unsafe {
+                Rc::increment_strong_count(iseq_call_ptr as *const IseqCall);
+                Rc::from_raw(iseq_call_ptr as *const IseqCall)
+            };
             let iseq = iseq_call.iseq.get();
             let argc = iseq_call.argc;
             let num_opts_filled = iseq_call.jit_entry_idx;
@@ -3944,17 +4011,12 @@ c_callable! {
                 _ => None,
             };
             if let Some(compile_error) = compile_error {
-                // We'll use this Rc again, so increment the ref count decremented by from_raw.
-                unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
-
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(compile_error));
                 return ZJITState::get_materialize_exit_trampoline_with_counter().raw_ptr(cb);
             }
 
             // Exit to the interpreter until the callee ISEQ collects enough profiles.
             if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
-                // Preserve the reference owned by the stub when iseq_call is dropped.
-                unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);
                 return ZJITState::get_materialize_exit_trampoline().raw_ptr(cb);
             }
@@ -3967,9 +4029,6 @@ c_callable! {
                 }
             }
             let code_ptr = code_ptr.unwrap_or_else(|compile_error| {
-                // We'll use this Rc again, so increment the ref count decremented by from_raw.
-                unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
-
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(&compile_error));
                 ZJITState::get_materialize_exit_trampoline_with_counter()
             });
@@ -4003,130 +4062,22 @@ fn function_stub_hit_body(cb: &mut CodeBlock, iseq_call: &IseqCallRef) -> Result
     Ok(jit_entry_ptr)
 }
 
-/// Compile a stub for an ISEQ called by SendDirect
-fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodePtr, CompileError> {
-    let (mut asm, scratch_reg) = Assembler::new_with_scratch_reg();
-    asm.new_block_without_id("gen_function_stub");
-    asm_comment!(asm, "Stub: {}", iseq_get_location(iseq_call.iseq.get(), 0));
-
-    // If the stubbed ISEQ fails to compile, function_stub_hit exits to the
-    // interpreter with this callee frame. Direct JIT-to-JIT calls pass arguments
-    // in C argument registers and the rest on the native stack, so spill the
-    // packed argument locals first. prepare_for_exit() will reshape these around
-    // any optional positional gaps.
-    let argc = iseq_call.argc.to_usize();
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq_call.iseq.get()) }.to_usize();
-
-    // Mirror the argument layout of gen_send_direct: self, then the packed
-    // positional arguments, and the block handler if it exists.
-    // TODO: Unify the argument order to avoid having to manually keep in sync
-    let params = unsafe { iseq_call.iseq.get().params() };
-    let block_spill = (params.flags.has_block() != 0).then(|| {
-        let block_local_idx: usize = params.block_start.try_into()
-            .expect("ISEQ block_start should be non-negative");
-        (argc + 1, block_local_idx) // +1 for self
-    });
-
-    let spills = (0..argc).map(|arg_idx| (arg_idx + 1, arg_idx)) // +1 for self
-        .chain(block_spill);
-    for (c_arg_idx, local_idx) in spills {
-        let src = match lir::c_arg_location(c_arg_idx) {
-            CArgLocation::Reg(reg) => reg,
-            CArgLocation::StackSlot(slot) => {
-                // The stub runs before any frame setup, so stack-passed arguments
-                // sit right above the return address (x86_64) or right at the
-                // native SP (arm64, where the return address is in a register).
-                let ret_addr_bytes = if cfg!(target_arch = "x86_64") { SIZEOF_VALUE_I32 } else { 0 };
-                asm.load_into(scratch_reg, Opnd::mem(64, NATIVE_STACK_PTR, ret_addr_bytes + slot as i32 * SIZEOF_VALUE_I32));
-                scratch_reg
-            }
-        };
-        asm.store(
-            Opnd::mem(64, SP, -local_size_and_idx_to_bp_offset(local_size, local_idx) * SIZEOF_VALUE_I32),
-            src,
-        );
-    }
-
-    // Call function_stub_hit using the shared trampoline. See `gen_function_stub_hit_trampoline`.
-    // Use load_into instead of mov, which is split on arm64, to avoid clobbering ALLOC_REGS.
-    asm.load_into(scratch_reg, Opnd::const_ptr(Rc::into_raw(iseq_call)));
-    asm.cpush(scratch_reg);
-    asm.jmp(ZJITState::get_function_stub_hit_trampoline().into());
-
-    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
-        assert_eq!(gc_offsets.len(), 0);
-        code_ptr
-    })
-}
-
-/// Generate a trampoline that is used when a function stub is called.
-/// See [gen_function_stub] for how it's used.
+/// Generate the trampoline that JIT-to-JIT calls call while their callee isn't compiled.
+/// It saves all general-purpose registers, calls [function_stub_hit] with them and the
+/// return address of the call, restores the registers and jumps to the address it returns,
+/// so the compiled callee (or the exit to the interpreter) runs as if called by the call site.
+///
+/// Like HotSpot's shared resolution stubs (SharedRuntime::resolve_static_call_C), there is
+/// no code per call site: [function_stub_hit] finds the call site's IseqCall by the return
+/// address, spills the arguments into the callee frame, and patches the call site.
 pub fn gen_function_stub_hit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
-    let (mut asm, scratch_reg) = Assembler::new_with_scratch_reg();
-    asm.new_block_without_id("function_stub_hit_trampoline");
-    asm_comment!(asm, "function_stub_hit trampoline");
-
-    asm.cpop_into(scratch_reg);
-
-    // Maintain alignment for x86_64, and set up a frame for arm64 properly
-    asm.frame_setup(&[]);
-
-    asm_comment!(asm, "preserve argument registers");
-
-    for pair in ALLOC_REGS.chunks(2) {
-        match *pair {
-            [reg0, reg1] => {
-                asm.cpush_pair(Opnd::Reg(reg0), Opnd::Reg(reg1));
-            }
-            [reg] => {
-                asm.cpush(Opnd::Reg(reg));
-            }
-            _ => unreachable!("chunks(2)")
-        }
+    let start_ptr = cb.get_write_ptr();
+    lir::Assembler::emit_function_stub_hit_trampoline(cb, function_stub_hit as *const u8);
+    if cb.has_dropped_bytes() {
+        return Err(CompileError::OutOfMemory);
     }
-    if cfg!(target_arch = "x86_64") && ALLOC_REGS.len() % 2 == 1 {
-        asm.cpush(Opnd::Reg(ALLOC_REGS[0])); // maintain alignment for x86_64
-    }
-
-    // We can't directly pass the scratch register in to the ccall because
-    // we're going to have parallel move automatically handle coping registers
-    // in to the C calling convention and the parallel move algorithm needs
-    // a scratch register to break any cycles.  If we use the scratch register
-    // as a C call parameter, then parallel move wouldn't be able to break
-    // cycles without clobbering something
-    asm.mov(C_ARG_OPNDS[0], scratch_reg);
-    // Compile the stubbed ISEQ
-    let jump_addr = asm_ccall!(asm, function_stub_hit, C_ARG_OPNDS[0], CFP, SP, EC);
-    asm.mov(scratch_reg, jump_addr);
-
-    asm_comment!(asm, "restore argument registers");
-    if cfg!(target_arch = "x86_64") && ALLOC_REGS.len() % 2 == 1 {
-        asm.cpop_into(Opnd::Reg(ALLOC_REGS[0]));
-    }
-
-    for pair in ALLOC_REGS.chunks(2).rev() {
-        match *pair {
-            [reg] => {
-                asm.cpop_into(Opnd::Reg(reg));
-            }
-            [reg0, reg1] => {
-                asm.cpop_pair_into(Opnd::Reg(reg1), Opnd::Reg(reg0));
-            }
-            _ => unreachable!("chunks(2)")
-        }
-    }
-
-    // Discard the current frame since the JIT function will set it up again
-    asm.frame_teardown(&[]);
-
-    // Jump to scratch_reg so that cpop_into() doesn't clobber it
-    asm.jmp_opnd(scratch_reg);
-
-    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
-        assert_eq!(gc_offsets.len(), 0);
-        perf::register_current_code_range(cb, "function_stub_hit trampoline", code_ptr);
-        code_ptr
-    })
+    perf::register_current_code_range(cb, "function_stub_hit trampoline", start_ptr);
+    Ok(start_ptr)
 }
 
 /// Generate a trampoline that is used when a function exits without restoring PC and the stack
@@ -4447,12 +4398,8 @@ pub struct IseqCall {
     /// Position where the call instruction starts
     start_addr: Cell<Option<CodePtr>>,
 
-    /// Position where the call instruction ends (exclusive)
+    /// Position where the call instruction ends (exclusive), i.e. its return address
     end_addr: Cell<Option<CodePtr>>,
-
-    /// Address of the function stub generated for this call, if already compiled.
-    // TODO(alan): Remove with removal of without_locals(), as this caching means `IseqCall` is never freed.
-    stub_addr: Cell<Option<CodePtr>>,
 }
 
 pub type IseqCallRef = Rc<IseqCall>;
@@ -4464,7 +4411,6 @@ impl IseqCall {
             iseq: Cell::new(iseq),
             start_addr: Cell::new(None),
             end_addr: Cell::new(None),
-            stub_addr: Cell::new(None),
             jit_entry_idx,
             argc,
         };
@@ -4480,6 +4426,90 @@ impl IseqCall {
             asm.compile(cb).unwrap();
             assert_eq!(self.end_addr.get().unwrap(), cb.get_write_ptr());
         });
+    }
+}
+
+/// Process-wide table of JIT-to-JIT call sites, keyed by the return address of the call,
+/// so that function_stub_hit_trampoline can tell which call site called it.
+///
+/// A call site is registered when it's pointed at the trampoline, and the entry is kept
+/// after the callee is compiled, since invalidating the callee points the call back at
+/// the trampoline. Entries are never removed because code is never freed. The table owns
+/// one strong reference to each IseqCall in it.
+///
+/// It is behind a lock because JIT code of other Ractors may look up a call site
+/// while one Ractor compiles. Compilation holds the VM lock, so writers never contend.
+#[derive(Default)]
+pub struct IseqCallTable {
+    /// Sorted return addresses as CodePtr offsets. Code is written at increasing
+    /// addresses, so this is mostly appended to, and looked up with a binary search.
+    ret_addrs: Vec<u32>,
+    /// The IseqCall for each entry of `ret_addrs`
+    iseq_calls: Vec<*const IseqCall>,
+    /// Address of CodePtr offset 0 in ZJIT's code block
+    code_base_addr: usize,
+}
+
+// The IseqCall pointers are only dereferenced by the Ractor running the call site,
+// and their reference counts are only touched under the VM lock.
+unsafe impl Send for IseqCallTable {}
+unsafe impl Sync for IseqCallTable {}
+
+impl IseqCallTable {
+    fn register(&mut self, ret_addr: u32, iseq_call: &IseqCallRef) {
+        let pos = match self.ret_addrs.last() {
+            Some(&last) if last >= ret_addr => self.ret_addrs.binary_search(&ret_addr),
+            _ => Err(self.ret_addrs.len()),
+        };
+        match pos {
+            // Re-registering a call site, e.g. on invalidation of its callee
+            Ok(pos) => {
+                if self.iseq_calls[pos] != Rc::as_ptr(iseq_call) {
+                    let old = std::mem::replace(&mut self.iseq_calls[pos], Rc::into_raw(iseq_call.clone()));
+                    unsafe { Rc::decrement_strong_count(old) };
+                }
+            }
+            Err(pos) => {
+                self.ret_addrs.insert(pos, ret_addr);
+                self.iseq_calls.insert(pos, Rc::into_raw(iseq_call.clone()));
+                incr_counter!(function_stub_call_site_count);
+            }
+        }
+    }
+
+    fn lookup(&self, ret_addr: usize) -> Option<*const IseqCall> {
+        let ret_addr = u32::try_from(ret_addr.wrapping_sub(self.code_base_addr)).ok()?;
+        let pos = self.ret_addrs.binary_search(&ret_addr).ok()?;
+        Some(self.iseq_calls[pos])
+    }
+}
+
+/// Register the call site of `iseq_call`, whose return address is `ret_addr`
+fn register_iseq_call(cb: &CodeBlock, ret_addr: CodePtr, iseq_call: &IseqCallRef) {
+    // Only calls in ZJIT's code block can reach the trampoline. Code assembled into
+    // another CodeBlock (unit tests) is never run, and its offsets would alias.
+    let code_base_addr = |cb: &CodeBlock| {
+        let start = cb.get_ptr(0);
+        start.raw_addr(cb) - start.as_offset() as usize
+    };
+    if !ZJITState::has_instance() || code_base_addr(ZJITState::get_code_block()) != code_base_addr(cb) {
+        return;
+    }
+    let ret_addr: u32 = ret_addr.as_offset().try_into().unwrap();
+    let mut table = ZJITState::get_iseq_calls().write().unwrap_or_else(|err| err.into_inner());
+    table.code_base_addr = code_base_addr(cb);
+    table.register(ret_addr, iseq_call);
+}
+
+/// Find the IseqCall of the call site whose return address is `ret_addr`
+fn lookup_iseq_call(ret_addr: usize) -> Option<*const IseqCall> {
+    // Another Ractor may be compiling, i.e. registering call sites, only when there
+    // are multiple Ractors. Otherwise this thread holds the GVL, which compilation
+    // needs too, so skip the lock.
+    if unsafe { rb_jit_multi_ractor_p() } {
+        ZJITState::get_iseq_calls().read().unwrap_or_else(|err| err.into_inner()).lookup(ret_addr)
+    } else {
+        ZJITState::get_iseq_calls_unlocked().lookup(ret_addr)
     }
 }
 

@@ -169,6 +169,8 @@ make_counters! {
         compile_side_exit_time_ns,
         exit_descriptor_count,
         exit_descriptor_bytes,
+        function_stub_call_site_count,
+        function_stub_hit_count,
 
         compile_hir_time_ns,
         compile_hir_build_time_ns,

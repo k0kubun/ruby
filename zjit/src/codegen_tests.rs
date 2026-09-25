@@ -1707,6 +1707,53 @@ fn test_function_stub_exit_initializes_block_param() {
 }
 
 #[test]
+fn test_function_stub_exit_spills_stack_args() {
+    set_mem_bytes(1024 * 1024);
+    set_inline_threshold(0);
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        # Make the callee big enough that compiling it exhausts the code region, so the
+        # stub hit fails with OutOfMemory and falls back to the interpreter, which reads
+        # every argument from the callee frame, including the ones passed on the native
+        # stack and those after an unfilled optional parameter.
+        body = (0...400).map { |k| "u#{k} = #{k} + a" }.join("
+")
+        Integer.class_eval <<~RUBY
+          def zjit_many_args_callee(a, b, c, d, e, f, g, h, i, opt = 10, j, &blk)
+            #{body}
+            [self, a, b, c, d, e, f, g, h, i, opt, j, blk&.call]
+          end
+        RUBY
+
+        # Compile the call sites without running them, so the callee is still
+        # uncompiled when function_stub_hit_trampoline is first called from them.
+        def kaller(run)
+          return unless run
+          [1.zjit_many_args_callee(2, 3, 4, 5, 6, 7, 8, 9, 10, 12),
+           1.zjit_many_args_callee(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12) { 13 }]
+        end
+        300.times { kaller(false) }
+        [kaller(true), kaller(true)]
+    "#), @"[[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 12, nil], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]], [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 12, nil], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]]]");
+}
+
+#[test]
+fn test_function_stub_recursive_call_with_stack_args() {
+    set_inline_threshold(0);
+    set_call_threshold(2);
+    // The callee is the caller, so compiling the callee from function_stub_hit
+    // patches a call site in the function being compiled's previous version.
+    assert_snapshot!(inspect(r#"
+        def zjit_rec(n, a, b, c, d, e, f, g, h)
+          return [n, a, b, c, d, e, f, g, h] if n == 0
+          zjit_rec(n - 1, a + 1, b, c, d, e, f, g, h + 1)
+        end
+        zjit_rec(1, 0, 1, 2, 3, 4, 5, 6, 0)
+        [zjit_rec(5, 0, 1, 2, 3, 4, 5, 6, 0), zjit_rec(3, 0, 1, 2, 3, 4, 5, 6, 0)]
+    "#), @"[[0, 5, 1, 2, 3, 4, 5, 6, 5], [0, 3, 1, 2, 3, 4, 5, 6, 3]]");
+}
+
+#[test]
 fn test_no_ep_escape_side_exit_restores_locals_while_oom() {
     // A regression test for stub compilation failures on OOM. Functions patched by NoEPEscape
     // is unsafe to enter (FrameState uses without_locals() and doesn't spill the entry state),
