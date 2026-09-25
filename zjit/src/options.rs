@@ -87,6 +87,11 @@ pub struct Options {
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
+    /// Number of times a side exit is materialized from its descriptor before it is
+    /// compiled into machine code. 0 compiles an exit the first time it is taken, and
+    /// values above `LAZY_EXIT_MAX_HITS` never compile exits. See `exit_desc::lazy_exit_hit`.
+    pub lazy_exit_threshold: usize,
+
     /// Enable ZJIT statistics
     pub stats: bool,
 
@@ -199,6 +204,21 @@ pub struct Options {
     pub inline_max_iterations: InlineDepth,
 }
 
+/// Default for --zjit-lazy-exit-threshold. An exit taken a couple of times is likely
+/// taken again, while compiling exits taken once or twice would cost code memory for
+/// little gain.
+pub const DEFAULT_LAZY_EXIT_THRESHOLD: usize = 2;
+
+/// Unit tests can override the threshold with $ZJIT_TEST_LAZY_EXIT_THRESHOLD to run
+/// every test with exits compiled on their first hit, or never compiled.
+fn default_lazy_exit_threshold() -> usize {
+    #[cfg(test)]
+    if let Some(threshold) = std::env::var("ZJIT_TEST_LAZY_EXIT_THRESHOLD").ok().and_then(|value| value.parse().ok()) {
+        return threshold;
+    }
+    DEFAULT_LAZY_EXIT_THRESHOLD
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
@@ -206,6 +226,7 @@ impl Default for Options {
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
+            lazy_exit_threshold: default_lazy_exit_threshold(),
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -455,6 +476,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => return None,
         },
 
+        ("lazy-exit-threshold", _) => match opt_val.parse() {
+            Ok(n) => options.lazy_exit_threshold = n,
+            Err(_) => return None,
+        },
+
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
             Err(_) => return None,
@@ -695,6 +721,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
+}
+
+/// Update --zjit-lazy-exit-threshold for testing
+#[cfg(test)]
+pub fn set_lazy_exit_threshold(lazy_exit_threshold: usize) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().lazy_exit_threshold = lazy_exit_threshold; }
 }
 
 /// Update --zjit-max-versions for testing

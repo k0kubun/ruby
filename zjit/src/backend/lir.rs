@@ -250,6 +250,8 @@ impl BasicBlock {
 
 pub use crate::backend::current::{
     mem_base_reg,
+    gp_reg,
+    LAZY_EXIT_BASE_OPND,
     Reg,
     EC, CFP, SP,
     NATIVE_BASE_PTR, NATIVE_STACK_PTR,

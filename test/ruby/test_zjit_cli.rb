@@ -340,6 +340,27 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_lazy_exit_threshold
+    # The exit is materialized from its descriptor once, then compiled and patched,
+    # and later hits run the compiled code. GC compaction moves what it references.
+    assert_runs('[[[2, 3.5], [3, 4.5], [4, 5.5], [5, 6.5]], 1, true]', <<~RUBY, call_threshold: 2, stats: :quiet, extra_args: ['--zjit-lazy-exit-threshold=1', '--zjit-num-exits-until-invalidate=100'])
+      def test(a, b)
+        c = a + 1
+        [c, b + 1]
+      end
+      test(1, 2)
+      test(1, 2)
+      result = [test(1, 2.5), test(2, 3.5)]
+      begin
+        GC.verify_compaction_references(expand_heap: true, toward: :empty)
+      rescue NotImplementedError
+      end
+      result += [test(3, 4.5), test(4, 5.5)]
+      stats = RubyVM::ZJIT.stats
+      [result, stats[:lazy_exit_compiled_count], stats[:lazy_exit_compiled_bytes] > 0]
+    RUBY
+  end
+
   def test_send_forwarded_block_arg_nil_then_non_nil
     # Regression test: when a forwarded &block arg is profiled as nil, the nil
     # block optimization must update the frame state to match the stripped args.
