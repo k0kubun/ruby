@@ -6,7 +6,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::perf;
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, zjit_jit_frame, local_size_and_idx_to_ep_offset};
+use crate::cruby::{IseqPtr, SIZEOF_VALUE_I32, VALUE, ZJIT_STACK_MAP_BASE_PTR_INDEX_MASK, ZJIT_STACK_MAP_BASE_PTR_SIZE_SHIFT, ZJIT_STACK_MAP_BASE_PTR_TAG, ZJIT_STACK_MAP_SHIFT, ZJIT_STACK_MAP_SKIP_TAG, ZJIT_STACK_MAP_VREG_TAG, vm_stack_canary, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, get_option};
@@ -14,7 +14,8 @@ use crate::payload::IseqVersionRef;
 use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
-use crate::state::{ZJITState, rb_zjit_record_exit_stack};
+use crate::state::ZJITState;
+use crate::exit_desc::{ExitDescriptor, ExitDescriptorExtra, ExitImms, ExitLoc, ExitStackMap};
 use crate::cast::IntoUsize;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
@@ -949,6 +950,12 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Call a side-exit trampoline without moving any arguments: `call rel32` on
+    /// x86_64 and `bl` on arm64, or a far call through the scratch register when
+    /// the target is out of range. The trampoline never returns here; it uses the
+    /// return address to find this exit's descriptor. See [`crate::exit_desc`].
+    CallExitTrampoline(CodePtr),
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -1036,6 +1043,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::CallExitTrampoline(_) |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1180,6 +1188,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::CallExitTrampoline(_) => "CallExitTrampoline",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::Comment(_) => "Comment",
@@ -3026,31 +3035,47 @@ impl Assembler
             VALUE(encoded)
         }
 
-        fn capture_stack_map_opnd(asm: &mut Assembler, opnd: Opnd, capture_idx: &mut usize, frame_depth: usize) -> VALUE {
-            let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(*capture_idx);
-            *capture_idx += 1;
-            let capture_slot = Opnd::Mem(Mem {
-                base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
-                disp: 0,
-                num_bits: 64,
-            });
-            let opnd = if matches!(opnd, Opnd::Reg(_)) { opnd.with_num_bits(64) } else { opnd };
-            asm.store(capture_slot, opnd);
-            encode_stack_map_index(asm, stack_idx, frame_depth)
+        /// Describe where an exit operand lives once register allocation is done
+        fn exit_loc(asm: &Assembler, opnd: Opnd, imms: &mut ExitImms) -> ExitLoc {
+            match opnd {
+                Opnd::Reg(reg) => ExitLoc::Reg { reg: reg.reg_no, bits: reg.num_bits },
+                Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, .. }, disp, num_bits }) => {
+                    ExitLoc::NativeSlot { disp: asm.stack_state.stack_idx_to_disp(stack_idx) + disp, bits: num_bits }
+                }
+                Opnd::Mem(Mem { base: MemBase::Reg(reg_no), disp, num_bits }) => {
+                    ExitLoc::Mem { base: reg_no, bits: num_bits, disp }
+                }
+                Opnd::Mem(Mem { base: MemBase::StackIndirect { stack_idx }, disp, num_bits }) => {
+                    ExitLoc::StackIndirect { slot: asm.stack_state.stack_idx_to_disp(stack_idx), disp, bits: num_bits }
+                }
+                Opnd::Value(value) => imms.imm(value.0 as u64, true),
+                Opnd::UImm(imm) => imms.imm(imm, false),
+                Opnd::Imm(imm) => imms.imm(imm as u64, false),
+                _ => unreachable!("unexpected side-exit operand after register allocation: {opnd:?}"),
+            }
         }
 
-        fn compile_exit_stack_map(asm: &mut Assembler, stack_map: &StackMap) {
+        /// Encode the JITFrame entries of a stack map at compile time, and describe the
+        /// register values the exit has to capture into native stack slots at run time.
+        fn compile_exit_stack_map(asm: &Assembler, stack_map: &StackMap, imms: &mut ExitImms) -> ExitStackMap {
             let StackMap { stack, jit_frame, frame_depth } = stack_map;
             let jit_frame = *jit_frame;
             assert_eq!(unsafe { (*jit_frame).stack_size } as usize, stack.len());
 
-            let mut capture_idx = 0;
+            let mut captures = vec![];
+            let mut capture = |opnd: Opnd, imms: &mut ExitImms| -> VALUE {
+                let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(captures.len());
+                let slot = asm.stack_state.stack_idx_to_disp(stack_idx.try_into().unwrap());
+                let opnd = if matches!(opnd, Opnd::Reg(_)) { opnd.with_num_bits(64) } else { opnd };
+                captures.push((exit_loc(asm, opnd, imms), slot));
+                encode_stack_map_index(asm, stack_idx, *frame_depth)
+            };
             for (idx, stack_entry) in stack.iter().enumerate() {
                 let entry = match *stack_entry {
                     StackMapEntry::Opnd(Opnd::Value(_) | Opnd::UImm(_)) => {
                         let StackMapEntry::Opnd(opnd) = *stack_entry else { unreachable!() };
                         immediate_stack_map_value(opnd)
-                            .unwrap_or_else(|| capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth))
+                            .unwrap_or_else(|| capture(opnd, imms))
                     }
                     StackMapEntry::Skip(size) => {
                         let encoded = (size << ZJIT_STACK_MAP_SHIFT) | ZJIT_STACK_MAP_SKIP_TAG as usize;
@@ -3063,99 +3088,77 @@ impl Assembler
                     }
                     StackMapEntry::Opnd(Opnd::Reg(_)) => {
                         let StackMapEntry::Opnd(opnd) = *stack_entry else { unreachable!() };
-                        capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth)
+                        capture(opnd, imms)
                     }
                     _ => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 };
                 unsafe { (*jit_frame.cast_mut()).stack.as_mut_ptr().add(idx).write(entry); }
             }
 
-            assert!(capture_idx <= asm.stack_state.num_side_exit_stack_map_slots);
-            asm_comment!(asm, "install side-exit JITFrame for caller depth {}", frame_depth);
-            let jit_frame_slot = Opnd::mem(64, NATIVE_BASE_PTR, -((*frame_depth as i32 + 1) * SIZEOF_VALUE_I32));
-            asm.store(jit_frame_slot, Opnd::const_ptr(jit_frame));
+            assert!(captures.len() <= asm.stack_state.num_side_exit_stack_map_slots);
+            ExitStackMap {
+                captures: captures.into_boxed_slice(),
+                jit_frame,
+                jit_frame_slot: -((*frame_depth as i32 + 1) * SIZEOF_VALUE_I32),
+            }
         }
 
-        /// Restore VM state (cfp->pc, cfp->sp, stack, locals) for the side exit.
-        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
-            let SideExit { pc, stack, locals, iseq, stack_map, .. } = exit;
+        /// Build the descriptor of a side exit: everything the exit does when taken.
+        fn compile_exit_descriptor(asm: &Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) -> ExitDescriptor {
+            let SideExit { pc, stack, locals, iseq, stack_map, recompile } = exit;
+            let mut imms = ExitImms::default();
+            let stack = stack.iter().map(|&opnd| exit_loc(asm, opnd, &mut imms)).collect();
+            let locals = locals.iter().map(|&opnd| exit_loc(asm, opnd, &mut imms)).collect();
+            let stack_map = stack_map.as_ref().map(|stack_map| compile_exit_stack_map(asm, stack_map, &mut imms));
+            let trace_reason = trace_reason.map(|reason| {
+                // Leak a CString with the reason so it's available at runtime
+                let reason_cstr = std::ffi::CString::new(reason.to_string())
+                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
+                reason_cstr.into_raw() as *const std::ffi::c_char
+            });
+            let extra = (stack_map.is_some() || trace_reason.is_some())
+                .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
+            let recompile = match recompile {
+                Some(SideExitRecompile { compiled_iseq: Opnd::Value(compiled_iseq) }) => compiled_iseq.as_iseq(),
+                Some(recompile) => unreachable!("recompile target should be an ISEQ VALUE, got {:?}", recompile.compiled_iseq),
+                None => std::ptr::null(),
+            };
+            let Opnd::UImm(pc) = *pc else {
+                unreachable!("side exit PC should be a constant pointer, got {pc:?}")
+            };
+            ExitDescriptor::new(pc as *const VALUE, *iseq, stack, locals, imms, recompile, extra)
+        }
+
+        /// Compile the main side-exit code: a single call to exit_descriptor_trampoline.
+        /// Everything else the exit does -- restoring cfp->pc/sp/iseq, writing the Ruby
+        /// stack and locals, installing JITFrames for older inlined frames, and optionally
+        /// recording a traced exit stack and triggering recompilation -- is done by
+        /// rb_zjit_side_exit_descriptor() from the descriptor registered for the call's
+        /// return address. Shared exits pass no trace reason so they can still be
+        /// deduplicated by SideExit. IOW, we should never pass a trace reason if we
+        /// expect the exit to be deduplicated.
+        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
+            let SideExit { stack, locals, .. } = exit;
 
             // Side exit blocks are not part of the CFG at the moment,
             // so we need to manually ensure that patchpoints get padded
             // so that nobody stomps on us
             asm.boundary_pad();
 
-            asm_comment!(asm, "save cfp->pc");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), *pc);
-
-            asm_comment!(asm, "save cfp->sp");
-            asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, stack.len() as i32 * SIZEOF_VALUE_I32));
-
-            asm_comment!(asm, "save cfp->iseq");
-            asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(*iseq).into());
-
-            // cfp->block_code and cfp->jit_return are cleared by the materialize_exit trampoline
-
             if !stack.is_empty() {
-                asm_comment!(asm, "write stack slots: {}", join_opnds(&stack, ", "));
-                for (idx, &opnd) in stack.iter().enumerate() {
-                    asm.store(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
-                }
+                asm_comment!(asm, "stack slots: {}", join_opnds(stack, ", "));
             }
-
             if !locals.is_empty() {
-                asm_comment!(asm, "write locals: {}", join_opnds(&locals, ", "));
-                for (idx, &opnd) in locals.iter().enumerate() {
-                    asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(locals.len(), idx) - 1) * SIZEOF_VALUE_I32), opnd);
-                }
+                asm_comment!(asm, "locals: {}", join_opnds(locals, ", "));
             }
-
-            if let Some(stack_map) = stack_map {
-                compile_exit_stack_map(asm, stack_map);
-            }
-        }
-
-        /// Tear down the JIT frame and return to the interpreter.
-        fn compile_exit_return(asm: &mut Assembler) {
-            asm_comment!(asm, "exit to the interpreter");
-            asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
-        }
-
-        fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
-            if let Some(recompile) = &exit.recompile {
-                use crate::codegen::exit_recompile;
+            if exit.recompile.is_some() {
                 asm_comment!(asm, "invalidate for recompilation");
-                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
             }
-        }
-
-        /// Compile the main side-exit code.  The side exit will optionally record a traced exit
-        /// stack, optionally trigger recompilation, and then return to the interpreter. Shared
-        /// exits pass no trace reason so they can still be deduplicated by SideExit.
-        /// IOW, we should never pass a trace reason if we expect the exit to be
-        /// deduplicated.
-        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
-            // Save VM state before the ccall so that
-            // rb_profile_frames sees valid cfp->pc and the
-            // ccall doesn't clobber caller-saved registers
-            // holding stack/local operands.
-            compile_exit_save_state(asm, exit);
-            if trace_reason.is_some() || exit.recompile.is_some() {
-                // Clear cfp->jit_return to prepare for a C call. Normally, cfp->jit_return
-                // is cleared by the materialize_exit trampoline, but if we're about to
-                // make a C call, we need to clear any stale JITFrame.
-                asm_comment!(asm, "clear cfp->jit_return");
-                asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
-            }
-            if let Some(reason) = trace_reason {
-                // Leak a CString with the reason so it's available at runtime
-                let reason_cstr = std::ffi::CString::new(reason.to_string())
-                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
-                let reason_ptr = reason_cstr.into_raw() as *const u8;
-                asm_ccall!(asm, rb_zjit_record_exit_stack, Opnd::const_ptr(reason_ptr));
-            }
-            compile_exit_recompile(asm, exit);
-            compile_exit_return(asm);
+            let desc = compile_exit_descriptor(asm, exit, trace_reason).encode();
+            asm_comment!(asm, "exit to the interpreter");
+            asm.push_insn(Insn::CallExitTrampoline(ZJITState::get_exit_descriptor_trampoline()));
+            // The position right after the call is its return address
+            asm.pos_marker(move |ret_addr, cb| crate::exit_desc::register(ret_addr, cb, &desc));
         }
 
         fn join_opnds(opnds: &Vec<Opnd>, delimiter: &str) -> String {

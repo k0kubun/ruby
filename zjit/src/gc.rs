@@ -118,6 +118,9 @@ fn iseq_mark(payload: &IseqPayload) {
                 rb_gc_mark_movable(object);
             }
         }
+
+        // Mark objects referenced by side-exit descriptors
+        crate::exit_desc::mark(&unsafe { version.as_ref() }.exit_descs);
     }
 }
 
@@ -157,6 +160,9 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
             iseq_call.iseq.set(new_iseq);
         }
     }
+
+    // Move objects referenced by side-exit descriptors
+    crate::exit_desc::update_references(&unsafe { version.as_ref() }.exit_descs);
 
     // Move objects baked in JIT code.
     // The code region is already writable because rb_zjit_mark_all_writable() was called

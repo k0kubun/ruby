@@ -3431,6 +3431,134 @@ fn test_opt_plus_type_guard_nested_exit_with_locals() {
     "), @"[9, 9.0]");
 }
 
+/// Descriptors of the compiled versions of a method
+fn exit_descriptors_of(name: &str) -> Vec<crate::exit_desc::ExitDescriptor> {
+    crate::exit_desc::descriptors_of(get_method_iseq("self", name))
+}
+
+#[test]
+fn test_exit_descriptor_registers_spills_and_immediates() {
+    // More live values than allocatable registers, so the exit finds some of them
+    // in registers and some in spilled native stack slots. The array literal puts
+    // immediates on the Ruby stack: special constants that fit in 32 bits, ones
+    // that don't, and a heap object.
+    assert_snapshot!(inspect("
+        def exit_desc_many(a, b)
+          l1 = a + 1; l2 = a + 2; l3 = a + 3; l4 = a + 4; l5 = a + 5; l6 = a + 6
+          l7 = a + 7; l8 = a + 8; l9 = a + 9; l10 = a + 10; l11 = a + 11; l12 = a + 12
+          [nil, :exit_desc_sym, 1099511627776, (1..2), l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, b + 1]
+        end
+        exit_desc_many(0, 1) # profile
+        [exit_desc_many(0, 1), exit_desc_many(10, 1.5)]
+    "), @"[[nil, :exit_desc_sym, 1099511627776, 1..2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 2], [nil, :exit_desc_sym, 1099511627776, 1..2, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 2.5]]");
+
+    use crate::exit_desc::ExitLoc;
+    let descs = exit_descriptors_of("exit_desc_many");
+    assert!(!descs.is_empty());
+    let locs: Vec<(ExitLoc, Option<u64>)> = descs.iter()
+        .flat_map(|desc| desc.all_locs().into_iter().map(move |loc| (loc, desc.imm_value(loc))))
+        .collect();
+    assert!(locs.iter().any(|(loc, _)| matches!(loc, ExitLoc::Reg { .. })), "expected a register location: {locs:?}");
+    assert!(locs.iter().any(|(loc, _)| matches!(loc, ExitLoc::NativeSlot { .. })), "expected a spilled location: {locs:?}");
+    assert!(locs.iter().any(|&(loc, value)| matches!(loc, ExitLoc::SmallImm(_)) && value == Some(Qnil.as_u64())), "expected nil as a small immediate: {locs:?}");
+    assert!(locs.iter().any(|&(loc, value)| matches!(loc, ExitLoc::Value(_) | ExitLoc::Imm(_)) && value == Some(VALUE::fixnum_from_usize(1099511627776).as_u64())),
+        "expected a wide special constant: {locs:?}");
+    assert!(locs.iter().any(|&(loc, value)| matches!(loc, ExitLoc::Value(_)) && value.is_some_and(|value| !VALUE(value as usize).special_const_p())),
+        "expected a heap object: {locs:?}");
+}
+
+#[test]
+fn test_exit_descriptor_locals() {
+    assert_snapshot!(inspect("
+        def exit_desc_locals(a, b)
+          c = a * 2
+          d = [a, c]
+          e = b + 1
+          [a, b, c, d, e]
+        end
+        exit_desc_locals(1, 2) # profile
+        [exit_desc_locals(3, 4), exit_desc_locals(5, 6.5)]
+    "), @"[[3, 4, 6, [3, 6], 5], [5, 6.5, 10, [5, 10], 7.5]]");
+
+    let descs = exit_descriptors_of("exit_desc_locals");
+    assert!(descs.iter().any(|desc| desc.locals().len() == 5), "expected an exit writing all 5 locals");
+}
+
+#[test]
+fn test_exit_descriptor_survives_compaction() {
+    // The heap object and the ISEQs referenced by the descriptor must be marked and
+    // moved by compaction while the exit has not been taken yet.
+    assert_snapshot!(inspect(r#"
+        def exit_desc_compact(a) = [(1..2), "exit_desc_compact".freeze, a + 1]
+        exit_desc_compact(1) # profile
+        exit_desc_compact(1)
+        GC.start
+        begin
+          GC.verify_compaction_references(expand_heap: true, toward: :empty)
+        rescue NotImplementedError
+        end
+        exit_desc_compact(1.5)
+    "#), @r#"[1..2, "exit_desc_compact", 2.5]"#);
+}
+
+#[test]
+fn test_exit_descriptor_stack_map() {
+    // The exit out of the inlined callee also has to materialize the caller's frame,
+    // whose stack holds `a` and `x` at the call.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        def exit_desc_callee(n) = n + 1
+        def exit_desc_caller(a, n)
+          x = a * 2
+          [a, x, exit_desc_callee(n)]
+        end
+        exit_desc_caller(1, 1)
+        exit_desc_caller(1, 1)
+        exit_desc_caller(1, 1)
+        [exit_desc_caller(2, 1), exit_desc_caller(3, 1.5)]
+    "));
+    assert_snapshot!(result, @"[[2, 4, 2], [3, 6, 2.5]]");
+
+    let descs = exit_descriptors_of("exit_desc_caller");
+    assert!(descs.iter().any(|desc| desc.has_stack_map()), "expected an exit with a stack map");
+}
+
+#[test]
+fn test_exit_descriptor_recompile() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    eval("
+        def exit_desc_recompile(a, b) = a + b
+        exit_desc_recompile(1, 2)
+        exit_desc_recompile(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "exit_desc_recompile");
+    let descs = crate::exit_desc::descriptors_of(iseq);
+    assert!(descs.iter().any(|desc| desc.recompile == iseq), "expected an exit that recompiles the method");
+
+    assert_eq!(Qtrue, eval("exit_desc_recompile(1.5, 2.5) == 4.0"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_exit_descriptor_trace_side_exits() {
+    rb_zjit_prepare_options();
+    unsafe { crate::options::OPTIONS.as_mut().unwrap().trace_side_exits = Some(crate::options::TraceExits::All); }
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def exit_desc_trace(a, b)
+          c = a + 1
+          [c, b + 1]
+        end
+        exit_desc_trace(1, 2)
+        exit_desc_trace(1, 2)
+        exit_desc_trace(1, 2.5)
+    "), @"[2, 3.5]");
+
+    let descs = exit_descriptors_of("exit_desc_trace");
+    assert!(descs.iter().any(|desc| desc.has_trace_reason()), "expected a traced exit");
+}
+
 #[test]
 fn test_opt_minus() {
     assert_snapshot!(inspect("

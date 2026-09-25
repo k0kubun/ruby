@@ -1115,6 +1115,11 @@ impl Assembler {
                     add(cb, mem.into(), value.into());
                 },
 
+                Insn::CallExitTrampoline(target) => {
+                    // Side-exit operands never live in the scratch register
+                    call_ptr(cb, SCRATCH0_OPND.into(), target.raw_ptr(cb));
+                },
+
                 Insn::Breakpoint => int3(cb),
                 Insn::Abort => ud2(cb),
 
@@ -1162,6 +1167,42 @@ impl Assembler {
 
             Ok(gc_offsets)
         }
+    }
+
+    /// Emit exit_descriptor_trampoline. See [`crate::codegen::gen_exit_descriptor_trampoline`].
+    /// A side exit calls this, so the return address is at [rsp] on entry.
+    pub fn emit_exit_descriptor_trampoline(cb: &mut CodeBlock, handler: *const u8, materialize_exit_trampoline: CodePtr) {
+        const NUM_REGS: i32 = 16;
+        const SAVE_AREA_BYTES: i32 = NUM_REGS * SIZEOF_VALUE_I32;
+        let reg = |reg_no: u8| X86Opnd::Reg(X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no });
+
+        cb.add_comment("exit_descriptor trampoline");
+        cb.add_comment("save all registers, indexed by reg_no");
+        sub(cb, RSP, uimm_opnd(SAVE_AREA_BYTES as u64));
+        for reg_no in 0..NUM_REGS as u8 {
+            if reg_no != RSP_REG.reg_no {
+                mov(cb, mem_opnd(64, RSP, reg_no as i32 * SIZEOF_VALUE_I32), reg(reg_no));
+            }
+        }
+        // Save RSP as of the exit, i.e. above the save area and the return address
+        lea(cb, R11, mem_opnd(64, RSP, SAVE_AREA_BYTES + SIZEOF_VALUE_I32));
+        mov(cb, mem_opnd(64, RSP, RSP_REG.reg_no as i32 * SIZEOF_VALUE_I32), R11);
+
+        cb.add_comment("rb_zjit_side_exit_descriptor(regs, return address)");
+        mov(cb, C_ARG_OPNDS[0].into(), RSP);
+        mov(cb, C_ARG_OPNDS[1].into(), mem_opnd(64, RSP, SAVE_AREA_BYTES));
+        // Align the stack for the call. The handler returns the save area.
+        and(cb, RSP, imm_opnd(-16));
+        call_ptr(cb, R11, handler);
+
+        // Go to materialize_exit_trampoline by returning to it rather than jumping, so
+        // that the exit's call is paired with a ret. An unpaired call would leave the
+        // return stack buffer misaligned and mispredict every return up the stack.
+        cb.add_comment("return to materialize_exit_trampoline");
+        lea(cb, RSP, mem_opnd(64, RAX, SAVE_AREA_BYTES));
+        mov(cb, R11, const_ptr_opnd(materialize_exit_trampoline.raw_ptr(cb)));
+        mov(cb, mem_opnd(64, RSP, 0), R11);
+        ret(cb);
     }
 
     /// Optimize and compile the stored instructions

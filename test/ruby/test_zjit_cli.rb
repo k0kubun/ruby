@@ -322,6 +322,24 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_exit_tracing_guard_exit_with_stack_and_locals
+    # A traced guard exit records the exit stack from the materialized frame,
+    # then resumes the interpreter with the stack and locals it wrote out.
+    assert_runs('[[2, 3], [2, 3.5], true]', <<~RUBY, call_threshold: 2, extra_args: ['--zjit-trace-exits'])
+      def test(a, b)
+        c = a + 1
+        [c, b + 1]
+      end
+      test(1, 2)
+      result = [test(1, 2), test(1, 2.5)]
+
+      fxt_files = Dir.glob("/tmp/perfetto-\#{Process.pid}.fxt")
+      traced = fxt_files.length == 1 && !File.empty?(fxt_files.first)
+      File.unlink(*fxt_files)
+      result << traced
+    RUBY
+  end
+
   def test_send_forwarded_block_arg_nil_then_non_nil
     # Regression test: when a forwarded &block arg is profiled as nil, the nil
     # block optimization must update the frame state to match the stripped args.

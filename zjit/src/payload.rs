@@ -53,6 +53,10 @@ pub struct IseqVersion {
     /// GC offsets of the JIT code. These are the addresses of objects that need to be marked.
     pub gc_offsets: Vec<CodePtr>,
 
+    /// Byte range of the side-exit descriptors registered for the JIT code. The GC
+    /// marks and moves the objects they refer to, like it does for `gc_offsets`.
+    pub exit_descs: std::ops::Range<u32>,
+
     /// JIT-to-JIT calls from the ISEQ. The IseqPayload's ISEQ is the caller of it.
     pub outgoing: Vec<IseqCallRef>,
 
@@ -75,6 +79,7 @@ impl IseqVersion {
             iseq,
             status: IseqStatus::NotCompiled,
             gc_offsets: vec![],
+            exit_descs: 0..0,
             outgoing: vec![],
             incoming: vec![],
         };

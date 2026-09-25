@@ -413,7 +413,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
 }
 
 /// Compile a function
-fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
+fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     let (mut jit, asm) = trace_compile_phase("codegen", || {
         // Reserve one JITFrame slot per simultaneously live frame. The top-level
         // frame is depth 0, and each level of inlining adds another frame that
@@ -570,8 +570,15 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         (jit, asm)
     });
 
-    // Generate code if everything can be compiled
+    // Generate code if everything can be compiled. Side-exit descriptors are
+    // registered while emitting, so the ones for this version form a range.
+    let exit_descs_start = crate::exit_desc::next_offset();
     let result = asm.compile(cb);
+    if result.is_ok() {
+        let exit_descs = exit_descs_start..crate::exit_desc::next_offset();
+        crate::exit_desc::write_barrier(iseq, &exit_descs);
+        unsafe { version.as_mut() }.exit_descs = exit_descs;
+    }
     if let Ok((start_ptr, _)) = result {
         perf::register_current_iseq_range(cb, iseq, start_ptr);
         if ZJITState::should_log_compiled_iseqs() {
@@ -4163,6 +4170,21 @@ pub fn gen_materialize_exit_trampoline(cb: &mut CodeBlock, exit_trampoline: Code
         perf::register_current_code_range(cb, "materialize_exit trampoline", code_ptr);
         code_ptr
     })
+}
+
+/// Generate the trampoline every side exit calls. It saves all general-purpose
+/// registers, calls [`crate::exit_desc::rb_zjit_side_exit_descriptor`] with them
+/// and the return address of the exit's call, and jumps to materialize_exit_trampoline.
+/// The save area and the return address are discarded by the frame teardown there.
+pub fn gen_exit_descriptor_trampoline(cb: &mut CodeBlock, materialize_exit_trampoline: CodePtr) -> Result<CodePtr, CompileError> {
+    let start_ptr = cb.get_write_ptr();
+    let handler = crate::exit_desc::rb_zjit_side_exit_descriptor as *const u8;
+    lir::Assembler::emit_exit_descriptor_trampoline(cb, handler, materialize_exit_trampoline);
+    if cb.has_dropped_bytes() {
+        return Err(CompileError::OutOfMemory);
+    }
+    perf::register_current_code_range(cb, "exit_descriptor trampoline", start_ptr);
+    Ok(start_ptr)
 }
 
 /// Generate a trampoline that increments exit_compilation_failure and jumps to materialize_exit_trampoline.
