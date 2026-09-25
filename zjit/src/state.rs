@@ -161,7 +161,7 @@ impl ZJITState {
         let entry_trampoline = gen_entry_trampoline(&mut cb).unwrap().raw_ptr(&cb);
         let exit_trampoline = gen_exit_trampoline(&mut cb).unwrap();
         let materialize_exit_trampoline = gen_materialize_exit_trampoline(&mut cb, exit_trampoline).unwrap();
-        let exit_descriptor_trampoline = gen_exit_descriptor_trampoline(&mut cb, materialize_exit_trampoline).unwrap();
+        let exit_descriptor_trampoline = gen_exit_descriptor_trampoline(&mut cb).unwrap();
         let function_stub_hit_trampoline = gen_function_stub_hit_trampoline(&mut cb).unwrap();
 
         let perfetto_tracer = if get_option!(trace_side_exits).is_some() || get_option!(trace_compiles) || get_option!(trace_invalidation) || get_option!(trace_fallbacks) {

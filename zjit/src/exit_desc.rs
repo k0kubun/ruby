@@ -20,6 +20,11 @@
 //! debug info: a register is one byte, a spill slot or a small immediate is two or
 //! three, and pointers the GC may move are stored as 8 raw bytes so that compaction
 //! can update them in place.
+//!
+//! Interpreting a descriptor makes a taken exit slower than the inline code was. Like
+//! JavaScriptCore's lazily compiled OSR exits, an exit that keeps being taken is
+//! compiled from its descriptor into the same code the inline exit used to be, and its
+//! call is patched into a jump to that code. See [`lazy_exit_hit`].
 
 use std::ffi::c_char;
 use std::ops::Range;
@@ -31,6 +36,9 @@ use crate::state::{rb_zjit_record_exit_stack, ZJITState};
 use crate::stats::{incr_counter, incr_counter_by, Counter};
 use crate::virtualmem::CodePtr;
 use crate::asm::CodeBlock;
+use crate::backend::lir::{Assembler, Opnd, Target, asm_comment, C_RET_OPND};
+use crate::options::get_option;
+use crate::payload::IseqVersionRef;
 
 /// Where a side exit finds one 64-bit value when it runs.
 ///
@@ -116,12 +124,13 @@ impl ExitImms {
 // Descriptor encoding. All multi-byte integers are little-endian; "varint" is
 // LEB128 and signed values are zigzag-encoded varints.
 //
-//   u64 pc, u64 iseq, u8 flags, [u64 recompile], varint num_stack, varint num_locals,
+//   u64 pc, u64 iseq, u8 flags, u8 hits, [u64 recompile], varint num_stack, varint num_locals,
 //   loc * (num_stack + num_locals),
 //   [u64 jit_frame, svarint jit_frame_slot, varint num_captures, (loc, svarint slot) * num_captures],
 //   [u64 trace_reason]
 //
 // Each loc starts with a byte whose low 3 bits are a tag and high 5 bits a payload.
+// `hits` is updated in place by the handler, see [`lazy_exit_hit`].
 const FLAG_RECOMPILE: u8 = 1 << 0; // a u64 recompile ISEQ follows
 const FLAG_RECOMPILE_SELF: u8 = 1 << 1; // recompile the exiting ISEQ itself
 const FLAG_STACK_MAP: u8 = 1 << 2;
@@ -285,6 +294,8 @@ struct DecodedHeader {
     /// Null if the exit doesn't recompile
     recompile: *mut u64,
     flags: u8,
+    /// Hit counter and lazy compilation state, updated in place. See [`lazy_exit_hit`].
+    hits: *mut u8,
     num_stack: usize,
     num_locals: usize,
 }
@@ -295,6 +306,8 @@ impl Decoder {
         let pc = self.u64() as *const VALUE;
         let iseq = self.u64_ptr();
         let flags = self.u8();
+        let hits = self.ptr;
+        self.u8();
         let recompile = if flags & FLAG_RECOMPILE != 0 {
             self.u64_ptr()
         } else if flags & FLAG_RECOMPILE_SELF != 0 {
@@ -304,7 +317,7 @@ impl Decoder {
         };
         let num_stack = self.varint() as usize;
         let num_locals = self.varint() as usize;
-        DecodedHeader { pc, iseq, recompile, flags, num_stack, num_locals }
+        DecodedHeader { pc, iseq, recompile, flags, hits, num_stack, num_locals }
     }
 
     /// Skip or visit the rest of a descriptor after its header, calling `on_value`
@@ -329,6 +342,32 @@ impl Decoder {
         if header.flags & FLAG_TRACE != 0 {
             self.u64();
         }
+    }
+}
+
+impl Decoder {
+    /// Decode the rest of a descriptor after its header into its compile-time form
+    fn descriptor(&mut self, header: &DecodedHeader) -> ExitDescriptor {
+        let mut imms = ExitImms::default();
+        let loc = |decoder: &mut Decoder, imms: &mut ExitImms| match decoder.loc() {
+            DecodedLoc::Loc(loc) => loc,
+            DecodedLoc::Imm(imm) => { imms.0.push(imm); ExitLoc::Imm(imms.0.len() as u32 - 1) }
+            DecodedLoc::Value(field) => { imms.0.push(unsafe { field.read_unaligned() }); ExitLoc::Value(imms.0.len() as u32 - 1) }
+        };
+        let stack = (0..header.num_stack).map(|_| loc(self, &mut imms)).collect();
+        let locals = (0..header.num_locals).map(|_| loc(self, &mut imms)).collect();
+        let stack_map = (header.flags & FLAG_STACK_MAP != 0).then(|| {
+            let jit_frame = self.u64() as *const zjit_jit_frame;
+            let jit_frame_slot = self.svarint() as i32;
+            let captures = (0..self.varint()).map(|_| (loc(self, &mut imms), self.svarint() as i32)).collect();
+            ExitStackMap { captures, jit_frame, jit_frame_slot }
+        });
+        let trace_reason = (header.flags & FLAG_TRACE != 0).then(|| self.u64() as *const c_char);
+        let extra = (stack_map.is_some() || trace_reason.is_some())
+            .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
+        let recompile = if header.recompile.is_null() { std::ptr::null() } else { unsafe { header.recompile.read_unaligned() as IseqPtr } };
+        let iseq = unsafe { header.iseq.read_unaligned() as IseqPtr };
+        ExitDescriptor::new(header.pc, iseq, stack, locals, imms, recompile, extra)
     }
 }
 
@@ -382,6 +421,7 @@ impl ExitDescriptor {
             flags |= FLAG_TRACE;
         }
         enc.u8(flags);
+        enc.u8(0); // hits
         if flags & FLAG_RECOMPILE != 0 {
             enc.u64(self.recompile as u64);
         }
@@ -423,6 +463,12 @@ pub struct ExitDescriptorTable {
     /// Address of CodePtr offset 0 in ZJIT's code block, to turn return addresses
     /// into offsets without borrowing the code block on every exit
     code_base_addr: usize,
+    /// Address of materialize_exit_trampoline, where the handler sends exits it
+    /// materialized from their descriptor
+    materialize_exit_addr: usize,
+    /// Sorted (byte range of descriptors, ISEQ version they were compiled for), to
+    /// find the version that owns a lazily compiled exit's GC offsets
+    versions: Vec<(Range<u32>, IseqVersionRef)>,
 }
 
 /// Reserve room for `additional` more elements in a table that only grows. Doubling
@@ -455,13 +501,20 @@ impl ExitDescriptorTable {
         }
     }
 
-    /// Return a decoder at the descriptor for a return address
+    /// Return a decoder at the descriptor for a return address, and its table offset
     #[inline(always)]
-    fn lookup(&self, ret_addr: usize) -> Option<Decoder> {
+    fn lookup(&self, ret_addr: usize) -> Option<(Decoder, u32)> {
         let ret_addr = u32::try_from(ret_addr.wrapping_sub(self.code_base_addr)).ok()?;
         let pos = self.ret_addrs.binary_search_by_key(&ret_addr, |&(addr, _)| addr).ok()?;
-        let offset = self.ret_addrs[pos].1 as usize;
-        Some(Decoder { ptr: unsafe { self.bytes.as_ptr().add(offset) as *mut u8 } })
+        let offset = self.ret_addrs[pos].1;
+        Some((Decoder { ptr: unsafe { self.bytes.as_ptr().add(offset as usize) as *mut u8 } }, offset))
+    }
+
+    /// Return the ISEQ version whose descriptors include the one at `offset`
+    fn version_of(&self, offset: u32) -> Option<IseqVersionRef> {
+        let pos = self.versions.partition_point(|(range, _)| range.start <= offset).checked_sub(1)?;
+        let (range, version) = &self.versions[pos];
+        range.contains(&offset).then_some(*version)
     }
 
     /// Call `f` with the header and a decoder positioned after it, for each descriptor
@@ -527,7 +580,19 @@ pub fn register(ret_addr: CodePtr, cb: &CodeBlock, encoded: &[u8]) {
     let ret_addr: u32 = ret_addr.as_offset().try_into().unwrap();
     let mut table = write_table();
     table.code_base_addr = code_base_addr(cb);
+    table.materialize_exit_addr = ZJITState::get_materialize_exit_trampoline().raw_addr(cb);
     table.register(ret_addr, encoded);
+}
+
+/// Record the ISEQ version that the descriptors in `range` were registered for
+pub fn register_version(range: &Range<u32>, version: IseqVersionRef) {
+    if range.is_empty() {
+        return;
+    }
+    let mut table = write_table();
+    debug_assert!(table.versions.last().map_or(true, |(last, _)| last.end <= range.start));
+    reserve_append_only(&mut table.versions, 1);
+    table.versions.push((range.clone(), version));
 }
 
 /// Write barrier for objects referenced by the descriptors of a new ISEQ version
@@ -606,7 +671,10 @@ unsafe fn read_loc(loc: DecodedLoc, regs: *const usize, native_base_ptr: usize) 
 ///
 /// `regs` is the trampoline's save area, holding every general-purpose register
 /// as of the exit, indexed by machine register number. `ret_addr` is the return
-/// address of the exit's call, which identifies its descriptor. Returns `regs`.
+/// address of the exit's call, which identifies its descriptor. Returns the address
+/// the trampoline goes to after restoring every register and popping the return
+/// address: materialize_exit_trampoline, or the exit's lazily compiled code when
+/// this hit compiled it (see [`lazy_exit_hit`]), which then does everything below.
 ///
 /// This does what the inline exit code used to do, in the same order: restore
 /// `cfp->pc`, `cfp->sp` and `cfp->iseq`, write out the Ruby stack and locals,
@@ -616,24 +684,34 @@ unsafe fn read_loc(loc: DecodedLoc, regs: *const usize, native_base_ptr: usize) 
 /// and materializes the JIT frames below this one. Nothing here allocates Ruby
 /// objects or can trigger GC before the optional calls at the end.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usize) -> *const usize {
+pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usize) -> *const u8 {
     let reg = |opnd: crate::backend::lir::Opnd| unsafe { *regs.add(opnd.unwrap_reg().reg_no as usize) };
     let cfp = reg(CFP) as CfpPtr;
 
-    let (trace_reason, recompile) = {
+    let (trace_reason, recompile, materialize_exit_addr) = {
         // Another Ractor may be compiling, i.e. appending to the table, only when
         // there are multiple Ractors. Otherwise this thread holds the GVL, which
         // compilation needs too, so skip the two atomic operations of the lock.
+        let multi_ractor = unsafe { rb_jit_multi_ractor_p() };
         let guard;
-        let table = if unsafe { rb_jit_multi_ractor_p() } {
+        let table = if multi_ractor {
             guard = read_table();
             &*guard
         } else {
             ZJITState::get_exit_descriptors_unlocked()
         };
-        let mut decoder = table.lookup(ret_addr)
+        let (mut decoder, offset) = table.lookup(ret_addr)
             .unwrap_or_else(|| panic!("no side-exit descriptor for return address {ret_addr:#x}"));
+        let desc_start = decoder.ptr;
         let header = decoder.header();
+
+        // Patching code while other Ractors may run it would need a barrier, so
+        // exits stay descriptor-only once there are multiple Ractors.
+        if !multi_ractor {
+            if let Some(code) = lazy_exit_hit(table, &header, desc_start, offset, ret_addr) {
+                return code;
+            }
+        }
         let sp = reg(SP) as *mut VALUE;
         let native_base_ptr = reg(NATIVE_BASE_PTR);
 
@@ -675,7 +753,7 @@ pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usi
         } else {
             unsafe { header.recompile.read_unaligned() as IseqPtr }
         };
-        (trace_reason, recompile)
+        (trace_reason, recompile, table.materialize_exit_addr)
     };
 
     if trace_reason.is_some() || !recompile.is_null() {
@@ -691,8 +769,173 @@ pub extern "C" fn rb_zjit_side_exit_descriptor(regs: *const usize, ret_addr: usi
         exit_recompile(VALUE::from(recompile));
     }
 
-    // Hand the save area back so that the trampoline can find the return address slot
-    regs
+    materialize_exit_addr as *const u8
+}
+
+/// `hits` value of a descriptor that is no longer counted: its exit has been
+/// compiled, or compiling it failed and it stays descriptor-only.
+const LAZY_EXIT_DONE: u8 = u8::MAX;
+/// Largest hit count. `--zjit-lazy-exit-threshold` above this never compiles.
+pub const LAZY_EXIT_MAX_HITS: u8 = LAZY_EXIT_DONE - 1;
+
+/// Count a hit of the exit whose descriptor starts at `desc_start` (table offset
+/// `offset`), and compile the exit into machine code once it has been materialized
+/// from its descriptor `--zjit-lazy-exit-threshold` times.
+///
+/// This is how JavaScriptCore compiles DFG/FTL OSR exits: the exit site initially
+/// calls a generic handler, and the first time an exit is taken, `compileOSRExit`
+/// generates specialized exit code and repatches the exit to jump to it. Here the
+/// descriptor handler is the generic path, which ZJIT keeps for exits that are
+/// taken only a few times, so that exits that never fire (most of them) cost no
+/// code memory and exits that fire in a loop run the same code the inline exit
+/// stubs used to be.
+///
+/// Returns the compiled code if this hit compiled it. The trampoline then jumps
+/// there with every register restored, so the compiled code does the whole exit.
+fn lazy_exit_hit(table: &ExitDescriptorTable, header: &DecodedHeader, desc_start: *mut u8, offset: u32, ret_addr: usize) -> Option<*const u8> {
+    let hits = unsafe { header.hits.read() };
+    if hits == LAZY_EXIT_DONE {
+        return None;
+    }
+    if hits == 0 {
+        incr_counter!(exit_descriptor_taken_count);
+    }
+    let threshold = get_option!(lazy_exit_threshold);
+    if threshold > LAZY_EXIT_MAX_HITS as usize || (hits as usize) < threshold {
+        // Saturate so that a threshold above LAZY_EXIT_MAX_HITS keeps counting distinct exits
+        unsafe { header.hits.write(hits.saturating_add(1).min(LAZY_EXIT_MAX_HITS)) };
+        return None;
+    }
+
+    // Whether or not this works, stop counting this exit
+    unsafe { header.hits.write(LAZY_EXIT_DONE) };
+    let mut decoder = Decoder { ptr: desc_start };
+    let header = decoder.header();
+    let desc = decoder.descriptor(&header);
+    let version = table.version_of(offset);
+    // There is only one Ractor, whose thread holds the GVL, so no VM lock is needed
+    let code = version.and_then(|version| compile_lazy_exit(&desc, version, ret_addr - table.code_base_addr));
+    if code.is_none() {
+        incr_counter!(lazy_exit_compile_failure_count);
+    }
+    code
+}
+
+/// Convert where a descriptor finds a value into an operand of lazily compiled
+/// exit code. A spilled memory base is loaded into LAZY_EXIT_BASE_OPND first.
+fn exit_loc_opnd(asm: &mut Assembler, desc: &ExitDescriptor, loc: ExitLoc) -> Opnd {
+    use crate::backend::lir::{gp_reg, LAZY_EXIT_BASE_OPND};
+    match loc {
+        ExitLoc::Reg { reg, bits } => Opnd::Reg(gp_reg(reg, bits)),
+        ExitLoc::NativeSlot { disp, bits } => Opnd::mem(bits, NATIVE_BASE_PTR, disp),
+        ExitLoc::Mem { base, bits, disp } => Opnd::mem(bits, Opnd::Reg(gp_reg(base, 64)), disp),
+        ExitLoc::StackIndirect { slot, disp, bits } => {
+            asm.load_into(LAZY_EXIT_BASE_OPND, Opnd::mem(64, NATIVE_BASE_PTR, slot));
+            Opnd::mem(bits, LAZY_EXIT_BASE_OPND, disp)
+        }
+        ExitLoc::SmallImm(imm) => Opnd::Imm(imm as i64),
+        ExitLoc::Imm(idx) => Opnd::UImm(desc.imms[idx as usize]),
+        ExitLoc::Value(idx) => Opnd::Value(VALUE(desc.imms[idx as usize] as usize)),
+    }
+}
+
+/// Generate the code of a side exit from its descriptor: what the inline exit stub
+/// emitted by compile_exits() did before descriptors, in the same order as
+/// [`rb_zjit_side_exit_descriptor`]. It runs with every register as of the exit
+/// and ends by jumping to materialize_exit_trampoline.
+fn gen_lazy_exit(desc: &ExitDescriptor) -> Assembler {
+    use crate::cruby::{RUBY_OFFSET_CFP_ISEQ, RUBY_OFFSET_CFP_JIT_RETURN, RUBY_OFFSET_CFP_PC, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32};
+    let mut asm = Assembler::new();
+    asm.new_block_without_id("lazy_side_exit");
+    asm_comment!(asm, "lazily compiled side exit: {:?}", desc.pc);
+
+    asm_comment!(asm, "save cfp->pc");
+    asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_PC), Opnd::const_ptr(desc.pc));
+    asm_comment!(asm, "save cfp->sp");
+    asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, desc.num_stack as i32 * SIZEOF_VALUE_I32));
+    asm_comment!(asm, "save cfp->iseq");
+    asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_ISEQ), VALUE::from(desc.iseq).into());
+    // cfp->block_code and cfp->jit_return are cleared by materialize_exit_trampoline
+
+    if !desc.stack().is_empty() {
+        asm_comment!(asm, "write stack slots");
+        for (idx, &loc) in desc.stack().iter().enumerate() {
+            let opnd = exit_loc_opnd(&mut asm, desc, loc);
+            asm.store(Opnd::mem(64, SP, idx as i32 * SIZEOF_VALUE_I32), opnd);
+        }
+    }
+    let num_locals = desc.locals().len();
+    if num_locals > 0 {
+        asm_comment!(asm, "write locals");
+        for (idx, &loc) in desc.locals().iter().enumerate() {
+            let opnd = exit_loc_opnd(&mut asm, desc, loc);
+            asm.store(Opnd::mem(64, SP, (-local_size_and_idx_to_ep_offset(num_locals, idx) - 1) * SIZEOF_VALUE_I32), opnd);
+        }
+    }
+    if let Some(stack_map) = desc.stack_map() {
+        asm_comment!(asm, "install side-exit JITFrame");
+        for &(loc, slot) in stack_map.captures.iter() {
+            let opnd = exit_loc_opnd(&mut asm, desc, loc);
+            asm.store(Opnd::mem(64, NATIVE_BASE_PTR, slot), opnd);
+        }
+        asm.store(Opnd::mem(64, NATIVE_BASE_PTR, stack_map.jit_frame_slot), Opnd::const_ptr(stack_map.jit_frame));
+    }
+
+    let trace_reason = desc.trace_reason();
+    if trace_reason.is_some() || !desc.recompile.is_null() {
+        asm_comment!(asm, "clear cfp->jit_return");
+        asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_JIT_RETURN), 0.into());
+    }
+    if let Some(reason) = trace_reason {
+        asm_comment!(asm, "call rb_zjit_record_exit_stack");
+        asm.ccall_into(C_RET_OPND, rb_zjit_record_exit_stack as *const u8, vec![Opnd::const_ptr(reason)]);
+    }
+    if !desc.recompile.is_null() {
+        asm_comment!(asm, "call exit_recompile");
+        asm.ccall_into(C_RET_OPND, exit_recompile as *const u8, vec![VALUE::from(desc.recompile).into()]);
+    }
+
+    asm_comment!(asm, "exit to the interpreter");
+    asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
+    asm
+}
+
+/// Compile a side exit from its descriptor at the code block's write position, and
+/// patch the exit's call to exit_descriptor_trampoline, which ends at code offset
+/// `ret_offset`, into a jump to it. Returns the compiled code, or None if the call
+/// can't be patched or the code block is out of memory.
+fn compile_lazy_exit(desc: &ExitDescriptor, version: IseqVersionRef, ret_offset: usize) -> Option<*const u8> {
+    let cb = ZJITState::get_code_block();
+    let call_end = cb.get_ptr(ret_offset);
+    if !Assembler::exit_call_patchable(cb, call_end) || cb.has_dropped_bytes() {
+        return None;
+    }
+
+    let asm = gen_lazy_exit(desc);
+    let result = asm.compile_exit_code(cb);
+    let patched = match result {
+        Ok((start_ptr, gc_offsets)) => {
+            let size = cb.get_write_ptr().as_offset() - start_ptr.as_offset();
+            incr_counter!(lazy_exit_compiled_count);
+            incr_counter_by(Counter::lazy_exit_compiled_bytes, size as u64);
+            crate::perf::register_current_code_range(cb, "lazy side exit", start_ptr);
+            #[cfg(feature = "disasm")]
+            if let Some(dump_disasm) = crate::options::get_option_ref!(dump_disasm) {
+                crate::disasm::dump_disasm_addr_range(cb, start_ptr, cb.get_write_ptr(), dump_disasm);
+            }
+            crate::gc::append_gc_offsets(unsafe { version.as_ref() }.iseq, version, &gc_offsets);
+            Assembler::patch_exit_call(cb, call_end, start_ptr).then(|| start_ptr.raw_ptr(cb))
+        }
+        Err(err) => {
+            // Like Assembler::compile(), let later compilation retry if memory is freed
+            if err == crate::stats::CompileError::OutOfMemory {
+                cb.update_dropped_bytes();
+            }
+            None
+        }
+    };
+    cb.mark_all_executable();
+    patched
 }
 
 /// Decode the descriptors registered for every compiled version of `iseq`
@@ -704,26 +947,7 @@ pub fn descriptors_of(iseq: IseqPtr) -> Vec<ExitDescriptor> {
     for version in payload.versions.iter() {
         let range = unsafe { version.as_ref() }.exit_descs.clone();
         ExitDescriptorTable::each_descriptor(table.bytes.as_ptr().cast_mut(), &range, |header, decoder| {
-            let mut imms = ExitImms::default();
-            let loc = |decoder: &mut Decoder, imms: &mut ExitImms| match decoder.loc() {
-                DecodedLoc::Loc(loc) => loc,
-                DecodedLoc::Imm(imm) => { imms.0.push(imm); ExitLoc::Imm(imms.0.len() as u32 - 1) }
-                DecodedLoc::Value(field) => { imms.0.push(unsafe { field.read_unaligned() }); ExitLoc::Value(imms.0.len() as u32 - 1) }
-            };
-            let stack = (0..header.num_stack).map(|_| loc(decoder, &mut imms)).collect();
-            let locals = (0..header.num_locals).map(|_| loc(decoder, &mut imms)).collect();
-            let stack_map = (header.flags & FLAG_STACK_MAP != 0).then(|| {
-                let jit_frame = decoder.u64() as *const zjit_jit_frame;
-                let jit_frame_slot = decoder.svarint() as i32;
-                let captures = (0..decoder.varint()).map(|_| (loc(decoder, &mut imms), decoder.svarint() as i32)).collect();
-                ExitStackMap { captures, jit_frame, jit_frame_slot }
-            });
-            let trace_reason = (header.flags & FLAG_TRACE != 0).then(|| decoder.u64() as *const c_char);
-            let extra = (stack_map.is_some() || trace_reason.is_some())
-                .then(|| Box::new(ExitDescriptorExtra { stack_map, trace_reason }));
-            let recompile = if header.recompile.is_null() { std::ptr::null() } else { unsafe { header.recompile.read_unaligned() as IseqPtr } };
-            let iseq = unsafe { header.iseq.read_unaligned() as IseqPtr };
-            descs.push(ExitDescriptor::new(header.pc, iseq, stack, locals, imms, recompile, extra));
+            descs.push(decoder.descriptor(header));
         });
     }
     descs
