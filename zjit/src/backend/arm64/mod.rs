@@ -1591,6 +1591,17 @@ impl Assembler {
                     let status = A64Opnd::Reg(status_reg.unwrap_reg().with_num_bits(32));
                     stlxr(cb, status, Self::EMIT_OPND, mem.into());
                 },
+                Insn::CallExitTrampoline(target) => {
+                    let src_addr = cb.get_write_ptr().as_offset();
+                    let dst_addr = target.as_offset();
+                    if b_offset_fits_bits((dst_addr - src_addr) / 4) {
+                        bl(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
+                    } else {
+                        // Side-exit operands never live in EMIT_REG
+                        emit_load_value(cb, Self::EMIT_OPND, target.raw_addr(cb) as u64);
+                        blr(cb, Self::EMIT_OPND);
+                    }
+                },
                 Insn::Breakpoint => {
                     brk(cb, A64Opnd::None);
                 },
@@ -1637,6 +1648,44 @@ impl Assembler {
 
             Ok(gc_offsets)
         }
+    }
+
+    /// Emit exit_descriptor_trampoline. See [`crate::codegen::gen_exit_descriptor_trampoline`].
+    /// A side exit calls this with `bl`, so the return address is in X30.
+    pub fn emit_exit_descriptor_trampoline(cb: &mut CodeBlock, handler: *const u8, materialize_exit_trampoline: CodePtr) {
+        // x0..x30 plus the SP as of the exit at index 31
+        const NUM_REGS: i32 = 32;
+        const SAVE_AREA_BYTES: i32 = NUM_REGS * SIZEOF_VALUE_I32;
+        let reg = |reg_no: u8| A64Opnd::Reg(A64Reg { num_bits: 64, reg_no });
+
+        cb.add_comment("exit_descriptor trampoline");
+        cb.add_comment("save all registers, indexed by reg_no");
+        sub(cb, C_SP_REG, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        for reg_no in (0..30u8).step_by(2) {
+            stp(cb, reg(reg_no), reg(reg_no + 1), A64Opnd::new_mem(128, C_SP_REG, reg_no as i32 * SIZEOF_VALUE_I32));
+        }
+        // X30 (the return address) and the SP as of the exit
+        add(cb, Self::EMIT_OPND, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        stp(cb, X30, Self::EMIT_OPND, A64Opnd::new_mem(128, C_SP_REG, 30 * SIZEOF_VALUE_I32));
+
+        cb.add_comment("rb_zjit_side_exit_descriptor(regs, return address)");
+        mov(cb, C_ARG_OPNDS[0].into(), C_SP_REG);
+        mov(cb, C_ARG_OPNDS[1].into(), X30);
+        let src_addr = cb.get_write_ptr().raw_ptr(cb) as i64;
+        let dst_addr = handler as i64;
+        if b_offset_fits_bits((dst_addr - src_addr) / 4) {
+            bl(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
+        } else {
+            emit_load_value(cb, Self::EMIT_OPND, dst_addr as u64);
+            blr(cb, Self::EMIT_OPND);
+        }
+        // Go to materialize_exit_trampoline by returning to it rather than branching, so
+        // that the exit's bl is paired with a ret for the return address predictor.
+        // FrameTeardown there resets SP from X29 and reloads X30 from the frame record.
+        cb.add_comment("return to materialize_exit_trampoline");
+        add(cb, C_SP_REG, C_SP_REG, A64Opnd::new_uimm(SAVE_AREA_BYTES as u64));
+        emit_load_value(cb, X30, materialize_exit_trampoline.raw_addr(cb) as u64);
+        ret(cb, X30);
     }
 
     /// Optimize and compile the stored instructions
