@@ -116,6 +116,9 @@ impl Assembler {
     // on for common stack-slot accesses on x86_64.
     const MAX_FRAME_STACK_SLOTS: usize = 2048;
 
+    /// Upper bound of the number of bytes an Insn::CCall emits
+    const MAX_CCALL_BYTES: usize = 32;
+
     /// Return an Assembler with scratch registers disabled in the backend, and a scratch register.
     pub fn new_with_scratch_reg() -> (Self, Opnd) {
         (Self::new_with_accept_scratch_reg(true), SCRATCH0_OPND)
@@ -789,6 +792,14 @@ impl Assembler {
         let insns = &self.basic_blocks[0].insns;
 
         while let Some(insn) = insns.get(insn_idx) {
+            // Remember the state before this Insn so that we can retry it on the next page
+            // when the current half page doesn't have enough room for it, like YJIT.
+            let src_ptr = cb.get_write_ptr();
+            let had_dropped_bytes = cb.has_dropped_bytes();
+            let old_label_refs_len = cb.label_refs_len();
+            let old_gc_offsets_len = gc_offsets.len();
+            let old_pos_markers_len = pos_markers.len();
+
             match insn {
                 Insn::Comment(text) => {
                     cb.add_comment(text);
@@ -801,6 +812,15 @@ impl Assembler {
 
                 // Report back the current position in the generated code
                 Insn::PosMarker(..) => {
+                    // A PosMarker right before a CCall is its start marker, and
+                    // IseqCall::regenerate() needs the start and end markers to
+                    // bracket the call with nothing in between. Move to the next
+                    // page before recording it if the call might not fit.
+                    if let Some(Insn::CCall { .. }) = insns.get(insn_idx + 1) {
+                        if !cb.has_dropped_bytes() && !cb.has_capacity(Self::MAX_CCALL_BYTES) {
+                            let _ = cb.next_page(cb.get_write_ptr(), jmp_ptr);
+                        }
+                    }
                     pos_markers.push((insn_idx, cb.get_write_ptr()));
                 },
                 Insn::PosMarkerAtBlockEnd(..) => {
@@ -1106,6 +1126,20 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                Insn::BeginOutlined => {
+                    // Without interleaving, cold code just follows the function body.
+                    if cb.is_interleaved() {
+                        // Keep the last patch point in the inline half from stomping on
+                        // whatever comes next in the inline half.
+                        emit_pad_after_patch_point(cb, last_patch_pos);
+                        if !cb.has_dropped_bytes() {
+                            cb.set_outlined(true);
+                            // The last patch point is in the other half. No amount of padding
+                            // in the outlined half would ever be next to it.
+                            last_patch_pos = None;
+                        }
+                    }
+                },
 
                 // Atomically increment a counter at a given memory location
                 Insn::IncrCounter { mem, value } => {
@@ -1144,7 +1178,15 @@ impl Assembler {
                 }
             };
 
-            insn_idx += 1;
+            // On failure, jump to the next page and retry the current insn
+            if !had_dropped_bytes && cb.has_dropped_bytes() && cb.next_page(src_ptr, jmp_ptr) {
+                // Reset cb states before retrying the current Insn
+                cb.truncate_label_refs(old_label_refs_len);
+                gc_offsets.truncate(old_gc_offsets_len);
+                pos_markers.truncate(old_pos_markers_len);
+            } else {
+                insn_idx += 1;
+            }
         }
 
         // Error if we couldn't write out everything

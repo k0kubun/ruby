@@ -1,6 +1,6 @@
 //! Model for creating generating textual assembler code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
@@ -48,8 +48,41 @@ pub struct CodeBlock {
     // Memory block size
     mem_size: usize,
 
-    // Current writing position
+    /// Size of a code page in bytes, or 0 when inline and outlined code are not
+    /// interleaved. Like YJIT, each code page is split into two halves: inline (hot)
+    /// code is written into the first half of each page and outlined (cold) code
+    /// into the second half. When a half fills up, [`Self::next_page`] jumps to the
+    /// same half of the next page and moves the other half to that page too, so
+    /// cold code always stays within a page or so of the hot code jumping to it.
+    /// Must be a multiple of the OS page size.
+    page_size: usize,
+
+    // Current writing position, in whichever half `outlined` names
     write_pos: usize,
+
+    /// Write position of the half that is *not* current. [`Self::set_outlined`]
+    /// swaps it with `write_pos`.
+    other_write_pos: usize,
+
+    /// Whether `write_pos` currently points into the outlined half.
+    outlined: bool,
+
+    /// Size reserved at the end of each half page for a jump to the next page.
+    page_end_reserve: usize,
+
+    /// When false, writes are not bounded by the end of the current half page.
+    /// Used while patching existing code (label linking, invalidation), which
+    /// only rewrites bytes that were already reserved by the original write.
+    page_bounds_check: bool,
+
+    /// Bytes written to half pages that each half has moved past, indexed by
+    /// `outlined as usize`. Used for code size stats.
+    past_page_bytes: [usize; 2],
+
+    /// For each half page that was left with a jump to the next page, the
+    /// position right after that jump, keyed by the position where the half
+    /// page starts. Used to split a code range into the pieces that hold code.
+    page_jump_ends: HashMap<usize, usize>,
 
     // Table of registered label addresses
     label_addrs: Vec<usize>,
@@ -79,7 +112,14 @@ impl CodeBlock {
         Self {
             mem_block,
             mem_size,
+            page_size: 0,
             write_pos: 0,
+            other_write_pos: 0,
+            outlined: false,
+            page_end_reserve: 0,
+            page_bounds_check: true,
+            past_page_bytes: [0, 0],
+            page_jump_ends: HashMap::new(),
             label_addrs: Vec::new(),
             label_names: Vec::new(),
             label_refs: Vec::new(),
@@ -87,6 +127,244 @@ impl CodeBlock {
             asm_comments: BTreeMap::new(),
             dropped_bytes: false,
         }
+    }
+
+    /// Works for common AArch64 systems that have 16 KiB pages and
+    /// common x86_64 systems that use 4 KiB pages. Same as YJIT.
+    const PREFERRED_CODE_PAGE_SIZE: usize = 16 * 1024;
+
+    /// Make a new CodeBlock that interleaves inline and outlined code per code page like YJIT.
+    pub fn new_interleaved(mem_block: Rc<RefCell<VirtualMem>>, keep_comments: bool) -> Self {
+        // Pick the code page size
+        let system_page_size = mem_block.borrow().system_page_size();
+        let page_size = if 0 == Self::PREFERRED_CODE_PAGE_SIZE % system_page_size {
+            Self::PREFERRED_CODE_PAGE_SIZE
+        } else {
+            system_page_size
+        };
+
+        let mut cb = Self::new(mem_block, keep_comments);
+        assert_eq!(0, cb.mem_size % page_size, "partially in-bounds code pages should be impossible");
+        cb.page_size = page_size;
+        cb.write_pos = 0;
+        cb.other_write_pos = page_size / 2;
+        cb.page_end_reserve = cb.jmp_ptr_bytes();
+        cb
+    }
+
+    /// True when inline and outlined code are interleaved per code page.
+    pub fn is_interleaved(&self) -> bool {
+        self.page_size != 0
+    }
+
+    /// Size of a code page, or 0 if not interleaved.
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Whether writes currently go to the outlined half.
+    pub fn is_outlined(&self) -> bool {
+        self.outlined
+    }
+
+    /// Direct the next writes at the outlined (cold) half of each code page, or back at the
+    /// inline half. Returns the previous setting. No-op when not interleaved.
+    pub fn set_outlined(&mut self, outlined: bool) -> bool {
+        let was_outlined = self.outlined;
+        if !self.is_interleaved() || outlined == was_outlined {
+            return was_outlined;
+        }
+        mem::swap(&mut self.write_pos, &mut self.other_write_pos);
+        self.outlined = outlined;
+        was_outlined
+    }
+
+    /// The write position of the given half, whether or not it is the current one.
+    fn write_pos_for(&self, outlined: bool) -> usize {
+        if outlined == self.outlined { self.write_pos } else { self.other_write_pos }
+    }
+
+    /// A pointer to the inline half's write position.
+    pub fn inlined_write_ptr(&self) -> CodePtr {
+        self.get_ptr(self.write_pos_for(false))
+    }
+
+    /// A pointer to the outlined half's write position.
+    pub fn outlined_write_ptr(&self) -> CodePtr {
+        self.get_ptr(self.write_pos_for(true))
+    }
+
+    /// Offset within a code page where the given half starts
+    fn half_start(&self, outlined: bool) -> usize {
+        if outlined { self.page_size / 2 } else { 0 }
+    }
+
+    /// Offset within each page where the current half should stop writing (exclusive)
+    pub fn page_end(&self) -> usize {
+        let page_end = if self.outlined { self.page_size } else { self.page_size / 2 };
+        page_end - self.page_end_reserve // reserve space to jump to the next page
+    }
+
+    /// Position where the half page that `pos` writes to starts. The end of the
+    /// outlined half of a page is the start of the next page, so it's not just
+    /// `pos % page_size`.
+    fn half_page_start(&self, pos: usize, outlined: bool) -> usize {
+        let page_idx = if outlined { pos.saturating_sub(self.page_size / 2) / self.page_size } else { pos / self.page_size };
+        page_idx * self.page_size + self.half_start(outlined)
+    }
+
+    /// Bytes written to the current page of the given half at `pos`.
+    fn current_page_bytes(&self, pos: usize, outlined: bool) -> usize {
+        pos - self.half_page_start(pos, outlined)
+    }
+
+    /// Bytes of machine code written into the inline (hot) half of code pages.
+    pub fn inlined_code_size(&self) -> usize {
+        if !self.is_interleaved() {
+            return self.write_pos;
+        }
+        self.past_page_bytes[0] + self.current_page_bytes(self.write_pos_for(false), false)
+    }
+
+    /// Bytes of machine code written into the outlined (cold) half of code pages.
+    pub fn outlined_code_size(&self) -> usize {
+        if !self.is_interleaved() {
+            return 0;
+        }
+        self.past_page_bytes[1] + self.current_page_bytes(self.write_pos_for(true), true)
+    }
+
+    /// Check if this code block has sufficient remaining capacity in the current half page
+    pub fn has_capacity(&self, num_bytes: usize) -> bool {
+        if !self.is_interleaved() || !self.page_bounds_check {
+            return self.write_pos + num_bytes <= self.mem_size;
+        }
+        let page_offset = self.write_pos - self.half_page_start(self.write_pos, self.outlined) + self.half_start(self.outlined);
+        let capacity = self.page_end().saturating_sub(page_offset);
+        num_bytes <= capacity
+    }
+
+    /// Call a given function without the page bounds check. For patching bytes that
+    /// have been already reserved by a bounds-checked write.
+    pub fn without_page_bounds_check<R>(&mut self, block: impl FnOnce(&mut Self) -> R) -> R {
+        let old_page_bounds_check = self.page_bounds_check;
+        self.page_bounds_check = false;
+        let ret = block(self);
+        self.page_bounds_check = old_page_bounds_check;
+        ret
+    }
+
+    /// Move the current half to the next code page: rewind to `base_ptr`, write a jump
+    /// from there to the start of the same half on the next page, and continue writing
+    /// there. The other half is moved to the same page too, unless it is already past it.
+    /// This mirrors YJIT's `CodeBlock::next_page`. Returns false if there are no more
+    /// pages or the jump could not be written.
+    #[must_use]
+    pub fn next_page(&mut self, base_ptr: CodePtr, jmp_ptr: impl Fn(&mut CodeBlock, CodePtr)) -> bool {
+        if !self.is_interleaved() {
+            return false;
+        }
+        let old_write_pos = self.write_pos;
+        self.set_write_ptr(base_ptr);
+
+        // If we're already at the start of a fresh half page, moving to another fresh one
+        // doesn't help. Whatever failed doesn't fit in half a page, or memory can't be mapped.
+        if self.write_pos == self.half_page_start(self.write_pos, self.outlined) {
+            self.write_pos = old_write_pos;
+            return false;
+        }
+
+        // Move self to the next page
+        let next_page_idx = self.half_page_start(self.write_pos, self.outlined) / self.page_size + 1;
+        if !self.set_page(next_page_idx, &jmp_ptr) {
+            self.write_pos = old_write_pos; // rollback if there are no more pages
+            return false;
+        }
+
+        // Move the other half to the same page if it's not ahead of it. Unlike YJIT's
+        // other_cb().set_page(), we don't write a jump in the other half: ZJIT never
+        // leaves the other half in the middle of a code sequence that falls through.
+        let other_outlined = !self.outlined;
+        let other_dst_pos = self.page_size * next_page_idx + self.half_start(other_outlined);
+        if self.other_write_pos < other_dst_pos {
+            self.past_page_bytes[other_outlined as usize] += self.current_page_bytes(self.other_write_pos, other_outlined);
+            self.other_write_pos = other_dst_pos;
+        }
+
+        !self.dropped_bytes
+    }
+
+    /// Move the current half to page_idx only if it's not going backwards.
+    fn set_page(&mut self, page_idx: usize, jmp_ptr: &impl Fn(&mut CodeBlock, CodePtr)) -> bool {
+        let dst_pos = self.page_size * page_idx + self.half_start(self.outlined);
+        if self.write_pos < dst_pos {
+            // Fail if next page is out of bounds
+            if dst_pos >= self.mem_size {
+                return false;
+            }
+
+            // Reset dropped_bytes
+            self.dropped_bytes = false;
+
+            // Generate jmp_ptr from src_pos to dst_pos
+            let dst_ptr = self.get_ptr(dst_pos);
+            let half_page_start = self.half_page_start(self.write_pos, self.outlined);
+            let old_page_end_reserve = self.page_end_reserve;
+            self.page_end_reserve = 0;
+            assert!(self.has_capacity(self.jmp_ptr_bytes()));
+            self.add_comment("jump to next page");
+            jmp_ptr(self, dst_ptr);
+            self.page_end_reserve = old_page_end_reserve;
+            if self.dropped_bytes {
+                return false;
+            }
+            self.page_jump_ends.insert(half_page_start, self.write_pos);
+
+            // Update past_page_bytes for code size stats
+            self.past_page_bytes[self.outlined as usize] += self.current_page_bytes(self.write_pos, self.outlined);
+
+            // Start the next code from dst_pos
+            self.write_pos = dst_pos;
+        }
+        !self.dropped_bytes
+    }
+
+    /// Split a code range written by a single half into the pieces that are within a
+    /// half page, skipping the other half of pages and the unused tail of half pages
+    /// left with a jump to the next page. Returns `[(start, end)]` of non-empty pieces.
+    pub fn code_ranges(&self, start: CodePtr, end: CodePtr) -> Vec<(CodePtr, CodePtr)> {
+        let base = self.get_ptr(0).as_offset();
+        let start_pos = (start.as_offset() - base) as usize;
+        let end_pos = (end.as_offset() - base) as usize;
+        if start_pos >= end_pos {
+            return vec![];
+        }
+        if !self.is_interleaved() {
+            return vec![(start, end)];
+        }
+
+        let mut ranges = vec![];
+        let mut pos = start_pos;
+        while pos < end_pos {
+            let page_base = pos / self.page_size * self.page_size;
+            let half_start = if pos % self.page_size < self.page_size / 2 { 0 } else { self.page_size / 2 };
+            let half_end = page_base + half_start + self.page_size / 2;
+            if end_pos <= half_end {
+                ranges.push((self.get_ptr(pos), end));
+                break;
+            }
+            let piece_end = self.page_jump_ends.get(&(page_base + half_start)).copied().unwrap_or(half_end);
+            if pos < piece_end {
+                ranges.push((self.get_ptr(pos), self.get_ptr(piece_end)));
+            }
+            pos = page_base + self.page_size + half_start;
+        }
+        ranges
+    }
+
+    /// Number of bytes of code in the ranges returned by [`Self::code_ranges`].
+    pub fn code_size_between(&self, start: CodePtr, end: CodePtr) -> usize {
+        self.code_ranges(start, end).iter().map(|(s, e)| (e.as_offset() - s.as_offset()) as usize).sum()
     }
 
     /// Size of the region in bytes that we have allocated physical memory for.
@@ -147,8 +425,9 @@ impl CodeBlock {
         self.set_write_ptr(code_ptr);
         self.dropped_bytes = false;
 
-        // Invoke the callback
-        callback(self);
+        // Invoke the callback. Patching rewrites bytes that are already written,
+        // so it's not bounded by the current half page.
+        self.without_page_bounds_check(|cb| callback(cb));
 
         // Build a code range modified by the callback
         let ret = code_ptr..self.get_write_ptr();
@@ -167,8 +446,7 @@ impl CodeBlock {
     /// Write a single byte at the current position.
     pub fn write_byte(&mut self, byte: u8) {
         let write_ptr = self.get_write_ptr();
-        // TODO: check has_capacity()
-        if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
+        if self.has_capacity(1) && self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
             self.write_pos += 1;
         } else {
             self.dropped_bytes = true;
@@ -250,16 +528,35 @@ impl CodeBlock {
         self.label_refs.push(LabelRef { pos: self.write_pos, label, num_bytes, encode: Box::new(encode) });
 
         // Move past however many bytes the instruction takes up.
-        // Reserve the bytes by writing them rather than by moving the cursor
-        // over them. Pages are mapped on first write, so a cursor bump alone
-        // leaves a page that cannot be mapped.
-        const RESERVED: [u8; 16] = [0; 16];
-        assert!(num_bytes <= RESERVED.len(), "label reference wants {num_bytes} bytes");
-        self.write_bytes(&RESERVED[..num_bytes]);
+        if self.has_capacity(num_bytes) {
+            // Reserve the bytes by writing them rather than by moving the cursor
+            // over them. Pages are mapped on first write, so a cursor bump alone
+            // leaves a page that cannot be mapped.
+            const RESERVED: [u8; 16] = [0; 16];
+            assert!(num_bytes <= RESERVED.len(), "label reference wants {num_bytes} bytes");
+            self.write_bytes(&RESERVED[..num_bytes]);
+        } else {
+            self.dropped_bytes = true; // retry emitting the Insn after next_page
+        }
+    }
+
+    /// Number of label references recorded so far. Used to roll back an Insn to retry it on the next page.
+    pub fn label_refs_len(&self) -> usize {
+        self.label_refs.len()
+    }
+
+    /// Drop label references recorded after `len`. Used to roll back an Insn to retry it on the next page.
+    pub fn truncate_label_refs(&mut self, len: usize) {
+        self.label_refs.truncate(len);
     }
 
     // Link internal label references
     pub fn link_labels(&mut self) -> Result<(), ()> {
+        // Label references rewrite bytes reserved by label_ref(), which may be in either half.
+        self.without_page_bounds_check(|cb| cb.link_labels_inner())
+    }
+
+    fn link_labels_inner(&mut self) -> Result<(), ()> {
         let orig_pos = self.write_pos;
         let mut link_result = Ok(());
 
@@ -320,6 +617,13 @@ impl CodeBlock {
         let start_addr = self.get_ptr(0).raw_addr(self);
         let end_addr = self.get_write_ptr().raw_addr(self);
         crate::disasm::disasm_addr_range(self, start_addr, end_addr)
+    }
+
+    /// Read a written byte for testing
+    #[cfg(test)]
+    pub fn hexdump_byte_at(&self, pos: usize) -> [u8; 1] {
+        let mem_block = &*self.mem_block.borrow();
+        [unsafe { mem_block.start_ptr().raw_ptr(mem_block).add(pos).read() }]
     }
 
     /// Return the hex dump of generated code for testing
@@ -394,6 +698,14 @@ impl CodeBlock {
         let virt_mem = VirtualMem::alloc(mem_size, None);
         Self::new(Rc::new(RefCell::new(virt_mem)), false)
     }
+
+    /// Stubbed CodeBlock that interleaves inline and outlined code per code page.
+    pub fn new_dummy_interleaved() -> Self {
+        use crate::virtualmem::*;
+        const DEFAULT_MEM_SIZE: usize = 1024 * 1024;
+        let virt_mem = VirtualMem::alloc(DEFAULT_MEM_SIZE, None);
+        Self::new_interleaved(Rc::new(RefCell::new(virt_mem)), false)
+    }
 }
 
 impl crate::virtualmem::CodePtrBase for CodeBlock {
@@ -455,6 +767,140 @@ mod tests
 
         assert_eq!(imm_num_bits(i64::MIN), 64);
         assert_eq!(imm_num_bits(i64::MAX), 64);
+    }
+
+    /// Write a fake jump for next_page(): jmp_ptr_bytes() of 0xEE
+    fn fake_jmp(cb: &mut CodeBlock, _dst: CodePtr) {
+        for _ in 0..cb.jmp_ptr_bytes() {
+            cb.write_byte(0xEE);
+        }
+    }
+
+    #[test]
+    fn test_set_outlined_keeps_a_write_position_per_half() {
+        let mut cb = CodeBlock::new_dummy_interleaved();
+        assert!(cb.is_interleaved());
+        let half = cb.page_size() / 2;
+        assert_eq!(half as i64, cb.outlined_write_ptr().as_offset());
+
+        cb.write_byte(1);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(0, cb.outlined_code_size());
+
+        let was_outlined = cb.set_outlined(true);
+        assert!(!was_outlined);
+        assert!(cb.is_outlined());
+        cb.write_bytes(&[2, 3]);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(2, cb.outlined_code_size());
+        assert_eq!(half as i64 + 2, cb.outlined_write_ptr().as_offset());
+
+        cb.set_outlined(was_outlined);
+        assert_eq!(1, cb.get_write_pos());
+        cb.write_byte(4);
+        assert_eq!(2, cb.inlined_code_size());
+        assert_eq!(2, cb.outlined_code_size());
+    }
+
+    #[test]
+    fn test_non_interleaved_code_block_ignores_set_outlined() {
+        let mut cb = CodeBlock::new_dummy();
+        assert!(!cb.is_interleaved());
+        assert!(!cb.set_outlined(true));
+        assert!(!cb.is_outlined());
+        cb.write_byte(1);
+        assert_eq!(1, cb.inlined_code_size());
+        assert_eq!(0, cb.outlined_code_size());
+        assert!(!cb.next_page(cb.get_write_ptr(), fake_jmp));
+    }
+
+    #[test]
+    fn test_writes_are_bounded_by_the_half_page() {
+        let mut cb = CodeBlock::new_dummy_interleaved();
+        let page_end = cb.page_end();
+        assert_eq!(cb.page_size() / 2 - cb.jmp_ptr_bytes(), page_end);
+        for _ in 0..page_end {
+            cb.write_byte(0x90);
+        }
+        assert!(!cb.has_dropped_bytes());
+        assert!(!cb.has_capacity(1));
+
+        // The next byte doesn't fit, so it's dropped rather than written into the reserve
+        cb.write_byte(0x90);
+        assert!(cb.has_dropped_bytes());
+        assert_eq!(page_end, cb.get_write_pos());
+    }
+
+    #[test]
+    fn test_next_page_moves_both_halves() {
+        let mut cb = CodeBlock::new_dummy_interleaved();
+        let page_size = cb.page_size();
+        let half = page_size / 2;
+
+        // Fill the inline half and fail to write an instruction that straddles its end
+        for _ in 0..(cb.page_end() - 2) {
+            cb.write_byte(0x90);
+        }
+        let src_ptr = cb.get_write_ptr();
+        cb.write_bytes(&[1, 2, 3, 4]);
+        assert!(cb.has_dropped_bytes());
+
+        // Jump to the next page and retry
+        assert!(cb.next_page(src_ptr, fake_jmp));
+        assert!(!cb.has_dropped_bytes());
+        assert_eq!(page_size, cb.get_write_pos());
+        // The other half moves to the same page too
+        assert_eq!((page_size + half) as i64, cb.outlined_write_ptr().as_offset());
+        cb.write_bytes(&[1, 2, 3, 4]);
+        assert!(!cb.has_dropped_bytes());
+
+        // The jump was written where the instruction was going to start
+        let jmp_end = cb.page_end() - 2 + cb.jmp_ptr_bytes();
+        assert_eq!(&[0xEE], &cb.hexdump_byte_at(cb.page_end() - 2)[..]);
+        assert!(jmp_end <= half, "the jump should fit in the reserved space");
+        assert_eq!(jmp_end + 4, cb.inlined_code_size());
+
+        // The range spanning the two pages skips the outlined half in between
+        let ranges = cb.code_ranges(cb.get_ptr(0), cb.get_write_ptr());
+        assert_eq!(vec![
+            (cb.get_ptr(0), cb.get_ptr(jmp_end)),
+            (cb.get_ptr(page_size), cb.get_ptr(page_size + 4)),
+        ], ranges);
+        assert_eq!(cb.inlined_code_size(), cb.code_size_between(cb.get_ptr(0), cb.get_write_ptr()));
+
+        // Moving the outlined half from page 1 doesn't move the inline half back
+        cb.set_outlined(true);
+        for _ in 0..(cb.page_end() - half) {
+            cb.write_byte(0x90);
+        }
+        let src_ptr = cb.get_write_ptr();
+        cb.write_byte(0x90);
+        assert!(cb.has_dropped_bytes());
+        assert!(cb.next_page(src_ptr, fake_jmp));
+        assert_eq!((2 * page_size + half) as i64, cb.get_write_ptr().as_offset());
+        // The jump filled the outlined half of page 1 up to the end of the page
+        assert_eq!(half, cb.outlined_code_size());
+        cb.set_outlined(false);
+        assert_eq!(2 * page_size, cb.get_write_pos());
+    }
+
+    #[test]
+    fn test_next_page_at_the_start_of_a_page_fails() {
+        // An instruction that doesn't fit in a fresh half page would never fit
+        let mut cb = CodeBlock::new_dummy_interleaved();
+        assert!(!cb.next_page(cb.get_write_ptr(), fake_jmp));
+        assert_eq!(0, cb.get_write_pos());
+    }
+
+    #[test]
+    fn test_next_page_fails_on_the_last_page() {
+        let mut cb = CodeBlock::new_dummy_interleaved();
+        let page_size = cb.page_size();
+        let last_page_pos = cb.virtual_region_size() - page_size;
+        cb.set_write_ptr(cb.get_ptr(last_page_pos + 8));
+        let src_ptr = cb.get_write_ptr();
+        assert!(!cb.next_page(src_ptr, fake_jmp));
+        assert_eq!(last_page_pos + 8, cb.get_write_pos());
     }
 
     #[test]

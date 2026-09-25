@@ -9002,3 +9002,85 @@ fn test_regression_stub_frame_block_code_cleared_for_gc() {
     let caller_version = unsafe { caller_payload.versions.last().unwrap().as_ref() };
     assert_eq!(1, caller_version.outgoing.len(), "expected a JIT-to-JIT function stub");
 }
+
+#[test]
+fn test_side_exits_are_emitted_into_the_outlined_half() {
+    // Side exits belong in the outlined half of code pages, so that a function's
+    // body stays contiguous with the next function's in the inline half.
+    set_call_threshold(2);
+    with_rubyvm(|| {
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(cb.is_interleaved(), "ZJIT's code block should interleave inline and outlined code");
+        let inlined_before = cb.inlined_code_size();
+        let outlined_before = cb.outlined_code_size();
+
+        eval("
+            def guarded(a, b) = a + b + a * b - a
+            guarded(1, 2)
+            guarded(1, 2)
+        ");
+
+        let cb = crate::state::ZJITState::get_code_block();
+        assert!(!cb.is_outlined(), "compilation should leave the code block writing the inline half");
+        assert!(cb.inlined_code_size() > inlined_before,
+            "the function body should have been written to the inline half");
+        assert!(cb.outlined_code_size() > outlined_before,
+            "the side exits should have been written to the outlined half");
+
+        // Both halves are on the same code page (or the outlined half is on a later one)
+        let page_size = cb.page_size() as i64;
+        let inline_page = cb.inlined_write_ptr().as_offset() / page_size;
+        let outlined_page = cb.outlined_write_ptr().as_offset() / page_size;
+        assert_eq!(inline_page, outlined_page, "the two halves should move page by page together");
+    });
+}
+
+#[test]
+fn test_side_exit_reached_from_outlined_half() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def add(a, b) = a + b
+        add(1, 2)
+        add(1, 2)
+        [add(1, 2), add('x', 'y'), add(1.5, 2.5), add(1, 2)]
+    "), @r#"[3, "xy", 4.0, 3]"#);
+}
+
+#[test]
+fn test_function_larger_than_half_page_spans_pages() {
+    // A function body larger than half a code page continues on the next page
+    // through a jump, and so do its side exits in the outlined half.
+    set_call_threshold(2);
+    with_rubyvm(|| {
+        let cb = crate::state::ZJITState::get_code_block();
+        let page_before = cb.inlined_write_ptr().as_offset() / cb.page_size() as i64;
+        let out = inspect("
+            body = (0...400).map { |i| \"x = x + a * #{i} - b; y << x if x > 7\" }.join(\"\\n\")
+            eval \"def big(a, b); x = 0; y = []; #{body}; [x, y.size]; end\"
+            big(1, 2)
+            [big(1, 2), big(1.5, 2), big(3, 4)]
+        ");
+        assert_eq!("[[79000, 393], [118900.0, 395], [237800, 396]]", out);
+
+        let cb = crate::state::ZJITState::get_code_block();
+        let page_after = cb.inlined_write_ptr().as_offset() / cb.page_size() as i64;
+        assert!(page_after > page_before + 1, "the big function should have spanned multiple pages");
+    });
+}
+
+#[test]
+fn test_invalidation_jumps_from_the_inline_to_the_outlined_half() {
+    // Invalidation overwrites a patch point in the inline half with a jump to the
+    // patch point's side exit, which lives in the outlined half.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        INVALIDATED_CONST = 1
+        def read_const = INVALIDATED_CONST + 1
+        read_const
+        read_const
+        before = read_const
+        Object.send(:remove_const, :INVALIDATED_CONST)
+        INVALIDATED_CONST = 10
+        [before, read_const]
+    "), @"[2, 11]");
+}

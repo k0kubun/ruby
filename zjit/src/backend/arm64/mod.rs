@@ -197,6 +197,9 @@ const SCRATCH2_OPND: Opnd = Opnd::Reg(X14_REG);
 impl Assembler {
     const MAX_FRAME_STACK_SLOTS: usize = 2048;
 
+    /// Upper bound of the number of bytes an Insn::CCall emits
+    const MAX_CCALL_BYTES: usize = 32;
+
     /// Special register for intermediate processing in arm64_emit. It should be used only by arm64_emit.
     const EMIT_REG: Reg = X16_REG;
     const EMIT_OPND: A64Opnd = A64Opnd::Reg(Self::EMIT_REG);
@@ -1118,6 +1121,14 @@ impl Assembler {
         let insns = &self.basic_blocks[0].insns;
 
         while let Some(insn) = insns.get(insn_idx) {
+            // Remember the state before this Insn so that we can retry it on the next page
+            // when the current half page doesn't have enough room for it, like YJIT.
+            let src_ptr = cb.get_write_ptr();
+            let had_dropped_bytes = cb.has_dropped_bytes();
+            let old_label_refs_len = cb.label_refs_len();
+            let old_gc_offsets_len = gc_offsets.len();
+            let old_pos_markers_len = pos_markers.len();
+
             match insn {
                 Insn::Comment(text) => {
                     cb.add_comment(text);
@@ -1127,8 +1138,17 @@ impl Assembler {
                 },
                 // Report back the current position in the generated code
                 Insn::PosMarker(..) => {
-                    pos_markers.push((insn_idx, cb.get_write_ptr()))
-                }
+                    // A PosMarker right before a CCall is its start marker, and
+                    // IseqCall::regenerate() needs the start and end markers to
+                    // bracket the call with nothing in between. Move to the next
+                    // page before recording it if the call might not fit.
+                    if let Some(Insn::CCall { .. }) = insns.get(insn_idx + 1) {
+                        if !cb.has_dropped_bytes() && !cb.has_capacity(Self::MAX_CCALL_BYTES) {
+                            let _ = cb.next_page(cb.get_write_ptr(), emit_jmp_ptr);
+                        }
+                    }
+                    pos_markers.push((insn_idx, cb.get_write_ptr()));
+                },
                 Insn::PosMarkerAtBlockEnd(..) => {
                     unreachable!("PosMarkerAtBlockEnd should have been lowered by linearize_instructions");
                 },
@@ -1571,6 +1591,20 @@ impl Assembler {
                     // from. The last patch point stays that, and the pad just gave it its room.
                     emit_pad_after_patch_point(cb, last_patch_pos);
                 },
+                Insn::BeginOutlined => {
+                    // Without interleaving, cold code just follows the function body.
+                    if cb.is_interleaved() {
+                        // Keep the last patch point in the inline half from stomping on
+                        // whatever comes next in the inline half.
+                        emit_pad_after_patch_point(cb, last_patch_pos);
+                        if !cb.has_dropped_bytes() {
+                            cb.set_outlined(true);
+                            // The last patch point is in the other half. No amount of padding
+                            // in the outlined half would ever be next to it.
+                            last_patch_pos = None;
+                        }
+                    }
+                },
                 Insn::IncrCounter { mem, value } => {
                     // Get the status register allocated by arm64_scratch_split
                     let Some(Insn::Cmp {
@@ -1619,7 +1653,15 @@ impl Assembler {
                 }
             };
 
-            insn_idx += 1;
+            // On failure, jump to the next page and retry the current insn
+            if !had_dropped_bytes && cb.has_dropped_bytes() && cb.next_page(src_ptr, emit_jmp_ptr) {
+                // Reset cb states before retrying the current Insn
+                cb.truncate_label_refs(old_label_refs_len);
+                gc_offsets.truncate(old_gc_offsets_len);
+                pos_markers.truncate(old_pos_markers_len);
+            } else {
+                insn_idx += 1;
+            }
         }
 
         // Error if we couldn't write out everything
@@ -1745,14 +1787,28 @@ impl Assembler {
             }
 
             let start_ptr = cb.get_write_ptr();
+            let inlined_start_ptr = cb.inlined_write_ptr();
+            let outlined_start_ptr = cb.outlined_write_ptr();
             let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
             assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
 
             cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
 
             trace_compile_phase("invalidate_icache", || {
-                // Invalidate icache for newly written out region so we don't run stale code.
-                unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
+                // Invalidate icache for newly written out regions so we don't run stale code.
+                // The emit may have written to both halves of code pages, possibly across
+                // multiple pages. Pages are mapped in order, so everything between the lowest
+                // and the highest written address is mapped. Invalidate that at once.
+                let ranges = [
+                    (inlined_start_ptr, cb.inlined_write_ptr()),
+                    (outlined_start_ptr, cb.outlined_write_ptr()),
+                ];
+                let written = ranges.iter().filter(|(start, end)| start.as_offset() < end.as_offset());
+                let start = written.clone().map(|(start, _)| start.raw_addr(cb)).min();
+                let end = written.map(|(_, end)| end.raw_addr(cb)).max();
+                if let (Some(start), Some(end)) = (start, end) {
+                    unsafe { rb_jit_icache_invalidate(start as _, end as _) };
+                }
             });
 
             if crate::state::ZJITState::has_instance() {

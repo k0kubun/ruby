@@ -14,11 +14,15 @@ use crate::virtualmem::CodePtr;
 type SymbolRange = Rc<RefCell<Option<(CodePtr, String)>>>;
 
 /// Register a non-empty code range under `symbol_name` in the perf map.
+/// A range written by one half of code pages may span multiple pages, so
+/// register each piece that holds that half's code separately.
 pub(crate) fn register_range(cb: &CodeBlock, symbol_name: String, start: CodePtr, end: CodePtr) {
-    let start_ptr = start.raw_addr(cb);
-    let end_ptr = end.raw_addr(cb);
-    if start_ptr < end_ptr {
-        register(symbol_name, start_ptr, end_ptr - start_ptr);
+    for (start, end) in cb.code_ranges(start, end) {
+        let start_ptr = start.raw_addr(cb);
+        let end_ptr = end.raw_addr(cb);
+        if start_ptr < end_ptr {
+            register(symbol_name.clone(), start_ptr, end_ptr - start_ptr);
+        }
     }
 }
 
@@ -34,6 +38,15 @@ pub(crate) fn register_current_code_range(cb: &CodeBlock, symbol_name: &str, sta
 pub(crate) fn register_current_iseq_range(cb: &CodeBlock, iseq: IseqPtr, start: CodePtr) {
     if get_option!(perf) == Some(PerfMap::ISEQ) {
         register_range(cb, iseq_get_location(iseq, 0), start, cb.get_write_ptr());
+    }
+}
+
+/// Register the range an ISEQ's side exits occupy in the outlined half of
+/// code pages when ISEQ perf output is enabled.
+pub(crate) fn register_current_iseq_exits_range(cb: &CodeBlock, iseq: IseqPtr, start: CodePtr) {
+    if get_option!(perf) == Some(PerfMap::ISEQ) {
+        let symbol_name = format!("{} (exits)", iseq_get_location(iseq, 0));
+        register_range(cb, symbol_name, start, cb.outlined_write_ptr());
     }
 }
 

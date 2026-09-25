@@ -850,6 +850,8 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     let code_region_bytes = ZJITState::get_code_block().mapped_region_size();
     set_stat_usize!(hash, "jit_frame_region_bytes", jit_frame_region_bytes);
     set_stat_usize!(hash, "code_region_bytes", code_region_bytes);
+    set_stat_usize!(hash, "inlined_code_bytes", ZJITState::get_code_block().inlined_code_size());
+    set_stat_usize!(hash, "outlined_code_bytes", ZJITState::get_code_block().outlined_code_size());
     set_stat_usize!(hash, "zjit_alloc_bytes", zjit_alloc_bytes());
     set_stat_usize!(hash, "total_mem_bytes", code_region_bytes + jit_frame_region_bytes + zjit_alloc_bytes());
 

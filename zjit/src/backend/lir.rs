@@ -949,6 +949,12 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Zero-width marker. Everything after it in this Assembler is cold, and is
+    /// emitted into the outlined half of code pages instead of after the function
+    /// body. This is used as the first instruction of the block
+    /// [`Assembler::compile_exits`] builds.
+    BeginOutlined,
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -1036,6 +1042,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::BeginOutlined |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1180,6 +1187,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::BeginOutlined => "BeginOutlined",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::Comment(_) => "Comment",
@@ -2979,8 +2987,11 @@ impl Assembler
     pub fn compile(self, cb: &mut CodeBlock) -> Result<(CodePtr, Vec<CodePtr>), CompileError> {
         #[cfg(feature = "disasm")]
         let start_addr = cb.get_write_ptr();
+        #[cfg(feature = "disasm")]
+        let outlined_start_addr = cb.outlined_write_ptr();
         let alloc_regs = Self::get_alloc_regs();
         let had_dropped_bytes = cb.has_dropped_bytes();
+        let was_outlined = cb.is_outlined();
         let ret = self.compile_with_regs(cb, alloc_regs).inspect_err(|err| {
             // If we use too much memory to compile the Assembler, it would set cb.dropped_bytes = true.
             // To avoid failing future compilation by cb.has_dropped_bytes(), attempt to reset dropped_bytes with
@@ -2989,11 +3000,23 @@ impl Assembler
                 cb.update_dropped_bytes();
             }
         });
+        // Put back the original state of the CodeBlock. `Insn::BeginOutlined` moves the cursor to
+        // the outlined half, but we want to write to the original half in the next compilation.
+        #[cfg(feature = "disasm")]
+        let end_addr = cb.get_write_ptr();
+        cb.set_outlined(was_outlined);
 
         #[cfg(feature = "disasm")]
         if let Some(dump_disasm) = crate::options::get_option_ref!(dump_disasm).filter(|_| ret.is_ok()) {
-            let end_addr = cb.get_write_ptr();
-            crate::disasm::dump_disasm_addr_range(cb, start_addr, end_addr, dump_disasm);
+            // Code may span multiple pages, so dump only the pieces written by each half.
+            for (start, end) in cb.code_ranges(start_addr, end_addr) {
+                crate::disasm::dump_disasm_addr_range(cb, start, end, dump_disasm);
+            }
+            if !was_outlined {
+                for (start, end) in cb.code_ranges(outlined_start_addr, cb.outlined_write_ptr()) {
+                    crate::disasm::dump_disasm_addr_range(cb, start, end, dump_disasm);
+                }
+            }
         }
         ret
     }
@@ -3184,6 +3207,11 @@ impl Assembler
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> = HashMap::with_capacity(targets.len());
 
+        // Every side-exit code should be written in the outlined (cold) half of code pages.
+        if !targets.is_empty() {
+            self.push_insn(Insn::BeginOutlined);
+        }
+
         // Start a new perf range for side exits.
         let symbol_range = perf::symbol_range_start(self, "side exit");
 
@@ -3191,7 +3219,7 @@ impl Assembler
         if !targets.is_empty() {
             self.pos_marker(move |start_pos, cb| {
                 let end_pos = cb.get_write_ptr();
-                let size = end_pos.as_offset() - start_pos.as_offset();
+                let size = cb.code_size_between(start_pos, end_pos);
                 crate::stats::incr_counter_by(crate::stats::Counter::side_exit_size_bytes, size as u64);
             });
         }
