@@ -178,6 +178,9 @@ box_entry_initialize(rb_box_t *box)
     box->top_self = rb_obj_alloc(rb_cObject);
     rb_define_singleton_method(box->top_self, "to_s", box_main_to_s, 0);
     rb_define_alias(rb_singleton_class(box->top_self), "inspect", "to_s");
+    /* Lives as long as the box: make it old now, so that JITs treat its singleton class
+     * as stable without waiting for it to survive GCs. */
+    rb_gc_promote_immortal(box->top_self);
     box->load_path = rb_ary_dup(master->load_path);
     box->expanded_load_path = rb_ary_dup(master->expanded_load_path);
     box->load_path_snapshot = rb_ary_new();

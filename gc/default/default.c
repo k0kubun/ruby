@@ -8562,6 +8562,69 @@ rb_gc_impl_writebarrier_remember(void *objspace_ptr, VALUE obj)
     }
 }
 
+/* Promote obj, which the caller guarantees is never collected, to the old generation
+ * now instead of after RVALUE_OLD_AGE GCs.  Old is then a fact about the object that
+ * JITs can rely on right after boot.
+ *
+ * A promoted object may already point at young objects that were never recorded by
+ * the write barrier, which only remembers old -> young edges, so it is put in the
+ * remembered set: the next minor GC scans its children, and rgengc_check_relation keeps
+ * it remembered while any child is still young.
+ *
+ * No-op for objects the GC must not or need not touch:
+ * - WB-unprotected objects, which are never old.
+ * - Objects of another objspace: their age and remembered bits belong to the owner's
+ *   local GC.
+ * - Calls during GC: marking and sweeping own the age and mark bits.  No caller does
+ *   this today; the object then just ages normally. */
+void
+rb_gc_impl_promote_immortal(void *objspace_ptr, VALUE obj)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+
+    if (RB_SPECIAL_CONST_P(obj)) return;
+    if (gc_foreign_object_p(objspace, obj)) return;
+    if (during_gc) return;
+    if (RVALUE_WB_UNPROTECTED(objspace, obj)) return;
+    if (RVALUE_OLD_P(objspace, obj)) return;
+
+    gc_report(1, objspace, "rb_gc_impl_promote_immortal: %s\n", rb_obj_info(obj));
+
+    RVALUE_AGE_SET(obj, RVALUE_OLD_AGE);
+
+    if (is_incremental_marking(objspace)) {
+        /* Mid major mark: the uncollectible bits and old_objects are being rebuilt by
+         * gc_aging as objects get marked. */
+        if (gc_mark_set(objspace, obj)) {
+            /* White: mark it now, as gc_aging would for an old object under full
+             * marking, and grey it so its children get scanned with an old parent. */
+            RVALUE_OLD_UNCOLLECTIBLE_SET(objspace, obj);
+            objspace->marked_slots++;
+            gc_grey(objspace, obj);
+        }
+        else {
+            /* Already marked, so gc_aging ran while it was young and won't run again.
+             * A grey object is scanned later with an old parent; re-grey a black one
+             * so rgengc_check_relation sees its young children, as
+             * rb_gc_impl_writebarrier_remember does. */
+            RVALUE_OLD_UNCOLLECTIBLE_SET(objspace, obj);
+            if (!RVALUE_MARKING(objspace, obj)) {
+                gc_grey(objspace, obj);
+            }
+        }
+    }
+    else {
+        /* Outside marking, uncollectible objects are marked: minor marking starts from
+         * mark bits copied from the uncollectible bits.  A live object on a page not
+         * yet swept is already marked. */
+        MARK_IN_BITMAP(GET_HEAP_MARK_BITS(obj), obj);
+        RVALUE_OLD_UNCOLLECTIBLE_SET(objspace, obj);
+        rgengc_remember(objspace, obj);
+    }
+
+    check_rvalue_consistency(objspace, obj);
+}
+
 struct rb_gc_object_metadata_names {
     // Must be ID only
     ID ID_wb_protected, ID_age, ID_old, ID_uncollectible, ID_marking,
