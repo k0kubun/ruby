@@ -379,6 +379,17 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_box_main_singleton_class_is_profiled
+    # With Ruby::Box, the top-level self is not the current box's top_self.
+    # ZJIT should still profile its singleton class as a long-lived object.
+    assert_runs '[1, 0]', <<~RUBY, call_threshold: 2, stats: :quiet, env: {'RUBY_BOX' => '1'}
+      def box_main_callee = 1
+      def box_main_caller = box_main_callee
+      box_main_caller
+      [box_main_caller, RubyVM::ZJIT.stats(:send_fallback_send_megamorphic)]
+    RUBY
+  end
+
   private
 
   # Assert that every method call in `test_script` can be compiled by ZJIT
@@ -441,9 +452,11 @@ class TestZJITCLI < Test::Unit::TestCase
     allowed_iseqs: nil,
     extra_args: nil,
     timeout: 1000,
-    pipe_fd: nil
+    pipe_fd: nil,
+    env: nil
   )
     args = ["--disable-gems", *extra_args]
+    args.unshift(env) if env
     if zjit
       args << "--zjit-call-threshold=#{call_threshold}"
       args << "--zjit-num-profiles=#{num_profiles}"

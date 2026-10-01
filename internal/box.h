@@ -82,6 +82,8 @@ const rb_box_t * rb_current_box(void);
 const rb_box_t * rb_loading_box(void);
 const rb_box_t * rb_current_box_in_crash_report(void);
 
+bool rb_box_top_self_p(VALUE obj);
+
 void rb_box_entry_mark(void *);
 void rb_box_gc_update_references(void *ptr);
 

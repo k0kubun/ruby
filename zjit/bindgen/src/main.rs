@@ -478,6 +478,7 @@ fn main() {
         .allowlist_function("rb_vm_base_ptr")
         .allowlist_function("rb_ec_stack_check")
         .allowlist_function("rb_vm_top_self")
+        .allowlist_function("rb_box_top_self_p")
         .allowlist_function("rb_const_lookup")
 
         // We define these manually, don't import them

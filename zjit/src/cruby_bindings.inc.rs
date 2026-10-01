@@ -2340,6 +2340,7 @@ unsafe extern "C" {
         id: ID,
         klass: VALUE,
     ) -> shape_id_t;
+    pub fn rb_box_top_self_p(obj: VALUE) -> bool;
     pub fn rb_vm_top_self() -> VALUE;
     pub static mut rb_vm_insn_count: u64;
     pub fn rb_method_entry_at(obj: VALUE, id: ID) -> *const rb_method_entry_t;

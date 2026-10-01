@@ -196,6 +196,27 @@ box_entry_initialize(rb_box_t *box)
     box->is_optional = true;
 }
 
+/*
+ * Return true if obj is the main object (top_self) of any box. Instead of
+ * keeping a list of boxes, it identifies a box's top_self by the singleton
+ * "to_s" method defined by box_entry_initialize(). If the method is redefined,
+ * this may return false for a top_self.
+ */
+bool
+rb_box_top_self_p(VALUE obj)
+{
+    // The master box's top_self, which is the only one when Ruby::Box is disabled
+    if (obj == rb_master_box()->top_self) return true;
+    if (!rb_box_available() || SPECIAL_CONST_P(obj)) return false;
+
+    VALUE klass = RBASIC_CLASS(obj);
+    if (!klass || !RCLASS_SINGLETON_P(klass)) return false;
+
+    const rb_method_entry_t *me = rb_method_entry_at(klass, idTo_s);
+    return me && me->def->type == VM_METHOD_TYPE_CFUNC &&
+        me->def->body.cfunc.func == (rb_cfunc_t)box_main_to_s;
+}
+
 void
 rb_box_gc_update_references(void *ptr)
 {

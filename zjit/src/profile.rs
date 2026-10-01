@@ -183,7 +183,7 @@ fn observe_profiled_type(profiler: &Profiler, distribution: &mut TypeDistributio
     if !class.special_const_p() && class.is_singleton_class() && !class.is_metaclass() {
         let attached = unsafe { rb_class_attached_object(class) };
         let long_lived = attached.builtin_flags() & RUBY_FL_PROMOTED as usize != 0 // survived GC
-            || attached == unsafe { rb_vm_top_self() }
+            || unsafe { rb_box_top_self_p(attached) }
             || attached == unsafe { rb_block_param_proxy };
         if !long_lived {
             distribution.observe_other();
