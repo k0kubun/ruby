@@ -184,12 +184,11 @@ fn observe_profiled_type(profiler: &Profiler, distribution: &mut TypeDistributio
 
     // Skip observing short-lived objects with a singleton-class. Such a class
     // belongs to one object, so specializing on it doesn't help other objects.
+    // Objects that live forever, e.g. main and the block param proxy, are promoted
+    // by the GC at boot, so they're profiled before surviving any GC.
     if !class.special_const_p() && class.is_singleton_class() && !class.is_metaclass() {
         let attached = unsafe { rb_class_attached_object(class) };
-        let long_lived = attached.builtin_flags() & RUBY_FL_PROMOTED as usize != 0 // survived GC
-            || attached == unsafe { rb_vm_top_self() }
-            || attached == unsafe { rb_block_param_proxy };
-        if !long_lived {
+        if !attached.promoted() {
             distribution.observe_other();
             return;
         }
