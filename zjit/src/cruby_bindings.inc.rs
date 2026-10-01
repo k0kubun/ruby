@@ -2315,6 +2315,8 @@ unsafe extern "C" {
         buff_size: usize,
         obj: VALUE,
     ) -> *const ::std::os::raw::c_char;
+    pub fn rb_gc_declare_weak_references(obj: VALUE);
+    pub fn rb_gc_handle_weak_references_alive_p(obj: VALUE) -> bool;
     pub fn rb_gc_writebarrier_remember(obj: VALUE);
     pub fn rb_ec_stack_check(ec: *mut rb_execution_context_struct) -> ::std::os::raw::c_int;
     pub fn rb_id_table_lookup(

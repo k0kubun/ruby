@@ -177,6 +177,8 @@ fn main() {
         .allowlist_function("rb_gc_location")
         .allowlist_function("rb_gc_writebarrier")
         .allowlist_function("rb_gc_writebarrier_remember")
+        .allowlist_function("rb_gc_declare_weak_references")
+        .allowlist_function("rb_gc_handle_weak_references_alive_p")
         .allowlist_function("rb_gc_register_mark_object")
         .allowlist_function("rb_zjit_new_obj_shape")
 

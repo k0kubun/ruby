@@ -4347,6 +4347,45 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_profiled_class_survives_gc() {
+        eval("
+            class C
+              def foo = []
+            end
+
+            def test(c) = c.foo
+            c = C.new
+            test c
+            test c
+            4.times { GC.start(full_mark: true, immediate_sweep: true) }
+        ");
+
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :c@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :c@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
+          v23:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
+          PushInlineFrame :foo, v23 (0x1040), num_args=0
+          v30:ArrayExact = NewArray
+          PopInlineFrame
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
     fn test_send_to_instance_method() {
         eval("
             class C

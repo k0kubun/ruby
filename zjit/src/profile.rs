@@ -470,21 +470,19 @@ impl IseqProfile {
         }
     }
 
-    /// Run a given callback with every object in IseqProfile
-    pub fn each_object(&self, callback: impl Fn(VALUE)) {
-        for entry in &self.entries {
-            for distribution in &entry.opnd_types {
-                for profiled_type in distribution.each_item() {
-                    // If the type is a GC object, call the callback
-                    callback(profiled_type.class);
-                }
+    /// Remove every profiled object for which `alive_p` returns false. The profile holds
+    /// objects weakly, so this is called by the GC before it frees unreachable objects.
+    /// The counts of removed objects are kept as "other" in each distribution, so a site
+    /// that has seen objects that were freed is not considered monomorphic.
+    pub fn drop_dead_objects(&mut self, alive_p: impl Fn(VALUE) -> bool) {
+        for entry in &mut self.entries {
+            for distribution in &mut entry.opnd_types {
+                distribution.drop_items(|profiled_type| !alive_p(profiled_type.class));
             }
         }
 
-        for super_cme_values in self.super_cme.values() {
-            for profiled_type in super_cme_values.each_item() {
-                callback(profiled_type.class)
-            }
+        for super_cme_values in self.super_cme.values_mut() {
+            super_cme_values.drop_items(|profiled_type| !alive_p(profiled_type.class));
         }
     }
 

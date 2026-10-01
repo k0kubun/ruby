@@ -114,6 +114,9 @@ pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
             let new_payload = IseqPayload::new();
             let new_payload = Box::into_raw(Box::new(new_payload));
             rb_iseq_set_jit_payload(iseq, new_payload as VoidPtr);
+            // The profile in the payload holds objects weakly. Have the GC call
+            // rb_zjit_iseq_handle_weak_references() to drop unmarked ones.
+            rb_gc_declare_weak_references(iseq.into());
 
             new_payload
         } else {

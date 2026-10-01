@@ -1505,6 +1505,8 @@ rb_gc_handle_weak_references_alive_p(VALUE obj)
     return rb_gc_impl_handle_weak_references_alive_p(rb_gc_get_objspace(), obj);
 }
 
+void rb_iseq_handle_weak_references(rb_iseq_t *iseq);
+
 void
 rb_gc_handle_weak_references(VALUE obj)
 {
@@ -1536,6 +1538,9 @@ rb_gc_handle_weak_references(VALUE obj)
             }
             break;
           }
+          case imemo_iseq:
+            rb_iseq_handle_weak_references((rb_iseq_t *)obj);
+            break;
           case imemo_subclasses: {
             struct rb_subclasses *subs = (struct rb_subclasses *)obj;
             VALUE *entries = rb_imemo_subclasses_entries(obj);

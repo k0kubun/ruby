@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -9305,4 +9305,40 @@ fn test_regression_stub_frame_block_code_cleared_for_gc() {
     let caller_payload = get_or_create_iseq_payload(caller_iseq);
     let caller_version = unsafe { caller_payload.versions.last().unwrap().as_ref() };
     assert_eq!(1, caller_version.outgoing.len(), "expected a JIT-to-JIT function stub");
+}
+
+#[test]
+fn test_profiled_singleton_classes_are_not_retained() {
+    // Profile the receiver of `obj.profiled_singleton_method` for every call, but never
+    // compile the method, so that JIT code doesn't embed any singleton class.
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_num_profiles = get_option!(num_profiles);
+    set_call_threshold(1000);
+    set_num_profiles(1000);
+
+    let result = inspect("
+        def profiled_singleton_send(obj) = obj.profiled_singleton_method
+        PROFILED_SINGLETON_OBJECTS = ObjectSpace::WeakMap.new
+        def profiled_singleton_make(i)
+          obj = Object.new
+          obj.define_singleton_method(:profiled_singleton_method) { i }
+          PROFILED_SINGLETON_OBJECTS[i] = obj
+          profiled_singleton_send(obj)
+          nil
+        end
+        100.times { |i| profiled_singleton_make(i) }
+        4.times { GC.start(full_mark: true, immediate_sweep: true) }
+        # Without weak references, the profile retains the first DISTRIBUTION_SIZE objects.
+        # Check those instead of all objects since conservative stack scanning may keep
+        # a recently created one alive.
+        PROFILED_SINGLETON_OBJECTS.keys.select { |i| i < 20 }
+    ");
+    let iseq = get_method_iseq("self", "profiled_singleton_send");
+    let num_versions = get_or_create_iseq_payload(iseq).versions.len();
+
+    set_num_profiles(old_num_profiles);
+    set_call_threshold(old_call_threshold);
+    assert_eq!(0, num_versions, "profiled_singleton_send should not be compiled");
+    assert_snapshot!(result, @"[]");
 }

@@ -44,6 +44,24 @@ pub extern "C" fn rb_zjit_iseq_update_references(payload: *mut c_void) {
     with_time_stat(gc_time_ns, || iseq_update_references(payload));
 }
 
+/// GC callback for dropping profiled objects that are not marked, since the
+/// per-ISEQ profile holds them weakly. Called for ISEQs that ZJIT declared
+/// with rb_gc_declare_weak_references().
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_iseq_handle_weak_references(payload: *mut c_void) {
+    let payload = if payload.is_null() {
+        return; // nothing to update
+    } else {
+        // SAFETY: The GC takes the VM lock while handling weak references, which
+        // we assert, so we should be synchronized and data race free.
+        unsafe {
+            rb_assert_holding_vm_lock();
+            &mut *(payload as *mut IseqPayload)
+        }
+    };
+    with_time_stat(gc_time_ns, || iseq_handle_weak_references(payload));
+}
+
 /// GC callback for finalizing an ISEQ
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
@@ -112,10 +130,9 @@ pub extern "C" fn rb_zjit_root_update_references() {
 }
 
 fn iseq_mark(payload: &IseqPayload) {
-    // Mark objects retained by profiling instructions
-    payload.profile.each_object(|object| {
-        unsafe { rb_gc_mark_movable(object); }
-    });
+    // Objects retained by profiling instructions are not marked here. The profile
+    // holds them weakly and drops them in iseq_handle_weak_references, so that
+    // profiling e.g. a singleton class doesn't keep its attached object alive.
 
     // Mark objects baked in JIT code
     let cb = ZJITState::get_code_block();
@@ -133,7 +150,14 @@ fn iseq_mark(payload: &IseqPayload) {
     }
 }
 
-/// This is a mirror of [iseq_mark].
+/// Drop objects in the profile that have not been marked by other references.
+fn iseq_handle_weak_references(payload: &mut IseqPayload) {
+    // rb_gc_handle_weak_references_alive_p also remembers an old ISEQ that still
+    // references a young object, which keeps the generational invariant.
+    payload.profile.drop_dead_objects(|object| unsafe { rb_gc_handle_weak_references_alive_p(object) });
+}
+
+/// This is a mirror of [iseq_mark], plus the weakly held profiled objects.
 fn iseq_update_references(payload: &mut IseqPayload) {
     // Move objects retained by profiling instructions
     payload.profile.each_object_mut(|old_object| {

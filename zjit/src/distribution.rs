@@ -53,6 +53,37 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         self.buckets.iter_mut().zip(self.counts.iter())
             .filter_map(|(bucket, &count)| if count > 0 { Some(bucket) } else { None })
     }
+
+    /// Remove every item for which `drop_p` returns true. Their counts are folded into
+    /// `other`, so the distribution still reflects that more kinds of items were seen.
+    /// The remaining items are compacted toward index 0 because [Self::observe] stops
+    /// at the first empty bucket.
+    pub fn drop_items(&mut self, mut drop_p: impl FnMut(T) -> bool) {
+        let mut kept = 0;
+        for i in 0..N {
+            let count = self.counts[i];
+            if count == 0 {
+                continue;
+            }
+            if drop_p(self.buckets[i]) {
+                self.other = self.other.saturating_add(count);
+            } else {
+                self.buckets[kept] = self.buckets[i];
+                self.counts[kept] = count;
+                kept += 1;
+            }
+        }
+        for i in kept..N {
+            self.buckets[i] = Default::default();
+            self.counts[i] = 0;
+        }
+        // Keep the most frequent item at the front. If the front item was dropped, move the
+        // first most frequent item there, preserving the order of the others.
+        if let Some(max_index) = (0..kept).reduce(|max, i| if self.counts[i] > self.counts[max] { i } else { max }) {
+            self.buckets[..=max_index].rotate_right(1);
+            self.counts[..=max_index].rotate_right(1);
+        }
+    }
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -198,6 +229,81 @@ mod distribution_tests {
         assert!(dist.buckets.is_empty());
         assert!(dist.counts.is_empty());
         assert_eq!(dist.other, 1);
+    }
+
+    fn dist_from(buckets: [usize; 4], counts: [NumProfiles; 4], other: NumProfiles) -> Distribution<usize, 4> {
+        Distribution { buckets, counts, other }
+    }
+
+    #[test]
+    fn drop_items_compacts_and_folds_into_other() {
+        let mut dist = dist_from([12, 11, 10, 13], [3, 2, 1, 1], 0);
+        dist.drop_items(|item| item == 11);
+        assert_eq!(dist.buckets, [12, 10, 13, 0]);
+        assert_eq!(dist.counts, [3, 1, 1, 0]);
+        assert_eq!(dist.other, 2);
+    }
+
+    #[test]
+    fn drop_items_without_match_is_noop() {
+        let mut dist = dist_from([12, 11, 10, 13], [3, 3, 1, 3], 1);
+        dist.drop_items(|_| false);
+        assert_eq!(dist.buckets, [12, 11, 10, 13]);
+        assert_eq!(dist.counts, [3, 3, 1, 3]);
+        assert_eq!(dist.other, 1);
+    }
+
+    #[test]
+    fn drop_items_moves_most_frequent_item_to_front() {
+        let mut dist = dist_from([10, 11, 12, 13], [3, 1, 2, 2], 0);
+        dist.drop_items(|item| item == 10);
+        // 12 and 13 tie; the first one moves to the front and the others keep their order
+        assert_eq!(dist.buckets, [12, 11, 13, 0]);
+        assert_eq!(dist.counts, [2, 1, 2, 0]);
+        assert_eq!(dist.other, 3);
+        DistributionSummary::new(&dist); // asserts counts[0] is the largest in debug builds
+    }
+
+    #[test]
+    fn drop_items_does_not_duplicate_buckets() {
+        let mut dist = dist_from([10, 11, 12, 0], [3, 1, 1, 0], 0);
+        dist.drop_items(|item| item == 11);
+        // A hole at index 1 would make observe() store a second bucket for 12
+        dist.observe(12);
+        assert_eq!(dist.buckets, [10, 12, 0, 0]);
+        assert_eq!(dist.counts, [3, 2, 0, 0]);
+        assert_eq!(dist.other, 1);
+        dist.observe(14);
+        assert_eq!(dist.buckets, [10, 12, 14, 0]);
+        assert_eq!(dist.counts, [3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn drop_items_keeps_site_non_monomorphic() {
+        let mut dist = dist_from([10, 11, 12, 13], [1, 1, 1, 1], 1);
+        dist.drop_items(|item| item != 10);
+        assert_eq!(dist.buckets, [10, 0, 0, 0]);
+        assert_eq!(dist.counts, [1, 0, 0, 0]);
+        assert_eq!(dist.other, 4);
+        assert_eq!(DistributionSummary::new(&dist).kind, DistributionKind::Megamorphic);
+
+        // Dropping everything leaves no buckets but keeps the evidence
+        dist.drop_items(|_| true);
+        assert_eq!(dist.each_item().count(), 0);
+        assert_eq!(dist.counts, [0, 0, 0, 0]);
+        assert_eq!(dist.other, 5);
+        assert_eq!(DistributionSummary::new(&dist).kind, DistributionKind::Megamorphic);
+    }
+
+    #[test]
+    fn drop_items_after_monomorphic_is_not_monomorphic() {
+        let mut dist = Distribution::<usize, 4>::new();
+        dist.observe(10);
+        dist.observe(11);
+        dist.drop_items(|item| item == 11);
+        assert_eq!(dist.buckets, [10, 0, 0, 0]);
+        assert_eq!(dist.other, 1);
+        assert!(!DistributionSummary::new(&dist).is_monomorphic());
     }
 
     #[test]

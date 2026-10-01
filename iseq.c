@@ -404,6 +404,27 @@ cc_is_active(const struct rb_callcache *cc)
     return vm_cc_valid(cc) && !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc));
 }
 
+/* Called by the GC for ISEQs declared with rb_gc_declare_weak_references().
+ * ZJIT does so when it creates a JIT payload, whose profile holds objects weakly. */
+void
+rb_iseq_handle_weak_references(rb_iseq_t *iseq)
+{
+#if USE_ZJIT
+    if (rb_zjit_enabled_p && ISEQ_BODY(iseq) && ISEQ_BODY(iseq)->jit_payload) {
+        void *payload = ISEQ_BODY(iseq)->jit_payload;
+        /* Same critical section as the JIT payload marking in rb_iseq_mark_and_move */
+        if (rb_gc_multi_objspace_p()) {
+            RB_VM_LOCKING_NO_BARRIER() {
+                rb_zjit_iseq_handle_weak_references(payload);
+            }
+        }
+        else {
+            rb_zjit_iseq_handle_weak_references(payload);
+        }
+    }
+#endif
+}
+
 void
 rb_iseq_mark_and_move(rb_iseq_t *iseq, bool reference_updating)
 {
