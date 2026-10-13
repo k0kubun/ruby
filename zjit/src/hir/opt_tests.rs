@@ -27,6 +27,26 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_dispatch_on_megamorphic_shapes_of_few_classes() {
+        // Profile 20 samples so that 10 shapes of one class overflow the distribution
+        set_call_threshold(100);
+        set_num_profiles(20);
+        eval(r#"
+            class C
+              def initialize(i) = instance_variable_set(:"@a#{i}", i)
+              def foo = 1
+            end
+            OBJS = (0..9).map { |i| C.new(i) }
+            def test(o) = o.foo
+            90.times { |i| test(OBJS[i % 10]) }
+        "#);
+        // Dispatch on C instead of a megamorphic dynamic send
+        let hir = hir_string("test");
+        assert!(hir.contains("CondBranchHasType"), "{hir}");
+        assert!(!hir.contains("megamorphic"), "{hir}");
+    }
+
+    #[test]
     fn test_send_direct_rest_array_keeps_stripped_block_arg_in_exit_state() {
         eval("
             def rest_callee(*args) = args

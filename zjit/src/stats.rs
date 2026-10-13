@@ -156,6 +156,9 @@ make_counters! {
     default {
         compiled_iseq_count,
         failed_iseq_count,
+
+        // Megamorphic send profiles dispatched as polymorphic. See polymorphic_send_summary().
+        megamorphic_send_as_polymorphic,
         jit_frame_heap_bytes,
         skipped_native_stack_full,
 
