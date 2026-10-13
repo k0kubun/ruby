@@ -269,6 +269,7 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
     {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
+        payload.profile.phase = crate::profile::ProfilePhase::Reprofile;
 
         // Recompile JIT-to-JIT calls into the invalidated ISEQ
         for incoming in unsafe { version.as_ref() }.incoming.iter() {
@@ -3730,6 +3731,12 @@ fn gen_stack_overflow_check(jit: &mut JITState, asm: &mut Assembler, function: &
 fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
     // Convert ZJIT instructions back to bare instructions
     unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+    if get_option!(stats) {
+        let payload = get_or_create_iseq_payload(iseq);
+        let is_recompile = !payload.versions.is_empty();
+        payload.profile.count_kind_transitions(is_recompile);
+    }
+    get_or_create_iseq_payload(iseq).profile.phase = crate::profile::ProfilePhase::PostCompile;
 
     // Reject ISEQs with very large temp stacks.
     // We cannot encode too large offsets to access locals in arm64.

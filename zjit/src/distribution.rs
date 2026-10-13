@@ -55,8 +55,8 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
     }
 }
 
-#[derive(PartialEq, Debug, Clone, Copy)]
-enum DistributionKind {
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum DistributionKind {
     /// No types seen
     Empty,
     /// One type seen
@@ -114,6 +114,10 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
             }
         };
         Self { kind, buckets: dist.buckets }
+    }
+
+    pub fn kind(&self) -> DistributionKind {
+        self.kind
     }
 
     pub fn is_monomorphic(&self) -> bool {

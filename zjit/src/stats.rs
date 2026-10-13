@@ -469,6 +469,25 @@ make_counters! {
     load_field_count,
     store_field_count,
 
+    // Interpreter profile samples, by why the profiling instructions were armed:
+    // the initial profiling window, right after a compile (only side-exited or
+    // already-running frames reach the interpreter then), and the re-profiling
+    // window after a version was invalidated.
+    profile_sample_initial,
+    profile_sample_post_compile,
+    profile_sample_reprofile,
+
+    // How the DistributionKind of each profiled operand changed between the
+    // previous compile of an ISEQ and the current recompile.
+    recompile_profile_kind_unchanged,
+    recompile_profile_kind_new,
+    recompile_profile_kind_mono_to_skewed,
+    recompile_profile_kind_mono_to_poly,
+    recompile_profile_kind_mono_to_mega,
+    recompile_profile_kind_skewed_to_poly,
+    recompile_profile_kind_skewed_to_mega,
+    recompile_profile_kind_other_change,
+
     invokeblock_handler_monomorphic_iseq,
     invokeblock_handler_monomorphic_ifunc,
     invokeblock_handler_monomorphic_other,

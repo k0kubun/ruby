@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
-use crate::distribution::{Distribution, DistributionSummary};
-use crate::stats::Counter::profile_time_ns;
-use crate::stats::with_time_stat;
+use crate::distribution::{Distribution, DistributionKind, DistributionSummary};
+use crate::stats::Counter::{self, profile_time_ns};
+use crate::stats::{incr_counter_by, with_time_stat};
 
 /// Ephemeral state for profiling runtime information
 struct Profiler {
@@ -113,6 +113,14 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     let profiler = &mut Profiler::new(ec);
     let profile = &mut get_or_create_iseq_payload(profiler.iseq).profile;
     let _ = profile_insn_sample(bare_opcode, profiler, profile);
+    if get_option!(stats) {
+        let counter = match profile.phase {
+            ProfilePhase::Initial => Counter::profile_sample_initial,
+            ProfilePhase::PostCompile => Counter::profile_sample_post_compile,
+            ProfilePhase::Reprofile => Counter::profile_sample_reprofile,
+        };
+        incr_counter_by(counter, 1);
+    }
 
     // Once we profile the instruction enough times, we stop profiling it.
     let entry = profile.entry_mut(profiler.insn_idx);
@@ -130,6 +138,7 @@ pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
     }
+    profile.phase = ProfilePhase::PostCompile;
     unsafe { rb_zjit_profile_enable(iseq) };
 }
 
@@ -424,6 +433,17 @@ pub struct ProfileEntry {
     profiles_remaining: NumProfiles,
 }
 
+/// Why the interpreter is currently collecting profiles for an ISEQ. Used for stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilePhase {
+    /// Initial profiling window before the first compile
+    Initial,
+    /// Profiling re-armed right after compiling a version (or inlining the ISEQ)
+    PostCompile,
+    /// Profiling window after a version of the ISEQ was invalidated
+    Reprofile,
+}
+
 #[derive(Debug)]
 pub struct IseqProfile {
     /// Sparse storage of per-instruction profile data, sorted by instruction index.
@@ -435,6 +455,12 @@ pub struct IseqProfile {
 
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+
+    /// Why profiling is currently armed. Used for stats.
+    pub phase: ProfilePhase,
+
+    /// DistributionKind of each operand at the last compile. Only populated with --zjit-stats.
+    compiled_kinds: HashMap<YarvInsnIdx, Vec<DistributionKind>>,
 }
 
 impl IseqProfile {
@@ -443,6 +469,37 @@ impl IseqProfile {
             entries: Vec::new(),
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
+            phase: ProfilePhase::Initial,
+            compiled_kinds: HashMap::new(),
+        }
+    }
+
+    /// Count how the DistributionKind of each profiled operand changed since the
+    /// previous compile, and remember the current kinds for the next compile.
+    /// Called right before building HIR, only with --zjit-stats.
+    pub fn count_kind_transitions(&mut self, is_recompile: bool) {
+        use DistributionKind::*;
+        for entry in &self.entries {
+            let kinds: Vec<DistributionKind> = entry.opnd_types.iter()
+                .map(|dist| TypeDistributionSummary::new(dist).kind()).collect();
+            if is_recompile {
+                let old_kinds = self.compiled_kinds.get(&(entry.insn_idx as YarvInsnIdx));
+                for (i, &new) in kinds.iter().enumerate() {
+                    let old = old_kinds.and_then(|k| k.get(i).copied()).unwrap_or(Empty);
+                    let counter = match (old, new) {
+                        _ if old == new => Counter::recompile_profile_kind_unchanged,
+                        (Empty, _) => Counter::recompile_profile_kind_new,
+                        (Monomorphic, SkewedPolymorphic) => Counter::recompile_profile_kind_mono_to_skewed,
+                        (Monomorphic, Polymorphic) => Counter::recompile_profile_kind_mono_to_poly,
+                        (Monomorphic, Megamorphic | SkewedMegamorphic) => Counter::recompile_profile_kind_mono_to_mega,
+                        (SkewedPolymorphic, Polymorphic) => Counter::recompile_profile_kind_skewed_to_poly,
+                        (SkewedPolymorphic, Megamorphic) => Counter::recompile_profile_kind_skewed_to_mega,
+                        _ => Counter::recompile_profile_kind_other_change,
+                    };
+                    incr_counter_by(counter, 1);
+                }
+            }
+            self.compiled_kinds.insert(entry.insn_idx as YarvInsnIdx, kinds);
         }
     }
 
