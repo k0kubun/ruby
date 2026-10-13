@@ -482,6 +482,26 @@ make_counters! {
     compile_trigger_interp_recompile,
     compile_trigger_stub_recompile,
 
+    // Profile samples that changed a profile, i.e. added a new type to a distribution
+    profile_change_count,
+
+    // Compile gate decisions at the call threshold (see compile_gate() in codegen.rs).
+    // stable: the profile did not change in the last --zjit-profile-settle-calls calls.
+    // unstable_delayed: the profile changed recently, so the profiling window was extended.
+    // unstable_compiled: the profile changed recently, but it was compiled anyway because
+    // the ISEQ was already delayed --zjit-max-compile-delays times.
+    compile_gate_stable,
+    compile_gate_unstable_delayed,
+    compile_gate_unstable_compiled,
+
+    // How many calls before the call threshold the profile last changed, counted once per
+    // compile at the first gate check, i.e. at the end of the default profiling window.
+    profile_last_change_1_call_ago,
+    profile_last_change_2_calls_ago,
+    profile_last_change_3_to_5_calls_ago,
+    profile_last_change_over_5_calls_ago,
+    profile_last_change_never,
+
     // Profiled YARV instructions compiled into HIR, by the maturity of their profiles.
     // See ProfileMaturity for each category.
     profile_site_none,

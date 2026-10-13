@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles};
+use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_compile_delays, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -325,6 +325,79 @@ fn test_profile_site_counts_by_maturity() {
     assert_eq!(interp + 1, counters.no_profile_site_first_compile_interp);
     assert_eq!(recompile, counters.no_profile_site_recompile);
     assert_eq!(no_profile_opt_minus + 1, crate::state::ZJITState::get_no_profile_insn_counters()[YARVINSN_opt_minus as usize]);
+}
+
+#[test]
+fn test_profile_is_unsettled() {
+    use super::profile_is_unsettled;
+    // No profile change in the window
+    assert!(!profile_is_unsettled(30, None, 2, 5));
+    // Changed on the last call or the one before it
+    assert!(profile_is_unsettled(30, Some(29), 2, 5));
+    assert!(profile_is_unsettled(30, Some(28), 2, 5));
+    // Changed earlier in the window
+    assert!(!profile_is_unsettled(30, Some(27), 2, 5));
+    assert!(!profile_is_unsettled(30, Some(25), 2, 5));
+    // A change recorded at a later call count is stale
+    assert!(!profile_is_unsettled(30, Some(31), 2, 5));
+    // Windows no longer than settle_calls are never unsettled
+    assert!(!profile_is_unsettled(3, Some(2), 2, 2));
+    assert!(profile_is_unsettled(3, Some(2), 1, 2));
+}
+
+/// Call `compile_gate_target` with each Ruby literal in `values` and return how many ISEQ
+/// versions it has after each call.
+fn compile_gate_versions(values: &[&str]) -> Vec<usize> {
+    eval("def compile_gate_target(x) = x.to_s");
+    let iseq = get_method_iseq("self", "compile_gate_target");
+    values.iter().map(|value| {
+        eval(&format!("compile_gate_target({value})"));
+        get_or_create_iseq_payload(iseq).versions.len()
+    }).collect()
+}
+
+#[test]
+fn test_compile_gate_delays_unsettled_profile() {
+    ensure_rubyvm();
+    set_num_profiles(5);
+    set_call_threshold(7);
+    set_max_compile_delays(3);
+    // Calls 2-6 are profiled. The receiver type changes on call 6, so the compile at call 7
+    // is delayed by 5 calls. The profile does not change again, so call 12 compiles.
+    let versions = compile_gate_versions(&["1", "1", "1", "1", "1", "'a'", "1", "1", "1", "1", "1", "1"]);
+    assert_eq!(vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], versions);
+}
+
+#[test]
+fn test_compile_gate_compiles_settled_profile() {
+    ensure_rubyvm();
+    set_num_profiles(5);
+    set_call_threshold(7);
+    set_max_compile_delays(3);
+    // The receiver type changes on call 4, which is more than 2 calls before the threshold.
+    let versions = compile_gate_versions(&["1", "1", "1", "'a'", "1", "1", "1"]);
+    assert_eq!(vec![0, 0, 0, 0, 0, 0, 1], versions);
+}
+
+#[test]
+fn test_compile_gate_disabled() {
+    ensure_rubyvm();
+    set_num_profiles(5);
+    set_call_threshold(7);
+    set_max_compile_delays(0);
+    let versions = compile_gate_versions(&["1", "1", "1", "1", "1", "'a'", "1"]);
+    assert_eq!(vec![0, 0, 0, 0, 0, 0, 1], versions);
+}
+
+#[test]
+fn test_compile_gate_max_compile_delays() {
+    ensure_rubyvm();
+    set_num_profiles(5);
+    set_call_threshold(7);
+    set_max_compile_delays(1);
+    // The profile changes at the end of both windows, but only one delay is allowed.
+    let versions = compile_gate_versions(&["1", "1", "1", "1", "1", "'a'", "1", "1", "1", "1", "1.0", "1"]);
+    assert_eq!(vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], versions);
 }
 
 #[test]

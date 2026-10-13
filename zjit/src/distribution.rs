@@ -21,17 +21,23 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         Self { buckets: [Default::default(); N], counts: [0; N], other: 0 }
     }
 
-    pub fn observe(&mut self, item: T) {
+    /// Record an item. Return true if the item changed the shape of the distribution, i.e. it
+    /// took a new bucket or was the first item to overflow into `other`. Like an inline cache
+    /// state change in V8, this tells whether the profile is still changing.
+    pub fn observe(&mut self, item: T) -> bool {
         for (bucket, count) in self.buckets.iter_mut().zip(self.counts.iter_mut()) {
             if *bucket == item || *count == 0 {
+                let is_new = *count == 0;
                 *bucket = item;
                 *count = count.saturating_add(1);
                 // Keep the most frequent item at the front
                 self.bubble_up();
-                return;
+                return is_new;
             }
         }
+        let is_new = self.other == 0;
         self.other = self.other.saturating_add(1);
+        is_new
     }
 
     /// Keep the highest counted bucket at index 0
@@ -189,6 +195,19 @@ mod distribution_tests {
         assert_eq!(dist.buckets[1], 10);
         assert_eq!(dist.counts[1], 2);
         assert_eq!(dist.other, 0);
+    }
+
+    #[test]
+    fn observe_returns_whether_distribution_changed() {
+        let mut dist = Distribution::<usize, 2>::new();
+        assert!(dist.observe(10));
+        assert!(!dist.observe(10));
+        assert!(dist.observe(11));
+        assert!(!dist.observe(10));
+        assert!(!dist.observe(11));
+        // The first item that overflows into `other` changes the distribution, the rest don't.
+        assert!(dist.observe(12));
+        assert!(!dist.observe(13));
     }
 
     #[test]
