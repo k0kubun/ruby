@@ -3824,7 +3824,9 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
             return Err(CompileError::ParseError(err));
         }
     };
-    if !get_option!(disable_hir_opt) {
+    // Tier 1 doesn't run the optimizer to keep its compile time low. It doesn't speculate
+    // on profiles anyway, and it's replaced with tier 2 once the ISEQ gets hot.
+    if !get_option!(disable_hir_opt) && !function.is_tier1() {
         trace_compile_phase("optimize", || function.optimize());
     }
     function.dump_hir();
