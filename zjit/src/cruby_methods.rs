@@ -731,6 +731,7 @@ fn try_inline_float_op(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(
     // HeapFloat falls back to CCallWithFrame via the default Send path.
     if fun.likely_a(recv, types::Flonum, state)
         && (fun.likely_a(other, types::Flonum, state) || fun.likely_a(other, types::Fixnum, state))
+        && !fun.site_exited(state, hir::Recompile::OperandType)
     {
         let recv = coerce_float_op_operand(fun, block, recv, types::Flonum, state);
         let other_type = if fun.likely_a(other, types::Flonum, state) { types::Flonum } else { types::Fixnum };

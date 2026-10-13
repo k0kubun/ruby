@@ -265,12 +265,12 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, trigger: Counter) {
     let payload = get_or_create_iseq_payload(iseq);
     if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() >= max_iseq_versions()
+        && payload.versions.len() >= payload.version_limit()
     {
         incr_counter!(invalidation_skipped_max_versions);
     }
     if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < max_iseq_versions()
+        && payload.versions.len() < payload.version_limit()
     {
         incr_counter_by(trigger, 1);
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
@@ -355,7 +355,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         _ => {},
     }
     // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    if payload.versions.len() >= payload.version_limit() {
         return Err(CompileError::IseqVersionLimitReached);
     }
 
@@ -3857,7 +3857,18 @@ c_callable! {
     pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE, frame_iseq_raw: VALUE, site: u64) {
         let kind = hir::Recompile::from_u8((site >> 32) as u8).expect("valid Recompile kind");
         incr_counter_by(crate::stats::recompile_exit_counter(kind), 1);
-        let _ = frame_iseq_raw; // Used by per-site exit history
+        // Remember the failing site on the payload of the ISEQ that owns the guard's frame (the
+        // callee for inlined code) so that the next version doesn't speculate on it again.
+        let new_site = get_option!(site_exit_history) && {
+            let insn_idx = site as u32;
+            let compiled_payload = get_or_create_iseq_payload(compiled_iseq_raw.as_iseq());
+            // The latest version is the one exiting unless it's invalidated, in which case
+            // exits from it no longer matter much. Use its address as the version identity.
+            let version = compiled_payload.versions.last().map_or(0, |v| v.as_ptr() as usize);
+            // A final version can't re-speculate with new profiles, so de-speculate right away.
+            let force = compiled_payload.versions.len() >= compiled_payload.version_limit();
+            get_or_create_iseq_payload(frame_iseq_raw.as_iseq()).exit_sites.record(insn_idx, kind, version, force)
+        };
 
         // Fast check before taking the VM lock: skip if the compiled unit is already
         // invalidated or at the version limit. This avoids expensive lock acquisition
@@ -3866,9 +3877,18 @@ c_callable! {
         {
             let compiled_iseq: IseqPtr = compiled_iseq_raw.as_iseq();
             let payload = get_or_create_iseq_payload(compiled_iseq);
-            let already_done = payload.versions.last()
-                .map_or(false, |v| unsafe { v.as_ref() }.is_invalidated())
-                || payload.versions.len() >= max_iseq_versions();
+            let invalidated = payload.versions.last().map_or(false, |v| unsafe { v.as_ref() }.is_invalidated());
+            // A final version can't recompile. But if it exits at a site that never exited before,
+            // the exit history guarantees that another version won't speculate there again, so
+            // allow a bounded number of extra versions to get rid of the exit.
+            if new_site && !invalidated
+                && payload.versions.len() >= payload.version_limit()
+                && payload.extra_versions < get_option!(site_exit_extra_versions)
+            {
+                payload.extra_versions += 1;
+                incr_counter!(site_exit_extra_version_count);
+            }
+            let already_done = invalidated || payload.versions.len() >= payload.version_limit();
             if already_done {
                 return;
             }

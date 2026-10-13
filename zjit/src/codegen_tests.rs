@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_site_exit_threshold};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -245,6 +245,92 @@ fn test_recompile_exit_waits_for_exit_budget() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(1, payload.versions.len());
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_recompile_exit_records_exit_site() {
+    set_call_threshold(2);
+    set_site_exit_threshold(1);
+    set_num_exits_until_invalidate(1);
+    eval("
+        class SiteExitA; def foo = 1; end
+        class SiteExitB; def foo = 2; end
+        def record_exit_site(a, b) = [a.foo, b.foo]
+        record_exit_site(SiteExitA.new, SiteExitA.new)
+        record_exit_site(SiteExitA.new, SiteExitA.new)
+    ");
+
+    let iseq = get_method_iseq("self", "record_exit_site");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(payload.exit_sites.is_empty());
+
+    // Only the receiver guard of `b.foo` fails
+    assert_eq!(Qtrue, eval("record_exit_site(SiteExitA.new, SiteExitB.new) == [1, 2]"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+    let foo_idxs: Vec<u32> = {
+        let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+        let mut insn_idx = 0;
+        let mut idxs = vec![];
+        while insn_idx < iseq_size {
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+            let op: u32 = unsafe { rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(iseq, pc)) }.try_into().unwrap();
+            if op == YARVINSN_opt_send_without_block {
+                idxs.push(insn_idx);
+            }
+            insn_idx += crate::cruby::insn_len(op as usize);
+        }
+        idxs
+    };
+    assert_eq!(2, foo_idxs.len());
+    assert!(!payload.exit_sites.contains(foo_idxs[0], crate::hir::Recompile::SendRecvType));
+    assert!(payload.exit_sites.contains(foo_idxs[1], crate::hir::Recompile::SendRecvType));
+
+    // The next version keeps working for both receiver classes at the exited site
+    let num_profiles = get_option!(num_profiles);
+    for _ in 0..num_profiles + 2 {
+        assert_eq!(Qtrue, eval("record_exit_site(SiteExitA.new, SiteExitB.new) == [1, 2]"));
+    }
+    assert_eq!(Qtrue, eval("record_exit_site(SiteExitA.new, SiteExitA.new) == [1, 1]"));
+    assert_eq!(2, get_or_create_iseq_payload(iseq).versions.len());
+    assert!(!unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_final_version_gets_extra_version_for_new_exit_site() {
+    rb_zjit_prepare_options();
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    // The first version is the final version
+    set_max_versions(1);
+    eval("
+        class ExtraVersionA; def foo = 1; end
+        class ExtraVersionB; def foo = 2; end
+        def extra_version(a) = a.foo
+        extra_version(ExtraVersionA.new)
+        extra_version(ExtraVersionA.new)
+    ");
+    let iseq = get_method_iseq("self", "extra_version");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+
+    // The receiver guard has never exited before, so the final version gets invalidated
+    assert_eq!(Qtrue, eval("extra_version(ExtraVersionB.new) == 2"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.extra_versions);
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+
+    // The extra version doesn't speculate on the receiver, so it never gets invalidated
+    for _ in 0..10 {
+        assert_eq!(Qtrue, eval("extra_version(ExtraVersionB.new) == 2"));
+        assert_eq!(Qtrue, eval("extra_version(ExtraVersionA.new) == 1"));
+    }
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert_eq!(1, payload.extra_versions);
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+    set_max_versions(old_max_versions);
 }
 
 #[test]

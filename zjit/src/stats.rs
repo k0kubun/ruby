@@ -263,6 +263,7 @@ make_counters! {
         send_fallback_send_direct_missing_keyword,
         send_fallback_send_direct_too_many_keywords,
         send_fallback_send_polymorphic,
+        send_fallback_send_site_exited,
         send_fallback_send_megamorphic,
         send_fallback_send_no_profiles,
         send_fallback_send_not_optimized_method_type,
@@ -518,6 +519,10 @@ make_counters! {
     recompile_exit_operand_type,
     // Recompile exits that counted against the per-version budget
     budgeted_recompile_exit_count,
+    // Number of times HIR building skipped a speculation because of --zjit-site-exit-history
+    site_exit_despeculated,
+    // Number of versions allowed beyond --zjit-max-versions by --zjit-site-exit-extra-versions
+    site_exit_extra_version_count,
 }
 
 /// Counter for exit_recompile() calls of a given guard kind
@@ -758,6 +763,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SendDirectMissingKeyword                  => send_fallback_send_direct_missing_keyword,
         SendDirectTooManyKeywords                 => send_fallback_send_direct_too_many_keywords,
         SendPolymorphic                           => send_fallback_send_polymorphic,
+        SendSiteExited                            => send_fallback_send_site_exited,
         SendMegamorphic                           => send_fallback_send_megamorphic,
         SendNoProfiles                            => send_fallback_send_no_profiles,
         SendCfuncVariadic                         => send_fallback_send_cfunc_variadic,
