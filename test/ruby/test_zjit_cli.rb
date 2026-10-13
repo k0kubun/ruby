@@ -343,6 +343,28 @@ class TestZJITCLI < Test::Unit::TestCase
     }, stats: true
   end
 
+  def test_site_exit_history
+    script = <<~'RUBY'
+      class SiteExit
+        def initialize(x) = (x ? (@a = 1) : (@b = 2; @a = 3))
+        def get = @a
+      end
+      a = SiteExit.new(true)
+      b = SiteExit.new(false)
+      sum = 0
+      20.times { sum += a.get }
+      20.times { sum += b.get }
+      20.times { sum += a.get + b.get }
+      [sum, RubyVM::ZJIT.stats[:site_exit_despeculated] > 0]
+    RUBY
+    # The shape guard exits from one version, which is enough with --zjit-site-exit-threshold=1
+    assert_runs '[160, true]', script, stats: :quiet
+    assert_runs '[160, false]', script, stats: :quiet, extra_args: ['--zjit-site-exit-threshold=2']
+    assert_runs '[160, true]', script, stats: :quiet, extra_args: ['--zjit-site-exit-history=1', '--zjit-site-exit-threshold=1']
+    assert_runs '[160, false]', script, stats: :quiet, extra_args: ['--zjit-site-exit-history=0', '--zjit-site-exit-threshold=1']
+    assert_runs '[160, true]', script, stats: :quiet, extra_args: ['--zjit-site-exit-extra-versions=0', '--zjit-site-exit-threshold=1']
+  end
+
   def test_reset_stats
     assert_runs 'true', %q{
       def test = 1

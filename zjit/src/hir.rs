@@ -669,7 +669,8 @@ pub enum SideExitReason {
 }
 
 /// Marks a side exit as triggering profiling and recompilation. The variant says which kind of
-/// speculation the guard checks, so that `exit_recompile` can count exits per kind.
+/// speculation the guard checks, so that `exit_recompile` can count exits per kind and remember
+/// the (site, kind) pairs that failed. See [`crate::payload::ExitSites`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Recompile {
@@ -812,6 +813,8 @@ pub enum SendFallbackReason {
     SendDirectMissingKeyword,
     SendDirectTooManyKeywords,
     SendPolymorphic,
+    /// A receiver class guard at this site side-exited in a previous version
+    SendSiteExited,
     SendMegamorphic,
     SendNoProfiles,
     SendCfuncVariadic,
@@ -884,6 +887,7 @@ impl Display for SendFallbackReason {
             SendDirectMissingKeyword => write!(f, "SendDirect: missing keyword"),
             SendDirectTooManyKeywords => write!(f, "SendDirect: too many keywords for fixnum bitmask"),
             SendPolymorphic => write!(f, "Send: polymorphic call site"),
+            SendSiteExited => write!(f, "Send: receiver guard exited in a previous version"),
             SendMegamorphic => write!(f, "Send: megamorphic call site"),
             SendNoProfiles => write!(f, "Send: no profile data available"),
             SendCfuncVariadic => write!(f, "Send: C function is variadic"),
@@ -3391,7 +3395,7 @@ impl Function {
 
         // Monomorphic: guard the tag and the ISEQ, then invoke directly in-place.
         // No need for new HIR blocks.
-        if iseqs.len() == 1 && monomorphic_iseq && !self.policy.no_side_exits {
+        if iseqs.len() == 1 && monomorphic_iseq && !self.policy.no_side_exits && !self.site_exited(state, Recompile::BlockHandler) {
             let block_iseq = iseqs[0];
             self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile::BlockHandler) });
             let captured = self.untag_block_handler(block, block_handler);
@@ -3524,6 +3528,25 @@ impl Function {
     }
 
     /// Return a resolved, freshly allocated FrameState at the given instruction index.
+    /// Return true if a recompile exit of `kind` fired at the instruction of the Snapshot `state`
+    /// in a previous version, so we should not speculate on `kind` there again.
+    /// See [`crate::payload::ExitSites`].
+    pub fn site_exited(&self, state: InsnId, kind: Recompile) -> bool {
+        if !get_option!(site_exit_history) {
+            return false;
+        }
+        let frame_state = self.frame_state_ref(state);
+        let payload = get_or_create_iseq_payload(frame_state.iseq);
+        if payload.exit_sites.is_empty() {
+            return false;
+        }
+        let exited = payload.exit_sites.contains(frame_state.insn_idx() as u32, kind);
+        if exited {
+            incr_counter!(site_exit_despeculated);
+        }
+        exited
+    }
+
     pub fn frame_state(&self, insn_id: InsnId) -> FrameState {
         match self.find(insn_id) {
             Insn::Snapshot { state } => *state,
@@ -4953,6 +4976,17 @@ impl Function {
                         let mut has_block = send_block.is_some();
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
+                            ReceiverTypeResolution::Monomorphic { .. }
+                            | ReceiverTypeResolution::SkewedPolymorphic { .. } if self.site_exited(state, Recompile::SendRecvType) => {
+                                // The receiver guard exited in a previous version. Don't guard again.
+                                if let Some(class) = self.type_of(recv).runtime_exact_ruby_class() {
+                                    (class, None)
+                                } else {
+                                    self.set_dynamic_send_reason(insn_id, SendSiteExited);
+                                    self.push_insn_id(block, insn_id);
+                                    continue;
+                                }
+                            }
                             ReceiverTypeResolution::Monomorphic { profiled_type }
                             | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
                             ReceiverTypeResolution::SkewedMegamorphic { .. }
@@ -5029,6 +5063,9 @@ impl Function {
                             if let Some(&block_arg) = args.last() {
                                 let original_argc = args.len();
                                 let statically_nil = self.is_a(block_arg, types::NilClass);
+                                // We don't consult the exit history (Recompile::SendBlockArg) here:
+                                // the generic path is a dynamic send that also loses inlining for
+                                // the common nil case, which costs more than the exits on activerecord.
                                 let block_arg_profiled_type = self.profiled_type_of_at(block_arg, state);
                                 let profiled_nil = block_arg_profiled_type.map_or(false, |pt| pt.is_nil());
                                 if statically_nil || profiled_nil {
@@ -6343,8 +6380,9 @@ impl Function {
             // too-complex shapes can't use index access
             return Err(Counter::getivar_fallback_complex);
         }
-        if self.policy.no_side_exits {
-            // On the final version, skip GetIvar shape specialization.
+        if self.policy.no_side_exits || self.site_exited(state, Recompile::IvarShape) {
+            // On the final version, skip GetIvar shape specialization. Same if the shape guard
+            // at this site exited in a previous version.
             // iseq_to_hir already generates polymorphic branches with a
             // GetIvar C call fallback for getinstancevariable, so we don't
             // need to wrap it again here.
@@ -6454,8 +6492,9 @@ impl Function {
     }
 
     fn try_emit_optimized_setivar(&mut self, block: BlockId, self_val: InsnId, id: ID, val: InsnId, profiled_type: ProfiledType, state: InsnId, recompile: Option<Recompile>) -> Result<(), Counter> {
-        if self.policy.no_side_exits {
-            // On the final version, don't add a shape guard without a fallback.
+        if self.policy.no_side_exits || self.site_exited(state, Recompile::IvarShape) {
+            // On the final version, don't add a shape guard without a fallback. Same if the
+            // shape guard at this site exited in a previous version.
             return Err(Counter::setivar_fallback_no_side_exits);
         }
         let spec = self.prepare_optimized_setivar(id, profiled_type)?;
@@ -6587,7 +6626,7 @@ impl Function {
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
                 match self.resolve(insn_id).insn(self) {
-                    &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } => {
+                    &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } if !self.site_exited(state, Recompile::NoProfile) => {
                         self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile::NoProfile) });
                         // SideExit is a terminator; don't add remaining instructions
                         break;
@@ -8508,9 +8547,11 @@ impl Function {
         mut emit_optimized: impl FnMut(&mut Function, BlockId, T) -> Option<InsnId>,
         mut emit_fallback: impl FnMut(&mut Function, BlockId) -> Option<InsnId>,
     ) -> Option<(BlockId, Option<InsnId>)> {
+        // Avoid side exits on the final version, or at a site whose exits fired in a previous version.
+        let no_shape_exits = self.policy.no_side_exits || self.site_exited(exit_id, Recompile::IvarShape);
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
-            if self.policy.no_side_exits {
+            if self.policy.no_side_exits || self.site_exited(exit_id, Recompile::NoProfile) {
                 self.count(block, fallback_counter);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
@@ -8521,7 +8562,7 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        if profiles.len() == 1 && !no_shape_exits {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile::IvarShape));
             let result = emit_optimized(self, block, profiles[0]);
@@ -8543,7 +8584,7 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
+                if no_shape_exits {
                     // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
                     let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
@@ -9731,7 +9772,7 @@ fn add_iseq_to_hir(
                         state.stack_push(join_param);
                         block = join_block;
                     } else {
-                        if let Some(profiled_shape) = (if fun.policy.no_side_exits { None } else { Some(true) })
+                        if let Some(profiled_shape) = (if fun.policy.no_side_exits || fun.site_exited(exit_id, Recompile::IvarShape) { None } else { Some(true) })
                             .and_then(|_| fun.monomorphic_summary(&profiles, self_param, exit_id))
                             .and_then(can_optimize) {
                             self_param = fun.guard_heap(block, self_param, exit_id);

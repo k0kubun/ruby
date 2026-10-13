@@ -160,6 +160,18 @@ pub struct Options {
     /// Maximum number of versions per ISEQ
     pub max_versions: usize,
 
+    /// Remember which (insn, guard kind) recompile exits fired and stop speculating on that kind
+    /// at that site in the next versions of the ISEQ. See `crate::payload::ExitSites`.
+    pub site_exit_history: bool,
+
+    /// With site_exit_history, the number of versions an ISEQ may get beyond max_versions when
+    /// its final version hits recompile exits at a site that never exited before.
+    pub site_exit_extra_versions: usize,
+
+    /// With site_exit_history, the number of different versions that must exit at a site before
+    /// it's de-speculated. Exits from a final version de-speculate the site right away.
+    pub site_exit_threshold: u8,
+
     /// Per-callee size threshold for inlining, measured as the callee's YARV bytecode size
     /// (see `get_iseq_encoded_size`). Callees larger than this are rejected by `should_inline`.
     /// 0 disables inlining entirely.
@@ -233,6 +245,9 @@ impl Default for Options {
             allowed_iseqs: None,
             log_compiled_iseqs: None,
             max_versions: DEFAULT_MAX_VERSIONS,
+            site_exit_history: true,
+            site_exit_extra_versions: 2,
+            site_exit_threshold: 1,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             inline_budget: DEFAULT_INLINE_BUDGET as InlineBudget,
             inline_deny: HashSet::new(),
@@ -461,6 +476,19 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
+            Err(_) => return None,
+        },
+
+        ("site-exit-history", "" | "1" | "true") => options.site_exit_history = true,
+        ("site-exit-history", "0" | "false") => options.site_exit_history = false,
+
+        ("site-exit-threshold", _) => match opt_val.parse() {
+            Ok(n) => options.site_exit_threshold = n,
+            Err(_) => return None,
+        },
+
+        ("site-exit-extra-versions", _) => match opt_val.parse() {
+            Ok(n) => options.site_exit_extra_versions = n,
             Err(_) => return None,
         },
 
@@ -701,6 +729,20 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
+}
+
+/// Update --zjit-site-exit-history for testing
+#[cfg(test)]
+pub fn set_site_exit_history(enabled: bool) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().site_exit_history = enabled; }
+}
+
+/// Update --zjit-site-exit-threshold for testing
+#[cfg(test)]
+pub fn set_site_exit_threshold(threshold: u8) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().site_exit_threshold = threshold; }
 }
 
 /// Update --zjit-max-versions for testing
