@@ -270,6 +270,7 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
         payload.profile.phase = crate::profile::ProfilePhase::Reprofile;
+        payload.profile.decay(get_option!(profile_decay));
         if get_option!(reprofile) == Reprofile::Invalidate {
             // Give the next profiling window a full sample budget. The profiling
             // instructions are installed when the window starts (vm.c / function stubs).

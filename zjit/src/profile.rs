@@ -4,7 +4,7 @@
 #![allow(non_upper_case_globals)]
 
 use std::collections::HashMap;
-use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
+use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles, ProfileDecay}};
 use crate::distribution::{Distribution, DistributionKind, DistributionSummary};
 use crate::stats::Counter::{self, profile_time_ns};
 use crate::stats::{incr_counter_by, with_time_stat};
@@ -471,6 +471,30 @@ impl IseqProfile {
             splat_lengths: HashMap::new(),
             phase: ProfilePhase::Initial,
             compiled_kinds: HashMap::new(),
+        }
+    }
+
+    /// Age the type counts collected so far, so that the next profiling window
+    /// weighs more than older samples.
+    pub fn decay(&mut self, decay: ProfileDecay) {
+        let apply = |dist: &mut TypeDistribution| match decay {
+            ProfileDecay::None => {},
+            ProfileDecay::Halve => dist.halve(),
+            ProfileDecay::Clear => *dist = TypeDistribution::new(),
+        };
+        if decay == ProfileDecay::None {
+            return;
+        }
+        for entry in &mut self.entries {
+            entry.opnd_types.iter_mut().for_each(apply);
+        }
+        self.super_cme.values_mut().for_each(apply);
+        for dist in self.splat_lengths.values_mut() {
+            match decay {
+                ProfileDecay::None => {},
+                ProfileDecay::Halve => dist.halve(),
+                ProfileDecay::Clear => *dist = SplatLengthDistribution::new(),
+            }
         }
     }
 

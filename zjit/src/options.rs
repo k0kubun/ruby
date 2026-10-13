@@ -90,6 +90,9 @@ pub struct Options {
     /// When to re-arm interpreter profiling for the next version. See [Reprofile].
     pub reprofile: Reprofile,
 
+    /// How to age existing profiles when a version is invalidated. See [ProfileDecay].
+    pub profile_decay: ProfileDecay,
+
     /// Enable ZJIT statistics
     pub stats: bool,
 
@@ -213,6 +216,7 @@ impl Default for Options {
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             reprofile: Reprofile::Compile,
+            profile_decay: ProfileDecay::None,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -285,6 +289,18 @@ pub enum Reprofile {
     /// Only when a version is invalidated. The next version's extra samples then all
     /// come from the interpreter's profiling window before the recompile.
     Invalidate,
+}
+
+/// --zjit-profile-decay values: what to do with existing type counts when a version
+/// is invalidated, before the profiling window for the next version.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProfileDecay {
+    /// Keep all counts
+    None,
+    /// Halve all counts, dropping types whose count reaches zero
+    Halve,
+    /// Forget all counts
+    Clear,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -477,6 +493,10 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("reprofile", "compile") => options.reprofile = Reprofile::Compile,
         ("reprofile", "invalidate") => options.reprofile = Reprofile::Invalidate,
+
+        ("profile-decay", "none") => options.profile_decay = ProfileDecay::None,
+        ("profile-decay", "halve") => options.profile_decay = ProfileDecay::Halve,
+        ("profile-decay", "clear") => options.profile_decay = ProfileDecay::Clear,
 
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,

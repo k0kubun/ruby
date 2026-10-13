@@ -44,6 +44,25 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         }
     }
 
+    /// Halve every count, dropping items whose count reaches zero. Keeps the
+    /// buckets sorted the same way and packed at the front.
+    pub fn halve(&mut self) {
+        let mut next = 0;
+        for i in 0..N {
+            let count = self.counts[i] / 2;
+            if count > 0 {
+                self.buckets[next] = self.buckets[i];
+                self.counts[next] = count;
+                next += 1;
+            }
+        }
+        for i in next..N {
+            self.buckets[i] = Default::default();
+            self.counts[i] = 0;
+        }
+        self.other /= 2;
+    }
+
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
         self.buckets.iter().zip(self.counts.iter())
             .filter_map(|(&bucket, &count)| if count > 0 { Some(bucket) } else { None })
@@ -193,6 +212,37 @@ mod distribution_tests {
         assert_eq!(dist.buckets[1], 10);
         assert_eq!(dist.counts[1], 2);
         assert_eq!(dist.other, 0);
+    }
+
+    #[test]
+    fn halve_drops_singletons_and_keeps_order() {
+        let mut dist = Distribution::<usize, 4>::new();
+        for _ in 0..5 { dist.observe(10); }
+        dist.observe(11);
+        for _ in 0..3 { dist.observe(12); }
+        dist.halve();
+        assert_eq!(dist.buckets[0], 10);
+        assert_eq!(dist.counts[0], 2);
+        assert_eq!(dist.buckets[1], 12);
+        assert_eq!(dist.counts[1], 1);
+        assert_eq!(dist.counts[2], 0);
+        assert_eq!(dist.counts[3], 0);
+        // A dropped item gets a fresh bucket instead of a duplicate one
+        dist.observe(11);
+        assert_eq!(dist.buckets[2], 11);
+        assert_eq!(dist.counts[2], 1);
+        let summary = DistributionSummary::new(&dist);
+        assert!(summary.is_polymorphic());
+    }
+
+    #[test]
+    fn halve_monomorphic_minority_becomes_monomorphic() {
+        let mut dist = Distribution::<usize, 4>::new();
+        for _ in 0..6 { dist.observe(10); }
+        dist.observe(11);
+        assert!(DistributionSummary::new(&dist).is_skewed_polymorphic());
+        dist.halve();
+        assert!(DistributionSummary::new(&dist).is_monomorphic());
     }
 
     #[test]
