@@ -114,6 +114,25 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_profiling_tier_dispatches_on_megamorphic_shapes() {
+        set_call_threshold(2);
+        set_profiling_tier(100, 100);
+        // Tier 1 profiles receivers of one class with 10 shapes, which overflows the distribution
+        eval(r#"
+            class C
+              def initialize(i) = instance_variable_set(:"@a#{i}", i)
+              def foo = 1
+            end
+            def test(o) = o.foo
+            (0..9).each { |i| test(C.new(i)) }
+        "#);
+        // The next version (tier 2) still dispatches on C instead of a megamorphic dynamic send
+        let hir = hir_string("test");
+        assert!(hir.contains("CondBranchHasType"), "{hir}");
+        assert!(!hir.contains("megamorphic"), "{hir}");
+    }
+
+    #[test]
     fn test_profiling_tier_skips_iseq_without_profiled_insns() {
         set_profiling_tier(100, 200);
         eval("
