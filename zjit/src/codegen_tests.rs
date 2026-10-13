@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -290,6 +290,41 @@ fn test_function_stub_reprofiles_after_invalidation() {
     // The following hit observes a completed profiling window and recompiles.
     assert_eq!(Qtrue, eval("stub_reprofile_entry(1.5) == 2.5"));
     assert_eq!(2, get_or_create_iseq_payload(target_iseq).versions.len());
+}
+
+#[test]
+fn test_profile_site_counts_by_maturity() {
+    enable_zjit_stats();
+    set_num_profiles(2);
+    set_call_threshold(3);
+    eval("
+        def profile_site_maturity(a, b, flag)
+          if flag
+            a - b
+          else
+            a + b
+          end
+        end
+        profile_site_maturity(1, 2, false)
+        profile_site_maturity(1, 2, false)
+    ");
+
+    let counters = crate::state::ZJITState::get_counters();
+    let (full, none, interp, recompile) = (counters.profile_site_full, counters.profile_site_none,
+        counters.no_profile_site_first_compile_interp, counters.no_profile_site_recompile);
+    let no_profile_opt_minus = crate::state::ZJITState::get_no_profile_insn_counters()[YARVINSN_opt_minus as usize];
+
+    // The third call compiles the method. `a + b` was profiled in both calls of
+    // the profiling window, and `a - b` was never reached.
+    eval("profile_site_maturity(1, 2, false)");
+    let iseq = get_method_iseq("self", "profile_site_maturity");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+    let counters = crate::state::ZJITState::get_counters();
+    assert_eq!(full + 1, counters.profile_site_full);
+    assert_eq!(none + 1, counters.profile_site_none);
+    assert_eq!(interp + 1, counters.no_profile_site_first_compile_interp);
+    assert_eq!(recompile, counters.no_profile_site_recompile);
+    assert_eq!(no_profile_opt_minus + 1, crate::state::ZJITState::get_no_profile_insn_counters()[YARVINSN_opt_minus as usize]);
 }
 
 #[test]
