@@ -262,11 +262,17 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 /// TODO: evolve this into a general `handle_event(iseq, event)` state machine that
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
-pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, trigger: Counter) {
     let payload = get_or_create_iseq_payload(iseq);
+    if !unsafe { version.as_ref() }.is_invalidated()
+        && payload.versions.len() >= max_iseq_versions()
+    {
+        incr_counter!(invalidation_skipped_max_versions);
+    }
     if !unsafe { version.as_ref() }.is_invalidated()
         && payload.versions.len() < max_iseq_versions()
     {
+        incr_counter_by(trigger, 1);
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
 
@@ -374,6 +380,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         }
     }
     payload.versions.push(version);
+    crate::stats::record_iseq_version_count(payload.versions.len(), max_iseq_versions());
     code_ptrs
 }
 
@@ -1029,7 +1036,7 @@ fn gen_patch_point(jit: &mut JITState, asm: &mut Assembler, function: &Function,
     let exit = build_side_exit(jit, function, state);
 
     // Let compile_exits compile a side exit. Let scratch_split lower it with split_patch_point.
-    asm.patch_point(Target::SideExit(Box::new(SideExitTarget { exit, reason: PatchPoint(invariant) })), invariant, jit.version);
+    asm.patch_point(Target::SideExit(Box::new(SideExitTarget { exit, reason: PatchPoint(invariant), final_version: is_final_version(jit) })), invariant, jit.version);
 }
 
 /// This is used by scratch_split to lower PatchPoint into PatchPointPad and PosMarker.
@@ -3763,16 +3770,24 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
 /// Build a Target::SideExit
 fn side_exit(jit: &JITState, function: &Function, state: &FrameState, reason: SideExitReason) -> Target {
     let exit = build_side_exit(jit, function, state);
-    Target::SideExit(Box::new(SideExitTarget { exit, reason }))
+    Target::SideExit(Box::new(SideExitTarget { exit, reason, final_version: is_final_version(jit) }))
+}
+
+/// Return true if the version being compiled is the last version allowed by --zjit-max-versions.
+/// The version being compiled has not been pushed to `payload.versions` yet.
+fn is_final_version(jit: &JITState) -> bool {
+    get_or_create_iseq_payload(jit.iseq()).versions.len() + 1 >= max_iseq_versions()
 }
 
 /// Build a Target::SideExit that optionally triggers exit_recompile on the exit path.
 fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameState, reason: SideExitReason, recompile: Option<Recompile>) -> Target {
     let mut exit = build_side_exit(jit, function, state);
-    exit.recompile = recompile.map(|_| SideExitRecompile {
+    exit.recompile = recompile.map(|kind| SideExitRecompile {
         compiled_iseq: Opnd::Value(VALUE::from(jit.iseq())),
+        frame_iseq: Opnd::Value(VALUE::from(state.iseq)),
+        site: Opnd::UImm(((kind as u64) << 32) | state.insn_idx() as u64),
     });
-    Target::SideExit(Box::new(SideExitTarget { exit, reason }))
+    Target::SideExit(Box::new(SideExitTarget { exit, reason, final_version: is_final_version(jit) }))
 }
 
 /// Build a side-exit context
@@ -3839,7 +3854,11 @@ c_callable! {
     /// The version gets invalidated after `--zjit-num-exits-until-invalidate` recompile exits.
     /// Invalidation resets the ISEQ's call counter and re-stubs incoming JIT-to-JIT calls,
     /// so every entry runs the profiling window in the interpreter before the next compile.
-    pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE) {
+    pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE, frame_iseq_raw: VALUE, site: u64) {
+        let kind = hir::Recompile::from_u8((site >> 32) as u8).expect("valid Recompile kind");
+        incr_counter_by(crate::stats::recompile_exit_counter(kind), 1);
+        let _ = frame_iseq_raw; // Used by per-site exit history
+
         // Fast check before taking the VM lock: skip if the compiled unit is already
         // invalidated or at the version limit. This avoids expensive lock acquisition
         // on every shape guard exit taken by frames still running the invalidated code.
@@ -3855,6 +3874,7 @@ c_callable! {
             }
 
             // Wait for the configured number of recompile exits before invalidation.
+            incr_counter!(budgeted_recompile_exit_count);
             payload.num_exits_until_invalidate = payload.num_exits_until_invalidate.saturating_sub(1);
             if payload.num_exits_until_invalidate > 0 {
                 return;
@@ -3866,7 +3886,7 @@ c_callable! {
             let payload = get_or_create_iseq_payload(compiled_iseq);
             if let Some(version) = payload.versions.last_mut() {
                 let cb = ZJITState::get_code_block();
-                invalidate_iseq_version(cb, compiled_iseq, version);
+                invalidate_iseq_version(cb, compiled_iseq, version, Counter::invalidation_recompile_exit);
                 cb.mark_all_executable();
             }
         });

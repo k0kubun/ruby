@@ -646,6 +646,10 @@ pub struct SideExitRecompile {
     /// The compiled unit whose version must be invalidated to force a recompile. For inlined
     /// methods, this will be the outer function it was inlined into.
     pub compiled_iseq: Opnd,
+    /// The ISEQ of the frame the guard belongs to (the callee for inlined code)
+    pub frame_iseq: Opnd,
+    /// `(kind as u64) << 32 | insn_idx` of the guard. See `exit_recompile`.
+    pub site: Opnd,
 }
 
 /// Payload of `Target::SideExit`, boxed to keep `Target` (and every `Insn`
@@ -656,6 +660,9 @@ pub struct SideExitTarget {
     pub exit: SideExit,
     /// We use this to increment exit counters.
     pub reason: SideExitReason,
+    /// True if this exit belongs to the final version (--zjit-max-versions) of the ISEQ.
+    /// Used only for the final_exit_* stats.
+    pub final_version: bool,
 }
 
 /// Branch target (something that we can jump to)
@@ -3137,7 +3144,7 @@ impl Assembler
             if let Some(recompile) = &exit.recompile {
                 use crate::codegen::exit_recompile;
                 asm_comment!(asm, "invalidate for recompilation");
-                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
+                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq, recompile.frame_iseq, recompile.site);
             }
         }
 
@@ -3215,7 +3222,7 @@ impl Assembler
             // Compile a side exit. Note that this is past register assignment,
             // so you can't use an instruction that returns a VReg.
             if let Target::SideExit(data) = target {
-                let SideExitTarget { exit, reason } = *data;
+                let SideExitTarget { exit, reason, final_version } = *data;
                 // Only record the exit if `trace_side_exits` is defined and the counter is either the one specified
                 let should_record_exit = get_option!(trace_side_exits).map(|trace| match trace {
                     TraceExits::All => true,
@@ -3232,6 +3239,10 @@ impl Assembler
                     if get_option!(stats) || cfg!(test) {
                         asm_comment!(self, "increment a side exit counter");
                         self.incr_counter(Opnd::const_ptr(exit_counter_ptr(reason)), 1.into());
+                        if final_version {
+                            asm_comment!(self, "increment a final-version side exit counter");
+                            self.incr_counter(Opnd::const_ptr(crate::stats::final_exit_counter_ptr(reason)), 1.into());
+                        }
 
                         if let SideExitReason::UnhandledYARVInsn(opcode) = reason {
                             asm_comment!(self, "increment an unhandled YARV insn counter");

@@ -27,7 +27,7 @@ macro_rules! compile_patch_points {
                 let mut version = patch_point.version;
                 let iseq = unsafe { version.as_ref() }.iseq;
                 if !iseq.is_null() {
-                    invalidate_iseq_version($cb, iseq, &mut version);
+                    invalidate_iseq_version($cb, iseq, &mut version, crate::stats::Counter::invalidation_patch_point);
                     // Remember NoSingletonClass busts on the payload
                     if is_no_singleton_class!($cause) {
                         let payload = get_or_create_iseq_payload(iseq);
