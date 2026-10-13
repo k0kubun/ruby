@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles};
+use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles, set_recompile_threshold};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -245,6 +245,40 @@ fn test_recompile_exit_waits_for_exit_budget() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(1, payload.versions.len());
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_recompile_threshold_after_invalidation() {
+    set_call_threshold(10);
+    set_num_exits_until_invalidate(1);
+    set_recompile_threshold(Some(2));
+    eval("
+        def recompile_threshold_target(a, b) = a + b
+        i = 0
+        while i < 10
+          recompile_threshold_target(1, 2)
+          i += 1
+        end
+    ");
+
+    let iseq = get_method_iseq("self", "recompile_threshold_target");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+
+    // The first Float argument takes a recompile exit and invalidates the version.
+    eval("recompile_threshold_target(1.5, 2.5)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+
+    // With --zjit-recompile-threshold=2, the second call after invalidation recompiles
+    // instead of waiting for --zjit-call-threshold calls.
+    eval("recompile_threshold_target(1.5, 2.5)");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+    eval("recompile_threshold_target(1.5, 2.5)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
 }
 
 #[test]
