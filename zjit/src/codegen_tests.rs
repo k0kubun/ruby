@@ -1078,7 +1078,7 @@ fn test_yield_polymorphic_symbol_handler_falls_back() {
 fn test_yield_polymorphic_ifunc_handler_falls_back() {
     // An ifunc handler (Enumerator#each yields to the enumerator's C block) at a polymorphic
     // yield site fails the ISEQ tag check and takes the generic InvokeBlock fallback in-line.
-    // Threshold 4 keeps calls 1-3 in the profile window (num_profiles defaults to 5), so
+    // Threshold 4 keeps calls 1-3 in the profile window (num_profiles defaults to 10), so
     // invoke's first compile already sees both blocks and installs the polymorphic dispatch;
     // the standalone version matters here because the Enumerator calls invoke from C.
     set_call_threshold(4);
