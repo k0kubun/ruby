@@ -474,6 +474,15 @@ impl IseqProfile {
         }
     }
 
+    /// Reset every instruction's remaining profile count without installing
+    /// profiling instructions.
+    pub fn reset_profiles_remaining_counts(&mut self) {
+        let num_profiles = get_option!(num_profiles);
+        for entry in &mut self.entries {
+            entry.profiles_remaining = num_profiles;
+        }
+    }
+
     /// Count how the DistributionKind of each profiled operand changed since the
     /// previous compile, and remember the current kinds for the next compile.
     /// Called right before building HIR, only with --zjit-stats.

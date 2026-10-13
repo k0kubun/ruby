@@ -28,7 +28,7 @@ use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, InlineDepth, Reprofile, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
@@ -270,6 +270,11 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
         payload.profile.phase = crate::profile::ProfilePhase::Reprofile;
+        if get_option!(reprofile) == Reprofile::Invalidate {
+            // Give the next profiling window a full sample budget. The profiling
+            // instructions are installed when the window starts (vm.c / function stubs).
+            payload.profile.reset_profiles_remaining_counts();
+        }
 
         // Recompile JIT-to-JIT calls into the invalidated ISEQ
         for incoming in unsafe { version.as_ref() }.incoming.iter() {
@@ -3761,7 +3766,7 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
     }
     function.dump_hir();
     let non_final_version = get_or_create_iseq_payload(iseq).versions.len() + 1 < max_iseq_versions();
-    if non_final_version {
+    if non_final_version && get_option!(reprofile) == Reprofile::Compile {
         reset_profiles_remaining(iseq);
     }
     Ok(function)

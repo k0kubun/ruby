@@ -87,6 +87,9 @@ pub struct Options {
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
+    /// When to re-arm interpreter profiling for the next version. See [Reprofile].
+    pub reprofile: Reprofile,
+
     /// Enable ZJIT statistics
     pub stats: bool,
 
@@ -209,6 +212,7 @@ impl Default for Options {
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
+            reprofile: Reprofile::Compile,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -270,6 +274,18 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-trace-invalidation",
                      "Record invalidation events as Perfetto trace events."),
 ];
+
+/// --zjit-reprofile values: when to re-arm interpreter profiling after the first compile.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Reprofile {
+    /// Right after compiling a non-final version. While that version is live, the
+    /// interpreter only runs frames that side-exited from it, so the samples are
+    /// biased toward the types that failed a guard.
+    Compile,
+    /// Only when a version is invalidated. The next version's extra samples then all
+    /// come from the interpreter's profiling window before the recompile.
+    Invalidate,
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum TraceExits {
@@ -458,6 +474,9 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Ok(n) => options.num_exits_until_invalidate = n,
             Err(_) => return None,
         },
+
+        ("reprofile", "compile") => options.reprofile = Reprofile::Compile,
+        ("reprofile", "invalidate") => options.reprofile = Reprofile::Invalidate,
 
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
