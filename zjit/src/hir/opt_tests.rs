@@ -27,6 +27,104 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_profiling_tier_does_not_specialize_on_profiles() {
+        set_profiling_tier(100, 200);
+        // Profile the instructions in the interpreter but don't compile yet
+        eval("
+            def test(a, b) = a + b
+            test(1, 2)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          v4:BasicObject = LoadField v2, :b@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :a@1
+          v9:BasicObject = LoadArg :b@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          Tier1Tick
+          Tier1Profile opt_plus, v12, v13
+          v22:BasicObject = Send v12, :+, v13 # SendFallbackReason: Send: no profile data available
+          CheckInterrupts
+          Return v22
+        ");
+    }
+
+    #[test]
+    fn test_profiling_tier_profiles_ivars_and_counts_loops() {
+        set_profiling_tier(100, 200);
+        eval("
+            class C
+              def initialize = @a = 1
+              def test(n)
+                i = 0
+                while i < n
+                  i += @a
+                end
+                i
+              end
+            end
+            C.new.test(2)
+        ");
+        assert_snapshot!(hir_string_proc("C.new.method(:test)"), @"
+        fn test@<compiled>:5:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :n@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :n@1
+          Jump bb3(v7, v8)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v68:NilClass = Const Value(nil)
+          Tier1Tick
+          v18:Fixnum[0] = Const Value(0)
+          Jump bb5(v18)
+        bb5(v25:BasicObject):
+          Tier1Profile opt_lt, v25, v12
+          v32:BasicObject = Send v25, :<, v12 # SendFallbackReason: Send: no profile data available
+          CheckInterrupts
+          v35:CBool = Test v32
+          CondBranch v35, bb4(), bb6()
+        bb4():
+          Tier1Tick
+          Tier1Profile getinstancevariable
+          v57:HeapBasicObject = GuardType v11, HeapBasicObject
+          v58:BasicObject = GetIvar v57, :@a
+          Tier1Profile opt_plus, v25, v58
+          v62:BasicObject = Send v25, :+, v58 # SendFallbackReason: Send: no profile data available
+          PatchPoint NoEPEscape(test)
+          Jump bb5(v62)
+        bb6():
+          CheckInterrupts
+          Return v25
+        ");
+    }
+
+    #[test]
+    fn test_profiling_tier_skips_iseq_without_profiled_insns() {
+        set_profiling_tier(100, 200);
+        eval("
+            def test = [1, 2]
+            test
+        ");
+        let hir = hir_string("test");
+        assert!(!hir.contains("Tier1Tick"), "{hir}");
+    }
+
+    #[test]
     fn test_send_direct_rest_array_keeps_stripped_block_arg_in_exit_state() {
         eval("
             def rest_callee(*args) = args

@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_profiling_tier};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -192,6 +192,60 @@ fn test_putobject() {
         test
         test
     "), @"1");
+}
+
+#[test]
+fn test_profiling_tier_tiers_up() {
+    set_call_threshold(2);
+    set_profiling_tier(100, 4); // the compiling call counts as an entry
+    eval("
+        def tier_up(a, b) = a + b
+        tier_up(1, 2)
+        tier_up(1, 2) # compile tier 1
+    ");
+    let iseq = get_method_iseq("self", "tier_up");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    let tier1 = unsafe { payload.versions[0].as_ref() };
+    assert!(tier1.tier1);
+    assert!(!tier1.is_invalidated());
+
+    // Tier 1 profiles operands that the interpreter never saw
+    assert_snapshot!(inspect("tier_up(1.5, 2.5)"), @"4.0");
+    assert_snapshot!(inspect("tier_up(1.5, 2.5)"), @"4.0");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+
+    // The third tier 1 entry compiles tier 2
+    assert_snapshot!(inspect("tier_up(1, 2)"), @"3");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert!(unsafe { payload.versions[0].as_ref() }.is_invalidated());
+    let tier2 = unsafe { payload.versions[1].as_ref() };
+    assert!(!tier2.tier1);
+    assert!(matches!(tier2.status, IseqStatus::Compiled(_)), "tier 2 should be compiled: {:?}", tier2.status);
+    assert_snapshot!(inspect("tier_up(1, 2)"), @"3");
+    assert_snapshot!(inspect("tier_up(1.5, 2.5)"), @"4.0");
+}
+
+#[test]
+fn test_profiling_tier_redirects_jit_to_jit_calls() {
+    set_call_threshold(2);
+    set_profiling_tier(100, 4);
+    assert_snapshot!(inspect("
+        def callee(a) = a + 1
+        def caller(a) = callee(a)
+        caller(1)
+        caller(1) # compile tier 1 for caller
+        r = []
+        10.times { |i| r << caller(i) }
+        r
+    "), @"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
+    let callee = get_method_iseq("self", "callee");
+    let payload = get_or_create_iseq_payload(callee);
+    assert_eq!(2, payload.versions.len());
+    assert!(unsafe { payload.versions[0].as_ref() }.tier1);
+    assert!(!unsafe { payload.versions[1].as_ref() }.tier1);
 }
 
 #[test]

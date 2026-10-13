@@ -280,6 +280,52 @@ class TestZJITCLI < Test::Unit::TestCase
     }, stats: true
   end
 
+  def test_profiling_tier
+    script = %q{
+      class A; def v = 1; end
+      class B; def v = 2; end
+      def test(x, i)
+        # This branch is not taken until long after the first compilation
+        if i > 40
+          x.v + i
+        else
+          i + 1
+        end
+      end
+      a = A.new
+      b = B.new
+      sum = 0
+      200.times { |i| sum += test(i.even? ? a : b, i) }
+      stats = RubyVM::ZJIT.stats
+      [sum, stats[:tier1_compiled_iseq_count] > 0, stats[:tier_up_count] > 0, stats[:tier1_profile_samples] > 0]
+    }
+    assert_runs '[20180, true, true, true]', script, call_threshold: 2, stats: true,
+      extra_args: ['--zjit-profiling-tier', '--zjit-tier1-num-profiles=20', '--zjit-tier2-call-threshold=10']
+    # Tier knobs imply --zjit-profiling-tier
+    assert_runs '[20180, true, true, true]', script, call_threshold: 2, stats: true,
+      extra_args: ['--zjit-tier2-call-threshold=10']
+    assert_runs '[20180, false, false, false]', script, call_threshold: 2, stats: true,
+      extra_args: ['--zjit-tier2-call-threshold=10', '--zjit-profiling-tier=0']
+  end
+
+  def test_profiling_tier_tier_up_from_loop
+    # A method entered once tiers up from its loop header, and later calls use tier 2
+    assert_runs '[3, true]', %q{
+      def test(n)
+        sum = 0
+        i = 0
+        while i < n
+          sum += i
+          i += 1
+        end
+        sum
+      end
+      test(1) # compile tier 1
+      test(100) # tier up from the loop
+      [test(3), RubyVM::ZJIT.stats[:tier_up_count] > 0]
+    }, call_threshold: 1, stats: true, extra_args: ['--zjit-tier2-call-threshold=50']
+  end
+
   def test_reset_stats
     assert_runs 'true', %q{
       def test = 1
