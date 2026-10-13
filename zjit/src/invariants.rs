@@ -5,7 +5,8 @@ use std::{collections::{HashMap, HashSet}, mem};
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
 use crate::codegen::invalidate_iseq_version;
-use crate::cruby::{rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
+use crate::cruby::{rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
+use crate::lifecycle::{self, InvalidationCause};
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
 use crate::gc::remove_gc_offsets;
@@ -27,7 +28,7 @@ macro_rules! compile_patch_points {
                 let mut version = patch_point.version;
                 let iseq = unsafe { version.as_ref() }.iseq;
                 if !iseq.is_null() {
-                    invalidate_iseq_version($cb, iseq, &mut version);
+                    invalidate_iseq_version($cb, iseq, &mut version, InvalidationCause::PatchPoint);
                     // Remember NoSingletonClass busts on the payload
                     if is_no_singleton_class!($cause) {
                         let payload = get_or_create_iseq_payload(iseq);
@@ -220,22 +221,20 @@ pub extern "C" fn rb_zjit_invalidate_no_ep_escape(iseq: IseqPtr) {
             // instead of [] for keyword defaults).
             //
             // We can't rely on the invalidate_iseq_version() calls made by
-            // compile_patch_points! because it skips when at MAX_ISEQ_VERSIONS
-            // (to prevent unbounded recompilation). Instead, directly mark the
-            // versions as invalidated, reset jit_func, and re-stub incoming
-            // JIT-to-JIT calls so the interpreter takes over permanently.
+            // compile_patch_points! because the lifecycle skips them at the version
+            // limit (to prevent unbounded recompilation). An EpEscape invalidation
+            // is forced: the lifecycle marks the versions as invalidated and resets
+            // jit_func, and we re-stub incoming JIT-to-JIT calls so the interpreter
+            // takes over permanently.
             let payload = get_or_create_iseq_payload(iseq);
             patched_versions.extend(payload.versions.last());
             for mut version in patched_versions {
-                use crate::payload::IseqStatus;
                 let owner_iseq = unsafe { version.as_ref() }.iseq;
                 if owner_iseq.is_null() {
                     continue;
                 }
-                if unsafe { version.as_ref() }.status != IseqStatus::Invalidated {
-                    unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
-                    unsafe { rb_iseq_reset_jit_func(owner_iseq) };
-
+                let owner_payload = get_or_create_iseq_payload(owner_iseq);
+                if lifecycle::on_invalidate(owner_iseq, owner_payload, &mut version, InvalidationCause::EpEscape) {
                     // Re-stub incoming JIT-to-JIT calls. Resetting jit_func is not
                     // enough: SendDirect callers jump straight into the invalidated
                     // code, whose NoEPEscape patch points now side-exit with
@@ -442,7 +441,7 @@ pub fn track_no_trace_point_assumption(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_tracing_invalidate_all() {
-    use crate::payload::{get_or_create_iseq_payload, IseqStatus};
+    use crate::payload::get_or_create_iseq_payload;
     use crate::cruby::for_each_iseq;
 
     if !zjit_enabled_p() {
@@ -455,11 +454,7 @@ pub extern "C" fn rb_zjit_tracing_invalidate_all() {
 
         for_each_iseq(|iseq| {
             let payload = get_or_create_iseq_payload(iseq);
-
-            if let Some(version) = payload.versions.last_mut() {
-                unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
-            }
-            unsafe { rb_iseq_reset_jit_func(iseq) };
+            lifecycle::on_tracepoint_enabled(iseq, payload);
         });
 
         let cb = ZJITState::get_code_block();

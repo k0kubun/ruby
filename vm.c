@@ -567,8 +567,9 @@ zjit_compile(rb_execution_context_t *ec)
 
         // At profile-threshold, rewrite some of the YARV instructions
         // to zjit_* instructions to profile these instructions.
+        // The thresholds are published by zjit/src/lifecycle.rs.
         if (body->jit_entry_calls == rb_zjit_profile_threshold) {
-            rb_zjit_profile_enable(iseq);
+            rb_zjit_start_profiling(iseq, false);
         }
 
         // At call-threshold, compile the ISEQ with ZJIT.
@@ -647,8 +648,9 @@ jit_compile_exception(rb_execution_context_t *ec)
 
         // At profile-threshold, rewrite some of the YARV instructions
         // to zjit_* instructions to profile these instructions.
+        // The thresholds are published by zjit/src/lifecycle.rs.
         if (body->jit_exception_calls == rb_zjit_profile_threshold) {
-            rb_zjit_profile_enable(iseq);
+            rb_zjit_start_profiling(iseq, true);
         }
 
         // At call-threshold, compile the ISEQ with ZJIT.

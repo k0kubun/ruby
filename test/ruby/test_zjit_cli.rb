@@ -329,6 +329,18 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_trace_lifecycle
+    script = <<~RUBY
+      def test(object) = object.itself
+      5.times { test(1) }
+    RUBY
+    out, err, status = eval_with_jit(script, call_threshold: 3, num_profiles: 1, debug: false, extra_args: ['--zjit-trace-lifecycle', '--zjit-inline-threshold=0'])
+    assert_success(out, err, status)
+    assert_include(err, "ZJIT lifecycle: test@-e:1: Interpreted --InterpCall--> Profiling [StartProfiling]")
+    assert_include(err, "ZJIT lifecycle: test@-e:1: Profiling --StubHit--> Profiling [Compile]")
+    assert_include(err, "ZJIT lifecycle: test@-e:1: Profiling --CompileSucceeded--> Compiled(v1)")
+  end
+
   def test_send_forwarded_block_arg_nil_then_non_nil
     # Regression test: when a forwarded &block arg is profiled as nil, the nil
     # block optimization must update the frame state to match the stripped args.

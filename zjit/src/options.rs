@@ -19,11 +19,11 @@ pub enum PerfMap {
 pub const DEFAULT_MAX_VERSIONS: usize = 4;
 
 /// Default --zjit-num-profiles
-const DEFAULT_NUM_PROFILES: NumProfiles = 5;
+pub const DEFAULT_NUM_PROFILES: NumProfiles = 5;
 pub type NumProfiles = u16;
 
 /// Default --zjit-num-exits-until-invalidate
-const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
+pub const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
 pub type NumExits = u32;
 
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
@@ -53,19 +53,6 @@ pub const DEFAULT_INLINE_MAX_ITERATIONS: InlineDepth = 10;
 /// because depth is consumed as a JITFrame stack-slot index and as a term in
 /// native stack size computations, where every consumer is already `usize`.
 pub type InlineDepth = usize;
-
-/// Number of calls to start profiling YARV instructions.
-/// They are profiled `rb_zjit_call_threshold - rb_zjit_profile_threshold` times,
-/// which is equal to --zjit-num-profiles.
-#[unsafe(no_mangle)]
-#[allow(non_upper_case_globals)]
-pub static mut rb_zjit_profile_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD - DEFAULT_NUM_PROFILES as CallThreshold;
-
-/// Number of calls to compile ISEQ with ZJIT at jit_compile() in vm.c.
-/// --zjit-call-threshold=1 compiles on first execution without profiling information.
-#[unsafe(no_mangle)]
-#[allow(non_upper_case_globals)]
-pub static mut rb_zjit_call_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD;
 
 /// ZJIT command-line options. This is set before rb_zjit_init() sets
 /// ZJITState so that we can query some options while loading builtins.
@@ -148,6 +135,9 @@ pub struct Options {
     /// Trace invalidation events as Perfetto duration events.
     pub trace_invalidation: bool,
 
+    /// Print function lifecycle transitions to stderr. See lifecycle.rs.
+    pub trace_lifecycle: bool,
+
     /// Dump code map to /tmp for performance profilers.
     pub perf: Option<PerfMap>,
 
@@ -229,6 +219,7 @@ impl Default for Options {
             trace_fallbacks_sample_interval: 0,
             trace_compiles: false,
             trace_invalidation: false,
+            trace_lifecycle: false,
             perf: None,
             allowed_iseqs: None,
             log_compiled_iseqs: None,
@@ -269,6 +260,8 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Record compilation phases as Perfetto trace events."),
     ("--zjit-trace-invalidation",
                      "Record invalidation events as Perfetto trace events."),
+    ("--zjit-trace-lifecycle",
+                     "Print function lifecycle transitions to stderr."),
 ];
 
 #[derive(Copy, Clone, Debug)]
@@ -439,17 +432,14 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         },
 
         ("call-threshold", _) => match opt_val.parse() {
-            Ok(n) => {
-                unsafe { rb_zjit_call_threshold = n; }
-                update_profile_threshold();
-            },
+            Ok(n) => crate::lifecycle::set_call_threshold(n),
             Err(_) => return None,
         },
 
         ("num-profiles", _) => match opt_val.parse() {
             Ok(n) => {
                 options.num_profiles = n;
-                update_profile_threshold();
+                crate::lifecycle::publish_thresholds();
             },
             Err(_) => return None,
         },
@@ -546,6 +536,8 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("trace-compiles", "") => options.trace_compiles = true,
 
         ("trace-invalidation", "") => options.trace_invalidation = true,
+
+        ("trace-lifecycle", "") => options.trace_lifecycle = true,
 
         ("debug", "") => options.debug = true,
 
@@ -676,24 +668,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
     Some(())
 }
 
-/// Update rb_zjit_profile_threshold based on rb_zjit_call_threshold and options.num_profiles
-fn update_profile_threshold() {
-    if unsafe { rb_zjit_call_threshold == 1 } {
-        // If --zjit-call-threshold=1, never rewrite ISEQs to profile instructions.
-        unsafe { rb_zjit_profile_threshold = 0; }
-    } else {
-        // Otherwise, profile instructions at least once.
-        let num_profiles = get_option!(num_profiles);
-        unsafe { rb_zjit_profile_threshold = rb_zjit_call_threshold.saturating_sub(num_profiles.into()).max(1) };
-    }
-}
-
 /// Update --zjit-call-threshold for testing
 #[cfg(test)]
 pub fn set_call_threshold(call_threshold: CallThreshold) {
-    unsafe { rb_zjit_call_threshold = call_threshold; }
     rb_zjit_prepare_options();
-    update_profile_threshold();
+    crate::lifecycle::set_call_threshold(call_threshold);
 }
 
 /// Update --zjit-num-exits-until-invalidate for testing
@@ -722,7 +701,7 @@ pub fn set_inline_threshold(inline_threshold: InlineThreshold) {
 pub fn set_num_profiles(num_profiles: NumProfiles) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_profiles = num_profiles; }
-    update_profile_threshold();
+    crate::lifecycle::publish_thresholds();
 }
 
 /// Set --zjit-mem-size for testing. It's used to force OOM in tests.

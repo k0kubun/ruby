@@ -2399,7 +2399,6 @@ unsafe extern "C" {
     pub fn rb_iseqw_to_iseq(iseqw: VALUE) -> *const rb_iseq_t;
     pub fn rb_iseq_label(iseq: *const rb_iseq_t) -> VALUE;
     pub fn rb_iseq_defined_string(type_: defined_type) -> VALUE;
-    pub fn rb_zjit_profile_enable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_hash_new_size(flags_out: *mut VALUE, size: usize) -> usize;
     pub fn rb_zjit_new_obj_shape(flags: VALUE, alloc_size: usize) -> VALUE;
     pub fn rb_zjit_class_allocate_instance_fastpath(
@@ -2460,7 +2459,16 @@ unsafe extern "C" {
         code_ptr: *mut ::std::os::raw::c_void,
     );
     pub fn rb_vm_base_ptr(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
-    pub fn rb_zjit_iseq_has_profiled_enough(iseq: *const rb_iseq_t) -> bool;
+    pub fn rb_zjit_profile_enable(iseq: *const rb_iseq_t);
+    pub fn rb_zjit_iseq_entry_calls(
+        iseq: *const rb_iseq_t,
+        jit_exception: bool,
+    ) -> ::std::os::raw::c_uint;
+    pub fn rb_zjit_iseq_set_entry_calls(
+        iseq: *const rb_iseq_t,
+        jit_exception: bool,
+        calls: ::std::os::raw::c_uint,
+    );
     pub fn rb_zjit_iseq_insn_set(
         iseq: *const rb_iseq_t,
         insn_idx: ::std::os::raw::c_uint,

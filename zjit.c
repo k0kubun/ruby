@@ -176,24 +176,25 @@ rb_zjit_profile_enable(const rb_iseq_t *iseq)
     }
 }
 
-// Return false if a function stub has not collected enough profiles yet, enabling
-// profiling instructions as needed. Return true once enough profiles are collected.
-bool
-rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
+// Get the interpreter call counter that drives ZJIT's function lifecycle (zjit/src/lifecycle.rs)
+unsigned int
+rb_zjit_iseq_entry_calls(const rb_iseq_t *iseq, bool jit_exception)
 {
     struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    return jit_exception ? body->jit_exception_calls : body->jit_entry_calls;
+}
 
-    if (body->jit_entry_calls < rb_zjit_profile_threshold) {
-        // Skip the unprofiled warmup. The compiled caller already establishes
-        // that the callee is hot, so go straight to the profiling window.
-        body->jit_entry_calls = rb_zjit_profile_threshold;
-        rb_zjit_profile_enable(iseq);
+// Set the interpreter call counter that drives ZJIT's function lifecycle (zjit/src/lifecycle.rs)
+void
+rb_zjit_iseq_set_entry_calls(const rb_iseq_t *iseq, bool jit_exception, unsigned int calls)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    if (jit_exception) {
+        body->jit_exception_calls = calls;
     }
     else {
-        body->jit_entry_calls++;
+        body->jit_entry_calls = calls;
     }
-
-    return body->jit_entry_calls >= rb_zjit_call_threshold;
 }
 
 // Convert a given ISEQ's ZJIT instructions to bare instructions

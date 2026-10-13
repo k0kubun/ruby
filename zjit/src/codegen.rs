@@ -18,9 +18,9 @@ use crate::invariants::{
 };
 use crate::gc::append_gc_offsets;
 use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
-use crate::profile::reset_profiles_remaining;
+use crate::lifecycle::{self, InvalidationCause};
 use crate::perf;
-use crate::state::{rb_zjit_compiling_p, ZJITState};
+use crate::state::ZJITState;
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
 use crate::stats::{counter_ptr, with_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
@@ -28,15 +28,8 @@ use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, InlineDepth};
 use crate::cast::IntoUsize;
-
-/// Maximum number of compiled versions per ISEQ.
-/// Configurable via --zjit-max-versions.
-pub fn max_iseq_versions() -> usize {
-    unsafe { crate::options::OPTIONS.as_ref() }
-        .map_or(DEFAULT_MAX_VERSIONS, |opts| opts.max_versions)
-}
 
 /// Sentinel program counter stored in C frames when runtime checks are enabled.
 const PC_POISON: Option<*const VALUE> = if cfg!(feature = "runtime_checks") {
@@ -195,6 +188,11 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
     // Take a lock to avoid writing to ISEQ in parallel with Ractors.
     // with_vm_lock() does nothing if the program doesn't use Ractors.
     with_vm_lock(src_loc!(), || {
+        // The interpreter call counter reached the call threshold. Trace the transition.
+        if get_option!(trace_lifecycle) {
+            lifecycle::on_interp_threshold(iseq, jit_exception);
+        }
+
         // The current frame is this ISEQ's method frame, so its method entry tells
         // us the owning class and thus whether `self` is always a heap object.
         update_self_is_heap_object(iseq, unsafe { get_ec_cfp(ec) });
@@ -202,12 +200,9 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
         let cb = ZJITState::get_code_block();
         let mut code_ptr = with_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, jit_exception));
 
-        // If this compile ran out of executable memory, stop compiling so
-        // that the interpreter stops incrementing ISEQ call counters. It is
-        // set back to true in update_dropped_bytes() if memory becomes
-        // available again.
+        // If this compile ran out of executable memory, stop compiling.
         if matches!(&code_ptr, Err(CompileError::OutOfMemory)) {
-            unsafe { rb_zjit_compiling_p = false; }
+            lifecycle::on_out_of_memory(iseq);
         }
 
         if let Err(err) = &code_ptr {
@@ -255,21 +250,11 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
     })
 }
 
-/// Invalidate an ISEQ version and allow it to be recompiled on the next call.
-/// Both PatchPoint invalidation and exit-profiling recompilation go through this
-/// function, serving as the central point for all invalidation/recompile decisions.
-///
-/// TODO: evolve this into a general `handle_event(iseq, event)` state machine that
-/// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
-/// GC) so that all compile/recompile tuning decisions live in one place.
-pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+/// Invalidate an ISEQ version and allow it to be recompiled on the next call, if
+/// the function lifecycle allows it for `cause`. See [crate::lifecycle].
+pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, cause: InvalidationCause) {
     let payload = get_or_create_iseq_payload(iseq);
-    if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < max_iseq_versions()
-    {
-        unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
-        unsafe { rb_iseq_reset_jit_func(iseq) };
-
+    if lifecycle::on_invalidate(iseq, payload, version, cause) {
         // Recompile JIT-to-JIT calls into the invalidated ISEQ
         for incoming in unsafe { version.as_ref() }.incoming.iter() {
             if let Err(err) = gen_iseq_call(cb, incoming) {
@@ -349,7 +334,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         _ => {},
     }
     // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    if !lifecycle::on_compile_requested(iseq, payload) {
         return Err(CompileError::IseqVersionLimitReached);
     }
 
@@ -365,14 +350,13 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         Ok(code_ptrs) => {
             unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
             incr_counter!(compiled_iseq_count);
-            // Give the new version a fresh budget of recompile exits. See exit_recompile().
-            payload.num_exits_until_invalidate = get_option!(num_exits_until_invalidate);
         }
         Err(err) => {
             unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());
             incr_counter!(failed_iseq_count);
         }
     }
+    lifecycle::on_compile_finished(iseq, payload, code_ptrs.is_ok());
     payload.versions.push(version);
     code_ptrs
 }
@@ -3753,10 +3737,7 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
         trace_compile_phase("optimize", || function.optimize());
     }
     function.dump_hir();
-    let non_final_version = get_or_create_iseq_payload(iseq).versions.len() + 1 < max_iseq_versions();
-    if non_final_version {
-        reset_profiles_remaining(iseq);
-    }
+    lifecycle::on_hir_built(iseq, get_or_create_iseq_payload(iseq));
     Ok(function)
 }
 
@@ -3836,27 +3817,16 @@ c_callable! {
     /// the outer ISEQ's version holds the failing guard and must be invalidated to
     /// force a recompile. For non-inlined code, it is the same as the frame ISEQ.
     ///
-    /// The version gets invalidated after `--zjit-num-exits-until-invalidate` recompile exits.
-    /// Invalidation resets the ISEQ's call counter and re-stubs incoming JIT-to-JIT calls,
-    /// so every entry runs the profiling window in the interpreter before the next compile.
+    /// The lifecycle decides when the version gets invalidated (after
+    /// `--zjit-num-exits-until-invalidate` recompile exits). See [crate::lifecycle].
     pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE) {
-        // Fast check before taking the VM lock: skip if the compiled unit is already
-        // invalidated or at the version limit. This avoids expensive lock acquisition
+        // Count the exit before taking the VM lock. This avoids expensive lock acquisition
         // on every shape guard exit taken by frames still running the invalidated code.
-        // The check is on the compiled unit because that is the version we invalidate.
+        // The count is on the compiled unit because that is the version we invalidate.
         {
             let compiled_iseq: IseqPtr = compiled_iseq_raw.as_iseq();
             let payload = get_or_create_iseq_payload(compiled_iseq);
-            let already_done = payload.versions.last()
-                .map_or(false, |v| unsafe { v.as_ref() }.is_invalidated())
-                || payload.versions.len() >= max_iseq_versions();
-            if already_done {
-                return;
-            }
-
-            // Wait for the configured number of recompile exits before invalidation.
-            payload.num_exits_until_invalidate = payload.num_exits_until_invalidate.saturating_sub(1);
-            if payload.num_exits_until_invalidate > 0 {
+            if !lifecycle::on_recompile_exit(compiled_iseq, payload) {
                 return;
             }
         }
@@ -3866,7 +3836,7 @@ c_callable! {
             let payload = get_or_create_iseq_payload(compiled_iseq);
             if let Some(version) = payload.versions.last_mut() {
                 let cb = ZJITState::get_code_block();
-                invalidate_iseq_version(cb, compiled_iseq, version);
+                invalidate_iseq_version(cb, compiled_iseq, version, InvalidationCause::RecompileExit);
                 cb.mark_all_executable();
             }
         });
@@ -4014,7 +3984,7 @@ c_callable! {
             }
 
             // Exit to the interpreter until the callee ISEQ collects enough profiles.
-            if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
+            if !lifecycle::on_stub_hit(iseq, payload) {
                 // Preserve the reference owned by the stub when iseq_call is dropped.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);
