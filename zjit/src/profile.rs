@@ -120,11 +120,11 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     }
 }
 
-/// Reset existing profile counters and install profiling instructions throughout an ISEQ.
-/// Newly reached instructions initialize their counters from the same option.
-pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
+/// Reset existing profile counters to `num_profiles` and install profiling instructions
+/// throughout an ISEQ. Newly reached instructions initialize their counters from
+/// [crate::lifecycle::insn_profile_budget].
+pub(crate) fn reset_profiles_remaining(iseq: IseqPtr, num_profiles: NumProfiles) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
-    let num_profiles = crate::lifecycle::insn_profile_budget();
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
     }

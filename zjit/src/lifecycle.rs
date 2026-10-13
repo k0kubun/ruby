@@ -47,6 +47,7 @@
 //! | Compiled(vN)               | Invalidate(PatchPoint, RecompileExit) | N < max_versions      | Invalidated(vN) / Invalidate    |
 //! | Compiled(vN)               | Invalidate(EpEscape)  |                                   | Invalidated(vN) / Invalidate    |
 //! | any                        | Invalidate(TracePoint)|                                   | calls = 0 / Invalidate          |
+//! | (on Invalidate other than TracePoint) | | num_reprofiles = Some(n)                   | calls = call_threshold - n / RearmProfiling (n) |
 //! | any                        | OutOfMemory       |                                       | StopCompiling (global)          |
 //!
 //! `profile_threshold` is `call_threshold - num_profiles` (see [`Knobs::profile_threshold`]).
@@ -99,6 +100,9 @@ pub struct Knobs {
     pub call_threshold: CallThreshold,
     /// --zjit-num-profiles: calls profiled before compiling, and samples per instruction
     pub num_profiles: NumProfiles,
+    /// --zjit-num-reprofiles: calls profiled after an invalidation before recompiling.
+    /// None re-runs the whole call_threshold warmup.
+    pub num_reprofiles: Option<NumProfiles>,
     /// --zjit-num-exits-until-invalidate: recompile exits before invalidating a version
     pub num_exits_until_invalidate: NumExits,
     /// --zjit-max-versions: maximum number of compiled versions per ISEQ
@@ -110,6 +114,7 @@ impl Default for Knobs {
         Knobs {
             call_threshold: DEFAULT_CALL_THRESHOLD,
             num_profiles: DEFAULT_NUM_PROFILES,
+            num_reprofiles: None,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             max_versions: DEFAULT_MAX_VERSIONS,
         }
@@ -124,6 +129,7 @@ impl Knobs {
             Some(opts) => Knobs {
                 call_threshold,
                 num_profiles: opts.num_profiles,
+                num_reprofiles: opts.num_reprofiles,
                 num_exits_until_invalidate: opts.num_exits_until_invalidate,
                 max_versions: opts.max_versions,
             },
@@ -465,9 +471,16 @@ pub fn on_event(snapshot: &mut Snapshot, event: Event, knobs: &Knobs) -> Transit
                 if snapshot.num_versions > 0 {
                     snapshot.last_version = LastVersion::Invalidated;
                 }
-                // Count calls from 0 again, which re-runs the profiling window
-                // before the next version is compiled.
-                snapshot.calls = 0;
+                match knobs.num_reprofiles {
+                    // Profile the next num_reprofiles calls right away, then recompile.
+                    Some(num_reprofiles) if cause != InvalidationCause::TracePoint && num_reprofiles > 0 => {
+                        snapshot.calls = knobs.call_threshold.saturating_sub(num_reprofiles.into());
+                        actions |= Actions::REARM_PROFILING;
+                    }
+                    // Count calls from 0 again, which re-runs the warmup and the
+                    // profiling window before the next version is compiled.
+                    _ => snapshot.calls = 0,
+                }
             }
         }
         Event::OutOfMemory => {
@@ -593,7 +606,7 @@ pub fn on_compile_requested(iseq: IseqPtr, payload: &mut IseqPayload) -> bool {
 pub fn on_hir_built(iseq: IseqPtr, payload: &mut IseqPayload) {
     let transition = dispatch(iseq, payload, Event::HirBuilt);
     if transition.actions.contains(Actions::REARM_PROFILING) {
-        reset_profiles_remaining(iseq);
+        reset_profiles_remaining(iseq, insn_profile_budget());
     }
 }
 
@@ -625,6 +638,10 @@ pub fn on_invalidate(iseq: IseqPtr, payload: &mut IseqPayload, version: &mut Ise
         unsafe { rb_iseq_reset_jit_func(iseq) };
         if snapshot.calls != 0 {
             unsafe { rb_zjit_iseq_set_entry_calls(iseq, false, snapshot.calls) };
+        }
+        if transition.actions.contains(Actions::REARM_PROFILING) {
+            let num_reprofiles = knobs.num_reprofiles.unwrap_or(knobs.num_profiles);
+            reset_profiles_remaining(iseq, num_reprofiles);
         }
         trace(iseq, &transition, false);
         true
@@ -664,7 +681,7 @@ pub fn on_out_of_memory(iseq: IseqPtr) {
 /// `iseq` is being inlined into a caller. Its frames may be materialized by side
 /// exits, so re-arm its interpreter profiling to collect fresh profiles there too.
 pub fn on_inlined(iseq: IseqPtr) {
-    reset_profiles_remaining(iseq);
+    reset_profiles_remaining(iseq, insn_profile_budget());
 }
 
 /// Return true if the version being compiled for `payload` is the final one,
@@ -686,7 +703,7 @@ mod tests {
     use super::*;
 
     fn knobs() -> Knobs {
-        Knobs { call_threshold: 30, num_profiles: 5, num_exits_until_invalidate: 5, max_versions: 4 }
+        Knobs { call_threshold: 30, num_profiles: 5, num_reprofiles: None, num_exits_until_invalidate: 5, max_versions: 4 }
     }
 
     fn fresh() -> Snapshot {
@@ -839,6 +856,36 @@ mod tests {
         assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::COMPILE);
         let t = on_event(&mut s, Event::CompileSucceeded, &k);
         assert_eq!((t.from, t.to), (State::Reprofiling(1), State::Compiled(2)));
+    }
+
+    #[test]
+    fn num_reprofiles_shortens_reprofiling() {
+        let k = Knobs { num_reprofiles: Some(3), ..knobs() };
+        let mut s = Snapshot { calls: 30, num_versions: 1, last_version: LastVersion::Compiled, ..fresh() };
+        let event = Event::Invalidate { cause: InvalidationCause::RecompileExit, already_invalidated: false };
+        let t = on_event(&mut s, event, &k);
+        assert_eq!((t.from, t.to, t.actions), (State::Compiled(1), State::Reprofiling(1), Actions::INVALIDATE | Actions::REARM_PROFILING));
+        assert_eq!(s.calls, 27);
+        assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::NOTHING);
+        assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::NOTHING);
+        assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::COMPILE);
+
+        // A longer window than num_profiles still starts profiling right away and
+        // re-installs profiling instructions at profile_threshold.
+        let k = Knobs { num_reprofiles: Some(10), ..knobs() };
+        let mut s = Snapshot { calls: 30, num_versions: 1, last_version: LastVersion::Compiled, ..fresh() };
+        on_event(&mut s, event, &k);
+        assert_eq!(s.calls, 20);
+        for _ in 21..25 {
+            assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::NOTHING);
+        }
+        assert_eq!(on_event(&mut s, Event::InterpCall, &k).actions, Actions::START_PROFILING);
+
+        // TracePoint always counts from 0
+        let event = Event::Invalidate { cause: InvalidationCause::TracePoint, already_invalidated: false };
+        let mut s = Snapshot { calls: 30, num_versions: 1, last_version: LastVersion::Compiled, ..fresh() };
+        assert_eq!(on_event(&mut s, event, &k).actions, Actions::INVALIDATE);
+        assert_eq!(s.calls, 0);
     }
 
     #[test]
