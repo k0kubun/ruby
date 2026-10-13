@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
 use crate::distribution::{Distribution, DistributionSummary};
 use crate::stats::Counter::profile_time_ns;
+use crate::stats::incr_counter;
 use crate::stats::with_time_stat;
 
 /// Ephemeral state for profiling runtime information
@@ -58,7 +59,8 @@ pub extern "C" fn rb_zjit_profile_insn(bare_opcode: u32, ec: EcPtr) {
     });
 }
 
-/// Profile a YARV instruction
+/// Profile a YARV instruction. Return true if the sample changed the profile (see
+/// [Distribution::observe]).
 fn profile_insn_sample(
     bare_opcode: ruby_vminsn_type,
     profiler: &mut Profiler,
@@ -98,21 +100,24 @@ fn profile_insn_sample(
             let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
             let argc = num_arguments_on_stack(cd);
             // Profile all the arguments and self (+1).
-            profile_operands(profiler, profile, argc + 1);
-            profile_splat_length(profiler, profile, unsafe { (*cd).ci });
+            let changed = profile_operands(profiler, profile, argc + 1);
+            profile_splat_length(profiler, profile, unsafe { (*cd).ci }) | changed
         }
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
-        _ => return false,
+        _ => false,
     }
-
-    true
 }
 
 /// Profile a YARV instruction
 fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     let profiler = &mut Profiler::new(ec);
     let profile = &mut get_or_create_iseq_payload(profiler.iseq).profile;
-    let _ = profile_insn_sample(bare_opcode, profiler, profile);
+    if profile_insn_sample(bare_opcode, profiler, profile) {
+        // Remember when the profile last changed so that the compile gate can tell
+        // whether the profile has settled. See compile_gate() in codegen.rs.
+        profile.last_change_call = Some(unsafe { rb_zjit_iseq_jit_entry_calls(profiler.iseq) });
+        incr_counter!(profile_change_count);
+    }
 
     // Once we profile the instruction enough times, we stop profiling it.
     let entry = profile.entry_mut(profiler.insn_idx);
@@ -131,6 +136,17 @@ pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
         entry.window_samples = 0;
+    }
+    unsafe { rb_zjit_profile_enable(iseq) };
+}
+
+/// Give every profiled instruction of an ISEQ another --zjit-num-profiles samples, keeping the
+/// data and window sample counts collected so far. Used when the compile gate delays compilation.
+pub(crate) fn extend_profiling_window(iseq: IseqPtr) {
+    let profile = &mut get_or_create_iseq_payload(iseq).profile;
+    let num_profiles = get_option!(num_profiles);
+    for entry in &mut profile.entries {
+        entry.profiles_remaining = num_profiles;
     }
     unsafe { rb_zjit_profile_enable(iseq) };
 }
@@ -159,7 +175,7 @@ pub type SplatLengthDistribution = Distribution<Option<SplatLength>, DISTRIBUTIO
 pub type SplatLengthDistributionSummary = DistributionSummary<Option<SplatLength>, DISTRIBUTION_SIZE>;
 
 /// Profile the Type of top-`n` stack operands
-fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) {
+fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize) -> bool {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
         // Allocate exactly `n` distributions. A plain `resize` on an empty Vec rounds the capacity
@@ -167,21 +183,23 @@ fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize
         entry.opnd_types = vec![TypeDistribution::new(); n];
     }
 
+    let mut changed = false;
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate() {
         let obj = profiler.peek_at_stack((n - i - 1) as isize);
         // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
         // drop them or something
         let ty = ProfiledType::new(obj);
         VALUE::from(profiler.iseq).write_barrier(ty.class());
-        profile_type.observe(ty);
+        changed |= profile_type.observe(ty);
     }
+    changed
 }
 
-fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) {
+fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) -> bool {
     let flags = unsafe { rb_vm_ci_flag(ci) };
     // Only call sites with VM_CALL_ARGS_SPLAT have a splat array on the stack.
     if flags & VM_CALL_ARGS_SPLAT == 0 {
-        return;
+        return false;
     }
 
     let kwarg = unsafe { rb_vm_ci_kwarg(ci) };
@@ -198,10 +216,10 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
         None
     };
     profile.splat_lengths.entry(profiler.insn_idx)
-        .or_insert_with(SplatLengthDistribution::new).observe(length);
+        .or_insert_with(SplatLengthDistribution::new).observe(length)
 }
 
-fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
+fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) -> bool {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
         entry.opnd_types = vec![TypeDistribution::new()];
@@ -211,24 +229,24 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
     // drop them or something
     let ty = ProfiledType::new(obj);
     VALUE::from(profiler.iseq).write_barrier(ty.class());
-    entry.opnd_types[0].observe(ty);
+    entry.opnd_types[0].observe(ty)
 }
 
-fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
+fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) -> bool {
     let entry = profile.entry_mut(profiler.insn_idx);
     if entry.opnd_types.is_empty() {
         entry.opnd_types = vec![TypeDistribution::new()];
     }
     let ty = ProfiledType::block_handler(profiler.peek_at_block_handler());
     VALUE::from(profiler.iseq).write_barrier(ty.class());
-    entry.opnd_types[0].observe(ty);
+    entry.opnd_types[0].observe(ty)
 }
 
-fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
+fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) -> bool {
     let cme = unsafe { rb_vm_frame_method_entry(profiler.cfp) };
     let cme_value = VALUE(cme as usize);  // CME is a T_IMEMO, which is a VALUE
 
-    profile.super_cme.entry(profiler.insn_idx)
+    let mut changed = profile.super_cme.entry(profiler.insn_idx)
         .or_insert_with(|| TypeDistribution::new()).observe(ProfiledType::object(cme_value));
 
     unsafe { rb_gc_writebarrier(profiler.iseq.into(), cme_value) };
@@ -237,8 +255,9 @@ fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let argc = num_arguments_on_stack(cd);
 
     // Profile all the arguments and self (+1).
-    profile_operands(profiler, profile, (argc + 1) as usize);
-    profile_splat_length(profiler, profile, unsafe { (*cd).ci });
+    changed |= profile_operands(profiler, profile, (argc + 1) as usize);
+    changed |= profile_splat_length(profiler, profile, unsafe { (*cd).ci });
+    changed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +472,11 @@ pub struct IseqProfile {
 
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+
+    /// The ISEQ's call count (jit_entry_calls) when a sample last changed the profile, i.e.
+    /// added a new type to a distribution. Cleared when a version is compiled or invalidated,
+    /// so it only describes the current profiling window.
+    pub last_change_call: Option<u32>,
 }
 
 impl IseqProfile {
@@ -461,6 +485,7 @@ impl IseqProfile {
             entries: Vec::new(),
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
+            last_change_call: None,
         }
     }
 

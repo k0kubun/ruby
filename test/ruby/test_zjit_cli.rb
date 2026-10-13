@@ -310,6 +310,23 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_compile_gate_options
+    script = <<~'RUBY'
+      def gated(x) = x.to_s
+      [1, 1, 1, 1, 1, 'a', 1, 1, 1, 1, 1, 1].each { gated(it) }
+      RubyVM::ZJIT.stats.values_at(:compile_gate_unstable_delayed, :compile_gate_unstable_compiled) => [delayed, compiled]
+      [delayed > 0, compiled > 0]
+    RUBY
+    # An unsettled profile delays compilation by default
+    assert_runs '[true, false]', script, call_threshold: 7, num_profiles: 5, stats: :quiet
+    # --zjit-max-compile-delays=0 compiles an unsettled profile right away
+    assert_runs '[false, true]', script, call_threshold: 7, num_profiles: 5, stats: :quiet,
+      extra_args: ['--zjit-max-compile-delays=0']
+    # With a 0-call settle window, no profile is ever unsettled
+    assert_runs '[false, false]', script, call_threshold: 7, num_profiles: 5, stats: :quiet,
+      extra_args: ['--zjit-max-compile-delays=3', '--zjit-profile-settle-calls=0']
+  end
+
   def test_exit_tracing
     # Smoke test: --zjit-trace-exits writes a Fuchsia trace (.fxt) file to /tmp
     assert_compiles('true', <<~RUBY, extra_args: ['--zjit-trace-exits'])

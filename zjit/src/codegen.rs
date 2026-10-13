@@ -18,7 +18,7 @@ use crate::invariants::{
 };
 use crate::gc::append_gc_offsets;
 use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
-use crate::profile::reset_profiles_remaining;
+use crate::profile::{extend_profiling_window, reset_profiles_remaining};
 use crate::perf;
 use crate::state::{rb_zjit_compiling_p, ZJITState};
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
@@ -28,7 +28,7 @@ use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, rb_zjit_call_threshold, rb_zjit_profile_threshold, InlineDepth, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
@@ -195,6 +195,11 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
     // Take a lock to avoid writing to ISEQ in parallel with Ractors.
     // with_vm_lock() does nothing if the program doesn't use Ractors.
     with_vm_lock(src_loc!(), || {
+        // Keep profiling instead of compiling if the profile is still changing
+        if !jit_exception && compile_gate(iseq) {
+            return std::ptr::null();
+        }
+
         // The current frame is this ISEQ's method frame, so its method entry tells
         // us the owning class and thus whether `self` is always a heap object.
         update_self_is_heap_object(iseq, unsafe { get_ec_cfp(ec) });
@@ -269,6 +274,8 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
     {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
+        // Profile changes seen while this version was installed are not part of the next window
+        payload.profile.last_change_call = None;
 
         // Recompile JIT-to-JIT calls into the invalidated ISEQ
         for incoming in unsafe { version.as_ref() }.incoming.iter() {
@@ -374,7 +381,87 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         }
     }
     payload.versions.push(version);
+    // Start the next profiling window, if any, with a fresh compile gate
+    payload.compile_delays = 0;
+    payload.profile.last_change_call = None;
     code_ptrs
+}
+
+/// Return true if the profile of an ISEQ is still changing at call count `calls`, i.e. a profile
+/// sample added a new type to a distribution (`last_change_call`) within the last `settle_calls`
+/// calls. A profiling window of `window_calls <= settle_calls` calls is too short to tell, so it
+/// is never considered unsettled.
+fn profile_is_unsettled(calls: u32, last_change_call: Option<u32>, settle_calls: u32, window_calls: u32) -> bool {
+    if window_calls <= settle_calls {
+        return false;
+    }
+    match last_change_call {
+        Some(last_change_call) if last_change_call <= calls => calls - last_change_call <= settle_calls,
+        _ => false,
+    }
+}
+
+/// Decide whether to compile an ISEQ that reached the call threshold, or to keep profiling it.
+/// Return true to delay the compilation.
+///
+/// Like V8 pushing back tier-up whenever an inline cache changes state and JSC delaying DFG
+/// while its value profiles are immature, ZJIT runs the profiling window
+/// (--zjit-num-profiles calls) once more when the profile changed within the last --zjit-profile-settle-calls
+/// calls. An ISEQ is delayed at most --zjit-max-compile-delays times per version, then compiled
+/// anyway. This applies to compiles from the interpreter and from function stubs, including
+/// recompiles after invalidation.
+fn compile_gate(iseq: IseqPtr) -> bool {
+    let max_compile_delays = get_option!(max_compile_delays);
+    let stats = get_option!(stats);
+    if max_compile_delays == 0 && !stats {
+        return false;
+    }
+
+    let payload = get_or_create_iseq_payload(iseq);
+    // Nothing to decide if the ISEQ already has code; gen_iseq() returns the existing version.
+    if let Some(version) = payload.versions.last() {
+        if let IseqStatus::Compiled(_) | IseqStatus::CantCompile(_) = unsafe { version.as_ref() }.status {
+            return false;
+        }
+    }
+
+    let calls = unsafe { rb_zjit_iseq_jit_entry_calls(iseq) };
+    let last_change_call = payload.profile.last_change_call;
+    // The interpreter profiles calls from rb_zjit_profile_threshold to rb_zjit_call_threshold - 1.
+    let (profile_threshold, call_threshold) = unsafe { (rb_zjit_profile_threshold, rb_zjit_call_threshold) };
+    let window_calls = call_threshold.saturating_sub(profile_threshold);
+    if stats && payload.compile_delays == 0 {
+        incr_counter_by(match last_change_call {
+            Some(last_change_call) if last_change_call <= calls => match calls - last_change_call {
+                0..=1 => Counter::profile_last_change_1_call_ago,
+                2 => Counter::profile_last_change_2_calls_ago,
+                3..=5 => Counter::profile_last_change_3_to_5_calls_ago,
+                _ => Counter::profile_last_change_over_5_calls_ago,
+            },
+            _ => Counter::profile_last_change_never,
+        }, 1);
+    }
+
+    if !profile_is_unsettled(calls, last_change_call, get_option!(profile_settle_calls), window_calls) {
+        incr_counter!(compile_gate_stable);
+        return false;
+    }
+    if payload.compile_delays >= max_compile_delays {
+        incr_counter!(compile_gate_unstable_compiled);
+        return false;
+    }
+    incr_counter!(compile_gate_unstable_delayed);
+    payload.compile_delays += 1;
+
+    // Rewind the call counter to the start of the profiling window so that the interpreter
+    // (at == call_threshold) and function stubs (at >= call_threshold) try to compile again
+    // after window_calls more calls.
+    let rewound_calls = profile_threshold;
+    let rewind = calls.saturating_sub(rewound_calls);
+    payload.profile.last_change_call = last_change_call.map(|call| call.saturating_sub(rewind));
+    unsafe { rb_zjit_iseq_set_jit_entry_calls(iseq, rewound_calls) };
+    extend_profiling_window(iseq);
+    true
 }
 
 /// Compile an ISEQ into machine code
@@ -4061,8 +4148,9 @@ c_callable! {
                 return ZJITState::get_materialize_exit_trampoline_with_counter().raw_ptr(cb);
             }
 
-            // Exit to the interpreter until the callee ISEQ collects enough profiles.
-            if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
+            // Exit to the interpreter until the callee ISEQ collects enough profiles
+            // and its profile stops changing.
+            if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } || compile_gate(iseq) {
                 incr_counter!(function_stub_profile_exit_count);
                 // Preserve the reference owned by the stub when iseq_call is dropped.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }

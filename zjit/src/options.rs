@@ -26,6 +26,13 @@ pub type NumProfiles = u16;
 const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
 pub type NumExits = u32;
 
+/// Default --zjit-profile-settle-calls
+const DEFAULT_PROFILE_SETTLE_CALLS: CallThreshold = 2;
+
+/// Default --zjit-max-compile-delays
+const DEFAULT_MAX_COMPILE_DELAYS: MaxCompileDelays = 3;
+pub type MaxCompileDelays = u8;
+
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
 /// warmup code, but small enough to perform well on micro-benchmarks.
 pub const DEFAULT_CALL_THRESHOLD: CallThreshold = 30;
@@ -86,6 +93,14 @@ pub struct Options {
 
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
+
+    /// At the call threshold, delay compilation if a profile sample changed the profile
+    /// within this many calls. See `compile_gate` in codegen.rs.
+    pub profile_settle_calls: CallThreshold,
+
+    /// Maximum number of times to delay compiling an ISEQ (by --zjit-num-profiles calls each)
+    /// because its profile is still changing. 0 disables the compile gate.
+    pub max_compile_delays: MaxCompileDelays,
 
     /// Enable ZJIT statistics
     pub stats: bool,
@@ -209,6 +224,8 @@ impl Default for Options {
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
+            profile_settle_calls: DEFAULT_PROFILE_SETTLE_CALLS,
+            max_compile_delays: DEFAULT_MAX_COMPILE_DELAYS,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -459,6 +476,16 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => return None,
         },
 
+        ("profile-settle-calls", _) => match opt_val.parse() {
+            Ok(n) => options.profile_settle_calls = n,
+            Err(_) => return None,
+        },
+
+        ("max-compile-delays", _) => match opt_val.parse() {
+            Ok(n) => options.max_compile_delays = n,
+            Err(_) => return None,
+        },
+
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
             Err(_) => return None,
@@ -701,6 +728,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
+}
+
+/// Update --zjit-max-compile-delays for testing
+#[cfg(test)]
+pub fn set_max_compile_delays(max_compile_delays: MaxCompileDelays) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().max_compile_delays = max_compile_delays; }
 }
 
 /// Update --zjit-max-versions for testing

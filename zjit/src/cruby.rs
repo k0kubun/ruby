@@ -1299,6 +1299,10 @@ pub mod test_utils {
                 set_call_threshold(2);
             }
 
+            // Compile at the call threshold, as most tests expect. Tests of the compile gate
+            // enable it after booting the VM.
+            crate::options::set_max_compile_delays(0);
+
             // Pass command line options so the VM loads core library methods defined in
             // ruby such as from `kernel.rb`.
             // We drive ZJIT manually in tests, so disable heuristic compilation triggers.

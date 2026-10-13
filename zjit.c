@@ -196,6 +196,20 @@ rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
     return body->jit_entry_calls >= rb_zjit_call_threshold;
 }
 
+// Return the call counter that triggers profiling and compilation of a given ISEQ.
+unsigned int
+rb_zjit_iseq_jit_entry_calls(const rb_iseq_t *iseq)
+{
+    return ISEQ_BODY(iseq)->jit_entry_calls;
+}
+
+// Set the call counter of a given ISEQ. Used to extend the profiling window.
+void
+rb_zjit_iseq_set_jit_entry_calls(const rb_iseq_t *iseq, unsigned int calls)
+{
+    ISEQ_BODY(iseq)->jit_entry_calls = calls;
+}
+
 // Convert a given ISEQ's ZJIT instructions to bare instructions
 void
 rb_zjit_profile_disable(const rb_iseq_t *iseq)

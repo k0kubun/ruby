@@ -112,6 +112,8 @@ class << RubyVM::ZJIT
     print_counters_with_prefix(prefix: 'invokeblock_handler_', prompt: 'invokeblock handler', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'inline_reject_', prompt: 'HIR-level inlining rejection reasons', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'compile_trigger_', prompt: 'ISEQ compile triggers', buf:, stats:, limit: 4)
+    print_counters_with_prefix(prefix: 'compile_gate_', prompt: 'compile gate decisions', buf:, stats:, limit: 3)
+    print_counters_with_prefix(prefix: 'profile_last_change_', prompt: 'calls since the last profile change at first compile gate', buf:, stats:, limit: 5)
     print_counters_with_prefix(prefix: 'profile_site_', prompt: 'compiled profile sites by profile maturity', buf:, stats:, limit: 4)
     print_counters_with_prefix(prefix: 'no_profile_site_', prompt: 'compiled profile sites without profiles', buf:, stats:, limit: 4)
     print_counters_with_prefix(prefix: 'no_profile_yarv_insn_', prompt: 'compiled YARV insns without profiles', buf:, stats:, limit: 10)
@@ -198,6 +200,7 @@ class << RubyVM::ZJIT
 
       :side_exit_count,
       :function_stub_profile_exit_count,
+      :profile_change_count,
       :total_insn_count,
       :vm_insn_count,
       :zjit_insn_count,
