@@ -123,11 +123,12 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     }
 }
 
-/// Reset existing profile counters and install profiling instructions throughout an ISEQ.
-/// Newly reached instructions initialize their counters from the same option.
+/// Reset existing profile counters to --zjit-num-reprofiles and install profiling instructions
+/// throughout an ISEQ. Newly reached instructions initialize their counters from the same option.
 pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
-    let num_profiles = get_option!(num_profiles);
+    let num_profiles = get_option!(num_reprofiles).unwrap_or(get_option!(num_profiles));
+    profile.num_profiles = num_profiles;
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
         entry.window_samples = 0;
@@ -453,6 +454,10 @@ pub struct IseqProfile {
 
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+
+    /// Initial profiles_remaining for newly reached instructions. This is --zjit-num-profiles
+    /// until the ISEQ gets compiled, and --zjit-num-reprofiles after reset_profiles_remaining().
+    num_profiles: NumProfiles,
 }
 
 impl IseqProfile {
@@ -461,6 +466,7 @@ impl IseqProfile {
             entries: Vec::new(),
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
+            num_profiles: get_option!(num_profiles),
         }
     }
 
@@ -473,7 +479,7 @@ impl IseqProfile {
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
-                    profiles_remaining: get_option!(num_profiles),
+                    profiles_remaining: self.num_profiles,
                     window_samples: 0,
                 });
                 &mut self.entries[i]
