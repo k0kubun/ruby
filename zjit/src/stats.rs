@@ -476,6 +476,28 @@ make_counters! {
     invokeblock_handler_megamorphic,
     invokeblock_handler_no_profiles,
 
+    // Function stub hits that exited to the interpreter to profile the callee before compiling it
+    function_stub_profile_exit_count,
+
+    // ISEQ compilations that built HIR, by what triggered them and whether a version existed
+    compile_trigger_interp_first,
+    compile_trigger_stub_first,
+    compile_trigger_interp_recompile,
+    compile_trigger_stub_recompile,
+
+    // Profiled YARV instructions compiled into HIR, by the maturity of their profiles.
+    // See ProfileMaturity for each category.
+    profile_site_none,
+    profile_site_stale,
+    profile_site_partial,
+    profile_site_full,
+
+    // Profiled YARV instructions compiled with no profile, by why the ISEQ got compiled
+    no_profile_site_first_compile_interp,
+    no_profile_site_first_compile_stub,
+    no_profile_site_recompile,
+    no_profile_site_inlined,
+
     // HIR-level method inliner counters. Most rejection counters are incremented
     // once per SendDirect the inliner considers. inline_reject_budget_exceeded may
     // be incremented only once, rather than once per SendDirect, if the caller
@@ -785,6 +807,9 @@ pub extern "C" fn rb_zjit_reset_stats_bang(_ec: EcPtr, _self: VALUE) -> VALUE {
         // Reset send fallback counters
         ZJITState::get_send_fallback_counters().as_mut_slice().fill(0);
 
+        // Reset no-profile instruction counters
+        ZJITState::get_no_profile_insn_counters().as_mut_slice().fill(0);
+
         // Reset not-inlined counters
         ZJITState::get_not_inlined_cfunc_counter_pointers().iter_mut()
             .for_each(|b| { **(b.1) = 0; });
@@ -879,6 +904,14 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     for (op_idx, count) in exit_counters.iter().enumerate().take(VM_INSTRUCTION_SIZE as usize) {
         let op_name = insn_name(op_idx);
         let key_string = "unhandled_yarv_insn_".to_owned() + &op_name;
+        set_stat_usize!(hash, &key_string, *count);
+    }
+
+    // Set counters of profiled instructions compiled without profiles
+    let no_profile_insn_counters = ZJITState::get_no_profile_insn_counters();
+    for (op_idx, count) in no_profile_insn_counters.iter().enumerate().take(VM_INSTRUCTION_SIZE as usize) {
+        let op_name = insn_name(op_idx);
+        let key_string = "no_profile_yarv_insn_".to_owned() + &op_name;
         set_stat_usize!(hash, &key_string, *count);
     }
 

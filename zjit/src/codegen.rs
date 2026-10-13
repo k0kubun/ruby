@@ -242,7 +242,7 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
     let iseq_name = iseq_get_location(iseq, 0);
     trace_compile_phase(&iseq_name, || {
         // Compile ISEQ into High-level IR
-        let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq).inspect_err(|_| {
+        let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq, CompileTrigger::Interpreter).inspect_err(|_| {
             incr_counter!(failed_iseq_count);
         }))?;
 
@@ -387,7 +387,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
     // Convert ISEQ into optimized High-level IR if not given
     let function = match function {
         Some(function) => function,
-        None => &crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq))?,
+        None => &crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq, CompileTrigger::FunctionStub))?,
     };
 
     // Compile the High-level IR
@@ -3726,8 +3726,52 @@ fn gen_stack_overflow_check(jit: &mut JITState, asm: &mut Assembler, function: &
     asm.jbe(jit, side_exit(jit, function, state, StackOverflow));
 }
 
+/// What made ZJIT compile an ISEQ
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompileTrigger {
+    /// The interpreter reached --zjit-call-threshold
+    Interpreter,
+    /// A JIT-to-JIT call hit a function stub
+    FunctionStub,
+}
+
+/// Add the maturity of profiles used by a compiled Function to --zjit-stats counters
+fn count_profile_sites(function: &Function, trigger: CompileTrigger, is_recompile: bool) {
+    use crate::profile::ProfileMaturity;
+    incr_counter_by(match (is_recompile, trigger) {
+        (false, CompileTrigger::Interpreter) => Counter::compile_trigger_interp_first,
+        (false, CompileTrigger::FunctionStub) => Counter::compile_trigger_stub_first,
+        (true, CompileTrigger::Interpreter) => Counter::compile_trigger_interp_recompile,
+        (true, CompileTrigger::FunctionStub) => Counter::compile_trigger_stub_recompile,
+    }, 1);
+
+    let counts = &function.profile_site_counts;
+    let maturity_counters = [
+        (ProfileMaturity::None, Counter::profile_site_none),
+        (ProfileMaturity::Stale, Counter::profile_site_stale),
+        (ProfileMaturity::Partial, Counter::profile_site_partial),
+        (ProfileMaturity::Full, Counter::profile_site_full),
+    ];
+    for (maturity, counter) in maturity_counters {
+        incr_counter_by(counter, counts.own[maturity as usize] + counts.inlined[maturity as usize]);
+    }
+
+    let own_counter = match (is_recompile, trigger) {
+        (true, _) => Counter::no_profile_site_recompile,
+        (false, CompileTrigger::Interpreter) => Counter::no_profile_site_first_compile_interp,
+        (false, CompileTrigger::FunctionStub) => Counter::no_profile_site_first_compile_stub,
+    };
+    incr_counter_by(own_counter, counts.own[ProfileMaturity::None as usize]);
+    incr_counter_by(Counter::no_profile_site_inlined, counts.inlined[ProfileMaturity::None as usize]);
+
+    let no_profile_insn_counters = ZJITState::get_no_profile_insn_counters();
+    for &opcode in &counts.none_opcodes {
+        no_profile_insn_counters[opcode.to_usize()] += 1;
+    }
+}
+
 /// Convert ISEQ into High-level IR
-fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
+fn compile_iseq(iseq: IseqPtr, trigger: CompileTrigger) -> Result<Function, CompileError> {
     // Convert ZJIT instructions back to bare instructions
     unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
 
@@ -3753,7 +3797,11 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
         trace_compile_phase("optimize", || function.optimize());
     }
     function.dump_hir();
-    let non_final_version = get_or_create_iseq_payload(iseq).versions.len() + 1 < max_iseq_versions();
+    let num_versions = get_or_create_iseq_payload(iseq).versions.len();
+    if get_option!(stats) {
+        count_profile_sites(&function, trigger, num_versions > 0);
+    }
+    let non_final_version = num_versions + 1 < max_iseq_versions();
     if non_final_version {
         reset_profiles_remaining(iseq);
     }
@@ -4015,6 +4063,7 @@ c_callable! {
 
             // Exit to the interpreter until the callee ISEQ collects enough profiles.
             if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
+                incr_counter!(function_stub_profile_exit_count);
                 // Preserve the reference owned by the stub when iseq_call is dropped.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);

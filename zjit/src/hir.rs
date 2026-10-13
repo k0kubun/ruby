@@ -15,7 +15,7 @@ use std::{
 use crate::hir_type::{Type, types};
 use crate::hir_effect::{Effect, abstract_heaps, effects};
 use crate::bitset::BitSet;
-use crate::profile::{ProfiledType, SplatLength, TypeDistributionSummary};
+use crate::profile::{ProfileMaturity, ProfiledType, SplatLength, TypeDistributionSummary};
 use crate::stats::{Counter, incr_counter};
 use SendFallbackReason::*;
 
@@ -2964,10 +2964,34 @@ pub struct Function {
     /// fulfilling `(0..=opt_num)` optional parameters.
     jit_entry_blocks: Vec<BlockId>,
     profiles: Option<ProfileOracle>,
+    /// Maturity of the profiles read for profiled YARV instructions, collected for --zjit-stats.
+    pub profile_site_counts: ProfileSiteCounts,
     /// Rough estimate for the number of (actually executable) instructions in the function. Does
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+}
+
+/// Per-compilation tally of profiled YARV instructions by the maturity of their profiles.
+/// Collected only with --zjit-stats and flushed to counters once the compile trigger is known.
+#[derive(Debug, Default)]
+pub struct ProfileSiteCounts {
+    /// Profile sites in the ISEQ being compiled, indexed by ProfileMaturity
+    pub own: [u64; 4],
+    /// Profile sites in inlined callees, indexed by ProfileMaturity
+    pub inlined: [u64; 4],
+    /// Bare opcodes of the profile sites with no profile at all
+    pub none_opcodes: Vec<u32>,
+}
+
+impl ProfileSiteCounts {
+    fn record(&mut self, maturity: ProfileMaturity, inlined: bool, opcode: u32) {
+        let counts = if inlined { &mut self.inlined } else { &mut self.own };
+        counts[maturity as usize] += 1;
+        if maturity == ProfileMaturity::None {
+            self.none_opcodes.push(opcode);
+        }
+    }
 }
 
 /// The kind of a value an ISEQ returns
@@ -3227,6 +3251,7 @@ impl Function {
             jit_entry_blocks: vec![],
             param_types: vec![],
             profiles: None,
+            profile_site_counts: ProfileSiteCounts::default(),
             num_instructions: 0,
         }
     }
@@ -9209,6 +9234,12 @@ fn add_iseq_to_hir(
                 fn rb_iseq_event_flags(iseq: IseqPtr, pos: usize) -> rb_event_flag_t;
             }
             let exit_id = fun.push_insn(block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+
+            // Tally how mature the profile of this instruction is for --zjit-stats
+            if get_option!(stats) && unsafe { rb_zjit_insn_profiled_p(opcode as i32) } {
+                let maturity = payload.profile.maturity(exit_state.insn_idx);
+                fun.profile_site_counts.record(maturity, matches!(mode, AddIseqMode::Inlined { .. }), opcode);
+            }
 
             // If TracePoint has been enabled after we have collected profiles, we'll see
             // trace_getinstancevariable in the ISEQ. We have to treat it like getinstancevariable
