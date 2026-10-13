@@ -148,6 +148,11 @@ pub extern "C" fn rb_zjit_tier1_profile(cfp: CfpPtr, iseq: VALUE, site: *mut cra
         return;
     }
     site.remaining -= 1;
+    // JIT code doesn't save the frame state before this call, so we can't wait for the
+    // VM lock, which could let another Ractor run GC on this frame. Skip the sample.
+    if unsafe { rb_jit_multi_ractor_p() } {
+        return;
+    }
     with_vm_lock(src_loc!(), || {
         let iseq: IseqPtr = iseq.as_iseq();
         let insn_idx = site.insn_idx as usize;
