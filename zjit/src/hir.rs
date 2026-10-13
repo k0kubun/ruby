@@ -4614,6 +4614,44 @@ impl Function {
         None
     }
 
+    /// Like [`Self::polymorphic_summary`], but for method dispatch on the receiver. Dispatch only
+    /// depends on the receiver's class, while profiles distinguish shapes too. With many profile
+    /// samples (e.g. `--zjit-profiling-tier`), receivers of a few classes with many shapes
+    /// overflow the distribution and look megamorphic. When `--zjit-profiling-tier` is enabled,
+    /// treat such megamorphic profiles that cover at most `MAX_POLYMORPHIC_SEND_CLASSES` distinct
+    /// receiver types as polymorphic, dispatching on them with a fallback.
+    fn polymorphic_send_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<TypeDistributionSummary> {
+        // The most types that the default --zjit-num-profiles=5 can observe in the interpreter,
+        // so we don't dispatch on more types than the single-tier configuration does.
+        const MAX_POLYMORPHIC_SEND_CLASSES: usize = 5;
+        if let Some(summary) = self.polymorphic_summary(profiles, recv, state) {
+            return Some(summary);
+        }
+        if !get_option!(profiling_tier) {
+            return None;
+        }
+        let entries = profiles.get(state)?;
+        let recv = self.chase_insn(recv);
+        let (_, summary) = entries.iter().find(|(entry_insn, _)| self.chase_insn(*entry_insn) == recv)?;
+        if !(summary.is_megamorphic() || summary.is_skewed_megamorphic()) {
+            return None;
+        }
+        let mut receiver_types: Vec<Type> = Vec::with_capacity(summary.buckets().len());
+        for &profiled_type in summary.buckets() {
+            if profiled_type.is_empty() { break; }
+            let expected = Type::from_profiled_type(profiled_type);
+            if !receiver_types.iter().any(|ty| ty.bit_equal(expected)) {
+                receiver_types.push(expected);
+            }
+        }
+        if receiver_types.len() <= MAX_POLYMORPHIC_SEND_CLASSES {
+            incr_counter!(megamorphic_send_as_polymorphic);
+            Some(summary.clone())
+        } else {
+            None
+        }
+    }
+
     fn monomorphic_summary(&self, profiles: &ProfileOracle, recv: InsnId, state: InsnId) -> Option<ProfiledType> {
         let Some(entries) = profiles.get(state) else {
             return None;
@@ -10363,7 +10401,7 @@ fn add_iseq_to_hir(
                     let lengths = fun.caller_splat_lengths(call_info, recv, exit_id, &profiles);
                     let caller_splat_length = if lengths.len() == 1 { Some(lengths[0]) } else { None };
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    if let Some(summary) = fun.polymorphic_send_summary(&profiles, recv, exit_id) {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         let fallback_block = fun.new_block(insn_idx);
@@ -10466,7 +10504,7 @@ fn add_iseq_to_hir(
                     };
                     let lengths = fun.caller_splat_lengths(call_info, recv, exit_id, &profiles);
                     let caller_splat_length = if lengths.len() == 1 { Some(lengths[0]) } else { None };
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    if let Some(summary) = fun.polymorphic_send_summary(&profiles, recv, exit_id) {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         // Dedup by expected type so immediate/heap variants

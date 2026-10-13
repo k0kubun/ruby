@@ -165,6 +165,7 @@ make_counters! {
         tier1_profile_samples,
         tier_up_count,
         tier_up_failure_count,
+        megamorphic_send_as_polymorphic,
         jit_frame_heap_bytes,
         skipped_native_stack_full,
 
