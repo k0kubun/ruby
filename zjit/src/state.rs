@@ -75,6 +75,10 @@ pub struct ZJITState {
     /// Counter pointers for un-annotated C functions
     not_annotated_frame_cfunc_counter_pointers: HashMap<String, Box<u64>>,
 
+    /// Compile-time counts of inlined callee profile entries that were polymorphic/megamorphic
+    /// in the callee but monomorphic from the inlining caller's perspective, keyed by callee location
+    ctx_profile_callee_counts: HashMap<String, u64>,
+
     /// Counter pointers for all calls to any kind of C function from JIT code
     ccall_counter_pointers: HashMap<String, Box<u64>>,
 
@@ -167,6 +171,7 @@ impl ZJITState {
             function_stub_hit_trampoline,
             full_frame_cfunc_counter_pointers: HashMap::new(),
             not_annotated_frame_cfunc_counter_pointers: HashMap::new(),
+            ctx_profile_callee_counts: HashMap::new(),
             ccall_counter_pointers: HashMap::new(),
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
@@ -259,6 +264,11 @@ impl ZJITState {
     /// Get a mutable reference to full frame cfunc counter pointers
     pub fn get_not_inlined_cfunc_counter_pointers() -> &'static mut HashMap<String, Box<u64>> {
         &mut ZJITState::get_instance().full_frame_cfunc_counter_pointers
+    }
+
+    /// Get a mutable reference to the inline-context profile census per callee
+    pub fn get_ctx_profile_callee_counts() -> &'static mut HashMap<String, u64> {
+        &mut ZJITState::get_instance().ctx_profile_callee_counts
     }
 
     /// Get a mutable reference to non-annotated cfunc counter pointers

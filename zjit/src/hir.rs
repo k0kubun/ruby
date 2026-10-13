@@ -2964,6 +2964,10 @@ pub struct Function {
     /// fulfilling `(0..=opt_num)` optional parameters.
     jit_entry_blocks: Vec<BlockId>,
     profiles: Option<ProfileOracle>,
+    /// Maps the Snapshot of a SendDirect whose stack was rewritten (reordered keyword args, stripped
+    /// block arg) back to the pre-send Snapshot of the original Send. That Snapshot is where the
+    /// call-site profile is keyed and is safe to side-exit to before the call.
+    send_exit_states: HashMap<InsnId, InsnId>,
     /// Rough estimate for the number of (actually executable) instructions in the function. Does
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
@@ -3227,6 +3231,7 @@ impl Function {
             jit_entry_blocks: vec![],
             param_types: vec![],
             profiles: None,
+            send_exit_states: HashMap::new(),
             num_instructions: 0,
         }
     }
@@ -4127,6 +4132,9 @@ impl Function {
         } else {
             send_frame_state
         };
+        if send_state != exit_state {
+            self.send_exit_states.insert(send_state, exit_state);
+        }
 
         SendDirectArgs {
             state: send_state,
@@ -6041,6 +6049,24 @@ impl Function {
                 //   * any remaining non-parameter locals are nil-initialized.
                 let callee_body_params: Vec<InsnId> = self.blocks[callee_entry_body_block].params.clone();
 
+                // Compare the callee's per-ISEQ profiles of its parameters with what this caller
+                // knows about the values it passes.
+                if get_option!(stats) {
+                    // (callee entry param, Some(caller arg index) or None for self)
+                    let mut slots: Vec<(InsnId, Option<usize>)> = Vec::with_capacity(callee_body_params.len());
+                    if let Some(&self_param) = callee_body_params.first() {
+                        slots.push((self_param, None));
+                    }
+                    for (i, &param_id) in callee_body_params.iter().skip(1).enumerate() {
+                        if i < lead_num + passed_opt_num {
+                            slots.push((param_id, Some(i)));
+                        } else if i >= lead_num + opt_num && i < positional_kw_end {
+                            slots.push((param_id, Some(i - omitted_opt_num)));
+                        }
+                    }
+                    self.count_inline_context_profiles(iseq, recv, &args, &slots, &add_result.profiles, pre_blocks_len, state);
+                }
+
                 // First param is self.
                 if !callee_body_params.is_empty() {
                     self.make_equal_to(callee_body_params[0], recv);
@@ -6141,6 +6167,110 @@ impl Function {
         }
 
         did_inline
+    }
+
+    /// Trace `insn` in an inlined callee body (blocks `callee_blocks_start..`) back to one of the
+    /// callee body entry params in `roots`, following block params whose incoming values all agree.
+    fn trace_to_inline_param(&self, insn: InsnId, roots: &HashSet<InsnId>, param_loc: &HashMap<InsnId, (BlockId, usize)>,
+                             incoming: &HashMap<BlockId, Vec<Vec<InsnId>>>, visited: &mut HashSet<InsnId>) -> Result<Option<InsnId>, ()> {
+        let insn = self.chase_insn(insn);
+        if roots.contains(&insn) {
+            return Ok(Some(insn));
+        }
+        let Some(&(block, idx)) = param_loc.get(&insn) else { return Err(()) };
+        if !visited.insert(insn) {
+            // Already visited on this query: a loop back-edge or a diamond; adds no new value.
+            return Ok(None);
+        }
+        let Some(edges) = incoming.get(&block) else { return Err(()) };
+        let mut result = None;
+        for edge_args in edges {
+            let Some(&arg) = edge_args.get(idx) else { return Err(()) };
+            match self.trace_to_inline_param(arg, roots, param_loc, incoming, visited)? {
+                None => {}
+                Some(root) if result.is_none_or(|r| r == root) => result = Some(root),
+                Some(_) => return Err(()),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Census of an inlined callee's parameter profiles against what the inlining caller knows.
+    /// `slots` maps callee body entry params to the caller value (`None` = receiver,
+    /// `Some(i)` = `args[i]`).
+    fn count_inline_context_profiles(&self, callee_iseq: IseqPtr, recv: InsnId, args: &[InsnId],
+                                     slots: &[(InsnId, Option<usize>)], callee_profiles: &ProfileOracle,
+                                     callee_blocks_start: usize, send_state: InsnId) {
+        let roots: HashSet<InsnId> = slots.iter().map(|&(param, _)| param).collect();
+        let mut param_loc: HashMap<InsnId, (BlockId, usize)> = HashMap::new();
+        let mut incoming: HashMap<BlockId, Vec<Vec<InsnId>>> = HashMap::new();
+        for block_idx in callee_blocks_start..self.blocks.len() {
+            let block_id = BlockId(block_idx as u32);
+            for (idx, &param) in self.blocks[block_id].params.iter().enumerate() {
+                param_loc.insert(param, (block_id, idx));
+            }
+            let Some(&terminator) = self.blocks[block_id].insns.last() else { continue };
+            let edges: Vec<&BranchEdge> = match &self.insns[terminator] {
+                Insn::Jump(edge) => vec![edge],
+                Insn::CondBranch { if_true, if_false, .. } => vec![if_true, if_false],
+                Insn::CondBranchHasType(data) => vec![&data.if_true, &data.if_false],
+                _ => vec![],
+            };
+            for edge in edges {
+                incoming.entry(edge.target).or_default().push(edge.args.clone());
+            }
+        }
+
+        let exit_state = self.send_exit_states.get(&send_state).copied().unwrap_or(send_state);
+        let mut seen: HashSet<(YarvInsnIdx, InsnId)> = HashSet::new();
+        let mut fixable = 0u64;
+        for (&snapshot, entries) in &callee_profiles.types {
+            let insn_idx = self.frame_state(snapshot).insn_idx;
+            for (operand, summary) in entries {
+                let mut visited = HashSet::new();
+                let Ok(Some(root)) = self.trace_to_inline_param(*operand, &roots, &param_loc, &incoming, &mut visited) else { continue };
+                if !seen.insert((insn_idx, root)) { continue; }
+                let arg_idx = slots.iter().find(|&&(param, _)| param == root).and_then(|&(_, arg_idx)| arg_idx);
+                let caller_val = match arg_idx { None => recv, Some(i) => args[i] };
+                let static_class = self.type_of(caller_val).runtime_exact_ruby_class();
+                let caller_summary = self.profiles.as_ref().map(|profiles| self.profile_summary(profiles, caller_val, exit_state));
+                let caller_mono = caller_summary.as_ref().filter(|s| s.is_monomorphic()).map(|s| s.bucket(0));
+                incr_counter!(ctx_profile_param_entries);
+                if summary.is_monomorphic() {
+                    incr_counter!(ctx_profile_callee_monomorphic);
+                    let callee_class = summary.bucket(0).class();
+                    if static_class.or(caller_mono.map(|pt| pt.class())).is_some_and(|class| class != callee_class) {
+                        incr_counter!(ctx_profile_mono_caller_conflict);
+                    }
+                    continue;
+                }
+                if summary.is_polymorphic() || summary.is_skewed_polymorphic() {
+                    incr_counter!(ctx_profile_callee_polymorphic);
+                } else if summary.is_megamorphic() || summary.is_skewed_megamorphic() {
+                    incr_counter!(ctx_profile_callee_megamorphic);
+                } else {
+                    continue;
+                }
+                if arg_idx.is_none() { incr_counter!(ctx_profile_nonmono_self); } else { incr_counter!(ctx_profile_nonmono_arg); }
+                if static_class.is_some() {
+                    incr_counter!(ctx_profile_nonmono_caller_static_exact);
+                    fixable += 1;
+                } else if caller_mono.is_some() {
+                    incr_counter!(ctx_profile_nonmono_caller_profile_monomorphic);
+                    fixable += 1;
+                } else if caller_summary.as_ref().is_some_and(|s| s.is_skewed_polymorphic() || s.is_skewed_megamorphic()) {
+                    incr_counter!(ctx_profile_nonmono_caller_profile_skewed);
+                } else if caller_summary.as_ref().is_some_and(|s| s.is_polymorphic() || s.is_megamorphic()) {
+                    incr_counter!(ctx_profile_nonmono_caller_profile_polymorphic);
+                } else {
+                    incr_counter!(ctx_profile_nonmono_caller_no_profile);
+                }
+            }
+        }
+        if fixable > 0 {
+            let key = iseq_get_location(callee_iseq, 0);
+            *crate::state::ZJITState::get_ctx_profile_callee_counts().entry(key).or_insert(0) += fixable;
+        }
     }
 
     fn load_shape(&mut self, block: BlockId, recv: InsnId) -> InsnId {

@@ -490,6 +490,25 @@ make_counters! {
     inline_reject_no_returns,
     inline_reject_budget_exceeded,
 
+    // Inline-context profile census. Compile-time counts over the profile entries of an inlined
+    // callee whose operand is a callee parameter (self or a positional/keyword argument), i.e.
+    // the per-ISEQ profile entries that a caller context could sharpen. callee_* classify the
+    // callee's own (per-ISEQ) summary; nonmono_* classify what the inlining caller knows about the
+    // corresponding value when the callee summary is polymorphic or megamorphic.
+    ctx_profile_param_entries,
+    ctx_profile_callee_monomorphic,
+    ctx_profile_callee_polymorphic,
+    ctx_profile_callee_megamorphic,
+    ctx_profile_nonmono_self,
+    ctx_profile_nonmono_arg,
+    ctx_profile_nonmono_caller_static_exact,
+    ctx_profile_nonmono_caller_profile_monomorphic,
+    ctx_profile_nonmono_caller_profile_skewed,
+    ctx_profile_nonmono_caller_profile_polymorphic,
+    ctx_profile_nonmono_caller_no_profile,
+    // Monomorphic callee profile that disagrees with the caller's static/monomorphic type.
+    ctx_profile_mono_caller_conflict,
+
     total_native_stack_bytes,
 }
 
@@ -953,6 +972,12 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
     for (signature, counter) in not_inlined_cfuncs.iter() {
         let key_string = format!("not_inlined_cfuncs_{signature}");
         set_stat_usize!(hash, &key_string, **counter);
+    }
+
+    // Set inline-context profile census per callee
+    for (callee, count) in ZJITState::get_ctx_profile_callee_counts().iter() {
+        let key_string = format!("ctx_callee_{callee}");
+        set_stat_usize!(hash, &key_string, *count);
     }
 
     // Set not annotated cfunc counters

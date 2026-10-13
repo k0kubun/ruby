@@ -111,6 +111,8 @@ class << RubyVM::ZJIT
     print_counters_with_prefix(prefix: 'definedivar_fallback_', prompt: 'definedivar fallback reasons', buf:, stats:, limit: 5)
     print_counters_with_prefix(prefix: 'invokeblock_handler_', prompt: 'invokeblock handler', buf:, stats:, limit: 10)
     print_counters_with_prefix(prefix: 'inline_reject_', prompt: 'HIR-level inlining rejection reasons', buf:, stats:, limit: 10)
+    print_counters_with_prefix(prefix: 'ctx_profile_', prompt: 'inlined callee parameter profiles (compile-time)', buf:, stats:)
+    print_counters_with_prefix(prefix: 'ctx_callee_', prompt: 'inlined callees with non-monomorphic parameter profiles that are monomorphic in the caller', buf:, stats:, limit: 20)
 
     # Show most popular unsupported call features. Because each call can
     # use multiple complex features, a decrease in this number does not
