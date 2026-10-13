@@ -750,6 +750,27 @@ pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
 }
 
+/// Update --zjit-reprofile for testing
+#[cfg(test)]
+pub fn set_reprofile(reprofile: Reprofile) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().reprofile = reprofile; }
+}
+
+/// Update --zjit-profile-decay for testing
+#[cfg(test)]
+pub fn set_profile_decay(profile_decay: ProfileDecay) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().profile_decay = profile_decay; }
+}
+
+/// Update --zjit-profile-recompile-exit for testing
+#[cfg(test)]
+pub fn set_profile_recompile_exit(profile_recompile_exit: bool) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().profile_recompile_exit = profile_recompile_exit; }
+}
+
 /// Update --zjit-max-versions for testing
 #[cfg(test)]
 pub fn set_max_versions(max_versions: usize) {

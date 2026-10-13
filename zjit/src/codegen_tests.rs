@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, ProfileDecay, Reprofile, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_profile_decay, set_profile_recompile_exit, set_reprofile};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -245,6 +245,100 @@ fn test_recompile_exit_waits_for_exit_budget() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(1, payload.versions.len());
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+/// Summarize the profiled type distribution of the first operand of `opt_plus` in `a + b`
+fn opt_plus_lhs_summary(iseq: IseqPtr) -> crate::profile::TypeDistributionSummary {
+    // getlocal_WC_0 a, getlocal_WC_0 b, opt_plus
+    let opt_plus_idx = 4;
+    let pc = unsafe { rb_iseq_pc_at_idx(iseq, opt_plus_idx as u32) };
+    assert_eq!(YARVINSN_opt_plus, unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as ruby_vminsn_type);
+    let payload = get_or_create_iseq_payload(iseq);
+    match payload.profile.get_operand_types(opt_plus_idx) {
+        Some(types) => crate::profile::TypeDistributionSummary::new(&types[0]),
+        None => crate::profile::TypeDistributionSummary::empty(),
+    }
+}
+
+#[test]
+fn test_reprofile_on_invalidate_does_not_sample_exits() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(2);
+    set_reprofile(Reprofile::Invalidate);
+    eval("
+        def reprofile_on_invalidate(a, b) = a + b
+        reprofile_on_invalidate(1, 2)
+        reprofile_on_invalidate(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "reprofile_on_invalidate");
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+
+    // The first exit does not invalidate. With --zjit-reprofile=invalidate, the
+    // exited frame is not profiled, so the profile stays monomorphic.
+    eval("reprofile_on_invalidate(1.5, 2.5)");
+    assert!(!unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated());
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+}
+
+#[test]
+fn test_reprofile_on_compile_samples_exits() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(2);
+    set_reprofile(Reprofile::Compile);
+    eval("
+        def reprofile_on_compile(a, b) = a + b
+        reprofile_on_compile(1, 2)
+        reprofile_on_compile(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "reprofile_on_compile");
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+
+    // The side-exited frame runs the re-armed profiling instruction.
+    eval("reprofile_on_compile(1.5, 2.5)");
+    assert!(!opt_plus_lhs_summary(iseq).is_monomorphic());
+}
+
+#[test]
+fn test_profile_recompile_exit_records_failing_type() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    set_reprofile(Reprofile::Invalidate);
+    set_profile_decay(ProfileDecay::Clear);
+    set_profile_recompile_exit(true);
+    eval("
+        def profile_recompile_exit(a, b) = a + b
+        profile_recompile_exit(1, 2)
+        profile_recompile_exit(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "profile_recompile_exit");
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+    assert!(opt_plus_lhs_summary(iseq).bucket(0).is_fixnum());
+
+    // Invalidation clears the Fixnum counts, then the exit records the Float that failed the guard.
+    assert_eq!(Qtrue, eval("profile_recompile_exit(1.5, 2.5) == 4.0"));
+    assert!(unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated());
+    let summary = opt_plus_lhs_summary(iseq);
+    assert!(summary.is_monomorphic());
+    assert!(summary.bucket(0).is_flonum());
+}
+
+#[test]
+fn test_profile_decay_halve_on_invalidation() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    set_reprofile(Reprofile::Invalidate);
+    set_profile_decay(ProfileDecay::Halve);
+    eval("
+        def profile_decay_halve(a, b) = a + b
+        profile_decay_halve(1, 2)
+        profile_decay_halve(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "profile_decay_halve");
+    // call_threshold=2 profiles a single call, so halving drops the only sample.
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+    eval("profile_decay_halve(1.5, 2.5)");
+    assert!(unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated());
+    assert_eq!(opt_plus_lhs_summary(iseq).kind(), crate::distribution::DistributionKind::Empty);
 }
 
 #[test]

@@ -303,6 +303,39 @@ class TestZJITCLI < Test::Unit::TestCase
     }, stats: true
   end
 
+  def test_reprofile_options
+    script = <<~RUBY
+      def test(a, b) = a + b
+      r = []
+      20.times { r << test(1, 2) }
+      20.times { r << test(1.5, 2.5) }
+      20.times { r << test("a", "b") }
+      [r.uniq, RubyVM::ZJIT.stats[:profile_sample_initial] > 0]
+    RUBY
+    [
+      [],
+      ['--zjit-reprofile=compile'],
+      ['--zjit-reprofile=invalidate'],
+      ['--zjit-reprofile=invalidate', '--zjit-profile-decay=halve'],
+      ['--zjit-reprofile=invalidate', '--zjit-profile-decay=clear', '--zjit-profile-recompile-exit'],
+      ['--zjit-profile-decay=none', '--zjit-profile-recompile-exit=false'],
+    ].each do |args|
+      assert_runs '[[3, 4.0, "ab"], true]', script, stats: true, call_threshold: 2, extra_args: ['--zjit-num-exits-until-invalidate=1', *args]
+    end
+  end
+
+  def test_reprofile_options_reject_unknown_values
+    [
+      '--zjit-reprofile=never',
+      '--zjit-profile-decay=quarter',
+      '--zjit-profile-recompile-exit=yes',
+    ].each do |arg|
+      _out, err, status = EnvUtil.invoke_ruby([arg, '-e', ''], '', true, true)
+      refute_predicate status, :success?, "#{arg} should be rejected"
+      assert_match(/invalid/i, err)
+    end
+  end
+
   def test_reset_stats_with_zjit_off
     # [Bug #22327]
     assert_runs 'nil', <<~RUBY, zjit: false
