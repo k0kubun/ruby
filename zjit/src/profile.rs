@@ -14,31 +14,35 @@ struct Profiler {
     cfp: CfpPtr,
     iseq: IseqPtr,
     insn_idx: YarvInsnIdx,
+    /// PC of the profiled instruction
+    pc: *const VALUE,
+    /// Pointer past the topmost stack operand
+    sp: *const VALUE,
 }
 
 impl Profiler {
     fn new(ec: EcPtr) -> Self {
         let cfp = unsafe { get_ec_cfp(ec) };
         let iseq = unsafe { get_cfp_iseq(cfp) };
+        let pc = unsafe { get_cfp_pc(cfp) };
         Profiler {
             cfp,
             iseq,
-            insn_idx: unsafe { get_cfp_pc(cfp).offset_from(get_iseq_body_iseq_encoded(iseq)) as usize },
+            insn_idx: unsafe { pc.offset_from(get_iseq_body_iseq_encoded(iseq)) as usize },
+            pc,
+            sp: unsafe { get_cfp_sp(cfp) },
         }
     }
 
     // Get an instruction operand that sits next to the opcode at PC.
     fn insn_opnd(&self, idx: usize) -> VALUE {
-        unsafe { get_cfp_pc(self.cfp).add(1 + idx).read() }
+        unsafe { self.pc.add(1 + idx).read() }
     }
 
     // Peek at the nth topmost value on the Ruby stack.
     // Returns the topmost value when n == 0.
     fn peek_at_stack(&self, n: isize) -> VALUE {
-        unsafe {
-            let sp: *mut VALUE = get_cfp_sp(self.cfp);
-            *(sp.offset(-1 - n))
-        }
+        unsafe { *(self.sp.offset(-1 - n)) }
     }
 
     fn peek_at_self(&self) -> VALUE {
@@ -106,6 +110,58 @@ fn profile_insn_sample(
     }
 
     true
+}
+
+/// Return the number of stack operands that `profile_insn_sample` reads for a given bare
+/// opcode at `pc`, or None if the instruction is not profiled. Instructions that profile
+/// only `self`, the block handler, or the frame's method entry return Some(0).
+pub fn num_profiled_stack_opnds(bare_opcode: u32, pc: *const VALUE) -> Option<usize> {
+    let call_argc = || {
+        let cd: *const rb_call_data = unsafe { pc.add(1).read() }.as_ptr();
+        num_arguments_on_stack(cd) + 1
+    };
+    let n = match bare_opcode {
+        YARVINSN_opt_nil_p | YARVINSN_opt_empty_p | YARVINSN_opt_not | YARVINSN_objtostring
+        | YARVINSN_opt_length | YARVINSN_opt_size | YARVINSN_opt_succ => 1,
+        YARVINSN_opt_plus | YARVINSN_opt_minus | YARVINSN_opt_mult | YARVINSN_opt_div
+        | YARVINSN_opt_mod | YARVINSN_opt_eq | YARVINSN_opt_neq | YARVINSN_opt_lt
+        | YARVINSN_opt_le | YARVINSN_opt_gt | YARVINSN_opt_ge | YARVINSN_opt_and
+        | YARVINSN_opt_or | YARVINSN_opt_aref | YARVINSN_opt_ltlt | YARVINSN_opt_regexpmatch2
+        | YARVINSN_splatkw => 2,
+        YARVINSN_opt_aset => 3,
+        YARVINSN_getinstancevariable | YARVINSN_setinstancevariable | YARVINSN_definedivar
+        | YARVINSN_invokeblock => 0,
+        YARVINSN_opt_send_without_block | YARVINSN_send | YARVINSN_invokesuper => call_argc(),
+        _ => return None,
+    };
+    Some(n)
+}
+
+/// API called from tier 1 (profiling tier) JIT code. `argv` holds the `site.num_opnds`
+/// topmost stack operands of the profiled instruction, ordered from the bottom.
+/// `cfp` must be the frame of `iseq` (tier 1 code doesn't inline methods).
+/// This function doesn't allocate Ruby objects, so JIT code doesn't need to prepare for GC.
+pub extern "C" fn rb_zjit_tier1_profile(cfp: CfpPtr, iseq: VALUE, site: *mut crate::payload::Tier1Site, argv: *const VALUE) {
+    let site = unsafe { &mut *site };
+    // JIT code skips this call when remaining is 0, but be defensive.
+    if site.remaining == 0 {
+        return;
+    }
+    site.remaining -= 1;
+    with_vm_lock(src_loc!(), || {
+        let iseq: IseqPtr = iseq.as_iseq();
+        let insn_idx = site.insn_idx as usize;
+        let profiler = &mut Profiler {
+            cfp,
+            iseq,
+            insn_idx,
+            pc: unsafe { rb_iseq_pc_at_idx(iseq, site.insn_idx) },
+            sp: unsafe { argv.add(site.num_opnds as usize) },
+        };
+        let profile = &mut get_or_create_iseq_payload(iseq).profile;
+        profile_insn_sample(site.opcode as ruby_vminsn_type, profiler, profile);
+    });
+    crate::stats::incr_counter!(tier1_profile_samples);
 }
 
 /// Profile a YARV instruction

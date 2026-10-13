@@ -1362,6 +1362,14 @@ pub enum Insn {
     /// return instructions.
     CheckInterrupts { state: InsnId },
 
+    /// Tier 1 (profiling tier) only: record the types of `opnds` (and self/block handler,
+    /// depending on the instruction) into the ISEQ's profile while `site.remaining > 0`.
+    Tier1Profile { site: *mut crate::payload::Tier1Site, opnds: Vec<InsnId> },
+
+    /// Tier 1 (profiling tier) only: count down `site.remaining` and recompile the ISEQ
+    /// with tier 2 when it reaches zero. Placed at the method entry and loop headers.
+    Tier1Tick { site: *mut crate::payload::Tier1Site, state: InsnId },
+
     BreakPoint,
 
     /// Only use this instruction in tests where you need to end a block with
@@ -1390,6 +1398,13 @@ macro_rules! for_each_operand_impl {
             | Insn::BreakPoint | Insn::Unreachable
             | Insn::IncrCounter(_)
             | Insn::IncrCounterPtr { .. } => {}
+
+            Insn::Tier1Profile { opnds, .. } => {
+                $visit_many!(opnds);
+            }
+            Insn::Tier1Tick { state, .. } => {
+                $visit_one!(*state);
+            }
 
             Insn::IsBlockGiven { block_handler } => {
                 $visit_one!(*block_handler);
@@ -1740,6 +1755,7 @@ impl Insn {
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
+            | Insn::Tier1Profile { .. } | Insn::Tier1Tick { .. }
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
             | Insn::ArrayAset { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
@@ -1983,6 +1999,8 @@ impl Insn {
             Insn::IncrCounter(_) => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Stats),
             Insn::IncrCounterPtr { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Stats),
             Insn::CheckInterrupts { .. } => Effect::read_write(abstract_heaps::InterruptFlag, abstract_heaps::Control),
+            Insn::Tier1Profile { .. } => effects::Any,
+            Insn::Tier1Tick { .. } => effects::Any,
             Insn::InvokeProc { .. } => effects::Any,
             Insn::InvokeBlockIseqDirect { .. } => effects::Any,
             Insn::RefineType { .. } => effects::Empty,
@@ -2458,6 +2476,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 Ok(())
             },
             Insn::IncrCounterPtr { .. } => write!(f, "IncrCounterPtr"),
+            Insn::Tier1Profile { site, opnds } => {
+                let opcode = unsafe { (**site).opcode };
+                write!(f, "Tier1Profile {}", insn_name(opcode as usize))?;
+                write_separated!(f, ", ", ", ", opnds);
+                Ok(())
+            }
+            Insn::Tier1Tick { .. } => write!(f, "Tier1Tick"),
             Insn::Snapshot { state } => write!(f, "Snapshot {}", state.print(self.ptr_map)),
             Insn::Defined { op_type, v, .. } => {
                 // op_type (enum defined_type) printing logic from iseq.c.
@@ -2887,6 +2912,11 @@ struct CompilePolicy {
     /// side-exit, and instead use fallback paths (e.g. C calls) on mismatch.
     /// Set when this is the final version of an ISEQ after recompilation.
     no_side_exits: bool,
+    /// When true, compile the ISEQ with the profiling tier (tier 1): don't consume
+    /// type profiles, don't inline, don't generate recompile exits, and instead emit
+    /// `Tier1Profile` and `Tier1Tick` instructions that keep profiling from JIT code
+    /// and tier up to tier 2 later. See `--zjit-profiling-tier`.
+    tier1: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2908,8 +2938,31 @@ impl CompilePolicy {
                 |v| unsafe { v.as_ref() }.is_invalidated()
             ) && payload.versions.len() + 1 >= max_iseq_versions()
         };
-        Self { no_side_exits }
+        let tier1 = !iseq.is_null()
+            && get_or_create_iseq_payload(iseq).should_compile_tier1()
+            && iseq_has_profiled_insns(iseq);
+        // Tier 1 never speculates on profiles, so it falls back instead of side-exiting.
+        let no_side_exits = no_side_exits || tier1;
+        Self { no_side_exits, tier1 }
     }
+}
+
+/// Return true if the ISEQ has any instruction that ZJIT profiles. If it doesn't,
+/// the profiling tier has nothing to collect, so we compile tier 2 directly.
+fn iseq_has_profiled_insns(iseq: IseqPtr) -> bool {
+    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    let mut insn_idx = 0;
+    while insn_idx < iseq_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode: u32 = unsafe { rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(iseq, pc)) }
+            .try_into()
+            .unwrap();
+        if crate::profile::num_profiled_stack_opnds(opcode, pc).is_some() {
+            return true;
+        }
+        insn_idx += insn_len(opcode as usize);
+    }
+    false
 }
 
 /// A wrapper around [`InsnId`] that indicates the instruction's operands have been resolved.
@@ -3229,6 +3282,11 @@ impl Function {
             profiles: None,
             num_instructions: 0,
         }
+    }
+
+    /// Return true if this function is compiled by the profiling tier (tier 1).
+    pub fn is_tier1(&self) -> bool {
+        self.policy.tier1
     }
 
     pub fn iseq(&self) -> *const rb_iseq_t {
@@ -3717,6 +3775,7 @@ impl Function {
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
+            | Insn::Tier1Profile { .. } | Insn::Tier1Tick { .. }
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
@@ -5836,8 +5895,9 @@ impl Function {
     /// Inline method calls by replacing eligible SendDirect instructions with the
     /// callee's HIR body. Returns true if any inlining occurred.
     fn inline_methods(&mut self) -> bool {
-        // Bail early if inlining is disabled.
-        if get_option!(inline_threshold) == 0 {
+        // Bail early if inlining is disabled. The profiling tier doesn't inline because
+        // tier 1 profiles assume the profiled instruction runs in its own frame.
+        if get_option!(inline_threshold) == 0 || self.policy.tier1 {
             return false;
         }
 
@@ -6485,7 +6545,7 @@ impl Function {
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
         let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() || self.policy.tier1 {
             return;
         }
         for block in self.reverse_post_order() {
@@ -7989,6 +8049,8 @@ impl Function {
             | Insn::IncrCounter { .. }
             | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. }
+            | Insn::Tier1Profile { .. }
+            | Insn::Tier1Tick { .. }
             | Insn::GetClassVar { .. }
             | Insn::GetSpecialNumber { .. }
             | Insn::GetSpecialSymbol { .. }
@@ -8767,12 +8829,15 @@ fn insn_idx_at_offset(idx: u32, offset: i64) -> u32 {
 
 struct BytecodeInfo {
     jump_targets: Vec<u32>,
+    /// Targets of backward branches
+    loop_headers: HashSet<u32>,
 }
 
 fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeInfo {
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     let mut insn_idx = 0;
     let mut jump_targets: HashSet<u32> = opt_table.iter().copied().collect();
+    let mut loop_headers: HashSet<u32> = HashSet::new();
     while insn_idx < iseq_size {
         // Get the current pc and opcode
         let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
@@ -8793,7 +8858,11 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
             YARVINSN_branchunless | YARVINSN_jump | YARVINSN_branchif | YARVINSN_branchnil
             | YARVINSN_branchunless_without_ints | YARVINSN_jump_without_ints | YARVINSN_branchif_without_ints | YARVINSN_branchnil_without_ints => {
                 let offset = get_arg(pc, 0).as_i64();
-                jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+                let target = insn_idx_at_offset(insn_idx, offset);
+                jump_targets.insert(target);
+                if target < insn_idx {
+                    loop_headers.insert(target);
+                }
             }
             YARVINSN_opt_new => {
                 let offset = get_arg(pc, 1).as_i64();
@@ -8809,7 +8878,7 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
     }
     let mut result = jump_targets.into_iter().collect::<Vec<_>>();
     result.sort();
-    BytecodeInfo { jump_targets: result }
+    BytecodeInfo { jump_targets: result, loop_headers }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -9026,7 +9095,8 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     fun.self_is_heap_object = payload.self_is_heap_object;
 
     let result = add_iseq_to_hir(&mut fun, iseq, AddIseqMode::Standalone)?;
-    fun.profiles = Some(result.profiles);
+    // The profiling tier treats profiles as absent so that it doesn't speculate on them.
+    fun.profiles = if fun.policy.tier1 { None } else { Some(result.profiles) };
 
     if let Err(err) = crate::stats::trace_compile_phase("validate", || fun.validate()) {
         debug!("ZJIT: {err:?}: Initial HIR:\n{}", FunctionPrinter::without_snapshot(&fun));
@@ -9089,7 +9159,12 @@ fn add_iseq_to_hir(
         .get(jit_entry_start..)
         .expect("JIT entry index must be within the callee opt table")
         .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>();
-    let BytecodeInfo { jump_targets } = compute_bytecode_info(iseq, &jit_entry_insns);
+    let BytecodeInfo { jump_targets, loop_headers } = compute_bytecode_info(iseq, &jit_entry_insns);
+    // Profiling tier: profile instructions from JIT code and count entries for tier-up.
+    // Only the standalone ISEQ is compiled in tier 1 since tier 1 doesn't inline.
+    let tier1 = fun.policy.tier1 && matches!(mode, AddIseqMode::Standalone);
+    // Every JIT entry and the interpreter entry run the last opt-table entry's block.
+    let tier1_entry_insn_idx = jit_entry_insns.last().copied();
 
     let compile_jit_entries = matches!(mode, AddIseqMode::Standalone) && iseq_supports_jit_entry(iseq);
 
@@ -9161,10 +9236,15 @@ fn add_iseq_to_hir(
     // Keep compiling blocks until the queue becomes empty
     let mut visited = HashSet::new();
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    // A tier-up counter shared by the method entry and loop headers of a tier 1 function
+    let mut tier1_tick_site = None;
     while let Some((incoming_state, mut block, mut insn_idx, mut local_inval)) = queue.pop_front() {
         // Compile each block only once
         if visited.contains(&block) { continue; }
         visited.insert(block);
+        // Count tier 1 entries and loop iterations at the start of this block.
+        let mut tier1_tick_pending = tier1
+            && (Some(insn_idx) == tier1_entry_insn_idx || loop_headers.contains(&insn_idx));
 
         // Load basic block params first
         let mut self_param = fun.push_insn(block, Insn::Param);
@@ -9214,7 +9294,9 @@ fn add_iseq_to_hir(
             // trace_getinstancevariable in the ISEQ. We have to treat it like getinstancevariable
             // for profiling purposes: there is no operand on the stack to look up; we have
             // profiled cfp->self.
-            if opcode == YARVINSN_getinstancevariable || opcode == YARVINSN_trace_getinstancevariable {
+            if tier1 {
+                // The profiling tier doesn't specialize on (immature) profiles.
+            } else if opcode == YARVINSN_getinstancevariable || opcode == YARVINSN_trace_getinstancevariable {
                 profiles.profile_self(exit_id, &exit_state, self_param);
             } else if opcode == YARVINSN_setinstancevariable || opcode == YARVINSN_trace_setinstancevariable {
                 profiles.profile_self(exit_id, &exit_state, self_param);
@@ -9250,6 +9332,26 @@ fn add_iseq_to_hir(
             }
             else {
                 profiles.profile_stack(exit_id, &exit_state);
+            }
+
+            if tier1 {
+                if tier1_tick_pending {
+                    tier1_tick_pending = false;
+                    let site = *tier1_tick_site.get_or_insert_with(|| {
+                        payload.new_tier1_site(get_option!(tier2_call_threshold), insn_idx, opcode, 0)
+                    });
+                    fun.push_insn(block, Insn::Tier1Tick { site, state: exit_id });
+                }
+                let num_profiles = get_option!(tier1_num_profiles);
+                if num_profiles > 0 {
+                    if let Some(num_opnds) = crate::profile::num_profiled_stack_opnds(opcode, pc) {
+                        let opnds = (0..num_opnds).rev()
+                            .map(|n| exit_state.stack_topn(n).expect("Unexpected stack underflow in tier 1 profiling"))
+                            .collect();
+                        let site = payload.new_tier1_site(num_profiles, insn_idx, opcode, num_opnds as u32);
+                        fun.push_insn(block, Insn::Tier1Profile { site, opnds });
+                    }
+                }
             }
 
             // Flag a future getlocal/setlocal to add a patch point if this instruction is not leaf.

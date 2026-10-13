@@ -147,6 +147,14 @@ class << RubyVM::ZJIT
       :compiled_side_exit_count,
       :failed_iseq_count,
 
+      :tier1_compiled_iseq_count,
+      :tier2_compiled_iseq_count,
+      :tier_up_count,
+      :tier_up_failure_count,
+      :tier1_profile_samples,
+      :tier1_code_bytes,
+      :tier2_code_bytes,
+
       :compile_time_ns,
       :compile_side_exit_time_ns,
       :compile_side_exit_time_ratio,

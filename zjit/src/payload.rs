@@ -27,6 +27,41 @@ pub struct IseqPayload {
     pub self_is_heap_object: bool,
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
+    /// Counters referenced by tier 1 (profiling tier) JIT code. Boxed so that the JIT code
+    /// can embed stable addresses. They live as long as the ISEQ, like the JIT code.
+    pub tier1_sites: Vec<Box<Tier1Site>>,
+}
+
+/// A counter embedded in tier 1 (profiling tier) JIT code. See `--zjit-profiling-tier`.
+/// For a profiled instruction, `remaining` is the number of profile samples left.
+/// For a tier-up check, `remaining` is the number of entries left before tier 2.
+#[derive(Debug)]
+#[repr(C)]
+pub struct Tier1Site {
+    /// Decremented by JIT code or the profiling helper. Must be the first field.
+    pub remaining: u64,
+    /// YARV instruction index of the profiled instruction
+    pub insn_idx: u32,
+    /// Bare YARV opcode of the profiled instruction
+    pub opcode: u32,
+    /// Number of stack operands passed to the profiling helper
+    pub num_opnds: u32,
+}
+
+impl IseqPayload {
+    /// Allocate a counter for tier 1 JIT code and return its stable address.
+    pub fn new_tier1_site(&mut self, remaining: u64, insn_idx: u32, opcode: u32, num_opnds: u32) -> *mut Tier1Site {
+        let mut site = Box::new(Tier1Site { remaining, insn_idx, opcode, num_opnds });
+        let ptr: *mut Tier1Site = &mut *site;
+        self.tier1_sites.push(site);
+        ptr
+    }
+
+    /// Return true if the next compilation of this ISEQ should be tier 1 (profiling tier).
+    /// Only the first version of an ISEQ is compiled in tier 1.
+    pub fn should_compile_tier1(&self) -> bool {
+        get_option!(profiling_tier) && self.versions.is_empty()
+    }
 }
 
 impl IseqPayload {
@@ -37,6 +72,7 @@ impl IseqPayload {
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
+            tier1_sites: vec![],
         }
     }
 }
@@ -58,6 +94,9 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// True if this version was compiled by the profiling tier (tier 1).
+    pub tier1: bool,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -77,6 +116,7 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            tier1: false,
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")

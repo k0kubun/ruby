@@ -18,7 +18,7 @@ use crate::invariants::{
 };
 use crate::gc::append_gc_offsets;
 use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
-use crate::profile::reset_profiles_remaining;
+use crate::profile::{reset_profiles_remaining, rb_zjit_tier1_profile};
 use crate::perf;
 use crate::state::{rb_zjit_compiling_p, ZJITState};
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
@@ -33,9 +33,11 @@ use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
 /// Configurable via --zjit-max-versions.
+/// With --zjit-profiling-tier, the tier 1 version is exempt from the limit, so the
+/// limit is raised by one to leave the same number of versions for tier 2.
 pub fn max_iseq_versions() -> usize {
     unsafe { crate::options::OPTIONS.as_ref() }
-        .map_or(DEFAULT_MAX_VERSIONS, |opts| opts.max_versions)
+        .map_or(DEFAULT_MAX_VERSIONS, |opts| opts.max_versions + opts.profiling_tier as usize)
 }
 
 /// Sentinel program counter stored in C frames when runtime checks are enabled.
@@ -356,6 +358,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
     // Compile the ISEQ. When function is None, this is a lazy compile
     // from a stub hit -- wrap in a trace event covering the full compile.
     let mut version = IseqVersion::new(iseq);
+    let write_pos_before = cb.get_write_pos();
     let code_ptrs = if function.is_none() {
         trace_compile_phase(&iseq_get_location(iseq, 0), || gen_iseq_body(cb, iseq, version, function))
     } else {
@@ -365,6 +368,16 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         Ok(code_ptrs) => {
             unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
             incr_counter!(compiled_iseq_count);
+            if get_option!(profiling_tier) {
+                let code_bytes = cb.get_write_pos().saturating_sub(write_pos_before) as u64;
+                if unsafe { version.as_ref() }.tier1 {
+                    incr_counter!(tier1_compiled_iseq_count);
+                    incr_counter_by(Counter::tier1_code_bytes, code_bytes);
+                } else {
+                    incr_counter!(tier2_compiled_iseq_count);
+                    incr_counter_by(Counter::tier2_code_bytes, code_bytes);
+                }
+            }
             // Give the new version a fresh budget of recompile exits. See exit_recompile().
             payload.num_exits_until_invalidate = get_option!(num_exits_until_invalidate);
         }
@@ -389,6 +402,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
         Some(function) => function,
         None => &crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq))?,
     };
+    unsafe { version.as_mut() }.tier1 = function.is_tier1();
 
     // Compile the High-level IR
     let (iseq_code_ptrs, gc_offsets, iseq_calls) =
@@ -809,6 +823,8 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::IncrCounter(counter) => no_output!(gen_incr_counter(asm, counter)),
         Insn::IncrCounterPtr { counter_ptr } => no_output!(gen_incr_counter_ptr(asm, *counter_ptr)),
         &Insn::CheckInterrupts { state } => no_output!(gen_check_interrupts(jit, asm, function, &function.frame_state(state))),
+        Insn::Tier1Profile { site, opnds } => no_output!(gen_tier1_profile(jit, asm, *site, opnds!(opnds))),
+        &Insn::Tier1Tick { site, state } => no_output!(gen_tier1_tick(jit, asm, function, site, &function.frame_state(state))),
         Insn::BreakPoint => no_output!(asm.breakpoint()),
         Insn::Unreachable => no_output!(asm.abort()),
         &Insn::HashDup { val, state } => { gen_hash_dup(jit, asm, function, val, opnd!(val), &function.frame_state(state)) },
@@ -1367,6 +1383,65 @@ fn gen_check_interrupts(jit: &mut JITState, asm: &mut Assembler, function: &Func
     let interrupt_flag = asm.load(Opnd::mem(32, EC, RUBY_OFFSET_EC_INTERRUPT_FLAG));
     asm.test(interrupt_flag, interrupt_flag);
     asm.jnz(jit, side_exit(jit, function, state, SideExitReason::Interrupt));
+}
+
+/// Create a block that the current block's paths converge to, and return a jump edge to it.
+fn gen_join_block(asm: &mut Assembler) -> (lir::BlockId, Target) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let join_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let join_edge = Target::Block(Box::new(lir::BranchEdge { target: join_block, args: vec![] }));
+    (join_block, join_edge)
+}
+
+/// Continue code generation from a block created by gen_join_block().
+fn gen_enter_join_block(jit: &mut JITState, asm: &mut Assembler, join_block: lir::BlockId) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    asm.set_current_block(join_block);
+    let label = jit.get_label(asm, join_block, hir_block_id);
+    asm.write_label(label);
+}
+
+/// Tier 1: call the profiling helper while the site has profile samples remaining.
+fn gen_tier1_profile(jit: &mut JITState, asm: &mut Assembler, site: *mut crate::payload::Tier1Site, opnds: Vec<Opnd>) {
+    asm_comment!(asm, "tier1 profile");
+    let (join_block, join_edge) = gen_join_block(asm);
+
+    // remaining is the first field of Tier1Site
+    let site_ptr = asm.load(Opnd::const_ptr(site as *const u8));
+    let remaining = asm.load(Opnd::mem(64, site_ptr, 0));
+    asm.test(remaining, remaining);
+    asm.jz(jit, join_edge.clone());
+
+    // rb_zjit_tier1_profile() doesn't allocate, so we don't need to prepare for GC.
+    let argv = gen_push_opnds(jit, asm, &opnds);
+    let iseq = VALUE::from(jit.iseq()).into();
+    asm_ccall!(asm, rb_zjit_tier1_profile, CFP, iseq, Opnd::const_ptr(site as *const u8), argv);
+    asm.jmp(join_edge);
+
+    gen_enter_join_block(jit, asm, join_block);
+}
+
+/// Tier 1: count down the tier-up counter and compile tier 2 when it reaches zero.
+/// The counter wraps around after that, so tier_up() is called at most once per site.
+fn gen_tier1_tick(jit: &mut JITState, asm: &mut Assembler, function: &Function, site: *mut crate::payload::Tier1Site, state: &FrameState) {
+    asm_comment!(asm, "tier1 tick");
+    let (join_block, join_edge) = gen_join_block(asm);
+
+    let site_ptr = asm.load(Opnd::const_ptr(site as *const u8));
+    let remaining = asm.load(Opnd::mem(64, site_ptr, 0));
+    let remaining = asm.sub(remaining, Opnd::UImm(1));
+    asm.store(Opnd::mem(64, site_ptr, 0), remaining);
+    asm.test(remaining, remaining);
+    asm.jnz(jit, join_edge.clone());
+
+    // Compiling tier 2 may allocate objects, so prepare for GC.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    let iseq = VALUE::from(jit.iseq()).into();
+    asm_ccall!(asm, tier_up, EC, iseq);
+    asm.jmp(join_edge);
+
+    gen_enter_join_block(jit, asm, join_block);
 }
 
 fn gen_hash_dup(
@@ -3870,6 +3945,64 @@ c_callable! {
                 cb.mark_all_executable();
             }
         });
+    }
+}
+
+c_callable! {
+    /// Called from tier 1 (profiling tier) JIT code once it has been entered
+    /// `--zjit-tier2-call-threshold` times. Compile tier 2 now and redirect the interpreter
+    /// entry and JIT-to-JIT calls to it. Frames running tier 1 code keep running it.
+    /// If tier 2 fails to compile, keep using tier 1.
+    pub(crate) fn tier_up(ec: EcPtr, iseq_raw: VALUE) {
+        with_vm_lock(src_loc!(), || {
+            let iseq: IseqPtr = iseq_raw.as_iseq();
+            let payload = get_or_create_iseq_payload(iseq);
+            let Some(&tier1) = payload.versions.last() else { return };
+            let tier1_ptrs = match unsafe { tier1.as_ref() } {
+                IseqVersion { tier1: true, status: IseqStatus::Compiled(code_ptrs), .. } => code_ptrs.clone(),
+                _ => return, // already invalidated or tiered up
+            };
+            if unsafe { rb_ec_stack_check(ec as _) } != 0 {
+                incr_counter!(skipped_native_stack_full);
+                return;
+            }
+
+            // Make gen_iseq() compile a new version
+            let mut tier1 = tier1;
+            unsafe { tier1.as_mut() }.status = IseqStatus::Invalidated;
+            update_self_is_heap_object(iseq, unsafe { get_ec_cfp(ec) });
+
+            let cb = ZJITState::get_code_block();
+            let result = with_time_stat(compile_time_ns, || gen_iseq(cb, iseq, None));
+            match result {
+                Ok(IseqCodePtrs { start_ptr, jit_entry_ptrs }) => {
+                    incr_counter!(tier_up_count);
+                    unsafe { rb_zjit_iseq_set_jit_entry(iseq, start_ptr.raw_ptr(cb) as *mut c_void); }
+                    // Point JIT-to-JIT calls into tier 1 directly to tier 2
+                    let incoming = std::mem::take(&mut unsafe { tier1.as_mut() }.incoming);
+                    for iseq_call in incoming.iter() {
+                        let code_addr = jit_entry_ptrs[iseq_call.jit_entry_idx.to_usize()].raw_ptr(cb);
+                        iseq_call.regenerate(cb, |asm| {
+                            asm_comment!(asm, "call compiled function: {}", iseq_get_location(iseq, 0));
+                            asm.ccall_into(C_RET_OPND, code_addr, vec![]);
+                        });
+                    }
+                    let mut tier2 = *payload.versions.last().expect("gen_iseq should push a version");
+                    unsafe { tier2.as_mut() }.incoming.extend(incoming);
+                }
+                Err(err) => {
+                    debug!("{err:?}: tier_up failed: {}", iseq_get_location(iseq, 0));
+                    incr_counter!(tier_up_failure_count);
+                    // Drop the failed version and keep running tier 1. The failed version
+                    // has no live code, so we just leak it.
+                    if payload.versions.last().is_some_and(|v| *v != tier1) {
+                        payload.versions.pop();
+                    }
+                    unsafe { tier1.as_mut() }.status = IseqStatus::Compiled(tier1_ptrs);
+                }
+            }
+            cb.mark_all_executable();
+        })
     }
 }
 

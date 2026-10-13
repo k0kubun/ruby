@@ -26,6 +26,12 @@ pub type NumProfiles = u16;
 const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
 pub type NumExits = u32;
 
+/// Default --zjit-tier1-num-profiles
+pub const DEFAULT_TIER1_NUM_PROFILES: Tier1Count = 100;
+/// Default --zjit-tier2-call-threshold
+pub const DEFAULT_TIER2_CALL_THRESHOLD: Tier1Count = 200;
+pub type Tier1Count = u64;
+
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
 /// warmup code, but small enough to perform well on micro-benchmarks.
 pub const DEFAULT_CALL_THRESHOLD: CallThreshold = 30;
@@ -200,6 +206,17 @@ pub struct Options {
     /// cap exists to bound compile time when something pathological prevents the
     /// loop from reaching a fixed point.
     pub inline_max_iterations: InlineDepth,
+
+    /// Compile ISEQs first with a profiling tier (tier 1) that doesn't speculate on
+    /// type profiles but keeps collecting them from JIT code, and recompile them
+    /// with the fully optimizing tier (tier 2) once they're hot enough.
+    pub profiling_tier: bool,
+
+    /// Number of profile samples each profiled instruction collects in tier 1.
+    pub tier1_num_profiles: Tier1Count,
+
+    /// Number of tier 1 entries (and loop iterations) before tiering up to tier 2.
+    pub tier2_call_threshold: Tier1Count,
 }
 
 impl Default for Options {
@@ -237,6 +254,9 @@ impl Default for Options {
             inline_budget: DEFAULT_INLINE_BUDGET as InlineBudget,
             inline_deny: HashSet::new(),
             inline_max_iterations: DEFAULT_INLINE_MAX_ITERATIONS,
+            profiling_tier: false,
+            tier1_num_profiles: DEFAULT_TIER1_NUM_PROFILES,
+            tier2_call_threshold: DEFAULT_TIER2_CALL_THRESHOLD,
         }
     }
 }
@@ -251,6 +271,12 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Number of calls to trigger JIT (default: 30)."),
     ("--zjit-num-profiles=num",
                      "Number of profiled calls before JIT (default: 5)."),
+    ("--zjit-profiling-tier[=0|1]",
+                     "Profile in a non-speculating JIT tier before optimizing."),
+    ("--zjit-tier1-num-profiles=num",
+                     "Profiles per instruction in the profiling tier (default: 100)."),
+    ("--zjit-tier2-call-threshold=num",
+                     "Calls in the profiling tier to optimize (default: 200)."),
     ("--zjit-stats-quiet",
                      "Collect ZJIT stats and suppress output."),
     ("--zjit-stats[=file]",
@@ -477,6 +503,26 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("inline-max-iterations", _) => match opt_val.parse() {
             Ok(n) => { options.inline_max_iterations = n; },
             Err(_) => return None,
+        },
+
+        ("profiling-tier", "" | "1") => options.profiling_tier = true,
+        ("profiling-tier", "0") => options.profiling_tier = false,
+
+        // Setting a tier knob implies --zjit-profiling-tier.
+        ("tier1-num-profiles", _) => match opt_val.parse() {
+            Ok(n) => {
+                options.tier1_num_profiles = n;
+                options.profiling_tier = true;
+            }
+            Err(_) => return None,
+        },
+
+        ("tier2-call-threshold", _) => match opt_val.parse() {
+            Ok(n) if n >= 1 => {
+                options.tier2_call_threshold = n;
+                options.profiling_tier = true;
+            }
+            _ => return None,
         },
 
         ("inline-deny", csv) => {
@@ -725,6 +771,16 @@ pub fn set_num_profiles(num_profiles: NumProfiles) {
     update_profile_threshold();
 }
 
+/// Enable --zjit-profiling-tier with the given knobs for testing
+#[cfg(test)]
+pub fn set_profiling_tier(tier1_num_profiles: Tier1Count, tier2_call_threshold: Tier1Count) {
+    rb_zjit_prepare_options();
+    let options = unsafe { OPTIONS.as_mut().unwrap() };
+    options.profiling_tier = true;
+    options.tier1_num_profiles = tier1_num_profiles;
+    options.tier2_call_threshold = tier2_call_threshold;
+}
+
 /// Set --zjit-mem-size for testing. It's used to force OOM in tests.
 #[cfg(test)]
 pub fn set_mem_bytes(mem_bytes: usize) {
@@ -849,6 +905,36 @@ mod tests {
         assert!(expected.exists());
 
         let _ = std::fs::remove_file(expected);
+    }
+
+    #[test]
+    fn parse_profiling_tier() {
+        unsafe { OPTIONS = Some(Options::default()); }
+        let parse = |opt: &str| parse_option(CString::new(opt).unwrap().as_ptr()).is_some();
+        let options = || unsafe { OPTIONS.as_ref() }.unwrap();
+
+        assert!(!options().profiling_tier);
+        assert!(parse("profiling-tier"));
+        assert!(options().profiling_tier);
+        assert!(parse("profiling-tier=0"));
+        assert!(!options().profiling_tier);
+        assert!(parse("profiling-tier=1"));
+        assert!(options().profiling_tier);
+        assert!(!parse("profiling-tier=2"));
+
+        // Tier knobs imply --zjit-profiling-tier
+        assert!(parse("profiling-tier=0"));
+        assert!(parse("tier1-num-profiles=7"));
+        assert_eq!(options().tier1_num_profiles, 7);
+        assert!(options().profiling_tier);
+        assert!(parse("profiling-tier=0"));
+        assert!(parse("tier2-call-threshold=42"));
+        assert_eq!(options().tier2_call_threshold, 42);
+        assert!(options().profiling_tier);
+
+        assert!(!parse("tier1-num-profiles=abc"));
+        assert!(!parse("tier2-call-threshold=0"));
+        assert!(!parse("tier2-call-threshold=-1"));
     }
 
     #[test]

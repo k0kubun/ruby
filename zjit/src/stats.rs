@@ -156,6 +156,15 @@ make_counters! {
     default {
         compiled_iseq_count,
         failed_iseq_count,
+
+        // --zjit-profiling-tier counters
+        tier1_compiled_iseq_count,
+        tier2_compiled_iseq_count,
+        tier1_code_bytes,
+        tier2_code_bytes,
+        tier1_profile_samples,
+        tier_up_count,
+        tier_up_failure_count,
         jit_frame_heap_bytes,
         skipped_native_stack_full,
 
