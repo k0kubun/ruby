@@ -28,7 +28,7 @@ use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, rb_zjit_call_threshold, InlineDepth, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, rb_zjit_call_threshold, stub_profile_threshold, InlineDepth, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
@@ -4069,7 +4069,7 @@ c_callable! {
             }
 
             // Exit to the interpreter until the callee ISEQ collects enough profiles.
-            if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
+            if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq, stub_profile_threshold()) } {
                 incr_counter!(function_stub_profile_exit_count);
                 // Preserve the reference owned by the stub when iseq_call is dropped.
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }

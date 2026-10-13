@@ -178,16 +178,19 @@ rb_zjit_profile_enable(const rb_iseq_t *iseq)
 
 // Return false if a function stub has not collected enough profiles yet, enabling
 // profiling instructions as needed. Return true once enough profiles are collected.
+// profile_threshold is the call count at which a function stub starts profiling.
 bool
-rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
+rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq, unsigned int profile_threshold)
 {
     struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
 
-    if (body->jit_entry_calls < rb_zjit_profile_threshold) {
+    if (body->jit_entry_calls < profile_threshold) {
         // Skip the unprofiled warmup. The compiled caller already establishes
         // that the callee is hot, so go straight to the profiling window.
-        body->jit_entry_calls = rb_zjit_profile_threshold;
-        rb_zjit_profile_enable(iseq);
+        body->jit_entry_calls = profile_threshold;
+        if (profile_threshold < rb_zjit_call_threshold) {
+            rb_zjit_profile_enable(iseq);
+        }
     }
     else {
         body->jit_entry_calls++;

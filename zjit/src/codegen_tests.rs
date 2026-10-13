@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles, set_num_reprofiles, set_recompile_threshold};
+use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles, set_num_reprofiles, set_recompile_threshold, set_stub_num_profiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -182,6 +182,73 @@ fn test_function_stub_profiles_before_compiling() {
 
     // The following hit observes a completed profiling window and compiles.
     assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_profile_stub_entry(true)"));
+    assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
+}
+
+#[test]
+fn test_stub_num_profiles() {
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let call_threshold = CallThreshold::from(get_option!(num_profiles)) + 2;
+    set_call_threshold(call_threshold);
+    set_stub_num_profiles(Some(1));
+
+    eval(&format!("
+        class Integer
+          def stub_num_profiles_target = self + 1
+        end
+
+        def stub_num_profiles_entry(run)
+          1.stub_num_profiles_target if run
+        end
+
+        i = 0
+        while i < {call_threshold}
+          stub_num_profiles_entry(false)
+          i += 1
+        end
+    "));
+
+    let target_iseq = get_method_iseq("1", "stub_num_profiles_target");
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+
+    // With --zjit-stub-num-profiles=1, the first stub hit profiles the callee
+    // in the interpreter, and the second stub hit compiles it.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("stub_num_profiles_entry(true)"));
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("stub_num_profiles_entry(true)"));
+    assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
+}
+
+#[test]
+fn test_stub_num_profiles_zero_compiles_immediately() {
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let call_threshold = CallThreshold::from(get_option!(num_profiles)) + 2;
+    set_call_threshold(call_threshold);
+    set_stub_num_profiles(Some(0));
+
+    eval(&format!("
+        class Integer
+          def stub_num_profiles_zero_target = self + 1
+        end
+
+        def stub_num_profiles_zero_entry(run)
+          1.stub_num_profiles_zero_target if run
+        end
+
+        i = 0
+        while i < {call_threshold}
+          stub_num_profiles_zero_entry(false)
+          i += 1
+        end
+    "));
+
+    let target_iseq = get_method_iseq("1", "stub_num_profiles_zero_target");
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+
+    // With --zjit-stub-num-profiles=0, the first stub hit compiles the callee.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("stub_num_profiles_zero_entry(true)"));
     assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
 }
 

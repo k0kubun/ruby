@@ -88,6 +88,10 @@ pub struct Options {
     /// non-final version. If None, --zjit-num-profiles is used.
     pub num_reprofiles: Option<NumProfiles>,
 
+    /// Number of calls a function stub profiles an uncompiled callee for before compiling it.
+    /// If None, --zjit-num-profiles is used. Zero compiles the callee on the first stub hit.
+    pub stub_num_profiles: Option<CallThreshold>,
+
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
@@ -217,6 +221,7 @@ impl Default for Options {
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
             num_reprofiles: None,
+            stub_num_profiles: None,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             recompile_threshold: None,
             stats: false,
@@ -464,6 +469,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => return None,
         },
 
+        ("stub-num-profiles", _) => match opt_val.parse() {
+            Ok(n) => options.stub_num_profiles = Some(n),
+            Err(_) => return None,
+        },
+
         ("num-reprofiles", _) => match opt_val.parse() {
             Ok(n) if n > 0 => options.num_reprofiles = Some(n),
             _ => return None,
@@ -708,6 +718,16 @@ fn update_profile_threshold() {
     }
 }
 
+/// Return the call count at which a function stub starts profiling an uncompiled callee.
+/// A function stub compiles the callee once the call count reaches rb_zjit_call_threshold.
+pub fn stub_profile_threshold() -> CallThreshold {
+    match get_option!(stub_num_profiles) {
+        None => unsafe { rb_zjit_profile_threshold },
+        Some(_) if unsafe { rb_zjit_call_threshold == 1 } => 0,
+        Some(n) => unsafe { rb_zjit_call_threshold.saturating_sub(n).max(1) },
+    }
+}
+
 /// Update --zjit-call-threshold for testing
 #[cfg(test)]
 pub fn set_call_threshold(call_threshold: CallThreshold) {
@@ -721,6 +741,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
+}
+
+/// Update --zjit-stub-num-profiles for testing
+#[cfg(test)]
+pub fn set_stub_num_profiles(stub_num_profiles: Option<CallThreshold>) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().stub_num_profiles = stub_num_profiles; }
 }
 
 /// Update --zjit-num-reprofiles for testing
@@ -894,6 +921,16 @@ mod tests {
         assert!(parse_option(c"recompile-threshold=foo".as_ptr()).is_none());
         assert!(parse_option(c"recompile-threshold=5".as_ptr()).is_some());
         assert_eq!(Some(5), unsafe { OPTIONS.as_ref() }.unwrap().recompile_threshold);
+    }
+
+    #[test]
+    fn parse_stub_num_profiles() {
+        unsafe { OPTIONS = Some(Options::default()); }
+        assert_eq!(None, unsafe { OPTIONS.as_ref() }.unwrap().stub_num_profiles);
+
+        assert!(parse_option(c"stub-num-profiles=foo".as_ptr()).is_none());
+        assert!(parse_option(c"stub-num-profiles=0".as_ptr()).is_some());
+        assert_eq!(Some(0), unsafe { OPTIONS.as_ref() }.unwrap().stub_num_profiles);
     }
 
     #[test]
