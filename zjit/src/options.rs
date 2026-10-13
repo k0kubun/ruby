@@ -27,9 +27,9 @@ const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
 pub type NumExits = u32;
 
 /// Default --zjit-tier1-num-profiles
-pub const DEFAULT_TIER1_NUM_PROFILES: Tier1Count = 100;
+pub const DEFAULT_TIER1_NUM_PROFILES: Tier1Count = 30;
 /// Default --zjit-tier2-call-threshold
-pub const DEFAULT_TIER2_CALL_THRESHOLD: Tier1Count = 200;
+pub const DEFAULT_TIER2_CALL_THRESHOLD: Tier1Count = 30;
 pub type Tier1Count = u64;
 
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
@@ -274,9 +274,9 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-profiling-tier[=0|1]",
                      "Profile in a non-speculating JIT tier before optimizing."),
     ("--zjit-tier1-num-profiles=num",
-                     "Profiles per instruction in the profiling tier (default: 100)."),
+                     "Profiles per instruction in the profiling tier (default: 30)."),
     ("--zjit-tier2-call-threshold=num",
-                     "Calls in the profiling tier to optimize (default: 200)."),
+                     "Calls in the profiling tier to optimize (default: 30)."),
     ("--zjit-stats-quiet",
                      "Collect ZJIT stats and suppress output."),
     ("--zjit-stats[=file]",
