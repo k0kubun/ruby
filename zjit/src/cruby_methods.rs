@@ -752,7 +752,7 @@ fn coerce_float_op_operand(fun: &mut hir::Function, block: hir::BlockId, val: hi
     if fun.is_a(val, guard_type) {
         val
     } else {
-        fun.guard_type_recompile(block, val, guard_type, state, hir::Recompile)
+        fun.guard_type_recompile(block, val, guard_type, state, hir::Recompile::OperandType)
     }
 }
 

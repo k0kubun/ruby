@@ -486,6 +486,82 @@ make_counters! {
     inline_reject_budget_exceeded,
 
     total_native_stack_bytes,
+
+    // Version lifecycle. invalidation_*: what invalidated a version.
+    // invalidation_skipped_max_versions: an invalidation request ignored because the ISEQ is at
+    // --zjit-max-versions (the final version stays in place).
+    invalidation_recompile_exit,
+    invalidation_patch_point,
+    invalidation_skipped_max_versions,
+    // Number of ISEQs whose latest version count is N (moved as versions are added)
+    iseq_versions_1,
+    iseq_versions_2,
+    iseq_versions_3,
+    iseq_versions_4,
+    iseq_versions_5_or_more,
+    // Number of ISEQs that reached --zjit-max-versions
+    iseq_versions_at_max,
+
+    // recompile_exit_*: exit_recompile() calls by the kind of guard (hir::Recompile)
+    recompile_exit_send_recv_type,
+    recompile_exit_send_block_arg,
+    recompile_exit_splat_length,
+    recompile_exit_ivar_shape,
+    recompile_exit_no_profile,
+    recompile_exit_block_handler,
+    recompile_exit_once,
+    recompile_exit_operand_type,
+    // Recompile exits that counted against the per-version budget
+    budgeted_recompile_exit_count,
+}
+
+/// Counter for exit_recompile() calls of a given guard kind
+pub fn recompile_exit_counter(kind: crate::hir::Recompile) -> Counter {
+    use crate::hir::Recompile::*;
+    match kind {
+        SendRecvType => Counter::recompile_exit_send_recv_type,
+        SendBlockArg => Counter::recompile_exit_send_block_arg,
+        SplatLength => Counter::recompile_exit_splat_length,
+        IvarShape => Counter::recompile_exit_ivar_shape,
+        NoProfile => Counter::recompile_exit_no_profile,
+        BlockHandler => Counter::recompile_exit_block_handler,
+        Once => Counter::recompile_exit_once,
+        OperandType => Counter::recompile_exit_operand_type,
+    }
+}
+
+/// Update the iseq_versions_* histogram when an ISEQ gets its `num_versions`-th version.
+pub fn record_iseq_version_count(num_versions: usize, max_versions: usize) {
+    fn bucket(n: usize) -> Counter {
+        match n {
+            1 => Counter::iseq_versions_1,
+            2 => Counter::iseq_versions_2,
+            3 => Counter::iseq_versions_3,
+            4 => Counter::iseq_versions_4,
+            _ => Counter::iseq_versions_5_or_more,
+        }
+    }
+    if num_versions > 1 && bucket(num_versions - 1) != bucket(num_versions) {
+        // Saturate because reset_stats! may have cleared the old bucket
+        let ptr = counter_ptr(bucket(num_versions - 1));
+        unsafe { *ptr = (*ptr).saturating_sub(1); }
+    }
+    if num_versions == 1 || bucket(num_versions - 1) != bucket(num_versions) {
+        incr_counter_by(bucket(num_versions), 1);
+    }
+    if num_versions == max_versions {
+        incr_counter_by(Counter::iseq_versions_at_max, 1);
+    }
+}
+
+/// Side exits taken from a final version, indexed by position in EXIT_COUNTERS
+static mut FINAL_EXIT_COUNTERS: [u64; 256] = [0; 256];
+
+/// Return a raw pointer to the final-version exit counter for a given reason
+pub fn final_exit_counter_ptr(reason: crate::hir::SideExitReason) -> *mut u64 {
+    let idx = side_exit_counter(reason) as usize - EXIT_COUNTERS[0] as usize;
+    assert!(idx < 256 && EXIT_COUNTERS.len() <= 256);
+    unsafe { std::ptr::addr_of_mut!(FINAL_EXIT_COUNTERS[idx]) }
 }
 
 /// Increase a counter by a specified amount
@@ -773,6 +849,7 @@ pub extern "C" fn rb_zjit_reset_stats_bang(_ec: EcPtr, _self: VALUE) -> VALUE {
 
         // Reset exit counters for YARV instructions
         ZJITState::get_exit_counters().as_mut_slice().fill(0);
+        unsafe { (*std::ptr::addr_of_mut!(FINAL_EXIT_COUNTERS)).fill(0); }
 
         // Reset send fallback counters
         ZJITState::get_send_fallback_counters().as_mut_slice().fill(0);
@@ -865,6 +942,16 @@ pub extern "C" fn rb_zjit_stats(_ec: EcPtr, _self: VALUE, target_key: VALUE) -> 
         set_stat_usize!(hash, &counter.name(), count);
     }
     set_stat_usize!(hash, "side_exit_count", side_exit_count);
+
+    // Set side-exit counters for exits from final versions (final_exit_<reason>)
+    let mut final_version_exit_count = 0;
+    for (idx, &counter) in EXIT_COUNTERS.iter().enumerate() {
+        let count = unsafe { *std::ptr::addr_of!(FINAL_EXIT_COUNTERS[idx]) };
+        final_version_exit_count += count;
+        let key_string = format!("final_{}", counter.name());
+        set_stat_usize!(hash, &key_string, count);
+    }
+    set_stat_usize!(hash, "final_version_exit_count", final_version_exit_count);
 
     // Set side-exit counters for UnhandledYARVInsn
     let exit_counters = ZJITState::get_exit_counters();

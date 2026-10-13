@@ -147,6 +147,10 @@ class << RubyVM::ZJIT
     print_counters_with_prefix(prefix: 'unhandled_yarv_insn_', prompt: 'unhandled YARV insns', buf:, stats:, limit: 20)
     print_counters_with_prefix(prefix: 'unhandled_hir_insn_', prompt: 'unhandled HIR insns', buf:, stats:, limit: 20)
     print_counters_with_prefix(prefix: 'exit_', prompt: 'side exit reasons', buf:, stats:, limit: 20)
+    print_counters_with_prefix(prefix: 'final_exit_', prompt: 'side exit reasons in final versions', buf:, stats:, limit: 10)
+    print_counters_with_prefix(prefix: 'recompile_exit_', prompt: 'recompile exits by guard kind', buf:, stats:, limit: 10)
+    print_counters_with_prefix(prefix: 'invalidation_', prompt: 'version invalidation triggers', buf:, stats:, limit: 5)
+    print_counters_with_prefix(prefix: 'iseq_versions_', prompt: 'ISEQs by number of versions', buf:, stats:, limit: 10)
 
     # Show no-prefix counters, having the most important stat `ratio_in_zjit` at the end
     print_counters([

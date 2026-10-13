@@ -668,9 +668,39 @@ pub enum SideExitReason {
     OnceNotDone,
 }
 
-/// Marks a side exit as triggering profiling and recompilation.
+/// Marks a side exit as triggering profiling and recompilation. The variant says which kind of
+/// speculation the guard checks, so that `exit_recompile` can count exits per kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Recompile;
+#[repr(u8)]
+pub enum Recompile {
+    /// Receiver class guard of a specialized send (SendDirect, cfunc, attr_reader, ...)
+    SendRecvType = 0,
+    /// Block argument guard (nil or Proc) of a specialized send
+    SendBlockArg = 1,
+    /// Caller splat array length guard
+    SplatLength = 2,
+    /// Shape guard of a specialized getivar/setivar/definedivar/attr_reader
+    IvarShape = 3,
+    /// Side exit at a send/getivar/setivar that had no profile
+    NoProfile = 4,
+    /// Block handler / block ISEQ guard of a monomorphic invokeblock
+    BlockHandler = 5,
+    /// `once` whose value was not computed yet at compile time
+    Once = 6,
+    /// Operand type guard of a specialized operator (e.g. Float#+ operand)
+    OperandType = 7,
+}
+
+impl Recompile {
+    pub const ALL: [Recompile; 8] = [
+        Recompile::SendRecvType, Recompile::SendBlockArg, Recompile::SplatLength, Recompile::IvarShape,
+        Recompile::NoProfile, Recompile::BlockHandler, Recompile::Once, Recompile::OperandType,
+    ];
+
+    pub fn from_u8(kind: u8) -> Option<Recompile> {
+        Self::ALL.get(kind as usize).copied()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MethodType {
@@ -3363,14 +3393,14 @@ impl Function {
         // No need for new HIR blocks.
         if iseqs.len() == 1 && monomorphic_iseq && !self.policy.no_side_exits {
             let block_iseq = iseqs[0];
-            self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile) });
+            self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile::BlockHandler) });
             let captured = self.untag_block_handler(block, block_handler);
 
             // Guard captured->code.iseq is the profiled block iseq. The ISEQ is a GC object that
             // can be moved by compaction, so bake it in as a `Const::Value` rather than a raw
             // `Const::CPtr` to let the GC mark it and update the pointer embedded in JIT code.
             let captured_iseq = self.load_captured_code_iseq(block, captured);
-            self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::Value(VALUE::from(block_iseq)), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state, recompile: Some(Recompile) });
+            self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::Value(VALUE::from(block_iseq)), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state, recompile: Some(Recompile::BlockHandler) });
 
             let result = self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state });
             return (block, result);
@@ -4336,7 +4366,7 @@ impl Function {
             expected: Const::CInt64(i64::from(caller_splat.length)),
             reason: Box::new(SideExitReason::CallerSplatLengthMismatch),
             state,
-            recompile: Some(Recompile),
+            recompile: Some(Recompile::SplatLength),
         });
 
         // An empty splat cannot end in a ruby2_keywords hash, so skip
@@ -5017,7 +5047,7 @@ impl Function {
                                             expected: Const::Value(Qnil),
                                             reason: Box::new(SideExitReason::BlockArgNotNil),
                                             state,
-                                            recompile: Some(Recompile),
+                                            recompile: Some(Recompile::SendBlockArg),
                                         });
                                     }
                                     // Strip nil block arg and treat as no block
@@ -5035,7 +5065,7 @@ impl Function {
                                     let guarded = self.guard_type_recompile(
                                         block, block_arg,
                                         Type::from_profiled_type(block_arg_profiled_type.unwrap()),
-                                        state, Recompile,
+                                        state, Recompile::SendBlockArg,
                                     );
                                     _ = args.pop();
                                     send_block = Some(BlockHandler::BlockArgProc(guarded));
@@ -5113,7 +5143,7 @@ impl Function {
 
                             // Add GuardType for profiled receiver
                             if let Some(profiled_type) = profiled_type {
-                                recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state, recompile: Some(Recompile) });
+                                recv = self.push_insn(block, Insn::GuardType { val: recv, guard_type: Type::from_profiled_type(profiled_type), state, recompile: Some(Recompile::SendRecvType) });
                                 self.insn_types[recv] = self.infer_type(recv);
                             }
 
@@ -5155,7 +5185,7 @@ impl Function {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
 
                             if let Some(profiled_type) = profiled_type {
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                             }
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
@@ -5173,7 +5203,7 @@ impl Function {
 
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
 
                                 let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
                                     self.count(block, counter);
@@ -5195,7 +5225,7 @@ impl Function {
                                 // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
                                 // operand other than CFP self. Support it with a reprofile strategy that
                                 // profiles the receiver operand even after the send insn has finished profiling.
-                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                                 let recompile = None;
                                 self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
                                     self.count(block, counter);
@@ -5222,7 +5252,7 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
-                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                                     }
                                     let kw_splat = flags & VM_CALL_KW_SPLAT != 0;
                                     let invoke_proc = self.push_insn(block, Insn::InvokeProc { recv, args: args.clone(), state, kw_splat });
@@ -5259,7 +5289,7 @@ impl Function {
                                     }
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                                     if let Some(profiled_type) = profiled_type {
-                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                                     }
                                     // All structs from the same Struct class should have the same
                                     // length. So if our recv is embedded all runtime
@@ -5371,7 +5401,7 @@ impl Function {
 
                                         if let Some(profiled_type) = profiled_type {
                                             // Guard receiver class
-                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
@@ -5438,7 +5468,7 @@ impl Function {
 
                                         if let Some(profiled_type) = profiled_type {
                                             // Guard receiver class
-                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+                                            recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile::SendRecvType);
                                         }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
@@ -6325,7 +6355,7 @@ impl Function {
         }
         let self_val = self.guard_heap(block, self_val, state);
         let shape = self.load_shape(block, self_val);
-        self.guard_shape(block, shape, profiled_type.shape(), state, Some(Recompile));
+        self.guard_shape(block, shape, profiled_type.shape(), state, Some(Recompile::IvarShape));
         Ok(self.load_ivar(block, self_val, profiled_type, id))
     }
 
@@ -6558,7 +6588,7 @@ impl Function {
             for insn_id in old_insns {
                 match self.resolve(insn_id).insn(self) {
                     &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } => {
-                        self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile) });
+                        self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile::NoProfile) });
                         // SideExit is a terminator; don't add remaining instructions
                         break;
                     }
@@ -8486,14 +8516,14 @@ impl Function {
                 assert_eq!(has_result, result.is_some());
                 return Some((block, result));
             } else {
-                self.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(no_profile_reason), recompile: Some(Recompile) });
+                self.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(no_profile_reason), recompile: Some(Recompile::NoProfile) });
                 return None;
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
         if profiles.len() == 1 && !self.policy.no_side_exits {
             let actual = self.load_shape(block, self_param);
-            self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
+            self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile::IvarShape));
             let result = emit_optimized(self, block, profiles[0]);
             assert_eq!(has_result, result.is_some());
             return Some((block, result));
@@ -8524,7 +8554,7 @@ impl Function {
                     self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
                 } else {
                     // If the policy allows exits, exit to the interpreter if the shape doesn't match.
-                    self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile));
+                    self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile::IvarShape));
                     // TODO(max): Don't make a new block in this case
                     self.push_insn(block, Insn::Jump(edge(optimized_block)));
                 }
@@ -9706,7 +9736,7 @@ fn add_iseq_to_hir(
                             .and_then(can_optimize) {
                             self_param = fun.guard_heap(block, self_param, exit_id);
                             let shape = fun.load_shape(block, self_param);
-                            fun.guard_shape(block, shape, profiled_shape, exit_id, Some(Recompile));
+                            fun.guard_shape(block, shape, profiled_shape, exit_id, Some(Recompile::IvarShape));
                             let mut ivar_index: attr_index_t = 0;
                             let result = if unsafe { rb_shape_get_iv_index(profiled_shape.0, id, &mut ivar_index) } {
                                 fun.push_insn(block, Insn::Const { val: Const::Value(pushval) })
@@ -9807,7 +9837,7 @@ fn add_iseq_to_hir(
                         let val = fun.push_insn(block, Insn::Const { val: Const::Value(value) });
                         state.stack_push(val);
                     } else {
-                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::OnceNotDone), recompile: Some(Recompile) });
+                        fun.push_insn(block, Insn::SideExit { state: exit_id, reason: Box::new(SideExitReason::OnceNotDone), recompile: Some(Recompile::Once) });
                         break;  // End the block
                     }
                 }
