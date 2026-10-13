@@ -93,6 +93,10 @@ pub struct Options {
     /// How to age existing profiles when a version is invalidated. See [ProfileDecay].
     pub profile_decay: ProfileDecay,
 
+    /// Profile the exiting instruction at the side exit that invalidates a version,
+    /// so the next version sees the type that actually failed the guard.
+    pub profile_recompile_exit: bool,
+
     /// Enable ZJIT statistics
     pub stats: bool,
 
@@ -217,6 +221,7 @@ impl Default for Options {
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             reprofile: Reprofile::Compile,
             profile_decay: ProfileDecay::None,
+            profile_recompile_exit: false,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -497,6 +502,9 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("profile-decay", "none") => options.profile_decay = ProfileDecay::None,
         ("profile-decay", "halve") => options.profile_decay = ProfileDecay::Halve,
         ("profile-decay", "clear") => options.profile_decay = ProfileDecay::Clear,
+
+        ("profile-recompile-exit", "") | ("profile-recompile-exit", "true") => options.profile_recompile_exit = true,
+        ("profile-recompile-exit", "false") => options.profile_recompile_exit = false,
 
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,

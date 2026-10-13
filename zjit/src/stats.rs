@@ -476,6 +476,7 @@ make_counters! {
     profile_sample_initial,
     profile_sample_post_compile,
     profile_sample_reprofile,
+    profile_sample_recompile_exit,
 
     // How the DistributionKind of each profiled operand changed between the
     // previous compile of an ISEQ and the current recompile.

@@ -18,7 +18,10 @@ struct Profiler {
 
 impl Profiler {
     fn new(ec: EcPtr) -> Self {
-        let cfp = unsafe { get_ec_cfp(ec) };
+        Self::from_cfp(unsafe { get_ec_cfp(ec) })
+    }
+
+    fn from_cfp(cfp: CfpPtr) -> Self {
         let iseq = unsafe { get_cfp_iseq(cfp) };
         Profiler {
             cfp,
@@ -127,6 +130,27 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     entry.profiles_remaining = entry.profiles_remaining.saturating_sub(1);
     if entry.profiles_remaining == 0 {
         unsafe { rb_zjit_iseq_insn_set(profiler.iseq, profiler.insn_idx as u32, bare_opcode); }
+    }
+}
+
+/// Take one profile sample of the instruction a side exit resumes at, without
+/// consuming that instruction's profiling budget. Called from exit_recompile
+/// after the side exit has written cfp->pc, cfp->sp, and the stack.
+pub(crate) fn profile_exit(cfp: CfpPtr) {
+    let iseq = unsafe { get_cfp_iseq(cfp) };
+    let pc = unsafe { get_cfp_pc(cfp) };
+    if iseq.is_null() || pc.is_null() {
+        return;
+    }
+    let insn_idx = unsafe { pc.offset_from(get_iseq_body_iseq_encoded(iseq)) };
+    if insn_idx < 0 || insn_idx as u32 >= unsafe { get_iseq_encoded_size(iseq) } {
+        return;
+    }
+    let bare_opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as ruby_vminsn_type;
+    let profiler = &mut Profiler::from_cfp(cfp);
+    let profile = &mut get_or_create_iseq_payload(iseq).profile;
+    if profile_insn_sample(bare_opcode, profiler, profile) {
+        crate::stats::incr_counter!(profile_sample_recompile_exit);
     }
 }
 

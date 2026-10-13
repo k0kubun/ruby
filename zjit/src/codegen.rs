@@ -3852,7 +3852,7 @@ c_callable! {
     /// The version gets invalidated after `--zjit-num-exits-until-invalidate` recompile exits.
     /// Invalidation resets the ISEQ's call counter and re-stubs incoming JIT-to-JIT calls,
     /// so every entry runs the profiling window in the interpreter before the next compile.
-    pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE) {
+    pub(crate) fn exit_recompile(compiled_iseq_raw: VALUE, cfp: CfpPtr) {
         // Fast check before taking the VM lock: skip if the compiled unit is already
         // invalidated or at the version limit. This avoids expensive lock acquisition
         // on every shape guard exit taken by frames still running the invalidated code.
@@ -3881,6 +3881,11 @@ c_callable! {
                 let cb = ZJITState::get_code_block();
                 invalidate_iseq_version(cb, compiled_iseq, version);
                 cb.mark_all_executable();
+            }
+            // Record the operands that failed the guard, after any profile decay
+            // on invalidation, so the next version sees them with weight 1.
+            if get_option!(profile_recompile_exit) {
+                crate::profile::profile_exit(cfp);
             }
         });
     }

@@ -3137,7 +3137,7 @@ impl Assembler
             if let Some(recompile) = &exit.recompile {
                 use crate::codegen::exit_recompile;
                 asm_comment!(asm, "invalidate for recompilation");
-                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
+                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq, CFP);
             }
         }
 
