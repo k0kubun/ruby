@@ -149,6 +149,22 @@ rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit
     }
 }
 
+// Let the interpreter retry compiling an ISEQ on its next call. vm.c compiles only when the
+// call counter equals rb_zjit_call_threshold, so a compile skipped for a transient reason
+// (e.g. a full native stack) would otherwise never be attempted from the interpreter again.
+void
+rb_zjit_iseq_retry_compile(const rb_iseq_t *iseq, bool jit_exception)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    unsigned int calls = rb_zjit_call_threshold > 0 ? rb_zjit_call_threshold - 1 : 0;
+    if (jit_exception) {
+        body->jit_exception_calls = calls;
+    }
+    else {
+        body->jit_entry_calls = calls;
+    }
+}
+
 // This is used by a function stub to install compiled code as the ISEQ's entry point.
 void
 rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, void *code_ptr)

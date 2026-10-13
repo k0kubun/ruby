@@ -186,6 +186,29 @@ fn test_function_stub_profiles_before_compiling() {
 }
 
 #[test]
+fn test_retry_compile_after_native_stack_full() {
+    use std::sync::atomic::Ordering;
+    set_call_threshold(2);
+    eval("
+        def retry_after_stack_full = 1
+        retry_after_stack_full
+    ");
+    let iseq = get_method_iseq("self", "retry_after_stack_full");
+
+    // The call that reaches the call threshold skips compiling because the native stack is full.
+    let skipped = crate::state::ZJITState::get_counters().skipped_native_stack_full;
+    super::FORCE_NATIVE_STACK_FULL.store(true, Ordering::Relaxed);
+    assert_eq!(VALUE::fixnum_from_usize(1), eval("retry_after_stack_full"));
+    super::FORCE_NATIVE_STACK_FULL.store(false, Ordering::Relaxed);
+    assert_eq!(skipped + 1, crate::state::ZJITState::get_counters().skipped_native_stack_full);
+    assert!(get_or_create_iseq_payload(iseq).versions.is_empty());
+
+    // The next interpreter call retries compiling it.
+    assert_eq!(VALUE::fixnum_from_usize(1), eval("retry_after_stack_full"));
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+}
+
+#[test]
 fn test_putobject() {
     assert_snapshot!(inspect("
         def test = 1

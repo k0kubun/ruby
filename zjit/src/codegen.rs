@@ -181,14 +181,29 @@ fn update_self_is_heap_object(iseq: IseqPtr, cfp: CfpPtr) {
     get_or_create_iseq_payload(iseq).self_is_heap_object = self_is_heap_object;
 }
 
+/// Force native_stack_full() to return true for testing
+#[cfg(test)]
+pub static FORCE_NATIVE_STACK_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Return true if there is not enough native stack space to compile an ISEQ
+fn native_stack_full(ec: EcPtr) -> bool {
+    #[cfg(test)]
+    if FORCE_NATIVE_STACK_FULL.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    unsafe { rb_ec_stack_check(ec as _) != 0 }
+}
+
 /// CRuby API to compile a given ISEQ.
 /// If jit_exception is true, compile JIT code for handling exceptions.
 /// See jit_compile_exception() for details.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exception: bool) -> *const u8 {
-    // Don't compile when there is insufficient native stack space
-    if unsafe { rb_ec_stack_check(ec as _) } != 0 {
+    // Don't compile when there is insufficient native stack space. This is transient,
+    // so let the interpreter retry compiling this ISEQ on its next call.
+    if native_stack_full(ec) {
         incr_counter!(skipped_native_stack_full);
+        unsafe { rb_zjit_iseq_retry_compile(iseq, jit_exception) };
         return std::ptr::null();
     }
 
@@ -3988,7 +4003,7 @@ c_callable! {
             // TODO: Alan thinks the payload status part of this check can happen without the VM lock, since the whole
             // code path can be made read-only. But you still need the check as is while holding the VM lock in any case.
             let cb = ZJITState::get_code_block();
-            let native_stack_full = unsafe { rb_ec_stack_check(ec as _) } != 0;
+            let native_stack_full = native_stack_full(ec);
             let payload = get_or_create_iseq_payload(iseq);
             // cfp is the callee's (this ISEQ's) frame here, so its method entry gives
             // the owning class and thus whether `self` is always a heap object.

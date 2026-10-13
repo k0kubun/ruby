@@ -2455,6 +2455,7 @@ unsafe extern "C" {
     pub fn rb_zjit_reserve_low_addr_space(size: usize) -> *mut ::std::os::raw::c_void;
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+    pub fn rb_zjit_iseq_retry_compile(iseq: *const rb_iseq_t, jit_exception: bool);
     pub fn rb_zjit_iseq_set_jit_entry(
         iseq: *const rb_iseq_t,
         code_ptr: *mut ::std::os::raw::c_void,
