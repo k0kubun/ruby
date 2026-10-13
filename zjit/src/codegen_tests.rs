@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles, set_recompile_threshold};
+use crate::options::{CallThreshold, enable_zjit_stats, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_profiles, set_num_reprofiles, set_recompile_threshold};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -279,6 +279,45 @@ fn test_recompile_threshold_after_invalidation() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(2, payload.versions.len());
     assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_num_reprofiles_after_compile() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(100);
+    set_num_reprofiles(Some(2));
+    eval("
+        def num_reprofiles_target(a, b) = a + b
+        num_reprofiles_target(1, 2)
+        num_reprofiles_target(1, 2)
+    ");
+
+    let iseq = get_method_iseq("self", "num_reprofiles_target");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+
+    // Compiling a non-final version re-installs profiling instructions.
+    let find_plus = |opcode_to_find: u32| {
+        let mut insn_idx = 0;
+        let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+        while insn_idx < iseq_size {
+            let opcode = iseq_opcode_at_idx(iseq, insn_idx);
+            if opcode == opcode_to_find {
+                return true;
+            }
+            insn_idx += insn_len(opcode as usize);
+        }
+        false
+    };
+    assert!(find_plus(YARVINSN_zjit_opt_plus));
+
+    // Each Float call side-exits at `+` and profiles it in the interpreter. With
+    // --zjit-num-reprofiles=2, the second exit finishes re-profiling the instruction.
+    eval("num_reprofiles_target(1.5, 2.5)");
+    assert!(find_plus(YARVINSN_zjit_opt_plus));
+    eval("num_reprofiles_target(1.5, 2.5)");
+    assert!(find_plus(YARVINSN_opt_plus));
+    assert!(!find_plus(YARVINSN_zjit_opt_plus));
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
 }
 
 #[test]

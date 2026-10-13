@@ -84,6 +84,10 @@ pub struct Options {
     /// Number of times YARV instructions should be profiled.
     pub num_profiles: NumProfiles,
 
+    /// Number of times YARV instructions should be profiled again after compiling a
+    /// non-final version. If None, --zjit-num-profiles is used.
+    pub num_reprofiles: Option<NumProfiles>,
+
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
@@ -212,6 +216,7 @@ impl Default for Options {
             exec_mem_bytes: 64 * 1024 * 1024,
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
+            num_reprofiles: None,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             recompile_threshold: None,
             stats: false,
@@ -457,6 +462,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
                 update_profile_threshold();
             },
             Err(_) => return None,
+        },
+
+        ("num-reprofiles", _) => match opt_val.parse() {
+            Ok(n) if n > 0 => options.num_reprofiles = Some(n),
+            _ => return None,
         },
 
         ("num-exits-until-invalidate", _) => match opt_val.parse() {
@@ -713,6 +723,13 @@ pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
 }
 
+/// Update --zjit-num-reprofiles for testing
+#[cfg(test)]
+pub fn set_num_reprofiles(num_reprofiles: Option<NumProfiles>) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().num_reprofiles = num_reprofiles; }
+}
+
 /// Update --zjit-recompile-threshold for testing
 #[cfg(test)]
 pub fn set_recompile_threshold(recompile_threshold: Option<CallThreshold>) {
@@ -877,6 +894,17 @@ mod tests {
         assert!(parse_option(c"recompile-threshold=foo".as_ptr()).is_none());
         assert!(parse_option(c"recompile-threshold=5".as_ptr()).is_some());
         assert_eq!(Some(5), unsafe { OPTIONS.as_ref() }.unwrap().recompile_threshold);
+    }
+
+    #[test]
+    fn parse_num_reprofiles() {
+        unsafe { OPTIONS = Some(Options::default()); }
+        assert_eq!(None, unsafe { OPTIONS.as_ref() }.unwrap().num_reprofiles);
+
+        assert!(parse_option(c"num-reprofiles=0".as_ptr()).is_none());
+        assert!(parse_option(c"num-reprofiles=foo".as_ptr()).is_none());
+        assert!(parse_option(c"num-reprofiles=10".as_ptr()).is_some());
+        assert_eq!(Some(10), unsafe { OPTIONS.as_ref() }.unwrap().num_reprofiles);
     }
 
     #[test]
