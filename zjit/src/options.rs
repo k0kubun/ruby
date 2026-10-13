@@ -190,6 +190,15 @@ pub struct Options {
     /// (blocks, procs without a stable method binding) cannot be denied this way.
     pub inline_deny: HashSet<String>,
 
+    /// Use the inlining caller's context to sharpen per-ISEQ profiles of an inlined callee.
+    /// When a callee is shared by many callers, its per-ISEQ profile for a parameter can be
+    /// polymorphic even though each caller passes a single type. With this enabled, an inlined
+    /// callee prefers a receiver type that is statically known in the caller over its own
+    /// non-monomorphic profile, and the inliner guards an argument on the caller's monomorphic
+    /// call-site profile when the callee profiled that parameter as polymorphic/megamorphic.
+    /// `--zjit-context-profiles=0` disables it for A/B testing.
+    pub context_profiles: bool,
+
     /// Upper bound on how many times the `optimize` fixed-point loop will iterate
     /// before giving up. Each iteration runs `type_specialize` → `inline` →
     /// `inline_methods` → the rest of the HIR pipeline; in steady state the loop
@@ -236,6 +245,7 @@ impl Default for Options {
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             inline_budget: DEFAULT_INLINE_BUDGET as InlineBudget,
             inline_deny: HashSet::new(),
+            context_profiles: true,
             inline_max_iterations: DEFAULT_INLINE_MAX_ITERATIONS,
         }
     }
@@ -473,6 +483,9 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Ok(n) => { options.inline_budget = n; },
             Err(_) => return None,
         },
+
+        ("context-profiles", "" | "1" | "true") => options.context_profiles = true,
+        ("context-profiles", "0" | "false") => options.context_profiles = false,
 
         ("inline-max-iterations", _) => match opt_val.parse() {
             Ok(n) => { options.inline_max_iterations = n; },
@@ -715,6 +728,13 @@ pub fn set_max_versions(max_versions: usize) {
 pub fn set_inline_threshold(inline_threshold: InlineThreshold) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().inline_threshold = inline_threshold; }
+}
+
+/// Update --zjit-context-profiles for testing
+#[cfg(test)]
+pub fn set_context_profiles(enabled: bool) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().context_profiles = enabled; }
 }
 
 /// Update --zjit-num-profiles for testing

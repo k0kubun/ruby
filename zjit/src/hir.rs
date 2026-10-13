@@ -4530,6 +4530,26 @@ impl Function {
                     resolution
                 }
             }
+            ReceiverTypeResolution::Monomorphic { profiled_type } if recv_type.runtime_exact_ruby_class().is_none_or(|class| class == profiled_type.class()) => {
+                ReceiverTypeResolution::Monomorphic { profiled_type }
+            }
+            resolution if get_option!(context_profiles) => {
+                // The profile is per-ISEQ, so in an inlined callee it merges every caller's types.
+                // When the receiver class is statically known in this context (e.g. self of an
+                // inlined method after the caller's receiver guard), prefer it over a polymorphic,
+                // megamorphic, or contradicting profile. Keep the profiled bucket of that class if
+                // it is unique, since it carries shape information.
+                let Some(class) = recv_type.runtime_exact_ruby_class() else { return resolution };
+                incr_counter!(ctx_profile_static_receiver_override);
+                let summary = self.profiles.as_ref().map(|profiles| self.profile_summary(profiles, recv, state));
+                let mut matching = summary.iter()
+                    .flat_map(|summary| summary.buckets().iter().copied())
+                    .filter(|profiled_type| !profiled_type.is_empty() && profiled_type.class() == class);
+                match (matching.next(), matching.next()) {
+                    (Some(profiled_type), None) => ReceiverTypeResolution::Monomorphic { profiled_type },
+                    _ => ReceiverTypeResolution::StaticallyKnown { class },
+                }
+            }
             resolution => resolution,
         }
     }
@@ -5998,7 +6018,7 @@ impl Function {
                 incr_counter!(inline_method_count);
                 did_inline = true;
 
-                let args = match send.insn(self) {
+                let mut args = match send.insn(self) {
                     Insn::SendDirect(data) => data.args.to_vec(),
                     _ => unreachable!("position {send_insn_id} is not a SendDirect"),
                 };
@@ -6050,8 +6070,10 @@ impl Function {
                 let callee_body_params: Vec<InsnId> = self.blocks[callee_entry_body_block].params.clone();
 
                 // Compare the callee's per-ISEQ profiles of its parameters with what this caller
-                // knows about the values it passes.
-                if get_option!(stats) {
+                // knows about the values it passes, and (with --zjit-context-profiles) guard
+                // arguments on the caller's monomorphic call-site profile where that sharpens a
+                // polymorphic callee profile.
+                if get_option!(context_profiles) || get_option!(stats) {
                     // (callee entry param, Some(caller arg index) or None for self)
                     let mut slots: Vec<(InsnId, Option<usize>)> = Vec::with_capacity(callee_body_params.len());
                     if let Some(&self_param) = callee_body_params.first() {
@@ -6064,7 +6086,7 @@ impl Function {
                             slots.push((param_id, Some(i - omitted_opt_num)));
                         }
                     }
-                    self.count_inline_context_profiles(iseq, recv, &args, &slots, &add_result.profiles, pre_blocks_len, state);
+                    self.apply_inline_context_profiles(block, iseq, recv, &mut args, &slots, &add_result.profiles, pre_blocks_len, state);
                 }
 
                 // First param is self.
@@ -6195,10 +6217,11 @@ impl Function {
         Ok(result)
     }
 
-    /// Census of an inlined callee's parameter profiles against what the inlining caller knows.
-    /// `slots` maps callee body entry params to the caller value (`None` = receiver,
-    /// `Some(i)` = `args[i]`).
-    fn count_inline_context_profiles(&self, callee_iseq: IseqPtr, recv: InsnId, args: &[InsnId],
+    /// Census and context sharpening of an inlined callee's parameter profiles. See
+    /// `Options::context_profiles`. `slots` maps callee body entry params to the caller value
+    /// (`None` = receiver, `Some(i)` = `args[i]`). May replace `args[i]` with a GuardType on the
+    /// caller's monomorphic call-site profile of that argument.
+    fn apply_inline_context_profiles(&mut self, block: BlockId, callee_iseq: IseqPtr, recv: InsnId, args: &mut [InsnId],
                                      slots: &[(InsnId, Option<usize>)], callee_profiles: &ProfileOracle,
                                      callee_blocks_start: usize, send_state: InsnId) {
         let roots: HashSet<InsnId> = slots.iter().map(|&(param, _)| param).collect();
@@ -6222,7 +6245,11 @@ impl Function {
         }
 
         let exit_state = self.send_exit_states.get(&send_state).copied().unwrap_or(send_state);
+        let stats = get_option!(stats);
         let mut seen: HashSet<(YarvInsnIdx, InsnId)> = HashSet::new();
+        // Per caller argument: the caller's monomorphic profiled type, if some callee profile of
+        // the corresponding parameter is not monomorphic and the caller has no exact static type.
+        let mut guards: Vec<Option<ProfiledType>> = vec![None; args.len()];
         let mut fixable = 0u64;
         for (&snapshot, entries) in &callee_profiles.types {
             let insn_idx = self.frame_state(snapshot).insn_idx;
@@ -6241,6 +6268,11 @@ impl Function {
                     let callee_class = summary.bucket(0).class();
                     if static_class.or(caller_mono.map(|pt| pt.class())).is_some_and(|class| class != callee_class) {
                         incr_counter!(ctx_profile_mono_caller_conflict);
+                        // The callee's profile came from other callers. Its guard would always
+                        // fail here, so speculate on this caller's type instead.
+                        if let (None, Some(profiled_type), Some(i)) = (static_class, caller_mono, arg_idx) {
+                            guards[i] = Some(profiled_type);
+                        }
                     }
                     continue;
                 }
@@ -6255,9 +6287,12 @@ impl Function {
                 if static_class.is_some() {
                     incr_counter!(ctx_profile_nonmono_caller_static_exact);
                     fixable += 1;
-                } else if caller_mono.is_some() {
+                } else if let Some(profiled_type) = caller_mono {
                     incr_counter!(ctx_profile_nonmono_caller_profile_monomorphic);
                     fixable += 1;
+                    if let Some(i) = arg_idx {
+                        guards[i] = Some(profiled_type);
+                    }
                 } else if caller_summary.as_ref().is_some_and(|s| s.is_skewed_polymorphic() || s.is_skewed_megamorphic()) {
                     incr_counter!(ctx_profile_nonmono_caller_profile_skewed);
                 } else if caller_summary.as_ref().is_some_and(|s| s.is_polymorphic() || s.is_megamorphic()) {
@@ -6267,9 +6302,21 @@ impl Function {
                 }
             }
         }
-        if fixable > 0 {
+        if stats && fixable > 0 {
             let key = iseq_get_location(callee_iseq, 0);
             *crate::state::ZJITState::get_ctx_profile_callee_counts().entry(key).or_insert(0) += fixable;
+        }
+
+        if !get_option!(context_profiles) {
+            return;
+        }
+        for (i, profiled_type) in guards.into_iter().enumerate() {
+            let Some(profiled_type) = profiled_type else { continue };
+            let guard_type = Type::from_profiled_type(profiled_type);
+            if self.is_a(args[i], guard_type) { continue; }
+            args[i] = self.push_insn(block, Insn::GuardType { val: args[i], guard_type, state: exit_state, recompile: Some(Recompile) });
+            self.insn_types[args[i]] = self.type_of(args[i]).intersection(guard_type);
+            incr_counter!(ctx_profile_arg_guards);
         }
     }
 

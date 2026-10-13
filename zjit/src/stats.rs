@@ -508,6 +508,9 @@ make_counters! {
     ctx_profile_nonmono_caller_no_profile,
     // Monomorphic callee profile that disagrees with the caller's static/monomorphic type.
     ctx_profile_mono_caller_conflict,
+    // Actions taken with --zjit-context-profiles (default on).
+    ctx_profile_arg_guards,
+    ctx_profile_static_receiver_override,
 
     total_native_stack_bytes,
 }

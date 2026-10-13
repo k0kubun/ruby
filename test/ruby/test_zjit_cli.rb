@@ -379,6 +379,26 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_context_profiles
+    # `callee` is profiled with both A and B, but `test` only passes A. With context profiles,
+    # the inliner guards `test`'s argument on A; passing B later must side-exit correctly.
+    script = <<~RUBY
+      class A; def v = 1; end
+      class B; def v = 2; end
+      def callee(x) = x.v
+      def test(x) = callee(x)
+      a = A.new
+      b = B.new
+      4.times { callee(a); callee(b) }
+      r = 0
+      10.times { r += test(a) }
+      r += test(b)
+      [r, RubyVM::ZJIT.stats[:ctx_profile_arg_guards] > 0]
+    RUBY
+    assert_runs '[12, true]', script, call_threshold: 4, num_profiles: 2, stats: :quiet
+    assert_runs '[12, false]', script, call_threshold: 4, num_profiles: 2, stats: :quiet, extra_args: ['--zjit-context-profiles=0']
+  end
+
   private
 
   # Assert that every method call in `test_script` can be compiled by ZJIT

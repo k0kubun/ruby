@@ -1813,6 +1813,117 @@ mod hir_opt_tests {
         ");
     }
 
+    // `callee` is shared by callers passing A and B, so its per-ISEQ profile of `x.v` is
+    // polymorphic. `test` only passes A, as its own call-site profile shows, so the inliner guards
+    // the argument on A and the inlined `x.v` is specialized for A alone.
+    #[test]
+    fn test_inline_context_profile_guards_monomorphic_caller_arg() {
+        eval("
+            class A; def initialize = (@v = 1); def v = @v; end
+            class B; def initialize = (@w = @v = 2); def v = @v; end
+            def callee(x) = x.v
+            a = A.new
+            b = B.new
+            callee(a); callee(b); callee(a); callee(b)
+            def test(a) = callee(a)
+            test(a); test(a)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:8:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, callee@0x1010, cme:0x1018)
+          v23:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          v48:ObjectSubclass[class_exact:A] = GuardType v10, ObjectSubclass[class_exact:A] recompile
+          PushInlineFrame :callee, v23 (0x1040), num_args=1
+          PatchPoint NoSingletonClass(A@0x1060)
+          PatchPoint MethodRedefined(A@0x1060, v@0x1068, cme:0x1070)
+          PushInlineFrame :v, v48 (0x1098), num_args=0
+          v64:CShape = LoadField v48, :shape_id@0x10b8
+          v65:CShape[0x10b9] = GuardBitEquals v64, CShape(0x10b9) recompile
+          v66:BasicObject = LoadField v48, :@v@0x10ba
+          PopInlineFrame
+          PopInlineFrame
+          CheckInterrupts
+          Return v66
+        ");
+    }
+
+    // Same as above with --zjit-context-profiles=0: the inlined body dispatches on every type in
+    // the callee's merged profile.
+    #[test]
+    fn test_inline_context_profile_disabled() {
+        set_context_profiles(false);
+        eval("
+            class A; def initialize = (@v = 1); def v = @v; end
+            class B; def initialize = (@w = @v = 2); def v = @v; end
+            def callee(x) = x.v
+            a = A.new
+            b = B.new
+            callee(a); callee(b); callee(a); callee(b)
+            def test(a) = callee(a)
+            test(a); test(a)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:8:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, callee@0x1010, cme:0x1018)
+          v23:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :callee, v23 (0x1040), num_args=1
+          CondBranchHasType v10, ObjectSubclass[class_exact:B], bb8(), bb9()
+        bb8():
+          v35:ObjectSubclass[class_exact:B] = RefineType v10, ObjectSubclass[class_exact:B]
+          PatchPoint NoSingletonClass(B@0x1060)
+          PatchPoint MethodRedefined(B@0x1060, v@0x1068, cme:0x1070)
+          PushInlineFrame :v, v35 (0x1098), num_args=0
+          v64:CShape = LoadField v35, :shape_id@0x10b8
+          v65:CShape[0x10b9] = GuardBitEquals v64, CShape(0x10b9) recompile
+          v66:BasicObject = LoadField v35, :@v@0x10ba
+          PopInlineFrame
+          Jump bb6(v66)
+        bb9():
+          CondBranchHasType v10, ObjectSubclass[class_exact:A], bb10(), bb7()
+        bb10():
+          v40:ObjectSubclass[class_exact:A] = RefineType v10, ObjectSubclass[class_exact:A]
+          PatchPoint NoSingletonClass(A@0x10c0)
+          PatchPoint MethodRedefined(A@0x10c0, v@0x1068, cme:0x10c8)
+          PushInlineFrame :v, v40 (0x10f0), num_args=0
+          v80:CShape = LoadField v40, :shape_id@0x10b8
+          v81:CShape[0x1110] = GuardBitEquals v80, CShape(0x1110) recompile
+          v82:BasicObject = LoadField v40, :@v@0x10ba
+          PopInlineFrame
+          Jump bb6(v82)
+        bb7():
+          v43:BasicObject = Send v10, :v # SendFallbackReason: Send: polymorphic fallback
+          Jump bb6(v43)
+        bb6(v32:BasicObject):
+          PopInlineFrame
+          CheckInterrupts
+          Return v32
+        ");
+    }
+
     #[test]
     fn test_inline_nonparam_local_return() {
         eval("
@@ -1880,10 +1991,10 @@ mod hir_opt_tests {
           v20:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
           PushInlineFrame :m, v20 (0x1038), num_args=1
           PatchPoint MethodRedefined(NilClass@0x1058, nil?@0x1060, cme:0x1068)
-          v80:Fixnum[0] = Const Value(0)
+          v76:Fixnum[0] = Const Value(0)
           PopInlineFrame
           CheckInterrupts
-          Return v80
+          Return v76
         ");
     }
 
