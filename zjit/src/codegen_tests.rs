@@ -1077,7 +1077,7 @@ fn test_yield_polymorphic_symbol_handler_falls_back() {
 #[test]
 fn test_yield_polymorphic_ifunc_handler_falls_back() {
     // An ifunc handler (Enumerator#each yields to the enumerator's C block) at a polymorphic
-    // yield site fails the ISEQ tag check and takes the generic InvokeBlock fallback in-line.
+    // yield site fails the ISEQ tag check and takes the in-line ifunc arm of the fallback.
     // Threshold 4 keeps calls 1-3 in the profile window (num_profiles defaults to 5), so
     // invoke's first compile already sees both blocks and installs the polymorphic dispatch;
     // the standalone version matters here because the Enumerator calls invoke from C.
@@ -1091,6 +1091,35 @@ fn test_yield_polymorphic_ifunc_handler_falls_back() {
         add_one; double
     ");
     assert_snapshot!(assert_compiles("[add_one, double, via_enum]"), @"[11, 20, [10]]");
+}
+
+#[test]
+fn test_yield_single_iseq_and_ifunc_handlers_no_side_exits() {
+    // A yield site profiled with one ISEQ block and an ifunc handler dispatches both in-line
+    // instead of guarding on the ISEQ block and side-exiting for the ifunc.
+    set_call_threshold(4);
+    eval("
+        def invoke = yield(10)
+        def add_one = invoke { |x| x + 1 }
+        def via_enum = to_enum(:invoke).to_a
+        add_one; via_enum
+        add_one; via_enum
+    ");
+    assert_snapshot!(assert_compiles("[add_one, via_enum, add_one, via_enum]"), @"[11, [10], 11, [10]]");
+}
+
+#[test]
+fn test_yield_non_direct_iseq_profile_then_ifunc() {
+    // The profile only saw an ISEQ block that can't be invoked directly. An ifunc handler
+    // showing up later takes the in-line ifunc arm and returns the right result.
+    set_call_threshold(2);
+    eval("
+        def invoke = yield(10)
+        def two = invoke { |a, b| [a, b] }
+        def via_enum = to_enum(:invoke).to_a
+        two; two
+    ");
+    assert_snapshot!(assert_compiles("[two, via_enum, via_enum]"), @"[[10, nil], [10], [10]]");
 }
 
 #[test]
