@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -2916,10 +2916,7 @@ impl CompilePolicy {
         let no_side_exits = if iseq.is_null() {
             false
         } else {
-            let payload = get_or_create_iseq_payload(iseq);
-            payload.versions.iter().any(
-                |v| unsafe { v.as_ref() }.is_invalidated()
-            ) && payload.versions.len() + 1 >= max_iseq_versions()
+            crate::lifecycle::avoid_side_exits(get_or_create_iseq_payload(iseq))
         };
         Self { no_side_exits }
     }
@@ -6493,8 +6490,7 @@ impl Function {
         // On the final version, recompilation is not possible, so converting sends to
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
-        let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if crate::lifecycle::compiling_final_version(get_or_create_iseq_payload(self.iseq)) {
             return;
         }
         for block in self.reverse_post_order() {
@@ -11019,8 +11015,7 @@ fn add_iseq_to_hir(
         }
     }
     if matches!(mode, AddIseqMode::Inlined { .. }) {
-        // Materialized inlined frames also need fresh interpreter profiles.
-        reset_profiles_remaining(iseq);
+        crate::lifecycle::on_inlined(iseq);
     }
 
     Ok(AddIseqResult { body_entry_block, profiles })

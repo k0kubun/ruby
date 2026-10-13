@@ -4,7 +4,7 @@
 #![allow(non_upper_case_globals)]
 
 use std::collections::HashMap;
-use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
+use crate::{cruby::*, payload::get_or_create_iseq_payload, options::NumProfiles};
 use crate::distribution::{Distribution, DistributionSummary};
 use crate::stats::Counter::profile_time_ns;
 use crate::stats::with_time_stat;
@@ -115,8 +115,7 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
 
     // Once we profile the instruction enough times, we stop profiling it.
     let entry = profile.entry_mut(profiler.insn_idx);
-    entry.profiles_remaining = entry.profiles_remaining.saturating_sub(1);
-    if entry.profiles_remaining == 0 {
+    if crate::lifecycle::on_insn_profiled(&mut entry.profiles_remaining) {
         unsafe { rb_zjit_iseq_insn_set(profiler.iseq, profiler.insn_idx as u32, bare_opcode); }
     }
 }
@@ -125,7 +124,7 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
 /// Newly reached instructions initialize their counters from the same option.
 pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
-    let num_profiles = get_option!(num_profiles);
+    let num_profiles = crate::lifecycle::insn_profile_budget();
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
     }
@@ -454,7 +453,7 @@ impl IseqProfile {
                 self.entries.insert(i, ProfileEntry {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
-                    profiles_remaining: get_option!(num_profiles),
+                    profiles_remaining: crate::lifecycle::insn_profile_budget(),
                 });
                 &mut self.entries[i]
             }

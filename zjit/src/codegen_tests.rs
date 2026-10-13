@@ -3,7 +3,7 @@
 use super::{gen_insn, JITState};
 use crate::asm::CodeBlock;
 use crate::backend::lir::Assembler;
-use crate::codegen::max_iseq_versions;
+use crate::lifecycle::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
 use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
@@ -26,7 +26,7 @@ fn with_inlining<T>(ruby_fragment: impl FnMut() -> T) -> T {
 fn with_inlining_threshold<T>(threshold: usize, mut ruby_fragment: impl FnMut() -> T) -> T {
     with_rubyvm(|| {
         let old_inline_threshold = get_option!(inline_threshold);
-        let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+        let old_call_threshold = unsafe { crate::lifecycle::rb_zjit_call_threshold };
 
         set_inline_threshold(threshold);
         set_call_threshold(2);
@@ -9341,7 +9341,7 @@ fn test_regression_gc_stress_with_lazy_block_code() {
 #[test]
 fn test_keep_jit_frame_for_caught_jump() {
     rb_zjit_prepare_options();
-    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_call_threshold = unsafe { crate::lifecycle::rb_zjit_call_threshold };
     let old_inline_threshold = get_option!(inline_threshold);
     let old_max_versions = get_option!(max_versions);
     set_call_threshold(1);
@@ -9400,7 +9400,7 @@ fn test_keep_jit_frame_for_caught_jump() {
 #[test]
 fn test_no_ep_escape_invalidation_at_max_versions() {
     rb_zjit_prepare_options();
-    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_call_threshold = unsafe { crate::lifecycle::rb_zjit_call_threshold };
     let old_max_versions = get_option!(max_versions);
     set_call_threshold(2);
     set_max_versions(1);

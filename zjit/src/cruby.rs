@@ -1269,7 +1269,7 @@ pub use manual_defs::*;
 pub mod test_utils {
     use std::{ptr::null, sync::Once};
 
-    use crate::{options::{DEFAULT_CALL_THRESHOLD, rb_zjit_call_threshold, rb_zjit_prepare_options, set_call_threshold}, state::{ZJITState, rb_zjit_compiling_p, rb_zjit_entry}};
+    use crate::{lifecycle::rb_zjit_call_threshold, options::{DEFAULT_CALL_THRESHOLD, rb_zjit_prepare_options, set_call_threshold}, state::{ZJITState, rb_zjit_compiling_p, rb_zjit_entry}};
 
     use super::*;
 

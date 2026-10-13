@@ -154,6 +154,8 @@ ZJIT options:
                   Record source on side-exit. `Counter` picks specific counter.
   --zjit-trace-exits-sample-rate=num
                   Frequency at which to record side exits. Must be `usize`.
+  --zjit-trace-lifecycle
+                  Print function lifecycle transitions to stderr.
 $
 ```
 
@@ -412,6 +414,40 @@ You can also trace a specific counter with `--zjit-trace-exits=<counter_name>`
 `--zjit-trace-exits-sample-rate=N` to record every N-th exit.
 Enabling `--zjit-trace-exits-sample-rate=N` will automatically enable
 `--zjit-trace-exits`.
+
+### Function lifecycle
+
+Each ISEQ goes through a lifecycle of interpreting, profiling, compiling, and
+possibly invalidating and recompiling. The state machine and all of its tuning
+knobs live in [`zjit/src/lifecycle.rs`](../../zjit/src/lifecycle.rs):
+
+```
+Interpreted --(call_threshold - num_profiles calls)--> Profiling
+Profiling --(call_threshold calls, or stub hits)--> Compiled(v1)
+Compiled(vN) --(num_exits_until_invalidate recompile exits, or a broken assumption)--> Invalidated(vN)
+Invalidated(vN) --(call_threshold - num_profiles calls)--> Reprofiling(vN)
+Reprofiling(vN) --(call_threshold calls)--> Compiled(vN+1), up to max_versions versions
+any compile failure --> CantCompile
+```
+
+| Knob | Transition |
+|------|------------|
+| `--zjit-call-threshold` | Interpreted/Profiling -> Compiled (interpreter calls and stub hits) |
+| `--zjit-num-profiles` | Interpreted -> Profiling, and samples per profiled instruction |
+| `--zjit-num-exits-until-invalidate` | Compiled -> Invalidated on recompile exits |
+| `--zjit-max-versions` | Whether an invalidated ISEQ may be compiled again, and whether a version is final |
+
+`--zjit-trace-lifecycle` prints each transition to stderr with the ISEQ location,
+the old state, the event, the new state, and the actions taken:
+
+```
+$ ./miniruby --zjit --zjit-trace-lifecycle -e 'def foo = 1; 30.times { foo }'
+ZJIT lifecycle: block in <main>@-e:1: Interpreted --InterpCall--> Profiling [StartProfiling]
+ZJIT lifecycle: foo@-e:1: Interpreted --InterpCall--> Profiling [StartProfiling]
+ZJIT lifecycle: block in <main>@-e:1: Profiling --InterpCall--> Profiling [Compile]
+ZJIT lifecycle: block in <main>@-e:1: Profiling --HirBuilt--> Profiling [RearmProfiling]
+ZJIT lifecycle: block in <main>@-e:1: Profiling --CompileSucceeded--> Compiled(v1)
+```
 
 ### Viewing HIR as text
 

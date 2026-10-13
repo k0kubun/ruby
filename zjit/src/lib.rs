@@ -32,6 +32,7 @@ mod options;
 mod perf;
 mod profile;
 mod invariants;
+mod lifecycle;
 mod bitset;
 mod gc;
 mod jit_frame;

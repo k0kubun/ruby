@@ -265,7 +265,7 @@ mod tests {
     fn test_freed_iseqs_do_not_retain_payloads() {
         with_rubyvm(|| {
             // A high call threshold to keep any ISEQs out of the JIT
-            let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+            let old_call_threshold = unsafe { crate::lifecycle::rb_zjit_call_threshold };
             set_call_threshold(1_000_000);
 
             eval(r#"

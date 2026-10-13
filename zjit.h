@@ -115,7 +115,7 @@ extern uint64_t rb_zjit_max_compile_time_ns;
 extern uint64_t rb_zjit_total_compile_time_ns;
 void rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception);
 void rb_zjit_profile_insn(uint32_t insn, rb_execution_context_t *ec);
-void rb_zjit_profile_enable(const rb_iseq_t *iseq);
+void rb_zjit_start_profiling(const rb_iseq_t *iseq, bool jit_exception);
 void rb_zjit_bop_redefined(int redefined_flag, enum ruby_basic_operators bop);
 void rb_zjit_cme_invalidate(const rb_callable_method_entry_t *cme);
 void rb_zjit_cme_free(const rb_callable_method_entry_t *cme);
@@ -176,7 +176,7 @@ CFP_ZJIT_FRAME(const rb_control_frame_t *cfp)
 #define rb_zjit_compiling_p false
 static inline void rb_zjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception) {}
 static inline void rb_zjit_profile_insn(uint32_t insn, rb_execution_context_t *ec) {}
-static inline void rb_zjit_profile_enable(const rb_iseq_t *iseq) {}
+static inline void rb_zjit_start_profiling(const rb_iseq_t *iseq, bool jit_exception) {}
 static inline void rb_zjit_bop_redefined(int redefined_flag, enum ruby_basic_operators bop) {}
 static inline void rb_zjit_cme_invalidate(const rb_callable_method_entry_t *cme) {}
 static inline void rb_zjit_invalidate_no_ep_escape(const rb_iseq_t *iseq) {}
