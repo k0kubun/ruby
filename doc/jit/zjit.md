@@ -435,6 +435,7 @@ any compile failure --> CantCompile
 | `--zjit-call-threshold` | Interpreted/Profiling -> Compiled (interpreter calls and stub hits) |
 | `--zjit-num-profiles` | Interpreted -> Profiling, and samples per profiled instruction |
 | `--zjit-num-exits-until-invalidate` | Compiled -> Invalidated on recompile exits |
+| `--zjit-num-reprofiles` | Calls profiled after an invalidation before recompiling (default: the whole `--zjit-call-threshold` warmup) |
 | `--zjit-max-versions` | Whether an invalidated ISEQ may be compiled again, and whether a version is final |
 
 `--zjit-trace-lifecycle` prints each transition to stderr with the ISEQ location,

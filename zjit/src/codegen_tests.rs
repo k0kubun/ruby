@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::lifecycle::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_reprofiles};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -245,6 +245,39 @@ fn test_recompile_exit_waits_for_exit_budget() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(1, payload.versions.len());
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_num_reprofiles_recompiles_after_reprofiling() {
+    set_call_threshold(10);
+    set_num_exits_until_invalidate(1);
+    set_num_reprofiles(Some(2));
+    eval("
+        def num_reprofiles_target(a, b) = a + b
+        i = 0
+        while i < 10
+          num_reprofiles_target(1, 2)
+          i += 1
+        end
+    ");
+
+    let iseq = get_method_iseq("self", "num_reprofiles_target");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+
+    // The first Float argument takes a recompile exit, which invalidates the version.
+    eval("num_reprofiles_target(1.5, 2.5)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+
+    // With --zjit-num-reprofiles=2, the ISEQ is recompiled after 2 interpreted calls
+    // instead of re-running the whole --zjit-call-threshold warmup.
+    eval("num_reprofiles_target(1.5, 2.5)");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+    eval("num_reprofiles_target(1.5, 2.5)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
 }
 
 #[test]

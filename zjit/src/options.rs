@@ -71,6 +71,10 @@ pub struct Options {
     /// Number of times YARV instructions should be profiled.
     pub num_profiles: NumProfiles,
 
+    /// Number of calls profiled after an invalidation before recompiling.
+    /// None re-runs the whole --zjit-call-threshold warmup.
+    pub num_reprofiles: Option<NumProfiles>,
+
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
@@ -198,6 +202,7 @@ impl Default for Options {
             exec_mem_bytes: 64 * 1024 * 1024,
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
+            num_reprofiles: None,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             stats: false,
             print_stats: false,
@@ -242,6 +247,8 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Number of calls to trigger JIT (default: 30)."),
     ("--zjit-num-profiles=num",
                      "Number of profiled calls before JIT (default: 5)."),
+    ("--zjit-num-reprofiles=num",
+                     "Number of profiled calls before re-JIT after invalidation."),
     ("--zjit-stats-quiet",
                      "Collect ZJIT stats and suppress output."),
     ("--zjit-stats[=file]",
@@ -442,6 +449,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
                 crate::lifecycle::publish_thresholds();
             },
             Err(_) => return None,
+        },
+
+        ("num-reprofiles", _) => match opt_val.parse() {
+            Ok(n) if n > 0 => options.num_reprofiles = Some(n),
+            _ => return None,
         },
 
         ("num-exits-until-invalidate", _) => match opt_val.parse() {
@@ -680,6 +692,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_exits_until_invalidate = num_exits_until_invalidate; }
+}
+
+/// Update --zjit-num-reprofiles for testing
+#[cfg(test)]
+pub fn set_num_reprofiles(num_reprofiles: Option<NumProfiles>) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().num_reprofiles = num_reprofiles; }
 }
 
 /// Update --zjit-max-versions for testing
