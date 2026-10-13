@@ -196,6 +196,20 @@ rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
     return body->jit_entry_calls >= rb_zjit_call_threshold;
 }
 
+// Let an invalidated ISEQ recompile after `remaining_calls` more calls from the
+// interpreter or function stubs. Enable profiling instructions when the call
+// counter skips the profile threshold, so the remaining calls are still profiled.
+void
+rb_zjit_iseq_set_remaining_calls(const rb_iseq_t *iseq, unsigned int remaining_calls)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    RUBY_ASSERT(remaining_calls > 0 && remaining_calls <= rb_zjit_call_threshold);
+    body->jit_entry_calls = rb_zjit_call_threshold - remaining_calls;
+    if (rb_zjit_profile_threshold > 0 && body->jit_entry_calls >= rb_zjit_profile_threshold) {
+        rb_zjit_profile_enable(iseq);
+    }
+}
+
 // Convert a given ISEQ's ZJIT instructions to bare instructions
 void
 rb_zjit_profile_disable(const rb_iseq_t *iseq)

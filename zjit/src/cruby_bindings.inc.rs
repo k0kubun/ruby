@@ -2461,6 +2461,10 @@ unsafe extern "C" {
     );
     pub fn rb_vm_base_ptr(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
     pub fn rb_zjit_iseq_has_profiled_enough(iseq: *const rb_iseq_t) -> bool;
+    pub fn rb_zjit_iseq_set_remaining_calls(
+        iseq: *const rb_iseq_t,
+        remaining_calls: ::std::os::raw::c_uint,
+    );
     pub fn rb_zjit_insn_profiled_p(bare_insn: ::std::os::raw::c_int) -> bool;
     pub fn rb_zjit_iseq_insn_set(
         iseq: *const rb_iseq_t,
