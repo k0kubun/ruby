@@ -143,6 +143,10 @@ ZJIT options:
                   Number of calls to trigger JIT (default: 30).
   --zjit-num-profiles=num
                   Number of profiled calls before JIT (default: 5).
+  --zjit-num-branch-profiles=num
+                  Number of samples per branch instruction (default: 5).
+  --zjit-branch-speculation=bool
+                  Side-exit never-profiled branch directions (default: true).
   --zjit-stats[=quiet]
                   Enable collecting ZJIT statistics (=quiet to suppress output).
   --zjit-disable  Disable ZJIT for lazily enabling it with RubyVM::ZJIT.enable.

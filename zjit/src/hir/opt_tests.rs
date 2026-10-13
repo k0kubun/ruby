@@ -9382,6 +9382,333 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_branch_speculation_branchunless_never_taken() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x)
+              if x
+                1
+              else
+                2
+              end
+            end
+            test(true)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Truthy = GuardBranch v10, Truthy
+          v18:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v18
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_branchunless_always_taken() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x)
+              if x
+                1
+              else
+                2
+              end
+            end
+            test(nil)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Falsy = GuardBranch v10, Falsy
+          v22:Fixnum[2] = Const Value(2)
+          CheckInterrupts
+          Return v22
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_branchif() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x)
+              x || 3
+            end
+            test(false)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:Falsy = GuardBranch v10, Falsy
+          v19:Fixnum[3] = Const Value(3)
+          CheckInterrupts
+          Return v19
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_branchnil_never_nil() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x) = x&.succ
+            test(1)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:NotNil = GuardBranch v10, NotNil
+          PatchPoint MethodRedefined(Integer@0x1008, succ@0x1010, cme:0x1018)
+          v32:Fixnum = GuardType v16, Fixnum recompile
+          v33:Fixnum[1] = Const Value(1)
+          v34:Fixnum = FixnumAdd v32, v33
+          CheckInterrupts
+          Return v34
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_branchnil_always_nil() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x) = x&.succ
+            test(nil)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:NilClass = GuardBranch v10, NilClass
+          v17:NilClass = Const Value(nil)
+          CheckInterrupts
+          Return v17
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_both_directions() {
+        // Profile two calls, one per direction
+        set_call_threshold(3);
+        set_num_profiles(2);
+        set_num_branch_profiles(2);
+        eval("
+            def test(x)
+              if x
+                1
+              else
+                2
+              end
+            end
+            test(true)
+            test(false)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:CBool = Test v10
+          v16:Falsy = RefineType v10, Falsy
+          CondBranch v15, bb5(), bb4()
+        bb5():
+          v18:Truthy = RefineType v10, Truthy
+          v21:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v21
+        bb4():
+          v31:Fixnum[2] = Const Value(2)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_too_few_samples() {
+        set_num_branch_profiles(2);
+        eval("
+            def test(x)
+              if x
+                1
+              else
+                2
+              end
+            end
+            test(true)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:CBool = Test v10
+          v16:Falsy = RefineType v10, Falsy
+          CondBranch v15, bb5(), bb4()
+        bb5():
+          v18:Truthy = RefineType v10, Truthy
+          v21:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v21
+        bb4():
+          v31:Fixnum[2] = Const Value(2)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_disabled() {
+        set_num_branch_profiles(1);
+        set_branch_speculation(false);
+        eval("
+            def test(x)
+              if x
+                1
+              else
+                2
+              end
+            end
+            test(true)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:CBool = Test v10
+          v16:Falsy = RefineType v10, Falsy
+          CondBranch v15, bb5(), bb4()
+        bb5():
+          v18:Truthy = RefineType v10, Truthy
+          v21:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v21
+        bb4():
+          v31:Fixnum[2] = Const Value(2)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
+    fn test_branch_speculation_folds_known_truthy() {
+        set_num_branch_profiles(1);
+        eval("
+            def test(x)
+              y = x.to_s
+              if y
+                1
+              else
+                2
+              end
+            end
+            test(1)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          Jump bb3(v7, v8)
+        bb3(v11:BasicObject, v12:BasicObject):
+          v38:NilClass = Const Value(nil)
+          PatchPoint MethodRedefined(Integer@0x1008, to_s@0x1010, cme:0x1018)
+          v36:Fixnum = GuardType v12, Fixnum recompile
+          v37:StringExact = CCallVariadic v36, :Integer#to_s@0x1040
+          PatchPoint NoEPEscape(test)
+          v28:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v28
+        ");
+    }
+
+    #[test]
     fn test_branchnil_nil() {
         eval("
             def test

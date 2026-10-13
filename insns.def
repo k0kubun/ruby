@@ -1249,6 +1249,7 @@ branchif
 ()
 /* Same discussion as jump. */
 // attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
+// attr bool zjit_profile = true;
 {
     if (RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
@@ -1264,6 +1265,7 @@ branchunless
 ()
 /* Same discussion as jump. */
 // attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
+// attr bool zjit_profile = true;
 {
     if (!RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
@@ -1279,6 +1281,7 @@ branchnil
 ()
 /* Same discussion as jump. */
 // attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
+// attr bool zjit_profile = true;
 {
     if (NIL_P(val)) {
         RUBY_VM_CHECK_INTS(ec);

@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::{IseqPayload, get_or_create_iseq_payload}, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -15,7 +15,7 @@ use std::{
 use crate::hir_type::{Type, types};
 use crate::hir_effect::{Effect, abstract_heaps, effects};
 use crate::bitset::BitSet;
-use crate::profile::{ProfiledType, SplatLength, TypeDistributionSummary};
+use crate::profile::{BranchDirection, ProfiledType, SplatLength, TypeDistributionSummary};
 use crate::stats::{Counter, incr_counter};
 use SendFallbackReason::*;
 
@@ -669,6 +669,7 @@ pub enum SideExitReason {
     NoProfileSetIvar,
     InvokeBlockNotIfunc,
     OnceNotDone,
+    BranchSpeculation,
 }
 
 /// Marks a side exit as triggering profiling and recompilation.
@@ -1332,6 +1333,10 @@ pub enum Insn {
 
     /// Side-exit if val doesn't have the expected type.
     GuardType { val: InsnId, guard_type: Type, state: InsnId, recompile: Option<Recompile> },
+    /// Side-exit if val doesn't have guard_type, which is Truthy, Falsy, NilClass, or NotNil.
+    /// Emitted in place of a conditional branch whose other direction was never profiled.
+    /// Always recompiles, remembering in the profile that the speculation failed.
+    GuardBranch { val: InsnId, guard_type: Type, state: InsnId },
     /// Side-exit if val is not the expected Const.
     GuardBitEquals { val: InsnId, expected: Const, reason: Box<SideExitReason>, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if (val & mask) == 0
@@ -1495,6 +1500,7 @@ macro_rules! for_each_operand_impl {
             | Insn::StringCopy { val, state, .. }
             | Insn::ObjectAlloc { val, state }
             | Insn::GuardType { val, state, .. }
+            | Insn::GuardBranch { val, state, .. }
             | Insn::GuardBitEquals { val, state, .. }
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
@@ -1973,6 +1979,7 @@ impl Insn {
                     if guard_type.is_subtype(types::Immediate) { abstract_heaps::Empty } else { abstract_heaps::Memory },
                     abstract_heaps::Control
                 ),
+            Insn::GuardBranch { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardBitEquals { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardAnyBitSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardNoBitsSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
@@ -2385,6 +2392,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 return Ok(())
             },
             Insn::RefineType { val, new_type, .. } => { write!(f, "RefineType {val}, {}", new_type.print(self.ptr_map)) },
+            Insn::GuardBranch { val, guard_type, .. } => { write!(f, "GuardBranch {val}, {}", guard_type.print(self.ptr_map)) },
             Insn::GuardBitEquals { val, expected, recompile, .. } => {
                 write!(f, "GuardBitEquals {val}, {}", expected.print(self.ptr_map))?;
                 if recompile.is_some() {
@@ -3776,6 +3784,7 @@ impl Function {
             Insn::CCallVariadic(insn) => insn.return_type,
             Insn::CheckMatch { .. } => types::BasicObject,
             Insn::GuardType { val, guard_type, .. } => self.type_of(*val).intersection(*guard_type),
+            Insn::GuardBranch { val, guard_type, .. } => self.type_of(*val).intersection(*guard_type),
             Insn::RefineType { val, new_type, .. } => self.type_of(*val).intersection(*new_type),
             Insn::GuardBitEquals { val, expected, .. } => self.type_of(*val).intersection(Type::from_const(*expected)),
             Insn::GuardAnyBitSet { val, .. } => self.type_of(*val),
@@ -4065,6 +4074,7 @@ impl Function {
         let id = self.union_find.borrow().find_const(insn);
         match self.insns[id] {
             Insn::GuardType { val, .. }
+            | Insn::GuardBranch { val, .. }
             | Insn::GuardBitEquals { val, .. }
             | Insn::GuardAnyBitSet { val, .. }
             | Insn::GuardNoBitsSet { val, .. } => self.chase_insn(val),
@@ -6800,6 +6810,7 @@ impl Function {
                 // type_of(left).
                 match &self.insns[canonical_id] {
                     Insn::GuardType      { val:  src, .. }
+                    | Insn::GuardBranch    { val:  src, .. }
                     | Insn::GuardBitEquals { val:  src, .. }
                     | Insn::GuardAnyBitSet { val:  src, .. }
                     | Insn::GuardNoBitsSet { val:  src, .. }
@@ -6837,6 +6848,10 @@ impl Function {
                     &Insn::GuardType { val, guard_type, .. } if self.is_a(val, guard_type) => {
                         self.make_equal_to(insn_id, val);
                         // Don't bother re-inferring the type of val; we already know it.
+                        continue;
+                    }
+                    &Insn::GuardBranch { val, guard_type, .. } if self.is_a(val, guard_type) => {
+                        self.make_equal_to(insn_id, val);
                         continue;
                     }
                     &Insn::RefineType { val, new_type, .. } if self.is_a(val, new_type) => {
@@ -8006,6 +8021,7 @@ impl Function {
             | Insn::Return { val }
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
+            | Insn::GuardBranch { val, .. }
             | Insn::ToArray { val, .. }
             | Insn::ToNewArray { val, .. }
             | Insn::Defined { v: val, .. }
@@ -8767,12 +8783,22 @@ fn insn_idx_at_offset(idx: u32, offset: i64) -> u32 {
 
 struct BytecodeInfo {
     jump_targets: Vec<u32>,
+    /// Ranges [start, end) of instruction indexes covered by a backward jump, i.e. loops
+    loop_ranges: Vec<(u32, u32)>,
+}
+
+impl BytecodeInfo {
+    /// Whether the instruction at insn_idx is in a loop of the same ISEQ
+    fn in_loop(&self, insn_idx: u32) -> bool {
+        self.loop_ranges.iter().any(|&(start, end)| start <= insn_idx && insn_idx < end)
+    }
 }
 
 fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeInfo {
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     let mut insn_idx = 0;
     let mut jump_targets: HashSet<u32> = opt_table.iter().copied().collect();
+    let mut loop_ranges = vec![];
     while insn_idx < iseq_size {
         // Get the current pc and opcode
         let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
@@ -8780,9 +8806,8 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
         // Strip any ZJIT profiling instrumentation so we read the ISEQ's
         // original opcodes, mirroring the main translation loop. We map rather
         // than mutate the ISEQ because the caller must not dictate the profiling
-        // policy of a callee it inlines. Only control-flow opcodes matter here
-        // and those are never instrumented, but decoding both sites identically
-        // keeps them from diverging.
+        // policy of a callee it inlines. Only control-flow opcodes matter here,
+        // and conditional branches are instrumented to profile their direction.
         //
         // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
         let opcode: u32 = unsafe { rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(iseq, pc)) }
@@ -8793,7 +8818,11 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
             YARVINSN_branchunless | YARVINSN_jump | YARVINSN_branchif | YARVINSN_branchnil
             | YARVINSN_branchunless_without_ints | YARVINSN_jump_without_ints | YARVINSN_branchif_without_ints | YARVINSN_branchnil_without_ints => {
                 let offset = get_arg(pc, 0).as_i64();
-                jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+                let target = insn_idx_at_offset(insn_idx, offset);
+                jump_targets.insert(target);
+                if target < insn_idx {
+                    loop_ranges.push((target, insn_idx));
+                }
             }
             YARVINSN_opt_new => {
                 let offset = get_arg(pc, 1).as_i64();
@@ -8809,7 +8838,7 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
     }
     let mut result = jump_targets.into_iter().collect::<Vec<_>>();
     result.sort();
-    BytecodeInfo { jump_targets: result }
+    BytecodeInfo { jump_targets: result, loop_ranges }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -9035,6 +9064,60 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     Ok(fun)
 }
 
+/// Decide whether to compile one direction of the conditional branch at `insn_idx` as a side
+/// exit because it was never observed during profiling. Returns the direction to speculate away.
+fn speculated_branch_direction(fun: &Function, payload: &IseqPayload, bytecode_info: &BytecodeInfo, insn_idx: YarvInsnIdx) -> Option<BranchDirection> {
+    let stats = get_option!(stats);
+    if stats {
+        incr_counter!(branch_compiled_count);
+    }
+    let Some(profile) = payload.profile.get_branch_profile(insn_idx) else {
+        if stats { incr_counter!(branch_no_profile); }
+        return None;
+    };
+    let direction = profile.never_taken_direction();
+    if stats {
+        if direction.is_some() {
+            incr_counter!(branch_one_direction);
+        } else if profile.num_samples() > 0 {
+            incr_counter!(branch_both_directions);
+        }
+        if profile.num_cond_kinds() == 1 {
+            incr_counter!(branch_cond_one_kind);
+        } else if profile.num_cond_kinds() > 1 {
+            incr_counter!(branch_cond_multi_kind);
+        }
+    }
+    let direction = direction?;
+    if !get_option!(branch_speculation) {
+        return None;
+    }
+    // Samples of a branch in a loop come from consecutive iterations of the first profiled calls,
+    // so they are correlated, and loop exits are rarely sampled at all even though they are
+    // always eventually taken. Don't speculate on those.
+    if bytecode_info.in_loop(insn_idx as u32) {
+        if stats { incr_counter!(branch_speculation_skipped_in_loop); }
+        return None;
+    }
+    // Don't trust a direction that was never observed in only a few samples.
+    if profile.num_samples() < get_option!(num_branch_profiles).into() {
+        if stats { incr_counter!(branch_speculation_skipped_too_few_samples); }
+        return None;
+    }
+    // A previous version speculated on this branch and the speculation was wrong.
+    if profile.speculation_failed {
+        if stats { incr_counter!(branch_speculation_skipped_failed_before); }
+        return None;
+    }
+    // Don't speculate in the last version, which can't be recompiled.
+    if fun.policy.no_side_exits {
+        if stats { incr_counter!(branch_speculation_skipped_policy); }
+        return None;
+    }
+    if stats { incr_counter!(branch_speculated); }
+    Some(direction)
+}
+
 /// Populate `fun` with HIR translated from `iseq`. Used both for top-level
 /// compilation (`iseq_to_hir`) and for inlining an ISEQ directly into a caller
 /// (the method inliner).
@@ -9089,7 +9172,7 @@ fn add_iseq_to_hir(
         .get(jit_entry_start..)
         .expect("JIT entry index must be within the callee opt table")
         .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>();
-    let BytecodeInfo { jump_targets } = compute_bytecode_info(iseq, &jit_entry_insns);
+    let bytecode_info = compute_bytecode_info(iseq, &jit_entry_insns);
 
     let compile_jit_entries = matches!(mode, AddIseqMode::Standalone) && iseq_supports_jit_entry(iseq);
 
@@ -9110,7 +9193,7 @@ fn add_iseq_to_hir(
         insn_idx_to_block.entry(insn_idx).or_insert_with(|| fun.new_block(insn_idx));
     }
     // Make blocks for the rest of the jump targets
-    for insn_idx in jump_targets {
+    for insn_idx in bytecode_info.jump_targets.iter().copied() {
         insn_idx_to_block.entry(insn_idx).or_insert_with(|| fun.new_block(insn_idx));
     }
     // Done, drop `mut`.
@@ -9691,27 +9774,44 @@ fn add_iseq_to_hir(
                         fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     }
                     let val = state.stack_pop()?;
-                    let test_id = fun.push_insn(block, Insn::Test { val });
                     let target_idx = insn_idx_at_offset(insn_idx, offset);
                     let target = insn_idx_to_block[&target_idx];
-                    let nil_false_type = types::Falsy;
-                    let nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: nil_false_type });
-                    let mut iffalse_state = state.clone();
-                    iffalse_state.replace(val, nil_false);
-                    let fall_through = fun.new_block(insn_idx);
+                    match speculated_branch_direction(fun, payload, &bytecode_info, state.insn_idx as YarvInsnIdx) {
+                        // Never jumped: the condition is always truthy
+                        Some(BranchDirection::Taken) => {
+                            let truthy = fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::Truthy, state: exit_id });
+                            state.replace(val, truthy);
+                        }
+                        // Always jumped: the condition is always falsy
+                        Some(BranchDirection::NotTaken) => {
+                            let falsy = fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::Falsy, state: exit_id });
+                            state.replace(val, falsy);
+                            fun.push_insn(block, Insn::Jump(BranchEdge { target, args: state.as_args(self_param) }));
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                            break;  // Don't enqueue the next block as a successor
+                        }
+                        None => {
+                            let test_id = fun.push_insn(block, Insn::Test { val });
+                            let nil_false_type = types::Falsy;
+                            let nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: nil_false_type });
+                            let mut iffalse_state = state.clone();
+                            iffalse_state.replace(val, nil_false);
+                            let fall_through = fun.new_block(insn_idx);
 
-                    fun.push_insn(block, Insn::CondBranch {
-                        val: test_id,
-                        if_true: BranchEdge { target: fall_through, args: vec![] },
-                        if_false: BranchEdge { target, args: iffalse_state.as_args(self_param) }
-                    });
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: test_id,
+                                if_true: BranchEdge { target: fall_through, args: vec![] },
+                                if_false: BranchEdge { target, args: iffalse_state.as_args(self_param) }
+                            });
 
-                    block = fall_through;
+                            block = fall_through;
 
-                    let not_nil_false_type = types::Truthy;
-                    let not_nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: not_nil_false_type });
-                    state.replace(val, not_nil_false);
-                    queue.push_back((state.clone(), target, target_idx, local_inval));
+                            let not_nil_false_type = types::Truthy;
+                            let not_nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: not_nil_false_type });
+                            state.replace(val, not_nil_false);
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                        }
+                    }
                 }
                 YARVINSN_branchif | YARVINSN_branchif_without_ints => {
                     let offset = get_arg(pc, 0).as_i64();
@@ -9719,28 +9819,45 @@ fn add_iseq_to_hir(
                         fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                     }
                     let val = state.stack_pop()?;
-                    let test_id = fun.push_insn(block, Insn::Test { val });
                     let target_idx = insn_idx_at_offset(insn_idx, offset);
                     let target = insn_idx_to_block[&target_idx];
-                    let not_nil_false_type = types::Truthy;
-                    let not_nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: not_nil_false_type });
-                    let mut iftrue_state = state.clone();
-                    iftrue_state.replace(val, not_nil_false);
+                    match speculated_branch_direction(fun, payload, &bytecode_info, state.insn_idx as YarvInsnIdx) {
+                        // Never jumped: the condition is always falsy
+                        Some(BranchDirection::Taken) => {
+                            let falsy = fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::Falsy, state: exit_id });
+                            state.replace(val, falsy);
+                        }
+                        // Always jumped: the condition is always truthy
+                        Some(BranchDirection::NotTaken) => {
+                            let truthy = fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::Truthy, state: exit_id });
+                            state.replace(val, truthy);
+                            fun.push_insn(block, Insn::Jump(BranchEdge { target, args: state.as_args(self_param) }));
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                            break;  // Don't enqueue the next block as a successor
+                        }
+                        None => {
+                            let test_id = fun.push_insn(block, Insn::Test { val });
+                            let not_nil_false_type = types::Truthy;
+                            let not_nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: not_nil_false_type });
+                            let mut iftrue_state = state.clone();
+                            iftrue_state.replace(val, not_nil_false);
 
-                    let fall_through = fun.new_block(insn_idx);
+                            let fall_through = fun.new_block(insn_idx);
 
-                    fun.push_insn(block, Insn::CondBranch {
-                        val: test_id,
-                        if_true: BranchEdge { target, args: iftrue_state.as_args(self_param) },
-                        if_false: BranchEdge { target: fall_through, args: vec![] }
-                    });
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: test_id,
+                                if_true: BranchEdge { target, args: iftrue_state.as_args(self_param) },
+                                if_false: BranchEdge { target: fall_through, args: vec![] }
+                            });
 
-                    block = fall_through;
+                            block = fall_through;
 
-                    let nil_false_type = types::Falsy;
-                    let nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: nil_false_type });
-                    state.replace(val, nil_false);
-                    queue.push_back((state.clone(), target, target_idx, local_inval));
+                            let nil_false_type = types::Falsy;
+                            let nil_false = fun.push_insn(block, Insn::RefineType { val, new_type: nil_false_type });
+                            state.replace(val, nil_false);
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                        }
+                    }
                 }
                 YARVINSN_branchnil | YARVINSN_branchnil_without_ints => {
                     let offset = get_arg(pc, 0).as_i64();
@@ -9750,24 +9867,42 @@ fn add_iseq_to_hir(
                     let val = state.stack_pop()?;
                     let target_idx = insn_idx_at_offset(insn_idx, offset);
                     let target = insn_idx_to_block[&target_idx];
-                    let nil = fun.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
-                    let mut iftrue_state = state.clone();
-                    iftrue_state.replace(val, nil);
+                    match speculated_branch_direction(fun, payload, &bytecode_info, state.insn_idx as YarvInsnIdx) {
+                        // Never jumped: the condition is never nil
+                        Some(BranchDirection::Taken) => {
+                            let not_nil = fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::NotNil, state: exit_id });
+                            state.replace(val, not_nil);
+                        }
+                        // Always jumped: the condition is always nil
+                        Some(BranchDirection::NotTaken) => {
+                            fun.push_insn(block, Insn::GuardBranch { val, guard_type: types::NilClass, state: exit_id });
+                            let nil = fun.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                            state.replace(val, nil);
+                            fun.push_insn(block, Insn::Jump(BranchEdge { target, args: state.as_args(self_param) }));
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                            break;  // Don't enqueue the next block as a successor
+                        }
+                        None => {
+                            let nil = fun.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                            let mut iftrue_state = state.clone();
+                            iftrue_state.replace(val, nil);
 
-                    let fall_through = fun.new_block(insn_idx);
+                            let fall_through = fun.new_block(insn_idx);
 
-                    fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
-                        val,
-                        expected: types::NilClass,
-                        if_true: BranchEdge { target, args: iftrue_state.as_args(self_param) },
-                        if_false: BranchEdge { target: fall_through, args: vec![] }
-                    })));
+                            fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+                                val,
+                                expected: types::NilClass,
+                                if_true: BranchEdge { target, args: iftrue_state.as_args(self_param) },
+                                if_false: BranchEdge { target: fall_through, args: vec![] }
+                            })));
 
-                    block = fall_through;
-                    let new_type = types::NotNil;
-                    let not_nil = fun.push_insn(block, Insn::RefineType { val, new_type });
-                    state.replace(val, not_nil);
-                    queue.push_back((state.clone(), target, target_idx, local_inval));
+                            block = fall_through;
+                            let new_type = types::NotNil;
+                            let not_nil = fun.push_insn(block, Insn::RefineType { val, new_type });
+                            state.replace(val, not_nil);
+                            queue.push_back((state.clone(), target, target_idx, local_inval));
+                        }
+                    }
                 }
                 YARVINSN_opt_case_dispatch => {
                     // TODO: Some keys are visible at compile time, so in the future we can

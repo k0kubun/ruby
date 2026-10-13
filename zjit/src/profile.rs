@@ -102,6 +102,7 @@ fn profile_insn_sample(
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
         }
         YARVINSN_splatkw => profile_operands(profiler, profile, 2),
+        YARVINSN_branchif | YARVINSN_branchunless | YARVINSN_branchnil => profile_branch(bare_opcode, profiler, profile),
         _ => return false,
     }
 
@@ -127,8 +128,9 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
 pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
     let num_profiles = get_option!(num_profiles);
+    let num_branch_profiles = get_option!(num_branch_profiles);
     for entry in &mut profile.entries {
-        entry.profiles_remaining = num_profiles;
+        entry.profiles_remaining = if entry.is_branch { num_branch_profiles } else { num_profiles };
     }
     unsafe { rb_zjit_profile_enable(iseq) };
 }
@@ -197,6 +199,26 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     };
     profile.splat_lengths.entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
+}
+
+/// Record the direction taken by branchif/branchunless/branchnil and the kind of its condition.
+/// The condition is still on the stack because the profiler runs before the branch.
+fn profile_branch(bare_opcode: ruby_vminsn_type, profiler: &mut Profiler, profile: &mut IseqProfile) {
+    let entry = profile.entry_mut(profiler.insn_idx);
+    if !entry.is_branch {
+        // Branches use their own sample budget. See --zjit-num-branch-profiles.
+        entry.is_branch = true;
+        entry.profiles_remaining = get_option!(num_branch_profiles);
+    }
+    let cond = profiler.peek_at_stack(0);
+    let taken = match bare_opcode {
+        YARVINSN_branchif => cond.test(),
+        YARVINSN_branchunless => !cond.test(),
+        YARVINSN_branchnil => cond.nil_p(),
+        _ => unreachable!("not a branch: {}", insn_name(bare_opcode as usize)),
+    };
+    let branch = profile.branches.entry(profiler.insn_idx).or_default();
+    branch.observe(taken, BranchCond::of(cond));
 }
 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -413,6 +435,82 @@ impl ProfiledType {
     }
 }
 
+/// Kind of value a branch condition evaluated to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCond {
+    Nil = 0,
+    False = 1,
+    True = 2,
+    /// Any other (truthy) object
+    Other = 3,
+}
+
+impl BranchCond {
+    fn of(val: VALUE) -> Self {
+        if val == Qnil {
+            BranchCond::Nil
+        } else if val == Qfalse {
+            BranchCond::False
+        } else if val == Qtrue {
+            BranchCond::True
+        } else {
+            BranchCond::Other
+        }
+    }
+}
+
+/// Profile of a conditional branch (branchif/branchunless/branchnil). "Taken" means the branch
+/// jumped to its target; "not taken" means it fell through to the next instruction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BranchProfile {
+    /// Number of samples that jumped to the branch target
+    pub taken: u32,
+    /// Number of samples that fell through
+    pub not_taken: u32,
+    /// Number of samples per BranchCond
+    pub conds: [u32; 4],
+    /// Set when JIT code that speculated on this branch side-exited because the direction
+    /// assumed never to happen did happen. We stop speculating on such branches.
+    pub speculation_failed: bool,
+}
+
+/// Direction of a branch that has never been observed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDirection {
+    Taken,
+    NotTaken,
+}
+
+impl BranchProfile {
+    fn observe(&mut self, taken: bool, cond: BranchCond) {
+        if taken {
+            self.taken = self.taken.saturating_add(1);
+        } else {
+            self.not_taken = self.not_taken.saturating_add(1);
+        }
+        self.conds[cond as usize] = self.conds[cond as usize].saturating_add(1);
+    }
+
+    pub fn num_samples(&self) -> u32 {
+        self.taken.saturating_add(self.not_taken)
+    }
+
+    /// Return the direction that has never been observed, if only one direction has been observed.
+    pub fn never_taken_direction(&self) -> Option<BranchDirection> {
+        match (self.taken, self.not_taken) {
+            (0, 0) => None,
+            (0, _) => Some(BranchDirection::Taken),
+            (_, 0) => Some(BranchDirection::NotTaken),
+            _ => None,
+        }
+    }
+
+    /// Number of distinct condition kinds observed
+    pub fn num_cond_kinds(&self) -> usize {
+        self.conds.iter().filter(|&&n| n > 0).count()
+    }
+}
+
 /// Per-instruction profile entry, stored sparsely in a sorted Vec.
 #[derive(Debug)]
 pub struct ProfileEntry {
@@ -420,8 +518,11 @@ pub struct ProfileEntry {
     insn_idx: u32,
     /// Type information of YARV instruction operands
     opnd_types: Vec<TypeDistribution>,
-    /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
+    /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles
+    /// (or --zjit-num-branch-profiles for branches).
     profiles_remaining: NumProfiles,
+    /// Whether this entry profiles a branch instruction
+    is_branch: bool,
 }
 
 #[derive(Debug)]
@@ -435,6 +536,9 @@ pub struct IseqProfile {
 
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+
+    /// Observed directions of conditional branches.
+    branches: HashMap<YarvInsnIdx, BranchProfile>,
 }
 
 impl IseqProfile {
@@ -443,6 +547,7 @@ impl IseqProfile {
             entries: Vec::new(),
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
+            branches: HashMap::new(),
         }
     }
 
@@ -456,6 +561,7 @@ impl IseqProfile {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
+                    is_branch: false,
                 });
                 &mut self.entries[i]
             }
@@ -477,6 +583,22 @@ impl IseqProfile {
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
         self.splat_lengths.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
+    }
+
+    pub fn get_branch_profile(&self, insn_idx: YarvInsnIdx) -> Option<&BranchProfile> {
+        self.branches.get(&insn_idx)
+    }
+
+    #[cfg(test)]
+    pub fn branch_profiles(&self) -> impl Iterator<Item = &BranchProfile> {
+        self.branches.values()
+    }
+
+    /// Remember that speculating on the branch at insn_idx failed at run time.
+    /// Return true if it's the first failure for the branch.
+    pub fn mark_branch_speculation_failed(&mut self, insn_idx: YarvInsnIdx) -> bool {
+        let branch = self.branches.entry(insn_idx).or_default();
+        !std::mem::replace(&mut branch.speculation_failed, true)
     }
 
     pub fn get_super_method_entry(&self, insn_idx: YarvInsnIdx) -> Option<*const rb_callable_method_entry_t> {

@@ -379,6 +379,31 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_branch_speculation
+    script = <<~RUBY
+      def test(x) = x ? :t : :f
+      def test_nil(x) = x&.succ
+      test(true); test(true)
+      test_nil(1); test_nil(1)
+      [test(true), test(false), test(nil), test(1), test_nil(1), test_nil(nil)]
+    RUBY
+    expected = '[:t, :f, :f, :t, 2, nil]'
+    assert_runs expected, script, call_threshold: 2, extra_args: ['--zjit-num-branch-profiles=1']
+    assert_runs expected, script, call_threshold: 2, extra_args: ['--zjit-num-branch-profiles=1', '--zjit-branch-speculation']
+    assert_runs expected, script, call_threshold: 2, extra_args: ['--zjit-num-branch-profiles=3', '--zjit-branch-speculation=true']
+    assert_runs expected, script, call_threshold: 2, extra_args: ['--zjit-branch-speculation=false']
+  end
+
+  def test_branch_speculation_stats
+    assert_runs '[1, 1]', <<~RUBY, call_threshold: 2, stats: :quiet, extra_args: ['--zjit-num-branch-profiles=1']
+      def test(x) = x ? :t : :f
+      test(true); test(true)
+      test(false)
+      stats = RubyVM::ZJIT.stats
+      [stats[:branch_speculated], stats[:exit_branch_speculation]]
+    RUBY
+  end
+
   private
 
   # Assert that every method call in `test_script` can be compiled by ZJIT

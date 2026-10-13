@@ -22,6 +22,11 @@ pub const DEFAULT_MAX_VERSIONS: usize = 4;
 const DEFAULT_NUM_PROFILES: NumProfiles = 5;
 pub type NumProfiles = u16;
 
+/// Default --zjit-num-branch-profiles. Each branch instruction is sampled at most this
+/// many times per profiling window. The window is only --zjit-num-profiles calls long, so
+/// a larger value only gives more samples to branches executed several times per call.
+const DEFAULT_NUM_BRANCH_PROFILES: NumProfiles = 5;
+
 /// Default --zjit-num-exits-until-invalidate
 const DEFAULT_NUM_EXITS_UNTIL_INVALIDATE: NumExits = 5;
 pub type NumExits = u32;
@@ -86,6 +91,12 @@ pub struct Options {
 
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
+
+    /// Number of times branchif/branchunless/branchnil should be profiled.
+    pub num_branch_profiles: NumProfiles,
+
+    /// Compile the never-taken direction of a profiled branch as a side exit.
+    pub branch_speculation: bool,
 
     /// Enable ZJIT statistics
     pub stats: bool,
@@ -209,6 +220,8 @@ impl Default for Options {
             mem_bytes: 128 * 1024 * 1024,
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
+            num_branch_profiles: DEFAULT_NUM_BRANCH_PROFILES,
+            branch_speculation: true,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -251,6 +264,10 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
                      "Number of calls to trigger JIT (default: 30)."),
     ("--zjit-num-profiles=num",
                      "Number of profiled calls before JIT (default: 5)."),
+    ("--zjit-num-branch-profiles=num",
+                     "Number of samples per branch instruction (default: 5)."),
+    ("--zjit-branch-speculation=bool",
+                     "Side-exit never-profiled branch directions (default: true)."),
     ("--zjit-stats-quiet",
                      "Collect ZJIT stats and suppress output."),
     ("--zjit-stats[=file]",
@@ -453,6 +470,14 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             },
             Err(_) => return None,
         },
+
+        ("num-branch-profiles", _) => match opt_val.parse() {
+            Ok(n) if n > 0 => options.num_branch_profiles = n,
+            _ => return None,
+        },
+
+        ("branch-speculation", "") | ("branch-speculation", "true") => options.branch_speculation = true,
+        ("branch-speculation", "false") => options.branch_speculation = false,
 
         ("num-exits-until-invalidate", _) => match opt_val.parse() {
             Ok(n) => options.num_exits_until_invalidate = n,
@@ -723,6 +748,20 @@ pub fn set_num_profiles(num_profiles: NumProfiles) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().num_profiles = num_profiles; }
     update_profile_threshold();
+}
+
+/// Update --zjit-num-branch-profiles for testing
+#[cfg(test)]
+pub fn set_num_branch_profiles(num_branch_profiles: NumProfiles) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().num_branch_profiles = num_branch_profiles; }
+}
+
+/// Update --zjit-branch-speculation for testing
+#[cfg(test)]
+pub fn set_branch_speculation(branch_speculation: bool) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().branch_speculation = branch_speculation; }
 }
 
 /// Set --zjit-mem-size for testing. It's used to force OOM in tests.

@@ -767,6 +767,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::UnboxFixnum { val } => gen_unbox_fixnum(asm, opnd!(val)),
         Insn::Test { val } => gen_test(asm, opnd!(val)),
         Insn::RefineType { val, .. } => opnd!(val),
+        &Insn::GuardBranch { val, guard_type, state } => gen_guard_branch(jit, asm, function, opnd!(val), guard_type, &function.frame_state(state)),
         &Insn::GuardType { val, guard_type, state, recompile } => {
             let val_type = function.type_of(val);
             gen_guard_type(jit, asm, function, opnd!(val), val_type, guard_type, recompile, &function.frame_state(state))
@@ -3307,6 +3308,35 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, function: &Function, 
 }
 
 /// Compile an identity check with a side exit
+/// Side-exit if a branch condition goes in the direction that was never profiled.
+/// See [hir::Insn::GuardBranch].
+fn gen_guard_branch(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, guard_type: Type, state: &FrameState) -> lir::Opnd {
+    let mut exit = build_side_exit(jit, function, state);
+    exit.recompile = Some(SideExitRecompile {
+        compiled_iseq: Opnd::Value(VALUE::from(jit.iseq())),
+        branch: Some((Opnd::Value(VALUE::from(state.iseq)), state.insn_idx() as u32)),
+    });
+    let side_exit = Target::SideExit(Box::new(SideExitTarget { exit, reason: BranchSpeculation }));
+    let cond = asm.load_imm(val);
+    if guard_type.bit_equal(types::Truthy) {
+        // See RB_TEST(), include/ruby/internal/special_consts.h
+        asm.test(cond, Opnd::Imm(!Qnil.as_i64()));
+        asm.jz(jit, side_exit);
+    } else if guard_type.bit_equal(types::Falsy) {
+        asm.test(cond, Opnd::Imm(!Qnil.as_i64()));
+        asm.jnz(jit, side_exit);
+    } else if guard_type.bit_equal(types::NilClass) {
+        asm.cmp(cond, Qnil.into());
+        asm.jne(jit, side_exit);
+    } else if guard_type.bit_equal(types::NotNil) {
+        asm.cmp(cond, Qnil.into());
+        asm.je(jit, side_exit);
+    } else {
+        panic!("unexpected GuardBranch type: {guard_type}");
+    }
+    val
+}
+
 fn gen_guard_bit_equals(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: lir::Opnd, expected: hir::Const, reason: SideExitReason, recompile: Option<Recompile>, state: &FrameState) -> lir::Opnd {
     if matches!(reason, SideExitReason::GuardShape(_) ) {
         gen_incr_counter(asm, Counter::guard_shape_count);
@@ -3771,6 +3801,7 @@ fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameSt
     let mut exit = build_side_exit(jit, function, state);
     exit.recompile = recompile.map(|_| SideExitRecompile {
         compiled_iseq: Opnd::Value(VALUE::from(jit.iseq())),
+        branch: None,
     });
     Target::SideExit(Box::new(SideExitTarget { exit, reason }))
 }
@@ -3870,6 +3901,21 @@ c_callable! {
                 cb.mark_all_executable();
             }
         });
+    }
+}
+
+c_callable! {
+    /// Called from the side exit of a [hir::Insn::GuardBranch] that failed: the branch went in
+    /// the direction that had never been profiled. Remember that in the profile so that the next
+    /// version compiles both directions, then count the exit towards recompilation.
+    pub(crate) fn exit_branch_speculation(branch_iseq_raw: VALUE, branch_insn_idx: u64, compiled_iseq_raw: VALUE) {
+        with_vm_lock(src_loc!(), || {
+            let payload = get_or_create_iseq_payload(branch_iseq_raw.as_iseq());
+            if payload.profile.mark_branch_speculation_failed(branch_insn_idx as usize) {
+                incr_counter!(branch_speculation_failed);
+            }
+        });
+        exit_recompile(compiled_iseq_raw);
     }
 }
 

@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_branch_speculation, set_call_threshold, set_num_branch_profiles, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -118,6 +118,8 @@ fn test_nil() {
 #[test]
 fn test_function_stub_profiles_before_compiling() {
     rb_zjit_prepare_options();
+    // The caller only calls the callee after warmup. Keep the call compiled so it uses a stub.
+    set_branch_speculation(false);
     set_inline_threshold(0);
     let num_profiles = get_option!(num_profiles);
     let call_threshold = CallThreshold::from(num_profiles) + 2;
@@ -215,6 +217,56 @@ fn test_recompile_exit_invalidates_on_first_exit() {
     let payload = get_or_create_iseq_payload(iseq);
     assert_eq!(1, payload.versions.len());
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_branch_speculation_exit_recompiles_without_speculation() {
+    set_call_threshold(2);
+    set_num_branch_profiles(1);
+    set_num_exits_until_invalidate(1);
+    eval("
+        def branch_spec(x) = x ? 1 : 2
+        branch_spec(true)
+        branch_spec(true)
+    ");
+
+    let iseq = get_method_iseq("self", "branch_spec");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+    assert!(payload.profile.branch_profiles().all(|branch| !branch.speculation_failed));
+
+    // The falsy direction was never profiled, so it side-exits, marks the branch, and invalidates.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("branch_spec(false)"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+    assert!(payload.profile.branch_profiles().any(|branch| branch.speculation_failed));
+
+    // The next version compiles both directions even if the new profile sees only one again.
+    assert_eq!(VALUE::fixnum_from_usize(1), eval("branch_spec(true); branch_spec(true)"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("branch_spec(false)"));
+    assert_eq!(VALUE::fixnum_from_usize(1), eval("branch_spec(1)"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
+fn test_branch_speculation_side_exit_results() {
+    set_call_threshold(2);
+    set_num_branch_profiles(1);
+    assert_snapshot!(inspect("
+        def unless_spec(x) = x ? :t : :f
+        def if_spec(x) = x || :default
+        def nil_spec(x) = x&.succ
+        unless_spec(true); unless_spec(true)
+        if_spec(nil); if_spec(nil)
+        nil_spec(nil); nil_spec(nil)
+        [unless_spec(true), unless_spec(nil), unless_spec(false), if_spec(nil), if_spec(1), if_spec(false), nil_spec(nil), nil_spec(1)]
+    "), @"[:t, :f, :f, :default, 1, :default, nil, 2]");
 }
 
 #[test]
@@ -9237,6 +9289,8 @@ fn test_forward_fallback_with_lightweight_frame_reads_cfp() {
 #[test]
 fn test_regression_stub_frame_sp_published_for_gc() {
     rb_zjit_prepare_options();
+    // The caller only calls the callee after warmup. Keep the call compiled so it uses a stub.
+    set_branch_speculation(false);
     set_inline_threshold(0); // don't inline the callee; we need a function stub
     set_call_threshold(2000);
 
@@ -9307,6 +9361,8 @@ fn test_regression_stub_frame_sp_published_for_gc() {
 #[test]
 fn test_regression_stub_frame_block_code_cleared_for_gc() {
     rb_zjit_prepare_options();
+    // The caller only calls the callee after warmup. Keep the call compiled so it uses a stub.
+    set_branch_speculation(false);
     set_inline_threshold(0); // don't inline the callee; we need a function stub
     set_call_threshold(2000);
 

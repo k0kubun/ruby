@@ -248,6 +248,7 @@ make_counters! {
         exit_send_while_tracing,
         exit_invokeblock_not_ifunc,
         exit_once_not_done,
+        exit_branch_speculation,
     }
 
     // Send fallback counters that are summed as dynamic_send_count
@@ -397,6 +398,20 @@ make_counters! {
     unspecialized_send_def_type_missing,
     unspecialized_send_def_type_refined,
     unspecialized_send_def_type_null,
+
+    // Branch profiles seen when compiling branchif/branchunless/branchnil (incl. inlined copies)
+    branch_compiled_count,
+    branch_no_profile,
+    branch_one_direction,
+    branch_both_directions,
+    branch_cond_one_kind,
+    branch_cond_multi_kind,
+    branch_speculated,
+    branch_speculation_failed,
+    branch_speculation_skipped_in_loop,
+    branch_speculation_skipped_too_few_samples,
+    branch_speculation_skipped_failed_before,
+    branch_speculation_skipped_policy,
 
     // Super call def_type related to send fallback to dynamic dispatch
     unspecialized_super_def_type_iseq,
@@ -659,6 +674,7 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         NoProfileSetIvar              => exit_no_profile_setivar,
         InvokeBlockNotIfunc           => exit_invokeblock_not_ifunc,
         OnceNotDone                   => exit_once_not_done,
+        BranchSpeculation             => exit_branch_speculation,
     }
 }
 

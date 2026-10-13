@@ -646,6 +646,9 @@ pub struct SideExitRecompile {
     /// The compiled unit whose version must be invalidated to force a recompile. For inlined
     /// methods, this will be the outer function it was inlined into.
     pub compiled_iseq: Opnd,
+    /// If set, the exit is a failed branch speculation and the branch profile at
+    /// (ISEQ, insn_idx) is marked so that the next version doesn't speculate again.
+    pub branch: Option<(Opnd, u32)>,
 }
 
 /// Payload of `Target::SideExit`, boxed to keep `Target` (and every `Insn`
@@ -3135,9 +3138,13 @@ impl Assembler
 
         fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
             if let Some(recompile) = &exit.recompile {
-                use crate::codegen::exit_recompile;
+                use crate::codegen::{exit_recompile, exit_branch_speculation};
                 asm_comment!(asm, "invalidate for recompilation");
-                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
+                if let Some((branch_iseq, branch_insn_idx)) = recompile.branch {
+                    asm_ccall!(asm, exit_branch_speculation, branch_iseq, Opnd::UImm(branch_insn_idx as u64), recompile.compiled_iseq);
+                } else {
+                    asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
+                }
             }
         }
 
