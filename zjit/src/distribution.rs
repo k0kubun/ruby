@@ -135,6 +135,14 @@ impl<T: Copy + PartialEq + Default + std::fmt::Debug, const N: usize> Distributi
         Self { kind, buckets: dist.buckets }
     }
 
+    /// Report a SkewedPolymorphic distribution as Polymorphic
+    pub fn without_skew(mut self) -> Self {
+        if self.kind == DistributionKind::SkewedPolymorphic {
+            self.kind = DistributionKind::Polymorphic;
+        }
+        self
+    }
+
     pub fn kind(&self) -> DistributionKind {
         self.kind
     }

@@ -323,6 +323,31 @@ fn test_profile_recompile_exit_records_failing_type() {
 }
 
 #[test]
+fn test_profile_recompile_exit_stops_skewed_speculation() {
+    set_call_threshold(5);
+    set_num_exits_until_invalidate(1);
+    set_reprofile(Reprofile::Invalidate);
+    set_profile_recompile_exit(true);
+    eval("
+        def recompile_exit_skew(a, b) = a + b
+        4.times { recompile_exit_skew(1, 2) }
+        recompile_exit_skew(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "recompile_exit_skew");
+    assert!(opt_plus_lhs_summary(iseq).is_monomorphic());
+
+    // Four Fixnums and one Float from the exit is skewed, but since the Fixnum
+    // speculation already failed, the next version treats the site as polymorphic.
+    eval("recompile_exit_skew(1.5, 2.5)");
+    assert!(unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated());
+    assert!(opt_plus_lhs_summary(iseq).is_skewed_polymorphic());
+    let opt_plus_idx = 4;
+    let profile = &get_or_create_iseq_payload(iseq).profile;
+    let types = profile.get_operand_types(opt_plus_idx).unwrap();
+    assert!(profile.summarize_operand(opt_plus_idx, &types[0]).is_polymorphic());
+}
+
+#[test]
 fn test_profile_decay_halve_on_invalidation() {
     set_call_threshold(2);
     set_num_exits_until_invalidate(1);

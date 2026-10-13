@@ -8917,7 +8917,7 @@ impl ProfileOracle {
         // at run-time) so use that to drive iteration.
         for (idx, insn_type_distribution) in operand_types.iter().rev().enumerate() {
             let insn = state.stack_topn(idx).expect("Unexpected stack underflow in profiling");
-            entry.push((insn, TypeDistributionSummary::new(insn_type_distribution)))
+            entry.push((insn, payload.profile.summarize_operand(iseq_insn_idx, insn_type_distribution)))
         }
     }
 
@@ -8931,7 +8931,7 @@ impl ProfileOracle {
            return;
         }
         let self_type_distribution = &operand_types[0];
-        entry.push((self_param, TypeDistributionSummary::new(self_type_distribution)))
+        entry.push((self_param, payload.profile.summarize_operand(iseq_insn_idx, self_type_distribution)))
     }
 
     /// Append profile entries produced while translating an inlined callee. The callee was added

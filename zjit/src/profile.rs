@@ -151,6 +151,8 @@ pub(crate) fn profile_exit(cfp: CfpPtr) {
     let profile = &mut get_or_create_iseq_payload(iseq).profile;
     if profile_insn_sample(bare_opcode, profiler, profile) {
         crate::stats::incr_counter!(profile_sample_recompile_exit);
+        // Remember that speculating on the dominant type here already cost a version.
+        profile.entry_mut(profiler.insn_idx).had_recompile_exit = true;
     }
 }
 
@@ -455,6 +457,10 @@ pub struct ProfileEntry {
     opnd_types: Vec<TypeDistribution>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
+    /// Whether a guard on this instruction's operands triggered a recompile (with
+    /// --zjit-profile-recompile-exit). A skewed distribution is then not speculated
+    /// as monomorphic again, since that already failed once.
+    had_recompile_exit: bool,
 }
 
 /// Why the interpreter is currently collecting profiles for an ISEQ. Used for stats.
@@ -570,6 +576,7 @@ impl IseqProfile {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
+                    had_recompile_exit: false,
                 });
                 &mut self.entries[i]
             }
@@ -581,6 +588,18 @@ impl IseqProfile {
         let idx = insn_idx as u32;
         self.entries.binary_search_by_key(&idx, |e| e.insn_idx)
             .ok().map(|i| &self.entries[i])
+    }
+
+    /// Summarize a profiled operand distribution of the given instruction. If a guard
+    /// on this instruction already triggered a recompile, a skewed distribution is
+    /// reported as plain polymorphic so that we stop speculating on the dominant type.
+    pub fn summarize_operand(&self, insn_idx: YarvInsnIdx, dist: &TypeDistribution) -> TypeDistributionSummary {
+        let summary = TypeDistributionSummary::new(dist);
+        if self.entry(insn_idx).is_some_and(|e| e.had_recompile_exit) {
+            summary.without_skew()
+        } else {
+            summary
+        }
     }
 
     /// Get profiled operand types for a given instruction index
