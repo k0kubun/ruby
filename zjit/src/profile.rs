@@ -116,6 +116,7 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     // Once we profile the instruction enough times, we stop profiling it.
     let entry = profile.entry_mut(profiler.insn_idx);
     entry.profiles_remaining = entry.profiles_remaining.saturating_sub(1);
+    entry.window_samples = entry.window_samples.saturating_add(1);
     if entry.profiles_remaining == 0 {
         unsafe { rb_zjit_iseq_insn_set(profiler.iseq, profiler.insn_idx as u32, bare_opcode); }
     }
@@ -128,6 +129,7 @@ pub(crate) fn reset_profiles_remaining(iseq: IseqPtr) {
     let num_profiles = get_option!(num_profiles);
     for entry in &mut profile.entries {
         entry.profiles_remaining = num_profiles;
+        entry.window_samples = 0;
     }
     unsafe { rb_zjit_profile_enable(iseq) };
 }
@@ -421,6 +423,22 @@ pub struct ProfileEntry {
     opnd_types: Vec<TypeDistribution>,
     /// Number of profiles remaining before recompilation. Counts down from --zjit-num-profiles.
     profiles_remaining: NumProfiles,
+    /// Number of times this instruction has been profiled since profiles_remaining was last reset.
+    window_samples: NumProfiles,
+}
+
+/// How mature the profile of a profiled instruction is when it gets compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileMaturity {
+    /// The instruction has never been profiled.
+    None,
+    /// The instruction has profile data, but only from an earlier profiling window.
+    /// The window before this compilation did not reach it.
+    Stale,
+    /// The instruction was profiled in the latest window, but fewer times than requested.
+    Partial,
+    /// The instruction was profiled as many times as requested in the latest window.
+    Full,
 }
 
 #[derive(Debug)]
@@ -455,6 +473,7 @@ impl IseqProfile {
                     insn_idx: idx,
                     opnd_types: Vec::new(),
                     profiles_remaining: get_option!(num_profiles),
+                    window_samples: 0,
                 });
                 &mut self.entries[i]
             }
@@ -466,6 +485,18 @@ impl IseqProfile {
         let idx = insn_idx as u32;
         self.entries.binary_search_by_key(&idx, |e| e.insn_idx)
             .ok().map(|i| &self.entries[i])
+    }
+
+    /// Classify the profile of a given instruction index for stats.
+    pub fn maturity(&self, insn_idx: YarvInsnIdx) -> ProfileMaturity {
+        let has_data = |entry: &ProfileEntry| !entry.opnd_types.is_empty() || self.super_cme.contains_key(&insn_idx);
+        match self.entry(insn_idx) {
+            Some(entry) if !has_data(entry) => ProfileMaturity::None,
+            Some(entry) if entry.window_samples == 0 => ProfileMaturity::Stale,
+            Some(entry) if entry.profiles_remaining > 0 => ProfileMaturity::Partial,
+            Some(_) => ProfileMaturity::Full,
+            None => ProfileMaturity::None,
+        }
     }
 
     /// Get profiled operand types for a given instruction index

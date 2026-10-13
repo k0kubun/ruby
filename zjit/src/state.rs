@@ -84,6 +84,9 @@ pub struct ZJITState {
     /// Send fallback counters
     send_fallback_counters: InsnCounters,
 
+    /// Counters of profiled YARV instructions compiled without any profile
+    no_profile_insn_counters: InsnCounters,
+
     /// Assumptions that require invalidation
     invariants: Invariants,
 
@@ -194,6 +197,7 @@ impl ZJITState {
             counters: Counters::default(),
             exit_counters: [0; VM_INSTRUCTION_SIZE as usize],
             send_fallback_counters: [0; VM_INSTRUCTION_SIZE as usize],
+            no_profile_insn_counters: [0; VM_INSTRUCTION_SIZE as usize],
             invariants: Invariants::default(),
             assert_compiles: false,
             method_annotations,
@@ -290,6 +294,11 @@ impl ZJITState {
     /// Get a mutable reference to fallback counters
     pub fn get_send_fallback_counters() -> &'static mut InsnCounters {
         &mut ZJITState::get_instance().send_fallback_counters
+    }
+
+    /// Get a mutable reference to counters of instructions compiled without profiles
+    pub fn get_no_profile_insn_counters() -> &'static mut InsnCounters {
+        &mut ZJITState::get_instance().no_profile_insn_counters
     }
 
     /// Get a mutable reference to full frame cfunc counter pointers

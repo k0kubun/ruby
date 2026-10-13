@@ -242,6 +242,13 @@ rb_zjit_insn_to_bare_insn(int insn)
     return vm_zjit_insn_to_bare_insn(insn);
 }
 
+// Return true if a given bare instruction has a zjit_* variant, i.e. it is profiled.
+bool
+rb_zjit_insn_profiled_p(int bare_insn)
+{
+    return vm_bare_insn_to_zjit_insn(bare_insn) != bare_insn;
+}
+
 // Update a YARV instruction to a given opcode (to disable ZJIT profiling).
 void
 rb_zjit_iseq_insn_set(const rb_iseq_t *iseq, unsigned int insn_idx, enum ruby_vminsn_type bare_insn)

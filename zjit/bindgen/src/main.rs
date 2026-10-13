@@ -117,6 +117,7 @@ fn main() {
         .allowlist_function("rb_zjit_profile_disable")
         .allowlist_function("rb_zjit_profile_enable")
         .allowlist_function("rb_zjit_insn_to_bare_insn")
+        .allowlist_function("rb_zjit_insn_profiled_p")
         .allowlist_function("rb_zjit_hash_new_size")
         .allowlist_function("rb_zjit_class_allocate_instance_fastpath")
         .allowlist_function("rb_zjit_str_resurrect_fastpath")
