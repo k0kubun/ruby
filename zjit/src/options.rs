@@ -19,7 +19,7 @@ pub enum PerfMap {
 pub const DEFAULT_MAX_VERSIONS: usize = 4;
 
 /// Default --zjit-num-profiles
-const DEFAULT_NUM_PROFILES: NumProfiles = 5;
+const DEFAULT_NUM_PROFILES: NumProfiles = 10;
 pub type NumProfiles = u16;
 
 /// Default --zjit-num-exits-until-invalidate
@@ -28,7 +28,7 @@ pub type NumExits = u32;
 
 /// Default --zjit-call-threshold. This should be large enough to avoid compiling
 /// warmup code, but small enough to perform well on micro-benchmarks.
-pub const DEFAULT_CALL_THRESHOLD: CallThreshold = 30;
+pub const DEFAULT_CALL_THRESHOLD: CallThreshold = 60;
 pub type CallThreshold = u32;
 
 /// Default --zjit-inline-threshold
@@ -248,9 +248,9 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-mem-size=num",
                      "Max amount of memory that ZJIT can use in MiB (default: 128)."),
     ("--zjit-call-threshold=num",
-                     "Number of calls to trigger JIT (default: 30)."),
+                     "Number of calls to trigger JIT (default: 60)."),
     ("--zjit-num-profiles=num",
-                     "Number of profiled calls before JIT (default: 5)."),
+                     "Number of profiled calls before JIT (default: 10)."),
     ("--zjit-stats-quiet",
                      "Collect ZJIT stats and suppress output."),
     ("--zjit-stats[=file]",

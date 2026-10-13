@@ -1900,9 +1900,9 @@ mod hir_opt_tests {
     // so hir_string can then compile a valid function.
     #[test]
     fn test_dead_string_interp_raise_block_folds_to_unreachable() {
-        // NB: 31, not 30. boot_rubyvm() resets the threshold to 2 whenever it equals
-        // DEFAULT_CALL_THRESHOLD (30), which would make profiling sample the very first
-        // (String) call and defeat the race we need.
+        // NB: 31, not DEFAULT_CALL_THRESHOLD. boot_rubyvm() resets the threshold to 2
+        // whenever it equals DEFAULT_CALL_THRESHOLD, which would make profiling sample the
+        // very first (String) call and defeat the race we need.
         set_call_threshold(31);
         set_num_profiles(1);
         set_max_versions(2);
@@ -22121,6 +22121,7 @@ mod hir_opt_tests {
 
     #[test]
     fn test_specialize_inlined_megamorphic_receiver() {
+        set_num_profiles(5);
         assert_eq!(crate::profile::DISTRIBUTION_SIZE, 8, "If you change distribution size, update the number of classes used");
         set_call_threshold((crate::profile::DISTRIBUTION_SIZE + 2).try_into().unwrap());
         eval("

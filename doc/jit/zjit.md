@@ -140,9 +140,9 @@ ZJIT options:
   --zjit-mem-size=num
                   Max amount of memory that ZJIT can use in MiB (default: 128).
   --zjit-call-threshold=num
-                  Number of calls to trigger JIT (default: 30).
+                  Number of calls to trigger JIT (default: 60).
   --zjit-num-profiles=num
-                  Number of profiled calls before JIT (default: 5).
+                  Number of profiled calls before JIT (default: 10).
   --zjit-stats[=quiet]
                   Enable collecting ZJIT statistics (=quiet to suppress output).
   --zjit-disable  Disable ZJIT for lazily enabling it with RubyVM::ZJIT.enable.
@@ -415,7 +415,7 @@ Enabling `--zjit-trace-exits-sample-rate=N` will automatically enable
 
 ### Viewing HIR as text
 
-The compiled ZJIT HIR can be viewed as text using the `--zjit-dump-hir` option. However, HIR will only be generated if the call threshold is reached (default 30). By setting the threshold to 1 you can easily view the HIR for code snippets such as `1 + 1`:
+The compiled ZJIT HIR can be viewed as text using the `--zjit-dump-hir` option. However, HIR will only be generated if the call threshold is reached (default 60). By setting the threshold to 1 you can easily view the HIR for code snippets such as `1 + 1`:
 
 ```bash
 ./miniruby --zjit --zjit-dump-hir --zjit-call-threshold=1 -e "1 + 1"
