@@ -4013,14 +4013,28 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
     asm_comment!(asm, "spill stack");
 
     let mut offset = state.stack_size() as i32;
+    // Whether the cursor is in a frame's locals area; see StackMapEntry::SkipVmEnvData.
+    let mut locals_area = false;
     for entry in build_stack_map(jit, function, state) {
         match entry {
+            // Skip over locals in stack memory
+            StackMapEntry::Opnd(_) if locals_area => {
+                offset -= 1;
+            }
             StackMapEntry::Opnd(opnd) => {
                 offset -= 1;
                 asm.mov(Opnd::mem(64, SP, offset * SIZEOF_VALUE_I32), opnd);
             }
             StackMapEntry::Skip(skip) => {
                 offset -= skip as i32;
+            }
+            StackMapEntry::SkipVmEnvData => {
+                offset -= VM_ENV_DATA_SIZE as i32;
+                locals_area = true;
+            }
+            StackMapEntry::PrevFrame => {
+                // Switches frames on the decoder side without moving the cursor.
+                locals_area = false;
             }
             // Only gen_prepare_non_leaf_call() prepends this, and it doesn't spill.
             StackMapEntry::BasePtr { .. } => unreachable!("build_stack_map() does not emit BasePtr"),
@@ -4060,20 +4074,28 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
             break;
         };
         let caller_state = function.frame_state(caller);
-        stack.push(StackMapEntry::Skip(inline_frame_stack_gap(current_state.iseq, &caller_state)));
+        // Frame environment data (me/cref, specval, flags) already lives in memory.
+        // This entry also starts the locals area, so the decoder can drop the local
+        // writes below it when the frame's env has escaped.
+        stack.push(StackMapEntry::SkipVmEnvData);
+        // Locals are spilled to memory before pushing an inlined frame, and the callee's
+        // receiver, if any, is below its local table.
+        let skip = current_state.locals().len() + inline_frame_receiver_slots(&caller_state);
+        if skip > 0 {
+            stack.push(StackMapEntry::Skip(skip));
+        }
+        stack.push(StackMapEntry::PrevFrame);
         current_state = caller_state;
     }
     stack
 }
 
-/// The number of VM stack slots between the stack of an inlined frame for `iseq` and the
-/// stack of its caller frame at `caller_state`.
-fn inline_frame_stack_gap(iseq: IseqPtr, caller_state: &FrameState) -> usize {
+/// The number of VM stack slots for the receiver of an inlined frame called from `caller_state`.
+fn inline_frame_receiver_slots(caller_state: &FrameState) -> usize {
     // A method call has the callee's receiver below its local table. An inlined block called
     // by `invokeblock` doesn't have a receiver on the stack.
     let caller_opcode = unsafe { rb_iseq_bare_opcode_at_pc(caller_state.iseq, caller_state.pc) } as u32;
-    let receiver_slots = if caller_opcode == YARVINSN_invokeblock { 0 } else { 1 };
-    receiver_slots + unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + VM_ENV_DATA_SIZE.to_usize()
+    if caller_opcode == YARVINSN_invokeblock { 0 } else { 1 }
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.
