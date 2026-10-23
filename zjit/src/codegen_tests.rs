@@ -2790,6 +2790,24 @@ fn test_eval_local_write_survives_send_without_hir_opt() {
 }
 
 #[test]
+fn test_eval_local_write_survives_side_exit() {
+    // Like test_eval_local_write_survives_send_without_hir_opt(), but through a side exit
+    // instead of a send: the exit used to write the JIT's stale `n = 0` over the 2 from `eval`.
+    set_call_threshold(2);
+    eval(r#"
+        def test
+          n = 0
+          eval("n = 2")
+          ::RubyVM::ZJIT.induce_side_exit!
+          n
+        end
+        test
+        test
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("test"), @"2");
+}
+
+#[test]
 fn test_nested_local_access() {
     assert_snapshot!(inspect("
         1.times do |l2|
@@ -2946,8 +2964,8 @@ fn test_function_stub_recursive_call_with_stack_args() {
 #[test]
 fn test_no_ep_escape_side_exit_restores_locals_while_oom() {
     // A regression test for stub compilation failures on OOM. Functions patched by NoEPEscape
-    // is unsafe to enter (FrameState uses without_locals() and doesn't spill the entry state),
-    // so even under OOM, the re-stub after invalidation must succeed.
+    // used to be unsafe to enter (FrameState used without_locals() and didn't spill the entry
+    // state), so even under OOM, the re-stub after invalidation must succeed.
     set_mem_bytes(2 * 1024 * 1024);
     set_inline_threshold(0);
     set_call_threshold(2);
@@ -11102,8 +11120,8 @@ fn test_getivar_megamorphic_shapes() {
 
 /// When a method with keyword defaults contains a block that creates a lambda,
 /// the lambda causes EP escape, which globally patches NoEPEscape PatchPoints.
-/// On subsequent calls the PatchPoint side exit (which uses without_locals())
-/// must not leave stale keyword default values in the frame. We solve this by
+/// On subsequent calls the PatchPoint side exit must not leave stale keyword
+/// default values in the frame. It used to skip writing locals, which we solved by
 /// invalidating the ISEQ version on EP escape so the interpreter takes over.
 #[test]
 fn test_ep_escape_preserves_keyword_default() {
@@ -11758,6 +11776,22 @@ fn test_uncached_getconstant_path() {
 }
 
 #[test]
+fn test_trace_point_side_exit_materializes_locals() {
+    set_call_threshold(1);
+    eval("nil"); // boot the VM before assert_compiles_allowing_exits touches ZJITState
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        tp = TracePoint.new(:line) { }
+        out = []
+        [1, 2, 3, 4].each do |x|
+          out << x
+          tp.enable if x == 2
+        end
+        tp.disable
+        out
+    "#), @"[1, 2, 3, 4]");
+}
+
+#[test]
 fn test_line_tracepoint_on_c_method() {
     set_call_threshold(1);
     assert_snapshot!(assert_compiles_allowing_exits(r#"
@@ -11916,8 +11950,8 @@ fn test_keep_jit_frame_for_caught_jump() {
 // the patch point may be leaf. When an EP escape fires while the version limit
 // prevents invalidate_iseq_version() from running, every version containing a
 // patched point must still stop receiving calls. Otherwise a fresh call would
-// side-exit through the patched point's without_locals() frame state and the
-// interpreter would read garbage locals.
+// side-exit through the patched point, whose frame state used to have no locals
+// (without_locals()), and the interpreter would read garbage locals.
 #[test]
 fn test_no_ep_escape_invalidation_at_max_versions() {
     rb_zjit_prepare_options();
