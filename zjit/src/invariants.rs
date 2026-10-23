@@ -258,10 +258,11 @@ pub extern "C" fn rb_zjit_invalidate_no_ep_escape(iseq: IseqPtr) {
 
             // Also invalidate every version that contains one of the patched points,
             // and this ISEQ's latest version, so that no new call runs the patched code.
-            // NoEPEscape PatchPoint side exits use without_locals() and don't save
-            // locals to the frame. If a PatchPoint fires on a later call (where EP
-            // hasn't escaped), the interpreter would read stale locals (e.g., nil
-            // instead of [] for keyword defaults).
+            // NoEPEscape PatchPoint side exits used to skip writing locals to the
+            // frame (FrameState::without_locals()), so if a PatchPoint fired on a
+            // later call (where EP hasn't escaped), the interpreter read stale locals
+            // (e.g., nil instead of [] for keyword defaults). Exits write locals now,
+            // but the interpreter still takes over the ISEQ permanently.
             //
             // We can't rely on the invalidate_iseq_version() calls made by
             // compile_patch_points! because it skips when at MAX_ISEQ_VERSIONS
@@ -282,10 +283,7 @@ pub extern "C" fn rb_zjit_invalidate_no_ep_escape(iseq: IseqPtr) {
 
                     // Re-stub incoming JIT-to-JIT calls. Resetting jit_func is not
                     // enough: SendDirect callers jump straight into the invalidated
-                    // code, whose NoEPEscape patch points now side-exit with
-                    // without_locals() frame states. A frame entered through a
-                    // JIT-to-JIT call does not write locals to the stack, so resuming
-                    // the interpreter through such an exit would read garbage locals.
+                    // code, whose NoEPEscape patch points now side-exit on every call.
                     for incoming in unsafe { version.as_ref() }.incoming.iter() {
                         if let Err(err) = crate::codegen::gen_iseq_call(cb, incoming) {
                             debug!("{err:?}: gen_iseq_call failed during EP escape invalidation: {}", iseq_name(owner_iseq));
