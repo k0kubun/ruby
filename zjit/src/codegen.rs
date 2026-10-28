@@ -28,7 +28,7 @@ use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND
 use crate::hir::{self, iseq_to_hir, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchHasTypeData, Const, FieldName, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
-use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
+use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS, DEFAULT_NUM_EXTRA_VERSIONS};
 use crate::cast::IntoUsize;
 
 /// Maximum number of compiled versions per ISEQ.
@@ -255,6 +255,19 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
     })
 }
 
+/// Maximum number of versions an ISEQ may have when PatchPoint invalidations are involved.
+///
+/// --zjit-max-versions bounds recompilation caused by guard failures (see exit_recompile()).
+/// A PatchPoint invalidation is different: the code is no longer valid, so leaving the final
+/// version in place makes every call enter it only to side-exit at the patched point. We allow
+/// replacing such a version with another final version, up to --zjit-num-extra-versions more
+/// versions so that an assumption that is broken repeatedly can't cause unbounded compilation.
+pub fn max_iseq_versions_with_patch_points() -> usize {
+    let num_extra_versions = unsafe { crate::options::OPTIONS.as_ref() }
+        .map_or(DEFAULT_NUM_EXTRA_VERSIONS, |opts| opts.num_extra_versions);
+    max_iseq_versions() + num_extra_versions
+}
+
 /// Invalidate an ISEQ version and allow it to be recompiled on the next call.
 /// Both PatchPoint invalidation and exit-profiling recompilation go through this
 /// function, serving as the central point for all invalidation/recompile decisions.
@@ -262,10 +275,11 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 /// TODO: evolve this into a general `handle_event(iseq, event)` state machine that
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
-pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, by_patch_point: bool) {
     let payload = get_or_create_iseq_payload(iseq);
+    let max_versions = if by_patch_point { max_iseq_versions_with_patch_points() } else { max_iseq_versions() };
     if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < max_iseq_versions()
+        && payload.versions.len() < max_versions
     {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
@@ -348,8 +362,11 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         Some(IseqStatus::CantCompile(err)) => return Err(err.clone()),
         _ => {},
     }
-    // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    // If the ISEQ already has max versions, do not compile a new version. Reaching here with
+    // max_iseq_versions() or more versions means a PatchPoint invalidated the final version,
+    // since exit_recompile() doesn't invalidate it. Such a replacement is compiled as another
+    // final version (see CompilePolicy), so it doesn't speculate on guards.
+    if payload.versions.len() >= max_iseq_versions_with_patch_points() {
         return Err(CompileError::IseqVersionLimitReached);
     }
 
@@ -3875,7 +3892,7 @@ c_callable! {
             let payload = get_or_create_iseq_payload(compiled_iseq);
             if let Some(version) = payload.versions.last_mut() {
                 let cb = ZJITState::get_code_block();
-                invalidate_iseq_version(cb, compiled_iseq, version);
+                invalidate_iseq_version(cb, compiled_iseq, version, false);
                 cb.mark_all_executable();
             }
         });

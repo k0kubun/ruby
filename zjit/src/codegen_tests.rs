@@ -3,10 +3,10 @@
 use super::{gen_insn, JITState};
 use crate::asm::CodeBlock;
 use crate::backend::lir::Assembler;
-use crate::codegen::max_iseq_versions;
+use crate::codegen::{max_iseq_versions, max_iseq_versions_with_patch_points};
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_num_extra_versions};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -8226,7 +8226,8 @@ fn test_invokesuper_with_local_written_by_blockiseq() {
 
 #[test]
 fn test_max_iseq_versions() {
-    let max_versions = max_iseq_versions();
+    // PatchPoint invalidations may replace the final version, up to --zjit-num-extra-versions more times.
+    let max_versions = max_iseq_versions_with_patch_points();
     eval(&format!("
         TEST = -1
         def test = TEST
@@ -8243,13 +8244,91 @@ fn test_max_iseq_versions() {
         end
     "));
 
-    // It should not exceed MAX_ISEQ_VERSIONS
+    // It should not exceed the version limit for PatchPoint invalidations
     let iseq = get_method_iseq("self", "test");
     let payload = get_or_create_iseq_payload(iseq);
-    assert_eq!(payload.versions.len(), max_iseq_versions());
+    assert_eq!(payload.versions.len(), max_versions);
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+// When a PatchPoint fires on the final version, which exit_recompile() never invalidates,
+// the ISEQ should be compiled again instead of side-exiting at the patched point on every call.
+#[test]
+fn test_patch_point_recompiles_final_version() {
+    rb_zjit_prepare_options();
+    let old_max_versions = get_option!(max_versions);
+    let old_num_extra_versions = get_option!(num_extra_versions);
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    set_max_versions(2);
+    set_num_extra_versions(2);
+    eval("
+        PATCH_POINT_FINAL = 1
+        def patch_point_final(a) = a + PATCH_POINT_FINAL
+        patch_point_final(1); patch_point_final(1)       # compile version 1 for Integer
+        patch_point_final(1.5)                           # recompile exit invalidates version 1
+        patch_point_final(1.5); patch_point_final(1.5)   # compile version 2, the final version
+    ");
+    let iseq = get_method_iseq("self", "patch_point_final");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 2);
+    assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+
+    // Redefining the constant invalidates the final version, and it gets compiled again.
+    eval("
+        Object.send(:remove_const, :PATCH_POINT_FINAL)
+        PATCH_POINT_FINAL = 2
+        patch_point_final(1); patch_point_final(1)
+    ");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 3);
+    assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+
+    // Repeated redefinitions don't compile more than max_versions + num_extra_versions versions.
+    let result = eval("
+        10.times do |i|
+          Object.send(:remove_const, :PATCH_POINT_FINAL)
+          PATCH_POINT_FINAL = i
+          patch_point_final(1); patch_point_final(1)
+        end
+        patch_point_final(1)
+    ");
+    set_max_versions(old_max_versions);
+    set_num_extra_versions(old_num_extra_versions);
+    assert_eq!(result.as_fixnum(), 10);
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 4);
+    assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+// --zjit-num-extra-versions=0 keeps the final version in place when a PatchPoint fires on it.
+#[test]
+fn test_patch_point_keeps_final_version_without_extra_versions() {
+    rb_zjit_prepare_options();
+    let old_max_versions = get_option!(max_versions);
+    let old_num_extra_versions = get_option!(num_extra_versions);
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    set_max_versions(2);
+    set_num_extra_versions(0);
+    let result = eval("
+        PATCH_POINT_KEPT = 1
+        def patch_point_kept(a) = a + PATCH_POINT_KEPT
+        patch_point_kept(1); patch_point_kept(1)       # compile version 1 for Integer
+        patch_point_kept(1.5)                          # recompile exit invalidates version 1
+        patch_point_kept(1.5); patch_point_kept(1.5)   # compile version 2, the final version
+        Object.send(:remove_const, :PATCH_POINT_KEPT)
+        PATCH_POINT_KEPT = 2
+        patch_point_kept(1); patch_point_kept(1); patch_point_kept(1)
+    ");
+    set_max_versions(old_max_versions);
+    set_num_extra_versions(old_num_extra_versions);
+    assert_eq!(result.as_fixnum(), 3);
+    let iseq = get_method_iseq("self", "patch_point_kept");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 2);
 }
 
 #[test]

@@ -18,6 +18,9 @@ pub enum PerfMap {
 /// Default maximum number of compiled versions per ISEQ.
 pub const DEFAULT_MAX_VERSIONS: usize = 4;
 
+/// Default --zjit-num-extra-versions
+pub const DEFAULT_NUM_EXTRA_VERSIONS: usize = 4;
+
 /// Default --zjit-num-profiles
 const DEFAULT_NUM_PROFILES: NumProfiles = 5;
 pub type NumProfiles = u16;
@@ -160,6 +163,10 @@ pub struct Options {
     /// Maximum number of versions per ISEQ
     pub max_versions: usize,
 
+    /// Number of versions beyond --zjit-max-versions that PatchPoint invalidations may compile.
+    /// See `max_iseq_versions_with_patch_points` in codegen.rs.
+    pub num_extra_versions: usize,
+
     /// Per-callee size threshold for inlining, measured as the callee's YARV bytecode size
     /// (see `get_iseq_encoded_size`). Callees larger than this are rejected by `should_inline`.
     /// 0 disables inlining entirely.
@@ -233,6 +240,7 @@ impl Default for Options {
             allowed_iseqs: None,
             log_compiled_iseqs: None,
             max_versions: DEFAULT_MAX_VERSIONS,
+            num_extra_versions: DEFAULT_NUM_EXTRA_VERSIONS,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             inline_budget: DEFAULT_INLINE_BUDGET as InlineBudget,
             inline_deny: HashSet::new(),
@@ -461,6 +469,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
+            Err(_) => return None,
+        },
+
+        ("num-extra-versions", _) => match opt_val.parse() {
+            Ok(n) => options.num_extra_versions = n,
             Err(_) => return None,
         },
 
@@ -708,6 +721,13 @@ pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
 pub fn set_max_versions(max_versions: usize) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().max_versions = max_versions; }
+}
+
+/// Update --zjit-num-extra-versions for testing
+#[cfg(test)]
+pub fn set_num_extra_versions(num_extra_versions: usize) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().num_extra_versions = num_extra_versions; }
 }
 
 /// Update --zjit-inline-threshold for testing
