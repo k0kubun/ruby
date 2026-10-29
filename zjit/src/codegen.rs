@@ -3594,6 +3594,11 @@ pub(crate) fn block_iseq_may_throw(iseq: IseqPtr) -> bool {
     iseq_any_insn(iseq, |_pc, opcode| opcode == YARVINSN_throw)
 }
 
+/// True if the method ISEQ itself (not its blocks) yields to its block.
+pub(crate) fn iseq_may_yield(iseq: IseqPtr) -> bool {
+    iseq_any_insn(iseq, |_pc, opcode| opcode == YARVINSN_invokeblock)
+}
+
 /// True if `f(pc, opcode)` is true for any instruction in the ISEQ
 pub(crate) fn iseq_any_insn(iseq: IseqPtr, f: impl Fn(*const VALUE, u32) -> bool) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
