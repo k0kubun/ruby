@@ -6027,6 +6027,87 @@ fn test_array_fixnum_aset_out_of_bounds() {
 }
 
 #[test]
+fn test_array_fixnum_aset_push_at_length() {
+    eval("
+        def test
+          a = []
+          a[0] = 1
+          a[1] = 2
+          i = 2
+          while i < 20
+            a[i] = i
+            i += 1
+          end
+          a
+        end
+        test
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_aset);
+    assert_snapshot!(assert_compiles("test"), @"[1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]");
+}
+
+#[test]
+fn test_array_fixnum_aset_out_of_bounds_compiled() {
+    eval("
+        def test(arr, idx)
+          arr[idx] = 7
+        end
+        test([1,2,3], 0)
+    ");
+    assert_snapshot!(assert_compiles("[test(a = [1,2,3], 5), a, test(b = [1,2,3], -1), b, test(c = [1,2,3], 3), c]"), @"[7, [1, 2, 3, nil, nil, 7], 7, [1, 2, 7], 7, [1, 2, 3, 7]]");
+}
+
+#[test]
+fn test_array_fixnum_aset_negative_index_out_of_range() {
+    eval("
+        def test(arr, idx)
+          arr[idx] = 7
+        end
+        test([1,2,3], 0)
+    ");
+    assert_snapshot!(assert_compiles("
+        begin
+          test([1,2,3], -4)
+        rescue IndexError => e
+          e.message
+        end
+    "), @r#""index -4 too small for array; minimum: -3""#);
+}
+
+#[test]
+fn test_array_fixnum_aset_push_frozen() {
+    assert_snapshot!(inspect("
+        def test(arr, idx, val)
+          arr[idx] = val
+        end
+        arr = [1,2,3]
+        test(arr, 3, 9)
+        test(arr, 4, 9)
+        arr.freeze
+        begin
+          test(arr, 5, 9)
+        rescue => e
+          [e.class, arr]
+        end
+    "), @"[FrozenError, [1, 2, 3, 9, 9]]");
+}
+
+#[test]
+fn test_array_fixnum_aset_push_shared() {
+    assert_snapshot!(inspect("
+        def test(arr, idx, val)
+          arr[idx] = val
+        end
+        arr = (0..50).to_a
+        test(arr, 51, -1)
+        test(arr, 52, -2)
+        shared = arr[10, 20]
+        test(shared, 20, 999)
+        [arr.size, arr[30], shared.size, shared[20]]
+    "), @"[53, 30, 21, 999]");
+}
+
+#[test]
 fn test_array_fixnum_aset_negative_index() {
     assert_snapshot!(inspect("
         def test(arr)
