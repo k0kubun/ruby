@@ -809,6 +809,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::ArrayPush { array, val, state } => { no_output!(gen_array_push(asm, opnd!(array), opnd!(val), &function.frame_state(state))) },
         &Insn::ToNewArray { val, state } => { gen_to_new_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::ToArray { val, state } => { gen_to_array(jit, asm, function, opnd!(val), &function.frame_state(state)) },
+        &Insn::ExpandArrayToAry { val, state } => { gen_expandarray_to_ary(jit, asm, function, opnd!(val), &function.frame_state(state)) },
         &Insn::DefinedIvar { self_val, id, pushval, .. } => { gen_defined_ivar(asm, opnd!(self_val), id, pushval) },
         &Insn::ArrayExtend { left, right, state } => { no_output!(gen_array_extend(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state))) },
         Insn::LoadPC => gen_load_pc(asm),
@@ -1442,6 +1443,15 @@ fn gen_to_new_array(jit: &mut JITState, asm: &mut Assembler, function: &Function
 fn gen_to_array(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_vm_splat_array, Opnd::Value(Qfalse), val)
+}
+
+fn gen_expandarray_to_ary(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: Opnd, state: &FrameState) -> lir::Opnd {
+    unsafe extern "C" {
+        fn rb_zjit_expandarray_to_ary(obj: VALUE) -> VALUE;
+    }
+    // #to_ary may run arbitrary Ruby code
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_zjit_expandarray_to_ary, val)
 }
 
 fn gen_defined_ivar(asm: &mut Assembler, self_val: Opnd, id: ID, pushval: VALUE) -> lir::Opnd {
