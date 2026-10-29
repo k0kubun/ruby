@@ -2798,6 +2798,10 @@ pub enum ValidationError {
 }
 
 /// Set of flags incompatible with direct sends to forwardable callees.
+/// Maximum encoded size of a method that yields to a literal block that may `break` or `return`
+/// and is inlined regardless of the inlining threshold and budget, so that the throw can become a jump.
+const THROW_INLINE_MAX_CALLEE_SIZE: usize = 128;
+
 const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     // `gen_send_iseq_direct` currently handles only the interpreter's `vm_call_iseq_forwardable`
     // fastpath case on forwardable ISEQs: pass non-`...` arguments to a `...` callee, which sets
@@ -6410,10 +6414,15 @@ impl Function {
                     && unsafe { rb_jit_iseq_builtin_attrs(iseq) } & BUILTIN_ATTR_INLINE_BLOCK != 0;
                 // If the literal block may `break` or `return`, inlining both the method and the
                 // block may turn the throw into a jump, so skip the budget heuristic as well.
-                let throw_inlinable = inline_block && blockiseq.is_some_and(crate::codegen::block_iseq_may_throw);
+                // Do the same for a modestly sized method that yields to the literal block itself.
+                let throw_block = blockiseq.is_some_and(crate::codegen::block_iseq_may_throw);
+                let throw_inlinable = throw_block && (inline_block || (
+                    unsafe { get_iseq_encoded_size(iseq) } as usize <= THROW_INLINE_MAX_CALLEE_SIZE
+                        && crate::codegen::iseq_may_yield(iseq)
+                ));
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || !self.should_inline(iseq, cme, inline_block, throw_inlinable) || !Self::can_inline(iseq) {
+                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
