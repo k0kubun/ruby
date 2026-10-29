@@ -6900,6 +6900,68 @@ fn test_attr_writer() {
 }
 
 #[test]
+fn test_attr_writer_shape_transition() {
+    // The first write to each object adds @foo (a shape transition); later writes reuse it.
+    eval("
+        class C
+          attr_accessor :foo
+          def initialize = (@a = 1)
+        end
+        def test(c, v) = c.foo = v
+        2.times { c = C.new; test(c, 1); test(c, 2) }
+    ");
+    assert_snapshot!(assert_compiles("
+        objs = 3.times.map { C.new }
+        objs.each_with_index { |c, i| test(c, i) }
+        objs.each_with_index { |c, i| test(c, i * 10) }
+        objs.map(&:foo)
+    "), @"[0, 10, 20]");
+}
+
+#[test]
+fn test_attr_writer_shape_miss_and_frozen() {
+    // Shapes missing from the profile and frozen receivers take the rb_ivar_set fallback.
+    eval("
+        class C
+          attr_accessor :foo
+          def initialize(n) = n.times { |i| instance_variable_set(:\"@v#{i}\", i) }
+        end
+        def test(c, v) = c.foo = v
+        test(C.new(0), 1)
+        test(C.new(0), 1)
+    ");
+    assert_snapshot!(inspect("
+        objs = 4.times.map { |n| C.new(n) }
+        objs.each { |c| test(c, c.instance_variables.size) }
+        frozen = C.new(1).freeze
+        err = begin; test(frozen, 1); rescue FrozenError => e; e.class; end
+        [objs.map(&:foo), err, frozen.foo]
+    "), @"[[0, 1, 2, 3], FrozenError, nil]");
+}
+
+#[test]
+fn test_attr_reader_lazily_initialized_ivar() {
+    eval("
+        class C
+          attr_reader :x
+          def initialize = (@a = 1)
+          def init_x = (@x ||= 2)
+        end
+        def test(c) = c.x
+        o1 = C.new
+        o2 = C.new
+        o2.init_x
+        test(o1); test(o2)
+    ");
+    assert_snapshot!(inspect("
+        o = C.new
+        before = test(o)
+        o.init_x
+        [before, test(o), test(C.new)]
+    "), @"[nil, 2, nil]");
+}
+
+#[test]
 fn test_getconstant() {
     eval("
         class Foo
