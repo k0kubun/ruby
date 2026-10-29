@@ -5987,7 +5987,7 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool) -> bool {
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -6026,7 +6026,7 @@ impl Function {
         // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
         // `Options::inline_budget` for the full unit/semantics caveat.
         let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget {
+        if budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget && !ignore_budget {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -6124,7 +6124,10 @@ impl Function {
                 let blockiseq = match call_block { Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq), _ => None };
                 let inline_block = blockiseq.is_some()
                     && unsafe { rb_jit_iseq_builtin_attrs(iseq) } & BUILTIN_ATTR_INLINE_BLOCK != 0;
-                if !self.should_inline(iseq, cme, inline_block) || !Self::can_inline(iseq) {
+                // If the literal block may `break` or `return`, inlining both the method and the
+                // block may turn the throw into a jump, so skip the budget heuristic as well.
+                let throw_inlinable = inline_block && blockiseq.is_some_and(crate::codegen::block_iseq_may_throw);
+                if !self.should_inline(iseq, cme, inline_block, throw_inlinable) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -6466,7 +6469,7 @@ impl Function {
         // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
         // This is bounded by the number of literal blocks in the inlined methods' callers.
         let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
-        if (!throw_inlinable && !self.should_inline(iseq, ptr::null(), false)) || !Self::can_inline(iseq) {
+        if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
             return None;
         }
 
