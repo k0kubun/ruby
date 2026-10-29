@@ -432,6 +432,17 @@ rb_zjit_array_aref_with_adjusted_index(VALUE ary, rb_len_t index, VALUE *out)
     }
 }
 
+// Convert the operand of `expandarray num, 0` to the Array that vm_expandarray() reads elements
+// from: an Array as is, the result of #to_ary, or [obj] when obj has no #to_ary.
+VALUE
+rb_zjit_expandarray_to_ary(VALUE obj)
+{
+    if (RB_TYPE_P(obj, T_ARRAY)) return obj;
+    VALUE ary = rb_check_array_type(obj);
+    if (NIL_P(ary)) return rb_ary_new_from_values(1, &obj);
+    return ary;
+}
+
 // Primitives used by zjit.rb. Don't put other functions below, which wouldn't use them.
 VALUE rb_zjit_enable(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_assert_compiles(rb_execution_context_t *ec, VALUE self);

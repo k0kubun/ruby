@@ -1031,6 +1031,9 @@ pub enum Insn {
 
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise.
     ToArray { val: InsnId, state: InsnId },
+    /// Convert the operand of `expandarray` to an Array like `vm_expandarray`: an Array as is,
+    /// the result of `to_ary` if defined, or `[val]` otherwise.
+    ExpandArrayToAry { val: InsnId, state: InsnId },
     /// Call `to_a` on `val` if the method is defined, or make a new array `[val]` otherwise. If we
     /// called `to_a`, duplicate the returned array.
     ToNewArray { val: InsnId, state: InsnId },
@@ -1516,6 +1519,7 @@ macro_rules! for_each_operand_impl {
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
             | Insn::ToArray { val, state }
+            | Insn::ExpandArrayToAry { val, state }
             | Insn::IsMethodCfunc { val, state, .. }
             | Insn::ToNewArray { val, state }
             | Insn::SetLocal { val, state, .. }
@@ -1835,6 +1839,7 @@ impl Insn {
             Insn::ToRegexp { .. } => effects::Any,
             Insn::PutSpecialObject { .. } => effects::Any,
             Insn::ToArray { .. } => effects::Any,
+            Insn::ExpandArrayToAry { .. } => effects::Any,
             Insn::ToNewArray { .. } => effects::Any,
             Insn::NewArray { .. } => allocates,
             Insn::NewHash { elements, .. } => {
@@ -2556,6 +2561,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::GetClassVar { id, .. } => write!(f, "GetClassVar :{}", id.contents_lossy()),
             Insn::SetClassVar { id, val, .. } => write!(f, "SetClassVar :{}, {val}", id.contents_lossy()),
             Insn::ToArray { val, .. } => write!(f, "ToArray {val}"),
+            Insn::ExpandArrayToAry { val, .. } => write!(f, "ExpandArrayToAry {val}"),
             Insn::ToNewArray { val, .. } => write!(f, "ToNewArray {val}"),
             Insn::ArrayExtend { left, right, .. } => write!(f, "ArrayExtend {left}, {right}"),
             Insn::ArrayPush { array, val, .. } => write!(f, "ArrayPush {array}, {val}"),
@@ -4043,6 +4049,7 @@ impl Function {
             Insn::GetClassVar { .. } => types::BasicObject,
             Insn::ToNewArray { .. } => types::ArrayExact,
             Insn::ToArray { .. } => types::ArrayExact,
+            Insn::ExpandArrayToAry { .. } => types::Array,
             Insn::AnyToString { .. } => types::StringExact,
             Insn::IsBlockParamModified { .. } => types::CBool,
             Insn::GetBlockParam { .. } => types::BasicObject,
@@ -4820,6 +4827,26 @@ impl Function {
         self.gen_patch_points_for_optimized_ccall(block, class, method_id, cme, state);
         if !self.assume_no_singleton_classes(block, class, state) {
             return false;
+        }
+        true
+    }
+
+    /// Assume that `rb_check_array_type(nil)` returns nil without calling any Ruby method, i.e.
+    /// NilClass has no #to_ary and the default #respond_to?, #respond_to_missing?, and #method_missing.
+    fn assume_nil_has_no_to_ary(&mut self, block: BlockId, state: InsnId) -> bool {
+        let klass = unsafe { rb_cNilClass };
+        let to_ary_cme = unsafe { rb_callable_method_entry_or_negative(klass, ID!(to_ary)) };
+        if unsafe { get_cme_def_type(to_ary_cme) } != VM_METHOD_TYPE_UNDEF {
+            return false;
+        }
+        let basic_methods = [ID!(respond_to), ID!(respond_to_missing), ID!(method_missing)];
+        if basic_methods.iter().any(|&method| unsafe { rb_method_basic_definition_p(klass, method) } == 0) {
+            return false;
+        }
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: ID!(to_ary), cme: to_ary_cme }, state });
+        for method in basic_methods {
+            let cme = unsafe { rb_callable_method_entry(klass, method) };
+            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method, cme }, state });
         }
         true
     }
@@ -8502,6 +8529,7 @@ impl Function {
             | Insn::Throw { val, .. }
             | Insn::GuardType { val, .. }
             | Insn::ToArray { val, .. }
+            | Insn::ExpandArrayToAry { val, .. }
             | Insn::ToNewArray { val, .. }
             | Insn::Defined { v: val, .. }
             | Insn::ObjectAlloc { val, .. }
@@ -11399,12 +11427,38 @@ fn add_iseq_to_hir(
                         break;  // End the block
                     }
                     let val = state.stack_pop()?;
-                    let array = fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: None });
-                    let length = fun.push_insn(block, Insn::ArrayLength { array });
-                    for i in (0..num).rev() {
-                        let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
-                        let element = fun.push_insn(block, Insn::ArrayArefChecked { array, index, length });
-                        state.stack_push(element);
+                    let static_nil = matches!(fun.find(val), Insn::Const { val: Const::Value(v) } if v == Qnil);
+                    // e.g. the ISEQ's (GC-hidden) literal Array pushed by `putobject` for `a, b = 1, 2`
+                    let static_array = matches!(fun.find(val), Insn::Const { val: Const::Value(v) }
+                        if !v.special_const_p() && unsafe { RB_TYPE_P(v, RUBY_T_ARRAY) });
+                    let profiled_type = if fun.policy.no_side_exits || static_nil || static_array { None } else {
+                        fun.monomorphic_summary(&profiles, val, exit_id).map(Type::from_profiled_type)
+                    };
+                    if (static_nil || profiled_type.is_some_and(|ty| ty.is_subtype(types::NilClass)))
+                        && fun.assume_nil_has_no_to_ary(block, exit_id) {
+                        // Like the interpreter, nil (which has no #to_ary) is expanded as [nil].
+                        if !static_nil {
+                            fun.push_insn(block, Insn::GuardType { val, guard_type: types::NilClass, state: exit_id, recompile: Some(Recompile) });
+                        }
+                        for _ in 0..num {
+                            let nil = fun.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                            state.stack_push(nil);
+                        }
+                    } else {
+                        let array = if static_array {
+                            val
+                        } else if profiled_type.is_some_and(|ty| ty.is_subtype(types::ArrayExact)) {
+                            fun.push_insn(block, Insn::GuardType { val, guard_type: types::ArrayExact, state: exit_id, recompile: Some(Recompile) })
+                        } else {
+                            // Polymorphic, non-Array, or unprofiled: convert the operand like vm_expandarray.
+                            fun.push_insn(block, Insn::ExpandArrayToAry { val, state: exit_id })
+                        };
+                        let length = fun.push_insn(block, Insn::ArrayLength { array });
+                        for i in (0..num).rev() {
+                            let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i.try_into().unwrap()) });
+                            let element = fun.push_insn(block, Insn::ArrayArefChecked { array, index, length });
+                            state.stack_push(element);
+                        }
                     }
                 }
                 _ => {

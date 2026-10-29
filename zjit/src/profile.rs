@@ -92,6 +92,7 @@ fn profile_insn_sample(
         YARVINSN_opt_length    => profile_operands(profiler, profile, 1),
         YARVINSN_opt_size      => profile_operands(profiler, profile, 1),
         YARVINSN_opt_succ      => profile_operands(profiler, profile, 1),
+        YARVINSN_expandarray   => profile_operands(profiler, profile, 1),
         YARVINSN_invokeblock   => profile_block_handler(profiler, profile),
         YARVINSN_invokesuper   => profile_invokesuper(profiler, profile),
         YARVINSN_opt_send_without_block | YARVINSN_send => {
@@ -166,16 +167,22 @@ fn profile_operands(profiler: &mut Profiler, profile: &mut IseqProfile, n: usize
 
     for (i, profile_type) in entry.opnd_types.iter_mut().enumerate() {
         let obj = profiler.peek_at_stack((n - i - 1) as isize);
-        // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
-        // drop them or something
         let ty = ProfiledType::new(obj);
         observe_profiled_type(profiler, profile_type, obj, ty);
     }
 }
 
-/// Record the ProfiledType of `obj` unless its class is the singleton class of a non-Module object that may be collected.
+/// Record the ProfiledType of `obj` unless it is GC-hidden or its class is the singleton class of
+/// a non-Module object that may be collected.
 fn observe_profiled_type(profiler: &Profiler, distribution: &mut TypeDistribution, obj: VALUE, ty: ProfiledType) {
     let class = ty.class();
+
+    // A GC-hidden object, e.g. an ISEQ's literal Array pushed by `putobject` for `a, b = 1, 2`,
+    // has no class. A class of 0 would also be mistaken for an empty bucket.
+    if class == VALUE(0) {
+        distribution.observe_other();
+        return;
+    }
 
     // A singleton class belongs to one object, so specializing on it doesn't help other objects.
     if class.is_singleton_class()
@@ -221,8 +228,6 @@ fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
         entry.opnd_types = vec![TypeDistribution::new()];
     }
     let obj = profiler.peek_at_self();
-    // TODO(max): Handle GC-hidden classes like Array, Hash, etc and make them look normal or
-    // drop them or something
     let ty = ProfiledType::new(obj);
     observe_profiled_type(profiler, &mut entry.opnd_types[0], obj, ty);
 }
