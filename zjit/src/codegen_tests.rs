@@ -1439,6 +1439,23 @@ fn test_inline_block_return_from_home_method() {
 }
 
 #[test]
+fn test_inline_block_return_from_array_each_index() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              a.each_index do |i|
+                return i if a[i] == :b
+              end
+              nil
+            end
+            test([:a, :b])
+            test([:a, :b])
+        ", "test([:a, :b])"), @"1");
+        assert_snapshot!(assert_compiles("test([:a])"), @"nil");
+    });
+}
+
+#[test]
 fn test_inline_block_break_and_return_in_same_block() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("
