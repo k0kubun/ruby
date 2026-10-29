@@ -726,6 +726,9 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::PushInlineFrame { cme, iseq, recv, num_args, block, state, exit_state, .. } => {
             no_output!(gen_push_inline_frame(jit, asm, function, *cme, *iseq, opnd!(recv), *num_args, &function.frame_state(*state), &function.frame_state(*exit_state), block.map(|bh| lower_block_handler(jit, bh))))
         },
+        Insn::PushInlineBlockFrame { iseq, recv, captured, num_args, state } => {
+            no_output!(gen_push_inline_block_frame(jit, asm, function, *iseq, opnd!(recv), opnd!(captured), *num_args, &function.frame_state(*state)))
+        },
         Insn::PopInlineFrame { iseq, argc, state } => {
             no_output!(gen_pop_inline_frame(asm, *iseq, *argc, &function.frame_state(*state)))
         },
@@ -1847,6 +1850,67 @@ fn gen_push_inline_frame(
     let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
     asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+}
+
+/// Push the interpreter frame for an inlined block, the inlined form of
+/// gen_invoke_block_iseq_direct(). The frame layout mirrors gen_push_inline_frame()
+/// except that `yield` has no receiver on the stack, and self and the parent EP come
+/// from the captured block.
+fn gen_push_inline_block_frame(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    iseq: IseqPtr,
+    block_self: Opnd,
+    captured: Opnd,
+    num_args: u16,
+    state: &FrameState,
+) {
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+    let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
+    gen_stack_overflow_check(jit, asm, function, state, stack_growth);
+
+    // Save cfp->pc and cfp->sp for the caller frame. The block's arguments are
+    // the top `num_args` stack slots and become the block's leading locals.
+    let stack_size = state.stack().len() - num_args.to_usize();
+    gen_write_jit_frame(asm, state);
+    gen_save_sp(asm, stack_size);
+
+    // specval = VM_GUARDED_PREV_EP(captured->ep) = captured->ep | 0x01
+    let captured_ep = asm.load(Opnd::mem(64, captured, SIZEOF_VALUE_I32)); // captured->ep
+    let specval = asm.or(captured_ep, Opnd::Imm(0x1));
+
+    gen_push_frame(asm, num_args.to_usize(), state, ControlFrame {
+        recv: block_self,
+        iseq: Some(iseq),
+        cme: std::ptr::null(),
+        frame_type: VM_FRAME_MAGIC_BLOCK,
+        specval,
+        write_block_code: iseq_may_write_block_code(iseq),
+        forwarded_argc: None, // `...` is not allowed in block arguments
+    });
+
+    // Publish the inlined block's entry JITFrame. See gen_push_inline_frame().
+    fn cfp_opnd(offset: i32) -> Opnd {
+        Opnd::mem(64, CFP, offset - (RUBY_SIZEOF_CONTROL_FRAME as i32))
+    }
+    let callee_depth = state.depth + 1;
+    let callee_entry_pc = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
+    let callee_entry_frame = JITFrame::new_iseq(callee_entry_pc, iseq);
+    asm_comment!(asm, "install entry JITFrame for inlined block");
+    asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, jit_frame_slot_offset(callee_depth)), Opnd::const_ptr(callee_entry_frame));
+    let callee_jit_return = cfp_jit_return_for_depth(asm, callee_depth);
+    asm.mov(cfp_opnd(RUBY_OFFSET_CFP_JIT_RETURN), callee_jit_return);
+
+    let sp_offset = (stack_size + local_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
+    asm_comment!(asm, "switch to inlined block SP");
+    let new_sp = asm.add(SP, sp_offset.into());
+    asm.mov(SP, new_sp);
+
+    asm_comment!(asm, "switch to inlined block CFP");
+    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, new_cfp);
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP as i32), CFP);
 }
 
 /// Pop the interpreter frame for an inlined callee, restoring the caller's SP and CFP.
@@ -3632,10 +3696,10 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
                 offset -= VM_ENV_DATA_SIZE as i32;
                 locals_area = true;
             }
-            StackMapEntry::PrevFrame => {
-                // The inlined callee's receiver slot. Like Skip(1), but it also
-                // switches frames on the decoder side.
-                offset -= 1;
+            StackMapEntry::PrevFrame { receiver } => {
+                // The inlined callee's receiver slot, if any. Like Skip(receiver as usize),
+                // but it also switches frames on the decoder side.
+                offset -= receiver as i32;
                 locals_area = false;
             }
             // Only gen_prepare_non_leaf_call() prepends this, and it doesn't spill.
@@ -3695,8 +3759,9 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         let Some(caller) = current_state.caller() else {
             break;
         };
-        stack.push(StackMapEntry::PrevFrame);
-        current_state = function.frame_state(caller);
+        let caller_state = function.frame_state(caller);
+        stack.push(StackMapEntry::PrevFrame { receiver: inlined_frame_has_receiver(&caller_state) });
+        current_state = caller_state;
     }
     stack
 }
@@ -3711,6 +3776,14 @@ enum OperandStack {
     /// this routine, so the stack map only moves the cursor past it. See
     /// [gen_prepare_fallback_call()].
     AlreadySpilled,
+}
+
+/// Whether an inlined frame called from `caller_state` has its receiver in the VM stack slot
+/// below its local table. A method call does, but an inlined block called by `invokeblock`
+/// doesn't.
+fn inlined_frame_has_receiver(caller_state: &FrameState) -> bool {
+    let caller_opcode = unsafe { rb_iseq_bare_opcode_at_pc(caller_state.iseq, caller_state.pc) } as u32;
+    caller_opcode != YARVINSN_invokeblock
 }
 
 /// Prepare for calling a C function that may call an arbitrary method.
