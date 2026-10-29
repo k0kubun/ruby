@@ -910,6 +910,7 @@ pub enum FieldName {
     VM_ENV_DATA_INDEX_FLAGS,
     RBASIC_FLAGS,
     code_iseq,
+    captured_self,
     shape_id,
     as_heap,
     fields_obj,
@@ -1278,7 +1279,19 @@ pub enum Insn {
         exit_state: InsnId,
     },
 
-    /// Pop a lighter weight frame used for inlined methods.
+    /// Push a lighter weight frame used for an inlined block (the inlined form of
+    /// [`Insn::InvokeBlockIseqDirect`]). `recv` is the block's self, loaded from
+    /// `captured->self`, and `captured` is the `struct rb_captured_block *` whose
+    /// `ep` becomes the new frame's parent EP. Popped by [`Insn::PopInlineFrame`].
+    PushInlineBlockFrame {
+        iseq: IseqPtr,
+        recv: InsnId,
+        captured: InsnId,
+        num_args: u16,
+        state: InsnId,
+    },
+
+    /// Pop a lighter weight frame used for inlined methods and blocks.
     PopInlineFrame {
         iseq: IseqPtr,
         argc: usize,
@@ -1647,6 +1660,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*state);
                 $visit_one!(*exit_state);
             }
+            Insn::PushInlineBlockFrame { recv, captured, state, .. } => {
+                $visit_one!(*recv);
+                $visit_one!(*captured);
+                $visit_one!(*state);
+            }
             // SendDirect/CCallWithFrame/CCallVariadic carry their operands behind a Box,
             // which stable Rust can't destructure in a pattern. visit_one takes a place, so
             // a box field works the same as the deref'd bindings used by other arms.
@@ -1763,7 +1781,7 @@ impl Insn {
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
             | Insn::ArrayAset { .. }
-            | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
+            | Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
     }
@@ -1956,7 +1974,7 @@ impl Insn {
             // new CFP. It may side-exit on stack overflow. It does not allocate,
             // invalidate PatchPoint invariants, or set the interrupt flag, so
             // optimizations tracking those heaps can flow across an inlined call.
-            Insn::PushInlineFrame { .. } => Effect::read_write(
+            Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } => Effect::read_write(
                 abstract_heaps::Memory,
                 abstract_heaps::Frame
                     .union(abstract_heaps::Other)
@@ -2319,6 +2337,11 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 if let Some(block) = block {
                     write!(f, ", block={}", self.block_handler(block))?;
                 }
+                Ok(())
+            }
+            Insn::PushInlineBlockFrame { recv, captured, iseq, num_args, .. } => {
+                write!(f, "PushInlineBlockFrame {recv}, {captured} ({:?})", self.ptr_map.map_ptr(*iseq))?;
+                write!(f, ", num_args={num_args}")?;
                 Ok(())
             }
             Insn::PopInlineFrame { .. } => {
@@ -3571,6 +3594,10 @@ impl Function {
         matches!(self.find_ref(insn_id), Insn::SendDirect(..))
     }
 
+    fn is_invoke_block_iseq_direct(&self, insn_id: InsnId) -> bool {
+        matches!(self.find_ref(insn_id), Insn::InvokeBlockIseqDirect { .. })
+    }
+
     fn new_block(&mut self, insn_idx: u32) -> BlockId {
         let id = BlockId::from(self.blocks.len());
         let block = Block {
@@ -3828,7 +3855,7 @@ impl Function {
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
-            | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
+            | Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
             Insn::Const { val: Const::CBool(val) } => Type::from_cbool(*val),
@@ -5942,7 +5969,7 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t) -> bool {
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -5988,7 +6015,7 @@ impl Function {
 
         // Check callee bytecode size against threshold.
         let callee_size = unsafe { get_iseq_encoded_size(callee_iseq) } as usize;
-        if callee_size > threshold {
+        if callee_size > threshold && !ignore_size_threshold {
             incr_counter!(inline_reject_too_large);
             return false;
         }
@@ -6034,13 +6061,28 @@ impl Function {
             let mut search_start = 0;
             loop {
                 let Some(offset) = self.blocks[block].insns[search_start..].iter()
-                    .position(|&id| self.is_send_direct(id))
+                    .position(|&id| self.is_send_direct(id) || self.is_invoke_block_iseq_direct(id))
                 else {
                     break;
                 };
                 let send_pos = search_start + offset;
 
                 let send_insn_id = self.blocks[block].insns[send_pos];
+
+                // A `yield` to a known block ISEQ: inline the block body.
+                if self.is_invoke_block_iseq_direct(send_insn_id) {
+                    match self.try_inline_block(block, send_pos) {
+                        Some(continuation) => {
+                            did_inline = true;
+                            worklist.push_back(continuation);
+                            break;
+                        }
+                        None => {
+                            search_start = send_pos + 1;
+                            continue;
+                        }
+                    }
+                }
                 let send = self.resolve(send_insn_id);
                 let Insn::SendDirect(data) = send.insn(self)
                 else {
@@ -6056,7 +6098,14 @@ impl Function {
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
-                if !self.should_inline(iseq, cme) || !Self::can_inline(iseq) {
+                // Builtin methods marked with `Primitive.attr! :inline_block`, e.g. Array#each,
+                // are designed to be inlined together with a literal block, which lets the
+                // inliner inline the block into the caller as well. Skip the size heuristic
+                // for them when the caller passes a literal block.
+                let blockiseq = match call_block { Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq), _ => None };
+                let inline_block = blockiseq.is_some()
+                    && unsafe { rb_jit_iseq_builtin_attrs(iseq) } & BUILTIN_ATTR_INLINE_BLOCK != 0;
+                if !self.should_inline(iseq, cme, inline_block) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -6286,6 +6335,112 @@ impl Function {
         }
 
         did_inline
+    }
+
+    /// Inline the block body of the [`Insn::InvokeBlockIseqDirect`] at `pos` in `block`.
+    /// Like the method inliner, this splits `block` at the call: the pre-call instructions
+    /// stay in `block`, which pushes a block frame and jumps to the inlined block body, and
+    /// the post-call instructions move to a fresh continuation block that receives the
+    /// block's return value and pops the block frame. Returns the continuation block if
+    /// the block was inlined.
+    fn try_inline_block(&mut self, block: BlockId, pos: usize) -> Option<BlockId> {
+        let insn_id = self.blocks[block].insns[pos];
+        let Insn::InvokeBlockIseqDirect { iseq, captured, args, state } = self.find(insn_id) else {
+            unreachable!("position {insn_id} is not an InvokeBlockIseqDirect");
+        };
+
+        if !self.should_inline(iseq, ptr::null(), false) || !Self::can_inline(iseq) {
+            return None;
+        }
+
+        // See inline_methods for how the rollback snapshot works.
+        let pre_insns_len = self.insns.len();
+        let pre_insn_types_len = self.insn_types.len();
+        let pre_blocks_len = self.blocks.len();
+
+        let call_state = self.frame_state(state);
+        let continuation = self.new_block(call_state.insn_idx() as u32 + insn_len(call_state.get_opcode() as usize));
+        let caller_depth = self.frame_depth(state);
+
+        // The block's perspective of the stack is with the arguments popped off.
+        // Unlike a method call, `yield` has no receiver on the stack.
+        let caller_stack_size = call_state.stack_size() - args.len();
+        let post_yield_caller = self.new_insn(Insn::Snapshot { state: Box::new(call_state.with_stack_size(caller_stack_size)) });
+        let mode = AddIseqMode::Inlined {
+            return_block: continuation,
+            caller: post_yield_caller,
+            depth: caller_depth + 1,
+            // can_direct_invoke_block_iseq only accepts blocks with lead parameters
+            jit_entry_idx: 0,
+            // `yield` in a block goes to the block of its local frame, not to a block
+            // passed to this frame.
+            block: None,
+        };
+        let add_result = match add_iseq_to_hir(self, iseq, mode) {
+            Ok(r) => r,
+            Err(_) => {
+                self.insns.truncate(pre_insns_len);
+                self.insn_types.truncate(pre_insn_types_len);
+                self.blocks.truncate(pre_blocks_len);
+                incr_counter!(inline_reject_compile_failure);
+                return None;
+            }
+        };
+        self.num_instructions += self.insns.len() - pre_insns_len;
+
+        // Past the point of no return: commit the inlining.
+        incr_counter!(inline_block_count);
+
+        let tail = self.blocks[block].insns.split_off(pos);
+        debug_assert!(self.is_invoke_block_iseq_direct(tail[0]));
+
+        let callee_entry_body_block = add_result.body_entry_block
+            .expect("inlined compilation always produces a body entry block");
+        let callee_body_params: Vec<InsnId> = self.blocks[callee_entry_body_block].params.clone();
+
+        // The block's self is the self captured when the block was created.
+        let offset: i32 = std::mem::offset_of!(rb_captured_block, self_).try_into().unwrap();
+        let block_self = self.load_field(block, captured, FieldName::captured_self, offset, types::BasicObject);
+
+        // Map the block body entry params [self, local0, local1, ...] to caller values.
+        // can_direct_invoke_block_iseq ensures the block only has lead parameters and
+        // that `yield` passes exactly that many arguments, so the leading locals take the
+        // arguments in order and the remaining locals are nil-initialized.
+        if let Some((&self_param, local_params)) = callee_body_params.split_first() {
+            self.make_equal_to(self_param, block_self);
+            for (i, &param_id) in local_params.iter().enumerate() {
+                if i < args.len() {
+                    self.make_equal_to(param_id, args[i]);
+                } else {
+                    let nil = self.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
+                    self.make_equal_to(param_id, nil);
+                }
+            }
+        }
+        self.blocks[callee_entry_body_block].params.clear();
+
+        // Set up the continuation block. See inline_methods.
+        let return_val_param = self.push_insn(continuation, Insn::Param);
+        self.push_insn(continuation, Insn::PopInlineFrame { iseq, argc: args.len(), state });
+        for &id in &tail[1..] {
+            self.push_insn_id(continuation, id);
+        }
+        self.make_equal_to(insn_id, return_val_param);
+
+        self.push_insn_id(block, post_yield_caller);
+        self.push_insn(block, Insn::PushInlineBlockFrame {
+            iseq, recv: block_self, captured, num_args: args.len().try_into().unwrap(), state,
+        });
+        self.count(block, Counter::inline_block_optimized_send_count);
+        self.push_insn(block, Insn::Jump(BranchEdge { target: callee_entry_body_block, args: vec![] }));
+
+        if let Some(caller_profiles) = self.profiles.as_mut() {
+            caller_profiles.append(&add_result.profiles);
+        } else {
+            self.profiles = Some(add_result.profiles);
+        }
+
+        Some(continuation)
     }
 
     fn load_shape(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -7632,7 +7787,7 @@ impl Function {
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
-                    Insn::PushInlineFrame { .. } => {
+                    Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } => {
                         pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false });
                     }
                     Insn::PopInlineFrame { .. } => {
@@ -8269,6 +8424,9 @@ impl Function {
                     self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
                 }
                 Ok(())
+            }
+            Insn::PushInlineBlockFrame { recv, .. } => {
+                self.assert_subtype(insn_id, recv, types::BasicObject)
             }
             // Instructions with recv and a Vec of Ruby objects
             | Insn::Send { recv, ref args, .. }
@@ -9736,9 +9894,11 @@ fn add_iseq_to_hir(
                         // Similar to gen_is_block_given
                         Insn::Const { val: Const::Value(Qnil) }
                     } else {
-                        if op_type == DEFINED_YIELD && matches!(mode, AddIseqMode::Inlined { .. }) {
+                        if op_type == DEFINED_YIELD && local_iseq == iseq && matches!(mode, AddIseqMode::Inlined { .. }) {
                             // If we are inlining a method that has a block (literal blockiseq or
                             // a &proc argument), we can fold Defined(DEFINED_YIELD).
+                            // This doesn't apply to inlined blocks (local_iseq != iseq), whose `yield` goes to the
+                            // block of the enclosing method frame instead of a block passed to the inlined frame.
                             let has_block = matches!(mode, AddIseqMode::Inlined { block: Some(_), .. });
                             if has_block {
                                 Insn::Const { val: Const::Value(pushval) }
@@ -10782,11 +10942,12 @@ fn add_iseq_to_hir(
 
                     let inlined_known_block = if let AddIseqMode::Inlined { block: Some(BlockHandler::BlockIseq(bi)), .. } = mode {
                         if can_direct_invoke_block(flags)
-                            // Only methods are inlined today, so exit_state.iseq is always a method iseq and this is
+                            // `blockiseq` is only set for inlined methods, so exit_state.iseq is a method iseq and this is
                             // always 0. That matters because the emit below is guard-free and bakes in both level 0
                             // and *this* frame's block (bi) — sound only when the yield resolves to this exact frame.
-                            // TODO: if block iseqs become inlinable, a yield here could resolve to an ancestor frame
-                            // (level > 0). To stay guard-free we'd bake in get_lvar_level(...) as the level and fetch
+                            // Inlined blocks don't set `blockiseq` since their yield resolves to an ancestor frame
+                            // (level > 0).
+                            // TODO: To stay guard-free there, we'd bake in get_lvar_level(...) as the level and fetch
                             // that ancestor's blockiseq from the inline caller chain instead of bi.
                             && get_lvar_level(exit_state.iseq) == 0 {
                             match can_direct_invoke_block_iseq(bi, args.len()) {

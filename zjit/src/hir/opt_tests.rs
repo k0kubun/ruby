@@ -2348,10 +2348,34 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, fun_new_map@0x1010, cme:0x1018)
           v25:ArraySubclass[class_exact:C] = GuardType v10, ArraySubclass[class_exact:C] recompile
-          v26:BasicObject = SendDirect v25, 0x1040, :fun_new_map (0x1060)
+          v144:NilClass = Const Value(nil)
+          v145:NilClass = Const Value(nil)
+          PushInlineFrame :fun_new_map, v25 (0x1040), num_args=0, block=0x1060
+          v63:Fixnum[0] = Const Value(0)
+          v67:BasicObject = InvokeBuiltin ary_sized_alloc, v25
+          PatchPoint NoEPEscape(map)
+          Jump bb10(v63, v145)
+        bb10(v84:Fixnum, v86:BasicObject):
+          v90:CInt64 = ArrayLength v25
+          v91:Fixnum = BoxFixnum v90
+          v92:BoolExact = FixnumGe v84, v91
+          PatchPoint NoEPEscape(map)
+          v96:CBool = Test v92
+          CondBranch v96, bb14(), bb9()
+        bb14():
+          PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v26
+          Return v67
+        bb9():
+          v116:CInt64 = UnboxFixnum v84
+          v117:BasicObject = ArrayAref v25, v116
+          PatchPoint NoEPEscape(map)
+          v131:BasicObject = InvokeBuiltin rb_jit_ary_push, v25, v67, v117
+          PatchPoint NoEPEscape(map)
+          v137:Fixnum[1] = Const Value(1)
+          v138:Fixnum = FixnumAdd v84, v137
+          Jump bb10(v138, v117)
         ");
     }
 
@@ -5020,15 +5044,9 @@ mod hir_opt_tests {
         bb3(v6:BasicObject):
           PatchPoint MethodRedefined(Object@0x1000, foo@0x1008, cme:0x1010)
           v18:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
-          PushInlineFrame :foo, v18 (0x1038), num_args=0, block=0x1058
-          v25:CPtr = GetEP 0
-          v26:CInt64 = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1078
-          v27:CInt64[-4] = Const CInt64(-4)
-          v28:CInt64 = IntAnd v26, v27
-          v29:BasicObject = InvokeBlockIseqDirect (0x1058), v28
-          PopInlineFrame
+          v42:Fixnum[42] = Const Value(42)
           CheckInterrupts
-          Return v29
+          Return v42
         ");
     }
 
@@ -5064,14 +5082,16 @@ mod hir_opt_tests {
           v34:CInt64 = LoadField v33, :VM_ENV_DATA_INDEX_SPECVAL@0x1078
           v35:CInt64[-4] = Const CInt64(-4)
           v36:CInt64 = IntAnd v34, v35
-          v37:BasicObject = InvokeBlockIseqDirect (0x1058), v36, v29, v31
-          PatchPoint NoEPEscape(foo)
+          v69:BasicObject = LoadField v36, :captured_self@0x1079
+          PushInlineBlockFrame v69, v36 (0x1058), num_args=2
           PatchPoint MethodRedefined(Integer@0x1080, +@0x1088, cme:0x1090)
-          v53:Fixnum = GuardType v37, Fixnum recompile
-          v54:Fixnum = FixnumAdd v11, v53
+          v78:Fixnum[3] = Const Value(3)
+          PopInlineFrame
+          PatchPoint NoEPEscape(foo)
+          v79:Fixnum[13] = Const Value(13)
           PopInlineFrame
           CheckInterrupts
-          Return v54
+          Return v79
         ");
     }
 
@@ -5283,15 +5303,25 @@ mod hir_opt_tests {
           v24:CBool = IsBitEqual v22, v23
           CondBranch v24, bb7(), bb8()
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1008), v21, v10
-          Jump bb4(v26)
+          v62:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v62, v21 (0x1008), num_args=1
+          v55:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1018, *@0x1020, cme:0x1028)
+          v94:Fixnum[20] = Const Value(20)
+          PopInlineFrame
+          Jump bb4(v94)
         bb8():
-          v28:Iseq[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v28:Iseq[VALUE(0x1050)] = Const Value(VALUE(0x1050))
           v29:CBool = IsBitEqual v22, v28
           CondBranch v29, bb9(), bb10()
         bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1010), v21, v10
-          Jump bb4(v31)
+          v81:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v81, v21 (0x1050), num_args=1
+          v74:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1018, +@0x1058, cme:0x1060)
+          v95:Fixnum[11] = Const Value(11)
+          PopInlineFrame
+          Jump bb4(v95)
         bb10():
           Jump bb6()
         bb6():
@@ -5357,15 +5387,25 @@ mod hir_opt_tests {
           v24:CBool = IsBitEqual v22, v23
           CondBranch v24, bb7(), bb8()
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1008), v21, v10
-          Jump bb4(v26)
+          v62:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v62, v21 (0x1008), num_args=1
+          v55:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1018, +@0x1020, cme:0x1028)
+          v94:Fixnum[11] = Const Value(11)
+          PopInlineFrame
+          Jump bb4(v94)
         bb8():
-          v28:Iseq[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v28:Iseq[VALUE(0x1050)] = Const Value(VALUE(0x1050))
           v29:CBool = IsBitEqual v22, v28
           CondBranch v29, bb9(), bb10()
         bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1010), v21, v10
-          Jump bb4(v31)
+          v81:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v81, v21 (0x1050), num_args=1
+          v74:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1018, *@0x1058, cme:0x1060)
+          v95:Fixnum[20] = Const Value(20)
+          PopInlineFrame
+          Jump bb4(v95)
         bb10():
           Jump bb6()
         bb6():
@@ -5430,15 +5470,25 @@ mod hir_opt_tests {
           v24:CBool = IsBitEqual v22, v23
           CondBranch v24, bb7(), bb8()
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1008), v21, v10
-          Jump bb4(v26)
+          v62:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v62, v21 (0x1008), num_args=1
+          v55:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1018, +@0x1020, cme:0x1028)
+          v94:Fixnum[11] = Const Value(11)
+          PopInlineFrame
+          Jump bb4(v94)
         bb8():
-          v28:Iseq[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v28:Iseq[VALUE(0x1050)] = Const Value(VALUE(0x1050))
           v29:CBool = IsBitEqual v22, v28
           CondBranch v29, bb9(), bb10()
         bb9():
-          v31:BasicObject = InvokeBlockIseqDirect (0x1010), v21, v10
-          Jump bb4(v31)
+          v81:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v81, v21 (0x1050), num_args=1
+          v74:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1018, *@0x1058, cme:0x1060)
+          v95:Fixnum[20] = Const Value(20)
+          PopInlineFrame
+          Jump bb4(v95)
         bb10():
           Jump bb6()
         bb6():
@@ -5497,8 +5547,13 @@ mod hir_opt_tests {
           v24:CBool = IsBitEqual v22, v23
           CondBranch v24, bb7(), bb8()
         bb7():
-          v26:BasicObject = InvokeBlockIseqDirect (0x1008), v21, v10
-          Jump bb4(v26)
+          v57:BasicObject = LoadField v21, :captured_self@0x1010
+          PushInlineBlockFrame v57, v21 (0x1008), num_args=1
+          v50:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1018, +@0x1020, cme:0x1028)
+          v66:Fixnum[11] = Const Value(11)
+          PopInlineFrame
+          Jump bb4(v66)
         bb8():
           Jump bb6()
         bb6():
@@ -5815,11 +5870,16 @@ mod hir_opt_tests {
           v39:CInt64 = LoadField v38, :VM_ENV_DATA_INDEX_SPECVAL@0x10b0
           v40:CInt64[-4] = Const CInt64(-4)
           v41:CInt64 = IntAnd v39, v40
-          v42:BasicObject = InvokeBlockIseqDirect (0x1058), v41, v57
+          v72:BasicObject = LoadField v41, :captured_self@0x10b1
+          PushInlineBlockFrame v72, v41 (0x1058), num_args=1
+          v65:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x10b8, +@0x10c0, cme:0x10c8)
+          v80:Fixnum = FixnumAdd v57, v65
+          PopInlineFrame
           PatchPoint NoEPEscape(foo)
           PopInlineFrame
           CheckInterrupts
-          Return v42
+          Return v80
         ");
     }
 
@@ -12656,9 +12716,44 @@ mod hir_opt_tests {
           v11:ArrayExact = ArrayDup v10
           PatchPoint NoSingletonClass(Array@0x1008)
           PatchPoint MethodRedefined(Array@0x1008, map@0x1010, cme:0x1018)
-          v22:BasicObject = SendDirect v11, 0x1040, :map (0x1060)
+          v140:NilClass = Const Value(nil)
+          v141:NilClass = Const Value(nil)
+          PushInlineFrame :map, v11 (0x1040), num_args=0, block=0x1060
+          v59:Fixnum[0] = Const Value(0)
+          v63:BasicObject = InvokeBuiltin ary_sized_alloc, v11
+          PatchPoint NoEPEscape(map)
+          Jump bb10(v59, v141)
+        bb10(v80:Fixnum, v82:NilClass|Fixnum):
+          v86:CInt64 = ArrayLength v11
+          v87:Fixnum = BoxFixnum v86
+          v88:BoolExact = FixnumGe v80, v87
+          PatchPoint NoEPEscape(map)
+          v92:CBool = Test v88
+          CondBranch v92, bb14(), bb9()
+        bb14():
+          PopInlineFrame
           CheckInterrupts
-          Return v22
+          Return v63
+        bb9():
+          v112:CInt64 = UnboxFixnum v80
+          v113:BasicObject = ArrayAref v11, v112
+          PatchPoint NoEPEscape(map)
+          v117:CPtr = GetEP 0
+          v118:CInt64 = LoadField v117, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
+          v119:CInt64[-4] = Const CInt64(-4)
+          v120:CInt64 = IntAnd v118, v119
+          v162:BasicObject = LoadField v120, :captured_self@0x1081
+          PushInlineBlockFrame v162, v120 (0x1060), num_args=1
+          v155:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1088, *@0x1090, cme:0x1098)
+          v169:Fixnum = GuardType v113, Fixnum recompile
+          v170:Fixnum = FixnumMult v169, v155
+          PopInlineFrame
+          v127:BasicObject = InvokeBuiltin rb_jit_ary_push, v11, v63, v170
+          PatchPoint NoEPEscape(map)
+          v133:Fixnum[1] = Const Value(1)
+          v134:Fixnum = FixnumAdd v80, v133
+          Jump bb10(v134, v170)
         ");
     }
 
@@ -12950,10 +13045,14 @@ mod hir_opt_tests {
           v28:CInt64 = LoadField v27, :VM_ENV_DATA_INDEX_SPECVAL@0x1078
           v29:CInt64[-4] = Const CInt64(-4)
           v30:CInt64 = IntAnd v28, v29
-          v31:BasicObject = InvokeBlockIseqDirect (0x1058), v30, v25
+          v53:BasicObject = LoadField v30, :captured_self@0x1079
+          PushInlineBlockFrame v53, v30 (0x1058), num_args=1
+          v46:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1080, *@0x1088, cme:0x1090)
+          PopInlineFrame
           PopInlineFrame
           CheckInterrupts
-          Return v31
+          Return v46
         ");
     }
 
@@ -18170,12 +18269,17 @@ mod hir_opt_tests {
           v54:CInt64 = LoadField v53, :VM_ENV_DATA_INDEX_SPECVAL@0x10b8
           v55:CInt64[-4] = Const CInt64(-4)
           v56:CInt64 = IntAnd v54, v55
-          v57:BasicObject = InvokeBlockIseqDirect (0x1060), v56, v72
+          v87:BasicObject = LoadField v56, :captured_self@0x10b9
+          PushInlineBlockFrame v87, v56 (0x1060), num_args=1
+          v80:Fixnum[4] = Const Value(4)
+          PatchPoint MethodRedefined(Integer@0x10c0, +@0x10c8, cme:0x10d0)
+          v95:Fixnum = FixnumAdd v72, v80
+          PopInlineFrame
           PatchPoint NoEPEscape(foo)
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v57
+          Return v95
         ");
     }
 
@@ -23813,7 +23917,7 @@ mod hir_opt_tests {
           v5:BasicObject = LoadArg :self@0
           Jump bb3(v5)
         bb3(v8:BasicObject):
-          v107:NilClass = Const Value(nil)
+          v121:NilClass = Const Value(nil)
           v13:NilClass = Const Value(nil)
           v15:TrueClass|NilClass = Defined yield, v13
           v17:CBool = Test v15
@@ -23846,8 +23950,6 @@ mod hir_opt_tests {
           v91:CInt64 = IntAnd v86, v90
           v92:Iseq = LoadField v91, :code_iseq@0x1001
           v93:Iseq[VALUE(0x1008)] = GuardBitEquals v92, Value(VALUE(0x1008)) recompile
-          v94:BasicObject = InvokeBlockIseqDirect (0x1008), v91, v81
-          PatchPoint NoEPEscape(each)
           v100:Fixnum[1] = Const Value(1)
           v101:Fixnum = FixnumAdd v51, v100
           Jump bb8(v101)
@@ -24098,12 +24200,6 @@ mod hir_opt_tests {
         bb9():
           v94:CInt64 = UnboxFixnum v66
           v95:BasicObject = ArrayAref v11, v94
-          PatchPoint NoEPEscape(each)
-          v99:CPtr = GetEP 0
-          v100:CInt64 = LoadField v99, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v101:CInt64[-4] = Const CInt64(-4)
-          v102:CInt64 = IntAnd v100, v101
-          v103:BasicObject = InvokeBlockIseqDirect (0x1060), v102, v95
           PatchPoint NoEPEscape(each)
           v109:Fixnum[1] = Const Value(1)
           v110:Fixnum = FixnumAdd v66, v109
@@ -26977,12 +27073,18 @@ mod hir_opt_tests {
           v35:CInt64 = LoadField v34, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
           v36:CInt64[-4] = Const CInt64(-4)
           v37:CInt64 = IntAnd v35, v36
-          v38:BasicObject = InvokeBlockIseqDirect (0x1060), v37, v10
+          v62:BasicObject = LoadField v37, :captured_self@0x1081
+          PushInlineBlockFrame v62, v37 (0x1060), num_args=1
+          v55:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1088, +@0x1090, cme:0x1098)
+          v69:Fixnum = GuardType v10, Fixnum recompile
+          v70:Fixnum = FixnumAdd v69, v55
+          PopInlineFrame
           PatchPoint NoEPEscape(with_yield)
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v38
+          Return v70
         ");
     }
 
@@ -27747,41 +27849,29 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v18 (0x1040), num_args=0, block=0x1060
-          v54:CPtr = GetEP 0
-          v55:CInt64 = LoadField v54, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v56:CInt64[-4] = Const CInt64(-4)
-          v57:CInt64 = IntAnd v55, v56
-          v58:BasicObject = InvokeBlockIseqDirect (0x1060), v57
+          v105:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v58)
+          Jump bb4(v105)
         bb6():
           CondBranchHasType v10, ObjectSubclass[class_exact:A], bb7(), bb8()
         bb7():
           v23:ObjectSubclass[class_exact:A] = RefineType v10, ObjectSubclass[class_exact:A]
-          PatchPoint NoSingletonClass(A@0x1088)
-          PatchPoint MethodRedefined(A@0x1088, foo@0x1010, cme:0x1018)
+          PatchPoint NoSingletonClass(A@0x1080)
+          PatchPoint MethodRedefined(A@0x1080, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v23 (0x1040), num_args=0, block=0x1060
-          v71:CPtr = GetEP 0
-          v72:CInt64 = LoadField v71, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v73:CInt64[-4] = Const CInt64(-4)
-          v74:CInt64 = IntAnd v72, v73
-          v75:BasicObject = InvokeBlockIseqDirect (0x1060), v74
+          v119:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v75)
+          Jump bb4(v119)
         bb8():
           CondBranchHasType v10, ObjectSubclass[class_exact:B], bb9(), bb10()
         bb9():
           v28:ObjectSubclass[class_exact:B] = RefineType v10, ObjectSubclass[class_exact:B]
-          PatchPoint NoSingletonClass(B@0x1090)
-          PatchPoint MethodRedefined(B@0x1090, foo@0x1010, cme:0x1018)
+          PatchPoint NoSingletonClass(B@0x1088)
+          PatchPoint MethodRedefined(B@0x1088, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v28 (0x1040), num_args=0, block=0x1060
-          v88:CPtr = GetEP 0
-          v89:CInt64 = LoadField v88, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v90:CInt64[-4] = Const CInt64(-4)
-          v91:CInt64 = IntAnd v89, v90
-          v92:BasicObject = InvokeBlockIseqDirect (0x1060), v91
+          v133:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v92)
+          Jump bb4(v133)
         bb10():
           v31:BasicObject = Send v10, 0x1060, :foo # SendFallbackReason: Send: polymorphic fallback
           Jump bb4(v31)
