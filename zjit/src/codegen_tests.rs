@@ -1474,6 +1474,57 @@ fn test_inline_throwing_block_over_inline_budget() {
 }
 
 #[test]
+fn test_send_constant_name() {
+    assert_snapshot!(assert_compiles("
+        def target(a, b = 2) = [a, b]
+        def test(x) = [send(:target, x), __send__(:target, x, 3), send(:target, x) { }]
+        test(1)
+        test(1)
+    "), @"[[1, 2], [1, 3], [1, 2]]");
+}
+
+#[test]
+fn test_send_profiled_names() {
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        class C
+          def a(x) = [:a, x]
+          def b(x) = [:b, x]
+          private def c(x) = [:c, x]
+          def method_missing(name, *args) = [:missing, name, args]
+          def respond_to_missing?(*) = true
+          def test(name, x) = send(name, x)
+        end
+        obj = C.new
+        obj.test(:a, 1)
+        obj.test(:b, 2)
+        obj.test(:c, 3)
+        [obj.test(:a, 1), obj.test(:b, 2), obj.test(:c, 3), obj.test(:d, 4), obj.test("a", 5)]
+    "#), @"[[:a, 1], [:b, 2], [:c, 3], [:missing, :d, [4]], [:a, 5]]");
+}
+
+#[test]
+fn test_send_profiled_name_redefined() {
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        class C
+          def a = :a
+          def test(name) = send(name)
+        end
+        obj = C.new
+        obj.test(:a)
+        obj.test(:a)
+        r = [obj.test(:a)]
+        class C
+          def a = :redefined
+        end
+        r << obj.test(:a)
+        class C
+          def send(*) = :send_redefined
+        end
+        r << obj.test(:a)
+    "#), @"[:a, :redefined, :send_redefined]");
+}
+
+#[test]
 fn test_inline_block_break_and_return_in_same_block() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("
