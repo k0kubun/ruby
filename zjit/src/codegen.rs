@@ -17,7 +17,7 @@ use crate::invariants::{
     track_root_box_assumption, track_no_newobj_hook_assumption
 };
 use crate::gc::append_gc_offsets;
-use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
+use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload, get_or_create_iseq_payload_ptr};
 use crate::profile::reset_profiles_remaining;
 use crate::perf;
 use crate::state::{rb_zjit_compiling_p, ZJITState};
@@ -3515,8 +3515,22 @@ fn gen_incr_send_fallback_counter(asm: &mut Assembler, reason: SendFallbackReaso
 /// Check if an ISEQ contains instructions that may write to block_code
 /// (send, sendforward, invokesuper, invokesuperforward, invokeblock).
 /// These instructions call vm_caller_setup_arg_block which writes to cfp->block_code.
-#[allow(non_upper_case_globals)]
+/// The result is cached in the ISEQ payload since this is queried for every call that
+/// writes a JIT frame, and scanning a huge ISEQ each time is quadratic in compile time.
 pub(crate) fn iseq_may_write_block_code(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload_ptr(iseq);
+    // Access the field through the raw pointer to avoid creating a second `&mut IseqPayload`
+    // while a caller may hold one.
+    if let Some(cached) = unsafe { (*payload).may_write_block_code } {
+        return cached;
+    }
+    let result = iseq_may_write_block_code_uncached(iseq);
+    unsafe { (*payload).may_write_block_code = Some(result); }
+    result
+}
+
+#[allow(non_upper_case_globals)]
+fn iseq_may_write_block_code_uncached(iseq: IseqPtr) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
     let mut insn_idx: u32 = 0;
 
