@@ -1062,7 +1062,9 @@ pub enum Insn {
     /// adjusted to index 2, so any negative `index` is definitely considered out-of-bounds).
     /// `index` but may be out-of-bounds, in which case it returns `nil`.
     ArrayArefChecked { array: InsnId, index: InsnId, length: InsnId  },
-    ArrayAset { array: InsnId, index: InsnId, val: InsnId },
+    /// Store `val` at `index` like `rb_ary_store`: in place if `0 <= index < length`, otherwise
+    /// call `rb_ary_store`, which handles negative indexes and growing the array.
+    ArrayAsetChecked { array: InsnId, index: InsnId, length: InsnId, val: InsnId, state: InsnId },
     ArrayPop { array: InsnId, state: InsnId },
     /// Return the length of the array as a C `long` ([`types::CInt64`])
     ArrayLength { array: InsnId },
@@ -1606,10 +1608,12 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*index);
                 $visit_one!(*length);
             }
-            Insn::ArrayAset { array, index, val } => {
+            Insn::ArrayAsetChecked { array, index, length, val, state } => {
                 $visit_one!(*array);
                 $visit_one!(*index);
+                $visit_one!(*length);
                 $visit_one!(*val);
+                $visit_one!(*state);
             }
             Insn::ArrayPop { array, state } => {
                 $visit_one!(*array);
@@ -1769,7 +1773,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. }
+            | Insn::ArrayAsetChecked { .. }
             | Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
@@ -1865,7 +1869,7 @@ impl Insn {
             Insn::ArrayPush { .. } => effects::Any,
             Insn::ArrayAref { ..  } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::ArrayArefChecked { ..  } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
-            Insn::ArrayAset { .. } => effects::Any,
+            Insn::ArrayAsetChecked { .. } => effects::Any,
             Insn::ArrayPop { ..  } => effects::Any,
             Insn::ArrayLength { .. } => Effect::write(abstract_heaps::Empty),
             Insn::AdjustBounds { .. } => effects::Empty,
@@ -2167,8 +2171,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::ArrayArefChecked { array, index, length } => {
                 write!(f, "ArrayArefChecked {array}, {index}, {length}")
             }
-            Insn::ArrayAset { array, index, val, ..} => {
-                write!(f, "ArrayAset {array}, {index}, {val}")
+            Insn::ArrayAsetChecked { array, index, length, val, ..} => {
+                write!(f, "ArrayAsetChecked {array}, {index}, {length}, {val}")
             }
             Insn::ArrayPop { array, .. } => {
                 write!(f, "ArrayPop {array}")
@@ -3909,7 +3913,7 @@ impl Function {
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetLocal { .. }
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
-            | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
+            | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAsetChecked { .. }
             | Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -7179,11 +7183,13 @@ impl Function {
                         }
                         insn_id
                     }
-                    &Insn::ArrayAset { .. } => {
-                        // TODO: Model this better using separate effects. Aset doesn't change the
-                        // array's flags, but the current effects system lumps flags in with other
-                        // memory writes, so we manually exclude the flags from invalidation for
-                        // now.
+                    &Insn::ArrayAsetChecked { .. } => {
+                        // TODO: Model this better using separate effects. The in-bounds store
+                        // doesn't change the array's flags. The rb_ary_store() fallback may change
+                        // its embed and length bits, but not RUBY_FL_FREEZE or RUBY_ELTS_SHARED,
+                        // which are the only bits read from an Array's flags. The current effects
+                        // system lumps flags in with other memory writes, so we manually exclude
+                        // the flags from invalidation for now.
                         let offset = RUBY_OFFSET_RBASIC_FLAGS;
                         compile_time_heap.retain(|(_, off), _| *off == offset);
                         insn_id
@@ -8680,9 +8686,11 @@ impl Function {
                 self.assert_subtype(insn_id, index, types::CInt64)?;
                 self.assert_subtype(insn_id, length, types::CInt64)
             }
-            Insn::ArrayAset { array, index, .. } => {
+            Insn::ArrayAsetChecked { array, index, length, val, .. } => {
                 self.assert_subtype(insn_id, array, types::ArrayExact)?;
-                self.assert_subtype(insn_id, index, types::CInt64)
+                self.assert_subtype(insn_id, index, types::CInt64)?;
+                self.assert_subtype(insn_id, length, types::CInt64)?;
+                self.assert_subtype(insn_id, val, types::BasicObject)
             }
             Insn::AdjustBounds { index, length } => {
                 self.assert_subtype(insn_id, index, types::CInt64)?;
