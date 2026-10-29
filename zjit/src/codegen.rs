@@ -665,8 +665,8 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::AdjustBounds { index, length } => gen_adjust_bounds(asm, opnd!(index), opnd!(length)),
         Insn::ArrayAref { array, index, .. } => gen_array_aref(asm, opnd!(array), opnd!(index)),
         Insn::ArrayArefChecked { array, index, length } => gen_array_aref_checked(jit, asm, opnd!(array), opnd!(index), opnd!(length)),
-        Insn::ArrayAset { array, index, val } => {
-            no_output!(gen_array_aset(asm, opnd!(array), opnd!(index), opnd!(val)))
+        Insn::ArrayAsetChecked { array, index, length, val, state } => {
+            no_output!(gen_array_aset_checked(jit, asm, function, opnd!(array), opnd!(index), opnd!(length), opnd!(val), &function.frame_state(*state)))
         }
         Insn::ArrayPop { array, state } => gen_array_pop(asm, opnd!(array), &function.frame_state(*state)),
         Insn::ArrayLength { array } => gen_array_length(asm, opnd!(array)),
@@ -2512,6 +2512,53 @@ fn gen_array_aset(
     let elem_offset = asm.lshift(unboxed_idx, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
     let elem_ptr = asm.add(array_ptr, elem_offset);
     asm.store(Opnd::mem(VALUE_BITS, elem_ptr, 0), val);
+}
+
+/// Compile `array[index] = val` like rb_ary_store(). Store in place if index is in bounds,
+/// otherwise call rb_ary_store() to handle negative indexes and growing the array.
+fn gen_array_aset_checked(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    function: &Function,
+    array: Opnd,
+    index: Opnd,
+    length: Opnd,
+    val: Opnd,
+    state: &FrameState,
+) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let in_bounds_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let in_bounds_edge = Target::Block(Box::new(lir::BranchEdge { target: in_bounds_block, args: vec![] }));
+    let slow_edge = Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+
+    let unboxed_idx = asm.load_mem(index);
+    let length = asm.load_mem(length);
+    // An unsigned comparison also sends negative indices to the slow path.
+    asm.cmp(unboxed_idx, length);
+    asm.jb(in_bounds_edge);
+    asm.jmp(slow_edge);
+
+    asm.set_current_block(in_bounds_block);
+    let label = jit.get_label(asm, in_bounds_block, hir_block_id);
+    asm.write_label(label);
+    gen_array_aset(asm, array, unboxed_idx, val);
+    asm.jmp(result_edge());
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    // rb_ary_store() may allocate or raise IndexError for a negative index out of range.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    asm_ccall!(asm, rb_ary_store, array, unboxed_idx, val);
+    asm.jmp(result_edge());
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
 }
 
 fn gen_array_pop(asm: &mut Assembler, array: Opnd, state: &FrameState) -> lir::Opnd {
