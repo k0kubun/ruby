@@ -6928,6 +6928,120 @@ fn test_expandarray_no_splat() {
 }
 
 #[test]
+fn test_expandarray_static_nil() {
+    eval("
+        def test
+          a, b = nil
+          [a, b]
+        end
+        test
+    ");
+    assert_contains_opcode("test", YARVINSN_expandarray);
+    assert_snapshot!(assert_compiles("test"), @"[nil, nil]");
+}
+
+#[test]
+fn test_expandarray_profiled_nil() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test(nil)
+    ");
+    assert_snapshot!(assert_compiles("test(nil)"), @"[nil, nil]");
+}
+
+#[test]
+fn test_expandarray_non_array_without_to_ary() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test(1)
+    ");
+    assert_snapshot!(assert_compiles("[test(1), test(:x), test([5, 6])]"), @"[[1, nil], [:x, nil], [5, 6]]");
+}
+
+#[test]
+fn test_expandarray_to_ary() {
+    eval("
+        class ToAry
+          def to_ary = [7, 8, 9]
+        end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test(ToAry.new)
+    ");
+    assert_snapshot!(assert_compiles("test(ToAry.new)"), @"[7, 8]");
+}
+
+#[test]
+fn test_expandarray_array_subclass() {
+    eval("
+        class SubArray < Array; end
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test(SubArray[1, 2])
+    ");
+    assert_snapshot!(assert_compiles("test(SubArray[1, 2])"), @"[1, 2]");
+}
+
+#[test]
+fn test_expandarray_profiled_array_then_nil() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test([1, 2])
+        test([1, 2])
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(nil), test([3]), test(nil)]"), @"[[nil, nil], [3, nil], [nil, nil]]");
+}
+
+#[test]
+fn test_expandarray_profiled_nil_then_array() {
+    eval("
+        def test(o)
+          a, b = o
+          [a, b]
+        end
+        test(nil)
+        test(nil)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test([1, 2]), test(nil), test(3)]"), @"[[1, 2], [nil, nil], [3, nil]]");
+}
+
+#[test]
+fn test_expandarray_nil_to_ary_defined_later() {
+    eval("
+        def test
+          a, b = nil
+          [a, b]
+        end
+        test
+        test
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        r = [test]
+        class NilClass
+          def to_ary = [:a, :b]
+        end
+        r << test
+        class NilClass
+          remove_method :to_ary
+        end
+        r
+    "), @"[[nil, nil], [:a, :b]]");
+}
+
+#[test]
 fn test_expandarray_splat() {
     eval("
         def test(o)
