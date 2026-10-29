@@ -20908,12 +20908,20 @@ mod hir_opt_tests {
           v29:CPtr = GetEP 0
           v30:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
           v31:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v30, Value(VALUE(0x1048))
-          v32:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v33:FalseClass = GuardBitEquals v32, Value(false)
-          v34:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
+          v32:CInt64 = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v33:CInt64[0] = Const CInt64(0)
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb4(), bb5()
+        bb4():
+          v36:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
+          Jump bb6(v36)
+        bb5():
+          v38:BasicObject = SendDirect v11, frame_block:v32, :run (0x1058), v12, v13
+          Jump bb6(v38)
+        bb6(v40:BasicObject):
           PatchPoint NoEPEscape(run)
           CheckInterrupts
-          Return v34
+          Return v40
         ");
     }
 
@@ -22554,14 +22562,163 @@ mod hir_opt_tests {
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
           v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v21:CInt64 = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v22:CInt64[0] = Const CInt64(0)
+          v23:CBool = IsBitEqual v21, v22
+          CondBranch v23, bb4(), bb5()
+        bb4():
+          PushInlineFrame :foo, v6 (0x1050), num_args=0
+          v35:StringExact[VALUE(0x1070)] = Const Value(VALUE(0x1070))
+          v36:StringExact = StringCopy v35
+          PopInlineFrame
+          Jump bb6(v36)
+        bb5():
+          v27:BasicObject = SendDirect v6, frame_block:v21, :foo (0x1050)
+          Jump bb6(v27)
+        bb6(v29:BasicObject):
+          CheckInterrupts
+          Return v29
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_passes_frame_block() {
+        eval("
+            class A
+              def foo(x) = block_given? ? yield(x) : x
+            end
+            class B < A
+              def foo(x, &block) = super
+            end
+            B.new.foo(1) { _1 }; B.new.foo(1) { _1 }
+        ");
+        assert_snapshot!(hir_string_proc("B.new.method(:foo)"), @"
+        fn foo@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:HeapBasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :block@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:HeapBasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :block@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:HeapBasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v28:CPtr = GetEP 0
+          v29:RubyValue = LoadField v28, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v30:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v29, Value(VALUE(0x1048))
+          v31:CInt64 = LoadField v28, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v32:CInt64[0] = Const CInt64(0)
+          v33:CBool = IsBitEqual v31, v32
+          CondBranch v33, bb4(), bb5()
+        bb4():
+          PushInlineFrame :foo, v11 (0x1058), num_args=1
+          PatchPoint NoSingletonClass(B@0x1078)
+          PatchPoint MethodRedefined(B@0x1078, block_given?@0x1080, cme:0x1088)
+          v107:ObjectSubclass[class_exact:B] = GuardType v11, ObjectSubclass[class_exact:B] recompile
+          v108:CPtr = GetEP 0
+          v109:RubyValue = LoadField v108, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v110:BoolExact = IsBlockGiven v109
+          PatchPoint NoEPEscape(foo)
+          v51:CBool = Test v110
+          CondBranch v51, bb10(), bb9()
+        bb10():
+          v57:CPtr = GetEP 0
+          v58:CInt64 = LoadField v57, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v59:CInt64[3] = Const CInt64(3)
+          v60:CInt64 = IntAnd v58, v59
+          v62:CInt64[1] = Const CInt64(1)
+          v63:CBool = IsBitEqual v60, v62
+          CondBranch v63, bb12(), bb13()
+        bb12():
+          v65:CInt64[-4] = Const CInt64(-4)
+          v66:CInt64 = IntAnd v58, v65
+          v67:Iseq = LoadField v66, :code_iseq@0x10b0
+          v68:Iseq[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
+          v69:CBool = IsBitEqual v67, v68
+          CondBranch v69, bb14(), bb15()
+        bb14():
+          v120:BasicObject = LoadField v66, :captured_self@0x10c0
+          PushInlineBlockFrame v120, v66 (0x10b8), num_args=1
+          PopInlineFrame
+          Jump bb11(v12)
+        bb15():
+          v73:Iseq[VALUE(0x10c8)] = Const Value(VALUE(0x10c8))
+          v74:CBool = IsBitEqual v67, v73
+          CondBranch v74, bb16(), bb17()
+        bb16():
+          v134:BasicObject = LoadField v66, :captured_self@0x10c0
+          PushInlineBlockFrame v134, v66 (0x10c8), num_args=1
+          PopInlineFrame
+          Jump bb11(v12)
+        bb17():
+          Jump bb13()
+        bb13():
+          v79:CInt64[3] = Const CInt64(3)
+          v80:CBool = IsBitEqual v60, v79
+          CondBranch v80, bb19(), bb20()
+        bb19():
+          v83:BasicObject = InvokeBlockIfunc v58, v12
+          Jump bb18(v83)
+        bb20():
+          v85:BasicObject = InvokeBlock v12 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
+          Jump bb18(v85)
+        bb18(v81:BasicObject):
+          Jump bb11(v81)
+        bb11(v61:BasicObject):
+          PatchPoint NoEPEscape(foo)
+          Jump bb7(v61)
+        bb9():
+          Jump bb7(v12)
+        bb7(v100:BasicObject):
+          PopInlineFrame
+          Jump bb6(v100)
+        bb5():
+          v37:BasicObject = SendDirect v11, frame_block:v31, :foo (0x1058), v12
+          Jump bb6(v37)
+        bb6(v39:BasicObject):
+          PatchPoint NoEPEscape(foo)
+          CheckInterrupts
+          Return v39
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_to_method_rejecting_block_guards_no_block() {
+        eval("
+            class A
+              def foo(&nil) = 1
+            end
+            class B < A
+              def foo = super
+            end
+            B.new.foo; B.new.foo
+        ");
+        assert_snapshot!(hir_string_proc("B.new.method(:foo)"), @"
+        fn foo@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:HeapBasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:HeapBasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:HeapBasicObject):
+          PatchPoint MethodRedefined(A@0x1000, foo@0x1008, cme:0x1010)
+          v18:CPtr = GetEP 0
+          v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
+          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false)
-          PushInlineFrame :foo, v6 (0x1050), num_args=0
-          v29:StringExact[VALUE(0x1070)] = Const Value(VALUE(0x1070))
-          v30:StringExact = StringCopy v29
-          PopInlineFrame
+          v23:Fixnum[1] = Const Value(1)
           CheckInterrupts
-          Return v30
+          Return v23
         ");
     }
 
@@ -22628,20 +22785,29 @@ mod hir_opt_tests {
           v30:CPtr = GetEP 0
           v31:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
           v32:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v31, Value(VALUE(0x1048))
-          v33:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v34:FalseClass = GuardBitEquals v33, Value(false)
+          v33:CInt64 = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v34:CInt64[0] = Const CInt64(0)
+          v35:CBool = IsBitEqual v33, v34
+          CondBranch v35, bb4(), bb5()
+        bb4():
           PushInlineFrame :foo, v9 (0x1058), num_args=1
-          v47:Fixnum[2] = Const Value(2)
+          v53:Fixnum[2] = Const Value(2)
           PatchPoint MethodRedefined(Integer@0x1078, *@0x1080, cme:0x1088)
-          v60:Fixnum = GuardType v10, Fixnum recompile
-          v61:Fixnum = FixnumMult v60, v47
+          v66:Fixnum = GuardType v10, Fixnum recompile
+          v67:Fixnum = FixnumMult v66, v53
           PopInlineFrame
+          Jump bb6(v67)
+        bb5():
+          v39:BasicObject = SendDirect v9, frame_block:v33, :foo (0x1058), v10
+          Jump bb6(v39)
+        bb6(v41:BasicObject):
           PatchPoint NoEPEscape(foo)
           v20:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1078, +@0x10b0, cme:0x10b8)
-          v39:Fixnum = FixnumAdd v61, v20
+          v44:Fixnum = GuardType v41, Fixnum recompile
+          v45:Fixnum = FixnumAdd v44, v20
           CheckInterrupts
-          Return v39
+          Return v45
         ");
     }
 
@@ -26418,21 +26584,30 @@ mod hir_opt_tests {
           v48:CPtr = GetEP 0
           v49:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_ME_CREF@0x1090
           v50:CallableMethodEntry[VALUE(0x1018)] = GuardBitEquals v49, Value(VALUE(0x1018))
-          v51:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1091
-          v52:FalseClass = GuardBitEquals v51, Value(false)
+          v51:CInt64 = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1091
+          v52:CInt64[0] = Const CInt64(0)
+          v53:CBool = IsBitEqual v51, v52
+          CondBranch v53, bb6(), bb7()
+        bb6():
           PushInlineFrame :greet, v25 (0x1098), num_args=0
-          v64:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
-          v65:StringExact = StringCopy v64
+          v70:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
+          v71:StringExact = StringCopy v70
           PopInlineFrame
+          Jump bb8(v71)
+        bb7():
+          v57:BasicObject = SendDirect v25, frame_block:v51, :greet (0x1098)
+          Jump bb8(v57)
+        bb8(v59:BasicObject):
           v35:StringExact[VALUE(0x10c0)] = Const Value(VALUE(0x10c0))
           v36:StringExact = StringCopy v35
           PatchPoint NoSingletonClass(String@0x10c8)
           PatchPoint MethodRedefined(String@0x10c8, +@0x10d0, cme:0x10d8)
-          v58:BasicObject = CCallWithFrame v65, :String#+@0x1100, v36
+          v63:StringExact = GuardType v59, StringExact recompile
+          v64:BasicObject = CCallWithFrame v63, :String#+@0x1100, v36
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v58
+          Return v64
         ");
     }
 
