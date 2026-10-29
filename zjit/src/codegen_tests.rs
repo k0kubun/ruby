@@ -1456,6 +1456,24 @@ fn test_inline_block_return_from_array_each_index() {
 }
 
 #[test]
+fn test_inline_throwing_block_over_inline_budget() {
+    // The caller is over the inlining budget, but Array#each and its literal block are still
+    // inlined since the block's `return` can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              y = 0
+              y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+              a.each { |x| return x + y if x > 1 }
+              nil
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2])"), @"82");
+    });
+}
+
+#[test]
 fn test_inline_block_break_and_return_in_same_block() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("
