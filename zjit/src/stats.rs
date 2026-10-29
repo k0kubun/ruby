@@ -317,6 +317,8 @@ make_counters! {
         setivar_fallback_new_shape_complex,
         setivar_fallback_new_shape_needs_extension,
         setivar_fallback_no_side_exits,
+        setivar_fallback_no_profile,
+        setivar_fallback_shape_miss,
     }
 
     // Ivar fallback counters that are summed as dynamic_getivar_count
@@ -326,12 +328,12 @@ make_counters! {
         getivar_fallback_megamorphic,
         getivar_fallback_skewed_megamorphic,
         getivar_fallback_polymorphic,
-        getivar_fallback_no_profile_missing_ic,
         getivar_fallback_no_profile,
         getivar_fallback_immediate,
         getivar_fallback_not_t_object,
         getivar_fallback_complex,
         getivar_fallback_no_side_exits,
+        getivar_fallback_shape_miss,
         getivar_fallback_multi_ractor,
     }
 
