@@ -80,6 +80,22 @@ fn assert_inlines_block(program: &str) -> String {
     result
 }
 
+/// Run `warmup`, which must compile at least one `throw` in an inlined block into a jump.
+/// Then run `program` like `assert_compiles` and assert that it executes no `throw` instruction.
+#[track_caller]
+fn assert_inlines_throw(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let inline_throw_count_before = counters.inline_throw_count;
+    eval(warmup);
+    assert!(counters.inline_throw_count > inline_throw_count_before,
+        "expected the warmup to compile a throw into a jump, but inline_throw_count did not increase");
+    let throw_count_before = counters.throw_count;
+    let result = assert_compiles(program);
+    assert_eq!(counters.throw_count, throw_count_before, "Program executed a throw instruction");
+    result
+}
+
 #[test]
 fn test_breakpoint_hir_codegen() {
     rb_zjit_prepare_options();
@@ -1355,6 +1371,243 @@ fn test_inline_block_defined_yield_checks_method_block() {
             test
             test
         "), @"[[1], [10]]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_jumps_to_caller() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a) = a.each { |x| break x * 10 if x == 2 }
+            test([1, 2, 3])
+            test([1, 2, 3])
+        ", "test([1, 2, 3])"), @"20");
+        // The loop finishes without breaking
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[1, 3]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_value_used_by_caller() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              v = a.each { |x| break x + 100 if x > 1 }
+              v.to_s
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+        ", "test([1, 2, 3])"), @r#""102""#);
+    });
+}
+
+#[test]
+fn test_inline_block_break_from_kernel_loop() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(n)
+              i = 0
+              r = loop do
+                i += 1
+                break i * 2 if i == n
+              end
+              [i, r]
+            end
+            test(3)
+            test(3)
+        ", "test(3)"), @"[3, 6]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_home_method() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a, key)
+              a.each do |h|
+                v = h[key]
+                return v if v
+              end
+              nil
+            end
+            A = [{}, { a: 1 }]
+            test(A, :a)
+            test(A, :a)
+        ", "test(A, :a)"), @"1");
+        assert_snapshot!(assert_compiles("test(A, :b)"), @"nil");
+    });
+}
+
+#[test]
+fn test_inline_block_break_and_return_in_same_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              r = a.each do |x|
+                return :ret if x == :r
+                break :brk if x == :b
+              end
+              [r]
+            end
+            test([:b])
+            test([:r])
+        ", "test([:b])"), @"[:brk]");
+        assert_snapshot!(assert_compiles("test([:r])"), @":ret");
+        assert_snapshot!(assert_compiles("test([:x])"), @"[[:x]]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_runs_block_ensure() {
+    // The ensure clause in the block must run, so the break stays a throw.
+    with_inlining(|| {
+        eval("
+            def test(a)
+              log = []
+              r = a.each do |x|
+                begin
+                  break x if x == 2
+                ensure
+                  log << x
+                end
+              end
+              [r, log]
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_runs_block_ensure() {
+    // The ensure clause in the block covers the return, so the return stays a throw.
+    with_inlining(|| {
+        eval("
+            def test(a, log)
+              a.each do |x|
+                begin
+                  return x
+                ensure
+                  log << x
+                end
+              end
+            end
+            test([1], [])
+            test([1], [])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test([1], log), log]"), @"[1, [1]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_runs_home_ensure() {
+    // The ensure clause in the home method must run, so the return stays a throw.
+    with_inlining(|| {
+        eval("
+            def test(a, log)
+              begin
+                a.each { |x| return x if x == 2 }
+                nil
+              ensure
+                log << :ensure
+              end
+            end
+            test([1, 2], [])
+            test([1, 2], [])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test([1, 2], log), log]"), @"[2, [:ensure]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_inlined_home_method() {
+    // The home method of the block is inlined into the caller, so the return jumps to the
+    // return block of the inlined home method frame.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def find(a) = a.each { |x| return x if x.even? }
+            def test(a) = [find(a)]
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"[2]");
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[[1, 3]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_inlined_home_method_with_other_type() {
+    // The code after the inlined home method call must not be specialized for the type
+    // of the home method's normal return value.
+    with_inlining(|| {
+        eval(r#"
+            def find(a)
+              a.each { |x| return x if x.is_a?(String) }
+              0
+            end
+            def test(a) = find(a).succ
+            test([1])
+            test([1, "a"])
+            test([1])
+            test([1, "a"])
+        "#);
+        assert_snapshot!(assert_compiles_allowing_exits(r#"[test([1]), test([1, "a"])]"#), @r#"[1, "b"]"#);
+    });
+}
+
+#[test]
+fn test_inline_block_break_from_nested_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def test(a)
+              a.map do |row|
+                row.each { |x| break x if x > 1 }
+              end
+            end
+            test([[1, 2], [3]])
+            test([[1, 2], [3]])
+        "), @"[2, 3]");
+    });
+}
+
+#[test]
+fn test_inline_large_block_with_return() {
+    // The block is larger than the inline threshold, but it's inlined since its `return`
+    // can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              a.each do |x|
+                y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+                return y if y > 7
+              end
+              nil
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2])"), @"8");
+    });
+}
+
+#[test]
+fn test_yield_to_throwing_block_not_inlined() {
+    // The literal block can't be inlined since its EP escapes, so the yield calls the
+    // block's JIT code, which throws.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def foo = yield
+            def test(x)
+              foo do
+                l = -> { x }
+                break l.call + 1 if x > 0
+                0
+              end
+            end
+            test(1)
+            test(1)
+            [test(1), test(-10)]
+        "), @"[2, 0]");
     });
 }
 
