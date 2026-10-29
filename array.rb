@@ -231,6 +231,24 @@ class Array
       end
     end
 
+    if Primitive.rb_builtin_basic_definition_p(:each_index)
+      undef :each_index
+
+      def each_index # :nodoc:
+        Primitive.attr! :inline_block, :c_trace, :without_interrupts
+
+        unless defined?(yield)
+          return Primitive.cexpr! 'SIZED_ENUMERATOR(self, 0, 0, ary_enum_length)'
+        end
+        i = 0
+        until Primitive.rb_builtin_ary_at_end(i)
+          yield i
+          i = Primitive.rb_builtin_fixnum_inc(i)
+        end
+        self
+      end
+    end
+
     if Primitive.rb_builtin_basic_definition_p(:map)
       undef :map
 
