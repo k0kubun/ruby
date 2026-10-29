@@ -689,7 +689,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
-        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_)), .. } => unreachable!("BlockArgProc only appears in SendDirect"),
+        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)), .. } => unreachable!("BlockArgProc and FrameBlock only appear in direct calls"),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect(insn) => {
             let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, .. } = &**insn;
@@ -1095,16 +1095,7 @@ fn gen_ccall_with_frame(
     gen_spill_stack(jit, asm, function, state);
     gen_spill_locals(jit, asm, state);
 
-    let block_handler_specval = if let Some(BlockHandler::BlockIseq(block_iseq)) = block {
-        // Change cfp->block_code in the current frame. See vm_caller_setup_arg_block().
-        // VM_CFP_TO_CAPTURED_BLOCK then turns &cfp->self into a block handler.
-        // rb_captured_block->code.iseq aliases with cfp->block_code.
-        asm.store(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_BLOCK_CODE), VALUE::from(block_iseq).into());
-        let cfp_self_addr = asm.lea(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SELF));
-        asm.or(cfp_self_addr, Opnd::Imm(1))
-    } else {
-        VM_BLOCK_HANDLER_NONE.into()
-    };
+    let block_handler_specval = gen_cfunc_block_handler_specval(jit, asm, block);
 
     gen_push_frame(asm, args_with_recv_len, state, ControlFrame {
         recv,
@@ -1161,10 +1152,22 @@ fn gen_block_handler_specval(asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Op
     asm.or(cfp_self_addr, Opnd::Imm(1))
 }
 
+/// Specval for a C method frame given an optional literal block or a forwarded frame block handler.
+fn gen_cfunc_block_handler_specval(jit: &JITState, asm: &mut Assembler, block: Option<BlockHandler>) -> lir::Opnd {
+    match block {
+        Some(BlockHandler::BlockIseq(blockiseq)) => gen_block_handler_specval(asm, blockiseq),
+        Some(BlockHandler::FrameBlock(block_handler)) => jit.get_opnd(block_handler),
+        None => VM_BLOCK_HANDLER_NONE.into(),
+        Some(BlockHandler::BlockArg | BlockHandler::BlockArgProc(_)) => unreachable!("unsupported block handler in a C method call"),
+    }
+}
+
 fn lower_block_handler(jit: &JITState, bh: BlockHandler) -> lir::BlockHandler {
     match bh {
         BlockHandler::BlockIseq(blockiseq) => lir::BlockHandler::Iseq(blockiseq),
         BlockHandler::BlockArgProc(proc_id) => lir::BlockHandler::Proc(jit.get_opnd(proc_id)),
+        // A raw block handler is already a valid specval.
+        BlockHandler::FrameBlock(block_handler) => lir::BlockHandler::Proc(jit.get_opnd(block_handler)),
         BlockHandler::BlockArg => unreachable!("BlockArg in a direct iseq call"),
     }
 }
@@ -1206,11 +1209,7 @@ fn gen_ccall_variadic(
     gen_spill_stack(jit, asm, function, state);
     gen_spill_locals(jit, asm, state);
 
-    let block_handler_specval = if let Some(BlockHandler::BlockIseq(blockiseq)) = block {
-        gen_block_handler_specval(asm, blockiseq)
-    } else {
-        VM_BLOCK_HANDLER_NONE.into()
-    };
+    let block_handler_specval = gen_cfunc_block_handler_specval(jit, asm, block);
 
     gen_push_frame(asm, args_with_recv_len, state, ControlFrame {
         recv,

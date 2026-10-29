@@ -2687,6 +2687,117 @@ fn test_send_proc_subclass_block_arg_falls_back() {
 }
 
 #[test]
+fn test_forward_block_param_to_iseq_yield() {
+    assert_snapshot!(assert_compiles("
+        def callee(x) = yield(x)
+        def test(&block) = callee(1, &block)
+        def entry = test { |x| x + 2 }
+        entry
+        entry
+    "), @"3");
+}
+
+#[test]
+fn test_forward_block_param_to_iseq_block_given() {
+    assert_snapshot!(inspect("
+        def callee = block_given?
+        def test(&block) = callee(&block)
+        test { }; test { }; test
+        [test { }, test, test(&nil), test(&proc { })]
+    "), @"[true, false, false, true]");
+}
+
+#[test]
+fn test_forward_block_param_to_iseq_with_block_param() {
+    assert_snapshot!(inspect("
+        def callee(x, &b) = b ? b.call(x) : -x
+        def test(x, &block) = callee(x, &block)
+        test(1) { |x| x * 10 }; test(2) { |x| x * 10 }; test(3)
+        [test(4) { |x| x * 10 }, test(5), test(6, &:succ)]
+    "), @"[40, -5, 7]");
+}
+
+#[test]
+fn test_forward_block_param_from_inner_block() {
+    assert_snapshot!(inspect("
+        def callee = yield
+        def test(&block) = [1].map { callee(&block) }
+        test { 1 }; test { 2 }
+        [test { 3 }, (test rescue $!.class)]
+    "), @"[[3], LocalJumpError]");
+}
+
+#[test]
+fn test_forward_block_param_ifunc_block() {
+    // Enumerable#map calls #each with an IFUNC block handler.
+    assert_snapshot!(inspect("
+        class ForwardEach
+          include Enumerable
+          def initialize(a) = @a = a
+          def inner = yield(@a)
+          def each(&block) = inner(&block)
+        end
+        e = ForwardEach.new(3)
+        e.map { |x| x * 2 }; e.map { |x| x * 2 }
+        e.map { |x| x * 2 }
+    "), @"[6]");
+}
+
+#[test]
+fn test_forward_block_param_proc_after_proxy_profile() {
+    assert_snapshot!(inspect("
+        def callee = yield
+        def test(&block) = callee(&block)
+        test { 1 }; test { 2 }
+        pr = proc { 3 }
+        [test { 4 }, test(&pr), (test(&:itself) rescue $!.class)]
+    "), @"[4, 3, ArgumentError]");
+}
+
+#[test]
+fn test_forward_modified_block_param() {
+    assert_snapshot!(inspect("
+        def callee = block_given? ? yield : :none
+        def test(flag, &block)
+          block = nil if flag == :nil
+          block = proc { :new } if flag == :proc
+          callee(&block)
+        end
+        test(nil) { 1 }; test(nil) { 1 }
+        [test(nil) { 1 }, test(:nil) { 1 }, test(:proc) { 1 }, test(nil)]
+    "), @"[1, :none, :new, :none]");
+}
+
+#[test]
+fn test_forward_block_param_to_cfunc() {
+    assert_snapshot!(assert_compiles("
+        def test(h, &block) = h.each(&block)
+        sum = 0
+        test({a: 1}) { |_, v| sum += v }
+        test({a: 2}) { |_, v| sum += v }
+        sum
+    "), @"3");
+}
+
+#[test]
+fn test_forward_block_param_to_variadic_cfunc() {
+    assert_snapshot!(inspect("
+        def test(h, key, &block) = h.fetch(key, &block)
+        test({a: 1}, :b) { |k| k }; test({a: 1}, :b) { |k| k }; test({a: 1}, :a)
+        [test({a: 1}, :a) { 0 }, test({a: 1}, :b) { |k| k.to_s }, (test({a: 1}, :b) rescue $!.class)]
+    "), @r#"[1, "b", KeyError]"#);
+}
+
+#[test]
+fn test_forward_block_param_to_cfunc_nil_only() {
+    assert_snapshot!(assert_compiles("
+        def test(h, &block) = h.each(&block)
+        test({a: 1}); test({a: 1})
+        test({a: 1}).class
+    "), @"Enumerator");
+}
+
+#[test]
 fn test_send_symbol_block_arg() {
     assert_snapshot!(inspect("
         def test = [1, 2].map(&:to_s)
