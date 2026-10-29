@@ -100,6 +100,7 @@ fn profile_insn_sample(
             // Profile all the arguments and self (+1).
             profile_operands(profiler, profile, argc + 1);
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
+            profile_send_symbol(profiler, profile, unsafe { (*cd).ci }, argc);
         }
         _ => return false,
     }
@@ -213,6 +214,23 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
     };
     profile.splat_lengths.entry(profiler.insn_idx)
         .or_insert_with(SplatLengthDistribution::new).observe(length);
+}
+
+/// Profile the method name Symbol given to `send(name, ...)` or `__send__(name, ...)`.
+/// Only static Symbols are recorded. They are immediates, so they don't need GC marking.
+fn profile_send_symbol(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo, argc: usize) {
+    let mid = unsafe { vm_ci_mid(ci) };
+    let flags = unsafe { rb_vm_ci_flag(ci) };
+    if (mid != ID!(send) && mid != ID!(__send__)) || argc == 0 || flags & VM_CALL_ARGS_SPLAT != 0 {
+        return;
+    }
+    let name = profiler.peek_at_stack((argc - 1) as isize);
+    let distribution = profile.send_symbols.entry(profiler.insn_idx).or_insert_with(TypeDistribution::new);
+    if name.static_sym_p() {
+        distribution.observe(ProfiledType::object(name));
+    } else {
+        distribution.observe_other();
+    }
 }
 
 fn profile_self(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -450,6 +468,9 @@ pub struct IseqProfile {
 
     /// Observed lengths of caller splat arrays for call instructions.
     splat_lengths: HashMap<YarvInsnIdx, SplatLengthDistribution>,
+
+    /// Static Symbols given to `send` as the method name. Not GC objects, so not visited by `each_object`.
+    send_symbols: HashMap<YarvInsnIdx, TypeDistribution>,
 }
 
 impl IseqProfile {
@@ -458,6 +479,7 @@ impl IseqProfile {
             entries: Vec::new(),
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
+            send_symbols: HashMap::new(),
         }
     }
 
@@ -492,6 +514,12 @@ impl IseqProfile {
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
         self.splat_lengths.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
+    }
+
+    /// Get the static Symbols profiled as the method name of `send`, most common first.
+    pub fn get_send_symbols(&self, insn_idx: YarvInsnIdx) -> Vec<VALUE> {
+        let Some(distribution) = self.send_symbols.get(&insn_idx) else { return vec![] };
+        distribution.each_item().map(|profiled_type| profiled_type.class).filter(|name| name.static_sym_p()).collect()
     }
 
     pub fn get_super_method_entry(&self, insn_idx: YarvInsnIdx) -> Option<*const rb_callable_method_entry_t> {

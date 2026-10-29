@@ -2677,6 +2677,79 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_specialize_send_constant_name() {
+        eval("
+            def target(a) = a
+            def test(a) = send(:target, a)
+            test(1); test(2)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:StaticSymbol[:target] = Const Value(VALUE(0x1008))
+          PatchPoint MethodRedefined(Object@0x1010, send@0x1018, cme:0x1020)
+          v27:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1010)] recompile
+          PatchPoint MethodRedefined(Object@0x1010, target@0x1048, cme:0x1050)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v10
+        ");
+    }
+
+    #[test]
+    fn test_specialize_send_profiled_names() {
+        eval("
+            def foo(a) = a
+            def bar(a) = a
+            def test(name, a) = send(name, a)
+            test(:foo, 1); test(:bar, 2)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :name@0x1000
+          v4:BasicObject = LoadField v2, :a@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :name@1
+          v9:BasicObject = LoadArg :a@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, send@0x1010, cme:0x1018)
+          v29:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v11, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          v31:StaticSymbol[:foo] = Const Value(VALUE(0x1040))
+          v32:CBool = IsBitEqual v12, v31
+          CondBranch v32, bb5(), bb6()
+        bb5():
+          PatchPoint MethodRedefined(Object@0x1008, foo@0x1048, cme:0x1050)
+          Jump bb4(v13)
+        bb6():
+          v36:BasicObject = Send v29, :send, v12, v13 # SendFallbackReason: Send: send name is not a profiled method name
+          Jump bb4(v36)
+        bb4(v38:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v38
+        ");
+    }
+
+    #[test]
     fn test_optimize_send_into_fixnum_add_both_profiled() {
         eval("
             def test(a, b) = a + b

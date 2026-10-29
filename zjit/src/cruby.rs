@@ -1756,6 +1756,8 @@ pub(crate) mod ids {
         name: induce_side_exit_bang       content: b"induce_side_exit!"
         name: induce_compile_failure_bang content: b"induce_compile_failure!"
         name: induce_breakpoint_bang      content: b"induce_breakpoint!"
+        name: send
+        name: __send__
     }
 
     /// Get an CRuby `ID` to an interned string, e.g. a particular method name.

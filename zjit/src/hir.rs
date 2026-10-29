@@ -777,6 +777,8 @@ pub enum SendFallbackReason {
     SendNotOptimizedMethodTypeOptimized(OptimizedMethodType),
     SendOperandsNotFixnum,
     SendPolymorphicFallback,
+    /// The fallback of `send(name, ...)` dispatched on the profiled names when the name is none of them
+    SendNameMiss,
     SendDirectKeywordMismatch,
     SendDirectKeywordCountMismatch,
     SendDirectMissingKeyword,
@@ -849,6 +851,7 @@ impl Display for SendFallbackReason {
             SendNotOptimizedNeedPermission => write!(f, "Send: method private or protected and no FCALL"),
             SendOperandsNotFixnum => write!(f, "Send: operands are not fixnums"),
             SendPolymorphicFallback => write!(f, "Send: polymorphic fallback"),
+            SendNameMiss => write!(f, "Send: send name is not a profiled method name"),
             SendDirectKeywordMismatch => write!(f, "SendDirect: keyword mismatch"),
             SendDirectKeywordCountMismatch => write!(f, "SendDirect: keyword count mismatch"),
             SendDirectMissingKeyword => write!(f, "SendDirect: missing keyword"),
@@ -3878,7 +3881,7 @@ impl Function {
             => {
                 // Ignore the case where the instruction is intentionally a fallback for a
                 // polymorphic send. We already know that case is a lost cause.
-                if *reason != SendFallbackReason::SendPolymorphicFallback {
+                if *reason != SendFallbackReason::SendPolymorphicFallback && *reason != SendFallbackReason::SendNameMiss {
                     *reason = dynamic_send_reason;
                 }
             }
@@ -4789,6 +4792,111 @@ impl Function {
     /// param proxy or nil: the method frame's block handler for the proxy (what
     /// vm_caller_setup_arg_block() does), or no block for nil. Any other block arg side-exits
     /// to re-profile it. Returns the join block and the raw (CInt64) block handler.
+    /// Specialize `send(name, ...)` (Kernel#send or BasicObject#__send__) into direct calls of the
+    /// ISEQ methods named by a constant `name` or by the static Symbols profiled for `name`. Profiled
+    /// names are dispatched with IsBitEqual, falling back to the generic send on a miss.
+    /// Returns the block to continue specializing in, or None if nothing was emitted.
+    fn try_specialize_send_name(
+        &mut self,
+        block: BlockId,
+        insn_id: InsnId,
+        klass: VALUE,
+        mut recv: InsnId,
+        profiled_type: Option<ProfiledType>,
+        send_cme: *const rb_callable_method_entry_t,
+        state: InsnId,
+    ) -> Option<BlockId> {
+        let send_insn = self.resolve(insn_id).insn(self).clone();
+        let Insn::Send { cd, block: send_block, ref args, caller_splat_length: None, reason, .. } = send_insn else { return None };
+        let has_block = match send_block {
+            None => false,
+            Some(BlockHandler::BlockIseq(_)) => true,
+            Some(_) => return None,
+        };
+        let ci = unsafe { (*cd).ci };
+        if reason == SendNameMiss || args.is_empty() || unspecializable_call_type(unsafe { rb_vm_ci_flag(ci) }) {
+            return None;
+        }
+        let name = args[0];
+        let rest = &args[1..];
+        let constant_name = self.type_of(name).ruby_object().filter(|name| name.static_sym_p());
+        let names = match constant_name {
+            Some(name) => vec![name],
+            None => {
+                let frame_state = self.frame_state(state);
+                get_or_create_iseq_payload(frame_state.iseq).profile.get_send_symbols(frame_state.insn_idx)
+            }
+        };
+
+        // Resolve each name to an ISEQ method that can be called directly with the rest of the arguments.
+        // `send` ignores the method visibility.
+        let caller_args = CallerArguments::new(rest, ci);
+        let mut targets = vec![];
+        for name in names {
+            let mid = unsafe { rb_sym2id(name) };
+            let mut cme = unsafe { rb_callable_method_entry(klass, mid) };
+            if cme.is_null() { continue; }
+            cme = unsafe { rb_check_overloaded_cme(cme, ci) };
+            while unsafe { get_cme_def_type(cme) } == VM_METHOD_TYPE_ALIAS {
+                cme = unsafe { rb_aliased_callable_method_entry(cme) };
+            }
+            if unsafe { get_cme_def_type(cme) } != VM_METHOD_TYPE_ISEQ { continue; }
+            let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+            // A forwardable callee would need the callinfo of the target method.
+            if unsafe { iseq.params() }.flags.forwardable() != 0 { continue; }
+            let Ok(call) = self.build_send_direct_args(&caller_args, None, iseq, has_block) else { continue };
+            targets.push((name, mid, cme, iseq, call));
+        }
+        if targets.is_empty() || !self.assume_no_singleton_classes(block, klass, state) {
+            return None;
+        }
+
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: unsafe { vm_ci_mid(ci) }, cme: send_cme }, state });
+        if let Some(profiled_type) = profiled_type {
+            recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+        }
+        // The callee frame doesn't have the name on the stack.
+        let frame_state = self.frame_state(state).with_replaced_args(rest, args.len());
+        let send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(frame_state) });
+
+        let join_block = if constant_name.is_some() { None } else { Some(self.new_block(u32::MAX)) };
+        let mut block = block;
+        for (name, mid, cme, iseq, call) in targets {
+            let call_block = if join_block.is_some() {
+                let call_block = self.new_block(u32::MAX);
+                let miss_block = self.new_block(u32::MAX);
+                let expected = self.push_insn(block, Insn::Const { val: Const::Value(name) });
+                let is_name = self.push_insn(block, Insn::IsBitEqual { left: args[0], right: expected });
+                self.push_insn(block, Insn::CondBranch {
+                    val: is_name,
+                    if_true: BranchEdge { target: call_block, args: vec![] },
+                    if_false: BranchEdge { target: miss_block, args: vec![] },
+                });
+                block = miss_block;
+                call_block
+            } else {
+                block
+            };
+            self.push_insn(call_block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
+            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                self.emit_send_direct_args(call_block, call, rest, send_frame_state, state);
+            let result = self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, block: send_block })));
+            match join_block {
+                Some(join_block) => { self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] })); }
+                None => { self.make_equal_to(insn_id, result); return Some(call_block); }
+            }
+        }
+        let join_block = join_block.unwrap();
+        let mut fallback = send_insn.clone();
+        if let Insn::Send { reason, .. } = &mut fallback { *reason = SendNameMiss; }
+        let fallback = self.push_insn(block, fallback);
+        self.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+        let result = self.push_insn(join_block, Insn::Param);
+        self.insn_types[result] = types::BasicObject;
+        self.make_equal_to(insn_id, result);
+        Some(join_block)
+    }
+
     fn emit_forwarded_block_handler(&mut self, block: BlockId, block_arg: InsnId, state: InsnId) -> (BlockId, InsnId) {
         let proxy_block = self.new_block(u32::MAX);
         let nil_block = self.new_block(u32::MAX);
@@ -5198,6 +5306,14 @@ impl Function {
                         while def_type == VM_METHOD_TYPE_ALIAS {
                             cme = unsafe { rb_aliased_callable_method_entry(cme) };
                             def_type = unsafe { get_cme_def_type(cme) };
+                        }
+
+                        if def_type == VM_METHOD_TYPE_OPTIMIZED
+                            && unsafe { get_cme_def_body_optimized_type(cme) } == OPTIMIZED_METHOD_TYPE_SEND
+                            && let Some(next_block) = self.try_specialize_send_name(block, insn_id, klass, recv, profiled_type, cme, state)
+                        {
+                            block = next_block;
+                            continue;
                         }
 
                         // Check if we can optimize `foo(&block)` to a direct send: either `block` is
