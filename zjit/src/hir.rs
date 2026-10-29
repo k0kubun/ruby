@@ -2634,6 +2634,10 @@ pub struct Block {
     pub insn_idx: u32,
     params: Vec<InsnId>,
     insns: Vec<InsnId>,
+    /// The return block of an inlined method frame that may get new incoming edges later,
+    /// when a non-local `return` from a block inlined later is compiled into a jump to it.
+    /// Optimizations must not merge it into its predecessor or narrow its params.
+    pinned: bool,
 }
 
 impl Block {
@@ -3031,6 +3035,61 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// Frames inlined into this function, keyed by the caller `Snapshot` that the inlined
+    /// frame's FrameStates point to as their `caller`.
+    inline_frames: HashMap<InsnId, InlineFrame>,
+    /// The number of times `inline_methods` has run on this function
+    inline_pass: usize,
+}
+
+/// An inlined method or block frame. The inliner records these so that inlining a block
+/// later can find the frames that a `break` or non-local `return` from the block unwinds to.
+#[derive(Debug, Clone, Copy)]
+struct InlineFrame {
+    /// ISEQ of the inlined frame
+    iseq: IseqPtr,
+    /// Block the frame's `leave` jumps to. It takes the return value as its parameter, pops the
+    /// frame, and continues in the caller after the call that pushed the frame.
+    return_block: BlockId,
+    /// Operands for a PopInlineFrame that pops this frame
+    pop: InlineFramePop,
+    /// The literal block passed to an inlined method frame
+    blockiseq: Option<IseqPtr>,
+    /// The `inline_methods` pass that inlined this frame. Until the pass finishes, no other
+    /// optimization has touched `return_block`, so it's safe to add edges to it.
+    inline_pass: usize,
+}
+
+/// Operands of an [`Insn::PopInlineFrame`]
+#[derive(Debug, Clone, Copy)]
+struct InlineFramePop {
+    iseq: IseqPtr,
+    argc: usize,
+    /// FrameState of the call that pushed the frame
+    state: InsnId,
+}
+
+/// Where a `break` or non-local `return` from an inlined block can jump to instead of
+/// unwinding frames with a `throw`.
+#[derive(Debug, Clone, Copy)]
+struct InlinedBlockThrowTargets {
+    /// Pops the inlined block frame
+    block_pop: InlineFramePop,
+    /// For `break`: the continuation of the call that was passed the block. It takes the
+    /// break value as the call's return value and pops the yielding method frame.
+    break_target: Option<BlockId>,
+    /// For a non-local `return` from the block
+    return_target: Option<InlinedReturnTarget>,
+}
+
+/// Where a non-local `return` from an inlined block returns from its home method frame.
+#[derive(Debug, Clone, Copy)]
+struct InlinedReturnTarget {
+    /// Pops the method frame that yielded to the block
+    yielder_pop: InlineFramePop,
+    /// The home method frame's return block if it is inlined, or None if the home method frame
+    /// is the frame of this function, which returns with Insn::Return.
+    home_return_block: Option<BlockId>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3254,12 +3313,36 @@ fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
 }
 
+/// Return true if `iseq` passes a literal block that may do a non-local `return`.
+fn iseq_has_literal_block_with_return(iseq: IseqPtr) -> bool {
+    fn any_insn(iseq: IseqPtr, f: impl Fn(*const VALUE, u32) -> bool) -> bool {
+        let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+        let mut insn_idx: u32 = 0;
+        while insn_idx < encoded_size {
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+            let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+            if f(pc, opcode) {
+                return true;
+            }
+            insn_idx += insn_len(opcode as usize);
+        }
+        false
+    }
+    any_insn(iseq, |pc, opcode| opcode == YARVINSN_send && {
+        let block_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+        !block_iseq.is_null() && any_insn(block_iseq, |pc, opcode| opcode == YARVINSN_throw && {
+            let throw_state = unsafe { *pc.add(1) }.as_u32();
+            throw_state & VM_THROW_STATE_MASK == RUBY_TAG_RETURN && throw_state & VM_THROW_NO_ESCAPE_FLAG == 0
+        })
+    })
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
-/// non-local return). Anything else falls back to the generic `invokeblock` dispatch,
-/// with the returned reason attached to the fallback instruction.
-fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFallbackReason> {
+/// non-local return) unless `allow_throw`. Anything else falls back to the generic
+/// `invokeblock` dispatch, with the returned reason attached to the fallback instruction.
+fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize, allow_throw: bool) -> Result<(), SendFallbackReason> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
         return Err(InvokeBlockNotSpecialized);
     }
@@ -3270,7 +3353,7 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize) -> Result<(), SendFa
     if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
         return Err(InvokeBlockNotSpecialized);
     }
-    if crate::codegen::block_iseq_may_throw(iseq) {
+    if !allow_throw && crate::codegen::block_iseq_may_throw(iseq) {
         return Err(InvokeBlockNotSpecialized);
     }
     Ok(())
@@ -3294,6 +3377,8 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            inline_frames: HashMap::new(),
+            inline_pass: 0,
         }
     }
 
@@ -4047,6 +4132,14 @@ impl Function {
 
         // Fill entry parameter types
         self.copy_param_types();
+
+        // Pinned blocks may get incoming edges with any value later. Don't let optimizations
+        // specialize code on the values of their existing incoming edges.
+        for block in self.blocks.iter().filter(|block| block.pinned) {
+            for &param in &block.params {
+                self.insn_types[param] = types::BasicObject;
+            }
+        }
 
         // Assign `new_type` to `insn` if it differs from the recorded type.
         // Returns `true` if a write actually happened, `false` if the type
@@ -6033,6 +6126,7 @@ impl Function {
 
 
         let mut did_inline = false;
+        self.inline_pass += 1;
 
         // Worklist of blocks left to scan for inlinable SendDirects. Seeded with
         // the function's current RPO so we visit every existing block, and
@@ -6164,6 +6258,7 @@ impl Function {
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
+                    throw_targets: None,
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -6183,6 +6278,18 @@ impl Function {
                 // Past the point of no return: commit the inlining.
                 incr_counter!(inline_method_count);
                 did_inline = true;
+                // A non-local `return` from a literal block in the callee may be compiled
+                // into a jump to `continuation` once the block is inlined later.
+                if iseq_has_literal_block_with_return(iseq) {
+                    self.blocks[continuation].pinned = true;
+                }
+                self.inline_frames.insert(post_send_caller, InlineFrame {
+                    iseq,
+                    return_block: continuation,
+                    pop: InlineFramePop { iseq, argc: args_len, state },
+                    blockiseq,
+                    inline_pass: self.inline_pass,
+                });
 
                 let args = match send.insn(self) {
                     Insn::SendDirect(data) => data.args.to_vec(),
@@ -6325,6 +6432,15 @@ impl Function {
                 // single inline_methods call.
                 worklist.push_back(continuation);
 
+                // If the callee was passed a literal block, its `yield`s became
+                // InvokeBlockIseqDirect. Inline those blocks in this pass, while
+                // `continuation` is untouched by other optimizations, so that
+                // `break` and non-local `return` in the blocks can jump to the
+                // frames they unwind to. See inlined_block_throw_targets.
+                if blockiseq.is_some() {
+                    worklist.extend((pre_blocks_len..self.blocks.len()).map(BlockId::from).filter(|&b| b != continuation));
+                }
+
                 // Done with this block: the rest of it is in `continuation`.
                 break;
             }
@@ -6335,6 +6451,74 @@ impl Function {
         }
 
         did_inline
+    }
+
+    /// Find where a `break` or non-local `return` from a block inlined at a `yield` with
+    /// `yield_state` can jump to without a `throw`. That's possible when the method frame
+    /// that yields to the block was inlined with the block as a literal block in the current
+    /// `inline_methods` pass, so its return block can still take new edges. For a `return`,
+    /// the frame that passed the literal block (the block's home frame) must be the frame of
+    /// this function or an inlined frame whose return block is pinned.
+    ///
+    /// This mirrors vm_throw_start() and vm_exec_handle_exception(): a `break` resumes the
+    /// home frame after the call that was passed the block, and a `return` returns from the
+    /// home method frame. Both unwind the yielding method frame, and give up when unwinding
+    /// would run an ensure clause.
+    fn inlined_block_throw_targets(&self, block_pop: InlineFramePop, yield_state: &FrameState) -> Option<InlinedBlockThrowTargets> {
+        let block_iseq = block_pop.iseq;
+
+        // The yielding frame must be an inlined method frame that was passed the block.
+        // If the `yield` were in a block in that method, `yield_state` would be the block's frame.
+        let yielder = self.inline_frames.get(&yield_state.caller()?)?;
+        if yielder.iseq != yield_state.iseq
+            || yielder.inline_pass != self.inline_pass
+            || yielder.blockiseq != Some(block_iseq)
+            || unsafe { rb_get_iseq_body_type(yielder.iseq) } != ISEQ_TYPE_METHOD
+        {
+            return None;
+        }
+        // Unwinding the yielding frame must not run an ensure clause
+        let yield_epc = yield_state.insn_idx() as u32 + insn_len(YARVINSN_invokeblock as usize);
+        if unsafe { rb_zjit_iseq_ensure_covers_p(yielder.iseq, yield_epc) } {
+            return None;
+        }
+
+        // The home frame is the frame of the call that was passed the literal block.
+        let home_state = self.frame_state(yielder.pop.state);
+        let home_iseq = home_state.iseq;
+        debug_assert_eq!(unsafe { rb_get_iseq_body_parent_iseq(block_iseq) }, home_iseq);
+        let call_epc = home_state.insn_idx() as u32 + insn_len(home_state.get_opcode() as usize);
+
+        // `break` resumes the home frame after the call, if the catch table says it's not an orphan `break`.
+        let break_target = unsafe { rb_zjit_iseq_break_lands_p(home_iseq, block_iseq, call_epc) }
+            .then_some(yielder.return_block);
+
+        // `return` returns from the home frame if it's a method frame whose ensure clause doesn't
+        // cover the call. If the home frame is inlined, we jump to its return block, which must
+        // be pinned so that it's not optimized assuming its existing incoming edges. It also must
+        // still be reachable: dead code elimination doesn't keep values that only unreachable
+        // blocks use.
+        let return_target = if unsafe { rb_get_iseq_body_type(home_iseq) } == ISEQ_TYPE_METHOD
+            && unsafe { rb_get_iseq_body_parent_iseq(block_iseq) } == home_iseq
+            && !unsafe { rb_zjit_iseq_ensure_covers_p(home_iseq, call_epc) }
+        {
+            match home_state.caller() {
+                // The home frame is the frame of this function
+                None if home_iseq == self.iseq => Some(InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: None }),
+                None => None,
+                Some(home_caller) => self.inline_frames.get(&home_caller)
+                    .filter(|home| home.iseq == home_iseq && self.blocks[home.return_block].pinned)
+                    .filter(|home| self.reverse_post_order().contains(&home.return_block))
+                    .map(|home| InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: Some(home.return_block) }),
+            }
+        } else {
+            None
+        };
+
+        if break_target.is_none() && return_target.is_none() {
+            return None;
+        }
+        Some(InlinedBlockThrowTargets { block_pop, break_target, return_target })
     }
 
     /// Inline the block body of the [`Insn::InvokeBlockIseqDirect`] at `pos` in `block`.
@@ -6349,7 +6533,15 @@ impl Function {
             unreachable!("position {insn_id} is not an InvokeBlockIseqDirect");
         };
 
-        if !self.should_inline(iseq, ptr::null(), false) || !Self::can_inline(iseq) {
+        let call_state = self.frame_state(state);
+        let block_pop = InlineFramePop { iseq, argc: args.len(), state };
+        let throw_targets = self.inlined_block_throw_targets(block_pop, &call_state);
+
+        // Inlining a block whose `break` or `return` can become a jump saves an expensive
+        // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
+        // This is bounded by the number of literal blocks in the inlined methods' callers.
+        let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
+        if (!throw_inlinable && !self.should_inline(iseq, ptr::null(), false)) || !Self::can_inline(iseq) {
             return None;
         }
 
@@ -6358,7 +6550,6 @@ impl Function {
         let pre_insn_types_len = self.insn_types.len();
         let pre_blocks_len = self.blocks.len();
 
-        let call_state = self.frame_state(state);
         let continuation = self.new_block(call_state.insn_idx() as u32 + insn_len(call_state.get_opcode() as usize));
         let caller_depth = self.frame_depth(state);
 
@@ -6375,6 +6566,7 @@ impl Function {
             // `yield` in a block goes to the block of its local frame, not to a block
             // passed to this frame.
             block: None,
+            throw_targets,
         };
         let add_result = match add_iseq_to_hir(self, iseq, mode) {
             Ok(r) => r,
@@ -6390,6 +6582,13 @@ impl Function {
 
         // Past the point of no return: commit the inlining.
         incr_counter!(inline_block_count);
+        self.inline_frames.insert(post_yield_caller, InlineFrame {
+            iseq,
+            return_block: continuation,
+            pop: block_pop,
+            blockiseq: None,
+            inline_pass: self.inline_pass,
+        });
 
         let tail = self.blocks[block].insns.split_off(pos);
         debug_assert!(self.is_invoke_block_iseq_direct(tail[0]));
@@ -6887,9 +7086,10 @@ impl Function {
             .collect();
 
         // We only need to update blocks that have params. (Blocks without params cannot be improved)
+        // Pinned blocks may get more incoming edges later, so their params are not trivial.
         let blocks_receiving_params: Vec<BlockId> = blocks.iter().copied()
             .filter(|&block_id|
-                self.blocks[block_id].params().len() != 0)
+                self.blocks[block_id].params().len() != 0 && !self.blocks[block_id].pinned)
             .collect();
 
         // Create a vec to represent trivial indices
@@ -7600,6 +7800,10 @@ impl Function {
     fn absorb_dst_block(&mut self, num_in_edges: &[u32], block: BlockId) -> bool {
         let Some(&terminator_id) = self.blocks[block].insns.last()
             else { return false };
+        if matches!(self.find_ref(terminator_id), Insn::Jump(edge) if self.blocks[edge.target].pinned) {
+            // The block may get more incoming edges later
+            return false;
+        }
         let &mut Insn::Jump(ref mut edge) = self.resolve(terminator_id).insn_mut(self)
             else { return false };
         if edge.target == block {
@@ -9404,6 +9608,8 @@ enum AddIseqMode {
         jit_entry_idx: usize,
         /// The block the caller passed to this frame, if any.
         block: Option<BlockHandler>,
+        /// For an inlined block, where `break` and non-local `return` can jump to.
+        throw_targets: Option<InlinedBlockThrowTargets>,
     },
 }
 
@@ -10565,7 +10771,40 @@ fn add_iseq_to_hir(
                     break;  // Don't enqueue the next block as a successor
                 }
                 YARVINSN_throw => {
-                    fun.push_insn(block, Insn::Throw { throw_state: get_arg(pc, 0).as_u32(), val: state.stack_pop()?, state: exit_id });
+                    let throw_state = get_arg(pc, 0).as_u32();
+                    let val = state.stack_pop()?;
+                    // In an inlined block, turn `break` and non-local `return` into jumps when the
+                    // frames they unwind to are part of this function. See inlined_block_throw_targets.
+                    if let AddIseqMode::Inlined { throw_targets: Some(targets), .. } = mode {
+                        let tag = throw_state & VM_THROW_STATE_MASK;
+                        let no_escape = throw_state & VM_THROW_NO_ESCAPE_FLAG != 0;
+                        let throw_epc = insn_idx; // already advanced past the throw
+                        // Unwinding the block frame must not run an ensure clause
+                        let can_unwind = !no_escape && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, throw_epc) };
+                        let pop = |fun: &mut Function, pop: InlineFramePop| {
+                            fun.push_insn(block, Insn::PopInlineFrame { iseq: pop.iseq, argc: pop.argc, state: pop.state });
+                        };
+                        match (tag, targets.break_target, targets.return_target) {
+                            (RUBY_TAG_BREAK, Some(break_target), _) if can_unwind => {
+                                incr_counter!(inline_throw_count);
+                                pop(fun, targets.block_pop);
+                                fun.push_insn(block, Insn::Jump(BranchEdge { target: break_target, args: vec![val] }));
+                                break;  // Don't enqueue the next block as a successor
+                            }
+                            (RUBY_TAG_RETURN, _, Some(return_target)) if can_unwind => {
+                                incr_counter!(inline_throw_count);
+                                pop(fun, targets.block_pop);
+                                pop(fun, return_target.yielder_pop);
+                                match return_target.home_return_block {
+                                    Some(home_return_block) => fun.push_insn(block, Insn::Jump(BranchEdge { target: home_return_block, args: vec![val] })),
+                                    None => fun.push_insn(block, Insn::Return { val }),
+                                };
+                                break;  // Don't enqueue the next block as a successor
+                            }
+                            _ => {}
+                        }
+                    }
+                    fun.push_insn(block, Insn::Throw { throw_state, val, state: exit_id });
                     break;  // Don't enqueue the next block as a successor
                 }
 
@@ -10928,7 +11167,7 @@ fn add_iseq_to_hir(
                                 let obj = profiled_type.class();
                                 if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                     let iseq = obj.as_iseq();
-                                    match can_direct_invoke_block_iseq(iseq, args.len()) {
+                                    match can_direct_invoke_block_iseq(iseq, args.len(), false) {
                                         // Push an ISEQ that can be dispatched directly, deduplicating direct_iseqs.
                                         Ok(()) => if !direct_iseqs.contains(&iseq) {
                                             direct_iseqs.push(iseq);
@@ -10950,7 +11189,9 @@ fn add_iseq_to_hir(
                             // TODO: To stay guard-free there, we'd bake in get_lvar_level(...) as the level and fetch
                             // that ancestor's blockiseq from the inline caller chain instead of bi.
                             && get_lvar_level(exit_state.iseq) == 0 {
-                            match can_direct_invoke_block_iseq(bi, args.len()) {
+                            // The literal block's home frame is part of this function, so the inliner may be able
+                            // to turn its `break` and non-local `return` into jumps. Allow blocks that may throw.
+                            match can_direct_invoke_block_iseq(bi, args.len(), true) {
                                 Ok(()) => Some(bi),
                                 Err(reason) => {
                                     fallback_reason = reason;
