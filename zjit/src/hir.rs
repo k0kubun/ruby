@@ -2918,6 +2918,10 @@ pub enum ValidationError {
 }
 
 /// Set of flags incompatible with direct sends to forwardable callees.
+/// Maximum encoded size of a method that yields to a literal block that may `break` or `return`
+/// and is inlined regardless of the inlining threshold and budget, so that the throw can become a jump.
+const THROW_INLINE_MAX_CALLEE_SIZE: usize = 128;
+
 const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     // `gen_send_iseq_direct` currently handles only the interpreter's `vm_call_iseq_forwardable`
     // fastpath case on forwardable ISEQs: pass non-`...` arguments to a `...` callee, which sets
@@ -6718,7 +6722,7 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, insns_at_pass_start: usize) -> bool {
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, insns_at_pass_start: usize, throw_yielder: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -6750,6 +6754,12 @@ impl Function {
         // their budget. `can_inline` still gates them on correctness.
         let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(callee_iseq) };
         if builtin_attrs & BUILTIN_ATTR_ALWAYS_INLINE != 0 {
+            return true;
+        }
+
+        // A method that yields to a literal block that may `break` or `return` skips them too,
+        // so that the throw can become a jump.
+        if throw_yielder {
             return true;
         }
 
@@ -6872,9 +6882,13 @@ impl Function {
                 // that yields to such a block. This is bounded by the number of literal blocks passed
                 // to the inlined methods.
                 let skip_heuristics = throw_targets.is_some() || yields_to_throwing_block;
+                // Do the same for a modestly sized method that yields to a literal block that may throw.
+                let throw_yielder = matches!(call_block, Some(BlockHandler::BlockIseq(blockiseq)) if crate::codegen::block_iseq_may_throw(blockiseq))
+                    && unsafe { get_iseq_encoded_size(iseq) } as usize <= THROW_INLINE_MAX_CALLEE_SIZE
+                    && crate::codegen::iseq_may_yield(iseq);
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
+                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, insns_at_pass_start, throw_yielder)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }

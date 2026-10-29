@@ -1495,6 +1495,31 @@ fn test_send_profiled_name_redefined() {
 }
 
 #[test]
+fn test_inline_throwing_block_into_large_yielding_method() {
+    // The callee is over the inlining threshold, but it's still inlined since it yields to a
+    // literal block whose `return` can then become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def callee(h, k)
+              if h.key?(k)
+                yield h[k]
+              else
+                x = h.size + 1; x = x + 1; x = x + 1; x = x + 1; x = x + 1; x = x + 1; x = x + 1
+                yield x
+              end
+            end
+            def test(h, k)
+              callee(h, k) { |v| return v * 2 }
+              nil
+            end
+            test({a: 1}, :a)
+            test({a: 1}, :a)
+        ", "test({a: 1}, :a)"), @"2");
+        assert_snapshot!(assert_compiles_allowing_exits("test({a: 1}, :b)"), @"16");
+    });
+}
+
+#[test]
 fn test_inline_block_return_from_inlined_home_method() {
     // The home method of the block is inlined into the caller, so the return jumps to the
     // return block of the inlined home method frame.
