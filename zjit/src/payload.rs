@@ -27,6 +27,9 @@ pub struct IseqPayload {
     pub self_is_heap_object: bool,
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
+    /// Whether the next compile is delayed by `set_recompile_backoff`, which function stubs
+    /// need to know since they don't wait for jit_entry_calls to reach the call threshold.
+    pub backing_off: bool,
 }
 
 impl IseqPayload {
@@ -37,6 +40,7 @@ impl IseqPayload {
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
+            backing_off: false,
         }
     }
 }

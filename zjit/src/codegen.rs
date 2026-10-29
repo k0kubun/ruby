@@ -17,7 +17,7 @@ use crate::invariants::{
     track_root_box_assumption, track_no_newobj_hook_assumption
 };
 use crate::gc::append_gc_offsets;
-use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
+use crate::payload::{IseqCodePtrs, IseqPayload, IseqStatus, IseqVersion, IseqVersionRef, JITFrame, get_or_create_iseq_payload};
 use crate::profile::reset_profiles_remaining;
 use crate::perf;
 use crate::state::{rb_zjit_compiling_p, ZJITState};
@@ -262,13 +262,18 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 /// TODO: evolve this into a general `handle_event(iseq, event)` state machine that
 /// handles all compile lifecycle events (interpreter profiles, JIT profiles, invalidation,
 /// GC) so that all compile/recompile tuning decisions live in one place.
-pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
+///
+/// `by_patch_point` is true when a PatchPoint invalidated the code. Such a version is no longer
+/// valid, so with --zjit-recompile-backoff, it may be replaced even beyond --zjit-max-versions.
+/// Recompile exits (guard failures) never invalidate a version beyond the limit.
+pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef, by_patch_point: bool) {
     let payload = get_or_create_iseq_payload(iseq);
     if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < max_iseq_versions()
+        && (payload.versions.len() < max_iseq_versions() || (by_patch_point && recompile_backoff_enabled()))
     {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
+        set_recompile_backoff(iseq, payload);
 
         // Recompile JIT-to-JIT calls into the invalidated ISEQ
         for incoming in unsafe { version.as_ref() }.incoming.iter() {
@@ -277,6 +282,36 @@ pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut 
             }
         }
     }
+}
+
+/// Return true if recompiles may back off. Then PatchPoints can recompile an ISEQ beyond
+/// --zjit-max-versions because the backoff bounds the compile rate instead.
+fn recompile_backoff_enabled() -> bool {
+    get_option!(recompile_backoff) > 1
+}
+
+/// Make the ISEQ that was just invalidated wait longer before it's compiled again.
+///
+/// Once the ISEQ has --zjit-recompile-backoff-versions versions (--zjit-max-versions by default),
+/// the k-th such invalidation makes the next compile wait for `call_threshold * backoff^k` calls
+/// instead of `call_threshold`. The number of recompiles is then logarithmic in the number of
+/// calls, even if an assumption keeps breaking. The calls are counted by the interpreter's
+/// jit_entry_calls, so the interpreter's per-call path stays the same.
+fn set_recompile_backoff(iseq: IseqPtr, payload: &mut IseqPayload) {
+    payload.backing_off = false;
+    let backoff = get_option!(recompile_backoff);
+    let backoff_versions = get_option!(recompile_backoff_versions).unwrap_or_else(max_iseq_versions).max(1);
+    let num_versions = payload.versions.len();
+    if backoff <= 1 || num_versions < backoff_versions {
+        return;
+    }
+    let exponent = u32::try_from(num_versions + 1 - backoff_versions).unwrap_or(u32::MAX);
+    let call_threshold = u64::from(unsafe { crate::options::rb_zjit_call_threshold }.max(1));
+    // jit_entry_calls is an unsigned int, so keep the window well below its range.
+    let calls = call_threshold.saturating_mul(u64::from(backoff).saturating_pow(exponent)).min(1 << 31);
+    unsafe { rb_zjit_iseq_backoff(iseq, calls as u32) };
+    payload.backing_off = true;
+    incr_counter!(recompile_backoff_count);
 }
 
 /// Stub a branch for a JIT-to-JIT call
@@ -348,10 +383,14 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         Some(IseqStatus::CantCompile(err)) => return Err(err.clone()),
         _ => {},
     }
-    // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    // If the ISEQ already has max versions, do not compile a new version. Reaching here with
+    // max versions means a PatchPoint invalidated the last version (exit_recompile() doesn't
+    // invalidate it), which is allowed to be replaced after a backoff. The replacement is
+    // compiled with the final-version policy (see CompilePolicy), so it doesn't speculate.
+    if payload.versions.len() >= max_iseq_versions() && !recompile_backoff_enabled() {
         return Err(CompileError::IseqVersionLimitReached);
     }
+    payload.backing_off = false;
 
     // Compile the ISEQ. When function is None, this is a lazy compile
     // from a stub hit -- wrap in a trace event covering the full compile.
@@ -3875,7 +3914,7 @@ c_callable! {
             let payload = get_or_create_iseq_payload(compiled_iseq);
             if let Some(version) = payload.versions.last_mut() {
                 let cb = ZJITState::get_code_block();
-                invalidate_iseq_version(cb, compiled_iseq, version);
+                invalidate_iseq_version(cb, compiled_iseq, version, false);
                 cb.mark_all_executable();
             }
         });
@@ -3888,6 +3927,78 @@ c_callable! {
     /// We should be able to compile most (if not all) function stubs by side-exiting at unsupported
     /// instructions, so this should be used primarily for cb.has_dropped_bytes() situations.
     fn function_stub_hit(iseq_call_ptr: *const c_void, cfp: CfpPtr, sp: *mut VALUE, ec: EcPtr) -> *const u8 {
+        // JIT-to-JIT calls don't eagerly fill nils to non-parameter locals.
+        // If we side-exit from function_stub_hit (before JIT code runs), we need to set them here.
+        fn prepare_for_exit(iseq: IseqPtr, cfp: CfpPtr, sp: *mut VALUE, argc: u16, num_opts_filled: u16, compile_error: Option<&CompileError>) {
+            unsafe {
+                // Caller frames are materialized by the materialize_exit trampoline before unwinding native frames.
+                // The current frame's pc and iseq are already set by function_stub_hit before this point.
+
+                // Set SP which gen_push_frame() doesn't set
+                rb_set_cfp_sp(cfp, sp);
+
+                let local_size = get_iseq_body_local_table_size(iseq).to_usize();
+                let params = iseq.params();
+                let params_size = params.size.to_usize();
+                let frame_base = sp.offset(-local_size_and_idx_to_bp_offset(local_size, 0) as isize);
+                let locals = slice::from_raw_parts_mut(frame_base, local_size);
+                // Fill nils to uninitialized (non-parameter) locals
+                locals.get_mut(params_size..).unwrap_or_default().fill(Qnil);
+
+                // SendDirect packs args without gaps for unfilled optionals.
+                // When we exit to the interpreter, we need to shift args right
+                // to create the gap and nil-fill the unfilled optional slots.
+                //
+                // Example: def target(req, a = a, b = b, kw:); target(1, kw: 2)
+                //   lead_num=1, opt_num=2, opts_filled=0, argc=2
+                //
+                //   locals[] as placed by SendDirect (argc=2, no gaps):
+                //     [req, kw_val, ?, ?, ?, ...]
+                //      0    1
+                //      ^----caller's args----^
+                //
+                //   locals[] expected by interpreter (params_size=4):
+                //     [req,  a,   b,  kw_val, ?, ...]
+                //      0     1    2   3
+                //            ^nil ^nil^--moved--^
+                //
+                //   gap_start = lead_num + opts_filled = 1
+                //   gap_end   = lead_num + opt_num     = 3
+                //   We move locals[gap_start..argc] to locals[gap_end..], then
+                //   nil-fill locals[gap_start..gap_end].
+                let opt_num: usize = params.opt_num.try_into().expect("ISEQ opt_num should be non-negative");
+                let opts_filled = num_opts_filled.to_usize();
+                let opts_unfilled = opt_num.saturating_sub(opts_filled);
+                if opts_unfilled > 0 {
+                    let argc = argc.to_usize();
+                    let lead_num: usize = params.lead_num.try_into().expect("ISEQ lead_num should be non-negative");
+                    let param_locals = &mut locals[..params_size];
+                    // Gap of unspecified optional parameters
+                    let gap_start = lead_num + opts_filled;
+                    let gap_end = lead_num + opt_num;
+                    // When there are arguments in the gap, shift them past the gap
+                    let args_overlapping_gap = gap_start..argc;
+                    if !args_overlapping_gap.is_empty() {
+                        assert!(
+                            gap_end.checked_add(args_overlapping_gap.len())
+                                .is_some_and(|new_end| new_end <= param_locals.len()) ,
+                            "shift past gap out-of-bounds. params={params:#?} args_overlapping_gap={args_overlapping_gap:?}"
+                        );
+                        param_locals.copy_within(args_overlapping_gap, gap_end);
+                    }
+                    // Nil-fill the now-vacant optional parameter slots
+                    param_locals[gap_start..gap_end].fill(Qnil);
+                }
+            }
+
+            // Increment a compile error counter for --zjit-stats
+            if let Some(compile_error) = compile_error {
+                if get_option!(stats) {
+                    incr_counter_by(exit_counter_for_compile_error(compile_error), 1);
+                }
+            }
+        }
+
         // Make sure cfp is ready to be scanned by other Ractors and GC before taking the barrier
         {
             unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
@@ -3910,6 +4021,13 @@ c_callable! {
             let ec_cfp = unsafe { ec.byte_add(RUBY_OFFSET_EC_CFP as usize) as *mut CfpPtr };
             unsafe { *ec_cfp = cfp };
             unsafe { rb_set_cfp_sp(cfp, sp) };
+
+            // While the ISEQ is backing off (see set_recompile_backoff), a stub hit only counts
+            // the call and exits to the interpreter, which doesn't need the VM lock.
+            if get_or_create_iseq_payload(iseq).backing_off && unsafe { rb_zjit_iseq_backoff_call(iseq) } {
+                prepare_for_exit(iseq, cfp, sp, iseq_call.argc, iseq_call.jit_entry_idx, None);
+                return ZJITState::get_materialize_exit_trampoline().raw_ptr(ZJITState::get_code_block());
+            }
         }
 
         with_vm_lock(src_loc!(), || {
@@ -3919,78 +4037,6 @@ c_callable! {
             let iseq = iseq_call.iseq.get();
             let argc = iseq_call.argc;
             let num_opts_filled = iseq_call.jit_entry_idx;
-
-            // JIT-to-JIT calls don't eagerly fill nils to non-parameter locals.
-            // If we side-exit from function_stub_hit (before JIT code runs), we need to set them here.
-            fn prepare_for_exit(iseq: IseqPtr, cfp: CfpPtr, sp: *mut VALUE, argc: u16, num_opts_filled: u16, compile_error: Option<&CompileError>) {
-                unsafe {
-                    // Caller frames are materialized by the materialize_exit trampoline before unwinding native frames.
-                    // The current frame's pc and iseq are already set by function_stub_hit before this point.
-
-                    // Set SP which gen_push_frame() doesn't set
-                    rb_set_cfp_sp(cfp, sp);
-
-                    let local_size = get_iseq_body_local_table_size(iseq).to_usize();
-                    let params = iseq.params();
-                    let params_size = params.size.to_usize();
-                    let frame_base = sp.offset(-local_size_and_idx_to_bp_offset(local_size, 0) as isize);
-                    let locals = slice::from_raw_parts_mut(frame_base, local_size);
-                    // Fill nils to uninitialized (non-parameter) locals
-                    locals.get_mut(params_size..).unwrap_or_default().fill(Qnil);
-
-                    // SendDirect packs args without gaps for unfilled optionals.
-                    // When we exit to the interpreter, we need to shift args right
-                    // to create the gap and nil-fill the unfilled optional slots.
-                    //
-                    // Example: def target(req, a = a, b = b, kw:); target(1, kw: 2)
-                    //   lead_num=1, opt_num=2, opts_filled=0, argc=2
-                    //
-                    //   locals[] as placed by SendDirect (argc=2, no gaps):
-                    //     [req, kw_val, ?, ?, ?, ...]
-                    //      0    1
-                    //      ^----caller's args----^
-                    //
-                    //   locals[] expected by interpreter (params_size=4):
-                    //     [req,  a,   b,  kw_val, ?, ...]
-                    //      0     1    2   3
-                    //            ^nil ^nil^--moved--^
-                    //
-                    //   gap_start = lead_num + opts_filled = 1
-                    //   gap_end   = lead_num + opt_num     = 3
-                    //   We move locals[gap_start..argc] to locals[gap_end..], then
-                    //   nil-fill locals[gap_start..gap_end].
-                    let opt_num: usize = params.opt_num.try_into().expect("ISEQ opt_num should be non-negative");
-                    let opts_filled = num_opts_filled.to_usize();
-                    let opts_unfilled = opt_num.saturating_sub(opts_filled);
-                    if opts_unfilled > 0 {
-                        let argc = argc.to_usize();
-                        let lead_num: usize = params.lead_num.try_into().expect("ISEQ lead_num should be non-negative");
-                        let param_locals = &mut locals[..params_size];
-                        // Gap of unspecified optional parameters
-                        let gap_start = lead_num + opts_filled;
-                        let gap_end = lead_num + opt_num;
-                        // When there are arguments in the gap, shift them past the gap
-                        let args_overlapping_gap = gap_start..argc;
-                        if !args_overlapping_gap.is_empty() {
-                            assert!(
-                                gap_end.checked_add(args_overlapping_gap.len())
-                                    .is_some_and(|new_end| new_end <= param_locals.len()) ,
-                                "shift past gap out-of-bounds. params={params:#?} args_overlapping_gap={args_overlapping_gap:?}"
-                            );
-                            param_locals.copy_within(args_overlapping_gap, gap_end);
-                        }
-                        // Nil-fill the now-vacant optional parameter slots
-                        param_locals[gap_start..gap_end].fill(Qnil);
-                    }
-                }
-
-                // Increment a compile error counter for --zjit-stats
-                if let Some(compile_error) = compile_error {
-                    if get_option!(stats) {
-                        incr_counter_by(exit_counter_for_compile_error(compile_error), 1);
-                    }
-                }
-            }
 
             // If we already know we can't compile the ISEQ, or there is insufficient native
             // stack space, fail early without cb.mark_all_executable().

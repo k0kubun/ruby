@@ -18,6 +18,10 @@ pub enum PerfMap {
 /// Default maximum number of compiled versions per ISEQ.
 pub const DEFAULT_MAX_VERSIONS: usize = 4;
 
+/// Default --zjit-recompile-backoff
+pub const DEFAULT_RECOMPILE_BACKOFF: RecompileBackoff = 2;
+pub type RecompileBackoff = u32;
+
 /// Default --zjit-num-profiles
 const DEFAULT_NUM_PROFILES: NumProfiles = 5;
 pub type NumProfiles = u16;
@@ -160,6 +164,15 @@ pub struct Options {
     /// Maximum number of versions per ISEQ
     pub max_versions: usize,
 
+    /// Multiplier of the number of calls an ISEQ must wait before each recompile, once it has
+    /// `recompile_backoff_versions` versions. 1 disables the backoff, and then PatchPoints
+    /// can't recompile an ISEQ that has `max_versions` versions. See `set_recompile_backoff`.
+    pub recompile_backoff: RecompileBackoff,
+
+    /// Number of versions an ISEQ must have before recompiles start backing off.
+    /// None means `max_versions`, i.e. only PatchPoint recompiles beyond the limit back off.
+    pub recompile_backoff_versions: Option<usize>,
+
     /// Per-callee size threshold for inlining, measured as the callee's YARV bytecode size
     /// (see `get_iseq_encoded_size`). Callees larger than this are rejected by `should_inline`.
     /// 0 disables inlining entirely.
@@ -233,6 +246,8 @@ impl Default for Options {
             allowed_iseqs: None,
             log_compiled_iseqs: None,
             max_versions: DEFAULT_MAX_VERSIONS,
+            recompile_backoff: DEFAULT_RECOMPILE_BACKOFF,
+            recompile_backoff_versions: None,
             inline_threshold: DEFAULT_INLINE_THRESHOLD,
             inline_budget: DEFAULT_INLINE_BUDGET as InlineBudget,
             inline_deny: HashSet::new(),
@@ -462,6 +477,16 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
         ("max-versions", _) => match opt_val.parse() {
             Ok(n) => options.max_versions = n,
             Err(_) => return None,
+        },
+
+        ("recompile-backoff", _) => match opt_val.parse() {
+            Ok(n) if n >= 1 => options.recompile_backoff = n,
+            _ => return None,
+        },
+
+        ("recompile-backoff-versions", _) => match opt_val.parse() {
+            Ok(n) if n >= 1 => options.recompile_backoff_versions = Some(n),
+            _ => return None,
         },
 
         ("inline-threshold", _) => match opt_val.parse() {
@@ -708,6 +733,13 @@ pub fn set_num_exits_until_invalidate(num_exits_until_invalidate: NumExits) {
 pub fn set_max_versions(max_versions: usize) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().max_versions = max_versions; }
+}
+
+/// Update --zjit-recompile-backoff for testing
+#[cfg(test)]
+pub fn set_recompile_backoff(recompile_backoff: RecompileBackoff) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().recompile_backoff = recompile_backoff; }
 }
 
 /// Update --zjit-inline-threshold for testing

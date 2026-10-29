@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_recompile_backoff};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -8226,6 +8226,8 @@ fn test_invokesuper_with_local_written_by_blockiseq() {
 
 #[test]
 fn test_max_iseq_versions() {
+    // --zjit-recompile-backoff=1 disables the backoff, so PatchPoints don't recompile beyond the limit.
+    set_recompile_backoff(1);
     let max_versions = max_iseq_versions();
     eval(&format!("
         TEST = -1
@@ -8250,6 +8252,109 @@ fn test_max_iseq_versions() {
 
     // The last call should not discard the JIT code
     assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+}
+
+/// Call `recv.name` until it gets a new compiled version, and return the number of calls it took.
+fn calls_until_recompile(call: &str, recv: &str, name: &str) -> usize {
+    let iseq = get_method_iseq(recv, name);
+    let num_versions = get_or_create_iseq_payload(iseq).versions.len();
+    for calls in 1..=1000 {
+        eval(call);
+        let payload = get_or_create_iseq_payload(iseq);
+        if payload.versions.len() > num_versions {
+            assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+            return calls;
+        }
+    }
+    panic!("{recv}.{name} was not recompiled after 1000 calls");
+}
+
+#[test]
+fn test_patch_point_recompiles_after_backoff() {
+    set_call_threshold(2);
+    set_max_versions(1);
+    set_recompile_backoff(2);
+    eval("
+        BACKOFF_CONST = 1
+        def backoff_const = BACKOFF_CONST
+        backoff_const; backoff_const # compile the only version allowed by --zjit-max-versions
+    ");
+    let iseq = get_method_iseq("self", "backoff_const");
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), 1);
+
+    // Redefinition invalidates the final version. The k-th invalidation at the version limit
+    // makes the next compile wait for call_threshold * 2^k calls, so the wait doubles each time.
+    for (k, expected_calls) in [(1, 4), (2, 8), (3, 16), (4, 32)] {
+        eval(&format!("Object.send(:remove_const, :BACKOFF_CONST); BACKOFF_CONST = {k}"));
+        let payload = get_or_create_iseq_payload(iseq);
+        assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+        assert_eq!(calls_until_recompile("backoff_const", "self", "backoff_const"), expected_calls);
+        assert_eq!(eval("backoff_const"), VALUE::fixnum_from_usize(k));
+    }
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), 5);
+}
+
+#[test]
+fn test_patch_point_recompiles_after_backoff_from_function_stub() {
+    set_call_threshold(2);
+    set_max_versions(1);
+    set_recompile_backoff(2);
+    set_inline_threshold(0);
+    eval("
+        STUB_BACKOFF_CONST = 1
+        def stub_backoff_callee = STUB_BACKOFF_CONST
+        def stub_backoff_caller = stub_backoff_callee
+        stub_backoff_callee; stub_backoff_callee
+        stub_backoff_caller; stub_backoff_caller
+        Object.send(:remove_const, :STUB_BACKOFF_CONST); STUB_BACKOFF_CONST = 2
+    ");
+
+    // The compiled caller calls the invalidated callee through a function stub, which must
+    // wait for the same number of calls as the interpreter before compiling the callee.
+    assert_eq!(calls_until_recompile("stub_backoff_caller", "self", "stub_backoff_callee"), 4);
+    assert_eq!(eval("stub_backoff_caller"), VALUE::fixnum_from_usize(2));
+}
+
+#[test]
+fn test_patch_point_at_max_versions_without_backoff() {
+    set_call_threshold(2);
+    set_max_versions(1);
+    set_recompile_backoff(1);
+    eval("
+        NO_BACKOFF_CONST = 1
+        def no_backoff_const = NO_BACKOFF_CONST
+        no_backoff_const; no_backoff_const
+        Object.send(:remove_const, :NO_BACKOFF_CONST); NO_BACKOFF_CONST = 2
+        100.times { no_backoff_const }
+    ");
+
+    // Without the backoff, the final version is never invalidated or recompiled.
+    let iseq = get_method_iseq("self", "no_backoff_const");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(payload.versions.len(), 1);
+    assert!(matches!(unsafe { payload.versions.last().unwrap().as_ref() }.status, IseqStatus::Compiled(_)));
+    assert_eq!(eval("no_backoff_const"), VALUE::fixnum_from_usize(2));
+}
+
+#[test]
+fn test_no_backoff_below_max_versions() {
+    set_call_threshold(2);
+    set_max_versions(4);
+    set_recompile_backoff(2);
+    eval("
+        BELOW_MAX_CONST = 0
+        def below_max_const = BELOW_MAX_CONST
+        below_max_const; below_max_const
+    ");
+
+    // Below --zjit-max-versions, recompiles wait for the call threshold as they did without the backoff.
+    for k in 1..4 {
+        eval(&format!("Object.send(:remove_const, :BELOW_MAX_CONST); BELOW_MAX_CONST = {k}"));
+        assert_eq!(calls_until_recompile("below_max_const", "self", "below_max_const"), 2);
+    }
+    // The invalidation at the limit starts backing off.
+    eval("Object.send(:remove_const, :BELOW_MAX_CONST); BELOW_MAX_CONST = 4");
+    assert_eq!(calls_until_recompile("below_max_const", "self", "below_max_const"), 4);
 }
 
 #[test]

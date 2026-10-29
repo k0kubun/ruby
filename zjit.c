@@ -197,6 +197,28 @@ rb_zjit_profile_enable(const rb_iseq_t *iseq)
     }
 }
 
+// Delay the next compile of an invalidated ISEQ until it's called `calls` more times.
+// The counter wraps around, so the interpreter still runs the profiling window right
+// before reaching rb_zjit_call_threshold, without changing its per-call check.
+void
+rb_zjit_iseq_backoff(const rb_iseq_t *iseq, unsigned int calls)
+{
+    ISEQ_BODY(iseq)->jit_entry_calls = rb_zjit_call_threshold - calls;
+}
+
+// Count a function stub hit for an ISEQ delayed by rb_zjit_iseq_backoff().
+// Return true if it should keep waiting before rb_zjit_iseq_has_profiled_enough().
+bool
+rb_zjit_iseq_backoff_call(const rb_iseq_t *iseq)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    if (body->jit_entry_calls > rb_zjit_call_threshold) {
+        body->jit_entry_calls++;
+        return true;
+    }
+    return false;
+}
+
 // Return false if a function stub has not collected enough profiles yet, enabling
 // profiling instructions as needed. Return true once enough profiles are collected.
 bool
