@@ -27,6 +27,161 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_expandarray_profiled_array() {
+        eval("
+            def test(o)
+              a, b = o
+              [a, b]
+            end
+            test([1, 2])
+            test([3, 4])
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v42:NilClass = Const Value(nil)
+          v41:NilClass = Const Value(nil)
+          v21:ArrayExact = GuardType v14, ArrayExact recompile
+          v22:CInt64 = ArrayLength v21
+          v23:CInt64[1] = Const CInt64(1)
+          v24:BasicObject = ArrayArefChecked v21, v23, v22
+          v25:CInt64[0] = Const CInt64(0)
+          v26:BasicObject = ArrayArefChecked v21, v25, v22
+          PatchPoint NoEPEscape(test)
+          v35:ArrayExact = NewArray v26, v24
+          CheckInterrupts
+          Return v35
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_nil() {
+        eval("
+            def test(o)
+              a, b = o
+              [a, b]
+            end
+            test(nil)
+            test(nil)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v43:NilClass = Const Value(nil)
+          v42:NilClass = Const Value(nil)
+          PatchPoint MethodRedefined(NilClass@0x1008, to_ary@0x1010, cme:0x1018)
+          PatchPoint MethodRedefined(NilClass@0x1008, respond_to?@0x1040, cme:0x1048)
+          PatchPoint MethodRedefined(NilClass@0x1008, respond_to_missing?@0x1070, cme:0x1078)
+          PatchPoint MethodRedefined(NilClass@0x1008, method_missing@0x10a0, cme:0x10a8)
+          v25:NilClass = GuardType v14, NilClass recompile
+          v26:NilClass = Const Value(nil)
+          v27:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          v36:ArrayExact = NewArray v27, v26
+          CheckInterrupts
+          Return v36
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_profiled_polymorphic() {
+        eval("
+            def test(o)
+              a, b = o
+              [a, b]
+            end
+            test(nil)
+            test([1, 2])
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :o@1
+          Jump bb3(v8, v9)
+        bb3(v13:BasicObject, v14:BasicObject):
+          v42:NilClass = Const Value(nil)
+          v41:NilClass = Const Value(nil)
+          v21:Array = ExpandArrayToAry v14
+          v22:CInt64 = ArrayLength v21
+          v23:CInt64[1] = Const CInt64(1)
+          v24:BasicObject = ArrayArefChecked v21, v23, v22
+          v25:CInt64[0] = Const CInt64(0)
+          v26:BasicObject = ArrayArefChecked v21, v25, v22
+          PatchPoint NoEPEscape(test)
+          v35:ArrayExact = NewArray v26, v24
+          CheckInterrupts
+          Return v35
+        ");
+    }
+
+    #[test]
+    fn test_expandarray_static_nil() {
+        eval("
+            def test
+              a, b = nil
+              [a, b]
+            end
+            test
+            test
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          Jump bb3(v6)
+        bb3(v10:BasicObject):
+          v39:NilClass = Const Value(nil)
+          v38:NilClass = Const Value(nil)
+          v16:NilClass = Const Value(nil)
+          PatchPoint MethodRedefined(NilClass@0x1000, to_ary@0x1008, cme:0x1010)
+          PatchPoint MethodRedefined(NilClass@0x1000, respond_to?@0x1038, cme:0x1040)
+          PatchPoint MethodRedefined(NilClass@0x1000, respond_to_missing?@0x1068, cme:0x1070)
+          PatchPoint MethodRedefined(NilClass@0x1000, method_missing@0x1098, cme:0x10a0)
+          v22:NilClass = Const Value(nil)
+          v23:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          v32:ArrayExact = NewArray v23, v22
+          CheckInterrupts
+          Return v32
+        ");
+    }
+
+    #[test]
     fn test_send_direct_rest_array_keeps_stripped_block_arg_in_exit_state() {
         eval("
             def rest_callee(*args) = args
