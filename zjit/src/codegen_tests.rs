@@ -9997,6 +9997,34 @@ fn test_no_ep_escape_invalidation_at_max_versions() {
 }
 
 #[test]
+fn test_attr_reader_shape_miss_on_final_version() {
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_max_versions(2);
+    let result = inspect(r#"
+        class FinalAttrShapeMiss
+          attr_reader :foo
+          def initialize(foo) = @foo = foo
+        end
+
+        def final_attr_shape_miss(obj, x) = [obj.foo, x.succ]
+
+        obj = FinalAttrShapeMiss.new(1)
+        final_attr_shape_miss(obj, 1); final_attr_shape_miss(obj, 1)       # compile v1
+        final_attr_shape_miss(obj, "a"); final_attr_shape_miss(obj, "a")   # invalidate v1, compile the final version
+        other = FinalAttrShapeMiss.allocate
+        other.instance_variable_set(:@bar, 2)
+        other.instance_variable_set(:@foo, 3)
+        [final_attr_shape_miss(obj, "a"), final_attr_shape_miss(other, "a"), final_attr_shape_miss(FinalAttrShapeMiss.allocate, "a")]
+    "#);
+    set_max_versions(old_max_versions);
+    set_call_threshold(old_call_threshold);
+    assert_snapshot!(result, @r#"[[1, "b"], [3, "b"], [nil, "b"]]"#);
+}
+
+#[test]
 fn test_float_arithmetic() {
     set_call_threshold(1);
     assert_snapshot!(assert_compiles_allowing_exits("def test = 1.5 + 2.5; test"), @"4.0");

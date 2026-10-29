@@ -8889,6 +8889,81 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_specialize_attr_reader_on_final_version() {
+        set_max_versions(2);
+        set_inline_threshold(0);
+        eval("
+            class FinalAttrReader
+              attr_reader :foo
+              def initialize = @foo = 3
+            end
+
+            def test(obj, x) = [obj.foo, x.succ]
+
+            obj = FinalAttrReader.new
+            30.times { test(obj, 1) }
+            30.times { test(obj, 'a') }
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :obj@0x1000
+          v4:BasicObject = LoadField v2, :x@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :obj@1
+          v9:BasicObject = LoadArg :x@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(FinalAttrReader@0x1008)
+          PatchPoint MethodRedefined(FinalAttrReader@0x1008, foo@0x1010, cme:0x1018)
+          v46:ObjectSubclass[class_exact:FinalAttrReader] = GuardType v12, ObjectSubclass[class_exact:FinalAttrReader] recompile
+          v48:CShape = LoadField v46, :shape_id@0x1040
+          v50:CShape[0x1041] = Const CShape(0x1041)
+          v51:CBool = IsBitEqual v48, v50
+          CondBranch v51, bb10(), bb11()
+        bb10():
+          v55:BasicObject = LoadField v46, :@foo@0x1042
+          Jump bb9(v55)
+        bb11():
+          v53:BasicObject = GetIvar v46, :@foo
+          Jump bb9(v53)
+        bb9(v49:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CondBranchHasType v13, StringExact, bb6(), bb7()
+        bb6():
+          v27:StringExact = RefineType v13, StringExact
+          PatchPoint NoSingletonClass(String@0x1048)
+          PatchPoint MethodRedefined(String@0x1048, succ@0x1050, cme:0x1058)
+          v60:BasicObject = CCallWithFrame v27, :String#succ@0x1080
+          Jump bb4(v60)
+        bb7():
+          CondBranchHasType v13, Fixnum, bb8(), bb5()
+        bb8():
+          v32:Fixnum = RefineType v13, Fixnum
+          PatchPoint MethodRedefined(Integer@0x1088, succ@0x1050, cme:0x1090)
+          v63:Fixnum[1] = Const Value(1)
+          v64:Fixnum = FixnumAdd v32, v63
+          Jump bb4(v64)
+        bb5():
+          PatchPoint NoSingletonClass(String@0x1048)
+          PatchPoint MethodRedefined(String@0x1048, succ@0x1050, cme:0x1058)
+          v68:StringExact = GuardType v13, StringExact recompile
+          v69:BasicObject = CCallWithFrame v68, :String#succ@0x1080
+          Jump bb4(v69)
+        bb4(v24:BasicObject):
+          v38:ArrayExact = NewArray v49, v24
+          CheckInterrupts
+          Return v38
+        ");
+    }
+
+    #[test]
     fn test_specialize_multiple_monomorphic_setivar_with_shape_transition() {
         eval(r#"
             klass = Class.new do

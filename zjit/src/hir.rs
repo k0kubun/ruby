@@ -5304,10 +5304,11 @@ impl Function {
                             if let Some(profiled_type) = profiled_type {
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
 
-                                let replacement = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
+                                let (next_block, replacement) = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
                                     self.count(block, counter);
-                                    self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state })
+                                    (block, self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state }))
                                 });
+                                block = next_block;
                                 self.make_equal_to(insn_id, replacement);
                             } else {
                                 // The class is statically known. Dispatch on the receiver shapes
@@ -6707,7 +6708,8 @@ impl Function {
         shape.layout() != ShapeLayout::RClass || self.assume_single_ractor_mode(block, state)
     }
 
-    fn try_emit_optimized_getivar(&mut self, block: BlockId, self_val: InsnId, id: ID, profiled_type: ProfiledType, state: InsnId) -> Result<InsnId, Counter> {
+    /// Returns the block to continue in and the ivar value.
+    fn try_emit_optimized_getivar(&mut self, block: BlockId, self_val: InsnId, id: ID, profiled_type: ProfiledType, state: InsnId) -> Result<(BlockId, InsnId), Counter> {
         if profiled_type.flags().is_immediate() {
             // Instance variable lookups on immediate values are always nil
             return Err(Counter::getivar_fallback_immediate);
@@ -6718,11 +6720,13 @@ impl Function {
             return Err(Counter::getivar_fallback_complex);
         }
         if self.policy.no_side_exits {
-            // On the final version, skip GetIvar shape specialization.
-            // iseq_to_hir already generates polymorphic branches with a
-            // GetIvar C call fallback for getinstancevariable, so we don't
-            // need to wrap it again here.
-            return Err(Counter::getivar_fallback_no_side_exits);
+            // The final version can't recompile on a shape guard failure, so compare the shape
+            // and call rb_ivar_get on a miss instead.
+            let self_val = self.guard_heap(block, self_val, state);
+            let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, u32::MAX, self_val, id, std::ptr::null(), state, false, Counter::getivar_fallback_shape_miss)
+                .expect("dispatch_getivar without exits always returns a value");
+            self.insn_types[result] = types::BasicObject;
+            return Ok((join_block, result));
         }
         if !self.assume_ivar_read_ractor_independent(block, profiled_type.shape(), state) {
             return Err(Counter::getivar_fallback_multi_ractor);
@@ -6730,7 +6734,7 @@ impl Function {
         let self_val = self.guard_heap(block, self_val, state);
         let shape = self.load_shape(block, self_val);
         self.guard_shape(block, shape, profiled_type.shape(), state, Some(Recompile));
-        Ok(self.load_ivar(block, self_val, profiled_type, id))
+        Ok((block, self.load_ivar(block, self_val, profiled_type, id)))
     }
 
     fn prepare_optimized_setivar(&mut self, id: ID, profiled_type: ProfiledType) -> Result<SetIvarSpec, Counter> {
@@ -11223,7 +11227,7 @@ fn add_iseq_to_hir(
                         ic,
                         exit_id,
                         !fun.policy.no_side_exits,
-                        Counter::getivar_fallback_no_side_exits,
+                        if profiled_types_unique_shapes.is_empty() { Counter::getivar_fallback_no_side_exits_no_profile } else { Counter::getivar_fallback_no_side_exits },
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
@@ -11275,7 +11279,7 @@ fn add_iseq_to_hir(
                         val,
                         exit_id,
                         !fun.policy.no_side_exits,
-                        Counter::setivar_fallback_no_side_exits,
+                        if specs.is_empty() { Counter::setivar_fallback_no_side_exits_no_profile } else { Counter::setivar_fallback_no_side_exits },
                     ) else {
                         // Side-exiting unconditionally; end the block.
                         break;
