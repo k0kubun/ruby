@@ -2790,6 +2790,27 @@ rb_builtin_fixnum_inc(rb_execution_context_t *ec, VALUE self, VALUE num)
     return LONG2FIX(FIX2LONG(num) + 1);
 }
 
+// Decrement a fixnum by 1.
+VALUE
+rb_builtin_fixnum_dec(rb_execution_context_t *ec, VALUE self, VALUE num)
+{
+    return LONG2FIX(FIX2LONG(num) - 1);
+}
+
+// Return true if a fixnum is zero.
+VALUE
+rb_builtin_fixnum_zero_p(rb_execution_context_t *ec, VALUE self, VALUE num)
+{
+    return RBOOL(num == INT2FIX(0));
+}
+
+// Return the length of the array as a fixnum.
+VALUE
+rb_builtin_ary_length(rb_execution_context_t *ec, VALUE self)
+{
+    return LONG2FIX(RARRAY_LEN(self));
+}
+
 VALUE
 rb_builtin_ary_first(rb_execution_context_t *ec, VALUE self)
 {

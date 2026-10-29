@@ -249,6 +249,28 @@ class Array
       end
     end
 
+    if Primitive.rb_builtin_basic_definition_p(:reverse_each)
+      undef :reverse_each
+
+      def reverse_each # :nodoc:
+        Primitive.attr! :inline_block, :c_trace, :without_interrupts
+
+        unless defined?(yield)
+          return Primitive.cexpr! 'SIZED_ENUMERATOR(self, 0, 0, ary_enum_length)'
+        end
+        i = Primitive.rb_builtin_ary_length
+        until Primitive.rb_builtin_fixnum_zero_p(i)
+          i = Primitive.rb_builtin_fixnum_dec(i)
+          yield Primitive.rb_builtin_ary_at(i)
+          # Like rb_ary_reverse_each(), continue from the new end if the block shrank self.
+          if Primitive.rb_builtin_ary_at_end(i)
+            i = Primitive.rb_builtin_ary_length
+          end
+        end
+        self
+      end
+    end
+
     if Primitive.rb_builtin_basic_definition_p(:map)
       undef :map
 

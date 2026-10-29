@@ -20,6 +20,9 @@ unsafe extern "C" {
     fn rb_builtin_ary_at(ec: EcPtr, self_: VALUE, index: VALUE) -> VALUE;
     fn rb_builtin_ary_first(ec: EcPtr, self_: VALUE) -> VALUE;
     fn rb_builtin_fixnum_inc(ec: EcPtr, self_: VALUE, num: VALUE) -> VALUE;
+    fn rb_builtin_fixnum_dec(ec: EcPtr, self_: VALUE, num: VALUE) -> VALUE;
+    fn rb_builtin_fixnum_zero_p(ec: EcPtr, self_: VALUE, num: VALUE) -> VALUE;
+    fn rb_builtin_ary_length(ec: EcPtr, self_: VALUE) -> VALUE;
     fn rb_builtin_bool_negate(ec: EcPtr, self_: VALUE, value: VALUE) -> VALUE;
 }
 
@@ -320,8 +323,11 @@ pub fn init() -> Annotations {
 
     annotate_builtin!(rb_builtin_bool_negate, inline_bool_negate, types::BoolExact);
 
-    // Array iteration builtins (used in with_jit Array#each, map, select, find)
+    // Array iteration builtins (used in with_jit Array#each, reverse_each, map, select)
     annotate_builtin!(rb_builtin_fixnum_inc, inline_fixnum_inc, types::Fixnum);
+    annotate_builtin!(rb_builtin_fixnum_dec, inline_fixnum_dec, types::Fixnum);
+    annotate_builtin!(rb_builtin_fixnum_zero_p, inline_fixnum_zero_p, types::BoolExact);
+    annotate_builtin!(rb_builtin_ary_length, inline_ary_length, types::Fixnum);
     annotate_builtin!(rb_builtin_ary_at, inline_ary_at);
     annotate_builtin!(rb_builtin_ary_at_end, inline_ary_at_end, types::BoolExact);
     annotate_builtin!(rb_builtin_ary_first, inline_ary_first);
@@ -1199,6 +1205,32 @@ fn inline_fixnum_inc(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::I
     let &[_self, num] = args else { return None; };
     let one = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(1)) });
     let result = fun.push_insn(block, hir::Insn::FixnumAdd { left: num, right: one, state });
+    Some(result)
+}
+
+/// Inline `fixnum_dec(ec, self, num)` implies FixnumSub(num, 1).
+/// num is always a positive Fixnum (Array#reverse_each checks fixnum_zero_p first).
+fn inline_fixnum_dec(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[_self, num] = args else { return None; };
+    let one = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(1)) });
+    let result = fun.push_insn(block, hir::Insn::FixnumSub { left: num, right: one, state });
+    Some(result)
+}
+
+/// Inline `fixnum_zero_p(ec, self, num)` implies FixnumEq(num, 0).
+fn inline_fixnum_zero_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[_self, num] = args else { return None; };
+    let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(0)) });
+    let result = fun.push_insn(block, hir::Insn::FixnumEq { left: num, right: zero });
+    Some(result)
+}
+
+/// Inline `ary_length(ec, self)` implies BoxFixnum(ArrayLength(self)).
+fn inline_ary_length(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[recv] = args else { return None; };
+    let recv = fun.push_insn(block, hir::Insn::RefineType { val: recv, new_type: types::Array });
+    let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
+    let result = fun.push_insn(block, hir::Insn::BoxFixnum { val: length, state });
     Some(result)
 }
 

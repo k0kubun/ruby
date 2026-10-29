@@ -1550,6 +1550,43 @@ fn test_inline_throwing_block_into_large_yielding_method() {
 }
 
 #[test]
+fn test_inline_block_break_from_array_reverse_each() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              r = []
+              a.reverse_each do |x|
+                break if x == :a
+                r << x
+              end
+              r
+            end
+            test([:a, :b, :c])
+            test([:a, :b, :c])
+        ", "test([:a, :b, :c])"), @"[:c, :b]");
+        assert_snapshot!(assert_compiles("test([])"), @"[]");
+    });
+}
+
+#[test]
+fn test_array_reverse_each_shrinking_array() {
+    // Like rb_ary_reverse_each(), continue from the new end when the block shrinks the array.
+    assert_snapshot!(assert_compiles_allowing_exits("
+        def test(a)
+          r = []
+          a.reverse_each do |x|
+            r << x
+            a.pop(2) if x == 5
+            a.push(9) if x == 2
+          end
+          r
+        end
+        test([1, 2, 3, 4, 5])
+        test([1, 2, 3, 4, 5])
+    "), @"[5, 3, 2, 1]");
+}
+
+#[test]
 fn test_inline_block_break_and_return_in_same_block() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("
