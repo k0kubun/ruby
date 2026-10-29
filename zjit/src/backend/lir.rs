@@ -2638,6 +2638,32 @@ impl Assembler
         use crate::backend::parcopy;
         use crate::backend::current::{C_RET_OPND, SCRATCH_REG, NATIVE_STACK_PTR};
 
+        let is_register = |interval: &Interval| {
+            interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs)).is_some()
+        };
+
+        // Precompute, for every CCall position, the register intervals covering it.
+        // Scanning every interval for every CCall is quadratic and dominates the
+        // compile time of huge functions, so instead we binary-search the sorted
+        // CCall positions inside each live range. Intervals are visited in VRegId
+        // order, so each list ends up sorted by VRegId.
+        let mut ccall_numbers: Vec<usize> = self.basic_blocks.iter()
+            .flat_map(|block| block.insns.iter().zip(block.insn_ids.iter()))
+            .filter(|(insn, _)| matches!(insn, Insn::CCall { .. }))
+            .map(|(_, insn_id)| insn_id.map(|id| id.0).unwrap_or(0))
+            .collect();
+        ccall_numbers.sort_unstable();
+        ccall_numbers.dedup();
+        let mut covering: Vec<Vec<VRegId>> = vec![vec![]; ccall_numbers.len()];
+        for interval in intervals.iter().filter(|interval| is_register(interval)) {
+            for range in interval.ranges.iter() {
+                let first = ccall_numbers.partition_point(|&n| n < range.from);
+                for (idx, _) in ccall_numbers[first..].iter().enumerate().take_while(|&(_, &n)| n < range.to) {
+                    covering[first + idx].push(interval.vreg_id);
+                }
+            }
+        }
+
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
             let old_insns = take(&mut block.insns);
@@ -2675,22 +2701,18 @@ impl Assembler
                         out_vreg_id.is_none_or(|id| !intervals[id].has_bounds() || intervals[id].born_at(insn_number)),
                         "a CCall's output interval must start at the CCall"
                     );
-                    let survivors: Vec<VRegId> = intervals.iter()
-                        .filter(|interval| {
-                            // We need to spill register intervals on this CCall in two cases:
-                            // 1) The VReg is live across the CCall. The VReg this CCall
-                            //    defines is not one of them: its range starts here, so it
-                            //    holds no value yet and there is nothing to preserve.
-                            let live_across_call = Some(interval.vreg_id) != out_vreg_id
-                                && interval.covers(insn_number);
-
-                            // 2) The VReg is referenced by the stack map for the CCall
-                            let stack_map_reg = stack_vreg_ids.contains(&interval.vreg_id);
-                            let is_register = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs)).is_some();
-                            is_register && (live_across_call || stack_map_reg)
-                        })
-                        .map(|interval| interval.vreg_id)
+                    // We need to spill register intervals on this CCall in two cases:
+                    // 1) The VReg is live across the CCall. The VReg this CCall
+                    //    defines is not one of them: its range starts here, so it
+                    //    holds no value yet and there is nothing to preserve.
+                    // 2) The VReg is referenced by the stack map for the CCall
+                    let call_idx = ccall_numbers.binary_search(&insn_number).unwrap();
+                    let mut survivors: Vec<VRegId> = covering[call_idx].iter().copied()
+                        .filter(|&vreg_id| Some(vreg_id) != out_vreg_id)
+                        .chain(stack_vreg_ids.iter().copied().filter(|&vreg_id| is_register(&intervals[vreg_id])))
                         .collect();
+                    survivors.sort_unstable();
+                    survivors.dedup();
 
                     let survivor_regs: Vec<Opnd> = survivors.iter()
                         .map(|&s| Opnd::Reg(intervals[s].assigned.get().unwrap().assigned_reg(alloc_regs).unwrap()))
