@@ -896,6 +896,10 @@ pub enum BlockHandler {
     /// guarded Proc value, which becomes the callee frame's block handler
     /// (a Proc VALUE is itself a valid block handler).
     BlockArgProc(InsnId),
+    /// The block handler of the current method frame, passed through as the callee frame's
+    /// specval like `super` does implicitly. The InsnId is a raw (CInt64) block handler,
+    /// which may be VM_BLOCK_HANDLER_NONE.
+    FrameBlock(InsnId),
 }
 
 /// Identifier used by LoadField/StoreField/LoadArg for HIR dumps. Variants
@@ -1641,7 +1645,7 @@ macro_rules! for_each_operand_impl {
             }
             Insn::PushInlineFrame { recv, state, block, .. } => {
                 $visit_one!(*recv);
-                if let Some(BlockHandler::BlockArgProc(id)) = &$($mut)? *block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::FrameBlock(id)) = &$($mut)? *block {
                     $visit_one!(*id);
                 }
                 $visit_one!(*state);
@@ -1657,7 +1661,7 @@ macro_rules! for_each_operand_impl {
             Insn::SendDirect(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::BlockArgProc(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -2068,6 +2072,7 @@ impl<'a> InsnPrinter<'a> {
     fn block_handler(&self, block: &BlockHandler) -> String {
         match block {
             BlockHandler::BlockArgProc(proc_id) => format!("&{proc_id}"),
+            BlockHandler::FrameBlock(block_handler) => format!("frame_block:{block_handler}"),
             BlockHandler::BlockIseq(blockiseq) => format!("{:p}", self.ptr_map.map_ptr(*blockiseq)),
             BlockHandler::BlockArg => "&block".to_string(),
         }
@@ -2334,8 +2339,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                         write!(f, "Send {recv}, {:p}, :{}", self.ptr_map.map_ptr(blockiseq), ruby_call_method_name(*cd))?,
                     Some(BlockHandler::BlockArg) =>
                         write!(f, "Send {recv}, &block, :{}", ruby_call_method_name(*cd))?,
-                    Some(BlockHandler::BlockArgProc(_)) =>
-                        unreachable!("BlockArgProc is not sent through Send"),
+                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)) =>
+                        unreachable!("BlockArgProc and FrameBlock are not sent through Send"),
                     None =>
                         write!(f, "Send {recv}, :{}", ruby_call_method_name(*cd))?,
                 }
@@ -5477,7 +5482,7 @@ impl Function {
 
                                 let blockiseq = match send_block {
                                     Some(BlockHandler::BlockArg) => unreachable!("unsupported &block should have been filtered out"),
-                                    Some(BlockHandler::BlockArgProc(_)) => unreachable!("BlockArgProc is only built for ISEQ callees"),
+                                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)) => unreachable!("BlockArgProc and FrameBlock are only built for ISEQ callees"),
                                     Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq),
                                     None => None,
                                 };
@@ -5702,7 +5707,8 @@ impl Function {
                             mid: ID,
                             state: InsnId,
                             local_iseq: IseqPtr,
-                        ) {
+                            pass_frame_block: bool,
+                        ) -> Option<InsnId> {
                             fun.push_insn(block, Insn::PatchPoint {
                                 invariant: Invariant::MethodRedefined {
                                     klass: unsafe { (*super_cme).defined_class },
@@ -5723,6 +5729,10 @@ impl Function {
                             // Guard that it matches the expected CME
                             fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
 
+                            if pass_frame_block {
+                                // `super` implicitly passes the method's block. Return it for the caller to pass through.
+                                return Some(fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::CInt64));
+                            }
                             let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
                             fun.push_insn(block, Insn::GuardBitEquals {
                                 val: block_handler,
@@ -5731,6 +5741,7 @@ impl Function {
                                 state,
                                 recompile: None,
                             });
+                            None
                         }
 
                         // Don't handle calls with literal blocks (e.g., super { ... })
@@ -5827,22 +5838,49 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
-                            emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
+                            // A method with `&nil` raises when given a block, so only pass the frame's block to
+                            // others, and keep the guard that the frame has no block for `&nil`.
+                            let pass_frame_block = unsafe { super_iseq.params() }.flags.accepts_no_block() == 0;
+                            let frame_block = emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq, pass_frame_block);
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
                             // Use SendDirect with the super method's CME and ISEQ.
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
+                            let send_direct = |block| Insn::SendDirect(Box::new(SendDirectData {
                                 recv,
                                 cd,
                                 cme: super_cme,
                                 iseq: super_iseq,
-                                args: send_args,
+                                args: send_args.clone(),
                                 kw_bits,
                                 jit_entry_idx,
                                 state: send_state,
-                                block: None,
-                            })));
+                                block,
+                            }));
+                            let replacement = if let Some(frame_block) = frame_block {
+                                // Branch on whether the method was given a block. Without one, emit the
+                                // block-less call, which may be inlined. With one, pass it through.
+                                let none = self.push_insn(block, Insn::Const { val: Const::CInt64(VM_BLOCK_HANDLER_NONE.into()) });
+                                let no_block = self.push_insn(block, Insn::IsBitEqual { left: frame_block, right: none });
+                                let no_block_bb = self.new_block(u32::MAX);
+                                let frame_block_bb = self.new_block(u32::MAX);
+                                let join_block = self.new_block(u32::MAX);
+                                self.push_insn(block, Insn::CondBranch {
+                                    val: no_block,
+                                    if_true: BranchEdge { target: no_block_bb, args: vec![] },
+                                    if_false: BranchEdge { target: frame_block_bb, args: vec![] },
+                                });
+                                let result = self.try_inline_send_direct(no_block_bb, send_direct(None));
+                                self.push_insn(no_block_bb, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+                                let result = self.push_insn(frame_block_bb, send_direct(Some(BlockHandler::FrameBlock(frame_block))));
+                                self.push_insn(frame_block_bb, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+                                let result = self.push_insn(join_block, Insn::Param);
+                                self.insn_types[result] = types::BasicObject;
+                                block = join_block;
+                                result
+                            } else {
+                                self.try_inline_send_direct(block, send_direct(None))
+                            };
                             self.make_equal_to(insn_id, replacement);
 
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
@@ -5865,7 +5903,7 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
+                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq, false);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -5915,7 +5953,7 @@ impl Function {
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
-                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq);
+                                    emit_super_call_guards(self, block, super_cme, current_cme, mid, state, frame_state_iseq, false);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -6151,7 +6189,9 @@ impl Function {
                 // If the literal block may `break` or `return`, inlining both the method and the
                 // block may turn the throw into a jump, so skip the budget heuristic as well.
                 let throw_inlinable = inline_block && blockiseq.is_some_and(crate::codegen::block_iseq_may_throw);
-                if !self.should_inline(iseq, cme, inline_block, throw_inlinable) || !Self::can_inline(iseq) {
+                // The inliner doesn't know how to yield to a block handler loaded from the frame.
+                let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
+                if frame_block || !self.should_inline(iseq, cme, inline_block, throw_inlinable) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -8590,6 +8630,9 @@ impl Function {
                 }
                 if let Some(BlockHandler::BlockArgProc(proc_id)) = insn.block {
                     self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
+                }
+                if let Some(BlockHandler::FrameBlock(block_handler)) = insn.block {
+                    self.assert_subtype(insn_id, block_handler, types::CInt64)?;
                 }
                 Ok(())
             }

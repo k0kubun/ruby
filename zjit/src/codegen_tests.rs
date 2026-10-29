@@ -3548,6 +3548,98 @@ fn test_invokesuper_forwards_block_param() {
 }
 
 #[test]
+fn test_invokesuper_passes_frame_block_without_exit() {
+    eval(r#"
+        class A
+          def foo(x) = yield(x)
+        end
+        class B < A
+          def foo(x) = super
+        end
+        def test(x) = B.new.foo(x) { |y| y * 10 }
+        test(1); test(1)
+    "#);
+    assert_snapshot!(assert_compiles("test(2)"), @"20");
+}
+
+#[test]
+fn test_invokesuper_passes_frame_block_param_without_exit() {
+    eval(r#"
+        class A
+          def foo(x) = yield(x)
+        end
+        class B < A
+          def foo(x, &block) = super(x)
+        end
+        def test(x) = B.new.foo(x, &:succ)
+        test(1); test(1)
+    "#);
+    assert_snapshot!(assert_compiles("test(2)"), @"3");
+}
+
+#[test]
+fn test_invokesuper_passes_no_frame_block() {
+    eval(r#"
+        class A
+          def foo(x) = block_given? ? yield(x) : [:no_block, x]
+        end
+        class B < A
+          def foo(x) = super
+        end
+        def test(x) = [B.new.foo(x) { |y| [:blk, y] }, B.new.foo(x)]
+        test(1); test(1)
+    "#);
+    assert_snapshot!(inspect("test(2)"), @"[[:blk, 2], [:no_block, 2]]");
+}
+
+#[test]
+fn test_invokesuper_passes_frame_block_that_breaks() {
+    eval(r#"
+        class A
+          def foo = yield
+        end
+        class B < A
+          def foo = super
+        end
+        def test = B.new.foo { break :broke }
+        test; test
+    "#);
+    assert_snapshot!(assert_compiles("test"), @":broke");
+}
+
+#[test]
+fn test_invokesuper_to_method_rejecting_block() {
+    eval(r#"
+        class A
+          def foo(&nil) = :ok
+        end
+        class B < A
+          def foo = super
+        end
+        def test = B.new.foo
+        def test_block = begin; B.new.foo { }; rescue ArgumentError => e; e.message; end
+        test; test
+    "#);
+    assert_snapshot!(inspect("[test, test_block, test_block]"), @r#"[:ok, "no block accepted", "no block accepted"]"#);
+}
+
+#[test]
+fn test_defined_super_with_block() {
+    eval(r#"
+        class A
+          def foo = :a
+        end
+        class B < A
+          def foo = defined?(super)
+          def bar = defined?(super)
+        end
+        def test = [B.new.foo { }, B.new.bar { }]
+        test; test
+    "#);
+    assert_snapshot!(assert_compiles("test"), @r#"["super", nil]"#);
+}
+
+#[test]
 fn test_invokesuper_with_blockarg() {
     assert_snapshot!(inspect(r#"
         class A
