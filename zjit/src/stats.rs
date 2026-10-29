@@ -331,7 +331,9 @@ make_counters! {
         setivar_fallback_shape_transition,
         setivar_fallback_new_shape_complex,
         setivar_fallback_new_shape_needs_extension,
+        // Final version: runtime miss of the profiled shapes, or no profiled shape at all
         setivar_fallback_no_side_exits,
+        setivar_fallback_no_side_exits_no_profile,
         setivar_fallback_no_profile,
         setivar_fallback_shape_miss,
     }
@@ -347,7 +349,9 @@ make_counters! {
         getivar_fallback_immediate,
         getivar_fallback_not_t_object,
         getivar_fallback_complex,
+        // Final version: runtime miss of the profiled shapes, or no profiled shape at all
         getivar_fallback_no_side_exits,
+        getivar_fallback_no_side_exits_no_profile,
         getivar_fallback_shape_miss,
         getivar_fallback_multi_ractor,
     }
