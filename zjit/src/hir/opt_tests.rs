@@ -11538,9 +11538,9 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_setivar_shape_guard_attr_writer_no_recompile() {
-        // attr_writer SetIvar has no inline cache and may target a receiver
-        // operand other than CFP self, so don't recompile here yet.
+    fn test_attr_writer_shape_miss_calls_setivar() {
+        // attr_writer may target a receiver operand other than CFP self, so a shape
+        // miss calls SetIvar instead of side-exiting.
         eval("
             class C
               attr_writer :foo
@@ -11561,7 +11561,7 @@ mod hir_opt_tests {
             d.write(c)  # profile
             d.write(c)  # compile (version 1 with shape guard)
             e = C.new(true)  # same class, different shape
-            100.times { d.write(e) }  # shape guard exits, but no recompile
+            100.times { d.write(e) }  # shape misses take the SetIvar fallback
         ");
         assert_snapshot!(hir_string_proc("D.new.method(:write)"), @"
         fn write@<compiled>:12:
@@ -11578,16 +11578,19 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:HeapBasicObject, v10:BasicObject):
           v17:Fixnum[5] = Const Value(5)
-          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
-        bb6():
-          v23:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
-          SetIvar v23, :@foo, v17
-          Jump bb4(v17)
+          v30:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
+          v32:CShape = LoadField v30, :shape_id@0x1040
+          v33:CShape[0x1041] = Const CShape(0x1041)
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb5(), bb6()
         bb5():
-          v26:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v26)
-        bb4(v20:BasicObject):
+          StoreField v30, :@foo@0x1042, v17
+          Jump bb4()
+        bb6():
+          SetIvar v30, :@foo, v17
+          Jump bb4()
+        bb4():
           PatchPoint NoEPEscape(write)
           CheckInterrupts
           Return v17
@@ -12205,7 +12208,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_dont_optimize_attr_accessor_polymorphic() {
+    fn test_attr_reader_two_shapes_of_known_class() {
         set_call_threshold(3);
         eval("
             class C
@@ -12249,8 +12252,25 @@ mod hir_opt_tests {
           v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v32:BasicObject = GetIvar v18, :@foo
-          Jump bb4(v32)
+          v33:CShape = LoadField v18, :shape_id@0x1040
+          v35:CShape[0x1041] = Const CShape(0x1041)
+          v36:CBool = IsBitEqual v33, v35
+          CondBranch v36, bb8(), bb9()
+        bb8():
+          v38:BasicObject = LoadField v18, :@foo@0x1042
+          Jump bb7(v38)
+        bb9():
+          v40:CShape[0x1043] = Const CShape(0x1043)
+          v41:CBool = IsBitEqual v33, v40
+          CondBranch v41, bb10(), bb11()
+        bb10():
+          v45:BasicObject = LoadField v18, :@foo@0x1044
+          Jump bb7(v45)
+        bb11():
+          v43:BasicObject = GetIvar v18, :@foo
+          Jump bb7(v43)
+        bb7(v34:BasicObject):
+          Jump bb4(v34)
         bb5():
           v21:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
           Jump bb4(v21)
@@ -12258,6 +12278,305 @@ mod hir_opt_tests {
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v15
+        ");
+    }
+
+    #[test]
+    fn test_attr_writer_two_shapes_of_known_class() {
+        set_call_threshold(3);
+        eval("
+            class C
+              attr_writer :foo
+              def initialize(extra) = (@bar = 1 if extra; @foo = 0)
+            end
+            class D
+              attr_writer :foo
+            end
+            O1 = C.new(false)
+            O2 = C.new(true)
+            def test(o) = o.foo = 5
+            test O1
+            test O2
+            test D.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:11:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v17:Fixnum[5] = Const Value(5)
+          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
+        bb6():
+          v23:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
+          v38:CShape = LoadField v23, :shape_id@0x1040
+          v39:CShape[0x1041] = Const CShape(0x1041)
+          v40:CBool = IsBitEqual v38, v39
+          CondBranch v40, bb8(), bb9()
+        bb8():
+          StoreField v23, :@foo@0x1042, v17
+          Jump bb7()
+        bb9():
+          v44:CShape[0x1043] = Const CShape(0x1043)
+          v45:CBool = IsBitEqual v38, v44
+          CondBranch v45, bb10(), bb11()
+        bb10():
+          StoreField v23, :@foo@0x1044, v17
+          Jump bb7()
+        bb11():
+          SetIvar v23, :@foo, v17
+          Jump bb7()
+        bb7():
+          Jump bb4(v17)
+        bb5():
+          v26:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v26)
+        bb4(v20:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v17
+        ");
+    }
+
+    #[test]
+    fn test_attr_accessor_known_class_from_polymorphic_callee_profile() {
+        // The receiver class is known from `C.new` after inlining, but the callee's send
+        // profile is polymorphic across classes. Use the profiled shapes of C.
+        eval("
+            class C
+              attr_accessor :foo
+              def initialize = (@foo = 1)
+            end
+            class D
+              attr_accessor :foo
+              def initialize = (@foo = 2)
+            end
+            def get(o) = o.foo
+            def set(o) = o.foo = 3
+            get(C.new); get(D.new); set(C.new); set(D.new)
+            def test = (o = C.new; set(o); get(o))
+            test
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:13:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v5:BasicObject = LoadArg :self@0
+          Jump bb3(v5)
+        bb3(v8:BasicObject):
+          v170:NilClass = Const Value(nil)
+          v13:NilClass = Const Value(nil)
+          PatchPoint StableConstantNames(0x1000, C)
+          v16:ClassSubclass[C@0x1008] = Const Value(VALUE(0x1008))
+          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(C@0x1008, new@0x1009, cme:0x1010)
+          v69:ObjectSubclass[class_exact:C] = ObjectAllocClass C:VALUE(0x1008)
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, initialize@0x1038, cme:0x1040)
+          PushInlineFrame :initialize, v69 (0x1068), num_args=0
+          v88:Fixnum[1] = Const Value(1)
+          v92:CShape = LoadField v69, :shape_id@0x1088
+          v93:CShape[0x1089] = GuardBitEquals v92, CShape(0x1089) recompile
+          StoreField v69, :@foo@0x108a, v88
+          v96:CShape[0x108b] = Const CShape(0x108b)
+          StoreField v69, :shape_id@0x1088, v96
+          PopInlineFrame
+          PatchPoint MethodRedefined(Object@0x1090, set@0x1098, cme:0x10a0)
+          v78:ObjectSubclass[class_exact*:Object@VALUE(0x1090)] = GuardType v8, ObjectSubclass[class_exact*:Object@VALUE(0x1090)] recompile
+          PushInlineFrame :set, v78 (0x10c8), num_args=1
+          v115:Fixnum[3] = Const Value(3)
+          PatchPoint MethodRedefined(C@0x1008, foo=@0x10e8, cme:0x10f0)
+          v181:CShape[0x108b] = Const CShape(0x108b)
+          v182:CBool = IsBitEqual v96, v181
+          CondBranch v182, bb25(), bb26()
+        bb25():
+          StoreField v69, :@foo@0x108a, v115
+          Jump bb24()
+        bb26():
+          SetIvar v69, :@foo, v115
+          Jump bb24()
+        bb24():
+          PatchPoint NoEPEscape(set)
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(Object@0x1090, get@0x1118, cme:0x1120)
+          PushInlineFrame :get, v78 (0x1148), num_args=1
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1168, cme:0x1170)
+          v191:CShape = LoadField v69, :shape_id@0x1088
+          v193:CShape[0x108b] = Const CShape(0x108b)
+          v194:CBool = IsBitEqual v191, v193
+          CondBranch v194, bb28(), bb29()
+        bb28():
+          v198:BasicObject = LoadField v69, :@foo@0x108a
+          Jump bb27(v198)
+        bb29():
+          v196:BasicObject = GetIvar v69, :@foo
+          Jump bb27(v196)
+        bb27(v192:BasicObject):
+          PatchPoint NoEPEscape(get)
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v192
+        ");
+    }
+
+    #[test]
+    fn test_attr_reader_lazily_initialized_ivar() {
+        // An attr_reader of an ivar that is only set on some objects (`@x ||= ...`) reads nil
+        // for the shape without it instead of calling GetIvar.
+        set_call_threshold(3);
+        eval("
+            class C
+              attr_reader :x
+              def initialize = (@a = 1)
+              def init_x = (@x ||= 2)
+            end
+            O1 = C.new
+            O2 = C.new
+            O2.init_x
+            def test(o) = o.x
+            test O1
+            test O2
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:10:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
+        bb6():
+          v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint NoSingletonClass(C@0x1008)
+          PatchPoint MethodRedefined(C@0x1008, x@0x1010, cme:0x1018)
+          v33:CShape = LoadField v18, :shape_id@0x1040
+          v35:CShape[0x1041] = Const CShape(0x1041)
+          v36:CBool = IsBitEqual v33, v35
+          CondBranch v36, bb8(), bb9()
+        bb8():
+          v38:BasicObject = LoadField v18, :@x@0x1042
+          Jump bb7(v38)
+        bb9():
+          v40:CShape[0x1043] = Const CShape(0x1043)
+          v41:CBool = IsBitEqual v33, v40
+          CondBranch v41, bb10(), bb11()
+        bb10():
+          v45:NilClass = Const Value(nil)
+          Jump bb7(v45)
+        bb11():
+          v43:BasicObject = GetIvar v18, :@x
+          Jump bb7(v43)
+        bb7(v34:BasicObject):
+          Jump bb4(v34)
+        bb5():
+          v21:BasicObject = Send v10, :x # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v21)
+        bb4(v15:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn test_attr_writer_shape_transition_in_polymorphic_profile() {
+        set_call_threshold(3);
+        eval("
+            class C
+              attr_writer :foo
+              def initialize = (@a = 1)
+            end
+            class D
+              attr_writer :foo
+            end
+            O1 = C.new
+            def test(o) = o.foo = 5
+            test C.new
+            test O1
+            test D.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:10:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v17:Fixnum[5] = Const Value(5)
+          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb7()
+        bb6():
+          v23:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
+          v43:CShape = LoadField v23, :shape_id@0x1040
+          v44:CShape[0x1041] = Const CShape(0x1041)
+          v45:CBool = IsBitEqual v43, v44
+          CondBranch v45, bb10(), bb11()
+        bb10():
+          StoreField v23, :@foo@0x1042, v17
+          v50:CShape[0x1043] = Const CShape(0x1043)
+          StoreField v23, :shape_id@0x1040, v50
+          Jump bb9()
+        bb11():
+          SetIvar v23, :@foo, v17
+          Jump bb9()
+        bb9():
+          Jump bb4(v17)
+        bb7():
+          CondBranchHasType v10, ObjectSubclass[class_exact:D], bb8(), bb5()
+        bb8():
+          v28:ObjectSubclass[class_exact:D] = RefineType v10, ObjectSubclass[class_exact:D]
+          PatchPoint MethodRedefined(D@0x1048, foo=@0x1010, cme:0x1050)
+          v55:CShape = LoadField v28, :shape_id@0x1040
+          v56:CShape[0x1078] = Const CShape(0x1078)
+          v57:CBool = IsBitEqual v55, v56
+          CondBranch v57, bb13(), bb14()
+        bb13():
+          StoreField v28, :@foo@0x1079, v17
+          v62:CShape[0x107a] = Const CShape(0x107a)
+          StoreField v28, :shape_id@0x1040, v62
+          Jump bb12()
+        bb14():
+          SetIvar v28, :@foo, v17
+          Jump bb12()
+        bb12():
+          Jump bb4(v17)
+        bb5():
+          v31:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v31)
+        bb4(v20:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v17
         ");
     }
 
@@ -13382,10 +13701,18 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
           v30:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
           v32:CShape = LoadField v30, :shape_id@0x1040
-          v33:CShape[0x1041] = GuardBitEquals v32, CShape(0x1041)
+          v33:CShape[0x1041] = Const CShape(0x1041)
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb5(), bb6()
+        bb5():
           StoreField v30, :@foo@0x1042, v17
-          v35:CShape[0x1043] = Const CShape(0x1043)
-          StoreField v30, :shape_id@0x1040, v35
+          v39:CShape[0x1043] = Const CShape(0x1043)
+          StoreField v30, :shape_id@0x1040, v39
+          Jump bb4()
+        bb6():
+          SetIvar v30, :@foo, v17
+          Jump bb4()
+        bb4():
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v17
@@ -13421,10 +13748,18 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
           v30:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
           v32:CShape = LoadField v30, :shape_id@0x1040
-          v33:CShape[0x1041] = GuardBitEquals v32, CShape(0x1041)
+          v33:CShape[0x1041] = Const CShape(0x1041)
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb5(), bb6()
+        bb5():
           StoreField v30, :@foo@0x1042, v17
-          v35:CShape[0x1043] = Const CShape(0x1043)
-          StoreField v30, :shape_id@0x1040, v35
+          v39:CShape[0x1043] = Const CShape(0x1043)
+          StoreField v30, :shape_id@0x1040, v39
+          Jump bb4()
+        bb6():
+          SetIvar v30, :@foo, v17
+          Jump bb4()
+        bb4():
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v17

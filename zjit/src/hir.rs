@@ -5040,6 +5040,9 @@ impl Function {
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
         for block in self.reverse_post_order() {
+            // Shape dispatch for attr_reader/attr_writer may split `block`; the rest of the old
+            // instructions are then pushed onto its join block.
+            let mut block = block;
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
@@ -5307,29 +5310,49 @@ impl Function {
                                 });
                                 self.make_equal_to(insn_id, replacement);
                             } else {
-                                // No shape information, just static class information
-                                let resolution = self.resolve_receiver_type_from_profile(recv, state);
-                                let counter = Self::getivar_fallback_reason(resolution, std::ptr::null());
-                                self.count(block, counter);
-                                let getivar = self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state });
-                                self.make_equal_to(insn_id, getivar);
+                                // The class is statically known. Dispatch on the receiver shapes
+                                // profiled for that class, falling back to a C call on a miss.
+                                let profiled_types: Vec<_> = self.attr_receiver_profiles(recv, klass, state)
+                                    .into_iter().filter(|profiled_type| !profiled_type.shape().is_complex()).collect();
+                                if profiled_types.is_empty() {
+                                    let resolution = self.resolve_receiver_type_from_profile(recv, state);
+                                    self.count(block, Self::getivar_fallback_reason(resolution));
+                                    let getivar = self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state });
+                                    self.make_equal_to(insn_id, getivar);
+                                } else {
+                                    let recv = self.guard_heap(block, recv, state);
+                                    let (join_block, result) = self.dispatch_getivar(&profiled_types, block, u32::MAX, recv, id, std::ptr::null(), state, false, Counter::getivar_fallback_shape_miss)
+                                        .expect("dispatch_getivar without exits always returns a value");
+                                    self.insn_types[result] = types::BasicObject;
+                                    block = join_block;
+                                    self.make_equal_to(insn_id, result);
+                                }
                             }
                         } else if let (false, VM_METHOD_TYPE_ATTRSET, &[val]) = (has_block, def_type, args.as_slice()) {
                             self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
                             let id = unsafe { get_cme_def_body_attr_id(cme) };
                             if let Some(profiled_type) = profiled_type {
-                                // TODO: attr_writer SetIvar has a null inline cache and may target a receiver
-                                // operand other than CFP self. Support it with a reprofile strategy that
-                                // profiles the receiver operand even after the send insn has finished profiling.
                                 recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
-                                let recompile = None;
-                                self.try_emit_optimized_setivar(block, recv, id, val, profiled_type, state, recompile).unwrap_or_else(|counter| {
-                                    self.count(block, counter);
-                                    self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
-                                });
-                            } else {
-                                // No shape information, just static class information
+                            }
+                            // Dispatch on every profiled shape of the class, including ones that need a
+                            // shape transition, and call rb_ivar_set on a miss. The receiver may not be
+                            // CFP self, so a shape guard exit could not be fixed by recompiling.
+                            let mut specs = vec![];
+                            let mut unoptimized_reason = None;
+                            for profiled_type in self.attr_receiver_profiles(recv, klass, state) {
+                                match self.prepare_optimized_setivar(id, profiled_type) {
+                                    Ok(spec) => specs.push(spec),
+                                    Err(counter) => { unoptimized_reason.get_or_insert(counter); }
+                                }
+                            }
+                            let unoptimized_reason = unoptimized_reason.unwrap_or(Counter::setivar_fallback_no_profile);
+                            if specs.is_empty() {
+                                self.count(block, unoptimized_reason);
                                 self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
+                            } else {
+                                let recv = self.guard_heap(block, recv, state);
+                                block = self.dispatch_setivar(&specs, None, block, u32::MAX, recv, id, std::ptr::null(), val, state, false, Counter::setivar_fallback_shape_miss)
+                                    .expect("dispatch_setivar without exits always continues");
                             }
                             self.make_equal_to(insn_id, val);
                         } else if !has_block && def_type == VM_METHOD_TYPE_OPTIMIZED {
@@ -6647,12 +6670,30 @@ impl Function {
         }
     }
 
-    fn getivar_fallback_reason(resolution: ReceiverTypeResolution, ic: *const iseq_inline_iv_cache_entry) -> Counter {
+    /// Profiled heap receiver types of `class` at `state`, de-duplicated by shape, for
+    /// shape-specializing an attr_reader/attr_writer on a receiver of a statically known class.
+    fn attr_receiver_profiles(&self, recv: InsnId, class: VALUE, state: InsnId) -> Vec<ProfiledType> {
+        let Some(profiles) = self.profiles.as_ref() else { return vec![] };
+        let summary = self.profile_summary(profiles, recv, state);
+        let mut result: Vec<ProfiledType> = vec![];
+        for &profiled_type in summary.buckets().iter().chain(profiles.refined_receiver_types(state)) {
+            if profiled_type.is_empty() || profiled_type.flags().is_immediate() || profiled_type.class() != class {
+                continue;
+            }
+            if result.iter().any(|seen| seen.shape() == profiled_type.shape()) {
+                continue;
+            }
+            result.push(profiled_type);
+        }
+        result
+    }
+
+    /// Reason for an attr_reader GetIvar C call on a receiver whose class is known but which has no profiled shape.
+    fn getivar_fallback_reason(resolution: ReceiverTypeResolution) -> Counter {
         match resolution {
             ReceiverTypeResolution::Megamorphic => Counter::getivar_fallback_megamorphic,
             ReceiverTypeResolution::SkewedMegamorphic { .. } => Counter::getivar_fallback_skewed_megamorphic,
             ReceiverTypeResolution::Polymorphic => Counter::getivar_fallback_polymorphic,
-            ReceiverTypeResolution::NoProfile if ic.is_null() => Counter::getivar_fallback_no_profile_missing_ic,
             ReceiverTypeResolution::NoProfile => Counter::getivar_fallback_no_profile,
             _ => Counter::getivar_fallback_not_monomorphic,
         }
@@ -6784,19 +6825,6 @@ impl Function {
             }
             self.push_insn(block, Insn::StoreField { recv: self_val, id: FieldName::shape_id, offset: shape_id_offset, val: shape_id, num_bits: types::CShape.num_bits() });
         }
-    }
-
-    fn try_emit_optimized_setivar(&mut self, block: BlockId, self_val: InsnId, id: ID, val: InsnId, profiled_type: ProfiledType, state: InsnId, recompile: Option<Recompile>) -> Result<(), Counter> {
-        if self.policy.no_side_exits {
-            // On the final version, don't add a shape guard without a fallback.
-            return Err(Counter::setivar_fallback_no_side_exits);
-        }
-        let spec = self.prepare_optimized_setivar(id, profiled_type)?;
-        let self_val = self.guard_heap(block, self_val, state);
-        let shape = self.load_shape(block, self_val);
-        self.guard_shape(block, shape, profiled_type.shape(), state, recompile);
-        self.emit_optimized_setivar(block, self_val, id, val, spec);
-        Ok(())
     }
 
     fn gen_patch_points_for_optimized_ccall(&mut self, block: BlockId, recv_class: VALUE, method_id: ID, cme: *const rb_callable_method_entry_struct, state: InsnId) {
@@ -8844,6 +8872,7 @@ impl Function {
 
     /// Dispatch an ivar access to profiled shapes. Callbacks generate the optimized access and
     /// generic fallback, optionally returning a value to pass through the join block.
+    /// When `allow_exit` is false, a shape miss takes the generic fallback instead of side-exiting.
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
@@ -8851,6 +8880,7 @@ impl Function {
         insn_idx: u32,
         self_param: InsnId,
         exit_id: InsnId,
+        allow_exit: bool,
         no_profile_reason: SideExitReason,
         fallback_counter: Counter,
         has_result: bool,
@@ -8860,7 +8890,7 @@ impl Function {
     ) -> Option<(BlockId, Option<InsnId>)> {
         // 0 profiles: Generate a recompile exit or a fallback. No need for new HIR blocks.
         if profiles.is_empty() {
-            if self.policy.no_side_exits {
+            if !allow_exit {
                 self.count(block, fallback_counter);
                 let result = emit_fallback(self, block);
                 assert_eq!(has_result, result.is_some());
@@ -8871,7 +8901,7 @@ impl Function {
             }
         }
         // 1 profile: Generate a monomorphic ivar access with a guard if allowed by policy. No need for new HIR blocks.
-        if profiles.len() == 1 && !self.policy.no_side_exits {
+        if profiles.len() == 1 && allow_exit {
             let actual = self.load_shape(block, self_param);
             self.guard_shape(block, actual, profile_shape(profiles[0]), exit_id, Some(Recompile));
             let result = emit_optimized(self, block, profiles[0]);
@@ -8893,7 +8923,7 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if self.policy.no_side_exits {
+                if !allow_exit {
                     // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
                     let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                     let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
@@ -8933,6 +8963,8 @@ impl Function {
         id: ID,
         ic: *const iseq_inline_iv_cache_entry,
         exit_id: InsnId,
+        allow_exit: bool,
+        fallback_counter: Counter,
     ) -> Option<(BlockId, InsnId)> {
         let (block, result) = self.dispatch_ivar(
             profiled_types,
@@ -8940,8 +8972,9 @@ impl Function {
             insn_idx,
             self_param,
             exit_id,
+            allow_exit,
             SideExitReason::NoProfileGetIvar,
-            Counter::getivar_fallback_no_side_exits,
+            fallback_counter,
             true,
             |profiled_type| profiled_type.shape(),
             |fun, block, profiled_type| Some(
@@ -8970,6 +9003,8 @@ impl Function {
         ic: *const iseq_inline_iv_cache_entry,
         val: InsnId,
         exit_id: InsnId,
+        allow_exit: bool,
+        fallback_counter: Counter,
     ) -> Option<BlockId> {
         if specs.is_empty() {
             if let Some(counter) = unoptimized_reason {
@@ -8984,8 +9019,9 @@ impl Function {
             insn_idx,
             self_param,
             exit_id,
+            allow_exit,
             SideExitReason::NoProfileSetIvar,
-            Counter::setivar_fallback_no_side_exits,
+            fallback_counter,
             false,
             |spec| spec.profiled_type.shape(),
             |fun, block, spec| {
@@ -9402,11 +9438,32 @@ struct ProfileOracle {
     /// that Snapshot. Inlined callees are translated directly into the caller, so their profile
     /// entries are already in caller InsnId space and can be appended without remapping.
     types: HashMap<InsnId, Vec<(InsnId, TypeDistributionSummary)>>,
+    /// Receiver profiles dropped from the fresh Snapshot of each arm of a polymorphic send
+    /// dispatch, keyed by that Snapshot. The receiver resolves from its refined type there, but
+    /// attr_reader/attr_writer specialization still wants the profiled shapes of that class.
+    refined_receiver_types: HashMap<InsnId, Vec<ProfiledType>>,
 }
 
 impl ProfileOracle {
     fn new() -> Self {
-        Self { types: Default::default() }
+        Self { types: Default::default(), refined_receiver_types: Default::default() }
+    }
+
+    /// Profiled receiver types recorded by [`Self::record_refined_receiver_types`].
+    fn refined_receiver_types(&self, state: InsnId) -> &[ProfiledType] {
+        self.refined_receiver_types.get(&state).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Record the profiled receiver types of `class` for the Snapshot of a polymorphic dispatch arm.
+    fn record_refined_receiver_types(&mut self, snapshot: InsnId, summary: &TypeDistributionSummary, class: Option<VALUE>) {
+        let Some(class) = class else { return };
+        let types: Vec<_> = summary.buckets().iter()
+            .filter(|profiled_type| !profiled_type.is_empty() && profiled_type.class() == class)
+            .copied()
+            .collect();
+        if !types.is_empty() {
+            self.refined_receiver_types.insert(snapshot, types);
+        }
     }
 
     /// Look up profile entries for a Snapshot. Returns None when no profile data was recorded for
@@ -9448,6 +9505,9 @@ impl ProfileOracle {
     fn append(&mut self, callee: &ProfileOracle) {
         for (snapshot, entries) in &callee.types {
             self.types.entry(*snapshot).or_default().extend(entries.iter().cloned());
+        }
+        for (snapshot, types) in &callee.refined_receiver_types {
+            self.refined_receiver_types.entry(*snapshot).or_default().extend(types.iter().copied());
         }
     }
 
@@ -10818,6 +10878,7 @@ fn add_iseq_to_hir(
                             // the receiver's entry is dropped: it must resolve from its refined,
                             // exact type, and resolve_receiver_type prefers profiles over types.
                             profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                            profiles.record_refined_receiver_types(snapshot, &summary, expected.runtime_exact_ruby_class());
                             let refined_recv = fun.push_insn(iftrue_block, Insn::RefineType { val: recv, new_type: expected });
                             // Set the refined type now; otherwise length selection sees Any and cannot
                             // identify the ISEQ callee needed for polymorphic splat dispatch.
@@ -11161,6 +11222,8 @@ fn add_iseq_to_hir(
                         id,
                         ic,
                         exit_id,
+                        !fun.policy.no_side_exits,
+                        Counter::getivar_fallback_no_side_exits,
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
@@ -11211,6 +11274,8 @@ fn add_iseq_to_hir(
                         ic,
                         val,
                         exit_id,
+                        !fun.policy.no_side_exits,
+                        Counter::setivar_fallback_no_side_exits,
                     ) else {
                         // Side-exiting unconditionally; end the block.
                         break;
