@@ -119,6 +119,9 @@ fn iseq_mark(payload: &IseqPayload) {
 
     // Mark objects referenced by patch points. They're pinned since patch points in
     // Invariants hold them as raw VALUEs, which aren't updated on compaction.
+    if let Some(cref) = payload.compile_cref {
+        unsafe { rb_gc_mark(cref); }
+    }
     for version in payload.versions.iter() {
         for &object in unsafe { version.as_ref() }.patch_point_objects.iter() {
             unsafe { rb_gc_mark(object); }

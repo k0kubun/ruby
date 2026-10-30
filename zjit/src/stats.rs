@@ -169,6 +169,10 @@ make_counters! {
         // their method entry, after re-checking the method lookup
         method_invalidation_kept,
         method_invalidation_invalidated,
+        // Patch points for folded constant paths that were kept or invalidated on a write
+        // to one of their constant names, after re-resolving the path
+        constant_invalidation_kept,
+        constant_invalidation_invalidated,
 
         compiled_side_exit_count,
         side_exit_count,
