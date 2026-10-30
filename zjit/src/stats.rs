@@ -164,6 +164,11 @@ make_counters! {
         gc_time_ns,
         invalidation_time_ns,
 
+        // Patch points for folded constant paths that were kept or invalidated on a write
+        // to one of their constant names, after re-resolving the path
+        constant_invalidation_kept,
+        constant_invalidation_invalidated,
+
         compiled_side_exit_count,
         side_exit_size_bytes,
         compile_side_exit_time_ns,
