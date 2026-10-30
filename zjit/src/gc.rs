@@ -117,6 +117,14 @@ fn iseq_mark(payload: &IseqPayload) {
         unsafe { rb_gc_mark_movable(object); }
     });
 
+    // Mark objects referenced by patch points. They're pinned since patch points in
+    // Invariants hold them as raw VALUEs, which aren't updated on compaction.
+    for version in payload.versions.iter() {
+        for &object in unsafe { version.as_ref() }.patch_point_objects.iter() {
+            unsafe { rb_gc_mark(object); }
+        }
+    }
+
     // Mark objects baked in JIT code
     let cb = ZJITState::get_code_block();
     for version in payload.versions.iter() {

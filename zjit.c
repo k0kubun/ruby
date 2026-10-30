@@ -386,6 +386,75 @@ rb_zjit_callable_method_entry_is_undefined(const rb_callable_method_entry_t *cme
     return UNDEFINED_METHOD_ENTRY_P(cme);
 }
 
+// Return true if `cme` is a plain method entry of a class, so that two of them with the same
+// fields behave the same when called on the same receiver class.
+static bool
+zjit_class_method_entry_p(const rb_callable_method_entry_t *cme)
+{
+    if (!cme->def || METHOD_ENTRY_COMPLEMENTED(cme)) return false;
+    // Module methods are called through complemented entries, refinements are T_MODULE,
+    // and negative entries have no owner
+    if (!RB_TYPE_P(cme->owner, T_CLASS) || cme->defined_class != cme->owner) return false;
+    switch (cme->def->type) {
+      case VM_METHOD_TYPE_ISEQ:
+      case VM_METHOD_TYPE_CFUNC:
+      case VM_METHOD_TYPE_ATTRSET:
+      case VM_METHOD_TYPE_IVAR:
+      case VM_METHOD_TYPE_BMETHOD:
+      case VM_METHOD_TYPE_OPTIMIZED:
+        return true;
+      default:
+        // ZSUPER, ALIAS, UNDEF, NOTIMPLEMENTED, MISSING, REFINED
+        return false;
+    }
+}
+
+// For a ZJIT MethodRedefined patch point assuming that looking up `mid` on `klass` finds
+// `old_cme`, which is being invalidated for a method table change that only affects lookups
+// going through `changed_klass` (see rb_clear_method_cache_for_change()): return the method
+// entry the lookup finds now if it doesn't go through `changed_klass` and the entry is
+// equivalent to `old_cme`, e.g. a clone of it. Return NULL otherwise. This doesn't allocate,
+// call Ruby code, or update any method cache. Must be called with the VM lock.
+const rb_callable_method_entry_t *
+rb_zjit_cme_lookup_unchanged(VALUE klass, ID mid, const rb_callable_method_entry_t *old_cme, VALUE changed_klass)
+{
+    ASSERT_vm_locking();
+    if (!changed_klass || rb_multi_ractor_p()) return NULL;
+    if (!RB_TYPE_P(changed_klass, T_CLASS) && !RB_TYPE_P(changed_klass, T_MODULE) && !RB_TYPE_P(changed_klass, T_ICLASS)) return NULL;
+    if (!RB_TYPE_P(klass, T_CLASS) || !zjit_class_method_entry_p(old_cme)) return NULL;
+
+    // Method tables that the change may write to or put an iclass after
+    struct rb_id_table *changed_tbl = RCLASS_M_TBL(changed_klass);
+    VALUE changed_origin = RCLASS_ORIGIN(changed_klass);
+    struct rb_id_table *changed_origin_tbl = RCLASS_M_TBL(changed_origin);
+
+    // Mirror search_method0() without the method cache
+    for (VALUE k = klass; k; k = RCLASS_SUPER(k)) {
+        if (k == changed_klass || k == changed_origin) return NULL;
+        struct rb_id_table *tbl = RCLASS_M_TBL(k);
+        if (!tbl) continue;
+        if (tbl == changed_tbl || tbl == changed_origin_tbl) return NULL;
+
+        VALUE me;
+        if (rb_id_table_lookup(tbl, mid, &me)) {
+            const rb_callable_method_entry_t *cme = (const rb_callable_method_entry_t *)me;
+            if (!zjit_class_method_entry_p(cme) || METHOD_ENTRY_INVALIDATED(cme)) return NULL;
+            if (cme->def != old_cme->def ||
+                    cme->owner != old_cme->owner ||
+                    cme->defined_class != old_cme->defined_class ||
+                    cme->called_id != old_cme->called_id ||
+                    METHOD_ENTRY_VISI(cme) != METHOD_ENTRY_VISI(old_cme)) {
+                return NULL;
+            }
+            // The VM invalidates a method entry for a change below its owner only if it's
+            // marked as cached. JIT code depends on this one (which may be a clone of old_cme) now.
+            METHOD_ENTRY_CACHED_SET((rb_callable_method_entry_t *)cme);
+            return cme;
+        }
+    }
+    return NULL;
+}
+
 VALUE rb_vm_get_untagged_block_handler(rb_control_frame_t *reg_cfp);
 bool rb_vm_once_done_value(ISE is, VALUE *result);
 

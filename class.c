@@ -1785,11 +1785,17 @@ add_refined_method_entry_i(ID key, VALUE value, void *data)
     return ID_TABLE_CONTINUE;
 }
 
+struct clear_module_cache_arg {
+    VALUE klass;
+    // See rb_clear_method_cache_for_change()
+    VALUE changed_klass;
+};
+
 static enum rb_id_table_iterator_result
 clear_module_cache_i(ID id, VALUE val, void *data)
 {
-    VALUE klass = (VALUE)data;
-    rb_clear_method_cache(klass, id);
+    const struct clear_module_cache_arg *arg = (const struct clear_module_cache_arg *)data;
+    rb_clear_method_cache_for_change(arg->klass, id, arg->changed_klass);
     return ID_TABLE_CONTINUE;
 }
 
@@ -1867,14 +1873,19 @@ do_include_modules_at(const VALUE klass, VALUE c, VALUE module, int search_super
         ruby_vm_global_cvar_state++;
         tbl = RCLASS_M_TBL(module);
         if (tbl && rb_id_table_size(tbl)) {
+            // The iclass is inserted right after c below, which only changes method lookups
+            // that go through c. Refinements change lookups depending on the caller's cref.
+            VALUE changed_klass = (RB_TYPE_P(klass, T_MODULE) && FL_TEST(klass, RMODULE_IS_REFINEMENT)) ? 0 : c;
             if (search_super) { // include
                 if (super_class && !RB_TYPE_P(super_class, T_MODULE)) {
-                    rb_id_table_foreach(tbl, clear_module_cache_i, (void *)super_class);
+                    struct clear_module_cache_arg arg = { .klass = super_class, .changed_klass = changed_klass };
+                    rb_id_table_foreach(tbl, clear_module_cache_i, (void *)&arg);
                 }
             }
             else { // prepend
                 if (!RB_TYPE_P(original_klass, T_MODULE)) {
-                    rb_id_table_foreach(tbl, clear_module_cache_i, (void *)original_klass);
+                    struct clear_module_cache_arg arg = { .klass = original_klass, .changed_klass = changed_klass };
+                    rb_id_table_foreach(tbl, clear_module_cache_i, (void *)&arg);
                 }
             }
             method_changed = 1;
@@ -2026,7 +2037,8 @@ rb_prepend_module(VALUE klass, VALUE module)
                 if (!rb_objspace_garbage_object_p(subclass)) {
                     if (klass_had_no_origin && klass_origin_m_tbl == RCLASS_M_TBL(subclass)) {
                         // backfill an origin iclass to handle refinements and future prepends
-                        rb_id_table_foreach(RCLASS_M_TBL(subclass), clear_module_cache_i, (void *)subclass);
+                        struct clear_module_cache_arg arg = { .klass = subclass, .changed_klass = 0 };
+                        rb_id_table_foreach(RCLASS_M_TBL(subclass), clear_module_cache_i, (void *)&arg);
                         RCLASS_WRITE_M_TBL(subclass, klass_m_tbl);
                         VALUE origin = rb_include_class_new(klass_origin, RCLASS_SUPER(subclass));
                         rb_class_set_super(subclass, origin);

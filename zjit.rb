@@ -191,6 +191,8 @@ class << RubyVM::ZJIT
       :profile_time_ns,
       :gc_time_ns,
       :invalidation_time_ns,
+      :method_invalidation_kept,
+      :method_invalidation_invalidated,
 
       :vm_write_jit_frame_count,
       :vm_write_sp_count,

@@ -58,6 +58,11 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// Objects referenced by this version's patch points (receiver classes of
+    /// `MethodRedefined`). They're pinned by [`crate::gc`] because the patch points
+    /// hold them as raw VALUEs.
+    pub patch_point_objects: Vec<VALUE>,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -77,6 +82,7 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            patch_point_objects: vec![],
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")

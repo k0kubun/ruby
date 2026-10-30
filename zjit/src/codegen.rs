@@ -1043,8 +1043,8 @@ pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invari
             Invariant::BOPRedefined { klass, bop } => {
                 track_bop_assumption(klass, bop, code_ptr, side_exit_ptr, version);
             }
-            Invariant::MethodRedefined { klass: _, method: _, cme } => {
-                track_cme_assumption(cme, code_ptr, side_exit_ptr, version);
+            Invariant::MethodRedefined { klass, method, cme, recheckable } => {
+                track_cme_assumption(cme, recheckable.then_some((klass, method)), code_ptr, side_exit_ptr, version);
             }
             Invariant::StableConstantNames { idlist } => {
                 track_stable_constant_names_assumption(idlist, code_ptr, side_exit_ptr, version);

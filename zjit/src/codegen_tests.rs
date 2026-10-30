@@ -7307,6 +7307,311 @@ fn test_method_redefined_with_module() {
     "#), @r#"["original", "redefined"]"#);
 }
 
+/// Whether the latest version of `iseq` has been invalidated
+fn last_version_is_invalidated(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    unsafe { payload.versions.last().expect("compiled").as_ref() }.is_invalidated()
+}
+
+/// Evaluate `setup`, which defines and compiles `{module}.test`, then `change`. Return whether
+/// the compiled `test` was invalidated by `change`.
+fn method_change_invalidates(module: &str, setup: &str, change: &str) -> bool {
+    eval(setup);
+    let iseq = get_method_iseq(module, "test");
+    assert!(!last_version_is_invalidated(iseq), "{module}.test should be compiled and valid");
+    eval(change);
+    last_version_is_invalidated(iseq)
+}
+
+#[test]
+fn test_method_include_into_unrelated_class_keeps_code() {
+    // `include Comparable` into a subclass of Object invalidates BasicObject#==
+    let invalidated = method_change_invalidates("PMIa", "
+        class PMIaRecv; end
+        module PMIa
+          def self.test(o, x) = o == x
+        end
+        PMIa.test(PMIaRecv.new, 1)
+        PMIa.test(PMIaRecv.new, 1)
+    ", "
+        class PMIaOther
+          include Comparable
+        end
+    ");
+    assert!(!invalidated);
+    assert_snapshot!(assert_compiles("o = PMIaRecv.new; [PMIa.test(o, 1), PMIa.test(o, o)]"), @"[false, true]");
+    assert_snapshot!(inspect("o = PMIaOther.new; def o.<=>(other) = 0; o == 1"), @"true");
+}
+
+#[test]
+fn test_method_def_in_unrelated_class_keeps_code() {
+    // Defining #== in a class with subclasses invalidates BasicObject#== too
+    let invalidated = method_change_invalidates("PMIb", "
+        class PMIbRecv; end
+        class PMIbParent; end
+        class PMIbChild < PMIbParent; end
+        module PMIb
+          def self.test(o, x) = o == x
+        end
+        PMIb.test(PMIbRecv.new, 1)
+        PMIb.test(PMIbRecv.new, 1)
+        PMIbChild.new == 1
+    ", "
+        class PMIbParent
+          def ==(other) = :redefined
+        end
+    ");
+    assert!(!invalidated);
+    assert_snapshot!(assert_compiles("o = PMIbRecv.new; [PMIb.test(o, 1), PMIb.test(o, o)]"), @"[false, true]");
+    assert_snapshot!(inspect("PMIbChild.new == 1"), @":redefined");
+}
+
+#[test]
+fn test_method_include_into_sibling_keeps_code() {
+    let invalidated = method_change_invalidates("PMIc", "
+        class PMIcBase
+          def foo = :base
+        end
+        class PMIcRecv < PMIcBase; end
+        class PMIcSibling < PMIcBase; end
+        module PMIcMod
+          def foo = :mod
+        end
+        module PMIc
+          def self.test(o) = o.foo
+        end
+        PMIc.test(PMIcRecv.new)
+        PMIc.test(PMIcRecv.new)
+    ", "
+        class PMIcSibling
+          include PMIcMod
+        end
+    ");
+    assert!(!invalidated);
+    assert_snapshot!(assert_compiles("[PMIc.test(PMIcRecv.new), PMIcSibling.new.foo]"), @"[:base, :mod]");
+}
+
+/// Set up `{prefix}.test(o) = o.foo` compiled for a receiver of `{prefix}Recv`, whose `foo` is
+/// `{prefix}Base#foo` through `{prefix}Mid`. `{prefix}Base` has another subclass so that changes
+/// below it invalidate the method entry of `{prefix}Base#foo` itself.
+fn method_change_setup(prefix: &str) -> String {
+    format!("
+        class {prefix}Base
+          def foo = :base
+          def bar = :bar
+        end
+        class {prefix}Mid < {prefix}Base; end
+        class {prefix}Recv < {prefix}Mid; end
+        class {prefix}Other < {prefix}Base; end
+        module {prefix}
+          def self.test(o) = o.foo
+        end
+        {prefix}.test({prefix}Recv.new)
+        {prefix}.test({prefix}Recv.new)
+    ")
+}
+
+/// Call `{prefix}.test` with a `{prefix}Recv` and return the result or the exception class
+fn method_change_result(prefix: &str) -> String {
+    inspect(&format!("begin; {prefix}.test({prefix}Recv.new); rescue NoMethodError => e; e.class; end"))
+}
+
+#[test]
+fn test_method_def_on_receiver_class_invalidates() {
+    assert!(method_change_invalidates("PMId", &method_change_setup("PMId"), "class PMIdRecv; def foo = :recv; end"));
+    assert_snapshot!(method_change_result("PMId"), @":recv");
+}
+
+#[test]
+fn test_method_def_on_ancestor_invalidates() {
+    assert!(method_change_invalidates("PMIe", &method_change_setup("PMIe"), "class PMIeMid; def foo = :mid; end"));
+    assert_snapshot!(method_change_result("PMIe"), @":mid");
+}
+
+#[test]
+fn test_method_def_on_object_invalidates_basic_object_eq() {
+    // Defining Object#== (between the receiver class and BasicObject) must invalidate `o == x`.
+    let invalidated = method_change_invalidates("PMIf", "
+        class PMIfRecv; end
+        module PMIf
+          def self.test(o, x) = o == x
+        end
+        PMIf.test(PMIfRecv.new, 1)
+        PMIf.test(PMIfRecv.new, 1)
+    ", "
+        class Object
+          def ==(other) = :object_eq
+        end
+    ");
+    let result = inspect("PMIf.test(PMIfRecv.new, 1)");
+    eval("class Object; remove_method :==; end");
+    assert!(invalidated);
+    assert_snapshot!(result, @":object_eq");
+    assert_snapshot!(inspect("PMIf.test(PMIfRecv.new, 1)"), @"false");
+}
+
+#[test]
+fn test_method_def_on_nil_class_invalidates() {
+    let invalidated = method_change_invalidates("PMIg", "
+        module PMIg
+          def self.test(x) = nil == x
+        end
+        PMIg.test(true)
+        PMIg.test(true)
+    ", "
+        class NilClass
+          def ==(other) = :nil_eq
+        end
+    ");
+    let result = inspect("PMIg.test(true)");
+    eval("class NilClass; remove_method :==; end");
+    assert!(invalidated);
+    assert_snapshot!(result, @":nil_eq");
+    assert_snapshot!(inspect("PMIg.test(true)"), @"false");
+}
+
+#[test]
+fn test_method_remove_method_invalidates() {
+    let setup = method_change_setup("PMIh") + "
+        class PMIhRecv; def foo = :recv; end
+        PMIh.test(PMIhRecv.new)
+    ";
+    eval(&setup);
+    assert_snapshot!(method_change_result("PMIh"), @":recv");
+    let iseq = get_method_iseq("PMIh", "test");
+    // Compile a version for PMIhRecv#foo
+    for _ in 0..2 { method_change_result("PMIh"); }
+    assert!(!last_version_is_invalidated(iseq));
+    eval("class PMIhRecv; remove_method :foo; end");
+    assert!(last_version_is_invalidated(iseq));
+    assert_snapshot!(method_change_result("PMIh"), @":base");
+}
+
+#[test]
+fn test_method_undef_method_invalidates() {
+    assert!(method_change_invalidates("PMIi", &method_change_setup("PMIi"), "class PMIiMid; undef_method :foo; end"));
+    assert_snapshot!(method_change_result("PMIi"), @"NoMethodError");
+}
+
+#[test]
+fn test_method_private_on_ancestor_invalidates() {
+    assert!(method_change_invalidates("PMIj", &method_change_setup("PMIj"), "class PMIjMid; private :foo; end"));
+    assert_snapshot!(method_change_result("PMIj"), @"NoMethodError");
+}
+
+#[test]
+fn test_method_private_on_owner_invalidates() {
+    assert!(method_change_invalidates("PMIk", &method_change_setup("PMIk"), "class PMIkBase; private :foo; end"));
+    assert_snapshot!(method_change_result("PMIk"), @"NoMethodError");
+}
+
+#[test]
+fn test_method_alias_method_invalidates() {
+    assert!(method_change_invalidates("PMIl", &method_change_setup("PMIl"), "class PMIlRecv; alias_method :foo, :bar; end"));
+    assert_snapshot!(method_change_result("PMIl"), @":bar");
+}
+
+#[test]
+fn test_method_define_method_invalidates() {
+    assert!(method_change_invalidates("PMIm", &method_change_setup("PMIm"), "class PMImRecv; define_method(:foo) { :defined }; end"));
+    assert_snapshot!(method_change_result("PMIm"), @":defined");
+}
+
+#[test]
+fn test_method_attr_reader_invalidates() {
+    assert!(method_change_invalidates("PMIn", &method_change_setup("PMIn"), "class PMInMid; attr_reader :foo; end"));
+    assert_snapshot!(method_change_result("PMIn"), @"nil");
+}
+
+#[test]
+fn test_method_prepend_invalidates() {
+    assert!(method_change_invalidates("PMIo", &method_change_setup("PMIo"), "
+        module PMIoMod; def foo = :prepended; end
+        class PMIoRecv; prepend PMIoMod; end
+    "));
+    assert_snapshot!(method_change_result("PMIo"), @":prepended");
+}
+
+#[test]
+fn test_method_include_into_receiver_class_invalidates() {
+    assert!(method_change_invalidates("PMIp", &method_change_setup("PMIp"), "
+        module PMIpMod; def foo = :included; end
+        class PMIpMid; include PMIpMod; end
+    "));
+    assert_snapshot!(method_change_result("PMIp"), @":included");
+}
+
+#[test]
+fn test_method_def_in_included_module_invalidates() {
+    let setup = "
+        module PMIqMod; end
+        class PMIqBase
+          def foo = :base
+        end
+        class PMIqRecv < PMIqBase
+          include PMIqMod
+        end
+        class PMIqOther < PMIqBase; end
+        module PMIq
+          def self.test(o) = o.foo
+        end
+        PMIq.test(PMIqRecv.new)
+        PMIq.test(PMIqRecv.new)
+    ";
+    assert!(method_change_invalidates("PMIq", setup, "module PMIqMod; def foo = :module; end"));
+    assert_snapshot!(method_change_result("PMIq"), @":module");
+}
+
+#[test]
+fn test_method_refinement_invalidates() {
+    // Conservatively invalidated even though the refinement isn't activated for the caller
+    assert!(method_change_invalidates("PMIr", &method_change_setup("PMIr"), "
+        module PMIrRefinement
+          refine PMIrRecv do
+            def foo = :refined
+          end
+        end
+    "));
+    assert_snapshot!(method_change_result("PMIr"), @":base");
+    assert_snapshot!(inspect("
+        module PMIrUser
+          using PMIrRefinement
+          def self.call = PMIrRecv.new.foo
+        end
+        [PMIrUser.call, PMIr.test(PMIrRecv.new)]
+    "), @"[:refined, :base]");
+}
+
+#[test]
+fn test_method_kept_code_is_invalidated_through_stale_cache() {
+    // A change in PMIsOther (which has a subclass) clones PMIsBase#foo, keeping PMIs.test for
+    // PMIsRecv. PMIsRecv's method cache still has the old entry, which a later definition in
+    // PMIsRecv invalidates.
+    let setup = method_change_setup("PMIs") + "
+        class PMIsOtherChild < PMIsOther; end
+    ";
+    assert!(!method_change_invalidates("PMIs", &setup, "class PMIsOther; def foo = :other; end"));
+    assert_snapshot!(assert_compiles("PMIs.test(PMIsRecv.new)"), @":base");
+    let iseq = get_method_iseq("PMIs", "test");
+    eval("class PMIsRecv; def foo = :recv; end");
+    assert!(last_version_is_invalidated(iseq));
+    assert_snapshot!(method_change_result("PMIs"), @":recv");
+}
+
+#[test]
+fn test_method_kept_code_is_invalidated_through_clone() {
+    // After keeping the code for a clone of PMItBase#foo, a change below PMItBase that affects
+    // PMItRecv must invalidate it through the clone.
+    let setup = method_change_setup("PMIt") + "
+        class PMItOtherChild < PMItOther; end
+    ";
+    assert!(!method_change_invalidates("PMIt", &setup, "class PMItOther; def foo = :other; end"));
+    let iseq = get_method_iseq("PMIt", "test");
+    eval("class PMItMid; def foo = :mid; end");
+    assert!(last_version_is_invalidated(iseq));
+    assert_snapshot!(method_change_result("PMIt"), @":mid");
+}
+
 #[test]
 fn test_module_alias_redefined() {
     assert_eq!(assert_compiles("

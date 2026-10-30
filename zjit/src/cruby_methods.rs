@@ -1172,6 +1172,7 @@ fn inline_kernel_respond_to_p(
                         klass: recv_class,
                         method: respond_to_missing,
                         cme: respond_to_missing_cme,
+                        recheckable: true,
                     },
                     state,
                 },
@@ -1201,7 +1202,8 @@ fn inline_kernel_respond_to_p(
         invariant: hir::Invariant::MethodRedefined {
             klass: recv_class,
             method: mid,
-            cme: target_cme
+            cme: target_cme,
+            recheckable: true,
         }, state
     });
     Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(result) }))

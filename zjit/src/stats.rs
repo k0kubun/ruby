@@ -164,6 +164,11 @@ make_counters! {
         gc_time_ns,
         invalidation_time_ns,
 
+        // MethodRedefined patch points that were kept or invalidated on an invalidation of
+        // their method entry, after re-checking the method lookup
+        method_invalidation_kept,
+        method_invalidation_invalidated,
+
         compiled_side_exit_count,
         side_exit_size_bytes,
         compile_side_exit_time_ns,

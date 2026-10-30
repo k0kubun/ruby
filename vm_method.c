@@ -310,8 +310,10 @@ rb_vm_mtbl_dump(const char *msg, VALUE klass, ID target_mid)
     vm_mtbl_dump(klass, target_mid);
 }
 
+/* `changed_klass` is the class or module whose method lookups the pending method table
+ * change is limited to, or 0 if unknown. See rb_clear_method_cache_for_change(). */
 static inline void
-vm_cme_invalidate(rb_callable_method_entry_t *cme)
+vm_cme_invalidate_for_change(rb_callable_method_entry_t *cme, VALUE changed_klass)
 {
     VM_ASSERT(IMEMO_TYPE_P(cme, imemo_ment), "cme: %d", imemo_type((VALUE)cme));
     VM_ASSERT(callable_method_entry_p(cme));
@@ -319,7 +321,13 @@ vm_cme_invalidate(rb_callable_method_entry_t *cme)
     RB_DEBUG_COUNTER_INC(cc_cme_invalidate);
 
     rb_yjit_cme_invalidate(cme);
-    rb_zjit_cme_invalidate(cme);
+    rb_zjit_cme_invalidate(cme, changed_klass);
+}
+
+static inline void
+vm_cme_invalidate(rb_callable_method_entry_t *cme)
+{
+    vm_cme_invalidate_for_change(cme, 0);
 }
 
 static int
@@ -363,13 +371,13 @@ static const rb_callable_method_entry_t *complemented_callable_method_entry(VALU
 static const rb_callable_method_entry_t *lookup_overloaded_cme(const rb_callable_method_entry_t *cme);
 
 static void
-invalidate_method_cache_in_cc_table(VALUE tbl, ID mid)
+invalidate_method_cache_in_cc_table(VALUE tbl, ID mid, VALUE changed_klass)
 {
     VALUE ccs_data;
     if (tbl && rb_managed_id_table_lookup(tbl, mid, &ccs_data)) {
         struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_data;
         rb_yjit_cme_invalidate((rb_callable_method_entry_t *)ccs->cme);
-        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)ccs->cme);
+        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)ccs->cme, changed_klass);
         if (NIL_P(ccs->cme->owner)) invalidate_negative_cache(mid);
         rb_vm_ccs_invalidate_and_free(ccs);
         rb_managed_id_table_delete(tbl, mid);
@@ -378,12 +386,12 @@ invalidate_method_cache_in_cc_table(VALUE tbl, ID mid)
 }
 
 static void
-invalidate_callable_method_entry_in_callable_m_table(struct rb_id_table *tbl, ID mid)
+invalidate_callable_method_entry_in_callable_m_table(struct rb_id_table *tbl, ID mid, VALUE changed_klass)
 {
     VALUE cme;
     if (tbl && rb_id_table_lookup(tbl, mid, &cme)) {
         rb_yjit_cme_invalidate((rb_callable_method_entry_t *)cme);
-        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)cme);
+        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)cme, changed_klass);
         rb_id_table_delete(tbl, mid);
         RB_DEBUG_COUNTER_INC(cc_invalidate_leaf_callable);
     }
@@ -447,19 +455,19 @@ invalidate_callable_method_entry_in_every_m_table(VALUE klass, ID mid, const rb_
 }
 
 static void
-invalidate_complemented_method_entry_in_callable_m_table(struct rb_id_table *tbl, ID mid)
+invalidate_complemented_method_entry_in_callable_m_table(struct rb_id_table *tbl, ID mid, VALUE changed_klass)
 {
     VALUE cme;
     if (tbl && rb_id_table_lookup(tbl, mid, &cme)) {
         rb_yjit_cme_invalidate((rb_callable_method_entry_t *)cme);
-        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)cme);
+        rb_zjit_cme_invalidate((rb_callable_method_entry_t *)cme, changed_klass);
         rb_id_table_delete(tbl, mid);
         RB_DEBUG_COUNTER_INC(cc_invalidate_tree_callable);
     }
 }
 
 static void
-clear_method_cache_by_id_in_class(VALUE klass, ID mid)
+clear_method_cache_by_id_in_class(VALUE klass, ID mid, VALUE changed_klass)
 {
     VM_ASSERT_TYPE2(klass, T_CLASS, T_ICLASS);
     if (rb_objspace_garbage_object_p(klass)) return;
@@ -478,16 +486,16 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
 
             // invalidate CCs
             VALUE cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
-            invalidate_method_cache_in_cc_table(cc_tbl, mid);
+            invalidate_method_cache_in_cc_table(cc_tbl, mid, changed_klass);
             if (RCLASS_CC_TBL_NOT_PRIME_P(klass, cc_tbl)) {
-                invalidate_method_cache_in_cc_table(RCLASS_PRIME_CC_TBL(klass), mid);
+                invalidate_method_cache_in_cc_table(RCLASS_PRIME_CC_TBL(klass), mid, changed_klass);
             }
 
             // remove from callable_m_tbl, if exists
             struct rb_id_table *cm_tbl = RCLASS_WRITABLE_CALLABLE_M_TBL(klass);
-            invalidate_callable_method_entry_in_callable_m_table(cm_tbl, mid);
+            invalidate_callable_method_entry_in_callable_m_table(cm_tbl, mid, changed_klass);
             if (RCLASS_CALLABLE_M_TBL_NOT_PRIME_P(klass, cm_tbl)) {
-                invalidate_callable_method_entry_in_callable_m_table(RCLASS_PRIME_CALLABLE_M_TBL(klass), mid);
+                invalidate_callable_method_entry_in_callable_m_table(RCLASS_PRIME_CALLABLE_M_TBL(klass), mid, changed_klass);
             }
 
             RB_DEBUG_COUNTER_INC(cc_invalidate_leaf);
@@ -540,7 +548,7 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
                         }
                     }
 
-                    vm_cme_invalidate((rb_callable_method_entry_t *)cme);
+                    vm_cme_invalidate_for_change((rb_callable_method_entry_t *)cme, changed_klass);
                     RB_DEBUG_COUNTER_INC(cc_invalidate_tree_cme);
 
                     // In case of refinement ME, also invalidate the wrapped ME that
@@ -562,10 +570,10 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
                 if (METHOD_ENTRY_COMPLEMENTED(cme)) {
                     VALUE defined_class = cme->defined_class;
                     struct rb_id_table *cm_tbl = RCLASS_WRITABLE_CALLABLE_M_TBL(defined_class);
-                    invalidate_complemented_method_entry_in_callable_m_table(cm_tbl, mid);
+                    invalidate_complemented_method_entry_in_callable_m_table(cm_tbl, mid, changed_klass);
                     if (RCLASS_CALLABLE_M_TBL_NOT_PRIME_P(defined_class, cm_tbl)) {
                         struct rb_id_table *prime_cm_table = RCLASS_PRIME_CALLABLE_M_TBL(defined_class);
-                        invalidate_complemented_method_entry_in_callable_m_table(prime_cm_table, mid);
+                        invalidate_complemented_method_entry_in_callable_m_table(prime_cm_table, mid, changed_klass);
                     }
                 }
 
@@ -580,12 +588,17 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
     }
 }
 
+struct clear_iclass_method_cache_arg {
+    ID mid;
+    VALUE changed_klass;
+};
+
 static void
 clear_iclass_method_cache_by_id(VALUE iclass, VALUE d)
 {
     VM_ASSERT_TYPE(iclass, T_ICLASS);
-    ID mid = (ID)d;
-    clear_method_cache_by_id_in_class(iclass, mid);
+    const struct clear_iclass_method_cache_arg *arg = (const struct clear_iclass_method_cache_arg *)d;
+    clear_method_cache_by_id_in_class(iclass, arg->mid, arg->changed_klass);
 }
 
 static void
@@ -593,12 +606,20 @@ clear_iclass_method_cache_by_id_for_refinements(VALUE klass, VALUE d)
 {
     if (RB_TYPE_P(klass, T_ICLASS)) {
         ID mid = (ID)d;
-        clear_method_cache_by_id_in_class(klass, mid);
+        clear_method_cache_by_id_in_class(klass, mid, 0);
     }
 }
 
+/*
+ * Like rb_clear_method_cache(), but also tells ZJIT that the method table change being made
+ * only affects method lookups that go through `changed_klass`: an entry being added to or
+ * removed from its method table (or its origin's), or a module being included or prepended
+ * right after it in the ancestry. It must be called before the change; ZJIT re-checks the
+ * lookups that don't go through `changed_klass` and keeps the JIT code for them if they
+ * still find an equivalent method entry. Pass 0 if unknown (same as rb_clear_method_cache).
+ */
 void
-rb_clear_method_cache(VALUE klass_or_module, ID mid)
+rb_clear_method_cache_for_change(VALUE klass_or_module, ID mid, VALUE changed_klass)
 {
     if (RB_TYPE_P(klass_or_module, T_MODULE)) {
         VALUE module = klass_or_module; // alias
@@ -608,12 +629,20 @@ rb_clear_method_cache(VALUE klass_or_module, ID mid)
             rb_clear_method_cache(refined_class, mid);
             rb_class_foreach_subclass(refined_class, clear_iclass_method_cache_by_id_for_refinements, mid);
             rb_clear_all_refinement_method_cache();
+            changed_klass = 0; // Refinements change lookups depending on the caller's cref
         }
-        rb_class_foreach_subclass(module, clear_iclass_method_cache_by_id, mid);
+        struct clear_iclass_method_cache_arg arg = { .mid = mid, .changed_klass = changed_klass };
+        rb_class_foreach_subclass(module, clear_iclass_method_cache_by_id, (VALUE)&arg);
     }
     else {
-        clear_method_cache_by_id_in_class(klass_or_module, mid);
+        clear_method_cache_by_id_in_class(klass_or_module, mid, changed_klass);
     }
+}
+
+void
+rb_clear_method_cache(VALUE klass_or_module, ID mid)
+{
+    rb_clear_method_cache_for_change(klass_or_module, mid, 0);
 }
 
 static enum rb_id_table_iterator_result
@@ -1457,6 +1486,17 @@ rb_zsuper_to_super(int argc, VALUE *argv, VALUE self)
 }
 
 static inline rb_method_entry_t* search_method0(VALUE klass, ID id, VALUE *defined_class_ptr, bool skip_refined);
+
+/* The class to pass to rb_clear_method_cache_for_change() for adding a method entry of
+ * `type` to `klass`'s method table, or 0 if it involves refinements. */
+static VALUE
+method_change_klass(VALUE klass, rb_method_type_t type)
+{
+    if (type == VM_METHOD_TYPE_REFINED) return 0;
+    if (RB_TYPE_P(klass, T_MODULE) && FL_TEST(klass, RMODULE_IS_REFINEMENT)) return 0;
+    return klass;
+}
+
 static void
 method_entry_modify_check(VALUE klass, rb_method_type_t type)
 {
@@ -1532,7 +1572,7 @@ rb_method_entry_make(VALUE klass, ID mid, VALUE defined_class, rb_method_visibil
     else {
         klass = RCLASS_ORIGIN(klass);
         if (klass != orig_klass) {
-            rb_clear_method_cache(orig_klass, mid);
+            rb_clear_method_cache_for_change(orig_klass, mid, method_change_klass(orig_klass, type));
         }
     }
     mtbl = RCLASS_WRITABLE_M_TBL(klass);
@@ -1596,7 +1636,9 @@ rb_method_entry_make(VALUE klass, ID mid, VALUE defined_class, rb_method_visibil
     }
     rb_method_definition_set(me, def, opts);
 
-    rb_clear_method_cache(klass, mid);
+    // Called before rb_method_table_insert(), so lookups that go through orig_klass can't be
+    // re-checked. See rb_clear_method_cache_for_change().
+    rb_clear_method_cache_for_change(klass, mid, make_refined ? 0 : method_change_klass(orig_klass, type));
 
     /* check mid */
     if (klass == rb_cObject) {
@@ -2350,10 +2392,13 @@ remove_method(VALUE klass, ID mid)
                           klass, ID2SYM(mid));
     }
 
+    // Called before rb_id_table_delete(), so lookups that go through self can't be
+    // re-checked. See rb_clear_method_cache_for_change().
+    VALUE changed_klass = method_change_klass(self, me->def->type);
     if (klass != self) {
-        rb_clear_method_cache(self, mid);
+        rb_clear_method_cache_for_change(self, mid, changed_klass);
     }
-    rb_clear_method_cache(klass, mid);
+    rb_clear_method_cache_for_change(klass, mid, changed_klass);
     rb_id_table_delete(RCLASS_WRITABLE_M_TBL(klass), mid);
 
     rb_vm_check_redefinition_opt_method(me, klass);
