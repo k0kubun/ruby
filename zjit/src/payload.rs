@@ -25,6 +25,11 @@ pub struct IseqPayload {
     /// `BasicObject`) when the owner is unknown.
     /// See [`crate::cruby::iseq_self_is_heap_object`].
     pub self_is_heap_object: bool,
+    /// The lexical scope (`rb_cref_t`) of the frame that triggered the latest compilation
+    /// of this ISEQ, set at compile triggers like `self_is_heap_object`. Recorded with
+    /// folded constant paths so that constant definitions can re-resolve them instead of
+    /// invalidating every constant of the same name. Marked (pinned) by [`crate::gc`].
+    pub compile_cref: Option<VALUE>,
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 }
@@ -36,6 +41,7 @@ impl IseqPayload {
             versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
+            compile_cref: None,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
         }
     }
@@ -58,6 +64,11 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// Objects referenced by this version's patch points (crefs and expected values of
+    /// `StableConstantNames`). They're pinned by [`crate::gc`] because the patch points
+    /// hold them as raw VALUEs.
+    pub patch_point_objects: Vec<VALUE>,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -77,6 +88,7 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            patch_point_objects: vec![],
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")

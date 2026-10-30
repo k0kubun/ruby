@@ -216,6 +216,12 @@ pub enum Invariant {
     /// following code to be valid.
     StableConstantNames {
         idlist: *const ID,
+        /// The lexical scope (`rb_cref_t`) the path was resolved in, if known. With it,
+        /// a constant definition re-resolves the path and keeps the code if the path still
+        /// resolves to `value`. Without it, any write to the names invalidates the code.
+        cref: Option<VALUE>,
+        /// The value the path resolved to at compile time
+        value: VALUE,
     },
     /// TracePoint is not enabled. If TracePoint is enabled, this is invalidated.
     NoTracePoint,
@@ -350,7 +356,7 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
                     self.ptr_map.map_ptr(cme)
                 )
             }
-            Invariant::StableConstantNames { idlist } => {
+            Invariant::StableConstantNames { idlist, .. } => {
                 write!(f, "StableConstantNames({:p}, ", self.ptr_map.map_ptr(idlist))?;
                 let mut idx = 0;
                 let mut sep = "";
@@ -6115,6 +6121,10 @@ impl Function {
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
+                    cref: {
+                        let cref = unsafe { rb_zjit_cme_cref(cme) };
+                        if cref.is_null() { None } else { Some(VALUE(cref as usize)) }
+                    },
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -9246,6 +9256,8 @@ enum AddIseqMode {
         jit_entry_idx: usize,
         /// The block the caller passed to this frame, if any.
         block: Option<BlockHandler>,
+        /// The lexical scope (`rb_cref_t`) of the inlined method, if known.
+        cref: Option<VALUE>,
     },
 }
 
@@ -9309,6 +9321,12 @@ fn add_iseq_to_hir(
 ) -> Result<AddIseqResult, ParseError> {
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
+
+    // The lexical scope to record with folded constant paths. See Invariant::StableConstantNames.
+    let const_cref = match mode {
+        AddIseqMode::Standalone => payload.compile_cref,
+        AddIseqMode::Inlined { cref, .. } => cref,
+    };
 
     // Build the initial FrameState for a block being translated. In inlined
     // mode it carries the caller's post-send Snapshot and this frame's depth;
@@ -9888,8 +9906,9 @@ fn add_iseq_to_hir(
                     let result = if can_fold {
                         // Invalidate output code on any constant writes associated with constants
                         // referenced after the PatchPoint.
-                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist }, state: exit_id });
-                        fun.push_insn(block, Insn::Const { val: Const::Value(unsafe { (*ice).value }) })
+                        let value = unsafe { (*ice).value };
+                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist, cref: const_cref, value }, state: exit_id });
+                        fun.push_insn(block, Insn::Const { val: Const::Value(value) })
                     } else {
                         fun.push_insn(block, Insn::GetConstantPath { ic, state: exit_id })
                     };

@@ -181,6 +181,19 @@ fn update_self_is_heap_object(iseq: IseqPtr, cfp: CfpPtr) {
     get_or_create_iseq_payload(iseq).self_is_heap_object = self_is_heap_object;
 }
 
+/// Record on the ISEQ payload the lexical scope (cref) of `cfp`, this ISEQ's frame. Folded
+/// constant paths remember it to be re-resolved on constant definitions. See
+/// [`crate::invariants::rb_zjit_constant_state_changed`]. Must be called while holding the VM lock.
+fn update_compile_cref(iseq: IseqPtr, cfp: CfpPtr) {
+    let cref = unsafe { rb_zjit_frame_cref(cfp) };
+    let cref = if cref.is_null() { None } else { Some(VALUE(cref as usize)) };
+    if let Some(cref) = cref {
+        // The payload is marked as a part of the ISEQ
+        VALUE::from(iseq).write_barrier(cref);
+    }
+    get_or_create_iseq_payload(iseq).compile_cref = cref;
+}
+
 /// CRuby API to compile a given ISEQ.
 /// If jit_exception is true, compile JIT code for handling exceptions.
 /// See jit_compile_exception() for details.
@@ -198,6 +211,7 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr, jit_exc
         // The current frame is this ISEQ's method frame, so its method entry tells
         // us the owning class and thus whether `self` is always a heap object.
         update_self_is_heap_object(iseq, unsafe { get_ec_cfp(ec) });
+        update_compile_cref(iseq, unsafe { get_ec_cfp(ec) });
 
         let cb = ZJITState::get_code_block();
         let mut code_ptr = with_compile_time_stat(compile_time_ns, || gen_iseq_entry_point(cb, iseq, jit_exception));
@@ -1046,8 +1060,8 @@ pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invari
             Invariant::MethodRedefined { klass: _, method: _, cme } => {
                 track_cme_assumption(cme, code_ptr, side_exit_ptr, version);
             }
-            Invariant::StableConstantNames { idlist } => {
-                track_stable_constant_names_assumption(idlist, code_ptr, side_exit_ptr, version);
+            Invariant::StableConstantNames { idlist, cref, value } => {
+                track_stable_constant_names_assumption(idlist, cref, value, code_ptr, side_exit_ptr, version);
             }
             Invariant::NoTracePoint => {
                 track_no_trace_point_assumption(code_ptr, side_exit_ptr, version);
@@ -4004,6 +4018,8 @@ c_callable! {
             let cme = unsafe { rb_vm_frame_method_entry(cfp) };
             payload.self_is_heap_object = !cme.is_null()
                 && iseq_self_is_heap_object(iseq, unsafe { (*cme).owner });
+            update_compile_cref(iseq, cfp);
+            let payload = get_or_create_iseq_payload(iseq);
             let last_status = payload.versions.last().map(|version| &unsafe { version.as_ref() }.status);
             let compile_error = match last_status {
                 Some(IseqStatus::CantCompile(err)) => Some(err),

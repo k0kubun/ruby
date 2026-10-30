@@ -2126,6 +2126,10 @@ pub struct rb_zjit_runtime_offsets {
     pub ractor_newobj_cache: i32,
     pub ractor_objspace: i32,
 }
+pub const ZJIT_CONST_SAME: zjit_const_resolution = 0;
+pub const ZJIT_CONST_DIFFERENT: zjit_const_resolution = 1;
+pub const ZJIT_CONST_UNKNOWN: zjit_const_resolution = 2;
+pub type zjit_const_resolution = u32;
 pub const RSTRUCT_EMBED_LEN_MASK: ruby_rstruct_flags = 1040384;
 pub const RSTRUCT_EMBED_LEN_SHIFT: ruby_rstruct_flags = 13;
 pub type ruby_rstruct_flags = usize;
@@ -2509,6 +2513,13 @@ unsafe extern "C" {
         index: rb_len_t,
         out: *mut VALUE,
     ) -> bool;
+    pub fn rb_zjit_frame_cref(cfp: *const rb_control_frame_t) -> *const rb_cref_t;
+    pub fn rb_zjit_cme_cref(cme: *const rb_callable_method_entry_t) -> *const rb_cref_t;
+    pub fn rb_zjit_constant_path_resolves_to(
+        cref: *const rb_cref_t,
+        segments: *const ID,
+        expected: VALUE,
+    ) -> zjit_const_resolution;
     pub fn rb_nil_to_s(obj: VALUE) -> VALUE;
     pub fn rb_true_to_s(obj: VALUE) -> VALUE;
     pub fn rb_false_to_s(obj: VALUE) -> VALUE;

@@ -26,6 +26,7 @@
 #include "internal/jit.h"
 #include "ractor_core.h"
 #include "shape.h"
+#include "eval_intern.h"
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -400,6 +401,154 @@ rb_zjit_array_aref_with_adjusted_index(VALUE ary, rb_len_t index, VALUE *out)
     else {
         return false;
     }
+}
+
+rb_cref_t *rb_vm_get_cref(const VALUE *ep);
+
+// Return the lexical scope (cref) of an ISEQ frame. ZJIT records it with folded
+// constant paths so that it can re-resolve them in rb_zjit_constant_path_resolves_to().
+const rb_cref_t *
+rb_zjit_frame_cref(const rb_control_frame_t *cfp)
+{
+    return rb_vm_get_cref(cfp->ep);
+}
+
+// Return the lexical scope (cref) a method entry runs with, or NULL if unknown.
+const rb_cref_t *
+rb_zjit_cme_cref(const rb_callable_method_entry_t *cme)
+{
+    if (cme && cme->def && cme->def->type == VM_METHOD_TYPE_ISEQ) {
+        return cme->def->body.iseq.cref;
+    }
+    return NULL;
+}
+
+// Result of rb_zjit_constant_path_resolves_to()
+enum zjit_const_resolution {
+    ZJIT_CONST_SAME,
+    ZJIT_CONST_DIFFERENT,
+    ZJIT_CONST_UNKNOWN,
+};
+
+enum zjit_const_lookup {
+    ZJIT_CONST_LOOKUP_FOUND,
+    ZJIT_CONST_LOOKUP_MISS,
+    ZJIT_CONST_LOOKUP_UNKNOWN,
+};
+
+// Side-effect-free mirror of rb_const_search_from(). Never autoloads, never warns.
+static enum zjit_const_lookup
+zjit_const_search_from(VALUE klass, ID id, bool exclude, bool visibility, VALUE *value)
+{
+    bool first_iteration = true;
+    for (VALUE current = klass; RTEST(current); current = RCLASS_SUPER(current), first_iteration = false) {
+        if (!first_iteration && RCLASS_ORIGIN(current) != current) continue;
+
+        VALUE tmp = current;
+        if (BUILTIN_TYPE(tmp) == T_ICLASS) {
+            tmp = RBASIC(tmp)->klass;
+            // A module with prepended modules is included through several iclasses whose
+            // origins are fixed up only at the end of do_include_modules_at(), which
+            // invalidates constants in the middle of it. Don't try to be precise there.
+            if (RB_TYPE_P(tmp, T_MODULE) && RCLASS_ORIGIN(tmp) != tmp) return ZJIT_CONST_LOOKUP_UNKNOWN;
+        }
+
+        rb_const_entry_t *ce = rb_const_lookup(tmp, id);
+        if (ce) {
+            if (visibility && RB_CONST_PRIVATE_P(ce)) return ZJIT_CONST_LOOKUP_MISS;
+            if (UNDEF_P(ce->value)) return ZJIT_CONST_LOOKUP_UNKNOWN; // autoload
+            if (exclude && tmp == rb_cObject) return ZJIT_CONST_LOOKUP_MISS;
+            *value = ce->value;
+            return ZJIT_CONST_LOOKUP_FOUND;
+        }
+    }
+    return ZJIT_CONST_LOOKUP_MISS;
+}
+
+// Side-effect-free mirror of rb_const_search()
+static enum zjit_const_lookup
+zjit_const_search(VALUE klass, ID id, bool exclude, bool visibility, VALUE *value)
+{
+    if (klass == rb_cObject) exclude = false;
+    enum zjit_const_lookup result = zjit_const_search_from(klass, id, exclude, visibility, value);
+    if (result != ZJIT_CONST_LOOKUP_MISS || exclude || BUILTIN_TYPE(klass) != T_MODULE) return result;
+    return zjit_const_search_from(rb_cObject, id, false, visibility, value);
+}
+
+static bool
+zjit_namespace_p(VALUE klass)
+{
+    return !SPECIAL_CONST_P(klass) && (BUILTIN_TYPE(klass) == T_CLASS || BUILTIN_TYPE(klass) == T_MODULE);
+}
+
+// Side-effect-free mirror of the lexical scope search in vm_get_ev_const(), for a cref chain
+// with no CREF_PUSHED_BY_EVAL crefs (checked by the caller)
+static enum zjit_const_lookup
+zjit_const_lexical_search(const rb_cref_t *root_cref, ID id, VALUE *value)
+{
+    for (const rb_cref_t *cref = root_cref; CREF_NEXT(cref); cref = CREF_NEXT(cref)) {
+        VALUE klass = CREF_CLASS(cref);
+        if (!zjit_namespace_p(klass)) return ZJIT_CONST_LOOKUP_UNKNOWN;
+        rb_const_entry_t *ce = rb_const_lookup(klass, id);
+        if (ce) {
+            if (UNDEF_P(ce->value)) return ZJIT_CONST_LOOKUP_UNKNOWN; // autoload
+            *value = ce->value;
+            return ZJIT_CONST_LOOKUP_FOUND;
+        }
+    }
+
+    // Search the ancestors of the innermost class. (The interpreter would use CLASS_OF(self)
+    // if it was nil, which we don't know.)
+    if (!zjit_namespace_p(CREF_CLASS(root_cref))) return ZJIT_CONST_LOOKUP_UNKNOWN;
+    return zjit_const_search(CREF_CLASS(root_cref), id, false, false, value);
+}
+
+// Check whether the constant path `segments`, evaluated in the lexical scope `cref` the way
+// vm_get_ev_const_chain() does, still resolves to `expected`, without side effects (no autoload,
+// no const_missing, no deprecation warnings, no allocation). This must be called after the
+// constant table update that triggered rb_clear_constant_cache_for_id().
+// Returns ZJIT_CONST_SAME, ZJIT_CONST_DIFFERENT, or ZJIT_CONST_UNKNOWN.
+enum zjit_const_resolution
+rb_zjit_constant_path_resolves_to(const rb_cref_t *cref, const ID *segments, VALUE expected)
+{
+    // Constant tables and their ownership may be updated by other Ractors.
+    if (rb_multi_ractor_p()) return ZJIT_CONST_UNKNOWN;
+    if (!cref) return ZJIT_CONST_UNKNOWN;
+    for (const rb_cref_t *c = cref; c; c = CREF_NEXT(c)) {
+        // A dynamic cref makes the IC check the cref on every hit, so we never fold such paths.
+        // An ISEQ run by class_eval/instance_eval blocks may have other crefs that share the IC,
+        // so we can't resolve the path using only the one we've seen.
+        if (CREF_DYNAMIC(c) || CREF_PUSHED_BY_EVAL(c)) return ZJIT_CONST_UNKNOWN;
+    }
+
+    VALUE value = Qnil;
+    size_t idx = 0;
+    bool lexical = true;
+    if (segments[0] == idNULL) {
+        value = rb_cObject;
+        idx++;
+        lexical = false;
+    }
+    while (segments[idx]) {
+        ID id = segments[idx++];
+        enum zjit_const_lookup result;
+        if (lexical) {
+            result = zjit_const_lexical_search(cref, id, &value);
+            lexical = false;
+        }
+        else {
+            // vm_check_if_namespace() would raise
+            if (!RB_TYPE_P(value, T_CLASS) && !RB_TYPE_P(value, T_MODULE)) return ZJIT_CONST_DIFFERENT;
+            // rb_public_const_get_from()
+            result = zjit_const_search(value, id, true, true, &value);
+        }
+        switch (result) {
+          case ZJIT_CONST_LOOKUP_FOUND: break;
+          case ZJIT_CONST_LOOKUP_MISS: return ZJIT_CONST_DIFFERENT; // const_missing, not cached
+          case ZJIT_CONST_LOOKUP_UNKNOWN: return ZJIT_CONST_UNKNOWN;
+        }
+    }
+    return value == expected ? ZJIT_CONST_SAME : ZJIT_CONST_DIFFERENT;
 }
 
 VALUE rb_nil_to_s(VALUE obj);

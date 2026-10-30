@@ -6594,6 +6594,174 @@ fn test_constant_path_invalidation() {
     "#), @r#"["Foo::C", "Foo::C", "Bar::C"]"#);
 }
 
+/// Whether the latest version of `iseq` has been invalidated
+fn last_version_invalidated(iseq: IseqPtr) -> bool {
+    let payload = get_or_create_iseq_payload(iseq);
+    unsafe { payload.versions.last().expect("compiled").as_ref() }.is_invalidated()
+}
+
+#[test]
+fn test_constant_unrelated_definition_keeps_code() {
+    eval("
+        module PCIa
+          class Base; end
+          module Handling
+            def self.test = Base
+          end
+        end
+        PCIa::Handling.test
+        PCIa::Handling.test
+        module PCIaOther
+          module Browsers
+            class Base; end
+          end
+        end
+    ");
+    let iseq = get_method_iseq("PCIa::Handling", "test");
+    assert!(!last_version_invalidated(iseq));
+    assert_eq!(get_or_create_iseq_payload(iseq).versions.len(), 1);
+    assert_snapshot!(assert_compiles("PCIa::Handling.test.equal?(PCIa::Base)"), @"true");
+}
+
+#[test]
+fn test_constant_unrelated_definition_keeps_inlined_code() {
+    with_inlining(|| {
+        eval("
+            module PCIg
+              class Base; end
+              module Handling
+                def self.base = Base
+              end
+            end
+            def test = PCIg::Handling.base
+            test
+            test
+            module PCIgOther
+              class Base; end
+            end
+        ");
+        let iseq = get_method_iseq("self", "test");
+        assert!(!last_version_invalidated(iseq));
+        assert_snapshot!(assert_compiles("test.equal?(PCIg::Base)"), @"true");
+    });
+}
+
+#[test]
+fn test_constant_lexical_shadowing_invalidates_code() {
+    eval("
+        PCIbX = :outer
+        module PCIb
+          def self.test = PCIbX
+        end
+        PCIb.test
+        PCIb.test
+        module PCIb
+          PCIbX = :inner
+        end
+    ");
+    assert!(last_version_invalidated(get_method_iseq("PCIb", "test")));
+    assert_snapshot!(assert_compiles("PCIb.test"), @":inner");
+}
+
+#[test]
+fn test_constant_ancestor_shadowing_invalidates_code() {
+    eval("
+        module PCIcMixin; end
+        class PCIcParent
+          PCIcY = :parent
+        end
+        class PCIc < PCIcParent
+          include PCIcMixin
+          def test = PCIcY
+        end
+        PCIc.new.test
+        PCIc.new.test
+        module PCIcMixin
+          PCIcY = :mixin
+        end
+    ");
+    assert!(last_version_invalidated(get_instance_method_iseq("PCIc", "test")));
+    assert_snapshot!(assert_compiles("PCIc.new.test"), @":mixin");
+}
+
+#[test]
+fn test_constant_include_shadowing_invalidates_code() {
+    eval("
+        class PCIhParent
+          PCIhY = :parent
+        end
+        class PCIh < PCIhParent
+          def test = PCIhY
+        end
+        PCIh.new.test
+        PCIh.new.test
+        module PCIhMixin
+          PCIhY = :mixin
+        end
+    ");
+    let iseq = get_instance_method_iseq("PCIh", "test");
+    assert!(!last_version_invalidated(iseq));
+    eval("class PCIh; include PCIhMixin; end");
+    assert!(last_version_invalidated(iseq));
+    assert_snapshot!(assert_compiles("PCIh.new.test"), @":mixin");
+}
+
+#[test]
+fn test_constant_remove_const_invalidates_code() {
+    eval("
+        PCIdX = :outer
+        module PCId
+          PCIdX = :inner
+          def self.test = PCIdX
+        end
+        PCId.test
+        PCId.test
+        PCId.send(:remove_const, :PCIdX)
+    ");
+    assert!(last_version_invalidated(get_method_iseq("PCId", "test")));
+    assert_snapshot!(assert_compiles("PCId.test"), @":outer");
+}
+
+#[test]
+fn test_constant_path_replaced_invalidates_code() {
+    eval("
+        module PCIe
+          B = :old
+        end
+        def test = PCIe::B
+        test
+        test
+        module PCIeOther
+          B = :unrelated
+        end
+    ");
+    let iseq = get_method_iseq("self", "test");
+    assert!(!last_version_invalidated(iseq));
+    eval("
+        $VERBOSE, verbose = nil, $VERBOSE
+        PCIe.const_set(:B, :new)
+        $VERBOSE = verbose
+    ");
+    assert!(last_version_invalidated(iseq));
+    assert_snapshot!(assert_compiles("test"), @":new");
+}
+
+#[test]
+fn test_constant_autoload_invalidates_code() {
+    eval("
+        PCIfX = :outer
+        module PCIf
+          def self.test = PCIfX
+        end
+        PCIf.test
+        PCIf.test
+        module PCIf
+          autoload :PCIfX, 'pcif_nonexistent_feature'
+        end
+    ");
+    assert!(last_version_invalidated(get_method_iseq("PCIf", "test")));
+}
+
 #[test]
 fn test_dupn() {
     eval("
