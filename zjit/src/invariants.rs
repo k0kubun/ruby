@@ -1,6 +1,6 @@
 //! Code invalidation and patching for speculative optimizations.
 
-use std::{collections::{HashMap, HashSet}, mem};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, mem, rc::Rc};
 
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
@@ -8,6 +8,8 @@ use crate::codegen::invalidate_iseq_version;
 use crate::cruby::{rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
+use crate::stats::incr_counter_by;
+use crate::cruby::{rb_zjit_cme_lookup_unchanged, rb_objspace_garbage_object_p};
 use crate::gc::remove_gc_offsets;
 
 macro_rules! compile_patch_points {
@@ -45,7 +47,7 @@ macro_rules! is_no_singleton_class {
 }
 
 /// When a PatchPoint is invalidated, it generates a jump instruction from `from` to `to`.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct PatchPoint {
     /// Code pointer to be invalidated
     patch_point_ptr: CodePtr,
@@ -66,6 +68,43 @@ impl PatchPoint {
     }
 }
 
+/// `Invariant::MethodRedefined` patch points that share how the method entry was looked up.
+/// A group is shared by the method entries that the lookup has found, e.g. a method entry and
+/// its clones (see [rb_zjit_cme_invalidate]), so that keeping it for another method entry is
+/// independent of the number of patch points.
+struct CmePatchPointGroup {
+    /// The class and the method ID that the method entry was looked up with, if the JIT code
+    /// only depends on what the lookup finds. None makes us invalidate the patch points on any
+    /// invalidation of the method entry.
+    lookup: Option<(VALUE, ID)>,
+    patch_points: HashSet<PatchPoint>,
+}
+
+type CmePatchPointGroupRef = Rc<RefCell<CmePatchPointGroup>>;
+
+/// Patch points for a method entry, grouped by the lookup
+type CmePatchPointGroups = HashMap<Option<(VALUE, ID)>, Vec<CmePatchPointGroupRef>>;
+
+impl CmePatchPointGroup {
+    /// Return the method entry that the lookup finds now if it's known to be equivalent to
+    /// `old_cme`, which is being invalidated for a method table change that only affects
+    /// lookups going through `changed_klass`.
+    fn lookup_unchanged(&self, old_cme: *const rb_callable_method_entry_t, changed_klass: VALUE) -> Option<*const rb_callable_method_entry_t> {
+        let (klass, mid) = self.lookup?;
+        // The class is kept alive by the versions of live ISEQs. Without one, there's nothing
+        // to keep, and the class may be dead.
+        let has_live_iseq = self.patch_points.iter().any(|patch_point| {
+            let iseq = unsafe { patch_point.version.as_ref() }.iseq;
+            !iseq.is_null() && unsafe { rb_objspace_garbage_object_p(VALUE::from(iseq)) } == 0
+        });
+        if !has_live_iseq {
+            return None;
+        }
+        let new_cme = unsafe { rb_zjit_cme_lookup_unchanged(klass, mid, old_cme, changed_klass) };
+        if new_cme.is_null() { None } else { Some(new_cme) }
+    }
+}
+
 /// Used to track all of the various block references that contain assumptions
 /// about the state of the virtual machine.
 #[derive(Default)]
@@ -77,7 +116,7 @@ pub struct Invariants {
     bop_patch_points: HashMap<(RedefinitionFlag, ruby_basic_operators), HashSet<PatchPoint>>,
 
     /// Map from CME to patch points that assume the method hasn't been redefined
-    cme_patch_points: HashMap<*const rb_callable_method_entry_t, HashSet<PatchPoint>>,
+    cme_patch_points: HashMap<*const rb_callable_method_entry_t, CmePatchPointGroups>,
 
     /// Map from constant ID to patch points that assume the constant hasn't been redefined
     constant_state_patch_points: HashMap<ID, HashSet<PatchPoint>>,
@@ -291,19 +330,31 @@ pub fn track_bop_assumption(
     ));
 }
 
-/// Track a patch point for a callable method entry (CME).
+/// Track a patch point for a callable method entry (CME). `lookup` is the class and the method
+/// ID that `cme` was looked up with, if the patch point only depends on what the lookup finds.
 pub fn track_cme_assumption(
     cme: *const rb_callable_method_entry_t,
+    lookup: Option<(VALUE, ID)>,
     patch_point_ptr: CodePtr,
     side_exit_ptr: CodePtr,
-    version: IseqVersionRef,
+    mut version: IseqVersionRef,
 ) {
     let invariants = ZJITState::get_invariants();
-    invariants.cme_patch_points.entry(cme).or_default().insert(PatchPoint::new(
-        patch_point_ptr,
-        side_exit_ptr,
-        version,
-    ));
+
+    // Keep the class alive and unmoved while the patch point refers to it
+    if let Some((klass, _)) = lookup {
+        let version = unsafe { version.as_mut() };
+        if !klass.special_const_p() && !version.patch_point_objects.contains(&klass) {
+            VALUE::from(version.iseq).write_barrier(klass);
+            version.patch_point_objects.push(klass);
+        }
+    }
+
+    let groups = invariants.cme_patch_points.entry(cme).or_default().entry(lookup).or_default();
+    if groups.is_empty() {
+        groups.push(Rc::new(RefCell::new(CmePatchPointGroup { lookup, patch_points: HashSet::new() })));
+    }
+    groups[0].borrow_mut().patch_points.insert(PatchPoint::new(patch_point_ptr, side_exit_ptr, version));
 }
 
 /// Track a patch point for each constant name in a constant path assumption.
@@ -347,9 +398,15 @@ pub fn track_no_singleton_class_assumption(
     ));
 }
 
-/// Called when a method is redefined. Invalidates all JIT code that depends on the CME.
+/// Called when a method is redefined. Invalidates JIT code that depends on the CME.
+///
+/// The VM invalidates a CME when a method table change may affect a lookup that finds it, e.g.
+/// on `include Comparable` into any subclass of `Object`, it invalidates `BasicObject#==`. If
+/// `changed_klass` is non-zero, the change only affects lookups going through it (see
+/// rb_clear_method_cache_for_change()). Then patch points whose lookup doesn't go through it
+/// and still finds an equivalent method entry are kept.
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_cme_invalidate(cme: *const rb_callable_method_entry_t) {
+pub extern "C" fn rb_zjit_cme_invalidate(cme: *const rb_callable_method_entry_t, changed_klass: VALUE) {
     // If ZJIT isn't enabled, do nothing
     if !zjit_enabled_p() {
         return;
@@ -358,11 +415,43 @@ pub extern "C" fn rb_zjit_cme_invalidate(cme: *const rb_callable_method_entry_t)
     with_vm_lock(src_loc!(), || {
         let invariants = ZJITState::get_invariants();
         // Get the CMD's jumps and remove the entry from the map as it has been invalidated
-        if let Some(patch_points) = invariants.cme_patch_points.remove(&cme) {
+        if let Some(groups) = invariants.cme_patch_points.remove(&cme) {
+            // Method tables are per box, and the re-check only reads the current box's
+            let recheck = changed_klass != VALUE(0) && !invariants.non_root_box_created;
+            let mut num_kept = 0;
+            let mut invalidated = vec![];
+            for (lookup, groups) in groups {
+                for group in groups {
+                    let new_cme = if recheck { group.borrow().lookup_unchanged(cme, changed_klass) } else { None };
+                    if let Some(new_cme) = new_cme {
+                        // The VM may have replaced the CME with a clone in method tables. Track the
+                        // group for the clone, which will be invalidated on future changes. Keep
+                        // tracking it for the old CME too since stale method caches can still refer
+                        // to it, and the VM invalidates the CME it finds in method caches.
+                        num_kept += group.borrow().patch_points.len();
+                        for key in [cme, new_cme] {
+                            let key_groups = invariants.cme_patch_points.entry(key).or_default().entry(lookup).or_default();
+                            if !key_groups.iter().any(|key_group| Rc::ptr_eq(key_group, &group)) {
+                                key_groups.push(group.clone());
+                            }
+                        }
+                    } else {
+                        // Other method entries sharing the group see it empty
+                        invalidated.extend(group.borrow_mut().patch_points.drain());
+                    }
+                }
+            }
+            incr_counter_by(crate::stats::Counter::method_invalidation_kept, num_kept as u64);
+            incr_counter_by(crate::stats::Counter::method_invalidation_invalidated, invalidated.len() as u64);
+            if invalidated.is_empty() {
+                return;
+            }
+
             let cb = ZJITState::get_code_block();
             debug!("CME is invalidated: {:?}", cme);
 
-            // Invalidate all patch points for this CME
+            // Invalidate the patch points whose lookup may find a different method
+            let patch_points = invalidated;
             compile_patch_points!(cb, patch_points, CME, "CME is invalidated: {:?}", cme);
 
             cb.mark_all_executable();
