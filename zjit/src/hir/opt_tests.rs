@@ -31768,6 +31768,95 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_block_return_through_yield_in_nested_block() {
+        eval(r"
+            def search(a)
+              a.each { |x| yield x }
+              nil
+            end
+            def test(a)
+              search(a) { |x| return x if x }
+              nil
+            end
+            test([nil, 1])
+            test([nil, 1])
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, search@0x1010, cme:0x1018)
+          v38:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :search, v38 (0x1040), num_args=1, block=0x1060
+          PatchPoint NoSingletonClass(Array@0x1080)
+          PatchPoint MethodRedefined(Array@0x1080, each@0x1088, cme:0x1090)
+          v65:ArrayExact = GuardType v10, ArrayExact recompile
+          PushInlineFrame :each, v65 (0x10b8), num_args=0, block=0x10d8
+          v99:Fixnum[0] = Const Value(0)
+          Jump bb14(v99)
+        bb14(v112:Fixnum):
+          v116:CInt64 = ArrayLength v65
+          v117:Fixnum = BoxFixnum v116
+          v118:BoolExact = FixnumGe v112, v117
+          PatchPoint NoEPEscape(each)
+          CondBranchTest v118, bb17(), bb13()
+        bb17():
+          PopInlineFrame
+          PatchPoint NoEPEscape(search)
+          v53:NilClass = Const Value(nil)
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          v31:NilClass = Const Value(nil)
+          CheckInterrupts
+          Return v31
+        bb13():
+          v139:CInt64 = UnboxFixnum v112
+          v140:BasicObject = ArrayAref v65, v139
+          PatchPoint NoEPEscape(each)
+          v144:CPtr = GetEP 0
+          v145:CInt64 = LoadField v144, :VM_ENV_DATA_INDEX_SPECVAL@0x10f8
+          v146:CInt64[-4] = Const CInt64(-4)
+          v147:CInt64 = IntAnd v145, v146
+          v182:BasicObject = LoadField v147, :captured_self@0x10f9
+          PushInlineBlockFrame v182, v147 (0x10d8), num_args=1
+          v172:CPtr = GetEP 1
+          v173:CInt64 = LoadField v172, :VM_ENV_DATA_INDEX_SPECVAL@0x10f8
+          v174:CInt64[-4] = Const CInt64(-4)
+          v175:CInt64 = IntAnd v173, v174
+          v215:BasicObject = LoadField v175, :captured_self@0x10f9
+          PushInlineBlockFrame v215, v175 (0x1060), num_args=1
+          v197:Falsy = RefineType v140, Falsy
+          CondBranchTest v140, bb23(), bb22()
+        bb23():
+          v199:Truthy = RefineType v140, Truthy
+          PopInlineFrame
+          PopInlineFrame
+          PopInlineFrame
+          PopInlineFrame
+          Return v199
+        bb22():
+          v211:NilClass = Const Value(nil)
+          PopInlineFrame
+          PatchPoint NoEPEscape(block in search)
+          PopInlineFrame
+          PatchPoint NoEPEscape(each)
+          v154:Fixnum[1] = Const Value(1)
+          v155:Fixnum = FixnumAdd v112, v154
+          Jump bb14(v155)
+        ");
+    }
+
+    #[test]
     fn test_inline_block_return_jumps_to_inlined_home_return_block() {
         eval(r"
             def find(a)
