@@ -215,6 +215,47 @@ fn test_function_stub_profiles_before_compiling() {
 }
 
 #[test]
+fn test_backedges_count_toward_call_threshold() {
+    rb_zjit_prepare_options();
+    set_call_threshold(10);
+
+    // A single call that runs a long loop in the interpreter makes the method hot enough to
+    // compile on its next call, but it can't be compiled while the loop is running.
+    assert_eq!(VALUE::fixnum_from_usize(100_000), eval("
+        def backedge_loop(n)
+          i = 0
+          i += 1 while i < n
+          i
+        end
+        backedge_loop(100_000)
+    "));
+    let iseq = get_method_iseq("self", "backedge_loop");
+    assert!(get_or_create_iseq_payload(iseq).versions.is_empty());
+
+    assert_eq!(VALUE::fixnum_from_usize(3), eval("backedge_loop(3)"));
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+}
+
+#[test]
+fn test_short_loop_does_not_count_toward_call_threshold() {
+    rb_zjit_prepare_options();
+    set_call_threshold(10);
+
+    // A few backward branches don't make a method hot.
+    eval("
+        def short_loop(n)
+          i = 0
+          i += 1 while i < n
+          i
+        end
+        short_loop(3)
+        short_loop(3)
+    ");
+    let iseq = get_method_iseq("self", "short_loop");
+    assert!(get_or_create_iseq_payload(iseq).versions.is_empty());
+}
+
+#[test]
 fn test_putobject() {
     assert_snapshot!(inspect("
         def test = 1
