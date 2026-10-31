@@ -1,6 +1,7 @@
 use std::alloc::{handle_alloc_error, Layout};
 use std::ptr;
 
+use crate::cast::IntoU64;
 use crate::cruby::{IseqPtr, VALUE, Qnil, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::{ZJIT_STACK_MAP_OP_BITS, ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_OP_END, ZJIT_STACK_MAP_OP_VREG, ZJIT_STACK_MAP_OP_SKIP, ZJIT_STACK_MAP_OP_BASE_PTR, ZJIT_STACK_MAP_OP_IMM, ZJIT_STACK_MAP_OP_NIL, ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA, ZJIT_STACK_MAP_OP_PREV_FRAME};
 use crate::cruby::zjit_jit_frame;
@@ -85,7 +86,7 @@ fn alloc_jit_frame_memory(layout: Layout) -> *mut u8 {
         if raw_ptr.is_null() {
             handle_alloc_error(layout);
         }
-        incr_counter_by(Counter::jit_frame_heap_bytes, layout.size() as u64);
+        incr_counter_by(Counter::jit_frame_heap_bytes, layout.size().as_u64());
     }
     raw_ptr
 }
@@ -95,22 +96,40 @@ fn alloc_jit_frame_memory(layout: Layout) -> *mut u8 {
 static EMPTY_STACK_MAPS: [u8; 2] = [0, 1];
 const _: () = assert!(ZJIT_STACK_MAP_OP_END == 0);
 
-/// Writes a JITFrame stack map bit stream. Bit 0 is materialize_block_code. The
-/// rest are opcodes, ZJIT_STACK_MAP_OP_BITS wide, each followed by its operands.
-/// Operands are varints made of ZJIT_STACK_MAP_VARINT_BITS payload chunks, least
-/// significant first, each followed by a bit that says whether another chunk
-/// follows. Streams are little-endian bit order: bit i is
-/// `(bytes[i / 8] >> (i % 8)) & 1`. zjit_materialize_frames() decodes the
-/// opcodes in order while moving a write cursor down the VM stack.
+/// Writes a JITFrame stack map bit stream. The bit stream is little endian.
+/// Bit 0 is `materialize_block_code`.
+/// The rest is `opcode, payload` pairs on repeat where:
+///   - `opcode` is [`ZJIT_STACK_MAP_OP_BITS`] bits wide.
+///   - `payload` is 0 or more variable width integer ("varint") chunks, depending on the opcode.
+///   - Each varint chunk is [`ZJIT_STACK_MAP_VARINT_BITS`] plus one continuation bit. The varint
+///     ends when the continuation bit is clear. The width upper bound of varint is the number of
+///     bits in a `VALUE`.
+/// The opcode [`ZJIT_STACK_MAP_OP_END`] has no payload and ends the stream.
+///
+/// zjit_materialize_frames() decodes the opcodes in order while moving a write cursor down the VM
+/// stack.
 pub struct StackMapWriter {
     bytes: Vec<u8>,
     num_bits: usize,
 }
 
+#[cfg(test)]
+#[test]
+fn test_bit_stream_example() {
+    let mut writer = StackMapWriter::new(true);
+    writer.vreg(5);  // one varint chunk
+    writer.skip(17); // two varint chunks
+    // Fields are packed LSB first, so the literal reads right to left from bit 0. In each varint
+    // chunk the continuation bit sits above the 4 payload bits, so 17 is lo=1_0001 then hi=0_0001.
+    //                  END 17(hi) 17(lo) SKIP 5      VREG materialize_block_code
+    let stream: u32 = 0b000_0_0001_1_0001_010__0_0101_001__1;
+    assert_eq!(writer.finish(), stream.to_le_bytes());
+}
+
 impl StackMapWriter {
     pub fn new(materialize_block_code: bool) -> Self {
         let mut writer = Self { bytes: vec![], num_bits: 0 };
-        writer.write_bits(materialize_block_code as u64, 1);
+        writer.write_bits(u64::from(materialize_block_code), 1);
         writer
     }
 
@@ -126,7 +145,7 @@ impl StackMapWriter {
 
     fn write_op(&mut self, op: u32) {
         debug_assert!(op < 1 << ZJIT_STACK_MAP_OP_BITS);
-        self.write_bits(op as u64, ZJIT_STACK_MAP_OP_BITS);
+        self.write_bits(op.into(), ZJIT_STACK_MAP_OP_BITS);
     }
 
     fn write_varint(&mut self, mut value: u64) {
@@ -134,9 +153,9 @@ impl StackMapWriter {
         loop {
             let chunk = value & payload_mask;
             value >>= ZJIT_STACK_MAP_VARINT_BITS;
-            let more = u64::from(value != 0);
-            self.write_bits(chunk | more << ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_VARINT_BITS + 1);
-            if more == 0 {
+            let cont_bit = u64::from(value != 0);
+            self.write_bits(chunk | cont_bit << ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_VARINT_BITS + 1);
+            if cont_bit == 0 {
                 break;
             }
         }
@@ -146,7 +165,7 @@ impl StackMapWriter {
     /// Writes `jit_return[-slot_index]`.
     pub fn vreg(&mut self, slot_index: usize) {
         self.write_op(ZJIT_STACK_MAP_OP_VREG);
-        self.write_varint(slot_index as u64);
+        self.write_varint(slot_index.as_u64());
     }
 
     /// ZJIT_STACK_MAP_OP_NIL writes Qnil. Other immediates use
@@ -157,7 +176,7 @@ impl StackMapWriter {
             self.write_op(ZJIT_STACK_MAP_OP_NIL);
         } else {
             self.write_op(ZJIT_STACK_MAP_OP_IMM);
-            self.write_varint(value.0 as u64);
+            self.write_varint(value.as_u64());
         }
     }
 
@@ -165,7 +184,7 @@ impl StackMapWriter {
     /// without writing.
     pub fn skip(&mut self, size: usize) {
         self.write_op(ZJIT_STACK_MAP_OP_SKIP);
-        self.write_varint(size as u64);
+        self.write_varint(size.as_u64());
     }
 
     /// ZJIT_STACK_MAP_OP_BASE_PTR. Operands: slot index, stack size. Anchors the
@@ -198,7 +217,7 @@ impl StackMapWriter {
     }
 
     /// Terminate the stream with ZJIT_STACK_MAP_OP_END and return its bytes.
-    fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
         self.write_op(ZJIT_STACK_MAP_OP_END);
         self.bytes
     }
@@ -208,20 +227,22 @@ impl JITFrame {
     /// Allocate a JITFrame with an empty stack map, register it with ZJITState,
     /// and return a raw pointer that remains valid for the lifetime of the process.
     fn alloc(pc: *const VALUE, iseq: IseqPtr, materialize_block_code: bool) -> *const Self {
-        let raw_ptr = alloc_jit_frame_memory(Layout::new::<JITFrame>()) as *mut JITFrame;
+        let raw_ptr: *mut Self = alloc_jit_frame_memory(Layout::new::<JITFrame>()).cast();
         unsafe {
             ptr::write(raw_ptr, JITFrame {
                 pc,
                 iseq,
-                stack_map: &EMPTY_STACK_MAPS[materialize_block_code as usize],
+                stack_map: &EMPTY_STACK_MAPS[usize::from(materialize_block_code)],
             });
         }
         ZJITState::get_jit_frames().push(raw_ptr);
-        raw_ptr as *const _
+        raw_ptr.cast_const()
     }
 
     pub fn materialize_block_code(&self) -> bool {
-        unsafe { *self.stack_map & 1 != 0 }
+        // The 0th bit of the bitstream is this boolean.
+        let zeroth_byte = unsafe { *self.stack_map };
+        zeroth_byte & 1 != 0
     }
 
     pub fn stack_map_writer(&self) -> StackMapWriter {
@@ -231,10 +252,14 @@ impl JITFrame {
     /// Install a stack map built from [Self::stack_map_writer].
     pub fn set_stack_map(&mut self, writer: StackMapWriter) {
         debug_assert_eq!(writer.bytes.first().map(|byte| byte & 1 != 0), Some(self.materialize_block_code()));
+        // Avoid allocating memory more than once for the same stack map
+        if EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty)) {
+            return;
+        }
         let bytes = writer.finish();
         let stack_map = alloc_jit_frame_memory(Layout::array::<u8>(bytes.len()).unwrap());
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), stack_map, bytes.len()); }
-        incr_counter_by(Counter::jit_frame_stack_map_bytes, bytes.len() as u64);
+        incr_counter_by(Counter::jit_frame_stack_map_bytes, bytes.len().as_u64());
         self.stack_map = stack_map;
     }
 

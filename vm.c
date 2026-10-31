@@ -3154,6 +3154,9 @@ zjit_write_frame_stack(const rb_execution_context_t *ec, rb_control_frame_t *cfp
                 env_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(env_cfp);
                 env_escaped = VM_ENV_ESCAPED_P(env_cfp->ep);
                 break;
+              default:
+                rb_bug("unknown ZJIT stackmap opcode: %u", op);
+                break;
             }
             // The cursor only ever moves down, and an opcode that moves it off the
             // bottom of the VM stack means the map or the anchor is malformed.
