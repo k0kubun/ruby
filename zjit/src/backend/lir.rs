@@ -1893,6 +1893,10 @@ pub struct Assembler {
     /// consumes this through Insn::CCall, after it knows whether each live VReg
     /// is in a saved register or an allocator spill slot.
     stack_map: Option<StackMap>,
+
+    /// HIR blocks that are slow paths. Their LIR blocks are placed after the other blocks.
+    /// See [`hir::Block::cold`].
+    cold_hir_blocks: HashSet<hir::BlockId>,
 }
 
 impl Assembler
@@ -1909,6 +1913,7 @@ impl Assembler
             num_vregs: 0,
             idx: 0,
             stack_map: None,
+            cold_hir_blocks: HashSet::default(),
         }
     }
 
@@ -1943,6 +1948,7 @@ impl Assembler
             label_names: old_asm.label_names.clone(),
             accept_scratch_reg: old_asm.accept_scratch_reg,
             stack_state: old_asm.stack_state.clone(),
+            cold_hir_blocks: old_asm.cold_hir_blocks.clone(),
             ..Self::new()
         };
 
@@ -2083,6 +2089,28 @@ impl Assembler
                 if let Some(Insn::Jmp(Target::Label(label))) = insns.last() {
                     if *label == next_label {
                         insns.pop();
+                    }
+                }
+
+                // If a conditional jump to the next block is followed by an unconditional jump
+                // elsewhere, e.g. because the other target is a cold block, invert the condition
+                // and fall through instead.
+                if let [.., cond_jump, Insn::Jmp(Target::Label(other_label))] = insns.as_slice() {
+                    let other_target = Target::Label(*other_label);
+                    let inverted = match cond_jump {
+                        Insn::Jz(Target::Label(label)) if *label == next_label => Some(Insn::Jnz(other_target)),
+                        Insn::Jnz(Target::Label(label)) if *label == next_label => Some(Insn::Jz(other_target)),
+                        Insn::Je(Target::Label(label)) if *label == next_label => Some(Insn::Jne(other_target)),
+                        Insn::Jne(Target::Label(label)) if *label == next_label => Some(Insn::Je(other_target)),
+                        Insn::Jl(Target::Label(label)) if *label == next_label => Some(Insn::Jge(other_target)),
+                        Insn::Jge(Target::Label(label)) if *label == next_label => Some(Insn::Jl(other_target)),
+                        Insn::Jle(Target::Label(label)) if *label == next_label => Some(Insn::Jg(other_target)),
+                        Insn::Jg(Target::Label(label)) if *label == next_label => Some(Insn::Jle(other_target)),
+                        _ => None,
+                    };
+                    if let Some(inverted) = inverted {
+                        insns.pop();
+                        *insns.last_mut().unwrap() = inverted;
                     }
                 }
             }
@@ -3445,8 +3473,30 @@ impl Assembler
         (kill_sets, gen_sets)
     }
 
+    /// The order in which blocks are allocated registers and emitted: the reverse post-order,
+    /// except that the blocks of cold HIR blocks come after the other CFG blocks, keeping the
+    /// hot code together like V8's deferred blocks. Blocks outside the CFG, e.g. the one that
+    /// side exits are appended to, stay last.
     pub fn block_order(&self) -> Vec<BlockId> {
-        self.reverse_post_order()
+        let rpo = self.reverse_post_order();
+        if self.cold_hir_blocks.is_empty() {
+            return rpo;
+        }
+        let is_cold = |block: &BlockId| {
+            let block = &self.basic_blocks[block.0];
+            block.rpo_index != DUMMY_RPO_INDEX && self.cold_hir_blocks.contains(&block.hir_block_id)
+        };
+        let (cold, hot): (Vec<_>, Vec<_>) = rpo.into_iter().partition(is_cold);
+        // Insert the cold blocks before the trailing non-CFG blocks
+        let cfg_end = hot.iter().rposition(|block| self.basic_blocks[block.0].rpo_index != DUMMY_RPO_INDEX).map_or(0, |idx| idx + 1);
+        let mut order = hot;
+        order.splice(cfg_end..cfg_end, cold);
+        order
+    }
+
+    /// Mark a HIR block as a slow path to be placed after the other blocks.
+    pub fn mark_cold_hir_block(&mut self, hir_block_id: hir::BlockId) {
+        self.cold_hir_blocks.insert(hir_block_id);
     }
 
     /// Calculate live intervals for each VReg.
@@ -4671,6 +4721,24 @@ mod tests {
             bitset_to_vreg_indices(&live_in[b4.0], num_vregs),
             vec![r10.vreg_idx_usize(), r12.vreg_idx_usize()]
         );
+    }
+
+    #[test]
+    fn test_cold_blocks_go_last() {
+        let TestFunc { mut asm, b1, b2, b3, b4, .. } = build_func();
+        assert_eq!(asm.block_order(), vec![b1, b2, b3, b4]);
+
+        // Mark b3 (HIR block 2) cold: it moves after b4, so b2's jump to b4 falls through and
+        // its jump to b3 takes the inverted condition.
+        asm.mark_cold_hir_block(hir::BlockId(2));
+        assert_eq!(asm.block_order(), vec![b1, b2, b4, b3]);
+
+        crate::options::rb_zjit_prepare_options(); // for get_option! in linearize_instructions
+        let label_b3 = asm.block_label(b3);
+        let insns = asm.linearize_instructions();
+        // b1 falls through to b2, b2 jumps to b3 only if not less, and b3 jumps back to b2.
+        let jumps: Vec<_> = insns.iter().filter(|insn| matches!(insn, Insn::Jl(_) | Insn::Jge(_) | Insn::Jmp(_))).collect();
+        assert!(matches!(jumps[..], [Insn::Jge(Target::Label(label)), Insn::Jmp(_)] if *label == label_b3), "{jumps:?}");
     }
 
     #[test]

@@ -478,6 +478,9 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
             if block_id == function.entries_block { continue; }
             let lir_block_id = asm.new_block(block_id, function.is_entry_block(block_id), rpo_idx);
             hir_to_lir[block_id] = Some(lir_block_id);
+            if function.is_cold_block(block_id) {
+                asm.mark_cold_hir_block(block_id);
+            }
         }
 
         // Compile each basic block
