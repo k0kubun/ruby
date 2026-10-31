@@ -20,7 +20,7 @@ typedef struct zjit_jit_frame {
     // The ISEQ this frame belongs to. Marked via rb_execution_context_mark_ctx.
     // NULL for C frames.
     const rb_iseq_t *iseq;
-    // Stack map bit stream, decoded by zjit_materialize_frames(). Bit 0 is
+    // Stack map, decoded by zjit_materialize_frames(). Bit 0 of byte 0 is
     // materialize_block_code, see ZJIT_FRAME_MATERIALIZE_BLOCK_CODE_P().
     // The rest are ZJIT_STACK_MAP_OP_* opcodes, each followed by its operands.
     // NULL for C frames.
@@ -34,23 +34,27 @@ typedef struct zjit_jit_frame {
 static inline bool
 ZJIT_FRAME_MATERIALIZE_BLOCK_CODE_P(const zjit_jit_frame_t *jit_frame)
 {
-    // The 0th bit of the bitstream is this boolean.
+    // Bit 0 of byte 0 is this boolean.
     return jit_frame->stack_map && (jit_frame->stack_map[0] & 1);
 }
 
 #if USE_ZJIT
-// JITFrame stack map bit stream format. See StackMapWriter in zjit/src/jit_frame.rs.
-#define ZJIT_STACK_MAP_VARINT_BITS  4
-#define ZJIT_STACK_MAP_OP_BITS      3
-// Opcodes in the JITFrame stack map bit stream format
-#define ZJIT_STACK_MAP_OP_END       0
-#define ZJIT_STACK_MAP_OP_VREG      1
-#define ZJIT_STACK_MAP_OP_SKIP      2
-#define ZJIT_STACK_MAP_OP_BASE_PTR  3
-#define ZJIT_STACK_MAP_OP_IMM       4
-#define ZJIT_STACK_MAP_OP_NIL       5
-#define ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA 6
-#define ZJIT_STACK_MAP_OP_PREV_FRAME 7
+// JITFrame stack map format. See StackMapWriter in zjit/src/jit_frame.rs.
+// Byte 0 holds flags. Each opcode after it is a byte, and some are followed by
+// unsigned LEB128 operands.
+#define ZJIT_STACK_MAP_OP_END       0x00
+// 0x01..0xcf: write the native stack slot whose index is the opcode itself
+#define ZJIT_STACK_MAP_OP_VREG_MIN  0x01
+#define ZJIT_STACK_MAP_OP_VREG_MAX  0xcf
+#define ZJIT_STACK_MAP_OP_VREG      0xd0 // operand: slot index
+#define ZJIT_STACK_MAP_OP_NIL       0xd1
+#define ZJIT_STACK_MAP_OP_IMM       0xd2 // operand: VALUE
+#define ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA 0xd3
+#define ZJIT_STACK_MAP_OP_PREV_FRAME 0xd4
+#define ZJIT_STACK_MAP_OP_BASE_PTR  0xd5 // operands: slot index, stack size
+#define ZJIT_STACK_MAP_OP_SKIP      0xd6 // operand: number of slots
+// 0xd7..0xff: skip (opcode - 0xd6) slots
+#define ZJIT_STACK_MAP_OP_SKIP_MIN  0xd7
 
 extern void *rb_zjit_entry;
 extern bool rb_zjit_compiling_p;

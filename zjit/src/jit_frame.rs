@@ -3,7 +3,7 @@ use std::ptr;
 
 use crate::cast::{IntoU64, IntoUsize};
 use crate::cruby::{IseqPtr, VALUE, Qnil, rb_gc_mark_movable, rb_gc_location};
-use crate::cruby::{ZJIT_STACK_MAP_OP_BITS, ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_OP_END, ZJIT_STACK_MAP_OP_VREG, ZJIT_STACK_MAP_OP_SKIP, ZJIT_STACK_MAP_OP_BASE_PTR, ZJIT_STACK_MAP_OP_IMM, ZJIT_STACK_MAP_OP_NIL, ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA, ZJIT_STACK_MAP_OP_PREV_FRAME};
+use crate::cruby::{ZJIT_STACK_MAP_OP_END, ZJIT_STACK_MAP_OP_VREG_MIN, ZJIT_STACK_MAP_OP_VREG_MAX, ZJIT_STACK_MAP_OP_VREG, ZJIT_STACK_MAP_OP_NIL, ZJIT_STACK_MAP_OP_IMM, ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA, ZJIT_STACK_MAP_OP_PREV_FRAME, ZJIT_STACK_MAP_OP_BASE_PTR, ZJIT_STACK_MAP_OP_SKIP, ZJIT_STACK_MAP_OP_SKIP_MIN};
 use crate::cruby::zjit_jit_frame;
 use crate::codegen::iseq_may_write_block_code;
 use crate::options::get_option;
@@ -71,38 +71,18 @@ impl JITFrameAllocator {
         self.cursor = end;
         self.virt_mem.start_ptr().add_bytes(start).raw_ptr(&self.virt_mem) as *mut u8
     }
-
-    /// Like [Self::try_alloc], but also keep the `tail` bytes after the allocation
-    /// readable. They may be handed out as the start of the next allocation.
-    fn try_alloc_with_readable_tail(&mut self, layout: Layout, tail: usize) -> *mut u8 {
-        let Ok(padded) = Layout::from_size_align(layout.size() + tail, layout.align()) else {
-            return ptr::null_mut();
-        };
-        let raw_ptr = self.try_alloc(padded);
-        if !raw_ptr.is_null() {
-            self.cursor -= tail;
-        }
-        raw_ptr
-    }
 }
 
 /// Bump-allocate `layout` from the JITFrame arena, falling back to the heap.
 fn alloc_jit_frame_memory(layout: Layout) -> *mut u8 {
-    alloc_jit_frame_memory_with_readable_tail(layout, 0)
-}
-
-/// Like [alloc_jit_frame_memory], but also keep the `tail` bytes after the
-/// allocation readable.
-fn alloc_jit_frame_memory_with_readable_tail(layout: Layout, tail: usize) -> *mut u8 {
     // Prefer the low-address arena so that call sites can store JITFrame pointers
     // as a 32-bit immediate. Falling back to the heap only costs code size.
     let mut raw_ptr = match ZJITState::get_jit_frame_allocator() {
-        Some(arena) => arena.try_alloc_with_readable_tail(layout, tail),
+        Some(arena) => arena.try_alloc(layout),
         None => ptr::null_mut(),
     };
     if raw_ptr.is_null() {
-        let layout = Layout::from_size_align(layout.size() + tail, layout.align()).unwrap();
-        raw_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        raw_ptr = unsafe { std::alloc::alloc(layout) };
         if raw_ptr.is_null() {
             handle_alloc_error(layout);
         }
@@ -112,91 +92,91 @@ fn alloc_jit_frame_memory_with_readable_tail(layout: Layout, tail: usize) -> *mu
 }
 
 /// Stack maps with no entries, indexed by materialize_block_code.
-/// Bit 0 is the flag and the END opcode that follows is all zeros.
-/// Each one is followed by STACK_MAP_PADDING bytes like any other stream.
-static EMPTY_STACK_MAPS: [u8; 2 + STACK_MAP_PADDING] = [0, 1, 0, 0, 0, 0, 0, 0, 0];
-/// The decoder in vm.c loads 8 bytes at a time from any byte offset of a stream, so
-/// every stream is followed by this many readable bytes. The bytes after a stream
-/// in the arena may belong to the next allocation, since the decoder ignores them.
-const STACK_MAP_PADDING: usize = 7;
-const _: () = assert!(ZJIT_STACK_MAP_OP_END == 0);
+static EMPTY_STACK_MAPS: [[u8; 2]; 2] = [[0, ZJIT_STACK_MAP_OP_END as u8], [1, ZJIT_STACK_MAP_OP_END as u8]];
 
-/// Writes a JITFrame stack map bit stream. The bit stream is little endian.
-/// Bit 0 is `materialize_block_code`.
-/// The rest is `opcode, payload` pairs on repeat where:
-///   - `opcode` is [`ZJIT_STACK_MAP_OP_BITS`] bits wide.
-///   - `payload` is 0 or more variable width integer ("varint") chunks, depending on the opcode.
-///   - Each varint chunk is [`ZJIT_STACK_MAP_VARINT_BITS`] plus one continuation bit. The varint
-///     ends when the continuation bit is clear. The width upper bound of varint is the number of
-///     bits in a `VALUE`.
-/// The opcode [`ZJIT_STACK_MAP_OP_END`] has no payload and ends the stream.
+/// Writes a JITFrame stack map. Byte 0 holds flags, whose bit 0 is `materialize_block_code`.
+/// The rest is a sequence of one-byte opcodes, some followed by unsigned LEB128 operands, and
+/// [`ZJIT_STACK_MAP_OP_END`] ends it. See zjit.h for the opcodes.
 ///
 /// zjit_materialize_frames() decodes the opcodes in order while moving a write cursor down the VM
-/// stack.
+/// stack. Most opcodes are a native stack slot index small enough to be the opcode itself, so the
+/// decoder writes most slots with one byte load and one compare, without decoding any operand.
 pub struct StackMapWriter {
     bytes: Vec<u8>,
-    num_bits: usize,
+    /// The length of `bytes` after the last opcode that writes a slot. The opcodes after it
+    /// only move the cursor, so [Self::finish] drops them.
+    written_len: usize,
+    /// Where the last opcode starts, if it's a skip that fits in the opcode. Consecutive skips
+    /// are merged into it.
+    short_skip_pos: Option<usize>,
 }
 
 #[cfg(test)]
 #[test]
-fn test_bit_stream_example() {
+fn test_stack_map_example() {
     let mut writer = StackMapWriter::new(true);
-    writer.vreg(5);  // one varint chunk
-    writer.skip(17); // two varint chunks
-    // Fields are packed LSB first, so the literal reads right to left from bit 0. In each varint
-    // chunk the continuation bit sits above the 4 payload bits, so 17 is lo=1_0001 then hi=0_0001.
-    //                  END 17(hi) 17(lo) SKIP 5      VREG materialize_block_code
-    let stream: u32 = 0b000_0_0001_1_0001_010__0_0101_001__1;
-    assert_eq!(writer.finish(), stream.to_le_bytes());
+    writer.vreg(5);      // slot index as the opcode
+    writer.vreg(300);    // VREG, then 300 in LEB128
+    writer.skip(16);     // number of slots in the opcode
+    writer.skip(1);      // merged into the previous skip
+    writer.imm(Qnil);
+    writer.prev_frame(); // dropped, since no slot is written after it
+    writer.skip(3);
+    assert_eq!(writer.finish(), [
+        1,                                 // materialize_block_code
+        5,
+        ZJIT_STACK_MAP_OP_VREG as u8, 0b1_0101100, 0b0_0000010,
+        (ZJIT_STACK_MAP_OP_SKIP_MIN - 1 + 17) as u8,
+        ZJIT_STACK_MAP_OP_NIL as u8,
+        ZJIT_STACK_MAP_OP_END as u8,
+    ]);
+
+    // A stack map that writes no slot has no opcode other than END
+    let mut writer = StackMapWriter::new(false);
+    writer.base_ptr(3, 2);
+    writer.skip(2);
+    writer.skip_vm_env_data();
+    assert_eq!(writer.finish(), [0, ZJIT_STACK_MAP_OP_END as u8]);
 }
 
 impl StackMapWriter {
     pub fn new(materialize_block_code: bool) -> Self {
-        let mut writer = Self { bytes: vec![], num_bits: 0 };
-        writer.write_bits(u64::from(materialize_block_code), 1);
-        writer
-    }
-
-    /// Append the low `num_bits` bits of `value`, which must be at most 56.
-    fn write_bits(&mut self, value: u64, num_bits: u32) {
-        debug_assert!(num_bits <= 56);
-        let end_bits = self.num_bits + num_bits.to_usize();
-        self.bytes.resize(end_bits.div_ceil(8), 0);
-        // OR in a byte at a time, starting at the partially written last byte.
-        let mut bits = (value & ((1 << num_bits) - 1)) << (self.num_bits % 8);
-        let mut idx = self.num_bits / 8;
-        while bits != 0 {
-            self.bytes[idx] |= bits as u8;
-            bits >>= 8;
-            idx += 1;
-        }
-        self.num_bits = end_bits;
+        Self { bytes: vec![u8::from(materialize_block_code)], written_len: 1, short_skip_pos: None }
     }
 
     fn write_op(&mut self, op: u32) {
-        debug_assert!(op < 1 << ZJIT_STACK_MAP_OP_BITS);
-        self.write_bits(op.into(), ZJIT_STACK_MAP_OP_BITS);
+        self.short_skip_pos = None;
+        self.bytes.push(op.try_into().unwrap());
     }
 
-    fn write_varint(&mut self, mut value: u64) {
-        let payload_mask = (1 << ZJIT_STACK_MAP_VARINT_BITS) - 1;
+    /// Mark the end of an opcode that writes a slot
+    fn wrote_slot(&mut self) {
+        self.written_len = self.bytes.len();
+    }
+
+    fn write_uleb128(&mut self, mut value: u64) {
         loop {
-            let chunk = value & payload_mask;
-            value >>= ZJIT_STACK_MAP_VARINT_BITS;
-            let cont_bit = u64::from(value != 0);
-            self.write_bits(chunk | cont_bit << ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_VARINT_BITS + 1);
-            if cont_bit == 0 {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                self.bytes.push(byte);
                 break;
             }
+            self.bytes.push(byte | 0x80);
         }
     }
 
-    /// ZJIT_STACK_MAP_OP_VREG. Operand: slot index below `cfp->jit_return`.
-    /// Writes `jit_return[-slot_index]`.
+    /// Write `jit_return[-slot_index]`. A slot index in
+    /// ZJIT_STACK_MAP_OP_VREG_MIN..=ZJIT_STACK_MAP_OP_VREG_MAX is the opcode itself.
+    /// Others use ZJIT_STACK_MAP_OP_VREG, whose operand is the slot index.
     pub fn vreg(&mut self, slot_index: usize) {
-        self.write_op(ZJIT_STACK_MAP_OP_VREG);
-        self.write_varint(slot_index.as_u64());
+        if (ZJIT_STACK_MAP_OP_VREG_MIN.to_usize()..=ZJIT_STACK_MAP_OP_VREG_MAX.to_usize()).contains(&slot_index) {
+            self.write_op(slot_index as u32);
+        } else {
+            self.write_op(ZJIT_STACK_MAP_OP_VREG);
+            self.write_uleb128(slot_index.as_u64());
+        }
+        self.wrote_slot();
     }
 
     /// ZJIT_STACK_MAP_OP_NIL writes Qnil. Other immediates use
@@ -207,15 +187,31 @@ impl StackMapWriter {
             self.write_op(ZJIT_STACK_MAP_OP_NIL);
         } else {
             self.write_op(ZJIT_STACK_MAP_OP_IMM);
-            self.write_varint(value.as_u64());
+            self.write_uleb128(value.as_u64());
         }
+        self.wrote_slot();
     }
 
-    /// ZJIT_STACK_MAP_OP_SKIP. Operand: number of slots to move the cursor down
-    /// without writing.
-    pub fn skip(&mut self, size: usize) {
-        self.write_op(ZJIT_STACK_MAP_OP_SKIP);
-        self.write_varint(size.as_u64());
+    /// Move the cursor down `size` slots without writing. Up to
+    /// `0xff - ZJIT_STACK_MAP_OP_SKIP_MIN + 1` slots fit in the opcode. Others use
+    /// ZJIT_STACK_MAP_OP_SKIP, whose operand is the number of slots.
+    pub fn skip(&mut self, mut size: usize) {
+        if size == 0 {
+            return;
+        }
+        // Merge consecutive skips
+        if let Some(pos) = self.short_skip_pos {
+            size += usize::from(self.bytes[pos]) - (ZJIT_STACK_MAP_OP_SKIP_MIN.to_usize() - 1);
+            self.bytes.truncate(pos);
+        }
+        let short_op = ZJIT_STACK_MAP_OP_SKIP_MIN.to_usize() - 1 + size;
+        if short_op <= u8::MAX.into() {
+            self.write_op(short_op as u32);
+            self.short_skip_pos = Some(self.bytes.len() - 1);
+        } else {
+            self.write_op(ZJIT_STACK_MAP_OP_SKIP);
+            self.write_uleb128(size.as_u64());
+        }
     }
 
     /// ZJIT_STACK_MAP_OP_BASE_PTR. Operands: slot index, stack size. Anchors the
@@ -227,10 +223,10 @@ impl StackMapWriter {
     /// emits this opcode, always as the first one, so the opcodes after decode to
     /// the right place.
     pub fn base_ptr(&mut self, slot_index: u32, stack_size: u32) {
-        debug_assert_eq!(self.num_bits, 1, "base_ptr must be the first StackMap entry so later entries decode from it");
+        debug_assert_eq!(self.bytes.len(), 1, "base_ptr must be the first StackMap entry so later entries decode from it");
         self.write_op(ZJIT_STACK_MAP_OP_BASE_PTR);
-        self.write_varint(slot_index.into());
-        self.write_varint(stack_size.into());
+        self.write_uleb128(slot_index.into());
+        self.write_uleb128(stack_size.into());
     }
 
     /// ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA. Moves the cursor past the frame's env
@@ -247,8 +243,10 @@ impl StackMapWriter {
         self.write_op(ZJIT_STACK_MAP_OP_PREV_FRAME);
     }
 
-    /// Terminate the stream with ZJIT_STACK_MAP_OP_END and return its bytes.
+    /// Terminate the stack map with ZJIT_STACK_MAP_OP_END and return its bytes. The opcodes
+    /// after the last one that writes a slot only move the cursor, so they are dropped.
     pub fn finish(mut self) -> Vec<u8> {
+        self.bytes.truncate(self.written_len);
         self.write_op(ZJIT_STACK_MAP_OP_END);
         self.bytes
     }
@@ -263,7 +261,7 @@ impl JITFrame {
             ptr::write(raw_ptr, JITFrame {
                 pc,
                 iseq,
-                stack_map: &EMPTY_STACK_MAPS[usize::from(materialize_block_code)],
+                stack_map: EMPTY_STACK_MAPS[usize::from(materialize_block_code)].as_ptr(),
             });
         }
         ZJITState::get_jit_frames().push(raw_ptr);
@@ -271,7 +269,7 @@ impl JITFrame {
     }
 
     pub fn materialize_block_code(&self) -> bool {
-        // The 0th bit of the bitstream is this boolean.
+        // Bit 0 of byte 0 is this boolean.
         let zeroth_byte = unsafe { *self.stack_map };
         zeroth_byte & 1 != 0
     }
@@ -284,11 +282,11 @@ impl JITFrame {
     pub fn set_stack_map(&mut self, writer: StackMapWriter) {
         debug_assert_eq!(writer.bytes.first().map(|byte| byte & 1 != 0), Some(self.materialize_block_code()));
         // Avoid allocating memory more than once for the same stack map
-        if EMPTY_STACK_MAPS[..2].iter().all(|empty| !ptr::eq(self.stack_map, empty)) {
+        if EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty.as_ptr())) {
             return;
         }
         let bytes = writer.finish();
-        let stack_map = alloc_jit_frame_memory_with_readable_tail(Layout::array::<u8>(bytes.len()).unwrap(), STACK_MAP_PADDING);
+        let stack_map = alloc_jit_frame_memory(Layout::array::<u8>(bytes.len()).unwrap());
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), stack_map, bytes.len()); }
         incr_counter_by(Counter::jit_frame_stack_map_bytes, bytes.len().as_u64());
         self.stack_map = stack_map;
@@ -327,36 +325,8 @@ pub extern "C" fn rb_zjit_jit_frame_update_references(jit_frame: *mut JITFrame) 
 
 #[cfg(test)]
 mod tests {
-    use crate::cruby::{eval, inspect, VALUE};
+    use crate::cruby::{eval, inspect};
     use insta::assert_snapshot;
-    use super::StackMapWriter;
-
-    #[test]
-    fn test_stack_map_writer_bit_layout() {
-        let mut writer = StackMapWriter::new(true);
-        writer.vreg(5);
-        writer.imm(VALUE::fixnum_from_isize(-1)); // all 64 bits set, so 16 varint chunks
-        writer.skip(17); // two varint chunks
-        // Fields are packed LSB first, so each byte reads right to left. A varint
-        // chunk is 4 payload bits followed by a continuation bit, so 17 is chunks
-        // lo=1 and hi=1, and -1 is 15 chunks of 1111 with cont=1, then 1111 with cont=0.
-        assert_eq!(writer.finish(), vec![
-            0b0101_001_1,   // 5 payload=0101 | VREG=001       | flag=1
-            0b1111_100_0,   // -1 chunk 0     | IMM=100        | 5 cont=0
-            0b11111111,     // -1 chunk 0 cont through chunk 15 payload[0], all ones
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b11111111,
-            0b1_010_0_111,  // 17 lo[0]=1     | SKIP=010       | -1 chunk 15 cont=0 | -1 chunk 15 payload[3:1]=111
-            0b0001_1_000,   // 17 hi=0001     | 17 lo cont=1   | 17 lo[3:1]=000
-            0b0000_000_0,   // padding=0000   | END=000        | 17 hi cont=0
-        ]);
-    }
 
     #[test]
     fn test_jit_frame_entry_first() {
@@ -700,6 +670,31 @@ mod tests {
             test(h)
             test(h)
         "), @"[2, [2], :y]");
+    }
+
+    // find_key escapes the env of test to a Proc, then returns non-locally through a
+    // C method. The locals of test, which the Proc reads through the heap env, survive.
+    #[test]
+    fn test_nonlocal_return_after_escaping_caller_env() {
+        assert_snapshot!(inspect("
+            def find_key(h, &blk)
+              $blk = blk
+              h.each { |k, v| return k if v == 2 }
+              nil
+            end
+
+            def test(h)
+              a = h.size
+              b = [a]
+              r = find_key(h) { a += 1 }
+              [a, b, r, $blk.call, a]
+            end
+
+            h = {x: 1, y: 2}
+            test(h)
+            test(h)
+            [test(h), test(h)]
+        "), @"[[2, [2], :y, 3, 3], [2, [2], :y, 3, 3]]");
     }
 
     // An ensure clause in a frame that a non-local return unwinds runs before the
