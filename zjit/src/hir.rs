@@ -7833,6 +7833,19 @@ impl Function {
                 self.blocks[block_id].params().len() != 0 && !self.blocks[block_id].pinned)
             .collect();
 
+        // For each block, the blocks in `blocks_sending_params` that jump to it. Edge targets
+        // don't change in this pass, so this lets us update only the edges into a block whose
+        // params we remove instead of scanning every jump for every block.
+        let mut senders_by_target: Vec<Vec<BlockId>> = vec![vec![]; self.blocks.len()];
+        for &block_id in &blocks_sending_params {
+            for edge in outgoing_edges(self, block_id) {
+                let senders = &mut senders_by_target[usize::from(edge.target)];
+                if senders.last() != Some(&block_id) {
+                    senders.push(block_id);
+                }
+            }
+        }
+
         // Create a vec to represent trivial indices
         let max_params = blocks.iter().copied().map(|id| self.blocks[id].params.len()).max().unwrap_or(0);
         let mut trivial_indices: Vec<usize> = Vec::with_capacity(max_params);
@@ -7901,12 +7914,16 @@ impl Function {
                     }
                 }
 
+                if trivial_indices.is_empty() {
+                    continue;
+                }
+
                 // Update the block
                 prune_vec_by_indices(&mut self.blocks[*block_id].params, &trivial_indices);
 
                 // Update the terminators (basic blocks can only branch at the terminator. This is where block params are passed)
-                for jump_block_id in &blocks_sending_params {
-                    for edge in outgoing_edges_mut(self, *jump_block_id) {
+                for &jump_block_id in &senders_by_target[usize::from(*block_id)] {
+                    for edge in outgoing_edges_mut(self, jump_block_id) {
                         if edge.target == *block_id {
                             prune_vec_by_indices(&mut edge.args, &trivial_indices);
                         }
