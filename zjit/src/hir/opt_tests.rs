@@ -29499,39 +29499,54 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :o@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v17:Fixnum[1] = Const Value(1)
-          PatchPoint MethodRedefined(Integer@0x1008, ===@0x1010, cme:0x1018)
-          v83:Fixnum = GuardType v10, Fixnum recompile
-          v84:BoolExact = FixnumEq v17, v83
-          PatchPoint NoEPEscape(test)
-          CondBranchTest v84, bb4(), bb6()
-        bb4():
-          PatchPoint MethodRedefined(Object@0x1040, foo@0x1048, cme:0x1050)
-          v86:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
-          v87:Fixnum[1] = Const Value(1)
-          PatchPoint NoEPEscape(test)
-          CheckInterrupts
-          Return v87
-        bb6():
-          v28:Fixnum[2] = Const Value(2)
-          PatchPoint MethodRedefined(Integer@0x1008, ===@0x1010, cme:0x1018)
-          v92:BoolExact = FixnumEq v28, v83
-          PatchPoint NoEPEscape(test)
-          CondBranchTest v92, bb5(), bb7()
-        bb5():
-          PatchPoint MethodRedefined(Object@0x1040, bar@0x1078, cme:0x1080)
-          v94:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
-          v95:Fixnum[2] = Const Value(2)
-          PatchPoint NoEPEscape(test)
-          CheckInterrupts
-          Return v95
+          CondBranchHasType v10, Fixnum, bb7(), bb8()
         bb7():
-          PatchPoint MethodRedefined(Object@0x1040, baz@0x10a8, cme:0x10b0)
-          v97:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
-          v98:Fixnum[3] = Const Value(3)
+          PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQQ)
+          v18:Fixnum = RefineType v10, Fixnum
+          v19:Fixnum[2] = Const Value(2)
+          CondBranchFixnumCmp Lt, v18, v19, bb9(), bb10()
+        bb9():
+          v21:Fixnum[1] = Const Value(1)
+          CondBranchFixnumCmp Eq, v18, v21, bb5(), bb4()
+        bb10():
+          v23:Fixnum[2] = Const Value(2)
+          CondBranchFixnumCmp Eq, v18, v23, bb6(), bb4()
+        bb8():
+          v26:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1008, ===@0x1010, cme:0x1018)
+          v97:Fixnum = GuardType v10, Fixnum recompile
+          v98:BoolExact = FixnumEq v26, v97
+          PatchPoint NoEPEscape(test)
+          CondBranchTest v98, bb5(), bb11()
+        bb5():
+          PatchPoint MethodRedefined(Object@0x1040, foo@0x1048, cme:0x1050)
+          v100:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          v101:Fixnum[1] = Const Value(1)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v98
+          Return v101
+        bb11():
+          v37:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1008, ===@0x1010, cme:0x1018)
+          v106:BoolExact = FixnumEq v37, v97
+          PatchPoint NoEPEscape(test)
+          CondBranchTest v106, bb6(), bb12()
+        bb6():
+          PatchPoint MethodRedefined(Object@0x1040, bar@0x1078, cme:0x1080)
+          v108:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          v109:Fixnum[2] = Const Value(2)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v109
+        bb12():
+          Jump bb4()
+        bb4():
+          PatchPoint MethodRedefined(Object@0x1040, baz@0x10a8, cme:0x10b0)
+          v111:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          v112:Fixnum[3] = Const Value(3)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v112
         ");
     }
 

@@ -9,6 +9,7 @@
 #include "internal/numeric.h"
 #include "internal/gc.h"
 #include "internal/vm.h"
+#include "internal/imemo.h"
 #include "yjit.h"
 #include "vm_core.h"
 #include "vm_callinfo.h"
@@ -264,6 +265,13 @@ int
 rb_zjit_insn_to_bare_insn(int insn)
 {
     return vm_zjit_insn_to_bare_insn(insn);
+}
+
+// Iterate the (literal, offset) pairs of an opt_case_dispatch CDHASH.
+void
+rb_zjit_cdhash_foreach(VALUE cdhash, st_foreach_callback_func *func, st_data_t arg)
+{
+    st_foreach(rb_imemo_cdhash_tbl(cdhash), func, arg);
 }
 
 // Update a YARV instruction to a given opcode (to disable ZJIT profiling).

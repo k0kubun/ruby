@@ -3899,6 +3899,32 @@ impl Function {
         true
     }
 
+    /// Branch from `block` to the target of the literal equal to the Fixnum `key`, or to
+    /// `else_block` if there is none, by binary search over `targets` sorted by literal.
+    fn case_dispatch_binary_search(&mut self, block: BlockId, key: InsnId, targets: &[(VALUE, u32)], insn_idx_to_block: &HashMap<u32, BlockId>, else_block: BlockId, args: &[InsnId]) {
+        let insn_idx = self.blocks[block].insn_idx;
+        let edge = |target| BranchEdge { target, args: args.to_vec() };
+        if let [(lit, target_idx)] = *targets {
+            let lit = self.push_insn(block, Insn::Const { val: Const::Value(lit) });
+            self.push_insn(block, Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData {
+                op: FixnumCmpOp::Eq, left: key, right: lit,
+                if_true: edge(insn_idx_to_block[&target_idx]), if_false: edge(else_block),
+            })));
+            return;
+        }
+        let (low, high) = targets.split_at(targets.len() / 2);
+        let low_block = self.new_block(insn_idx);
+        let high_block = self.new_block(insn_idx);
+        let pivot = self.push_insn(block, Insn::Const { val: Const::Value(high[0].0) });
+        self.push_insn(block, Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData {
+            op: FixnumCmpOp::Lt, left: key, right: pivot,
+            if_true: BranchEdge { target: low_block, args: vec![] },
+            if_false: BranchEdge { target: high_block, args: vec![] },
+        })));
+        self.case_dispatch_binary_search(low_block, key, low, insn_idx_to_block, else_block, args);
+        self.case_dispatch_binary_search(high_block, key, high, insn_idx_to_block, else_block, args);
+    }
+
     pub fn assume_bop_not_redefined(&mut self, block: BlockId, klass: RedefinitionFlag, bop: ruby_basic_operators, state: InsnId) -> bool {
         if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, klass) } {
             return false;
@@ -10137,6 +10163,34 @@ struct BytecodeInfo {
     jump_targets: Vec<u32>,
 }
 
+/// Return the `(key, offset)` pairs of an `opt_case_dispatch` CDHASH, sorted by key, if
+/// every key is a Fixnum. The offsets are relative to the instruction after
+/// `opt_case_dispatch`. Returns None for other hashes, which keep using the `===` chain.
+fn case_dispatch_fixnum_entries(cdhash: VALUE) -> Option<Vec<(VALUE, i64)>> {
+    struct Entries {
+        entries: Vec<(VALUE, i64)>,
+        all_fixnum: bool,
+    }
+    unsafe extern "C" fn collect_entry(key: st_data_t, value: st_data_t, arg: st_data_t) -> c_int {
+        let entries = unsafe { &mut *(arg as *mut Entries) };
+        let key = VALUE(key as usize);
+        if !key.fixnum_p() {
+            entries.all_fixnum = false;
+            return ST_STOP as c_int;
+        }
+        // The value is a raw (untagged) instruction offset
+        entries.entries.push((key, value as i64));
+        ST_CONTINUE as c_int
+    }
+    let mut entries = Entries { entries: vec![], all_fixnum: true };
+    unsafe { rb_zjit_cdhash_foreach(cdhash, Some(collect_entry), (&mut entries as *mut Entries) as st_data_t) };
+    if !entries.all_fixnum || entries.entries.is_empty() {
+        return None;
+    }
+    entries.entries.sort_by_key(|&(key, _)| key.as_fixnum());
+    Some(entries.entries)
+}
+
 fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeInfo {
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     let mut insn_idx = 0;
@@ -10166,6 +10220,17 @@ fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeI
             YARVINSN_opt_new => {
                 let offset = get_arg(pc, 1).as_i64();
                 jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+            }
+            YARVINSN_opt_case_dispatch => {
+                // The when bodies are already branch targets of the === chain, but the else
+                // body is reached by falling through it. Both become jump targets when the
+                // dispatch is compiled to a binary search (see iseq_to_hir).
+                if let Some(entries) = case_dispatch_fixnum_entries(get_arg(pc, 0)) {
+                    jump_targets.insert(insn_idx_at_offset(insn_idx, get_arg(pc, 1).as_i64()));
+                    for (_, offset) in entries {
+                        jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+                    }
+                }
             }
             YARVINSN_leave | YARVINSN_opt_invokebuiltin_delegate_leave => {
                 if insn_idx < iseq_size {
@@ -11171,10 +11236,37 @@ fn add_iseq_to_hir(
                     queue.push_back((state.clone(), target, target_idx));
                 }
                 YARVINSN_opt_case_dispatch => {
-                    // TODO: Some keys are visible at compile time, so in the future we can
-                    // compile jump targets for certain cases
-                    // Pop the key from the stack and fallback to the === branches for now
-                    state.stack_pop()?;
+                    // opt_case_dispatch looks the key up in a hash of when-literals and jumps to
+                    // the matching body, falling through to a chain of === checks when it can't.
+                    // The chain is linear in the number of whens, which hurts large dispatches like
+                    // Ragel-generated lexers. When every literal is a Fixnum, compile Fixnum keys
+                    // to a binary search over the sorted literals instead, the way HotSpot and LLVM
+                    // lower a sparse switch. Other keys still take the === chain.
+                    let key = state.stack_pop()?;
+                    let entries = case_dispatch_fixnum_entries(get_arg(pc, 0));
+                    if let Some(entries) = entries.filter(|_| unsafe { rb_BASIC_OP_UNREDEFINED_P(BOP_EQQ, INTEGER_REDEFINED_OP_FLAG) }) {
+                        let else_idx = insn_idx_at_offset(insn_idx, get_arg(pc, 1).as_i64());
+                        let targets: Vec<(VALUE, u32)> = entries.iter()
+                            .map(|&(lit, offset)| (lit, insn_idx_at_offset(insn_idx, offset)))
+                            .collect();
+                        let fixnum_block = fun.new_block(insn_idx);
+                        let chain_block = fun.new_block(insn_idx);
+                        fun.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+                            val: key,
+                            expected: types::Fixnum,
+                            if_true: BranchEdge { target: fixnum_block, args: vec![] },
+                            if_false: BranchEdge { target: chain_block, args: vec![] },
+                        })));
+                        // Every literal is an Integer, so the chain would only call Integer#===.
+                        fun.push_insn(fixnum_block, Insn::PatchPoint { invariant: Invariant::BOPRedefined { klass: INTEGER_REDEFINED_OP_FLAG, bop: BOP_EQQ }, state: exit_id });
+                        let fixnum_key = fun.push_insn(fixnum_block, Insn::RefineType { val: key, new_type: types::Fixnum });
+                        let args = state.as_args(self_param);
+                        fun.case_dispatch_binary_search(fixnum_block, fixnum_key, &targets, &insn_idx_to_block, insn_idx_to_block[&else_idx], &args);
+                        for target_idx in targets.iter().map(|&(_, idx)| idx).chain(std::iter::once(else_idx)) {
+                            queue.push_back((state.clone(), insn_idx_to_block[&target_idx], target_idx));
+                        }
+                        block = chain_block;
+                    }
                 }
                 YARVINSN_opt_new => {
                     let cd: *const rb_call_data = get_arg(pc, 0).as_ptr();

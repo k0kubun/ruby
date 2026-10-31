@@ -6767,31 +6767,46 @@ pub(crate) mod hir_build_tests {
           v7:BasicObject = LoadArg :o@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v17:Fixnum[1] = Const Value(1)
-          v20:BasicObject = Send v17, :===, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
-          PatchPoint NoEPEscape(test)
-          v24:Truthy = RefineType v20, Truthy
-          CondBranchTest v20, bb4(v9, v10, v10), bb6()
-        bb4(v46:BasicObject, v47:BasicObject, v48:BasicObject):
-          v53:StaticSymbol[:one] = Const Value(VALUE(0x1008))
-          CheckInterrupts
-          Return v53
-        bb6():
-          v26:Falsy = RefineType v20, Falsy
-          v28:Fixnum[2] = Const Value(2)
-          v31:BasicObject = Send v28, :===, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
-          PatchPoint NoEPEscape(test)
-          v35:Truthy = RefineType v31, Truthy
-          CondBranchTest v31, bb5(v9, v10, v10), bb7()
-        bb5(v58:BasicObject, v59:BasicObject, v60:BasicObject):
-          v65:StaticSymbol[:two] = Const Value(VALUE(0x1010))
-          CheckInterrupts
-          Return v65
+          CondBranchHasType v10, Fixnum, bb7(), bb8()
         bb7():
-          v37:Falsy = RefineType v31, Falsy
-          v41:StaticSymbol[:other] = Const Value(VALUE(0x1018))
+          PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_EQQ)
+          v18:Fixnum = RefineType v10, Fixnum
+          v19:Fixnum[2] = Const Value(2)
+          CondBranchFixnumCmp Lt, v18, v19, bb9(), bb10()
+        bb9():
+          v21:Fixnum[1] = Const Value(1)
+          CondBranchFixnumCmp Eq, v18, v21, bb5(v9, v10, v10), bb4(v9, v10, v10)
+        bb10():
+          v23:Fixnum[2] = Const Value(2)
+          CondBranchFixnumCmp Eq, v18, v23, bb6(v9, v10, v10), bb4(v9, v10, v10)
+        bb8():
+          v26:Fixnum[1] = Const Value(1)
+          v29:BasicObject = Send v26, :===, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          PatchPoint NoEPEscape(test)
+          v33:Truthy = RefineType v29, Truthy
+          CondBranchTest v29, bb5(v9, v10, v10), bb11()
+        bb5(v48:BasicObject, v49:BasicObject, v50:BasicObject):
+          v55:StaticSymbol[:one] = Const Value(VALUE(0x1008))
           CheckInterrupts
-          Return v41
+          Return v55
+        bb11():
+          v35:Falsy = RefineType v29, Falsy
+          v37:Fixnum[2] = Const Value(2)
+          v40:BasicObject = Send v37, :===, v10 # SendFallbackReason: Uncategorized(opt_send_without_block)
+          PatchPoint NoEPEscape(test)
+          v44:Truthy = RefineType v40, Truthy
+          CondBranchTest v40, bb6(v9, v10, v10), bb12()
+        bb6(v60:BasicObject, v61:BasicObject, v62:BasicObject):
+          v67:StaticSymbol[:two] = Const Value(VALUE(0x1010))
+          CheckInterrupts
+          Return v67
+        bb12():
+          v46:Falsy = RefineType v40, Falsy
+          Jump bb4(v9, v10, v10)
+        bb4(v72:BasicObject, v73:BasicObject, v74:BasicObject):
+          v79:StaticSymbol[:other] = Const Value(VALUE(0x1018))
+          CheckInterrupts
+          Return v79
         ");
     }
 }

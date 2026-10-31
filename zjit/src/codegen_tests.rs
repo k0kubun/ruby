@@ -9424,6 +9424,55 @@ fn test_opt_case_dispatch() {
 }
 
 #[test]
+fn test_opt_case_dispatch_fixnum_binary_search() {
+    eval("
+        def test(x)
+          case x
+          when 1 then :one
+          when 3, 4 then :three_four
+          when 10 then :ten
+          when -5 then :minus_five
+          when 100 then :hundred
+          when 1000 then :thousand
+          else :other
+          end
+        end
+        test(1)
+    ");
+    assert_contains_opcode("test", YARVINSN_opt_case_dispatch);
+    // Fixnum keys take the binary search, which never side-exits
+    assert_snapshot!(assert_compiles("
+        [-5, 0, 1, 2, 3, 4, 10, 99, 100, 1000, 1001].map { test(it) }
+    "), @"[:minus_five, :other, :one, :other, :three_four, :three_four, :ten, :other, :hundred, :thousand, :other]");
+    // Other keys take the === chain
+    assert_snapshot!(assert_compiles_allowing_exits("
+        [3.0, 2**70, '1', nil].map { test(it) }
+    "), @"[:three_four, :other, :other, :other]");
+}
+
+#[test]
+fn test_opt_case_dispatch_fixnum_eqq_redefined() {
+    eval("
+        def test(x)
+          case x
+          when 1 then :one
+          when 2 then :two
+          else :other
+          end
+        end
+        test(1)
+    ");
+    assert_snapshot!(inspect("
+        r = [test(1), test(2), test(3)]
+        class Integer
+          alias_method :orig_eqq, :===
+          def ===(other) = other == 3 || orig_eqq(other)
+        end
+        r + [test(1), test(2), test(3)]
+    "), @"[:one, :two, :other, :one, :two, :one]");
+}
+
+#[test]
 fn test_checkmatch_case() {
     eval(r#"
         def test(o)
