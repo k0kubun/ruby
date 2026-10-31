@@ -3284,6 +3284,9 @@ pub struct Function {
     /// Pinned return blocks of inlined method frames, keyed by the caller Snapshot that
     /// FrameStates in the frame point to. See inlined_block_throw_targets.
     pinned_return_blocks: HashMap<InsnId, BlockId>,
+    /// `self` of inlined method and block frames, keyed by the caller Snapshot that FrameStates
+    /// in the frame point to: the receiver of a method or the captured self of a block
+    inline_frame_selfs: HashMap<InsnId, InsnId>,
     /// Per-call-site caches of the last receiver classes found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
@@ -3639,6 +3642,7 @@ impl Function {
             profiles: None,
             num_instructions: 0,
             pinned_return_blocks: HashMap::new(),
+            inline_frame_selfs: HashMap::new(),
             klass_caches: Default::default(),
             catch_return_sites: HashSet::default(),
         }
@@ -3994,6 +3998,15 @@ impl Function {
         match &self.insns[insn_id] {
             Insn::Snapshot { state } => state.depth,
             insn => panic!("Unexpected non-Snapshot {insn} when looking up frame depth"),
+        }
+    }
+
+    /// Return `self` of the frame that `state` belongs to. The top-level frame reads it from
+    /// the CFP. An inlined frame's self is the one the inliner recorded when it pushed the frame.
+    fn frame_self(&mut self, block: BlockId, state: InsnId) -> Option<InsnId> {
+        match self.frame_state_ref(state).caller() {
+            None => Some(self.load_self(block)),
+            Some(caller) => self.inline_frame_selfs.get(&caller).copied(),
         }
     }
 
@@ -6095,7 +6108,9 @@ impl Function {
     /// Check protected visibility only after committing to an optimized send.
     fn guard_protected_send(&mut self, block: BlockId, defined_class: Option<VALUE>, state: InsnId) {
         let Some(defined_class) = defined_class else { return };
-        let caller_self = self.load_self(block);
+        let Some(caller_self) = self.frame_self(block, state) else {
+            panic!("protected send specialized without the caller self");
+        };
         // IsA constants cannot be internal ICLASS objects.
         let defined_class = if defined_class.builtin_type() == RUBY_T_ICLASS { defined_class.class_of() } else { defined_class };
         let class = self.push_insn(block, Insn::Const { val: Const::Value(defined_class) });
@@ -6191,11 +6206,12 @@ impl Function {
                             (METHOD_VISI_PUBLIC, _) => None,
                             (METHOD_VISI_PRIVATE, true) => None,
                             (METHOD_VISI_PROTECTED, true) => None,
-                            (METHOD_VISI_PROTECTED, false) if self.frame_depth(state) == 0 && !matches!(unsafe { get_cme_def_type(cme) }, VM_METHOD_TYPE_REFINED | VM_METHOD_TYPE_ALIAS) => {
+                            (METHOD_VISI_PROTECTED, false) if self.frame_state_ref(state).caller().is_none_or(|caller| self.inline_frame_selfs.contains_key(&caller))
+                                && !matches!(unsafe { get_cme_def_type(cme) }, VM_METHOD_TYPE_REFINED | VM_METHOD_TYPE_ALIAS) => {
                                 // The VM checks the actual caller self, not the receiver or
-                                // the ISEQ owner. Inlined frames need an SSA self operand;
-                                // keep those calls dynamic rather than load the outer self.
-                                // Protected aliases and refinements stay dynamic as well.
+                                // the ISEQ owner. In an inlined frame, that's the receiver or
+                                // the captured self that pushed the frame, not the CFP self of
+                                // this function. Protected aliases and refinements stay dynamic.
                                 Some(unsafe { (*cme).defined_class })
                             }
                             _ => {
@@ -7603,6 +7619,7 @@ impl Function {
                         self.load_field(block, captured, FieldName::captured_self, offset, types::BasicObject)
                     }
                 };
+                self.inline_frame_selfs.insert(post_send_caller, recv);
                 if !callee_body_params.is_empty() {
                     self.make_equal_to(callee_body_params[0], recv);
                 }
