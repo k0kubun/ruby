@@ -212,6 +212,34 @@ fn test_protected_send_checks_instance_exec_self() {
 }
 
 #[test]
+fn test_protected_send_in_inlined_frames_checks_their_self() {
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        module Caller
+          def call_secret(other) = other.secret
+          def call_secret_in_block(other) = [other].map { |o| o.secret }
+        end
+        class Owner
+          include Caller
+          protected def secret = 47
+          def via(helper, other)
+            [(helper.call_secret(other) rescue :denied), (helper.call_secret_in_block(other) rescue :denied)]
+          end
+        end
+        class Child < Owner; end
+        class Helper
+          include Caller
+        end
+        owner, child, helper = Owner.new, Child.new, Helper.new
+        30.times do
+          owner.via(owner, owner)
+          owner.via(helper, owner)
+        end
+        # The inlined frames run with self = helper, so the caller self of `secret` is not `owner`.
+        [owner.via(owner, owner), owner.via(helper, owner), owner.via(child, owner), child.via(helper, child)]
+    "#), @"[[47, [47]], [:denied, :denied], [47, [47]], [:denied, :denied]]");
+}
+
+#[test]
 fn test_protected_send_visibility_changes() {
     assert_snapshot!(assert_compiles_allowing_exits(r#"
         class Owner

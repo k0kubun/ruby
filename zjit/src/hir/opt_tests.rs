@@ -23980,7 +23980,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn dont_guard_protected_send_in_inlined_frame() {
+    fn guard_protected_send_in_inlined_frame_with_its_self() {
         set_inline_threshold(100);
         eval(r#"
             class C
@@ -23993,8 +23993,29 @@ mod hir_opt_tests {
         "#);
         let hir = hir_string("test");
         assert!(hir.contains("PushInlineFrame :call_secret"), "{hir}");
-        assert!(hir.contains("method private or protected and no FCALL"), "{hir}");
+        assert!(!hir.contains("method private or protected and no FCALL"), "{hir}");
+        // The caller self of `other.secret` is the inlined receiver `Obj`, not the `self` of
+        // `test`, so the protected check folds to true.
         assert!(!hir.contains("IsA"), "{hir}");
+        assert!(hir.contains("GuardBitEquals"), "{hir}");
+    }
+
+    #[test]
+    fn guard_protected_send_in_inlined_block_with_its_self() {
+        set_inline_threshold(100);
+        eval(r#"
+            class C
+              protected def secret = 42
+              def call_secret(other) = [other].map { |o| o.secret }
+            end
+            obj = C.new
+            obj.call_secret(obj)
+            obj.call_secret(obj)
+        "#);
+        let hir = hir_string_proc("C.instance_method(:call_secret)");
+        assert!(hir.contains("PushInlineBlockFrame"), "{hir}");
+        assert!(!hir.contains("method private or protected and no FCALL"), "{hir}");
+        assert!(hir.contains("IsA"), "{hir}");
     }
 
     #[test]
