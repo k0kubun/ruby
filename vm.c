@@ -3027,32 +3027,64 @@ typedef struct {
     size_t pos; // in bits
 } zjit_stack_map_reader_t;
 
-// Read n <= 8 bits. Touches the next byte only when the bits straddle it.
-static inline unsigned int
-zjit_stack_map_read_bits(zjit_stack_map_reader_t *r, int n)
+// Load the 64 bits of the stream starting at bit `pos`, bit `pos` in the lowest bit.
+// At least 57 of them are valid. StackMapWriter pads every stream so that 8 bytes can
+// be read from any byte offset in it.
+static inline uint64_t
+zjit_stack_map_peek(const zjit_stack_map_reader_t *r)
 {
-    size_t byte = r->pos / 8;
-    int shift = r->pos % 8;
-    unsigned int bits = r->bytes[byte] >> shift;
-    if (shift + n > 8) bits |= (unsigned int)r->bytes[byte + 1] << (8 - shift);
-    r->pos += n;
-    return bits & ((1u << n) - 1);
+    const uint8_t *bytes = r->bytes + r->pos / 8;
+    uint64_t word;
+#ifdef WORDS_BIGENDIAN
+    word = 0;
+    for (int i = sizeof(word) - 1; i >= 0; i--) word = (word << 8) | bytes[i];
+#else
+    memcpy(&word, bytes, sizeof(word));
+#endif
+    return word >> (r->pos % 8);
 }
 
 static inline int64_t
 zjit_stack_map_read_varint(zjit_stack_map_reader_t *r)
 {
     const int chunk_bits = ZJIT_STACK_MAP_VARINT_BITS + 1; // payload, then continuation bit
-    const unsigned int payload_mask = (1u << ZJIT_STACK_MAP_VARINT_BITS) - 1;
+    const uint64_t payload_mask = (1u << ZJIT_STACK_MAP_VARINT_BITS) - 1;
+    const uint64_t cont_bit = 1u << ZJIT_STACK_MAP_VARINT_BITS;
+    // Decode as many chunks as fit in one load before loading again. Most operands
+    // are small slot indexes and sizes that take a single chunk.
+    const int chunks_per_peek = 57 / chunk_bits;
     uint64_t value = 0;
-    unsigned int chunk;
     int shift = 0;
-    do {
-        chunk = zjit_stack_map_read_bits(r, chunk_bits);
-        value |= (uint64_t)(chunk & payload_mask) << shift;
-        shift += ZJIT_STACK_MAP_VARINT_BITS;
-    } while (chunk >> ZJIT_STACK_MAP_VARINT_BITS);
-    return (int64_t)value;
+    for (;;) {
+        uint64_t word = zjit_stack_map_peek(r);
+        for (int i = 0; i < chunks_per_peek; i++) {
+            value |= (word & payload_mask) << shift;
+            shift += ZJIT_STACK_MAP_VARINT_BITS;
+            r->pos += chunk_bits;
+            if (!(word & cont_bit)) return (int64_t)value;
+            word >>= chunk_bits;
+        }
+    }
+}
+
+// Like zjit_stack_map_read_varint(), but take the bits at the cursor from `word`,
+// which the caller already loaded, when the varint fits in it. Most operands are
+// small slot indexes and sizes, so this saves a load and a loop per opcode.
+static inline int64_t
+zjit_stack_map_read_varint_from(zjit_stack_map_reader_t *r, uint64_t word)
+{
+    const int chunk_bits = ZJIT_STACK_MAP_VARINT_BITS + 1;
+    const uint64_t payload_mask = (1u << ZJIT_STACK_MAP_VARINT_BITS) - 1;
+    const uint64_t cont_bit = 1u << ZJIT_STACK_MAP_VARINT_BITS;
+    if (!(word & cont_bit)) {
+        r->pos += chunk_bits;
+        return (int64_t)(word & payload_mask);
+    }
+    if (!(word & (cont_bit << chunk_bits))) {
+        r->pos += 2 * chunk_bits;
+        return (int64_t)((word & payload_mask) | ((word >> chunk_bits) & payload_mask) << ZJIT_STACK_MAP_VARINT_BITS);
+    }
+    return zjit_stack_map_read_varint(r);
 }
 
 #if RUBY_DEBUG
@@ -3091,37 +3123,41 @@ zjit_write_frame_stack(const rb_execution_context_t *ec, rb_control_frame_t *cfp
         // decides whether its locals still live in VM stack memory.
         const rb_control_frame_t *env_cfp = cfp;
         bool env_escaped = VM_ENV_ESCAPED_P(env_cfp->ep);
-        // Whether the cursor is in a frame's locals area, i.e. past the frame's
-        // SKIP_VM_ENV_DATA opcode and before the next PREV_FRAME opcode. Locals are
-        // not written when that frame's env escaped:
+        // Whether writes are dropped. They are in a frame's locals area, i.e. past the
+        // frame's SKIP_VM_ENV_DATA opcode and before the next PREV_FRAME opcode, when
+        // that frame's env escaped:
         //   - locals in escaped envs are not in cfp->sp memory
         //   - the stack map describes pre-escape frame state, so is stale here
         // The slots still exist on the VM stack, so the write cursor moves past
         // them either way to stay aligned for the frames below.
-        bool locals_area = false;
+        bool drop_writes = false;
         VALUE *stack = cfp->sp;
+        const VALUE *native_base_ptr = (const VALUE *)cfp->jit_return;
         zjit_stack_map_reader_t reader = { jit_frame->stack_map, 1 }; // bit 0 is materialize_block_code
 #define WRITE_ONE(value) do { \
     --stack; \
-    if (!(locals_area && env_escaped)) { \
+    if (!drop_writes) { \
         zjit_check_owned_slot(cfp, jit_frame, stack, i); \
         *stack = (value); \
     } \
 } while (0)
         for (int32_t i = 0;; i++) {
-            unsigned int op = zjit_stack_map_read_bits(&reader, ZJIT_STACK_MAP_OP_BITS);
+            // Decode the opcode and, in most cases, its operand from a single load.
+            uint64_t word = zjit_stack_map_peek(&reader);
+            unsigned int op = (unsigned int)(word & ((1u << ZJIT_STACK_MAP_OP_BITS) - 1));
+            reader.pos += ZJIT_STACK_MAP_OP_BITS;
             if (op == ZJIT_STACK_MAP_OP_END) break;
             switch (op) {
               case ZJIT_STACK_MAP_OP_VREG: {
                 // Decode a native stack slot offset generated by ZJIT's backend.
                 // It's an offset from NATIVE_BASE_PTR, which is copied into
                 // cfp->jit_return, to the native stack slot holding the value.
-                int64_t slot_index = zjit_stack_map_read_varint(&reader);
-                WRITE_ONE(((VALUE *)cfp->jit_return)[-slot_index]);
+                int64_t slot_index = zjit_stack_map_read_varint_from(&reader, word >> ZJIT_STACK_MAP_OP_BITS);
+                WRITE_ONE(native_base_ptr[-slot_index]);
                 break;
               }
               case ZJIT_STACK_MAP_OP_IMM: {
-                VALUE value = (VALUE)zjit_stack_map_read_varint(&reader);
+                VALUE value = (VALUE)zjit_stack_map_read_varint_from(&reader, word >> ZJIT_STACK_MAP_OP_BITS);
                 RUBY_ASSERT(RB_SPECIAL_CONST_P(value)); // We don't GC mark stack map entries.
                 WRITE_ONE(value);
                 break;
@@ -3130,14 +3166,14 @@ zjit_write_frame_stack(const rb_execution_context_t *ec, rb_control_frame_t *cfp
                 WRITE_ONE(Qnil);
                 break;
               case ZJIT_STACK_MAP_OP_SKIP:
-                stack -= zjit_stack_map_read_varint(&reader);
+                stack -= zjit_stack_map_read_varint_from(&reader, word >> ZJIT_STACK_MAP_OP_BITS);
                 break;
               case ZJIT_STACK_MAP_OP_BASE_PTR: {
                 // This has to be the first code to align the write cursor for other entries
                 RUBY_ASSERT_ALWAYS(0 == i, "base_ptr stack map code only makes sense at 0");
                 int64_t slot_index = zjit_stack_map_read_varint(&reader);
                 int64_t stack_size = zjit_stack_map_read_varint(&reader);
-                VALUE *base_ptr = (VALUE *)((VALUE *)cfp->jit_return)[-slot_index];
+                VALUE *base_ptr = (VALUE *)native_base_ptr[-slot_index];
                 stack = base_ptr + stack_size;
                 break;
               }
@@ -3145,14 +3181,14 @@ zjit_write_frame_stack(const rb_execution_context_t *ec, rb_control_frame_t *cfp
                 // The env data (me/cref, specval, flags) already lives in VM stack
                 // memory. The opcodes that follow are this frame's locals.
                 stack -= VM_ENV_DATA_SIZE;
-                locals_area = true;
+                drop_writes = env_escaped;
                 break;
               case ZJIT_STACK_MAP_OP_PREV_FRAME:
                 // Continue decoding in the caller's frame. The inlined callee's
                 // receiver slot, if any, is skipped with a preceding SKIP.
-                locals_area = false;
                 env_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(env_cfp);
                 env_escaped = VM_ENV_ESCAPED_P(env_cfp->ep);
+                drop_writes = false;
                 break;
               default:
                 rb_bug("unknown ZJIT stackmap opcode: %u", op);

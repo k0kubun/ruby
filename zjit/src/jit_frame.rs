@@ -71,18 +71,38 @@ impl JITFrameAllocator {
         self.cursor = end;
         self.virt_mem.start_ptr().add_bytes(start).raw_ptr(&self.virt_mem) as *mut u8
     }
+
+    /// Like [Self::try_alloc], but also keep the `tail` bytes after the allocation
+    /// readable. They may be handed out as the start of the next allocation.
+    fn try_alloc_with_readable_tail(&mut self, layout: Layout, tail: usize) -> *mut u8 {
+        let Ok(padded) = Layout::from_size_align(layout.size() + tail, layout.align()) else {
+            return ptr::null_mut();
+        };
+        let raw_ptr = self.try_alloc(padded);
+        if !raw_ptr.is_null() {
+            self.cursor -= tail;
+        }
+        raw_ptr
+    }
 }
 
 /// Bump-allocate `layout` from the JITFrame arena, falling back to the heap.
 fn alloc_jit_frame_memory(layout: Layout) -> *mut u8 {
+    alloc_jit_frame_memory_with_readable_tail(layout, 0)
+}
+
+/// Like [alloc_jit_frame_memory], but also keep the `tail` bytes after the
+/// allocation readable.
+fn alloc_jit_frame_memory_with_readable_tail(layout: Layout, tail: usize) -> *mut u8 {
     // Prefer the low-address arena so that call sites can store JITFrame pointers
     // as a 32-bit immediate. Falling back to the heap only costs code size.
     let mut raw_ptr = match ZJITState::get_jit_frame_allocator() {
-        Some(arena) => arena.try_alloc(layout),
+        Some(arena) => arena.try_alloc_with_readable_tail(layout, tail),
         None => ptr::null_mut(),
     };
     if raw_ptr.is_null() {
-        raw_ptr = unsafe { std::alloc::alloc(layout) };
+        let layout = Layout::from_size_align(layout.size() + tail, layout.align()).unwrap();
+        raw_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if raw_ptr.is_null() {
             handle_alloc_error(layout);
         }
@@ -93,7 +113,12 @@ fn alloc_jit_frame_memory(layout: Layout) -> *mut u8 {
 
 /// Stack maps with no entries, indexed by materialize_block_code.
 /// Bit 0 is the flag and the END opcode that follows is all zeros.
-static EMPTY_STACK_MAPS: [u8; 2] = [0, 1];
+/// Each one is followed by STACK_MAP_PADDING bytes like any other stream.
+static EMPTY_STACK_MAPS: [u8; 2 + STACK_MAP_PADDING] = [0, 1, 0, 0, 0, 0, 0, 0, 0];
+/// The decoder in vm.c loads 8 bytes at a time from any byte offset of a stream, so
+/// every stream is followed by this many readable bytes. The bytes after a stream
+/// in the arena may belong to the next allocation, since the decoder ignores them.
+const STACK_MAP_PADDING: usize = 7;
 const _: () = assert!(ZJIT_STACK_MAP_OP_END == 0);
 
 /// Writes a JITFrame stack map bit stream. The bit stream is little endian.
@@ -253,11 +278,11 @@ impl JITFrame {
     pub fn set_stack_map(&mut self, writer: StackMapWriter) {
         debug_assert_eq!(writer.bytes.first().map(|byte| byte & 1 != 0), Some(self.materialize_block_code()));
         // Avoid allocating memory more than once for the same stack map
-        if EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty)) {
+        if EMPTY_STACK_MAPS[..2].iter().all(|empty| !ptr::eq(self.stack_map, empty)) {
             return;
         }
         let bytes = writer.finish();
-        let stack_map = alloc_jit_frame_memory(Layout::array::<u8>(bytes.len()).unwrap());
+        let stack_map = alloc_jit_frame_memory_with_readable_tail(Layout::array::<u8>(bytes.len()).unwrap(), STACK_MAP_PADDING);
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), stack_map, bytes.len()); }
         incr_counter_by(Counter::jit_frame_stack_map_bytes, bytes.len().as_u64());
         self.stack_map = stack_map;
@@ -643,6 +668,116 @@ mod tests {
             test(false)
             test(true)
         "), @"[3, 3, 3]");
+    }
+
+    // A non-local return from a block called by a C method longjmps over the block,
+    // the C method and find_key. The caller of find_key resumes in the interpreter, so
+    // its locals have to be written from its stack map.
+    #[test]
+    fn test_nonlocal_return_through_cfunc_keeps_caller_locals() {
+        assert_snapshot!(inspect("
+            def find_key(h)
+              unused = h.size + 1
+              h.each { |k, v| return k if v == 2 }
+              unused
+            end
+
+            def test(h)
+              a = h.size
+              b = [a]
+              r = find_key(h)
+              [a, b, r]
+            end
+
+            h = {x: 1, y: 2}
+            test(h)
+            test(h)
+            test(h)
+        "), @"[2, [2], :y]");
+    }
+
+    // An ensure clause in a frame that a non-local return unwinds runs before the
+    // frames below it are popped, and reads find_key's locals through its env.
+    #[test]
+    fn test_nonlocal_return_runs_ensure_with_outer_locals() {
+        assert_snapshot!(inspect("
+            def find_key(h, log)
+              seen = 0
+              h.each do |k, v|
+                seen += 1
+                begin
+                  return k if v == 2
+                ensure
+                  log << seen
+                end
+              end
+              nil
+            end
+
+            log = []
+            3.times { find_key({x: 1, y: 2}, log) }
+            log
+        "), @"[1, 2, 1, 2, 1, 2]");
+    }
+
+    // A break from a block called by a C method resumes the frame that called it.
+    #[test]
+    fn test_break_through_cfunc_keeps_caller_locals() {
+        assert_snapshot!(inspect("
+            def test(h)
+              a = h.size
+              r = h.each { |k, v| break [k, a] if v == 2 }
+              [a, r]
+            end
+
+            h = {x: 1, y: 2}
+            test(h)
+            test(h)
+            test(h)
+        "), @"[2, [:y, 2]]");
+    }
+
+    // An exception raised in a block called by a C method is rescued by an older frame,
+    // which has to see its own locals.
+    #[test]
+    fn test_raise_through_cfunc_keeps_rescuer_locals() {
+        assert_snapshot!(inspect(r##"
+            def inner(h)
+              c = h.size
+              h.each { |k, v| raise "#{k}#{c}" if v == 2 }
+            end
+
+            def outer(h)
+              a = h.size * 3
+              begin
+                inner(h)
+              rescue => e
+                [a, e.message]
+              end
+            end
+
+            h = {x: 1, y: 2}
+            outer(h)
+            outer(h)
+            outer(h)
+        "##), @r#"[6, "y2"]"#);
+    }
+
+    // A :return hook sees the locals of a frame that a non-local return unwinds.
+    #[test]
+    fn test_nonlocal_return_return_hook_sees_locals() {
+        assert_snapshot!(inspect("
+            def find_key(h)
+              local = h.size * 21
+              h.each { |k, v| return k if v == 2 }
+            end
+
+            3.times { find_key({x: 1, y: 2}) }
+            vals = []
+            tp = TracePoint.new(:return) { |t| vals << t.binding.local_variable_get(:local) if t.method_id == :find_key }
+            tp.enable { find_key({x: 1, y: 2}) }
+            vals
+        "), @"[42]");
     }
 
     // Proc.new inside a block passed via invokeblock captures the caller's
