@@ -1,7 +1,7 @@
 use std::alloc::{handle_alloc_error, Layout};
 use std::ptr;
 
-use crate::cast::IntoU64;
+use crate::cast::{IntoU64, IntoUsize};
 use crate::cruby::{IseqPtr, VALUE, Qnil, rb_gc_mark_movable, rb_gc_location};
 use crate::cruby::{ZJIT_STACK_MAP_OP_BITS, ZJIT_STACK_MAP_VARINT_BITS, ZJIT_STACK_MAP_OP_END, ZJIT_STACK_MAP_OP_VREG, ZJIT_STACK_MAP_OP_SKIP, ZJIT_STACK_MAP_OP_BASE_PTR, ZJIT_STACK_MAP_OP_IMM, ZJIT_STACK_MAP_OP_NIL, ZJIT_STACK_MAP_OP_SKIP_VM_ENV_DATA, ZJIT_STACK_MAP_OP_PREV_FRAME};
 use crate::cruby::zjit_jit_frame;
@@ -158,14 +158,20 @@ impl StackMapWriter {
         writer
     }
 
+    /// Append the low `num_bits` bits of `value`, which must be at most 56.
     fn write_bits(&mut self, value: u64, num_bits: u32) {
-        for i in 0..num_bits {
-            if self.num_bits % 8 == 0 {
-                self.bytes.push(0);
-            }
-            *self.bytes.last_mut().unwrap() |= (((value >> i) & 1) as u8) << (self.num_bits % 8);
-            self.num_bits += 1;
+        debug_assert!(num_bits <= 56);
+        let end_bits = self.num_bits + num_bits.to_usize();
+        self.bytes.resize(end_bits.div_ceil(8), 0);
+        // OR in a byte at a time, starting at the partially written last byte.
+        let mut bits = (value & ((1 << num_bits) - 1)) << (self.num_bits % 8);
+        let mut idx = self.num_bits / 8;
+        while bits != 0 {
+            self.bytes[idx] |= bits as u8;
+            bits >>= 8;
+            idx += 1;
         }
+        self.num_bits = end_bits;
     }
 
     fn write_op(&mut self, op: u32) {

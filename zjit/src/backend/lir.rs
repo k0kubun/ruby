@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
@@ -17,7 +18,7 @@ use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
 use crate::state::ZJITState;
 use crate::exit_desc::{ExitDescriptor, ExitDescriptorExtra, ExitImms, ExitLoc, ExitStackMap};
-use crate::cast::IntoUsize;
+use crate::cast::{IntoU64, IntoUsize};
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
 /// we can differentiate it from HIR block ids.
@@ -629,6 +630,39 @@ pub enum BlockHandler {
 }
 
 /// Context for a side exit. If `SideExit` matches, it reuses the same code.
+/// The hash function of rustc's FxHasher: fast, but not resistant to HashDoS, which
+/// doesn't matter for keys built by the compiler.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) { self.add(i.into()) }
+    fn write_u16(&mut self, i: u16) { self.add(i.into()) }
+    fn write_u32(&mut self, i: u32) { self.add(i.into()) }
+    fn write_u64(&mut self, i: u64) { self.add(i) }
+    fn write_usize(&mut self, i: usize) { self.add(i.as_u64()) }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SideExit {
     pub pc: Opnd,
@@ -3218,7 +3252,10 @@ impl Assembler
         let exit_block = self.new_block_without_id("side_exits");
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
-        let mut compiled_exits: HashMap<SideExit, Label> = HashMap::with_capacity(targets.len());
+        // A SideExit holds every stack slot and local of each frame, so hash it with FxHasher
+        // rather than SipHash; the keys are not attacker-controlled.
+        let mut compiled_exits: HashMap<SideExit, Label, BuildHasherDefault<FxHasher>> =
+            HashMap::with_capacity_and_hasher(targets.len(), Default::default());
 
         // Start a new perf range for side exits.
         let symbol_range = perf::symbol_range_start(self, "side exit");
