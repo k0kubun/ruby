@@ -232,6 +232,8 @@ rb_zjit_exec_callee_frame(rb_execution_context_t *ec)
     return rb_vm_exec_interpreter(ec);
 }
 
+void rb_zjit_iseq_mark_hot_loop(const rb_iseq_t *iseq); // defined in Rust
+
 // The number of backward branches taken by the interpreter. See JIT_BACKEDGE().
 unsigned int rb_zjit_backedge_count = 0;
 
@@ -251,6 +253,7 @@ rb_zjit_iseq_backedge(const rb_iseq_t *iseq)
     body->jit_entry_calls++;
     if (body->jit_entry_calls == rb_zjit_profile_threshold) {
         rb_zjit_profile_enable(iseq);
+        rb_zjit_iseq_mark_hot_loop(iseq);
     }
 }
 
