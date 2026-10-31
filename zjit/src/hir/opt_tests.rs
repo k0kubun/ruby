@@ -25772,6 +25772,28 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_iterator_over_threshold_with_literal_block() {
+        eval(r"
+            def each_pair_twice(a)
+              i = 0
+              n = a.length
+              while i < n
+                yield a[i], i
+                yield a[i], i
+                i += 1
+              end
+              a.length + n + i
+            end
+            def test(a) = each_pair_twice(a) { |x, i| x + i }
+            test([1, 2]); test([3])
+        ");
+        let hir = hir_string("test");
+        // The iterator is over the inlining threshold, but it's inlined with its literal block.
+        assert!(hir.contains("PushInlineFrame :each_pair_twice"), "{hir}");
+        assert!(!hir.contains("InvokeBlock "), "{hir}");
+    }
+
+    #[test]
     fn test_inline_without_block_folds_defined_yield() {
         eval(r"
             def foo = defined?(yield)

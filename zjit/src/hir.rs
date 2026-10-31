@@ -2919,9 +2919,10 @@ pub enum ValidationError {
 }
 
 /// Set of flags incompatible with direct sends to forwardable callees.
-/// Maximum encoded size of a method that yields to a literal block that may `break` or `return`
-/// and is inlined regardless of the inlining threshold and budget, so that the throw can become a jump.
-const THROW_INLINE_MAX_CALLEE_SIZE: usize = 128;
+/// Maximum encoded size of a method that yields to a literal block and is inlined regardless of
+/// the inlining threshold, so that its `yield` calls the literal block directly. If the block may
+/// `break` or `return`, it's inlined regardless of the budget as well, so the throw can become a jump.
+const ITERATOR_INLINE_MAX_CALLEE_SIZE: usize = 128;
 
 const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     // `gen_send_iseq_direct` currently handles only the interpreter's `vm_call_iseq_forwardable`
@@ -6959,10 +6960,13 @@ impl Function {
                 // block may turn the throw into a jump, so skip the budget heuristic as well.
                 // Do the same for a modestly sized method that yields to the literal block itself.
                 let throw_block = blockiseq.is_some_and(crate::codegen::block_iseq_may_throw);
-                let throw_inlinable = throw_block && (inline_block || (
-                    unsafe { get_iseq_encoded_size(iseq) } as usize <= THROW_INLINE_MAX_CALLEE_SIZE
-                        && crate::codegen::iseq_may_yield(iseq)
-                ));
+                // A modestly sized method that yields to the literal block is an iterator too. Its
+                // `yield` sees the blocks of all its callers, but inlined, it calls this one.
+                let yields_literal_block = blockiseq.is_some()
+                    && unsafe { get_iseq_encoded_size(iseq) } as usize <= ITERATOR_INLINE_MAX_CALLEE_SIZE
+                    && crate::codegen::iseq_may_yield(iseq);
+                let throw_inlinable = throw_block && (inline_block || yields_literal_block);
+                let inline_block = inline_block || yields_literal_block;
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
                 // An iterator that yields to the literal block, e.g. Array#each, is inlined with
