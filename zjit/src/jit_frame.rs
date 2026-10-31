@@ -601,6 +601,25 @@ mod tests {
         "), @"[43, 41]");
     }
 
+    // Integer#times and its block are inlined into test, and Fiber.new escapes the env
+    // of the block and then of test, which has no stack map of its own while the
+    // inlined frames run. Its locals come from the stack map of the inlined block.
+    #[test]
+    fn test_escape_env_of_frame_with_inlined_callee() {
+        assert_snapshot!(inspect("
+            def test(escape)
+              max = 3
+              r1 = max.times { Fiber.new {} if escape }
+              r2 = max.times { }
+              [max, r1, r2]
+            end
+
+            test(false)
+            test(false)
+            test(true)
+        "), @"[3, 3, 3]");
+    }
+
     // Proc.new inside a block passed via invokeblock captures the caller's
     // block_code. When the JIT compiles the caller, block_code must be
     // correctly available for the proc to work.

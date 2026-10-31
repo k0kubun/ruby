@@ -3226,7 +3226,22 @@ rb_zjit_spill_frame(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
 {
     if (!rb_zjit_enabled_p) return;
     if (CFP_ZJIT_FRAME_P(cfp)) {
-        zjit_write_frame_stack(ec, cfp, CFP_ZJIT_FRAME(cfp));
+        // A frame that a callee is inlined into has no stack map of its own while
+        // the callee runs. The stack map of the newest inlined callee describes it,
+        // since it describes every frame it's inlined into. Those callees have the
+        // next JITFrame slots in the same native frame; see cfp_jit_return_for_depth().
+        // vm_make_env_each() escapes the env of such a frame when a block in the
+        // inlined callee escapes, e.g. `n.times { Fiber.new {} }`.
+        rb_control_frame_t *newest_cfp = cfp;
+        while (newest_cfp > ec->cfp) {
+            rb_control_frame_t *callee_cfp = RUBY_VM_NEXT_CONTROL_FRAME(newest_cfp);
+            if (!(CFP_ZJIT_FRAME_P(callee_cfp) &&
+                  (const VALUE *)callee_cfp->jit_return == (const VALUE *)newest_cfp->jit_return - 1)) {
+                break;
+            }
+            newest_cfp = callee_cfp;
+        }
+        zjit_write_frame_stack(ec, newest_cfp, CFP_ZJIT_FRAME(newest_cfp));
     }
 }
 #endif
