@@ -305,16 +305,31 @@ rb_zjit_singleton_class_p(VALUE klass)
 // cache doesn't have a valid one. Unlike rb_callable_method_entry(), this never fills the cache,
 // so it never allocates or takes the VM lock. JIT code calls it to check the callee of a call site
 // whose receiver classes vary but which always calls the same method.
+//
+// `klass_cache` is the call site's cache of the last class found to resolve to `expected_cme`.
+// A hit skips the method cache lookup, whose hash table probe and the loads of the class's
+// method cache entries miss the CPU cache on most calls. `cache_owner` is the ISEQ whose JIT
+// code owns the cache and marks the class in it. The JIT code that calls this is invalidated
+// when `expected_cme` is, and a class that resolves `mid_sym` to `expected_cme` keeps doing so
+// until `expected_cme` is invalidated, which is what makes a cached class a valid hit.
 const rb_callable_method_entry_t *
-rb_zjit_cached_cme(VALUE recv, VALUE mid_sym)
+rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_owner, const rb_callable_method_entry_t *expected_cme)
 {
-    ID mid = rb_sym2id(mid_sym);
     VALUE klass = CLASS_OF(recv);
+    if (LIKELY(*klass_cache == klass)) {
+        return expected_cme;
+    }
+
+    ID mid = rb_sym2id(mid_sym);
     VALUE cc_tbl = RUBY_ATOMIC_VALUE_LOAD(RCLASS_WRITABLE_CC_TBL(klass));
     VALUE ccs_data;
     if (cc_tbl && rb_managed_id_table_lookup(cc_tbl, mid, &ccs_data)) {
         const struct rb_class_cc_entries *ccs = (const struct rb_class_cc_entries *)ccs_data;
         if (LIKELY(!METHOD_ENTRY_INVALIDATED(ccs->cme))) {
+            if (ccs->cme == expected_cme) {
+                *klass_cache = klass;
+                RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
+            }
             return ccs->cme;
         }
     }
