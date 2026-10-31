@@ -454,6 +454,25 @@ rb_zjit_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
     return rb_vm_getinstancevariable(iseq, obj, id, ic);
 }
 
+// rb_vm_getinstancevariable() for JIT code that missed the instruction's inline cache. For a
+// T_OBJECT, look up the index in the (shape, name) cache instead of walking the shape tree, and
+// put the object's shape in the inline cache, which the JIT code checks before calling this, for
+// the next read of an object in the same shape. On a miss, the interpreter caches the shape that
+// the ivar was added in, which serves it as a hint for the tree walk, but never matches the
+// object's shape exactly when ivars were added after it.
+VALUE
+rb_zjit_getinstancevariable_on_cache_miss(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
+{
+    VALUE fields_obj;
+    attr_index_t index;
+    if (zjit_obj_ivar_index(obj, id, &fields_obj, &index)) {
+        shape_id_t shape_id = RBASIC_SHAPE_ID_FOR_READ(fields_obj);
+        ATOMIC_U64_SET_RELAXED(ic->value, rb_getivar_cache_pack(RSHAPE_OFFSET(shape_id), index));
+        return index == ATTR_INDEX_NOT_SET ? Qnil : rb_imemo_fields_ptr(fields_obj)[index];
+    }
+    return rb_vm_getinstancevariable(iseq, obj, id, ic);
+}
+
 VALUE
 rb_zjit_defined_ivar(VALUE obj, ID id, VALUE pushval)
 {

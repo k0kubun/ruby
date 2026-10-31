@@ -11456,6 +11456,45 @@ fn test_ivar_inline_cache_on_final_version() {
 }
 
 #[test]
+fn test_ivar_inline_cache_refill_on_final_version() {
+    // On an inline cache miss, JIT code caches the object's shape. The interpreter would cache
+    // the shape that @foo was added in, which objects that got more ivars after @foo don't have.
+    // Read @foo on such objects in runs of the same shape and alternating shapes, including
+    // an object whose ivar index differs because @foo was added later.
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_max_versions(2);
+    let result = inspect(r#"
+        class LateIvarIC
+          def initialize(foo, n)
+            @foo = foo
+            n.times { |i| instance_variable_set(:"@x#{i}", i) }
+          end
+          def get(x) = [@foo, x.succ]
+        end
+
+        obj = LateIvarIC.new(0, 0)
+        obj.get(1); obj.get(1)      # compile v1
+        obj.get("a"); obj.get("a")  # invalidate v1, compile the final version
+
+        objs = [1, 2, 3].map { |n| LateIvarIC.new(n, n) }
+        late = LateIvarIC.allocate
+        late.instance_variable_set(:@x0, 0)
+        late.instance_variable_set(:@foo, 4)
+
+        result = []
+        objs.each { |o| 2.times { result << o.get("a").first } }
+        2.times { (objs + [late]).each { |o| result << o.get("a").first } }
+        result
+    "#);
+    set_max_versions(old_max_versions);
+    set_call_threshold(old_call_threshold);
+    assert_snapshot!(result, @"[1, 1, 2, 2, 3, 3, 1, 2, 3, 4, 1, 2, 3, 4]");
+}
+
+#[test]
 fn test_float_arithmetic() {
     set_call_threshold(1);
     assert_snapshot!(assert_compiles_allowing_exits("def test = 1.5 + 2.5; test"), @"4.0");

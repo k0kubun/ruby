@@ -1368,7 +1368,7 @@ fn ivar_inline_cache_filled(ic: *const iseq_inline_iv_cache_entry) -> bool {
 /// interpreter's getinstancevariable, check the shape cached in the instruction's
 /// inline cache and load the field directly on a hit. The cache only holds shapes of
 /// objects whose fields are embedded (T_OBJECT, SHAPE_ID_LAYOUT_ROBJECT), so a hit
-/// implies that layout. A miss calls rb_vm_getinstancevariable(), which refills the cache.
+/// implies that layout. A miss calls rb_zjit_getinstancevariable_on_cache_miss(), which refills the cache.
 fn gen_getivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
@@ -1410,7 +1410,7 @@ fn gen_getivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, recv: Op
     let label = jit.get_label(asm, miss_block, hir_block_id);
     asm.write_label(label);
     let iseq = Opnd::Value(state.iseq.into());
-    let val = asm_ccall!(asm, rb_vm_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic));
+    let val = asm_ccall!(asm, rb_zjit_getinstancevariable_on_cache_miss, iseq, recv, id.0.into(), Opnd::const_ptr(ic));
     asm.jmp(result_edge(val));
 
     asm.set_current_block(result_block);
