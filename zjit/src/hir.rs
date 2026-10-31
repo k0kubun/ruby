@@ -5454,10 +5454,28 @@ impl Function {
         if self.type_of(val).is_subtype(ty) {
             return true;
         }
-        let Some(profiled_type) = self.profiled_type_of_at(val, state) else {
-            return false;
-        };
-        Type::from_profiled_type(profiled_type).is_subtype(ty)
+        if let Some(profiled_type) = self.profiled_type_of_at(val, state) {
+            if Type::from_profiled_type(profiled_type).is_subtype(ty) {
+                return true;
+            }
+        }
+        // A polymorphic profile is still likely a `ty` if every type it saw is one, e.g. a
+        // String and a String subclass for `ty` = String.
+        self.profiled_type_union_at(val, state).is_some_and(|union| union.is_subtype(ty))
+    }
+
+    /// Union of the types in `insn`'s profile at `state`, if the profile saw all of its types
+    /// (i.e. it is not megamorphic).
+    fn profiled_type_union_at(&self, insn: InsnId, state: InsnId) -> Option<Type> {
+        let entries = self.profiles.as_ref()?.get(state)?;
+        let insn = self.chase_insn(insn);
+        let (_, summary) = entries.iter().find(|(entry_insn, _)| self.chase_insn(*entry_insn) == insn)?;
+        if !(summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
+            return None;
+        }
+        summary.buckets().iter().filter(|profiled_type| !profiled_type.is_empty())
+            .map(|&profiled_type| Type::from_profiled_type(profiled_type))
+            .reduce(|acc, ty| acc.union(ty))
     }
 
     /// Guard that `val` is a `guard_type`, unless it is already known to be one.

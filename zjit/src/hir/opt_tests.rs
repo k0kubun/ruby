@@ -18029,6 +18029,77 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_optimize_string_append_polymorphic_string_and_subclass() {
+        eval(r#"
+            class MyString < String
+            end
+            def test(x, y) = x << y
+            test("iron", "man")
+            test("iron", MyString.new)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, <<@0x1010, cme:0x1018)
+          v31:StringExact = GuardType v12, StringExact recompile
+          v32:String = GuardType v13, String recompile
+          v33:CUInt64 = LoadField v31, :RBASIC_FLAGS@0x1040
+          v34:CUInt64 = LoadField v32, :RBASIC_FLAGS@0x1040
+          v35:StringExact = StringAppend v31, v32, recv_flags: v33, other_flags: v34
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
+    fn test_dont_optimize_string_append_polymorphic_string_and_non_string() {
+        eval(r#"
+            def test(x, y) = x << y
+            test("iron", "man")
+            test("iron", 65)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, <<@0x1010, cme:0x1018)
+          v31:StringExact = GuardType v12, StringExact recompile
+          v32:BasicObject = CCallWithFrame v31, :String#<<@0x1040, v13
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v32
+        ");
+    }
+
+    #[test]
     fn test_do_not_optimize_string_subclass_append_string() {
         eval(r#"
             class MyString < String
