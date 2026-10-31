@@ -4051,9 +4051,7 @@ fn gen_spill_stack(jit: &JITState, asm: &mut Assembler, function: &Function, sta
                 locals_area = true;
             }
             StackMapEntry::PrevFrame => {
-                // The inlined callee's receiver slot. Like Skip(1), but it also
-                // switches frames on the decoder side.
-                offset -= 1;
+                // Switches frames on the decoder side without moving the cursor.
                 locals_area = false;
             }
             // Only gen_prepare_non_leaf_call() prepends this, and it doesn't spill.
@@ -4113,10 +4111,24 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         let Some(caller) = current_state.caller() else {
             break;
         };
+        let caller_state = function.frame_state(caller);
+        // The inlined callee's receiver, if any, is below its local table.
+        let receiver_slots = inline_frame_receiver_slots(&caller_state);
+        if receiver_slots > 0 {
+            stack.push(StackMapEntry::Skip(receiver_slots));
+        }
         stack.push(StackMapEntry::PrevFrame);
-        current_state = function.frame_state(caller);
+        current_state = caller_state;
     }
     stack
+}
+
+/// The number of VM stack slots for the receiver of an inlined frame called from `caller_state`.
+fn inline_frame_receiver_slots(caller_state: &FrameState) -> usize {
+    // A method call has the callee's receiver below its local table. An inlined block called
+    // by `invokeblock` doesn't have a receiver on the stack.
+    let caller_opcode = unsafe { rb_iseq_bare_opcode_at_pc(caller_state.iseq, caller_state.pc) } as u32;
+    if caller_opcode == YARVINSN_invokeblock { 0 } else { 1 }
 }
 
 /// Whether the stack map should carry this frame's own operand stack values.
