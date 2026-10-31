@@ -3266,6 +3266,8 @@ struct InlineFrame {
     /// The `inline_methods` pass that inlined this frame. Until the pass finishes, no other
     /// optimization has touched `return_block`, so it's safe to add edges to it.
     inline_pass: usize,
+    /// `self` of the inlined frame: the receiver of a method or the captured self of a block
+    recv: InsnId,
 }
 
 /// Operands of an [`Insn::PopInlineFrame`]
@@ -3994,6 +3996,16 @@ impl Function {
         match &self.insns[insn_id] {
             Insn::Snapshot { state } => state.depth,
             insn => panic!("Unexpected non-Snapshot {insn} when looking up frame depth"),
+        }
+    }
+
+    /// Return `self` of the frame that `state` belongs to. The top-level frame reads it from
+    /// the CFP. An inlined frame's self is the operand of the instruction that pushed the frame,
+    /// so it's known only for frames that the inliner recorded.
+    fn frame_self(&mut self, block: BlockId, state: InsnId) -> Option<InsnId> {
+        match self.frame_state_ref(state).caller() {
+            None => Some(self.load_self(block)),
+            Some(caller) => self.inline_frames.get(&caller).map(|frame| frame.recv),
         }
     }
 
@@ -6093,7 +6105,9 @@ impl Function {
     /// Check protected visibility only after committing to an optimized send.
     fn guard_protected_send(&mut self, block: BlockId, defined_class: Option<VALUE>, state: InsnId) {
         let Some(defined_class) = defined_class else { return };
-        let caller_self = self.load_self(block);
+        let Some(caller_self) = self.frame_self(block, state) else {
+            panic!("protected send specialized without the caller self");
+        };
         // IsA constants cannot be internal ICLASS objects.
         let defined_class = if defined_class.builtin_type() == RUBY_T_ICLASS { defined_class.class_of() } else { defined_class };
         let class = self.push_insn(block, Insn::Const { val: Const::Value(defined_class) });
@@ -6185,11 +6199,12 @@ impl Function {
                             (METHOD_VISI_PUBLIC, _) => None,
                             (METHOD_VISI_PRIVATE, true) => None,
                             (METHOD_VISI_PROTECTED, true) => None,
-                            (METHOD_VISI_PROTECTED, false) if self.frame_depth(state) == 0 && !matches!(unsafe { get_cme_def_type(cme) }, VM_METHOD_TYPE_REFINED | VM_METHOD_TYPE_ALIAS) => {
+                            (METHOD_VISI_PROTECTED, false) if self.frame_state_ref(state).caller().is_none_or(|caller| self.inline_frames.contains_key(&caller))
+                                && !matches!(unsafe { get_cme_def_type(cme) }, VM_METHOD_TYPE_REFINED | VM_METHOD_TYPE_ALIAS) => {
                                 // The VM checks the actual caller self, not the receiver or
-                                // the ISEQ owner. Inlined frames need an SSA self operand;
-                                // keep those calls dynamic rather than load the outer self.
-                                // Protected aliases and refinements stay dynamic as well.
+                                // the ISEQ owner. In an inlined frame, that's the receiver or
+                                // the captured self that pushed the frame, not the CFP self of
+                                // this function. Protected aliases and refinements stay dynamic.
                                 Some(unsafe { (*cme).defined_class })
                             }
                             _ => {
@@ -7458,6 +7473,7 @@ impl Function {
                     pop: InlineFramePop { iseq, argc: args_len, state },
                     blockiseq,
                     inline_pass: self.inline_pass,
+                    recv,
                 });
 
                 let args = match send.insn(self) {
@@ -7841,14 +7857,6 @@ impl Function {
 
         // Past the point of no return: commit the inlining.
         incr_counter!(inline_block_count);
-        self.inline_frames.insert(post_yield_caller, InlineFrame {
-            iseq,
-            return_block: continuation,
-            pop: block_pop,
-            blockiseq: None,
-            inline_pass: self.inline_pass,
-        });
-
         let tail = self.blocks[block].insns.split_off(pos);
         debug_assert!(self.is_invoke_block_iseq_direct(tail[0]));
 
@@ -7859,6 +7867,14 @@ impl Function {
         // The block's self is the self captured when the block was created.
         let offset: i32 = std::mem::offset_of!(rb_captured_block, self_).try_into().unwrap();
         let block_self = self.load_field(block, captured, FieldName::captured_self, offset, types::BasicObject);
+        self.inline_frames.insert(post_yield_caller, InlineFrame {
+            iseq,
+            return_block: continuation,
+            pop: block_pop,
+            blockiseq: None,
+            inline_pass: self.inline_pass,
+            recv: block_self,
+        });
 
         // Map the block body entry params [self, local0, local1, ...] to caller values.
         // can_direct_invoke_block_iseq ensures the block only has lead parameters and
