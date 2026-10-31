@@ -6617,46 +6617,49 @@ pub(crate) mod hir_build_tests {
         bb9():
           v19:TrueClass = RefineType v15, Truthy
           Jump bb6(v8, v9)
-        bb6(v31:BasicObject, v32:NilClass):
-          v36:Fixnum[0] = Const Value(0)
-          Jump bb8(v31, v36)
-        bb8(v49:BasicObject, v50:Fixnum):
-          v53:Array = RefineType v49, Array
-          v54:CInt64 = ArrayLength v53
-          v55:Fixnum = BoxFixnum v54
-          v56:BoolExact = FixnumGe v50, v55
+        bb6(v34:BasicObject, v35:NilClass):
+          v39:Fixnum[0] = Const Value(0)
+          Jump bb8(v34, v39)
+        bb8(v52:BasicObject, v53:Fixnum):
+          v56:Array = RefineType v52, Array
+          v57:CInt64 = ArrayLength v56
+          v58:Fixnum = BoxFixnum v57
+          v59:Fixnum = RefineType v53, Fixnum
+          v60:BoolExact = FixnumGe v59, v58
           PatchPoint NoEPEscape(each)
-          v60:FalseClass = RefineType v56, Falsy
-          CondBranchTest v56, bb11(), bb7(v49, v50)
+          v64:FalseClass = RefineType v60, Falsy
+          CondBranchTest v60, bb11(), bb7(v52, v53)
         bb11():
-          v62:TrueClass = RefineType v56, Truthy
-          v64:NilClass = Const Value(nil)
+          v66:TrueClass = RefineType v60, Truthy
+          v68:NilClass = Const Value(nil)
           CheckInterrupts
-          Return v49
-        bb7(v72:BasicObject, v73:Fixnum):
-          v77:Array = RefineType v72, Array
-          v78:CInt64 = UnboxFixnum v73
-          v79:BasicObject = ArrayAref v77, v78
+          Return v52
+        bb7(v76:BasicObject, v77:Fixnum):
+          v81:Array = RefineType v76, Array
+          v82:Fixnum = RefineType v77, Fixnum
+          v83:CInt64 = UnboxFixnum v82
+          v84:BasicObject = ArrayAref v81, v83
           PatchPoint NoEPEscape(each)
-          v83:CPtr = GetEP 0
-          v84:CInt64 = LoadField v83, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v85:CInt64[3] = Const CInt64(3)
-          v86:CInt64 = IntAnd v84, v85
-          v87:CInt64[3] = Const CInt64(3)
-          v88:CBool = IsBitEqual v86, v87
-          CondBranch v88, bb13(), bb14()
+          v88:CPtr = GetEP 0
+          v89:CInt64 = LoadField v88, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
+          v90:CInt64[3] = Const CInt64(3)
+          v91:CInt64 = IntAnd v89, v90
+          v92:CInt64[3] = Const CInt64(3)
+          v93:CBool = IsBitEqual v91, v92
+          CondBranch v93, bb13(), bb14()
         bb13():
-          v91:BasicObject = InvokeBlockIfunc v84, v79
-          Jump bb12(v91)
+          v96:BasicObject = InvokeBlockIfunc v89, v84
+          Jump bb12(v96)
         bb14():
-          v93:BasicObject = InvokeBlock v79 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb12(v93)
-        bb12(v89:BasicObject):
+          v98:BasicObject = InvokeBlock v84 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb12(v98)
+        bb12(v94:BasicObject):
           PatchPoint NoEPEscape(each)
-          v100:Fixnum[1] = Const Value(1)
-          v101:Fixnum = FixnumAdd v73, v100
+          v105:Fixnum = RefineType v77, Fixnum
+          v106:Fixnum[1] = Const Value(1)
+          v107:Fixnum = FixnumAdd v105, v106
           PatchPoint NoEPEscape(each)
-          Jump bb8(v72, v101)
+          Jump bb8(v76, v107)
         bb4(v22:BasicObject, v23:NilClass):
           v27:BasicObject = InvokeBuiltin <inline_expr>, v22
           PatchPoint NoEPEscape(each)
