@@ -2770,6 +2770,11 @@ pub struct Block {
     /// when a non-local `return` from a block inlined later is compiled into a jump to it.
     /// Optimizations must not merge it into its predecessor or narrow its params.
     pinned: bool,
+    /// A slow path, e.g. the fallback of a guard chain, that codegen places after the other
+    /// blocks so that the hot code stays dense. Like V8's deferred blocks, a block that calls a
+    /// generic runtime fallback is cold regardless of how often it runs: the call dwarfs the
+    /// cost of jumping out of line.
+    cold: bool,
 }
 
 impl Block {
@@ -3687,6 +3692,7 @@ impl Function {
             compare_block = miss_block;
         }
         self.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+        self.mark_cold(fallback_block);
 
         let (fallback_block, fallback_result) = self.dispatch_invoke_block_fallback(
             fallback_block, insn_idx, level, Some((block_handler, tag)), cd, flags, args, state, InvokeBlockPolymorphicMiss,
@@ -3826,6 +3832,16 @@ impl Function {
         };
         self.blocks.push(block);
         id
+    }
+
+    /// Mark a block as a slow path to be placed out of line. See [`Block::cold`].
+    fn mark_cold(&mut self, block: BlockId) {
+        self.blocks[block].cold = true;
+    }
+
+    /// Return true if the block is a slow path to be placed out of line. See [`Block::cold`].
+    pub fn is_cold_block(&self, block: BlockId) -> bool {
+        self.blocks[block].cold
     }
 
     fn remove_block(&mut self, block_id: BlockId) {
@@ -5146,6 +5162,7 @@ impl Function {
 
         let mut fallback = send_insn.clone();
         if let Insn::Send { reason, .. } = &mut fallback { *reason = SendMethodEntryMiss; }
+        self.mark_cold(miss_block);
         let fallback = self.push_insn(miss_block, fallback);
         self.push_insn(miss_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
 
@@ -5288,6 +5305,7 @@ impl Function {
         let join_block = join_block.unwrap();
         let mut fallback = send_insn.clone();
         if let Insn::Send { reason, .. } = &mut fallback { *reason = SendNameMiss; }
+        self.mark_cold(block);
         let fallback = self.push_insn(block, fallback);
         self.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
         let result = self.push_insn(join_block, Insn::Param);
@@ -9979,6 +9997,7 @@ impl Function {
                 let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
                 let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
                 let fallback_block = self.new_block(insn_idx);
+                self.mark_cold(fallback_block);
                 self.push_insn(block, branch(matches, optimized_block, fallback_block));
                 self.count(fallback_block, if allow_exit { chain_miss_counter } else { fallback_counter });
                 let fallback_result = emit_fallback(self, fallback_block);
@@ -12061,6 +12080,7 @@ fn add_iseq_to_hir(
                         }
                         // In the fallthrough case, do a generic interpreter send and then join.
                         let reason = SendPolymorphicFallback;
+                        fun.mark_cold(block);
                         let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, caller_splat_length, state: exit_id, reason });
                         fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
                         state.stack_push(join_param);
@@ -12148,6 +12168,7 @@ fn add_iseq_to_hir(
                         }
                         // In the fallthrough case, do a generic interpreter send and then join.
                         let reason = SendPolymorphicFallback;
+                        fun.mark_cold(block);
                         let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: send_state, reason });
                         fun.push_insn(block, Insn::Jump(BranchEdge { target: join_block, args: vec![send] }));
                         state.stack_push(join_param);
