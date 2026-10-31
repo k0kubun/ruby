@@ -4082,8 +4082,9 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
 /// JITFrame entries are encoded by the register allocator, where VReg locations
 /// on the native stack are known.
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
-    let mut stack = Vec::new();
-    let mut current_state = state.clone();
+    // The top frame's entries and the frame marker. Frames it's inlined into add more.
+    let mut stack = Vec::with_capacity(state.stack_size() + state.locals().len() + 1);
+    let mut current_state = std::borrow::Cow::Borrowed(state);
     loop {
         let to_entry = |insn_id| {
             let opnd = jit.get_opnd(insn_id);
@@ -4101,11 +4102,10 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         // writes below it when the frame's env has escaped.
         stack.push(StackMapEntry::SkipVmEnvData);
         // Locals, top-down (local[L-1] .. local[0]).
-        let spilled_locals = current_state.spilled_locals();
         let mut run_of_spilled_locals = 0;
         for (idx, &insn_id) in current_state.locals().enumerate().rev() {
             // Skip spilled slots which are already initialized on entry.
-            if spilled_locals.get(idx) {
+            if current_state.local_spilled(idx) {
                 run_of_spilled_locals += 1;
             } else {
                 if run_of_spilled_locals > 0 {
@@ -4129,7 +4129,7 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
             stack.push(StackMapEntry::Skip(receiver_slots));
         }
         stack.push(StackMapEntry::PrevFrame);
-        current_state = caller_state;
+        current_state = std::borrow::Cow::Owned(caller_state);
     }
     stack
 }
