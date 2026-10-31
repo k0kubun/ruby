@@ -229,6 +229,7 @@ pub const ANY_REDEFINED_OP_FLAG: u32 = 8192;
 pub const ARG_ENCODING_FIXED: u32 = 16;
 pub const ARG_ENCODING_NONE: u32 = 32;
 pub const SHAPE_ID_NUM_BITS: u32 = 32;
+pub const SHAPE_ID_OFFSET_MASK: u32 = 524287;
 pub const VM_KW_SPECIFIED_BITS_MAX: u32 = 31;
 pub const VM_ENV_DATA_SIZE: u32 = 3;
 pub const VM_ENV_DATA_INDEX_ME_CREF: i32 = -2;
@@ -2472,13 +2473,13 @@ unsafe extern "C" {
     pub fn rb_zjit_reserve_low_addr_space(size: usize) -> *mut ::std::os::raw::c_void;
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
-    pub fn rb_zjit_cdhash_foreach(cdhash: VALUE, func: st_foreach_callback_func, arg: st_data_t);
     pub fn rb_zjit_iseq_set_jit_entry(
         iseq: *const rb_iseq_t,
         code_ptr: *mut ::std::os::raw::c_void,
     );
     pub fn rb_vm_base_ptr(cfp: *mut rb_control_frame_struct) -> *mut VALUE;
     pub fn rb_zjit_iseq_has_profiled_enough(iseq: *const rb_iseq_t) -> bool;
+    pub fn rb_zjit_cdhash_foreach(cdhash: VALUE, func: st_foreach_callback_func, arg: st_data_t);
     pub fn rb_zjit_iseq_insn_set(
         iseq: *const rb_iseq_t,
         insn_idx: ::std::os::raw::c_uint,
