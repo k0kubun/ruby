@@ -7503,6 +7503,27 @@ fn test_send_on_method_entry_for_unprofiled_subclasses() {
 }
 
 #[test]
+fn test_send_on_method_entry_shared_by_profiled_classes() {
+    // The site is profiled with classes that share Base#foo and one that overrides it. The
+    // fallback of the polymorphic dispatch calls Base#foo for other subclasses after checking it.
+    assert_snapshot!(inspect("
+        class Base
+          def foo = 1
+        end
+        class Override < Base
+          def foo = 2
+        end
+        CLASSES = 8.times.map { Class.new(Base) }
+        def test(o) = o.foo
+        test(CLASSES[0].new); test(CLASSES[1].new); test(Override.new)
+        r = CLASSES.map { test(it.new) }
+        r << test(Class.new(Override).new) << (test(Object.new) rescue :no_method)
+        CLASSES[5].class_eval { def foo = 4 }
+        r + [test(CLASSES[5].new), test(CLASSES[6].new), test(Override.new)]
+    "), @"[1, 1, 1, 1, 1, 1, 1, 1, 2, :no_method, 4, 1, 2]");
+}
+
+#[test]
 fn test_send_on_method_entry_cached_class() {
     // The site caches the last unprofiled class that resolved to the method. A redefinition in
     // the cached class, a compaction that moves it, and immediates must all be handled.

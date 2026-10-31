@@ -5040,17 +5040,37 @@ impl Function {
             return None;
         }
 
-        // Every profiled receiver class must resolve to the same method entry.
+        // Every profiled receiver class must resolve to the same method entry. The fallback of a
+        // polymorphic dispatch only sees classes outside the profile, though. They are more likely
+        // to inherit a method that several profiled classes share than one overridden by a single
+        // class, e.g. Kernel#nil? rather than NilClass#nil?, so check for the most shared one.
         let mid = unsafe { vm_ci_mid(ci) };
-        let mut lookup_cme: *const rb_callable_method_entry_t = std::ptr::null();
+        // Profiles of one class with different shapes or flags count as one class.
+        let mut classes: Vec<VALUE> = vec![];
         for profiled_type in summary.buckets().iter().filter(|profiled_type| !profiled_type.is_empty()) {
-            let cme = unsafe { rb_callable_method_entry(profiled_type.class(), mid) };
-            if cme.is_null() || (!lookup_cme.is_null() && cme != lookup_cme) {
+            if !classes.contains(&profiled_type.class()) {
+                classes.push(profiled_type.class());
+            }
+        }
+        let mut cmes: Vec<(*const rb_callable_method_entry_t, VALUE, usize)> = vec![];
+        for klass in classes {
+            let cme = unsafe { rb_callable_method_entry(klass, mid) };
+            if cme.is_null() {
                 return None;
             }
-            lookup_cme = cme;
+            match cmes.iter_mut().find(|(known, _, _)| *known == cme) {
+                Some((_, _, count)) => *count += 1,
+                None => cmes.push((cme, klass, 1)),
+            }
         }
-        if lookup_cme.is_null() {
+        if cmes.len() > 1 && reason != SendPolymorphicFallback {
+            return None;
+        }
+        // The method entry of the most classes, preferring the most frequent receiver class on a tie
+        let Some(&(lookup_cme, klass, count)) = cmes.iter().rev().max_by_key(|(_, _, count)| *count) else {
+            return None;
+        };
+        if cmes.len() > 1 && count < 2 {
             return None;
         }
         match (unsafe { METHOD_ENTRY_VISI(lookup_cme) }, flags & VM_CALL_FCALL != 0) {
@@ -5097,7 +5117,6 @@ impl Function {
         // which replaces the entry of the superclass. So the entry is valid wherever this code
         // runs, and a class whose method cache has it calls it. A class that doesn't have the
         // entry cached takes the fallback, which fills the cache.
-        let klass = summary.bucket(0).class();
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
         let mid_opnd = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { rb_id2sym(mid) }) });
         // Qfalse is never the class of an object, so a new cache misses.

@@ -25375,6 +25375,27 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_on_method_entry_shared_by_profiled_classes_on_fallback() {
+        set_call_threshold(4);
+        eval("
+        class A; def foo = 1; end
+        class B < A; end
+        class C < A; def foo = 2; end
+
+        def test o
+          o.foo
+        end
+
+        test A.new; test B.new; test C.new; test A.new
+        ");
+        let hir = hir_string("test");
+        // The fallback checks for A#foo, which both A and B call.
+        assert!(hir.contains("rb_zjit_cached_cme"), "{hir}");
+        assert!(hir.contains("receiver class doesn't call the profiled method"), "{hir}");
+        assert!(!hir.contains("polymorphic fallback"), "{hir}");
+    }
+
+    #[test]
     fn test_no_send_on_method_entry_for_different_methods() {
         set_call_threshold(4);
         eval("
