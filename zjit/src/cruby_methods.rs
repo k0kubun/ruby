@@ -828,13 +828,18 @@ fn inline_integer_eq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
     if let Some(result) = try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumEq { left, right }, BOP_EQ, recv, other, state) {
         return Some(result);
     }
-    // Heuristic: Objects get compared to nil a lot, so we can optimize that case:
+    // Heuristic: Objects get compared to nil, true, and false a lot, so we can optimize that case:
     // * `Integer#==` (`num_equal`) checks if the other object is not `Integer`/`Float`, and, if not,
-    //   dispatches to `#==` on the other object. If the other object is `nil` and `NilClass#==`
-    //   (`rb_obj_equal`, pointer equality) has not been redefined, it returns `Qfalse`
-    if fun.is_a(other, types::NilClass)
-        && fun.assume_expected_cfunc(block, unsafe { rb_cNilClass }, ID!(eq), rb_obj_equal as _, state) {
-        return Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) }));
+    //   dispatches to `#==` on the other object, guarded against recursion. If the other object is
+    //   `nil`, `true`, or `false` and its `#==` (`rb_obj_equal`, pointer equality) has not been
+    //   redefined, it returns `Qfalse`
+    for (ty, klass) in [(types::NilClass, unsafe { rb_cNilClass }), (types::TrueClass, unsafe { rb_cTrueClass }), (types::FalseClass, unsafe { rb_cFalseClass })] {
+        if fun.is_a(other, ty) {
+            if fun.assume_expected_cfunc(block, klass, ID!(eq), rb_obj_equal as _, state) {
+                return Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) }));
+            }
+            return None;
+        }
     }
     None
 }

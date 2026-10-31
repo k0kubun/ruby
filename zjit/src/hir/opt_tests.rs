@@ -1691,6 +1691,18 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_fold_fixnum_eq_true_and_false() {
+        eval("
+            def test(o) = [o == true, o == false]
+            test(3)
+        ");
+        let hir = hir_string("test");
+        assert!(hir.contains("PatchPoint MethodRedefined(TrueClass@"), "{hir}");
+        assert!(hir.contains("PatchPoint MethodRedefined(FalseClass@"), "{hir}");
+        assert!(!hir.contains("Integer#=="), "{hir}");
+    }
+
+    #[test]
     fn test_fold_bignum_eq_nil() {
         eval("
             def test(o) = o == nil

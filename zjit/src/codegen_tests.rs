@@ -7545,6 +7545,19 @@ fn test_send_on_method_entry_of_module_method_definition() {
 }
 
 #[test]
+fn test_fixnum_eq_true_after_true_eq_redefinition() {
+    assert_snapshot!(inspect("
+        def test(o) = [o == true, o == false, o == nil]
+        test(1); test(2)
+        r = [test(1)]
+        class TrueClass
+          def ==(other) = :redefined
+        end
+        r << test(1)
+    "), @"[[false, false, false], [true, false, false]]");
+}
+
+#[test]
 fn test_send_on_method_entry_cached_class() {
     // The site caches the last unprofiled class that resolved to the method. A redefinition in
     // the cached class, a compaction that moves it, and immediates must all be handled.
