@@ -785,6 +785,9 @@ pub enum SendFallbackReason {
     SendPolymorphicFallback,
     /// The fallback of `send(name, ...)` dispatched on the profiled names when the name is none of them
     SendNameMiss,
+    /// The fallback of a send whose profiled receiver classes all call one method, when the
+    /// receiver's class doesn't have that method cached
+    SendMethodEntryMiss,
     SendDirectKeywordMismatch,
     SendDirectKeywordCountMismatch,
     SendDirectMissingKeyword,
@@ -858,6 +861,7 @@ impl Display for SendFallbackReason {
             SendOperandsNotFixnum => write!(f, "Send: operands are not fixnums"),
             SendPolymorphicFallback => write!(f, "Send: polymorphic fallback"),
             SendNameMiss => write!(f, "Send: send name is not a profiled method name"),
+            SendMethodEntryMiss => write!(f, "Send: receiver class doesn't call the profiled method"),
             SendDirectKeywordMismatch => write!(f, "SendDirect: keyword mismatch"),
             SendDirectKeywordCountMismatch => write!(f, "SendDirect: keyword count mismatch"),
             SendDirectMissingKeyword => write!(f, "SendDirect: missing keyword"),
@@ -4008,7 +4012,7 @@ impl Function {
             => {
                 // Ignore the case where the instruction is intentionally a fallback for a
                 // polymorphic send. We already know that case is a lost cause.
-                if *reason != SendFallbackReason::SendPolymorphicFallback && *reason != SendFallbackReason::SendNameMiss {
+                if !matches!(*reason, SendFallbackReason::SendPolymorphicFallback | SendFallbackReason::SendNameMiss | SendFallbackReason::SendMethodEntryMiss) {
                     *reason = dynamic_send_reason;
                 }
             }
@@ -4945,6 +4949,122 @@ impl Function {
     /// ISEQ methods named by a constant `name` or by the static Symbols profiled for `name`. Profiled
     /// names are dispatched with IsBitEqual, falling back to the generic send on a miss.
     /// Returns the block to continue specializing in, or None if nothing was emitted.
+    /// Specialize a send whose receiver classes vary but all resolve to one ISEQ method, e.g. a
+    /// method of a superclass called on instances of many subclasses, or a singleton method of a
+    /// base class called on many subclasses. Instead of a class guard, check at run time that the
+    /// method cache of the receiver's class holds the same method entry, and call it directly.
+    /// This is the method-guarded call that HotSpot and V8 use when a call site is megamorphic in
+    /// receiver types but monomorphic in its target. A miss, including an uncached class, falls
+    /// back to the original send, which fills the cache.
+    fn try_send_direct_on_method_entry(&mut self, block: BlockId, insn_id: InsnId, summary: &TypeDistributionSummary, state: InsnId) -> Option<BlockId> {
+        let send_insn = self.resolve(insn_id).insn(self).clone();
+        let Insn::Send { recv, cd, block: send_block, ref args, caller_splat_length: None, reason, .. } = send_insn else { return None };
+        let has_block = match send_block {
+            None => false,
+            Some(BlockHandler::BlockIseq(_)) => true,
+            Some(_) => return None,
+        };
+        let ci = unsafe { (*cd).ci };
+        let flags = unsafe { rb_vm_ci_flag(ci) };
+        if reason == SendMethodEntryMiss || unspecializable_call_type(flags) {
+            return None;
+        }
+
+        // Every profiled receiver class must resolve to the same method entry.
+        let mid = unsafe { vm_ci_mid(ci) };
+        let mut lookup_cme: *const rb_callable_method_entry_t = std::ptr::null();
+        for profiled_type in summary.buckets().iter().filter(|profiled_type| !profiled_type.is_empty()) {
+            let cme = unsafe { rb_callable_method_entry(profiled_type.class(), mid) };
+            if cme.is_null() || (!lookup_cme.is_null() && cme != lookup_cme) {
+                return None;
+            }
+            lookup_cme = cme;
+        }
+        if lookup_cme.is_null() {
+            return None;
+        }
+        match (unsafe { METHOD_ENTRY_VISI(lookup_cme) }, flags & VM_CALL_FCALL != 0) {
+            (METHOD_VISI_PUBLIC, _) | (METHOD_VISI_PRIVATE, true) | (METHOD_VISI_PROTECTED, true) => {}
+            _ => return None,
+        }
+        let mut cme = unsafe { rb_check_overloaded_cme(lookup_cme, ci) };
+        while unsafe { get_cme_def_type(cme) } == VM_METHOD_TYPE_ALIAS {
+            cme = unsafe { rb_aliased_callable_method_entry(cme) };
+        }
+        enum Target { Iseq(IseqPtr, SendDirectCall), Ivar(ID) }
+        let target = match unsafe { get_cme_def_type(cme) } {
+            VM_METHOD_TYPE_ISEQ => {
+                let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+                let Ok(call) = self.build_send_direct_args(&CallerArguments::new(args, ci), None, iseq, has_block) else { return None };
+                Target::Iseq(iseq, call)
+            }
+            VM_METHOD_TYPE_BMETHOD if !has_block => {
+                let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
+                let proc_block = unsafe { (*rb_jit_get_proc_ptr(procv)).block.as_ref() };
+                if proc_block.type_() != block_type_iseq {
+                    return None;
+                }
+                let iseq = unsafe { *proc_block.as_.captured.as_ref().code.iseq.as_ref() };
+                let Ok(call) = self.build_send_direct_args(&CallerArguments::new(args, ci), None, iseq, has_block) else { return None };
+                // A Proc that isn't shareable can only be called from the Ractor that defined it.
+                if !procv.shareable_p() && !self.assume_single_ractor_mode(block, state) {
+                    return None;
+                }
+                Target::Iseq(iseq, call)
+            }
+            VM_METHOD_TYPE_IVAR if !has_block && args.is_empty() => Target::Ivar(unsafe { get_cme_def_body_attr_id(cme) }),
+            _ => return None,
+        };
+
+        // Recompile when the method entry is invalidated, e.g. by a redefinition in a subclass,
+        // which replaces the entry of the superclass. So the entry is valid wherever this code
+        // runs, and a class whose method cache has it calls it. A class that doesn't have the
+        // entry cached takes the fallback, which fills the cache.
+        let klass = summary.bucket(0).class();
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
+        let mid_opnd = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { rb_id2sym(mid) }) });
+        let recv_cme = self.push_insn(block, Insn::CCall {
+            cfunc: rb_zjit_cached_cme as *const u8,
+            recv,
+            args: vec![mid_opnd],
+            name: ID!(rb_zjit_cached_cme),
+            owner: Qnil,
+            // A method entry, or 0 if the class doesn't have it cached
+            return_type: types::RubyValue,
+            elidable: false,
+        });
+        let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
+        let is_expected = self.push_insn(block, Insn::IsBitEqual { left: recv_cme, right: expected_cme });
+        let call_block = self.new_block(u32::MAX);
+        let miss_block = self.new_block(u32::MAX);
+        let join_block = self.new_block(u32::MAX);
+        self.push_insn(block, Insn::CondBranch {
+            val: is_expected,
+            if_true: BranchEdge { target: call_block, args: vec![] },
+            if_false: BranchEdge { target: miss_block, args: vec![] },
+        });
+
+        let result = match target {
+            Target::Iseq(iseq, call) => {
+                let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                    self.emit_send_direct_args(call_block, call, args, state, state);
+                self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block })))
+            }
+            Target::Ivar(id) => self.push_insn(call_block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state }),
+        };
+        self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+
+        let mut fallback = send_insn.clone();
+        if let Insn::Send { reason, .. } = &mut fallback { *reason = SendMethodEntryMiss; }
+        let fallback = self.push_insn(miss_block, fallback);
+        self.push_insn(miss_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+
+        let result = self.push_insn(join_block, Insn::Param);
+        self.insn_types[result] = types::BasicObject;
+        self.make_equal_to(insn_id, result);
+        Some(join_block)
+    }
+
     fn try_specialize_send_name(
         &mut self,
         block: BlockId,
@@ -5448,20 +5568,33 @@ impl Function {
                 }
                 let resolved = self.resolve(insn_id);
                 match resolved.insn(self) {
-                    &Insn::Send { mut recv, cd, state, block: send_block, caller_splat_length, .. } => {
+                    &Insn::Send { mut recv, cd, state, block: send_block, caller_splat_length, reason, .. } => {
                         let mut has_block = send_block.is_some();
+                        // The fallback of a polymorphic dispatch sees receiver classes outside the profile.
+                        if reason == SendPolymorphicFallback
+                            && let Some(summary) = self.profiles.as_ref().and_then(|profiles| self.polymorphic_summary(profiles, recv, state))
+                            && let Some(next_block) = self.try_send_direct_on_method_entry(block, insn_id, &summary, state)
+                        {
+                            block = next_block;
+                            continue;
+                        }
                         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
                             ReceiverTypeResolution::StaticallyKnown { class } => (class, None),
                             ReceiverTypeResolution::Monomorphic { profiled_type }
                             | ReceiverTypeResolution::SkewedPolymorphic { profiled_type } => (profiled_type.class(), Some(profiled_type)),
-                            ReceiverTypeResolution::SkewedMegamorphic { .. }
-                            | ReceiverTypeResolution::Megamorphic => {
-                                self.set_dynamic_send_reason(insn_id, SendMegamorphic);
-                                self.push_insn_id(block, insn_id);
-                                continue;
-                            }
-                            ReceiverTypeResolution::Polymorphic => {
-                                self.set_dynamic_send_reason(insn_id, SendPolymorphic);
+                            resolution @ (ReceiverTypeResolution::SkewedMegamorphic { .. }
+                            | ReceiverTypeResolution::Megamorphic
+                            | ReceiverTypeResolution::Polymorphic) => {
+                                // Polymorphic sends that weren't split by receiver class, e.g. `!=`, and
+                                // megamorphic sends may still call one method.
+                                if let Some(summary) = self.profiles.as_ref().map(|profiles| self.profile_summary(profiles, recv, state))
+                                    && let Some(next_block) = self.try_send_direct_on_method_entry(block, insn_id, &summary, state)
+                                {
+                                    block = next_block;
+                                    continue;
+                                }
+                                let reason = if matches!(resolution, ReceiverTypeResolution::Polymorphic) { SendPolymorphic } else { SendMegamorphic };
+                                self.set_dynamic_send_reason(insn_id, reason);
                                 self.push_insn_id(block, insn_id);
                                 continue;
                             }

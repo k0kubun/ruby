@@ -7207,6 +7207,65 @@ fn test_method_call() {
 }
 
 #[test]
+fn test_send_on_method_entry_for_unprofiled_subclasses() {
+    // The site is profiled with two subclasses, then sees more subclasses that call the same
+    // inherited method, a subclass that overrides it, and a class without it.
+    assert_snapshot!(inspect("
+        class Base
+          def foo(x) = x + 1
+          attr_reader :iv
+          define_method(:bm) { |x| x * 2 }
+          def initialize = @iv = 7
+          def method_missing(name, *) = name
+        end
+        CLASSES = 8.times.map { Class.new(Base) }
+        class Other
+          def foo(x) = x + 10
+        end
+        def test(o) = [o.foo(1), o.iv, o.bm(3)]
+        test(CLASSES[0].new); test(CLASSES[1].new)
+        r = CLASSES.map { test(it.new) }
+        CLASSES[2].class_eval { def foo(x) = x + 100 }
+        Base.class_eval { def bm(x) = x * 3 }
+        r + [test(CLASSES[2].new), test(CLASSES[3].new), [Other.new.foo(1)], test(Struct.new(:iv) { def foo(x) = 5; def bm(x) = 6 }.new(8))]
+    "), @"[[2, 7, 6], [2, 7, 6], [2, 7, 6], [2, 7, 6], [2, 7, 6], [2, 7, 6], [2, 7, 6], [2, 7, 6], [101, 7, 9], [2, 7, 9], [11], [5, 8, 6]]");
+}
+
+#[test]
+fn test_send_on_method_entry_respects_visibility() {
+    assert_snapshot!(inspect("
+        class Base
+          def call_foo = foo
+          private def foo = :private
+        end
+        class Pub
+          def foo = :public
+          def call_foo = foo
+        end
+        A = Class.new(Base); B = Class.new(Base); C = Class.new(Base)
+        def test(o) = (o.foo rescue :no_method)
+        def test_fcall(o) = o.call_foo
+        test(Pub.new); test(Pub.new)
+        test_fcall(A.new); test_fcall(B.new)
+        [test(Pub.new), test(A.new), test_fcall(C.new), test_fcall(Pub.new)]
+    "), @"[:public, :no_method, :private, :public]");
+}
+
+#[test]
+fn test_send_on_method_entry_after_singleton_method() {
+    assert_snapshot!(inspect("
+        class Base
+          def self.name2 = :base
+        end
+        CLASSES = 6.times.map { Class.new(Base) }
+        def test(k) = k.name2
+        CLASSES.each { test(it) }
+        CLASSES[4].define_singleton_method(:name2) { :redefined }
+        CLASSES.map { test(it) }
+    "), @"[:base, :base, :base, :base, :redefined, :base]");
+}
+
+#[test]
 fn test_polymorphic_iseq_dispatch_same_site() {
     assert_snapshot!(inspect("
         class A; def foo = 1; end
