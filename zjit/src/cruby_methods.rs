@@ -1342,10 +1342,22 @@ fn inline_kernel_class(fun: &mut hir::Function, block: hir::BlockId, _recv: hir:
     Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(real_class) }))
 }
 
+/// Refine the type of an index counter of the Array iteration builtins, which starts at 0 and
+/// is incremented by fixnum_inc, to Fixnum. HIR can't infer it when the counter is loaded
+/// from the frame, e.g. by an entry that resumes the frame in the middle of the loop.
+fn refine_fixnum_counter(fun: &mut hir::Function, block: hir::BlockId, num: hir::InsnId) -> hir::InsnId {
+    if fun.is_a(num, types::Fixnum) {
+        num
+    } else {
+        fun.push_insn(block, hir::Insn::RefineType { val: num, new_type: types::Fixnum })
+    }
+}
+
 /// Inline `fixnum_inc(ec, self, num)` implies FixnumAdd(num, 1).
 /// num is always a Fixnum (starts at 0 and is incremented by fixnum_inc).
 fn inline_fixnum_inc(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[_self, num] = args else { return None; };
+    let num = refine_fixnum_counter(fun, block, num);
     let one = fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(VALUE::fixnum_from_usize(1)) });
     let result = fun.push_insn(block, hir::Insn::FixnumAdd { left: num, right: one, state });
     Some(result)
@@ -1356,6 +1368,7 @@ fn inline_fixnum_inc(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::I
 fn inline_ary_at(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[recv, index] = args else { return None; };
     let recv = fun.push_insn(block, hir::Insn::RefineType { val: recv, new_type: types::Array });
+    let index = refine_fixnum_counter(fun, block, index);
     let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
     let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
     Some(result)
@@ -1368,6 +1381,7 @@ fn inline_ary_at_end(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::I
     let recv = fun.push_insn(block, hir::Insn::RefineType { val: recv, new_type: types::Array });
     let length_cint = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
     let length = fun.push_insn(block, hir::Insn::BoxFixnum { val: length_cint, state });
+    let index = refine_fixnum_counter(fun, block, index);
     let result = fun.push_insn(block, hir::Insn::FixnumGe { left: index, right: length });
     Some(result)
 }

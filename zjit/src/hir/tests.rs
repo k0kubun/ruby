@@ -6508,39 +6508,42 @@ pub(crate) mod hir_build_tests {
           v56:Array = RefineType v52, Array
           v57:CInt64 = ArrayLength v56
           v58:Fixnum = BoxFixnum v57
-          v59:BoolExact = FixnumGe v53, v58
+          v59:Fixnum = RefineType v53, Fixnum
+          v60:BoolExact = FixnumGe v59, v58
           PatchPoint NoEPEscape(each)
-          v63:FalseClass = RefineType v59, Falsy
-          CondBranchTest v59, bb11(), bb7(v52, v53)
+          v64:FalseClass = RefineType v60, Falsy
+          CondBranchTest v60, bb11(), bb7(v52, v53)
         bb11():
-          v65:TrueClass = RefineType v59, Truthy
-          v67:NilClass = Const Value(nil)
+          v66:TrueClass = RefineType v60, Truthy
+          v68:NilClass = Const Value(nil)
           CheckInterrupts
           Return v52
-        bb7(v75:BasicObject, v76:Fixnum):
-          v80:Array = RefineType v75, Array
-          v81:CInt64 = UnboxFixnum v76
-          v82:BasicObject = ArrayAref v80, v81
+        bb7(v76:BasicObject, v77:Fixnum):
+          v81:Array = RefineType v76, Array
+          v82:Fixnum = RefineType v77, Fixnum
+          v83:CInt64 = UnboxFixnum v82
+          v84:BasicObject = ArrayAref v81, v83
           PatchPoint NoEPEscape(each)
-          v86:CPtr = GetEP 0
-          v87:CInt64 = LoadField v86, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
-          v88:CInt64[3] = Const CInt64(3)
-          v89:CInt64 = IntAnd v87, v88
+          v88:CPtr = GetEP 0
+          v89:CInt64 = LoadField v88, :VM_ENV_DATA_INDEX_SPECVAL@0x1000
           v90:CInt64[3] = Const CInt64(3)
-          v91:CBool = IsBitEqual v89, v90
-          CondBranch v91, bb13(), bb14()
+          v91:CInt64 = IntAnd v89, v90
+          v92:CInt64[3] = Const CInt64(3)
+          v93:CBool = IsBitEqual v91, v92
+          CondBranch v93, bb13(), bb14()
         bb13():
-          v94:BasicObject = InvokeBlockIfunc v87, v82
-          Jump bb12(v94)
-        bb14():
-          v96:BasicObject = InvokeBlock v82 # SendFallbackReason: InvokeBlock: not yet specialized
+          v96:BasicObject = InvokeBlockIfunc v89, v84
           Jump bb12(v96)
-        bb12(v92:BasicObject):
+        bb14():
+          v98:BasicObject = InvokeBlock v84 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb12(v98)
+        bb12(v94:BasicObject):
           PatchPoint NoEPEscape(each)
-          v103:Fixnum[1] = Const Value(1)
-          v104:Fixnum = FixnumAdd v76, v103
+          v105:Fixnum = RefineType v77, Fixnum
+          v106:Fixnum[1] = Const Value(1)
+          v107:Fixnum = FixnumAdd v105, v106
           PatchPoint NoEPEscape(each)
-          Jump bb8(v75, v104)
+          Jump bb8(v76, v107)
         bb4(v22:BasicObject, v23:NilClass):
           v27:CPtr = LoadSP
           StoreField v27, :i@0x1001, v23
