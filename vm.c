@@ -2932,8 +2932,8 @@ vm_exec_bottom_rescue(void *context)
 }
 #endif
 
-VALUE
-vm_exec(rb_execution_context_t *ec)
+static inline VALUE
+vm_exec_with_jit(rb_execution_context_t *ec, bool jit)
 {
     VALUE result = Qundef;
 
@@ -2958,7 +2958,7 @@ vm_exec(rb_execution_context_t *ec)
 #else
     enum ruby_tag_type state;
     if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-        if (UNDEF_P(result = jit_exec(ec))) {
+        if (!jit || UNDEF_P(result = jit_exec(ec))) {
             result = vm_exec_core(ec);
         }
         /* fallback to the VM */
@@ -2972,6 +2972,22 @@ vm_exec(rb_execution_context_t *ec)
     EC_POP_TAG();
     return result;
 }
+
+VALUE
+vm_exec(rb_execution_context_t *ec)
+{
+    return vm_exec_with_jit(ec, true);
+}
+
+#if USE_ZJIT
+// Like vm_exec(), but run the current frame in the interpreter without entering its JIT code.
+// ZJIT runs a callee of JIT code with it while the callee is too cold to compile.
+VALUE
+rb_vm_exec_interpreter(rb_execution_context_t *ec)
+{
+    return vm_exec_with_jit(ec, false);
+}
+#endif
 
 static inline VALUE
 vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state,

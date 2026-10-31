@@ -215,6 +215,75 @@ fn test_function_stub_profiles_before_compiling() {
 }
 
 #[test]
+fn test_function_stub_returns_to_compiled_caller() {
+    // While a callee collects profiles, a function stub runs it in the interpreter and returns
+    // its result to the compiled caller, which keeps running the rest of its loop. Each call in
+    // the loop then hits the stub again. If the stub left the caller to the interpreter too, the
+    // rest of the loop would call the callee from the interpreter instead.
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let num_profiles = get_option!(num_profiles);
+    let call_threshold = CallThreshold::from(num_profiles) + 2;
+    set_call_threshold(call_threshold);
+
+    eval(&format!("
+        class Integer
+          def zjit_stub_return_target(x) = self + x
+        end
+
+        def zjit_stub_return_loop(n, run)
+          sum = 0
+          i = 0
+          while i < n
+            sum += run ? 1.zjit_stub_return_target(i) : i + 1
+            i += 1
+          end
+          sum
+        end
+
+        {call_threshold}.times {{ zjit_stub_return_loop(2, false) }}
+    "));
+    let target_iseq = get_method_iseq("1", "zjit_stub_return_target");
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+
+    let counters = crate::state::ZJITState::get_counters();
+    let stub_hits_before = counters.function_stub_hit_count;
+    let calls = usize::from(num_profiles) - 1;
+    assert_eq!(VALUE::fixnum_from_usize(calls * (calls + 1) / 2), eval(&format!("zjit_stub_return_loop({calls}, true)")));
+    assert_eq!(calls as u64, counters.function_stub_hit_count - stub_hits_before);
+    assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+}
+
+#[test]
+fn test_function_stub_interpreted_callee_raises_and_breaks() {
+    // Exceptions and `break` from a callee that a function stub runs in the interpreter
+    // unwind through the compiled caller.
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let num_profiles = get_option!(num_profiles);
+    let call_threshold = CallThreshold::from(num_profiles) + 2;
+    set_call_threshold(call_threshold);
+
+    assert_snapshot!(inspect(&format!(r#"
+        def zjit_stub_raise_target(x) = x == :raise ? raise("boom") : x
+        def zjit_stub_yield_target(x) = yield(x)
+
+        def zjit_stub_raise_entry(x)
+          zjit_stub_raise_target(x)
+        rescue => e
+          e.message
+        end
+
+        def zjit_stub_break_entry(x)
+          zjit_stub_yield_target(x) {{ |y| break y * 2 if y > 0; y }}
+        end
+
+        {call_threshold}.times {{ zjit_stub_raise_entry(0); zjit_stub_break_entry(0) }}
+        [zjit_stub_raise_entry(:raise), zjit_stub_raise_entry(1), zjit_stub_break_entry(3), zjit_stub_break_entry(-1)]
+    "#)), @r#"["boom", 1, 6, -1]"#);
+}
+
+#[test]
 fn test_backedges_count_toward_call_threshold() {
     rb_zjit_prepare_options();
     set_call_threshold(10);

@@ -220,6 +220,18 @@ rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
     return body->jit_entry_calls >= rb_zjit_call_threshold;
 }
 
+VALUE rb_vm_exec_interpreter(rb_execution_context_t *ec);
+
+// Run the frame of a callee that JIT code pushed for a JIT-to-JIT call in the interpreter, and
+// return the callee's result to the JIT code, which continues running the caller.
+VALUE
+rb_zjit_exec_callee_frame(rb_execution_context_t *ec)
+{
+    // Return from the interpreter when the callee returns, like VM_EXEC() does after vm_sendish()
+    VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);
+    return rb_vm_exec_interpreter(ec);
+}
+
 // The number of backward branches taken by the interpreter. See JIT_BACKEDGE().
 unsigned int rb_zjit_backedge_count = 0;
 

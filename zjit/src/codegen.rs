@@ -4463,10 +4463,12 @@ c_callable! {
                 return ZJITState::get_materialize_exit_trampoline_with_counter().raw_ptr(cb);
             }
 
-            // Exit to the interpreter until the callee ISEQ collects enough profiles.
+            // Run the callee in the interpreter until it collects enough profiles. Return its
+            // result to the caller instead of exiting the caller to the interpreter as well,
+            // which would leave the rest of the caller, e.g. a long loop, to the interpreter.
             if !unsafe { rb_zjit_iseq_has_profiled_enough(iseq) } {
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, None);
-                return ZJITState::get_materialize_exit_trampoline().raw_ptr(cb);
+                return ZJITState::get_exec_callee_trampoline().raw_ptr(cb);
             }
 
             // Otherwise, attempt to compile the ISEQ. We have to mark_all_executable() beyond this point.
@@ -4540,6 +4542,38 @@ pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
         perf::register_current_code_range(cb, "exit trampoline", code_ptr);
+        code_ptr
+    })
+}
+
+/// Generate the trampoline that a function stub jumps to in order to run the callee in the
+/// interpreter. Like the compiled callee would, it returns the callee's result to the JIT-to-JIT
+/// call, with the callee frame popped. Like HotSpot's c2i adapters, it lets compiled code call
+/// a method that has no compiled code yet without deoptimizing the caller.
+pub fn gen_exec_callee_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> {
+    unsafe extern "C" {
+        fn rb_zjit_exec_callee_frame(ec: EcPtr) -> VALUE;
+    }
+
+    let mut asm = Assembler::new();
+    asm.new_block_without_id("exec_callee_trampoline");
+    asm.frame_setup(&[]); // matching the setup in gen_entry_point()
+
+    asm_comment!(asm, "run the callee frame in the interpreter");
+    let ret = asm_ccall!(asm, rb_zjit_exec_callee_frame, EC);
+
+    // The interpreter has popped the callee frame and set ec->cfp. Pop it from CFP like gen_return().
+    asm_comment!(asm, "pop stack frame");
+    let incr_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
+    asm.mov(CFP, incr_cfp);
+
+    asm.load_into(C_RET_OPND, ret);
+    asm.frame_teardown(&[]);
+    asm.cret(C_RET_OPND);
+
+    asm.compile(cb).map(|(code_ptr, gc_offsets)| {
+        assert_eq!(gc_offsets.len(), 0);
+        perf::register_current_code_range(cb, "exec_callee trampoline", code_ptr);
         code_ptr
     })
 }
