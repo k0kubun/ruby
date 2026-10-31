@@ -367,9 +367,86 @@ rb_zjit_new_obj_shape(VALUE flags, size_t alloc_size)
     return (flags & SHAPE_FLAG_MASK) | ((VALUE)shape_id << SHAPE_FLAG_SHIFT);
 }
 
+// A cache of instance variable indexes for the reads of T_OBJECT ivars that JIT code
+// didn't specialize for the object's shape, e.g. at sites whose receivers have more shapes
+// than a guard chain covers. Like V8's megamorphic stub cache, it's a direct-mapped table
+// keyed by (shape, name), so such a read doesn't walk the shape tree every time.
+// Shapes are never freed and an ivar's index on a shape never changes, so an entry is valid
+// forever once written. It's only used while a single Ractor runs, where the GVL serializes
+// reads and writes of an entry.
+#define ZJIT_IVAR_CACHE_BITS 12
+struct zjit_ivar_cache_entry {
+    ID id;
+    shape_id_t shape_id;
+    attr_index_t index; // ATTR_INDEX_NOT_SET if the shape doesn't have the ivar
+};
+static struct zjit_ivar_cache_entry zjit_ivar_cache[1 << ZJIT_IVAR_CACHE_BITS];
+
+// Find the fields of a T_OBJECT `obj` and the index of `id` in them (ATTR_INDEX_NOT_SET if
+// unset). Return false if `obj` is not a T_OBJECT with a non-complex shape or multiple
+// Ractors are running.
+static inline bool
+zjit_obj_ivar_index(VALUE obj, ID id, VALUE *fields_obj, attr_index_t *index)
+{
+    if (SPECIAL_CONST_P(obj) || BUILTIN_TYPE(obj) != T_OBJECT || rb_multi_ractor_p()) {
+        return false;
+    }
+    *fields_obj = ROBJECT_FIELDS_OBJ(obj);
+    shape_id_t shape_id = RBASIC_SHAPE_ID(*fields_obj);
+    if (rb_shape_complex_p(shape_id)) {
+        return false;
+    }
+
+    shape_id_t read_shape_id = shape_id & SHAPE_ID_READ_ONLY_MASK;
+    // Fibonacci hashing. The low bits of an ID are its scope, so drop them.
+    uint32_t hash = (read_shape_id ^ (uint32_t)(id >> 4)) * 2654435761u;
+    struct zjit_ivar_cache_entry *entry = &zjit_ivar_cache[hash >> (32 - ZJIT_IVAR_CACHE_BITS)];
+    if (entry->id != id || entry->shape_id != read_shape_id) {
+        attr_index_t new_index;
+        if (!rb_shape_get_iv_index(shape_id, id, &new_index)) {
+            new_index = ATTR_INDEX_NOT_SET;
+        }
+        *entry = (struct zjit_ivar_cache_entry){ .id = id, .shape_id = read_shape_id, .index = new_index };
+    }
+    *index = entry->index;
+    return true;
+}
+
+// rb_ivar_get() for a read without an inline cache
+VALUE
+rb_zjit_getivar(VALUE obj, ID id)
+{
+    VALUE fields_obj;
+    attr_index_t index;
+    if (zjit_obj_ivar_index(obj, id, &fields_obj, &index)) {
+        return index == ATTR_INDEX_NOT_SET ? Qnil : rb_imemo_fields_ptr(fields_obj)[index];
+    }
+    return rb_ivar_get(obj, id);
+}
+
+VALUE rb_vm_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic);
+
+// rb_vm_getinstancevariable() that doesn't use the inline cache for T_OBJECTs. The inline
+// cache holds one shape, so it misses on every read at a site whose receivers alternate.
+VALUE
+rb_zjit_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
+{
+    VALUE fields_obj;
+    attr_index_t index;
+    if (zjit_obj_ivar_index(obj, id, &fields_obj, &index)) {
+        return index == ATTR_INDEX_NOT_SET ? Qnil : rb_imemo_fields_ptr(fields_obj)[index];
+    }
+    return rb_vm_getinstancevariable(iseq, obj, id, ic);
+}
+
 VALUE
 rb_zjit_defined_ivar(VALUE obj, ID id, VALUE pushval)
 {
+    VALUE fields_obj;
+    attr_index_t index;
+    if (zjit_obj_ivar_index(obj, id, &fields_obj, &index)) {
+        return index == ATTR_INDEX_NOT_SET ? Qnil : pushval;
+    }
     VALUE result = rb_ivar_defined(obj, id);
     return result ? pushval : Qnil;
 }

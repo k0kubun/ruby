@@ -1342,10 +1342,10 @@ fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
         gen_prepare_non_leaf_call(jit, asm, function, state);
     }
     if ic.is_null() {
-        asm_ccall!(asm, rb_ivar_get, recv, id.0.into())
+        asm_ccall!(asm, rb_zjit_getivar, recv, id.0.into())
     } else {
         let iseq = Opnd::Value(state.iseq.into());
-        asm_ccall!(asm, rb_vm_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic))
+        asm_ccall!(asm, rb_zjit_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic))
     }
 }
 

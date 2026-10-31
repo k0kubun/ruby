@@ -10466,6 +10466,31 @@ fn test_polymorphic_getivar_complex_shape() {
     "#), @"[:normal, :complex]");
 }
 
+#[test]
+fn test_getivar_megamorphic_shapes() {
+    // Receivers with more shapes than a site specializes for read their ivars through the
+    // fallback, which caches ivar indexes by shape. Each object sets the ivars in another order,
+    // so @a lives at a different index on each shape. Some have no @a, some have so many ivars
+    // that they're not embedded, and one is too complex.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        class C
+          def initialize(n)
+            n.times { |i| instance_variable_set(:"@x#{i}", i) }
+            @a = n unless n % 4 == 3
+          end
+          def a = @a
+          def a? = defined?(@a)
+        end
+        objs = 20.times.map { |n| C.new(n) }
+        complex = C.new(1)
+        1001.times { |i| complex.instance_variable_set(:"@v#{i}", i) }
+        1001.times { |i| complex.remove_instance_variable(:"@v#{i}") }
+        objs << complex
+        3.times.map { objs.map { |o| [o.a, o.a?] } }.uniq
+    "#), @r#"[[[0, "instance-variable"], [1, "instance-variable"], [2, "instance-variable"], [nil, nil], [4, "instance-variable"], [5, "instance-variable"], [6, "instance-variable"], [nil, nil], [8, "instance-variable"], [9, "instance-variable"], [10, "instance-variable"], [nil, nil], [12, "instance-variable"], [13, "instance-variable"], [14, "instance-variable"], [nil, nil], [16, "instance-variable"], [17, "instance-variable"], [18, "instance-variable"], [nil, nil], [1, "instance-variable"]]]"#);
+}
+
 /// When a method with keyword defaults contains a block that creates a lambda,
 /// the lambda causes EP escape, which globally patches NoEPEscape PatchPoints.
 /// On subsequent calls the PatchPoint side exit (which uses without_locals())
