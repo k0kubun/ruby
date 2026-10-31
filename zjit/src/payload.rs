@@ -70,6 +70,10 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// Per-call-site caches of a receiver class that the JIT code writes at run time. See
+    /// [`crate::hir::Function::klass_caches`]. Marked and moved by [`crate::gc`].
+    pub klass_caches: Vec<Box<VALUE>>,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -89,6 +93,7 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            klass_caches: vec![],
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
