@@ -30,6 +30,11 @@ impl<T: Into<usize> + Copy> BitSet<T> {
         newly_inserted
     }
 
+    /// Set all bits to 0.
+    pub fn clear(&mut self) {
+        self.entries.fill(0);
+    }
+
     /// Set all bits to 1.
     pub fn insert_all(&mut self) {
         for i in 0..self.entries.len() {
