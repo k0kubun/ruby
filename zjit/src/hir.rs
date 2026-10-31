@@ -9778,7 +9778,9 @@ impl Function {
 
     /// Dispatch an ivar access to profiled shapes. Callbacks generate the optimized access and
     /// generic fallback, optionally returning a value to pass through the join block.
-    /// When `allow_exit` is false, a shape miss takes the generic fallback instead of side-exiting.
+    /// Only a monomorphic guard side-exits on a shape miss, and only when `allow_exit` is true. A
+    /// shape chain's miss takes the generic fallback, counted by `chain_miss_counter` when exits
+    /// are allowed and by `fallback_counter` otherwise.
     fn dispatch_ivar<T: Copy>(
         &mut self,
         profiles: &[T],
@@ -9789,6 +9791,7 @@ impl Function {
         allow_exit: bool,
         no_profile_reason: SideExitReason,
         fallback_counter: Counter,
+        chain_miss_counter: Counter,
         has_result: bool,
         profile_shape: impl Fn(T) -> ShapeId,
         mut emit_optimized: impl FnMut(&mut Function, BlockId, T) -> Option<InsnId>,
@@ -9829,21 +9832,18 @@ impl Function {
         for (i, &profile) in profiles.iter().enumerate() {
             let optimized_block = self.new_block(insn_idx);
             if i == last_shape_index {
-                if !allow_exit {
-                    // If the policy doesn't allow exits, make a fallback block and jump to it if the shape doesn't match.
-                    let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
-                    let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
-                    let fallback_block = self.new_block(insn_idx);
-                    self.push_insn(block, branch(matches, optimized_block, fallback_block));
-                    self.count(fallback_block, fallback_counter);
-                    let fallback_result = emit_fallback(self, fallback_block);
-                    self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
-                } else {
-                    // If the policy allows exits, exit to the interpreter if the shape doesn't match.
-                    self.guard_shape(block, actual, profile_shape(profile), exit_id, Some(Recompile));
-                    // TODO(max): Don't make a new block in this case
-                    self.push_insn(block, Insn::Jump(edge(optimized_block)));
-                }
+                // The last arm falls through to a cold block that does the access generically
+                // instead of side-exiting, even if the policy allows exits. A receiver that
+                // misses every arm of a shape chain is not news the profiler can act on: the
+                // site is already known to be shape-polymorphic, so recompiling would rebuild
+                // the same chain out of the same buckets and exit again on the next miss.
+                let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
+                let matches = self.push_insn(block, Insn::IsBitEqual { left: actual, right: expected });
+                let fallback_block = self.new_block(insn_idx);
+                self.push_insn(block, branch(matches, optimized_block, fallback_block));
+                self.count(fallback_block, if allow_exit { chain_miss_counter } else { fallback_counter });
+                let fallback_result = emit_fallback(self, fallback_block);
+                self.push_insn(fallback_block, Insn::Jump(result_edge(join_block, fallback_result)));
             } else {
                 // If this is not the last profiled shape, let the guard jump to the next block.
                 let expected = self.push_insn(block, Insn::Const { val: Const::CShape(profile_shape(profile)) });
@@ -9881,6 +9881,7 @@ impl Function {
             allow_exit,
             SideExitReason::NoProfileGetIvar,
             fallback_counter,
+            Counter::getivar_fallback_shape_chain_miss,
             true,
             |profiled_type| profiled_type.shape(),
             |fun, block, profiled_type| Some(
@@ -9928,6 +9929,7 @@ impl Function {
             allow_exit,
             SideExitReason::NoProfileSetIvar,
             fallback_counter,
+            Counter::setivar_fallback_shape_chain_miss,
             false,
             |spec| spec.profiled_type.shape(),
             |fun, block, spec| {

@@ -337,6 +337,8 @@ make_counters! {
         setivar_fallback_no_side_exits_no_profile,
         setivar_fallback_no_profile,
         setivar_fallback_shape_miss,
+        // Runtime miss of every arm of a shape chain in a version that may side-exit
+        setivar_fallback_shape_chain_miss,
     }
 
     // Ivar fallback counters that are summed as dynamic_getivar_count
@@ -355,6 +357,8 @@ make_counters! {
         getivar_fallback_no_side_exits_no_profile,
         getivar_fallback_shape_miss,
         getivar_fallback_multi_ractor,
+        // Runtime miss of every arm of a shape chain in a version that may side-exit
+        getivar_fallback_shape_chain_miss,
     }
 
     // Ivar fallback counters that are summed as dynamic_definedivar_count
