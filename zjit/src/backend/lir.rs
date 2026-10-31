@@ -3431,46 +3431,67 @@ impl Assembler
     /// Returns (kill_sets, gen_sets) where each is indexed by block ID.
     /// - kill: VRegs defined (written) in the block
     /// - gen: VRegs used (read) in the block before being defined
-    pub fn compute_initial_liveness_sets(&self, block_ids: &[BlockId]) -> (Vec<BitSet<usize>>, Vec<BitSet<usize>>) {
+    /// Number the VRegs that some block uses before defining them (upward-exposed uses), and
+    /// compute for each block the numbered VRegs it uses before defining them (gen) and the
+    /// numbered VRegs it defines (kill). Returns the VReg index of each number, gen, and kill.
+    pub fn compute_initial_liveness_sets(&self, block_ids: &[BlockId]) -> (Vec<usize>, Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let num_blocks = self.basic_blocks.len();
-        let num_vregs = self.num_vregs;
-
-        let mut kill_sets: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
-        let mut gen_sets: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
+        const NONE: usize = usize::MAX;
+        // The last block that defined each VReg, to find uses defined in the same block
+        let mut def_block = vec![NONE; self.num_vregs];
+        // The dense number of each upward-exposed VReg
+        let mut dense_idx = vec![NONE; self.num_vregs];
+        let mut vregs: Vec<usize> = vec![];
+        let mut gen_sets: Vec<Vec<usize>> = vec![vec![]; num_blocks];
 
         for &block_id in block_ids {
             let block = &self.basic_blocks[block_id.0];
-            let kill_set = &mut kill_sets[block_id.0];
-            let gen_set = &mut gen_sets[block_id.0];
-
-            // Iterate over instructions in reverse
-            for insn in block.insns.iter().rev() {
-                // If the instruction has an output that is a VReg, add to kill set
-                if let Some(out) = insn.out_opnd() {
-                    if let Opnd::VReg { idx, .. } = out {
-                        kill_set.insert(idx.to_usize());
-                    }
+            for param in &block.parameters {
+                if let Opnd::VReg { idx, .. } = param {
+                    def_block[idx.to_usize()] = block_id.0;
                 }
+            }
+            for insn in &block.insns {
+                if let Some(Opnd::VReg { idx, .. }) = insn.out_opnd() {
+                    def_block[idx.to_usize()] = block_id.0;
+                }
+            }
 
-                // For all input operands that are VRegs (including memory base VRegs), add to gen set
+            // Uses that the block doesn't define are upward-exposed. VRegs are only used
+            // after their definition within a block.
+            let gen_set = &mut gen_sets[block_id.0];
+            for insn in &block.insns {
                 insn.for_each_operand(|opnd| {
                     for idx in opnd.vreg_ids() {
-                        assert!(!kill_set.get(idx.to_usize()));
-                        gen_set.insert(idx.to_usize());
+                        let idx = idx.to_usize();
+                        if def_block[idx] != block_id.0 {
+                            if dense_idx[idx] == NONE {
+                                dense_idx[idx] = vregs.len();
+                                vregs.push(idx);
+                            }
+                            gen_set.push(dense_idx[idx]);
+                        }
                     }
                 });
             }
-
-            // Add block parameters to kill set
-            for param in &block.parameters {
-                if let Opnd::VReg { idx, .. } = param {
-                    kill_set.insert(idx.to_usize());
-                }
-            }
-
         }
 
-        (kill_sets, gen_sets)
+        // Kill sets only need the numbered VRegs; others are never live-in anywhere.
+        let mut kill_sets: Vec<Vec<usize>> = vec![vec![]; num_blocks];
+        for &block_id in block_ids {
+            let block = &self.basic_blocks[block_id.0];
+            let kill_set = &mut kill_sets[block_id.0];
+            let params = block.parameters.iter().filter_map(|param| match param { Opnd::VReg { idx, .. } => Some(*idx), _ => None });
+            let outs = block.insns.iter().filter_map(|insn| match insn.out_opnd() { Some(Opnd::VReg { idx, .. }) => Some(*idx), _ => None });
+            for idx in params.chain(outs) {
+                let idx = dense_idx[idx.to_usize()];
+                if idx != NONE {
+                    kill_set.push(idx);
+                }
+            }
+        }
+
+        (vregs, gen_sets, kill_sets)
     }
 
     /// The order in which blocks are allocated registers and emitted: the reverse post-order,
@@ -3500,32 +3521,31 @@ impl Assembler
     }
 
     /// Calculate live intervals for each VReg.
-    pub fn build_intervals(&self, live_in: Vec<BitSet<usize>>) -> Vec<Interval> {
+    pub fn build_intervals(&self, liveness: Liveness) -> Vec<Interval> {
         let num_vregs = self.num_vregs;
         let mut intervals: Vec<Interval> = (0..num_vregs)
             .map(|i| Interval::new(i.into()))
             .collect();
 
         let blocks = self.block_order();
+        let mut live = BitSet::with_capacity(liveness.vregs.len());
 
         for block_id in blocks {
             let block = &self.basic_blocks[block_id.0];
 
             // live = union of successor.liveIn for each successor
-            let mut live = BitSet::with_capacity(num_vregs);
+            live.clear();
             for succ_id in block.successors() {
-                live.union_with(&live_in[succ_id.0]);
+                live.union_with(&liveness.live_in[succ_id.0]);
             }
 
-            // Add out_vregs to live set
-            for idx in block.out_vregs() {
-                live.insert(idx.to_usize());
-            }
-
-            // For each live vreg, add entire block range
+            // For each live vreg and each vreg passed to a successor, add entire block range.
             // block.to is the first instruction of the next block
             for idx in live.iter_set_bits() {
-                intervals[idx].add_range(block.from.0, block.to.0);
+                intervals[liveness.vregs[idx]].add_range(block.from.0, block.to.0);
+            }
+            for idx in block.out_vregs() {
+                intervals[idx.to_usize()].add_range(block.from.0, block.to.0);
             }
 
             // Iterate instructions in reverse
@@ -3554,7 +3574,7 @@ impl Assembler
     /// Analyze liveness for all blocks using a fixed-point algorithm.
     /// Returns live_in sets for each block, indexed by block ID.
     /// A VReg is live-in to a block if it may be used before being defined.
-    pub fn analyze_liveness(&self) -> Vec<BitSet<usize>> {
+    pub fn analyze_liveness(&self) -> Liveness {
         // Get blocks in postorder
         let po_blocks = {
             let entry_blocks: Vec<BlockId> = self.basic_blocks.iter()
@@ -3564,14 +3584,18 @@ impl Assembler
             self.po_from(entry_blocks)
         };
 
-        // Compute initial gen/kill sets
-        let (kill_sets, gen_sets) = self.compute_initial_liveness_sets(&po_blocks);
+        // A VReg can only be live-in to a block if some block uses it without defining it.
+        // Most VRegs are temporaries that are only used in the block that defines them, so
+        // number just the upward-exposed ones densely. This keeps the live-in sets small;
+        // sized by every VReg, they made the fixed-point iteration quadratic in function size.
+        let (vregs, gen_sets, kill_sets) = self.compute_initial_liveness_sets(&po_blocks);
 
         let num_blocks = self.basic_blocks.len();
-        let num_vregs = self.num_vregs;
+        let num_live = vregs.len();
 
         // Initialize live_in sets
-        let mut live_in: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_vregs); num_blocks];
+        let mut live_in: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_live); num_blocks];
+        let mut block_live = BitSet::with_capacity(num_live);
 
         // Fixed-point iteration
         let mut changed = true;
@@ -3583,26 +3607,47 @@ impl Assembler
                 let block = &self.basic_blocks[block_id.0];
 
                 // block_live = union of live_in[succ] for all successors
-                let mut block_live = BitSet::with_capacity(num_vregs);
+                block_live.clear();
                 for succ_id in block.successors() {
                     block_live.union_with(&live_in[succ_id.0]);
                 }
 
-                // block_live |= gen[block]
-                block_live.union_with(&gen_sets[block_id.0]);
-
                 // block_live &= ~kill[block]
-                block_live.difference_with(&kill_sets[block_id.0]);
+                for &idx in &kill_sets[block_id.0] {
+                    block_live.remove(idx);
+                }
+
+                // block_live |= gen[block]
+                for &idx in &gen_sets[block_id.0] {
+                    block_live.insert(idx);
+                }
 
                 // Update live_in if changed
                 if !live_in[block_id.0].equals(&block_live) {
-                    live_in[block_id.0] = block_live;
+                    std::mem::swap(&mut live_in[block_id.0], &mut block_live);
                     changed = true;
                 }
             }
         }
 
-        live_in
+        Liveness { live_in, vregs }
+    }
+}
+
+/// Result of [Assembler::analyze_liveness]
+pub struct Liveness {
+    /// Live-in sets for each block, indexed by block ID. Bits are indexes into `vregs`.
+    live_in: Vec<BitSet<usize>>,
+    /// VReg index of each bit in the live-in sets
+    vregs: Vec<usize>,
+}
+
+impl Liveness {
+    /// VReg indexes that are live-in to a block, in ascending order
+    pub fn live_in_vregs(&self, block: BlockId) -> Vec<usize> {
+        let mut vregs: Vec<usize> = self.live_in[block.0].iter_set_bits().map(|idx| self.vregs[idx]).collect();
+        vregs.sort_unstable();
+        vregs
     }
 }
 
@@ -4616,13 +4661,6 @@ mod tests {
         ], Some(scratch_reg()));
     }
 
-    // Helper function to convert a BitSet to a list of vreg indices
-    fn bitset_to_vreg_indices(bitset: &BitSet<usize>, num_vregs: usize) -> Vec<usize> {
-        (0..num_vregs)
-            .filter(|&idx| bitset.get(idx))
-            .collect()
-    }
-
     struct TestFunc {
         asm: Assembler,
         r10: Opnd,
@@ -4701,24 +4739,23 @@ mod tests {
     fn test_live_in() {
         let TestFunc { asm, r10, r12, r13, b1, b2, b3, b4, .. } = build_func();
 
-        let num_vregs = asm.num_vregs;
         let live_in = asm.analyze_liveness();
 
         // b1: [] - entry block, no variables are live-in
-        assert_eq!(bitset_to_vreg_indices(&live_in[b1.0], num_vregs), vec![]);
+        assert_eq!(live_in.live_in_vregs(b1), vec![]);
 
         // b2: [r10] - r10 is live-in (used in b4 which is reachable)
-        assert_eq!(bitset_to_vreg_indices(&live_in[b2.0], num_vregs), vec![r10.vreg_idx_usize()]);
+        assert_eq!(live_in.live_in_vregs(b2), vec![r10.vreg_idx_usize()]);
 
         // b3: [r10, r12, r13] - all are live-in
         assert_eq!(
-            bitset_to_vreg_indices(&live_in[b3.0], num_vregs),
+            live_in.live_in_vregs(b3),
             vec![r10.vreg_idx_usize(), r12.vreg_idx_usize(), r13.vreg_idx_usize()]
         );
 
         // b4: [r10, r12] - both are live-in
         assert_eq!(
-            bitset_to_vreg_indices(&live_in[b4.0], num_vregs),
+            live_in.live_in_vregs(b4),
             vec![r10.vreg_idx_usize(), r12.vreg_idx_usize()]
         );
     }
