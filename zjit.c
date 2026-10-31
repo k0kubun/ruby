@@ -27,6 +27,7 @@
 #include "ractor_core.h"
 #include "shape.h"
 #include "eval_intern.h"
+#include "id_table.h"
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -290,6 +291,26 @@ bool
 rb_zjit_singleton_class_p(VALUE klass)
 {
     return RCLASS_SINGLETON_P(klass);
+}
+
+// Return the method entry for the Symbol `mid_sym` cached on the class of `recv`, or NULL if the class's method
+// cache doesn't have a valid one. Unlike rb_callable_method_entry(), this never fills the cache,
+// so it never allocates or takes the VM lock. JIT code calls it to check the callee of a call site
+// whose receiver classes vary but which always calls the same method.
+const rb_callable_method_entry_t *
+rb_zjit_cached_cme(VALUE recv, VALUE mid_sym)
+{
+    ID mid = rb_sym2id(mid_sym);
+    VALUE klass = CLASS_OF(recv);
+    VALUE cc_tbl = RUBY_ATOMIC_VALUE_LOAD(RCLASS_WRITABLE_CC_TBL(klass));
+    VALUE ccs_data;
+    if (cc_tbl && rb_managed_id_table_lookup(cc_tbl, mid, &ccs_data)) {
+        const struct rb_class_cc_entries *ccs = (const struct rb_class_cc_entries *)ccs_data;
+        if (LIKELY(!METHOD_ENTRY_INVALIDATED(ccs->cme))) {
+            return ccs->cme;
+        }
+    }
+    return NULL;
 }
 
 /* Sets all of the required shape flags for the object including the layout type,
