@@ -52,6 +52,11 @@ impl<T: Into<usize> + Copy> BitSet<T> {
         was_set
     }
 
+    /// The number of bits in the set
+    pub fn len(&self) -> usize {
+        self.num_bits
+    }
+
     pub fn get(&self, idx: T) -> bool {
         let entry_idx = idx.into() / ENTRY_NUM_BITS;
         let bit_idx = idx.into() % ENTRY_NUM_BITS;

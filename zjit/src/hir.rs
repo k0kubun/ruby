@@ -10634,7 +10634,8 @@ pub struct FrameState {
     locals: Vec<InsnId>,
     /// The subset of locals that are already in frame memory prior to a safepoint, established by
     /// [`Function::spill_locals`]. Predominantly used for with-block sends for locals
-    /// syntactically accessed within the block.
+    /// syntactically accessed within the block. Empty (and not allocated) when there's none,
+    /// since FrameStates are cloned for every Snapshot.
     spilled_locals: LocalSet,
 
     /// `InsnId` of the caller's post-send `Snapshot` for inlined frames; `None`
@@ -10732,8 +10733,9 @@ impl FrameState {
         self.locals.iter()
     }
 
-    pub fn spilled_locals(&self) -> &LocalSet {
-        &self.spilled_locals
+    /// Whether the local at `local_idx` is in [`field@FrameState::spilled_locals`]
+    pub fn local_spilled(&self, local_idx: usize) -> bool {
+        local_idx < self.spilled_locals.len() && self.spilled_locals.get(local_idx)
     }
 
     /// Push a stack operand
