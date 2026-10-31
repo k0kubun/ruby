@@ -141,6 +141,13 @@ fn iseq_mark(payload: &IseqPayload) {
                 rb_gc_mark_movable(object);
             }
         }
+
+        // Mark the classes cached by the JIT code
+        for klass_cache in unsafe { version.as_ref() }.klass_caches.iter() {
+            if **klass_cache != Qfalse {
+                unsafe { rb_gc_mark_movable(**klass_cache); }
+            }
+        }
     }
 }
 
@@ -178,6 +185,13 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
         let new_iseq = unsafe { rb_gc_location(VALUE(old_iseq as usize)) }.0 as IseqPtr;
         if old_iseq != new_iseq {
             iseq_call.iseq.set(new_iseq);
+        }
+    }
+
+    // Move the classes cached by the JIT code
+    for klass_cache in unsafe { version.as_mut() }.klass_caches.iter_mut() {
+        if **klass_cache != Qfalse {
+            **klass_cache = unsafe { rb_gc_location(**klass_cache) };
         }
     }
 
