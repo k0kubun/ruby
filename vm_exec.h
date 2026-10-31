@@ -165,6 +165,20 @@ default:                        \
     } \
 } while (0)
 
+// Count a backward branch taken by the interpreter toward compiling the current ISEQ, so that an
+// ISEQ that is called rarely but runs a long loop gets compiled for its next call. To keep the
+// interpreter cheap, only every ZJIT_BACKEDGE_INTERVAL-th backward branch is counted.
+#if USE_ZJIT
+#define ZJIT_BACKEDGE_INTERVAL 256
+#define JIT_BACKEDGE(dst) do { \
+    if ((dst) < 0 && rb_zjit_compiling_p && ++rb_zjit_backedge_count % ZJIT_BACKEDGE_INTERVAL == 0) { \
+        rb_zjit_iseq_backedge(GET_ISEQ()); \
+    } \
+} while (0)
+#else
+#define JIT_BACKEDGE(dst) ((void)0)
+#endif
+
 // Run the JIT from the interpreter
 #define JIT_EXEC(ec, val) do { \
     /* don't run tailcalls since that breaks FINISH */ \
