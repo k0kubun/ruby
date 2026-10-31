@@ -295,6 +295,12 @@ pub enum ShapeLayout {
 
 pub const INVALID_SHAPE_ID: ShapeId = ShapeId(rb_invalid_shape_id);
 
+/// The attr_index_t of an inline cache entry for an ivar that a shape doesn't have. See shape.h.
+pub const ATTR_INDEX_NOT_SET: attr_index_t = attr_index_t::MAX;
+
+/// The value of an ivar inline cache entry that no instruction has filled yet. See shape.h.
+pub const IVAR_CACHE_INIT: u64 = u64::MAX;
+
 impl ShapeId {
     pub fn is_valid(self) -> bool {
         self != INVALID_SHAPE_ID
