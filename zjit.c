@@ -218,6 +218,28 @@ rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
     return body->jit_entry_calls >= rb_zjit_call_threshold;
 }
 
+// The number of backward branches taken by the interpreter. See JIT_BACKEDGE().
+unsigned int rb_zjit_backedge_count = 0;
+
+// Count a sampled backward branch of an interpreted ISEQ like a call to it, so that an ISEQ
+// entered rarely but looping a lot, e.g. a block called once per request that walks a large
+// Array, doesn't need call-threshold separate calls to get compiled. Like a call, it enables
+// profiling at the profile threshold, which profiles the rest of the loop. It stops one short
+// of the call threshold, so that the next call compiles the ISEQ: ZJIT can't enter the compiled
+// code in the middle of the running loop.
+void
+rb_zjit_iseq_backedge(const rb_iseq_t *iseq)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    if (body->jit_entry != NULL || body->jit_entry_calls + 1 >= rb_zjit_call_threshold) {
+        return;
+    }
+    body->jit_entry_calls++;
+    if (body->jit_entry_calls == rb_zjit_profile_threshold) {
+        rb_zjit_profile_enable(iseq);
+    }
+}
+
 // Convert a given ISEQ's ZJIT instructions to bare instructions
 void
 rb_zjit_profile_disable(const rb_iseq_t *iseq)
