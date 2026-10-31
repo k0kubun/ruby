@@ -11304,6 +11304,62 @@ fn test_attr_reader_shape_miss_on_final_version() {
 }
 
 #[test]
+fn test_ivar_inline_cache_on_final_version() {
+    // A final version takes the generic ivar access for shapes it didn't profile, which
+    // checks the instruction's inline cache. Run it on embedded objects with shapes the
+    // profile didn't see, an object with heap fields, an unset ivar, a frozen object,
+    // and receivers with other layouts, alternating shapes so the cache misses too.
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_max_versions(2);
+    let result = inspect(r#"
+        module FinalIvarICMethods
+          def get(x) = [@foo, x.succ]
+          def set(v, x) = [(@foo = v), x.succ]
+        end
+        class FinalIvarIC
+          include FinalIvarICMethods
+          def initialize(foo) = @foo = foo
+        end
+
+        obj = FinalIvarIC.new(1)
+        obj.get(1); obj.get(1); obj.set(1, 1); obj.set(1, 1)          # compile v1
+        obj.get("a"); obj.get("a"); obj.set(1, "a"); obj.set(1, "a")  # invalidate v1, compile the final version
+
+        other = FinalIvarIC.allocate
+        other.instance_variable_set(:@bar, 2)
+        other.instance_variable_set(:@foo, 3)
+        heap = FinalIvarIC.allocate
+        20.times { |i| heap.instance_variable_set(:"@a#{i}", i) }
+        heap.instance_variable_set(:@foo, 4)
+        unset = FinalIvarIC.allocate
+        frozen = FinalIvarIC.new(5).freeze
+        str = +"str"
+        str.instance_variable_set(:@foo, 6)
+        klass = Class.new
+        klass.instance_variable_set(:@foo, 7)
+        get = FinalIvarICMethods.instance_method(:get)
+        set = FinalIvarICMethods.instance_method(:set)
+
+        result = []
+        2.times do
+          [obj, other, heap, unset, frozen, other, other].each { |o| result << o.get("a") }
+          [str, klass].each { |o| result << get.bind_call(o, "a") }
+        end
+        [other, heap, unset, other, obj].each_with_index { |o, i| result << o.set(i, "a") << o.get("a") }
+        [str, klass].each { |o| result << set.bind_call(o, :s, "a") << get.bind_call(o, "a") }
+        result << begin; frozen.set(8, "a"); rescue FrozenError; :frozen; end
+        result << frozen.get("a")
+        result
+    "#);
+    set_max_versions(old_max_versions);
+    set_call_threshold(old_call_threshold);
+    assert_snapshot!(result, @r#"[[1, "b"], [3, "b"], [4, "b"], [nil, "b"], [5, "b"], [3, "b"], [3, "b"], [6, "b"], [7, "b"], [1, "b"], [3, "b"], [4, "b"], [nil, "b"], [5, "b"], [3, "b"], [3, "b"], [6, "b"], [7, "b"], [0, "b"], [0, "b"], [1, "b"], [1, "b"], [2, "b"], [2, "b"], [3, "b"], [3, "b"], [4, "b"], [4, "b"], [:s, "b"], [:s, "b"], [:s, "b"], [:s, "b"], :frozen, [5, "b"]]"#);
+}
+
+#[test]
 fn test_float_arithmetic() {
     set_call_threshold(1);
     assert_snapshot!(assert_compiles_allowing_exits("def test = 1.5 + 2.5; test"), @"4.0");

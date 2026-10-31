@@ -878,7 +878,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::GetConstantPath { ic, state } => gen_get_constant_path(jit, asm, function, *ic, &function.frame_state(*state)),
         Insn::GetClassVar { id, ic, state } => gen_getclassvar(jit, asm, function, *id, *ic, &function.frame_state(*state)),
         Insn::SetClassVar { id, val, ic, state } => no_output!(gen_setclassvar(jit, asm, function, *id, opnd!(val), *ic, &function.frame_state(*state))),
-        Insn::SetIvar { self_val, id, ic, val, state } => no_output!(gen_setivar(jit, asm, function, opnd!(self_val), *id, *ic, opnd!(val), &function.frame_state(*state))),
+        Insn::SetIvar { self_val, id, ic, val, state } => no_output!(gen_setivar(jit, asm, function, *self_val, opnd!(self_val), *id, *ic, *val, opnd!(val), &function.frame_state(*state))),
         Insn::FixnumBitCheck { val, index } => gen_fixnum_bit_check(asm, opnd!(val), *index),
         Insn::SideExit { state, reason, recompile } => no_output!(gen_side_exit(jit, asm, function, reason, *recompile, &function.frame_state(*state))),
         Insn::PutSpecialObject { value_type, state } => gen_putspecialobject(jit, asm, function, *value_type, &function.frame_state(*state)),
@@ -1346,15 +1346,85 @@ fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
     }
     if ic.is_null() {
         asm_ccall!(asm, rb_zjit_getivar, recv, id.0.into())
+    } else if function.type_of(recv_id).is_subtype(types::HeapBasicObject) && ivar_inline_cache_filled(ic) {
+        gen_getivar_on_inline_cache(jit, asm, recv, id, ic, state)
     } else {
         let iseq = Opnd::Value(state.iseq.into());
         asm_ccall!(asm, rb_zjit_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic))
     }
 }
 
+/// Return true if the instruction of an ivar inline cache has run, so checking the cache in
+/// JIT code may pay off. A cache that is still unset means the instruction is cold: its
+/// final version wasn't even profiled, so we only emit the C call, which is less code.
+fn ivar_inline_cache_filled(ic: *const iseq_inline_iv_cache_entry) -> bool {
+    unsafe { (*ic).value != IVAR_CACHE_INIT }
+}
+
+/// Read an ivar of a heap object that the profiled shapes didn't cover. Like the
+/// interpreter's getinstancevariable, check the shape cached in the instruction's
+/// inline cache and load the field directly on a hit. The cache only holds shapes of
+/// objects whose fields are embedded (T_OBJECT, SHAPE_ID_LAYOUT_ROBJECT), so a hit
+/// implies that layout. A miss calls rb_vm_getinstancevariable(), which refills the cache.
+fn gen_getivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, state: &FrameState) -> Opnd {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let hit_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let miss_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let hit_edge = Target::Block(Box::new(lir::BranchEdge { target: hit_block, args: vec![] }));
+    let miss_edge = Target::Block(Box::new(lir::BranchEdge { target: miss_block, args: vec![] }));
+    let result_edge = |val| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![val] }));
+
+    asm_comment!(asm, "getivar on inline cache");
+    let recv = asm.load_mem(recv);
+    // The shape that the cache compares: RBASIC_SHAPE_ID_FOR_READ() plus the layout bits,
+    // which are 0 (SHAPE_ID_LAYOUT_ROBJECT) for an object with embedded fields.
+    let shape_id = asm.load(Opnd::mem(32, recv, unsafe { rb_shape_id_offset() })).with_num_bits(64);
+    let shape_id = asm.and(shape_id, Opnd::UImm((SHAPE_ID_OFFSET_MASK | SHAPE_ID_FL_COMPLEX | SHAPE_ID_LAYOUT_MASK) as u64));
+    // See rb_getivar_cache: the attr_index_t is in the low byte and the shape offset
+    // in the high 32 bits. An unset cache has all bits set, which no shape matches.
+    let ic_ptr = asm.load(Opnd::const_ptr(ic));
+    let cache = asm.load(Opnd::mem(64, ic_ptr, 0));
+    let cached_shape = asm.urshift(cache, Opnd::UImm(32));
+    asm.cmp(shape_id, cached_shape);
+    asm.jne(jit, miss_edge.clone());
+    // ATTR_INDEX_NOT_SET means the ivar is not set on this shape: let the miss path return nil.
+    let index = asm.and(cache, Opnd::UImm(attr_index_t::MAX as u64));
+    asm.cmp(index, Opnd::UImm(ATTR_INDEX_NOT_SET as u64));
+    asm.je(jit, miss_edge);
+    asm.jmp(hit_edge);
+
+    asm.set_current_block(hit_block);
+    let label = jit.get_label(asm, hit_block, hir_block_id);
+    asm.write_label(label);
+    let field_offset = asm.lshift(index, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let field_ptr = asm.add(recv, field_offset);
+    let val = asm.load(Opnd::mem(VALUE_BITS, field_ptr, ROBJECT_OFFSET_AS_ARY as i32));
+    asm.jmp(result_edge(val));
+
+    asm.set_current_block(miss_block);
+    let label = jit.get_label(asm, miss_block, hir_block_id);
+    asm.write_label(label);
+    let iseq = Opnd::Value(state.iseq.into());
+    let val = asm_ccall!(asm, rb_vm_getinstancevariable, iseq, recv, id.0.into(), Opnd::const_ptr(ic));
+    asm.jmp(result_edge(val));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
+}
+
 /// Emit an uncached instance variable store
-fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val: Opnd, state: &FrameState) {
+fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv_id: InsnId, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val_id: InsnId, val: Opnd, state: &FrameState) {
     gen_trace_fallback(asm, "setivar");
+    if !ic.is_null() && function.type_of(recv_id).is_subtype(types::HeapBasicObject) && ivar_inline_cache_filled(ic) {
+        gen_setivar_on_inline_cache(jit, asm, function, recv, id, ic, val, function.type_of(val_id), state);
+        return;
+    }
     // Setting an ivar can raise FrozenError, so we need proper frame state for exception handling.
     gen_prepare_non_leaf_call(jit, asm, function, state);
     if ic.is_null() {
@@ -1363,6 +1433,65 @@ fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
         let iseq = Opnd::Value(state.iseq.into());
         asm_ccall!(asm, rb_vm_setinstancevariable, iseq, recv, id.0.into(), val, Opnd::const_ptr(ic));
     }
+}
+
+/// Write an ivar of a heap object that the profiled shapes didn't cover. Like the
+/// interpreter's setinstancevariable, check the inline cache and store the field directly
+/// when the cache holds the object's shape without a shape transition. The cache only holds
+/// unfrozen shapes, and the layout bits make a hit imply embedded T_OBJECT fields. Other
+/// cases call rb_vm_setinstancevariable(), which handles transitions and refills the cache.
+fn gen_setivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val: Opnd, val_type: Type, state: &FrameState) {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let hit_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let miss_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let hit_edge = Target::Block(Box::new(lir::BranchEdge { target: hit_block, args: vec![] }));
+    let miss_edge = Target::Block(Box::new(lir::BranchEdge { target: miss_block, args: vec![] }));
+    let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+
+    asm_comment!(asm, "setivar on inline cache");
+    let recv = asm.load_mem(recv);
+    // See rb_setivar_cache_revalidate(): the cache compares shape_id & SHAPE_ID_WRITE_MASK,
+    // which keeps the frozen bit. Also keep the layout bits, which are 0 for embedded fields.
+    let shape_id = asm.load(Opnd::mem(32, recv, unsafe { rb_shape_id_offset() })).with_num_bits(64);
+    let shape_id = asm.and(shape_id, Opnd::UImm((SHAPE_ID_OFFSET_MASK | SHAPE_ID_FL_COMPLEX | SHAPE_ID_FL_FROZEN | SHAPE_ID_LAYOUT_MASK) as u64));
+    // See rb_setivar_cache_pack(): the attr_index_t is in the low byte, followed by the
+    // source and the destination shape offsets.
+    let ic_ptr = asm.load(Opnd::const_ptr(ic));
+    let cache = asm.load(Opnd::mem(64, ic_ptr, 0));
+    let source_shape = asm.urshift(cache, Opnd::UImm(attr_index_t::BITS as u64));
+    let source_shape = asm.and(source_shape, Opnd::UImm(SHAPE_ID_OFFSET_MASK as u64));
+    asm.cmp(shape_id, source_shape);
+    asm.jne(jit, miss_edge.clone());
+    // Shape transitions take the miss path.
+    let dest_shape = asm.urshift(cache, Opnd::UImm((attr_index_t::BITS + SHAPE_ID_OFFSET_MASK.count_ones()) as u64));
+    asm.cmp(shape_id, dest_shape);
+    asm.jne(jit, miss_edge);
+    asm.jmp(hit_edge);
+
+    asm.set_current_block(hit_block);
+    let label = jit.get_label(asm, hit_block, hir_block_id);
+    asm.write_label(label);
+    let index = asm.and(cache, Opnd::UImm(attr_index_t::MAX as u64));
+    let field_offset = asm.lshift(index, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let field_ptr = asm.add(recv, field_offset);
+    asm.store(Opnd::mem(VALUE_BITS, field_ptr, ROBJECT_OFFSET_AS_ARY as i32), val);
+    gen_write_barrier(jit, asm, recv, val, val_type);
+    asm.jmp(result_edge());
+
+    asm.set_current_block(miss_block);
+    let label = jit.get_label(asm, miss_block, hir_block_id);
+    asm.write_label(label);
+    // Setting an ivar can raise FrozenError, so we need proper frame state for exception handling.
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    let iseq = Opnd::Value(state.iseq.into());
+    asm_ccall!(asm, rb_vm_setinstancevariable, iseq, recv, id.0.into(), val, Opnd::const_ptr(ic));
+    asm.jmp(result_edge());
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
 }
 
 fn gen_getclassvar(jit: &mut JITState, asm: &mut Assembler, function: &Function, id: ID, ic: *const iseq_inline_cvar_cache_entry, state: &FrameState) -> Opnd {
