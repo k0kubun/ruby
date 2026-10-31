@@ -606,10 +606,14 @@ pub fn write_barrier(iseq: IseqPtr, range: &Range<u32>) {
 /// Mark objects referenced by the descriptors of an ISEQ version
 pub fn mark(range: &Range<u32>) {
     let table = read_table();
+    // Consecutive descriptors mostly have the same ISEQ, so skip an object that was
+    // just marked.
+    let mut last_object = VALUE(0);
     ExitDescriptorTable::each_object_field(table.bytes.as_ptr().cast_mut(), range, |field| {
         let object = VALUE(unsafe { field.read_unaligned() } as usize);
-        if object != VALUE(0) {
+        if object != VALUE(0) && object != last_object {
             unsafe { rb_gc_mark_movable(object) };
+            last_object = object;
         }
     });
 }
