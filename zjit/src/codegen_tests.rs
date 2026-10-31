@@ -7499,6 +7499,33 @@ fn test_send_on_method_entry_for_unprofiled_subclasses() {
 }
 
 #[test]
+fn test_send_on_method_entry_cfunc() {
+    assert_snapshot!(inspect("
+        class Base; end
+        CLASSES = 8.times.map { Class.new(Base) }
+        def eq(k) = k == Base
+        def isa(o) = o.is_a?(Base)
+        def resp(o) = o.respond_to?(:foo, true)
+        eq(CLASSES[0]); eq(CLASSES[1]); isa(CLASSES[0].new); isa(CLASSES[1].new); resp(CLASSES[0].new); resp(CLASSES[1].new)
+        r = CLASSES.map { [eq(it), isa(it.new), resp(it.new)] }
+        CLASSES[4].define_method(:is_a?) { |_| :custom }
+        r + [eq(Base), isa(CLASSES[4].new), isa(CLASSES[5].new), isa(Object.new)]
+    "), @"[[false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], true, :custom, true, false]");
+}
+
+#[test]
+fn test_send_on_method_entry_inlined_cfunc_gets_owner_type() {
+    assert_snapshot!(inspect("
+        class S1 < String; end
+        class S2 < String; end
+        def test(s) = s.byteslice(0, 2)
+        strs = ['abc', S1.new('def'), S2.new('ghi')]
+        r = strs.map { test(it) } + strs.map { test(it) }
+        r + [test(S2.new('xyz')), test(Class.new(String).new('uvw'))]
+    "), @r#"["ab", "de", "gh", "ab", "de", "gh", "xy", "uv"]"#);
+}
+
+#[test]
 fn test_send_on_method_entry_respects_visibility() {
     assert_snapshot!(inspect("
         class Base
