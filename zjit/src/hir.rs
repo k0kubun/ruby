@@ -4991,7 +4991,7 @@ impl Function {
         while unsafe { get_cme_def_type(cme) } == VM_METHOD_TYPE_ALIAS {
             cme = unsafe { rb_aliased_callable_method_entry(cme) };
         }
-        enum Target { Iseq(IseqPtr, SendDirectCall), Ivar(ID) }
+        enum Target { Iseq(IseqPtr, SendDirectCall), Ivar(ID), Cfunc }
         let target = match unsafe { get_cme_def_type(cme) } {
             VM_METHOD_TYPE_ISEQ => {
                 let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
@@ -5013,6 +5013,13 @@ impl Function {
                 Target::Iseq(iseq, call)
             }
             VM_METHOD_TYPE_IVAR if !has_block && args.is_empty() => Target::Ivar(unsafe { get_cme_def_body_attr_id(cme) }),
+            VM_METHOD_TYPE_CFUNC if !unspecializable_c_call_type(flags) && !unsafe { rb_zjit_method_tracing_currently_enabled() } => {
+                let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(cme)) };
+                if cfunc_argc != -1 && cfunc_argc as usize != args.len() {
+                    return None;
+                }
+                Target::Cfunc
+            }
             _ => return None,
         };
 
@@ -5051,6 +5058,7 @@ impl Function {
                 self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block })))
             }
             Target::Ivar(id) => self.push_insn(call_block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state }),
+            Target::Cfunc => self.emit_cfunc_call_on_method_entry(call_block, recv, cd, cme, send_block, args, state),
         };
         self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
 
@@ -5063,6 +5071,46 @@ impl Function {
         self.insn_types[result] = types::BasicObject;
         self.make_equal_to(insn_id, result);
         Some(join_block)
+    }
+
+    /// Call the C method `cme` for a receiver whose class is only known to resolve to it.
+    fn emit_cfunc_call_on_method_entry(&mut self, block: BlockId, recv: InsnId, cd: *const rb_call_data, cme: *const rb_callable_method_entry_t, send_block: Option<BlockHandler>, args: &[InsnId], state: InsnId) -> InsnId {
+        let cfunc = unsafe { get_cme_def_body_cfunc(cme) };
+        let cfunc_argc = unsafe { get_mct_argc(cfunc) };
+        let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
+        let name = unsafe { (*cme).called_id };
+        let props = ZJITState::get_method_annotations().get_cfunc_properties(cme).unwrap_or_default();
+        let no_block = send_block.is_none();
+        let elidable = no_block && props.elidable;
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoTracePoint, state });
+        if no_block {
+            // Annotated methods check the types they depend on. The receiver is an instance of a
+            // class that resolves to `cme`, as a profiled receiver would be.
+            let tmp_block = self.new_block(u32::MAX);
+            if let Some(replacement) = (props.inline)(self, tmp_block, recv, args, state) {
+                let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
+                self.blocks[block].insns.extend(insns);
+                self.remove_block(tmp_block);
+                if self.type_of(replacement).bit_equal(types::Any) {
+                    self.insn_types[replacement] = self.infer_type(replacement);
+                }
+                return replacement;
+            }
+            if props.leaf && props.no_gc {
+                let owner = unsafe { (*cme).owner };
+                let ccall = self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args: args.to_vec(), name, owner, return_type: props.return_type, elidable });
+                self.insn_types[ccall] = self.infer_type(ccall);
+                return ccall;
+            }
+        }
+        let call = if cfunc_argc == -1 {
+            Insn::CCallVariadic(Box::new(CCallVariadicData { cfunc: cfunc_ptr, recv, args: args.to_vec(), cme, name, state, return_type: props.return_type, elidable, block: send_block }))
+        } else {
+            Insn::CCallWithFrame(Box::new(CCallWithFrameData { cd, cfunc: cfunc_ptr, recv, args: args.to_vec(), cme, name, state, return_type: props.return_type, elidable, block: send_block }))
+        };
+        let ccall = self.push_insn(block, call);
+        self.insn_types[ccall] = self.infer_type(ccall);
+        ccall
     }
 
     fn try_specialize_send_name(

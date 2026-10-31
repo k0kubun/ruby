@@ -7232,6 +7232,21 @@ fn test_send_on_method_entry_for_unprofiled_subclasses() {
 }
 
 #[test]
+fn test_send_on_method_entry_cfunc() {
+    assert_snapshot!(inspect("
+        class Base; end
+        CLASSES = 8.times.map { Class.new(Base) }
+        def eq(k) = k == Base
+        def isa(o) = o.is_a?(Base)
+        def resp(o) = o.respond_to?(:foo, true)
+        eq(CLASSES[0]); eq(CLASSES[1]); isa(CLASSES[0].new); isa(CLASSES[1].new); resp(CLASSES[0].new); resp(CLASSES[1].new)
+        r = CLASSES.map { [eq(it), isa(it.new), resp(it.new)] }
+        CLASSES[4].define_method(:is_a?) { |_| :custom }
+        r + [eq(Base), isa(CLASSES[4].new), isa(CLASSES[5].new), isa(Object.new)]
+    "), @"[[false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], [false, true, false], true, :custom, true, false]");
+}
+
+#[test]
 fn test_send_on_method_entry_respects_visibility() {
     assert_snapshot!(inspect("
         class Base
