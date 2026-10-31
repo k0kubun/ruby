@@ -2486,7 +2486,13 @@ unsafe extern "C" {
     );
     pub fn rb_zjit_print_exception();
     pub fn rb_zjit_singleton_class_p(klass: VALUE) -> bool;
-    pub fn rb_zjit_cached_cme(recv: VALUE, mid_sym: VALUE) -> *const rb_callable_method_entry_t;
+    pub fn rb_zjit_cached_cme(
+        recv: VALUE,
+        mid_sym: VALUE,
+        klass_cache: *mut VALUE,
+        cache_owner: VALUE,
+        expected_cme: *const rb_callable_method_entry_t,
+    ) -> *const rb_callable_method_entry_t;
     pub fn rb_zjit_defined_ivar(obj: VALUE, id: ID, pushval: VALUE) -> VALUE;
     pub fn rb_zjit_method_tracing_currently_enabled() -> bool;
     pub fn rb_zjit_iseq_tracing_currently_enabled() -> bool;

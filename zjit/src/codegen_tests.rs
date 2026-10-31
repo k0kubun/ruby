@@ -7232,6 +7232,29 @@ fn test_send_on_method_entry_for_unprofiled_subclasses() {
 }
 
 #[test]
+fn test_send_on_method_entry_cached_class() {
+    // The site caches the last unprofiled class that resolved to the method. A redefinition in
+    // the cached class, a compaction that moves it, and immediates must all be handled.
+    assert_snapshot!(inspect("
+        class Base
+          def foo = 1
+        end
+        class Integer
+          def foo = 2
+        end
+        CLASSES = 8.times.map { Class.new(Base) }
+        def test(o) = o.foo
+        test(CLASSES[0].new); test(CLASSES[1].new)
+        r = CLASSES.map { [test(it.new), test(it.new)] }
+        r << test(3)
+        CLASSES[7].class_eval { def foo = 3 }
+        r << test(CLASSES[7].new)
+        GC.verify_compaction_references(expand_heap: true, toward: :empty) rescue nil
+        r << [test(CLASSES[6].new), test(CLASSES[6].new), test(4)]
+    "), @"[[1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], 2, 3, [1, 1, 2]]");
+}
+
+#[test]
 fn test_send_on_method_entry_cfunc() {
     assert_snapshot!(inspect("
         class Base; end

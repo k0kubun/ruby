@@ -443,6 +443,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
 
     // Prepare for GC
     unsafe { version.as_mut() }.outgoing.extend(iseq_calls);
+    unsafe { version.as_mut() }.klass_caches.extend(function.klass_caches.take());
     append_gc_offsets(iseq, version, &gc_offsets);
     Ok(iseq_code_ptrs)
 }
@@ -3410,6 +3411,12 @@ fn gen_cond_branch_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::O
     } else if ty.is_immediate() {
         // All immediate types' guard should have been handled above
         panic!("unexpected immediate guard type: {ty}");
+    } else if ty.bit_equal(types::HeapBasicObject) {
+        // Neither an immediate nor Qfalse
+        asm.test(val, (RUBY_IMMEDIATE_MASK as u64).into());
+        asm.jnz(jit, false_target.clone());
+        asm.cmp(val, Qfalse.into());
+        lir::Insn::Jne
     } else if let Some(expected_class) = ty.runtime_exact_ruby_class() {
         // If val isn't in a register, load it to use it as the base of Opnd::mem later.
         // TODO: Max thinks codegen should not care about the shapes of the operands except to create them. (Shopify/ruby#685)

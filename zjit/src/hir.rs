@@ -927,6 +927,8 @@ pub enum FieldName {
     VM_ENV_DATA_INDEX_SPECVAL,
     VM_ENV_DATA_INDEX_FLAGS,
     RBASIC_FLAGS,
+    RBASIC_KLASS,
+    klass_cache,
     code_iseq,
     captured_self,
     shape_id,
@@ -3151,6 +3153,10 @@ pub struct Function {
     inline_frames: HashMap<InsnId, InlineFrame>,
     /// The number of times `inline_methods` has run on this function
     inline_pass: usize,
+    /// Per-call-site caches of the last receiver class found to resolve to the method entry
+    /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
+    /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
+    pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
 }
 
 /// An inlined method or block frame. The inliner records these so that inlining a block
@@ -3490,6 +3496,7 @@ impl Function {
             num_instructions: 0,
             inline_frames: HashMap::new(),
             inline_pass: 0,
+            klass_caches: Default::default(),
         }
     }
 
@@ -5056,22 +5063,50 @@ impl Function {
         let klass = summary.bucket(0).class();
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
         let mid_opnd = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { rb_id2sym(mid) }) });
-        let recv_cme = self.push_insn(block, Insn::CCall {
+        // Qfalse is never the class of an object, so a new cache misses.
+        let klass_cache = Box::new(Qfalse);
+        let klass_cache_opnd = self.push_insn(block, Insn::Const { val: Const::CPtr(&*klass_cache as *const VALUE as *const u8) });
+        self.klass_caches.borrow_mut().push(klass_cache);
+        let cache_owner = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(self.iseq)) });
+        let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
+        let call_block = self.new_block(u32::MAX);
+        let miss_block = self.new_block(u32::MAX);
+        let join_block = self.new_block(u32::MAX);
+        let lookup_block = self.new_block(u32::MAX);
+
+        // Check the cached class inline, so a hit makes no call. Immediates, which have no
+        // class pointer to load, check it in rb_zjit_cached_cme().
+        let mut cache_block = block;
+        if !self.type_of(recv).is_subtype(types::HeapBasicObject) {
+            cache_block = self.new_block(u32::MAX);
+            self.push_insn(block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+                val: recv,
+                expected: types::HeapBasicObject,
+                if_true: BranchEdge { target: cache_block, args: vec![] },
+                if_false: BranchEdge { target: lookup_block, args: vec![] },
+            })));
+        }
+        let recv_klass = self.load_field(cache_block, recv, FieldName::RBASIC_KLASS, RUBY_OFFSET_RBASIC_KLASS, types::CUInt64);
+        let cached_klass = self.load_field(cache_block, klass_cache_opnd, FieldName::klass_cache, 0, types::CUInt64);
+        let is_cached = self.push_insn(cache_block, Insn::IsBitEqual { left: recv_klass, right: cached_klass });
+        self.push_insn(cache_block, Insn::CondBranch {
+            val: is_cached,
+            if_true: BranchEdge { target: call_block, args: vec![] },
+            if_false: BranchEdge { target: lookup_block, args: vec![] },
+        });
+
+        let recv_cme = self.push_insn(lookup_block, Insn::CCall {
             cfunc: rb_zjit_cached_cme as *const u8,
             recv,
-            args: vec![mid_opnd],
+            args: vec![mid_opnd, klass_cache_opnd, cache_owner, expected_cme],
             name: ID!(rb_zjit_cached_cme),
             owner: Qnil,
             // A method entry, or 0 if the class doesn't have it cached
             return_type: types::RubyValue,
             elidable: false,
         });
-        let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
-        let is_expected = self.push_insn(block, Insn::IsBitEqual { left: recv_cme, right: expected_cme });
-        let call_block = self.new_block(u32::MAX);
-        let miss_block = self.new_block(u32::MAX);
-        let join_block = self.new_block(u32::MAX);
-        self.push_insn(block, Insn::CondBranch {
+        let is_expected = self.push_insn(lookup_block, Insn::IsBitEqual { left: recv_cme, right: expected_cme });
+        self.push_insn(lookup_block, Insn::CondBranch {
             val: is_expected,
             if_true: BranchEdge { target: call_block, args: vec![] },
             if_false: BranchEdge { target: miss_block, args: vec![] },
