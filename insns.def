@@ -1269,6 +1269,7 @@ jump
 // attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
 {
     RUBY_VM_CHECK_INTS(ec);
+    JIT_BACKEDGE(dst);
     JUMP(dst);
 }
 
@@ -1283,6 +1284,7 @@ branchif
 {
     if (RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
+        JIT_BACKEDGE(dst);
         JUMP(dst);
     }
 }
@@ -1298,6 +1300,7 @@ branchunless
 {
     if (!RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
+        JIT_BACKEDGE(dst);
         JUMP(dst);
     }
 }
@@ -1313,6 +1316,7 @@ branchnil
 {
     if (NIL_P(val)) {
         RUBY_VM_CHECK_INTS(ec);
+        JIT_BACKEDGE(dst);
         JUMP(dst);
     }
 }
