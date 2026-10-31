@@ -5044,6 +5044,10 @@ impl Function {
         // polymorphic dispatch only sees classes outside the profile, though. They are more likely
         // to inherit a method that several profiled classes share than one overridden by a single
         // class, e.g. Kernel#nil? rather than NilClass#nil?, so check for the most shared one.
+        //
+        // A module method resolves to a different method entry in each class that includes the
+        // module, though. If the profiled classes agree on the method definition, check for that
+        // instead, which is only valid for a method that can't tell its method entry apart.
         let mid = unsafe { vm_ci_mid(ci) };
         // Profiles of one class with different shapes or flags count as one class.
         let mut classes: Vec<VALUE> = vec![];
@@ -5053,6 +5057,7 @@ impl Function {
             }
         }
         let mut cmes: Vec<(*const rb_callable_method_entry_t, VALUE, usize)> = vec![];
+        let mut defs: Vec<(*const rb_method_definition_t, *const rb_callable_method_entry_t, VALUE, usize)> = vec![];
         for klass in classes {
             let cme = unsafe { rb_callable_method_entry(klass, mid) };
             if cme.is_null() {
@@ -5062,17 +5067,21 @@ impl Function {
                 Some((_, _, count)) => *count += 1,
                 None => cmes.push((cme, klass, 1)),
             }
+            let def = unsafe { (*cme).def };
+            match defs.iter_mut().find(|(known, _, _, _)| *known == def) {
+                Some((_, _, _, count)) => *count += 1,
+                None => defs.push((def, cme, klass, 1)),
+            }
         }
-        if cmes.len() > 1 && reason != SendPolymorphicFallback {
-            return None;
-        }
-        // The method entry of the most classes, preferring the most frequent receiver class on a tie
-        let Some(&(lookup_cme, klass, count)) = cmes.iter().rev().max_by_key(|(_, _, count)| *count) else {
-            return None;
+        // The method entry or definition of the most classes, preferring the most frequent receiver class on a tie
+        let best_cme = cmes.iter().rev().max_by_key(|(_, _, count)| *count).copied();
+        let best_def = defs.iter().rev().max_by_key(|(_, _, _, count)| *count).copied();
+        let ((lookup_cme, klass, _), match_def) = match (best_cme, best_def) {
+            (Some(best_cme), _) if cmes.len() == 1 => (best_cme, false),
+            (Some(best_cme), _) if reason == SendPolymorphicFallback && best_cme.2 >= 2 => (best_cme, false),
+            (_, Some((_, cme, klass, count))) if defs.len() == 1 || (reason == SendPolymorphicFallback && count >= 2) => ((cme, klass, count), true),
+            _ => return None,
         };
-        if cmes.len() > 1 && count < 2 {
-            return None;
-        }
         match (unsafe { METHOD_ENTRY_VISI(lookup_cme) }, flags & VM_CALL_FCALL != 0) {
             (METHOD_VISI_PUBLIC, _) | (METHOD_VISI_PRIVATE, true) | (METHOD_VISI_PROTECTED, true) => {}
             _ => return None,
@@ -5085,9 +5094,14 @@ impl Function {
         let target = match unsafe { get_cme_def_type(cme) } {
             VM_METHOD_TYPE_ISEQ => {
                 let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+                // The frame of the call gets the expected method entry, so e.g. `super` would search the wrong class.
+                if match_def && crate::codegen::iseq_may_observe_method_entry(iseq) {
+                    return None;
+                }
                 let Ok(call) = self.build_send_direct_args(&CallerArguments::new(args, ci), None, iseq, has_block) else { return None };
                 Target::Iseq(iseq, call)
             }
+            _ if match_def && unsafe { get_cme_def_type(cme) } != VM_METHOD_TYPE_IVAR => return None,
             VM_METHOD_TYPE_BMETHOD if !has_block => {
                 let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
                 let proc_block = unsafe { (*rb_jit_get_proc_ptr(procv)).block.as_ref() };
@@ -5125,6 +5139,7 @@ impl Function {
         self.klass_caches.borrow_mut().push(klass_cache);
         let cache_owner = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(self.iseq)) });
         let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
+        let match_def_opnd = self.push_insn(block, Insn::Const { val: Const::CBool(match_def) });
         let call_block = self.new_block(u32::MAX);
         let miss_block = self.new_block(u32::MAX);
         let join_block = self.new_block(u32::MAX);
@@ -5154,7 +5169,7 @@ impl Function {
         let recv_cme = self.push_insn(lookup_block, Insn::CCall {
             cfunc: rb_zjit_cached_cme as *const u8,
             recv,
-            args: vec![mid_opnd, klass_cache_opnd, cache_owner, expected_cme],
+            args: vec![mid_opnd, klass_cache_opnd, cache_owner, expected_cme, match_def_opnd],
             name: ID!(rb_zjit_cached_cme),
             owner: Qnil,
             // A method entry, or 0 if the class doesn't have it cached

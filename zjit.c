@@ -327,8 +327,11 @@ rb_zjit_singleton_class_p(VALUE klass)
 // code owns the cache and marks the class in it. The JIT code that calls this is invalidated
 // when `expected_cme` is, and a class that resolves `mid_sym` to `expected_cme` keeps doing so
 // until `expected_cme` is invalidated, which is what makes a cached class a valid hit.
+//
+// With `match_def`, a method entry of the same method definition, e.g. of a module method included
+// in another class, is a hit as well. It isn't cached since `expected_cme` doesn't guard it.
 const rb_callable_method_entry_t *
-rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_owner, const rb_callable_method_entry_t *expected_cme)
+rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_owner, const rb_callable_method_entry_t *expected_cme, bool match_def)
 {
     VALUE klass = CLASS_OF(recv);
     if (LIKELY(*klass_cache == klass)) {
@@ -344,6 +347,9 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
             if (ccs->cme == expected_cme) {
                 *klass_cache = klass;
                 RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
+            }
+            else if (match_def && ccs->cme->def == expected_cme->def) {
+                return expected_cme;
             }
             return ccs->cme;
         }

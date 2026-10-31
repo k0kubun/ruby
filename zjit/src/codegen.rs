@@ -3821,6 +3821,28 @@ pub(crate) fn iseq_may_yield(iseq: IseqPtr) -> bool {
     iseq_has_opcode(iseq, YARVINSN_invokeblock)
 }
 
+/// Return true if running `iseq` might observe the method entry of its frame, e.g. with `super`
+/// or a method that inspects its caller. Only ISEQs that call nothing, like `def to_liquid = self`
+/// or a reader of an instance variable, are known not to.
+#[allow(non_upper_case_globals)]
+pub(crate) fn iseq_may_observe_method_entry(iseq: IseqPtr) -> bool {
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+        match opcode {
+            YARVINSN_nop | YARVINSN_pop | YARVINSN_dup | YARVINSN_putself | YARVINSN_putnil
+            | YARVINSN_putobject | YARVINSN_putobject_INT2FIX_0_ | YARVINSN_putobject_INT2FIX_1_
+            | YARVINSN_getlocal | YARVINSN_getlocal_WC_0 | YARVINSN_getlocal_WC_1
+            | YARVINSN_getinstancevariable | YARVINSN_leave => {}
+            _ => return true,
+        }
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+    false
+}
+
 fn iseq_has_opcode(iseq: IseqPtr, target: u32) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
     let mut insn_idx: u32 = 0;

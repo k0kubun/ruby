@@ -7524,6 +7524,27 @@ fn test_send_on_method_entry_shared_by_profiled_classes() {
 }
 
 #[test]
+fn test_send_on_method_entry_of_module_method_definition() {
+    // The classes that include M resolve `id` to different method entries of one definition.
+    // Calling `sup`, which uses `super`, on one of them would search the wrong class.
+    assert_snapshot!(inspect("
+        module M
+          def id = self
+          def sup = [:m, super]
+        end
+        class Base
+          def sup = :base
+        end
+        CLASSES = 8.times.map { |i| Class.new(Base) { include M; define_method(:to_s) { i.to_s } } }
+        def test(o) = [o.id.to_s, o.sup]
+        test(CLASSES[0].new); test(CLASSES[1].new); test(CLASSES[2].new)
+        r = CLASSES.map { test(it.new) }
+        CLASSES[5].class_eval { def id = :redefined; def sup = :sup_redefined }
+        r + [test(CLASSES[5].new), test(CLASSES[6].new)]
+    "), @r#"[["0", [:m, :base]], ["1", [:m, :base]], ["2", [:m, :base]], ["3", [:m, :base]], ["4", [:m, :base]], ["5", [:m, :base]], ["6", [:m, :base]], ["7", [:m, :base]], ["redefined", :sup_redefined], ["6", [:m, :base]]]"#);
+}
+
+#[test]
 fn test_send_on_method_entry_cached_class() {
     // The site caches the last unprofiled class that resolved to the method. A redefinition in
     // the cached class, a compaction that moves it, and immediates must all be handled.
