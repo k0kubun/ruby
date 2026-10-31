@@ -2497,6 +2497,7 @@ unsafe extern "C" {
         klass_cache: *mut VALUE,
         cache_owner: VALUE,
         expected_cme: *const rb_callable_method_entry_t,
+        match_def: bool,
     ) -> *const rb_callable_method_entry_t;
     pub fn rb_zjit_defined_ivar(obj: VALUE, id: ID, pushval: VALUE) -> VALUE;
     pub fn rb_zjit_method_tracing_currently_enabled() -> bool;
