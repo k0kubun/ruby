@@ -13441,8 +13441,20 @@ mod hir_opt_tests {
         bb7(v34:BasicObject):
           Jump bb4(v34)
         bb5():
-          v21:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v21)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
+          v48:StaticSymbol[:foo] = Const Value(VALUE(0x1048))
+          v49:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1050, v48
+          v50:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v51:CBool = IsBitEqual v49, v50
+          CondBranch v51, bb12(), bb13()
+        bb12():
+          v53:BasicObject = GetIvar v10, :@foo
+          Jump bb14(v53)
+        bb13():
+          v55:BasicObject = Send v10, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb14(v55)
+        bb14(v57:BasicObject):
+          Jump bb4(v57)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -13652,8 +13664,20 @@ mod hir_opt_tests {
         bb7(v34:BasicObject):
           Jump bb4(v34)
         bb5():
-          v21:BasicObject = Send v10, :x # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v21)
+          PatchPoint MethodRedefined(C@0x1008, x@0x1010, cme:0x1018)
+          v48:StaticSymbol[:x] = Const Value(VALUE(0x1048))
+          v49:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1050, v48
+          v50:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v51:CBool = IsBitEqual v49, v50
+          CondBranch v51, bb12(), bb13()
+        bb12():
+          v53:BasicObject = GetIvar v10, :@x
+          Jump bb14(v53)
+        bb13():
+          v55:BasicObject = Send v10, :x # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb14(v55)
+        bb14(v57:BasicObject):
+          Jump bb4(v57)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -21950,11 +21974,11 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(String@0x1008, !=@0x1010, cme:0x1018)
           PushInlineFrame :!=, v23 (0x1040), num_args=1
           PatchPoint MethodRedefined(String@0x1008, ==@0x1060, cme:0x1068)
-          v119:BasicObject = CCallWithFrame v23, :String#==@0x1090, v13
-          v68:BoolExact = BoolNegate v119
+          v163:BasicObject = CCallWithFrame v23, :String#==@0x1090, v13
+          v79:BoolExact = BoolNegate v163
           PatchPoint NoEPEscape(!=)
           PopInlineFrame
-          Jump bb4(v68)
+          Jump bb4(v79)
         bb7():
           CondBranchHasType v12, Fixnum, bb8(), bb5()
         bb8():
@@ -21962,14 +21986,47 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Integer@0x1098, !=@0x1010, cme:0x1018)
           PushInlineFrame :!=, v28 (0x1040), num_args=1
           PatchPoint MethodRedefined(Integer@0x1098, ==@0x1060, cme:0x10a0)
-          v123:BasicObject = CCallWithFrame v28, :Integer#==@0x10c8, v13
-          v101:BoolExact = BoolNegate v123
+          v167:BasicObject = CCallWithFrame v28, :Integer#==@0x10c8, v13
+          v112:BoolExact = BoolNegate v167
           PatchPoint NoEPEscape(!=)
           PopInlineFrame
-          Jump bb4(v101)
+          Jump bb4(v112)
         bb5():
-          v31:BasicObject = Send v12, :!=, v13 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v31)
+          PatchPoint MethodRedefined(String@0x1008, !=@0x1010, cme:0x1018)
+          v46:StaticSymbol[:!=] = Const Value(VALUE(0x10d0))
+          v47:RubyValue = CCall v12, :rb_zjit_cached_cme@0x10d8, v46
+          v48:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v49:CBool = IsBitEqual v47, v48
+          CondBranch v49, bb9(), bb10()
+        bb9():
+          PushInlineFrame :!=, v12 (0x1040), num_args=1
+          CondBranchHasType v12, StringExact, bb30(), bb31()
+        bb30():
+          v134:StringExact = RefineType v12, StringExact
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, ==@0x1060, cme:0x1068)
+          v172:BasicObject = CCallWithFrame v134, :String#==@0x1090, v13
+          Jump bb28(v172)
+        bb31():
+          CondBranchHasType v12, Fixnum, bb32(), bb29()
+        bb32():
+          v139:Fixnum = RefineType v12, Fixnum
+          PatchPoint MethodRedefined(Integer@0x1098, ==@0x1060, cme:0x10a0)
+          v176:BasicObject = CCallWithFrame v139, :Integer#==@0x10c8, v13
+          Jump bb28(v176)
+        bb29():
+          v142:BasicObject = Send v12, :==, v13 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb28(v142)
+        bb28(v131:BasicObject):
+          v145:BoolExact = BoolNegate v131
+          PatchPoint NoEPEscape(!=)
+          PopInlineFrame
+          Jump bb11(v145)
+        bb10():
+          v53:BasicObject = Send v12, :!=, v13 # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb11(v53)
+        bb11(v55:BasicObject):
+          Jump bb4(v55)
         bb4(v20:BasicObject):
           CheckInterrupts
           Return v20
@@ -22044,12 +22101,12 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(NilClass@0x1010, !=@0x1018, cme:0x1020)
           PushInlineFrame :!=, v21 (0x1048), num_args=1
           PatchPoint MethodRedefined(NilClass@0x1010, ==@0x1068, cme:0x1070)
-          v115:CBool = IsBitEqual v21, v15
-          v116:BoolExact = BoxBool v115
-          v65:BoolExact = BoolNegate v116
+          v159:CBool = IsBitEqual v21, v15
+          v160:BoolExact = BoxBool v159
+          v76:BoolExact = BoolNegate v160
           PatchPoint NoEPEscape(!=)
           PopInlineFrame
-          Jump bb4(v65)
+          Jump bb4(v76)
         bb7():
           CondBranchHasType v10, StaticSymbol, bb8(), bb5()
         bb8():
@@ -22057,15 +22114,49 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Symbol@0x1098, !=@0x1018, cme:0x1020)
           PushInlineFrame :!=, v26 (0x1048), num_args=1
           PatchPoint MethodRedefined(Symbol@0x1098, ==@0x1068, cme:0x10a0)
-          v120:CBool = IsBitEqual v26, v15
-          v121:BoolExact = BoxBool v120
-          v98:BoolExact = BoolNegate v121
+          v164:CBool = IsBitEqual v26, v15
+          v165:BoolExact = BoxBool v164
+          v109:BoolExact = BoolNegate v165
           PatchPoint NoEPEscape(!=)
           PopInlineFrame
-          Jump bb4(v98)
+          Jump bb4(v109)
         bb5():
-          v29:BasicObject = Send v10, :!=, v15 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v29)
+          PatchPoint MethodRedefined(NilClass@0x1010, !=@0x1018, cme:0x1020)
+          v43:StaticSymbol[:!=] = Const Value(VALUE(0x10c8))
+          v44:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10d0, v43
+          v45:CallableMethodEntry[VALUE(0x1020)] = Const Value(VALUE(0x1020))
+          v46:CBool = IsBitEqual v44, v45
+          CondBranch v46, bb9(), bb10()
+        bb9():
+          PushInlineFrame :!=, v10 (0x1048), num_args=1
+          CondBranchHasType v10, NilClass, bb30(), bb31()
+        bb30():
+          v131:NilClass = RefineType v10, NilClass
+          PatchPoint MethodRedefined(NilClass@0x1010, ==@0x1068, cme:0x1070)
+          v169:CBool = IsBitEqual v131, v15
+          v170:BoolExact = BoxBool v169
+          Jump bb28(v170)
+        bb31():
+          CondBranchHasType v10, StaticSymbol, bb32(), bb29()
+        bb32():
+          v136:StaticSymbol = RefineType v10, StaticSymbol
+          PatchPoint MethodRedefined(Symbol@0x1098, ==@0x1068, cme:0x10a0)
+          v174:CBool = IsBitEqual v136, v15
+          v175:BoolExact = BoxBool v174
+          Jump bb28(v175)
+        bb29():
+          v139:BasicObject = Send v10, :==, v15 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb28(v139)
+        bb28(v128:BasicObject):
+          v142:BoolExact = BoolNegate v128
+          PatchPoint NoEPEscape(!=)
+          PopInlineFrame
+          Jump bb11(v142)
+        bb10():
+          v50:BasicObject = Send v10, :!=, v15 # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb11(v50)
+        bb11(v52:BasicObject):
+          Jump bb4(v52)
         bb4(v18:BasicObject):
           CheckInterrupts
           Return v18
@@ -25777,7 +25868,134 @@ mod hir_opt_tests {
           v40:StringExact = InvokeBuiltin leaf <inline_expr>, v23
           Jump bb4(v40)
         bb5():
-          v26:BasicObject = Send v10, :to_s # SendFallbackReason: Send: polymorphic fallback
+          PatchPoint MethodRedefined(Symbol@0x1008, to_s@0x1010, cme:0x1018)
+          v42:StaticSymbol[:to_s] = Const Value(VALUE(0x1040))
+          v43:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1048, v42
+          v44:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v45:CBool = IsBitEqual v43, v44
+          CondBranch v45, bb11(), bb12()
+        bb11():
+          v47:StringExact = InvokeBuiltin leaf <inline_expr>, v10
+          Jump bb13(v47)
+        bb12():
+          v49:BasicObject = Send v10, :to_s # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb13(v49)
+        bb13(v51:BasicObject):
+          Jump bb4(v51)
+        bb4(v15:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn test_send_on_method_entry_beyond_profiled_subclasses() {
+        set_call_threshold(4);
+        eval("
+        class Base
+          def foo = 3
+        end
+        class A < Base; end
+        class B < Base; end
+
+        def test o
+          o.foo
+        end
+
+        test A.new; test B.new; test A.new; test B.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:9:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          CondBranchHasType v10, ObjectSubclass[class_exact:A], bb6(), bb7()
+        bb6():
+          PatchPoint NoSingletonClass(A@0x1008)
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v38:Fixnum[3] = Const Value(3)
+          Jump bb4(v38)
+        bb7():
+          CondBranchHasType v10, ObjectSubclass[class_exact:B], bb8(), bb5()
+        bb8():
+          PatchPoint NoSingletonClass(B@0x1040)
+          PatchPoint MethodRedefined(B@0x1040, foo@0x1010, cme:0x1018)
+          v42:Fixnum[3] = Const Value(3)
+          Jump bb4(v42)
+        bb5():
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v44:StaticSymbol[:foo] = Const Value(VALUE(0x1048))
+          v45:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1050, v44
+          v46:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v47:CBool = IsBitEqual v45, v46
+          CondBranch v47, bb9(), bb10()
+        bb9():
+          v49:Fixnum[3] = Const Value(3)
+          Jump bb11(v49)
+        bb10():
+          v51:BasicObject = Send v10, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb11(v51)
+        bb11(v53:BasicObject):
+          Jump bb4(v53)
+        bb4(v15:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v15
+        ");
+    }
+
+    #[test]
+    fn test_no_send_on_method_entry_for_different_methods() {
+        set_call_threshold(4);
+        eval("
+        class A; def foo = 1; end
+        class B; def foo = 2; end
+
+        def test o
+          o.foo
+        end
+
+        test A.new; test B.new; test A.new; test B.new
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          CondBranchHasType v10, ObjectSubclass[class_exact:A], bb6(), bb7()
+        bb6():
+          PatchPoint NoSingletonClass(A@0x1008)
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v38:Fixnum[1] = Const Value(1)
+          Jump bb4(v38)
+        bb7():
+          CondBranchHasType v10, ObjectSubclass[class_exact:B], bb8(), bb5()
+        bb8():
+          PatchPoint NoSingletonClass(B@0x1040)
+          PatchPoint MethodRedefined(B@0x1040, foo@0x1010, cme:0x1048)
+          v42:Fixnum[2] = Const Value(2)
+          Jump bb4(v42)
+        bb5():
+          v26:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
           Jump bb4(v26)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
@@ -25826,8 +26044,20 @@ mod hir_opt_tests {
           v32:Fixnum[3] = Const Value(3)
           Jump bb4(v32)
         bb5():
-          v21:BasicObject = Send v10, :foo # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v21)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
+          v34:StaticSymbol[:foo] = Const Value(VALUE(0x1040))
+          v35:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1048, v34
+          v36:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v37:CBool = IsBitEqual v35, v36
+          CondBranch v37, bb7(), bb8()
+        bb7():
+          v39:Fixnum[3] = Const Value(3)
+          Jump bb9(v39)
+        bb8():
+          v41:BasicObject = Send v10, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb9(v41)
+        bb9(v43:BasicObject):
+          Jump bb4(v43)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -30055,9 +30285,9 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v18 (0x1040), num_args=0, block=0x1060
-          v108:NilClass = Const Value(nil)
+          v136:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v108)
+          Jump bb4(v136)
         bb6():
           CondBranchHasType v10, ObjectSubclass[class_exact:A], bb7(), bb8()
         bb7():
@@ -30065,9 +30295,9 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(A@0x1080)
           PatchPoint MethodRedefined(A@0x1080, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v23 (0x1040), num_args=0, block=0x1060
-          v122:NilClass = Const Value(nil)
+          v150:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v122)
+          Jump bb4(v150)
         bb8():
           CondBranchHasType v10, ObjectSubclass[class_exact:B], bb9(), bb10()
         bb9():
@@ -30075,12 +30305,26 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(B@0x1088)
           PatchPoint MethodRedefined(B@0x1088, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v28 (0x1040), num_args=0, block=0x1060
-          v136:NilClass = Const Value(nil)
+          v164:NilClass = Const Value(nil)
           PopInlineFrame
-          Jump bb4(v136)
+          Jump bb4(v164)
         bb10():
-          v31:BasicObject = Send v10, 0x1060, :foo # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v31)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
+          v53:StaticSymbol[:foo] = Const Value(VALUE(0x1090))
+          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1098, v53
+          v55:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v56:CBool = IsBitEqual v54, v55
+          CondBranch v56, bb11(), bb12()
+        bb11():
+          PushInlineFrame :foo, v10 (0x1040), num_args=0, block=0x1060
+          v178:NilClass = Const Value(nil)
+          PopInlineFrame
+          Jump bb13(v178)
+        bb12():
+          v60:BasicObject = Send v10, 0x1060, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb13(v60)
+        bb13(v62:BasicObject):
+          Jump bb4(v62)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -30126,17 +30370,17 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v21 (0x1040), num_args=0, block=0x1060
-          v62:CPtr = GetEP 0
-          v63:CInt64 = LoadField v62, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v64:CInt64[-4] = Const CInt64(-4)
-          v65:CInt64 = IntAnd v63, v64
-          v120:BasicObject = LoadField v65, :captured_self@0x1081
-          PushInlineBlockFrame v120, v65 (0x1060), num_args=0
-          v113:Fixnum[0] = Const Value(0)
-          SetLocal :obj, l1, EP@3, v113
+          v73:CPtr = GetEP 0
+          v74:CInt64 = LoadField v73, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
+          v75:CInt64[-4] = Const CInt64(-4)
+          v76:CInt64 = IntAnd v74, v75
+          v148:BasicObject = LoadField v76, :captured_self@0x1081
+          PushInlineBlockFrame v148, v76 (0x1060), num_args=0
+          v141:Fixnum[0] = Const Value(0)
+          SetLocal :obj, l1, EP@3, v141
           PopInlineFrame
           PopInlineFrame
-          Jump bb4(v113)
+          Jump bb4(v141)
         bb6():
           CondBranchHasType v10, ObjectSubclass[class_exact:A], bb7(), bb8()
         bb7():
@@ -30144,17 +30388,17 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(A@0x1088)
           PatchPoint MethodRedefined(A@0x1088, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v26 (0x1040), num_args=0, block=0x1060
-          v79:CPtr = GetEP 0
-          v80:CInt64 = LoadField v79, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v81:CInt64[-4] = Const CInt64(-4)
-          v82:CInt64 = IntAnd v80, v81
-          v137:BasicObject = LoadField v82, :captured_self@0x1081
-          PushInlineBlockFrame v137, v82 (0x1060), num_args=0
-          v130:Fixnum[0] = Const Value(0)
-          SetLocal :obj, l1, EP@3, v130
+          v90:CPtr = GetEP 0
+          v91:CInt64 = LoadField v90, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
+          v92:CInt64[-4] = Const CInt64(-4)
+          v93:CInt64 = IntAnd v91, v92
+          v165:BasicObject = LoadField v93, :captured_self@0x1081
+          PushInlineBlockFrame v165, v93 (0x1060), num_args=0
+          v158:Fixnum[0] = Const Value(0)
+          SetLocal :obj, l1, EP@3, v158
           PopInlineFrame
           PopInlineFrame
-          Jump bb4(v130)
+          Jump bb4(v158)
         bb8():
           CondBranchHasType v10, ObjectSubclass[class_exact:B], bb9(), bb10()
         bb9():
@@ -30162,20 +30406,42 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(B@0x1090)
           PatchPoint MethodRedefined(B@0x1090, foo@0x1010, cme:0x1018)
           PushInlineFrame :foo, v31 (0x1040), num_args=0, block=0x1060
-          v96:CPtr = GetEP 0
-          v97:CInt64 = LoadField v96, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
-          v98:CInt64[-4] = Const CInt64(-4)
-          v99:CInt64 = IntAnd v97, v98
-          v154:BasicObject = LoadField v99, :captured_self@0x1081
-          PushInlineBlockFrame v154, v99 (0x1060), num_args=0
-          v147:Fixnum[0] = Const Value(0)
-          SetLocal :obj, l1, EP@3, v147
+          v107:CPtr = GetEP 0
+          v108:CInt64 = LoadField v107, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
+          v109:CInt64[-4] = Const CInt64(-4)
+          v110:CInt64 = IntAnd v108, v109
+          v182:BasicObject = LoadField v110, :captured_self@0x1081
+          PushInlineBlockFrame v182, v110 (0x1060), num_args=0
+          v175:Fixnum[0] = Const Value(0)
+          SetLocal :obj, l1, EP@3, v175
           PopInlineFrame
           PopInlineFrame
-          Jump bb4(v147)
+          Jump bb4(v175)
         bb10():
-          v34:BasicObject = Send v10, 0x1060, :foo # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v34)
+          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
+          v58:StaticSymbol[:foo] = Const Value(VALUE(0x1098))
+          v59:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10a0, v58
+          v60:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v61:CBool = IsBitEqual v59, v60
+          CondBranch v61, bb11(), bb12()
+        bb11():
+          PushInlineFrame :foo, v10 (0x1040), num_args=0, block=0x1060
+          v124:CPtr = GetEP 0
+          v125:CInt64 = LoadField v124, :VM_ENV_DATA_INDEX_SPECVAL@0x1080
+          v126:CInt64[-4] = Const CInt64(-4)
+          v127:CInt64 = IntAnd v125, v126
+          v199:BasicObject = LoadField v127, :captured_self@0x1081
+          PushInlineBlockFrame v199, v127 (0x1060), num_args=0
+          v192:Fixnum[0] = Const Value(0)
+          SetLocal :obj, l1, EP@3, v192
+          PopInlineFrame
+          PopInlineFrame
+          Jump bb13(v192)
+        bb12():
+          v65:BasicObject = Send v10, 0x1060, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb13(v65)
+        bb13(v67:BasicObject):
+          Jump bb4(v67)
         bb4(v18:BasicObject):
           v36:CPtr = LoadSP
           v37:BasicObject = LoadField v36, :obj@0x1000
