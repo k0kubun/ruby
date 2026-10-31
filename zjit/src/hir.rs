@@ -3157,7 +3157,13 @@ pub struct Function {
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
     pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
+    /// Number of `inline_block` iterators inlined past the inlining budget. See `inline_methods`.
+    inline_budget_bonuses: usize,
 }
+
+/// Maximum number of `inline_block` iterators, e.g. Array#each with a literal block, that a
+/// function inlines after it has spent its inlining budget.
+const MAX_INLINE_BUDGET_BONUSES: usize = 3;
 
 /// An inlined method or block frame. The inliner records these so that inlining a block
 /// later can find the frames that a `break` or non-local `return` from the block unwinds to.
@@ -3497,6 +3503,7 @@ impl Function {
             inline_frames: HashMap::new(),
             inline_pass: 0,
             klass_caches: Default::default(),
+            inline_budget_bonuses: 0,
         }
     }
 
@@ -6720,6 +6727,12 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
+    /// Whether the function has spent its inlining budget. See [`Self::should_inline`].
+    fn over_inline_budget(&self) -> bool {
+        let budget = get_option!(inline_budget);
+        budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
+    }
+
     fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
@@ -6758,8 +6771,7 @@ impl Function {
         // Per-caller cumulative budget. Once that count crosses the budget, every further callee
         // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
         // `Options::inline_budget` for the full unit/semantics caveat.
-        let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget && !ignore_budget {
+        if self.over_inline_budget() && !ignore_budget {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -6867,9 +6879,18 @@ impl Function {
                 ));
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
+                // An iterator that yields to the literal block, e.g. Array#each, is inlined with
+                // the block, which turns the `yield` into a direct call or the block's body. Only
+                // inlining it does that: the iterator is shared by many callers, so its own `yield`
+                // sees too many blocks to dispatch on. Let a few of them past the budget, which a
+                // big caller like a Rails controller action or view has long spent.
+                let budget_bonus = inline_block && self.inline_budget_bonuses < MAX_INLINE_BUDGET_BONUSES && self.over_inline_budget();
+                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable || budget_bonus) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
+                }
+                if budget_bonus {
+                    self.inline_budget_bonuses += 1;
                 }
 
                 // Snapshot the caller's HIR length so we can roll back if compiling

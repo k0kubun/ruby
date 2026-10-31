@@ -27676,6 +27676,37 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_block_iterators_past_budget() {
+        // Array#each with a literal block is inlined even after the caller has spent its
+        // inlining budget, but only up to MAX_INLINE_BUDGET_BONUSES times per function.
+        eval("
+            def test(a)
+              s = 0
+              a.each { |x| s += x }
+              a.each { |x| s += x }
+              a.each { |x| s += x }
+              a.each { |x| s += x }
+              s
+            end
+            test([1])
+            test([1])
+        ");
+        let old_threshold = get_option!(inline_threshold);
+        let old_budget = get_option!(inline_budget);
+        unsafe {
+            OPTIONS.as_mut().unwrap().inline_threshold = 30;
+            OPTIONS.as_mut().unwrap().inline_budget = 1;
+        }
+        let result = hir_string("test");
+        unsafe {
+            OPTIONS.as_mut().unwrap().inline_threshold = old_threshold;
+            OPTIONS.as_mut().unwrap().inline_budget = old_budget;
+        }
+        assert_eq!(result.matches("PushInlineFrame :each").count(), 3,
+            "Expected three Array#each calls to be inlined past the budget:\n{result}");
+    }
+
+    #[test]
     fn test_always_inline_ignores_budget() {
         // BasicObject#!= is marked `Primitive.attr! :always_inline`, so it is inlined
         // even with the per-caller budget exhausted. Its body calls a user-defined #==
