@@ -400,7 +400,10 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
             unsafe { version.as_mut() }.status = IseqStatus::Compiled(code_ptrs.clone());
             incr_counter!(compiled_iseq_count);
             // Give the new version a fresh budget of recompile exits. See exit_recompile().
-            payload.num_exits_until_invalidate = get_option!(num_exits_until_invalidate);
+            // For an ISEQ whose loops made it hot, recompile on the first exit. Without OSR,
+            // the exit leaves the rest of the loop to the interpreter, which profiles it for
+            // the recompile, and waiting for more exits would interpret more such loops.
+            payload.num_exits_until_invalidate = if payload.hot_loop { 1 } else { get_option!(num_exits_until_invalidate) };
         }
         Err(err) => {
             unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());

@@ -35,6 +35,9 @@ pub struct IseqPayload {
     /// Memoized result of [`crate::codegen::iseq_may_write_block_code`]. The bare
     /// opcodes of an ISEQ never change, so this is computed at most once.
     pub may_write_block_code: Option<bool>,
+    /// Whether the interpreter's back-edges, rather than calls, opened the profiling window
+    /// of this ISEQ (see `rb_zjit_iseq_backedge`), i.e. it runs long loops but is called rarely.
+    pub hot_loop: bool,
 }
 
 impl IseqPayload {
@@ -47,8 +50,15 @@ impl IseqPayload {
             compile_cref: None,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
             may_write_block_code: None,
+            hot_loop: false,
         }
     }
+}
+
+/// Remember that back-edges made an ISEQ hot. See [`IseqPayload::hot_loop`].
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_iseq_mark_hot_loop(iseq: IseqPtr) {
+    get_or_create_iseq_payload(iseq).hot_loop = true;
 }
 
 /// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.

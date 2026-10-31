@@ -306,6 +306,33 @@ fn test_backedges_count_toward_call_threshold() {
 }
 
 #[test]
+fn test_hot_loop_recompiles_on_first_exit() {
+    rb_zjit_prepare_options();
+    set_call_threshold(10);
+
+    // The back-edges of a single call make the method hot. Its compiled version gets
+    // invalidated on the first exit instead of after --zjit-num-exits-until-invalidate exits.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("
+        def hot_loop_exit(n, x)
+          i = 0
+          i += 1 while i < n
+          x + 1
+        end
+        hot_loop_exit(100_000, 1)
+    "));
+    let iseq = get_method_iseq("self", "hot_loop_exit");
+    assert!(get_or_create_iseq_payload(iseq).versions.is_empty());
+
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("hot_loop_exit(3, 1)"));
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+
+    assert_snapshot!(inspect("hot_loop_exit(3, 1.5)"), @"2.5");
+    assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+#[test]
 fn test_short_loop_does_not_count_toward_call_threshold() {
     rb_zjit_prepare_options();
     set_call_threshold(10);
