@@ -2056,6 +2056,117 @@ fn test_inline_block_return_from_inlined_home_method_with_other_type() {
 }
 
 #[test]
+fn test_inline_block_return_through_yield_in_nested_blocks() {
+    // `search` yields from blocks nested in its own literal blocks, like ActionView's
+    // PathSet#search_combinations. When everything is inlined into `test`, the `yield` goes to
+    // the literal block of the inlined `search`, and the block's `return` jumps out of `test`.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a, b)
+              a.each do |x|
+                b.each { |y| yield x, y }
+              end
+            end
+            def test(a, b)
+              search(a, b) do |x, y|
+                s = x + y
+                return s if s > 3
+              end
+              nil
+            end
+            test([1, 2], [1, 2])
+            test([1, 2], [1, 2])
+        ", "test([1, 2], [1, 2, 3])"), @"4");
+        assert_snapshot!(assert_compiles("test([1], [1])"), @"nil");
+    });
+}
+
+#[test]
+fn test_inline_block_return_through_yield_in_nested_blocks_of_inlined_home() {
+    // Like test_inline_block_return_through_yield_in_nested_blocks, but the home method of the
+    // returning block is inlined too, so the return jumps to its return block.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a)
+              a.each { |x| [x, x + 1].each { |y| yield y } }
+            end
+            def find(a)
+              search(a) { |y| return y if y.even? }
+              nil
+            end
+            def test(a) = [find(a)]
+            test([1, 3])
+            test([1, 3])
+        ", "test([3, 5])"), @"[4]");
+        assert_snapshot!(assert_compiles("test([])"), @"[nil]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_through_yield_in_nested_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def search(a)
+              a.each { |x| yield x }
+              :done
+            end
+            def test(a)
+              r = search(a) { |x| break x * 10 if x > 1 }
+              [r]
+            end
+            test([1, 2])
+            test([1, 2])
+            [test([1, 2]), test([1])]
+        "), @"[[20], [:done]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_through_yield_runs_nested_block_ensure() {
+    // An ensure clause around the `yield` in a nested block of the yielding method must run,
+    // so the return stays a throw.
+    with_inlining(|| {
+        eval("
+            def search(a, log)
+              a.each do |x|
+                begin
+                  yield x
+                ensure
+                  log << x
+                end
+              end
+            end
+            def test(a, log)
+              search(a, log) { |x| return x if x > 1 }
+              nil
+            end
+            test([1, 2, 3], [])
+            test([1, 2, 3], [])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test([1, 2, 3], log), log]"), @"[2, [1, 2]]");
+    });
+}
+
+#[test]
+fn test_yield_in_nested_block_of_inlined_method_with_different_blocks() {
+    // Each caller inlines `search` with its own literal block, so each `yield` in the
+    // nested block goes to the block of that caller.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def search(a)
+              a.each { |x| yield x }
+              nil
+            end
+            def test1(a) = search(a) { |x| return x * 2 if x > 1 }
+            def test2(a) = search(a) { |x| return x * 3 if x > 1 }
+            def test3(a, &b) = search(a, &b)
+            3.times { test1([1, 2]); test2([1, 2]); test3([1, 2]) { } }
+            [test1([1, 2]), test2([1, 2]), test3([1, 2]) { |x| break x * 5 if x > 1 }]
+        "), @"[4, 6, 10]");
+    });
+}
+
+#[test]
 fn test_inline_block_break_from_nested_block() {
     with_inlining(|| {
         assert_snapshot!(assert_compiles_allowing_exits("

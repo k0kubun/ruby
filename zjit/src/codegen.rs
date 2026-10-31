@@ -3888,6 +3888,28 @@ pub(crate) fn iseq_may_observe_method_entry(iseq: IseqPtr) -> bool {
     false
 }
 
+/// True if the method ISEQ or a literal block in it, at any depth, yields to the method's block,
+/// e.g. `def each_pair = pairs.each { |pair| yield pair }`.
+pub(crate) fn iseq_or_blocks_may_yield(iseq: IseqPtr) -> bool {
+    if iseq_may_yield(iseq) {
+        return true;
+    }
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+        if opcode == YARVINSN_send || opcode == YARVINSN_invokesuper {
+            let block_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+            if !block_iseq.is_null() && iseq_or_blocks_may_yield(block_iseq) {
+                return true;
+            }
+        }
+        insn_idx = insn_idx.saturating_add(unsafe { rb_insn_len(VALUE(opcode as usize)) }.try_into().unwrap());
+    }
+    false
+}
+
 fn iseq_has_opcode(iseq: IseqPtr, target: u32) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
     let mut insn_idx: u32 = 0;
