@@ -3249,6 +3249,11 @@ pub struct Function {
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
     pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
+    /// Per-call-site ivar inline caches for attr_reader reads that the profiled shapes didn't
+    /// cover. Like the inline cache of a getinstancevariable instruction, the compiled code
+    /// checks them and refills them on a miss. Codegen hands them over to the
+    /// [`crate::payload::IseqVersion`]. They hold no objects, so GC doesn't need to see them.
+    pub ivar_caches: std::cell::RefCell<Vec<Box<iseq_inline_iv_cache_entry>>>,
     /// `send`s, as (ISEQ, insn_idx), after which this function checks if the callee returned
     /// Qundef for a non-local `return` caught by rb_zjit_ccall_catching_throw(). A C method call
     /// for them may let the helper catch a `return`. See [`cfunc_call_catches_return`].
@@ -3719,6 +3724,7 @@ impl Function {
             inline_frames: HashMap::default(),
             inline_pass: 0,
             klass_caches: Default::default(),
+            ivar_caches: Default::default(),
             catch_return_sites: HashSet::default(),
             ensure_return_blocks: HashMap::default(),
         }
@@ -6480,11 +6486,13 @@ impl Function {
                                 if profiled_types.is_empty() {
                                     let resolution = self.resolve_receiver_type_from_profile(recv, state);
                                     self.count(block, Self::getivar_fallback_reason(resolution));
-                                    let getivar = self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state });
+                                    let ic = self.new_ivar_cache();
+                                    let getivar = self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic, state });
                                     self.make_equal_to(insn_id, getivar);
                                 } else {
                                     let recv = self.guard_heap(block, recv, state);
-                                    let (join_block, result) = self.dispatch_getivar(&profiled_types, block, u32::MAX, recv, id, std::ptr::null(), state, false, Counter::getivar_fallback_shape_miss)
+                                    let ic = self.new_ivar_cache();
+                                    let (join_block, result) = self.dispatch_getivar(&profiled_types, block, u32::MAX, recv, id, ic, state, false, Counter::getivar_fallback_shape_miss)
                                         .expect("dispatch_getivar without exits always returns a value");
                                     self.insn_types[result] = types::BasicObject;
                                     block = join_block;
@@ -8067,6 +8075,23 @@ impl Function {
         self.load_field(block, recv, FieldName::shape_id, unsafe { rb_shape_id_offset() }, types::CShape)
     }
 
+    /// Allocate an ivar inline cache for an attr_reader read, which has no instruction cache.
+    /// The receivers of a site can move on to shapes that weren't profiled, e.g. when objects
+    /// gain lazily initialized ivars in a later phase of the program. The final version can't
+    /// recompile for them, so it reads through a cache that follows the latest shape, like
+    /// the inline caches of an interpreter or a baseline JIT.
+    fn new_ivar_cache(&self) -> *const iseq_inline_iv_cache_entry {
+        let cache = Box::new(iseq_inline_iv_cache_entry { value: IVAR_CACHE_INIT, iv_set_name: ID(0) });
+        let ptr: *const iseq_inline_iv_cache_entry = &*cache;
+        self.ivar_caches.borrow_mut().push(cache);
+        ptr
+    }
+
+    /// Return true if `ic` is an attr_reader cache made by [`Self::new_ivar_cache`]
+    pub fn is_attr_ivar_cache(&self, ic: *const iseq_inline_iv_cache_entry) -> bool {
+        self.ivar_caches.borrow().iter().any(|cache| std::ptr::eq(&**cache, ic))
+    }
+
     fn guard_shape(&mut self, block: BlockId, val: InsnId, expected: ShapeId, state: InsnId, recompile: Option<Recompile>) -> InsnId {
         self.push_insn(block, Insn::GuardBitEquals {
             val,
@@ -8192,7 +8217,8 @@ impl Function {
             // The final version can't recompile on a shape guard failure, so compare the shape
             // and call rb_ivar_get on a miss instead.
             let self_val = self.guard_heap(block, self_val, state);
-            let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, u32::MAX, self_val, id, std::ptr::null(), state, false, Counter::getivar_fallback_shape_miss)
+            let ic = self.new_ivar_cache();
+            let (join_block, result) = self.dispatch_getivar(&[profiled_type], block, u32::MAX, self_val, id, ic, state, false, Counter::getivar_fallback_shape_miss)
                 .expect("dispatch_getivar without exits always returns a value");
             self.insn_types[result] = types::BasicObject;
             return Ok((join_block, result));

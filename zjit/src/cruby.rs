@@ -303,6 +303,12 @@ pub const ATTR_INDEX_NOT_SET: attr_index_t = attr_index_t::MAX;
 /// The value of an ivar inline cache entry that no instruction has filled yet. See shape.h.
 pub const IVAR_CACHE_INIT: u64 = u64::MAX;
 
+impl std::fmt::Debug for iseq_inline_iv_cache_entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "iseq_inline_iv_cache_entry({:#x})", self.value)
+    }
+}
+
 impl ShapeId {
     pub fn is_valid(self) -> bool {
         self != INVALID_SHAPE_ID
