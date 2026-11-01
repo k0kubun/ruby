@@ -109,6 +109,7 @@ pub extern "C" fn rb_zjit_root_update_references() {
     for &jit_frame in ZJITState::get_jit_frames().iter() {
         unsafe { &mut *jit_frame }.update_references();
     }
+    ZJITState::get_jit_frame_iseqs().update_references();
 }
 
 fn iseq_mark(payload: &IseqPayload) {
@@ -281,16 +282,9 @@ pub extern "C" fn rb_zjit_root_mark() {
     if !ZJITState::has_instance() {
         return;
     }
-    // JITFrames are allocated as the JIT compiles each call site, so consecutive ones
-    // mostly share an ISEQ. Mark each run of them once.
-    let mut last_iseq = std::ptr::null();
-    for &jit_frame in ZJITState::get_jit_frames().iter() {
-        let jit_frame = unsafe { &*jit_frame };
-        if jit_frame.iseq != last_iseq {
-            jit_frame.mark();
-            last_iseq = jit_frame.iseq;
-        }
-    }
+    // There are far fewer distinct ISEQs than JITFrames, so mark the ISEQs without
+    // loading every JITFrame.
+    ZJITState::get_jit_frame_iseqs().mark();
 }
 
 #[cfg(test)]

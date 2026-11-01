@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use crate::invariants::Invariants;
 use crate::asm::CodeBlock;
 use crate::options::{get_option, rb_zjit_prepare_options};
-use crate::jit_frame::{JITFrame, JITFrameAllocator};
+use crate::jit_frame::{JITFrame, JITFrameAllocator, JITFrameIseqs};
 use crate::stats::{Counters, InsnCounters, PerfettoTracer};
 use crate::virtualmem::CodePtr;
 use std::sync::atomic::AtomicUsize;
@@ -135,6 +135,10 @@ pub struct ZJITState {
     /// Frame metadata for ISEQ and C calls that are known at compile time
     jit_frames: Vec<*mut JITFrame>,
 
+    /// The distinct ISEQs of `jit_frames`, which the GC marks as roots. There are far fewer
+    /// of them than JITFrames, and marking them doesn't load every JITFrame.
+    jit_frame_iseqs: JITFrameIseqs,
+
     /// Bump allocator that serves JITFrame allocations from address space below
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
@@ -232,6 +236,7 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            jit_frame_iseqs: JITFrameIseqs::default(),
             jit_frame_allocator: JITFrameAllocator::new(),
             exit_descriptors: RwLock::new(ExitDescriptorTable::default()),
             iseq_calls: RwLock::new(IseqCallTable::default()),
@@ -315,6 +320,11 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Get the distinct ISEQs referenced by JITFrames
+    pub fn get_jit_frame_iseqs() -> &'static mut JITFrameIseqs {
+        &mut ZJITState::get_instance().jit_frame_iseqs
     }
 
     /// Get a mutable reference to the JITFrame allocator
