@@ -2518,6 +2518,114 @@ fn test_throw_break_runs_ensure() {
     assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
 }
 
+/// Run `warmup`, which must compile at least one resume entry. Then run `program` like
+/// `assert_compiles`, so the frames resumed after an exception run in JIT code.
+#[track_caller]
+fn assert_resumes(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let resume_entry_count_before = counters.compiled_resume_entry_count;
+    eval(warmup);
+    assert!(counters.compiled_resume_entry_count > resume_entry_count_before,
+        "expected the warmup to compile a resume entry, but compiled_resume_entry_count did not increase");
+    assert_compiles(program)
+}
+
+#[test]
+fn test_resume_frames_after_return_through_ensure() {
+    // A non-local return through a block passed down with &block unwinds the JIT code of
+    // every frame. The ensure clause and the frame the return returns to are resumed in
+    // JIT code.
+    set_call_threshold(2);
+    let warmup = "
+        def each_token(tokens) = tokens.each { |token| yield token }
+        def forward(tokens, &block) = each_token(tokens, &block)
+        def parse_body(tokens, log)
+          begin
+            forward(tokens) do |token|
+              return false if token == :end
+              log << token
+            end
+          ensure
+            log << :ensure
+          end
+          true
+        end
+        def parse(tokens, log)
+          while parse_body(tokens, log)
+          end
+          log << :done
+        end
+        def test
+          log = []
+          parse([:a, :end], log)
+          log
+        end
+        # Array#map calls the block from C, so the frames end at the block's FINISH frame
+        def run = [0].map { test }.first
+        30.times { run }
+    ";
+    assert_snapshot!(assert_resumes(warmup, "run"), @"[:a, :ensure, :done]");
+}
+
+#[test]
+fn test_resume_frames_after_rescue() {
+    // The rescue clause and the frame that caught the exception, at the end of the
+    // begin/rescue, are resumed in JIT code.
+    set_call_threshold(2);
+    let warmup = "
+        def risky(x) = x == 2 ? raise('boom') : x
+        def collect(xs)
+          out = []
+          xs.each do |x|
+            out << begin
+              risky(x)
+            rescue => e
+              e.message
+            end
+          end
+          out
+        end
+        def run = [0].map { collect([1, 2, 3]) }.first
+        30.times { run }
+    ";
+    assert_snapshot!(assert_resumes(warmup, "run"), @r#"[1, "boom", 3]"#);
+}
+
+#[test]
+fn test_resume_entry_after_trace_point() {
+    // Enabling a TracePoint drops compiled resume entries, so the interpreter runs the
+    // rescue clause and fires its line events.
+    set_call_threshold(2);
+    let warmup = "
+        def risky(x) = x == 2 ? raise('boom') : x
+        def collect(xs)
+          out = []
+          xs.each do |x|
+            out << begin
+              risky(x)
+            rescue => e
+              e.message
+            end
+          end
+          out
+        end
+        def run = [0].map { collect([1, 2, 3]) }.first
+        30.times { run }
+    ";
+    ensure_rubyvm();
+    let counters = crate::state::ZJITState::get_counters();
+    let resume_entry_count_before = counters.compiled_resume_entry_count;
+    eval(warmup);
+    assert!(counters.compiled_resume_entry_count > resume_entry_count_before);
+    assert_snapshot!(inspect("
+        lines = []
+        tp = TracePoint.new(:line) { |tp| lines << tp.lineno if tp.method_id == :collect }
+        result = tp.enable { run }
+        [result, lines.count(9)]
+    "), @r#"[[1, "boom", 3], 1]"#);
+}
+
 #[test]
 fn test_throw_return_from_proc() {
     set_call_threshold(2);

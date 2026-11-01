@@ -941,6 +941,8 @@ pub enum FieldName {
     thread_ptr,
     len,
     SelfParam,
+    /// A slot of the operand stack, counted from its bottom
+    Stack(u16),
     Id(ID),
 }
 
@@ -951,6 +953,7 @@ impl std::fmt::Display for FieldName {
             Id(id) if id_is_empty(*id) => f.write_str("<empty>"),
             Id(id) => f.write_str(&id.contents_lossy()),
             SelfParam => f.write_str("self"),
+            Stack(index) => write!(f, "stack[{index}]"),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -1387,6 +1390,9 @@ pub enum Insn {
 
     /// Set up frame. Remember the address as the JIT entry for the insn_idx in `jit_entry_insns()[jit_entry_idx]`.
     EntryPoint { jit_entry_idx: Option<usize> },
+    /// Set up a frame that the interpreter resumes at `insn_idx` with `stack_size` values on
+    /// its operand stack, e.g. after an exception handler. See [`iseq_to_hir_resume`].
+    ResumeEntryPoint { insn_idx: u16, stack_size: u8 },
     /// Control flow instructions
     Return { val: InsnId },
     /// Non-local control flow. See the throw YARV instruction
@@ -1483,6 +1489,7 @@ macro_rules! for_each_operand_impl {
             | Insn::LoadArg { .. }
             | Insn::Entries { .. }
             | Insn::EntryPoint { .. }
+            | Insn::ResumeEntryPoint { .. }
             | Insn::LoadPC
             | Insn::LoadSP
             | Insn::LoadEC
@@ -1874,7 +1881,7 @@ impl Insn {
             | Insn::Jump(_)
             | Insn::Entries { .. }
             | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
-            | Insn::EntryPoint { .. } | Insn::Return { .. }
+            | Insn::EntryPoint { .. } | Insn::ResumeEntryPoint { .. } | Insn::Return { .. }
             | Insn::PatchPoint { .. } | Insn::SetIvar { .. } | Insn::SetClassVar { .. } | Insn::ArrayExtend { .. }
             | Insn::ArrayPush { .. } | Insn::SideExit { .. } | Insn::SetGlobal { .. }
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
@@ -2093,6 +2100,7 @@ impl Insn {
             ),
             Insn::InvokeBuiltin { .. } => effects::Any,
             Insn::EntryPoint { .. } => effects::Any,
+            Insn::ResumeEntryPoint { .. } => effects::Any,
             Insn::Return { .. } => effects::Any,
             Insn::Throw { .. } => effects::Any,
             Insn::FixnumAdd { .. } => effects::Empty,
@@ -2530,6 +2538,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             &Insn::EntryPoint { jit_entry_idx: Some(idx) } => write!(f, "EntryPoint JIT({idx})"),
             &Insn::EntryPoint { jit_entry_idx: None } => write!(f, "EntryPoint interpreter"),
+            &Insn::ResumeEntryPoint { insn_idx, stack_size } => write!(f, "EntryPoint resume({insn_idx}, stack_size={stack_size})"),
             Insn::Return { val } => { write!(f, "Return {val}") }
             Insn::FixnumAdd  { left, right, .. } => { write!(f, "FixnumAdd {left}, {right}") },
             Insn::FixnumSub  { left, right, .. } => { write!(f, "FixnumSub {left}, {right}") },
@@ -4133,7 +4142,7 @@ impl Function {
         match &self.insns[insn] {
             Insn::Param => unimplemented!("params should not be present in block.insns"),
             Insn::LoadArg { val_type, .. } => *val_type,
-            Insn::SetGlobal { .. } | Insn::Jump(_) | Insn::Entries { .. } | Insn::EntryPoint { .. }
+            Insn::SetGlobal { .. } | Insn::Jump(_) | Insn::Entries { .. } | Insn::EntryPoint { .. } | Insn::ResumeEntryPoint { .. }
             | Insn::Comment { .. }
             | Insn::CondBranch { .. } | Insn::CondBranchHasType { .. } | Insn::CondBranchTest { .. } | Insn::CondBranchFixnumCmp { .. }
             | Insn::Return { .. } | Insn::Throw { .. }
@@ -9884,6 +9893,7 @@ impl Function {
             | Insn::Jump { .. }
             | Insn::Entries { .. }
             | Insn::EntryPoint { .. }
+            | Insn::ResumeEntryPoint { .. }
             | Insn::PatchPoint { .. }
             | Insn::SideExit { .. }
             | Insn::IncrCounter { .. }
@@ -11064,6 +11074,9 @@ pub const SELF_PARAM_IDX: usize = 0;
 #[derive(Clone, Copy)]
 enum AddIseqMode {
     Standalone,
+    /// Compile the ISEQ for a frame that the interpreter resumes at `insn_idx` with `stack_size`
+    /// values on its operand stack. See [`iseq_to_hir_resume`].
+    Resume { insn_idx: u16, stack_size: u8 },
     Inlined {
         return_block: BlockId,
         /// The caller's post-send `Snapshot`. Allows side-exits to restore the outer frame.
@@ -11099,6 +11112,18 @@ struct AddIseqResult {
 
 /// Compile ISEQ into High-level IR
 pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
+    iseq_to_hir_with_mode(iseq, AddIseqMode::Standalone)
+}
+
+/// Compile an ISEQ into High-level IR whose only entry resumes an existing frame at `insn_idx`
+/// with `stack_size` values on its operand stack, e.g. the continuation of a frame whose JIT
+/// code was unwound by an exception or a non-local exit. Every local and stack slot is loaded
+/// from the frame.
+pub fn iseq_to_hir_resume(iseq: IseqPtr, insn_idx: u16, stack_size: u8) -> Result<Function, ParseError> {
+    iseq_to_hir_with_mode(iseq, AddIseqMode::Resume { insn_idx, stack_size })
+}
+
+fn iseq_to_hir_with_mode(iseq: IseqPtr, mode: AddIseqMode) -> Result<Function, ParseError> {
     if !ZJITState::can_compile_iseq(iseq) {
         return Err(ParseError::NotAllowed);
     }
@@ -11106,8 +11131,13 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
     let mut fun = Function::new(iseq);
     fun.was_invalidated_for_singleton_class_creation = payload.was_invalidated_for_singleton_class_creation;
     fun.self_is_heap_object = payload.self_is_heap_object;
+    // A resume entry runs once per exception that resumes the frame there, so compile it
+    // like a lukewarm ISEQ, inlining only small callees.
+    if matches!(mode, AddIseqMode::Resume { .. }) {
+        fun.policy.lukewarm = true;
+    }
 
-    let result = add_iseq_to_hir(&mut fun, iseq, AddIseqMode::Standalone)?;
+    let result = add_iseq_to_hir(&mut fun, iseq, mode)?;
     fun.profiles = Some(result.profiles);
 
     if let Err(err) = crate::stats::trace_compile_phase("validate", || fun.validate()) {
@@ -11144,7 +11174,7 @@ fn add_iseq_to_hir(
 
     // The lexical scope to record with folded constant paths. See Invariant::StableConstantNames.
     let const_cref = match mode {
-        AddIseqMode::Standalone => payload.compile_cref,
+        AddIseqMode::Standalone | AddIseqMode::Resume { .. } => payload.compile_cref,
         AddIseqMode::Inlined { cref, .. } => cref,
     };
 
@@ -11156,7 +11186,7 @@ fn add_iseq_to_hir(
     fn new_frame_state(mode: AddIseqMode, iseq: IseqPtr) -> FrameState {
         match mode {
             AddIseqMode::Inlined { caller, depth, .. } => FrameState::inlined(iseq, caller, depth),
-            AddIseqMode::Standalone => FrameState::new(iseq),
+            AddIseqMode::Standalone | AddIseqMode::Resume { .. } => FrameState::new(iseq),
         }
     }
 
@@ -11169,14 +11199,20 @@ fn add_iseq_to_hir(
     // Those entries are known to be unreachable so slicing them off here avoids
     // translating prologue blocks that would only be discarded later, rather
     // than emitting them and relying on a downstream pass to prune the dead CFG.
-    let jit_entry_start = match mode {
-        AddIseqMode::Standalone => 0,
-        AddIseqMode::Inlined { jit_entry_idx, .. } => jit_entry_idx,
+    let jit_entry_insns = match mode {
+        // A resumed frame is entered only at the resume PC.
+        AddIseqMode::Resume { insn_idx, .. } => vec![u32::from(insn_idx)],
+        AddIseqMode::Standalone | AddIseqMode::Inlined { .. } => {
+            let jit_entry_start = match mode {
+                AddIseqMode::Inlined { jit_entry_idx, .. } => jit_entry_idx,
+                _ => 0,
+            };
+            unsafe { iseq.params() }.opt_table_slice()
+                .get(jit_entry_start..)
+                .expect("JIT entry index must be within the callee opt table")
+                .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>()
+        }
     };
-    let jit_entry_insns = unsafe { iseq.params() }.opt_table_slice()
-        .get(jit_entry_start..)
-        .expect("JIT entry index must be within the callee opt table")
-        .iter().copied().map(VALUE::as_u32).collect::<Vec<_>>();
     // Check if the EP is escaped for the ISEQ from the beginning. We give up
     // optimizing locals in that case because they're shared with other frames.
     let ep_starts_escaped = iseq_ep_starts_escaped(iseq);
@@ -11219,8 +11255,15 @@ fn add_iseq_to_hir(
     // optionals, reached from this one by fallthrough rather than targeted directly.
     // Standalone compilation has no single body entry block, so it produces none.
     let body_entry_block = match mode {
-        AddIseqMode::Standalone => None,
+        AddIseqMode::Standalone | AddIseqMode::Resume { .. } => None,
         AddIseqMode::Inlined { .. } => Some(insn_idx_to_block[&jit_entry_insns[0]]),
+    };
+
+    let resume_entry_state = if let AddIseqMode::Resume { insn_idx, stack_size } = mode {
+        let target_block = insn_idx_to_block[&u32::from(insn_idx)];
+        Some(compile_resume_entry_block(fun, insn_idx, stack_size, target_block))
+    } else {
+        None
     };
 
     if matches!(mode, AddIseqMode::Standalone) {
@@ -11242,8 +11285,13 @@ fn add_iseq_to_hir(
     // Iteratively fill out basic blocks using a queue.
     // TODO(max): Basic block arguments at edges
     let mut queue = VecDeque::new();
-    for &insn_idx in jit_entry_insns.iter() {
-        queue.push_back((new_frame_state(mode, iseq), insn_idx_to_block[&insn_idx], /*insn_idx=*/insn_idx));
+    if let Some(entry_state) = resume_entry_state {
+        let insn_idx = u32::try_from(entry_state.insn_idx()).unwrap();
+        queue.push_back((entry_state, insn_idx_to_block[&insn_idx], insn_idx));
+    } else {
+        for &insn_idx in jit_entry_insns.iter() {
+            queue.push_back((new_frame_state(mode, iseq), insn_idx_to_block[&insn_idx], /*insn_idx=*/insn_idx));
+        }
     }
 
     // Keep compiling blocks until the queue becomes empty
@@ -12279,7 +12327,7 @@ fn add_iseq_to_hir(
                 YARVINSN_leave => {
                     let val = state.stack_pop()?;
                     match mode {
-                        AddIseqMode::Standalone => {
+                        AddIseqMode::Standalone | AddIseqMode::Resume { .. } => {
                             fun.push_insn(block, Insn::CheckInterrupts { state: exit_id });
                             fun.push_insn(block, Insn::Return { val })
                         },
@@ -13139,7 +13187,7 @@ fn add_iseq_to_hir(
         }
     }
 
-    if matches!(mode, AddIseqMode::Standalone) {
+    if matches!(mode, AddIseqMode::Standalone | AddIseqMode::Resume { .. }) {
         // Populate the entries superblock with an Entries instruction targeting all entry blocks
         fun.seal_entries();
 
@@ -13159,6 +13207,44 @@ fn add_iseq_to_hir(
     }
 
     Ok(AddIseqResult { body_entry_block, profiles })
+}
+
+/// Compile the entry_block of a resumed frame. It loads every local from the frame's EP and the
+/// operand stack from its SP, since the frame may be resumed at any instruction.
+fn compile_resume_entry_block(fun: &mut Function, insn_idx: u16, stack_size: u8, target_block: BlockId) -> FrameState {
+    let entry_block = fun.entry_block;
+    fun.push_insn(entry_block, Insn::ResumeEntryPoint { insn_idx, stack_size });
+
+    let iseq = fun.iseq;
+    let self_param = fun.load_self(entry_block);
+    let mut entry_state = FrameState::new(iseq);
+    entry_state.insn_idx = insn_idx.into();
+    entry_state.pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx.into()) };
+
+    let ep = fun.get_ep(entry_block, 0);
+    for local_idx in 0..num_locals(iseq) {
+        let ep_offset = local_idx_to_ep_offset(iseq, local_idx);
+        let ep_offset = u32::try_from(ep_offset)
+            .unwrap_or_else(|_| panic!("Could not convert ep_offset {ep_offset} to u32"));
+        let local = fun.get_local_from_ep(entry_block, iseq, ep, ep_offset, 0, types::BasicObject);
+        entry_state.locals.push(local);
+    }
+
+    // The resume entry point moves the SP register to the bottom of the operand stack.
+    if stack_size > 0 {
+        let sp = fun.load_sp(entry_block);
+        for stack_idx in 0..u16::from(stack_size) {
+            let offset = SIZEOF_VALUE_I32 * i32::from(stack_idx);
+            let val = fun.load_field(entry_block, sp, FieldName::Stack(stack_idx), offset, types::BasicObject);
+            entry_state.stack_push(val);
+        }
+    }
+
+    if get_option!(stats) {
+        fun.count_iseq_calls(entry_block);
+    }
+    fun.push_insn(entry_block, Insn::Jump(BranchEdge { target: target_block, args: entry_state.as_args(self_param) }));
+    entry_state
 }
 
 /// Compile an entry_block for the interpreter

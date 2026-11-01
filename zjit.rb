@@ -173,6 +173,8 @@ class << RubyVM::ZJIT
       :compiled_iseq_count,
       :compiled_lukewarm_iseq_count,
       :lukewarm_tier_up_count,
+      :compiled_resume_entry_count,
+      :resumed_frame_count,
       :compiled_side_exit_count,
       :failed_iseq_count,
 

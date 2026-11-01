@@ -65,7 +65,7 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
 
     // Clear IseqVersion references. Patch points may hold raw pointers to them, so
     // they have to outlive the ISEQ. They're dropped when the assumption is broken.
-    for &version in payload.versions.iter() {
+    for version in payload.all_versions() {
         unsafe { (*version.as_ptr()).iseq = null() };
     }
 
@@ -122,7 +122,7 @@ fn iseq_mark(payload: &IseqPayload) {
     if let Some(cref) = payload.compile_cref {
         unsafe { rb_gc_mark(cref); }
     }
-    for version in payload.versions.iter() {
+    for version in payload.all_versions() {
         for &object in unsafe { version.as_ref() }.patch_point_objects.iter() {
             unsafe { rb_gc_mark(object); }
         }
@@ -130,7 +130,7 @@ fn iseq_mark(payload: &IseqPayload) {
 
     // Mark objects baked in JIT code
     let cb = ZJITState::get_code_block();
-    for version in payload.versions.iter() {
+    for version in payload.all_versions() {
         for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
             let value_ptr: *const u8 = offset.raw_ptr(cb);
             // Creating an unaligned pointer is well defined unlike in C.
@@ -164,7 +164,7 @@ fn iseq_update_references(payload: &mut IseqPayload) {
         }
     });
 
-    for &version in payload.versions.iter() {
+    for version in payload.all_versions() {
         iseq_version_update_references(version);
     }
 }

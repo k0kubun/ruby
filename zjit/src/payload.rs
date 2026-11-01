@@ -14,6 +14,12 @@ pub struct IseqPayload {
     pub profile: IseqProfile,
     /// JIT code versions. Different versions should have different assumptions.
     pub versions: Vec<IseqVersionRef>,
+    /// Entries that resume a frame of this ISEQ in JIT code at an instruction other than
+    /// the start, e.g. after an exception handler. See [`crate::codegen::rb_zjit_resume_entry`].
+    pub resume_entries: Vec<ResumeEntry>,
+    /// Every version compiled for `resume_entries`, including invalidated ones whose code
+    /// may still be running. Kept for GC, like `versions`.
+    pub resume_versions: Vec<IseqVersionRef>,
     /// Whether a previous compilation of this ISEQ was invalidated due to
     /// singleton class creation (violation of [`crate::hir::Invariant::NoSingletonClass`]).
     pub was_invalidated_for_singleton_class_creation: bool,
@@ -54,6 +60,8 @@ impl IseqPayload {
         Self {
             profile: IseqProfile::new(),
             versions: vec![],
+            resume_entries: vec![],
+            resume_versions: vec![],
             was_invalidated_for_singleton_class_creation: false,
             self_is_heap_object: false,
             compile_cref: None,
@@ -89,6 +97,11 @@ impl IseqPayload {
         gc_count > 0 && !self.hot_loop && !self.tiered_up
             && unsafe { rb_gc_count() }.wrapping_sub(self.profile_start_gc_count) >= gc_count
     }
+
+    /// Every JIT code version of the ISEQ, including the ones for resume entries.
+    pub fn all_versions(&self) -> impl Iterator<Item = IseqVersionRef> + '_ {
+        self.versions.iter().chain(self.resume_versions.iter()).copied()
+    }
 }
 
 /// Remember when the profiling window of an ISEQ started. See [`IseqPayload::is_lukewarm`].
@@ -109,6 +122,19 @@ pub extern "C" fn rb_zjit_iseq_mark_hot_loop(iseq: IseqPtr) {
     with_vm_lock(src_loc!(), || {
         get_or_create_iseq_payload(iseq).hot_loop = true;
     });
+}
+
+/// An entry that resumes a frame at `insn_idx` with `stack_size` values on its operand stack.
+#[derive(Debug)]
+pub struct ResumeEntry {
+    pub insn_idx: u16,
+    pub stack_size: u8,
+    /// Number of times the frame has been resumed here without compiled code
+    pub count: u32,
+    /// Number of versions compiled for the entry
+    pub num_versions: usize,
+    /// The latest version compiled for the entry
+    pub version: Option<IseqVersionRef>,
 }
 
 /// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.
@@ -141,6 +167,9 @@ pub struct IseqVersion {
     /// Per-call-site caches of a receiver class that the JIT code writes at run time. See
     /// [`crate::hir::Function::klass_caches`]. Marked and moved by [`crate::gc`].
     pub klass_caches: Vec<Box<VALUE>>,
+
+    /// Whether this version is for a [`ResumeEntry`] rather than the start of the ISEQ.
+    pub is_resume: bool,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -163,6 +192,7 @@ impl IseqVersion {
             incoming: vec![],
             patch_point_objects: vec![],
             klass_caches: vec![],
+            is_resume: false,
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")

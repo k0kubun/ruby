@@ -535,6 +535,14 @@ pub extern "C" fn rb_zjit_tracing_invalidate_all() {
             if let Some(version) = payload.versions.last_mut() {
                 unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
             }
+            // Resume entries are entered only by the interpreter, which would otherwise keep
+            // entering their code. Drop it so that they're compiled again like jit_func.
+            for entry in payload.resume_entries.iter_mut() {
+                if let Some(mut version) = entry.version {
+                    unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
+                }
+                entry.count = 0;
+            }
             unsafe { rb_iseq_reset_jit_func(iseq) };
         });
 
