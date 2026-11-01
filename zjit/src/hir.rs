@@ -1353,6 +1353,9 @@ pub enum Insn {
         /// Guarded `struct rb_captured_block *` (block handler with the ISEQ tag masked off).
         captured: InsnId,
         args: Vec<InsnId>,
+        /// Number of `yield` arguments on the caller's stack. It's 1 when the block splats its
+        /// sole Array argument into `args`.
+        stack_argc: usize,
         state: InsnId,
     },
 
@@ -3554,9 +3557,18 @@ pub fn cfunc_call_catches_break(iseq: IseqPtr, insn_idx: u32, block_iseq: IseqPt
         && unsafe { rb_zjit_iseq_break_lands_p(iseq, block_iseq, epc) }
 }
 
+/// True if `yield` with `argc` positional args to the simple block `iseq` splats its only
+/// argument into the block's lead parameters when it's an Array, e.g. `|key, value|` or `|a,|`.
+/// See `vm_callee_setup_block_arg`.
+fn block_arg0_splat_p(iseq: IseqPtr, argc: usize) -> bool {
+    argc == 1
+        && unsafe { rb_get_iseq_body_param_lead_num(iseq) } >= 1
+        && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) }
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
-/// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
+/// with an exact arity match or an arg0 auto-splat, and contain no `throw` (break /
 /// non-local return) unless `allow_throw`. Anything else falls back to the generic
 /// `invokeblock` dispatch, with the returned reason attached to the fallback instruction.
 fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize, allow_throw: bool) -> Result<(), SendFallbackReason> {
@@ -3564,10 +3576,7 @@ fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize, allow_throw: bool) -
         return Err(InvokeBlockNotSpecialized);
     }
     let lead_num = unsafe { rb_get_iseq_body_param_lead_num(iseq) } as usize;
-    if argc != lead_num {
-        return Err(InvokeBlockNotSpecialized);
-    }
-    if argc == 1 && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) } {
+    if argc != lead_num && !block_arg0_splat_p(iseq, argc) {
         return Err(InvokeBlockNotSpecialized);
     }
     if !allow_throw && crate::codegen::block_iseq_may_throw(iseq) {
@@ -3720,7 +3729,42 @@ impl Function {
         let ep = self.get_ep(block, level);
         let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
         let captured = self.untag_block_handler(block, block_handler);
-        self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state })
+        let stack_argc = args.len();
+        let args = self.setup_block_args(block, block_iseq, args, state);
+        self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, stack_argc, state })
+    }
+
+    /// Set up the arguments of a `yield` to the simple block `block_iseq` for its lead parameters.
+    /// Like `vm_callee_setup_block_arg`, a sole Array argument is splatted, e.g. each pair yielded
+    /// to `|key, value|`, padding missing elements with nil and dropping extra ones.
+    fn setup_block_args(&mut self, block: BlockId, block_iseq: IseqPtr, args: Vec<InsnId>, state: InsnId) -> Vec<InsnId> {
+        if !block_arg0_splat_p(block_iseq, args.len()) {
+            return args;
+        }
+        let arg0 = args[0];
+        // While building HIR, types are not inferred yet, but e.g. a literal's type is known.
+        // A block param's type is not known until infer_types().
+        let arg0_type = if matches!(self.insns[arg0], Insn::Param) {
+            self.type_of(arg0)
+        } else {
+            self.type_of(arg0).intersection(self.infer_type(arg0))
+        };
+        let array = if arg0_type.is_subtype(types::Array) {
+            arg0
+        } else if !self.policy.no_side_exits && arg0_type.could_be(types::Array) {
+            // A non-Array would be converted with `to_ary`. Leave that rare case to the interpreter.
+            self.push_insn(block, Insn::GuardType { val: arg0, guard_type: types::Array, state, recompile: Some(Recompile) })
+        } else {
+            // Like vm_callee_setup_block_arg_arg0_check: `to_ary` if defined, otherwise the
+            // argument is passed as is, which is the first element of `[arg0]`.
+            self.push_insn(block, Insn::ExpandArrayToAry { val: arg0, state })
+        };
+        let length = self.push_insn(block, Insn::ArrayLength { array });
+        let lead_num = unsafe { rb_get_iseq_body_param_lead_num(block_iseq) } as i64;
+        (0..lead_num).map(|i| {
+            let index = self.push_insn(block, Insn::Const { val: Const::CInt64(i) });
+            self.push_insn(block, Insn::ArrayArefChecked { array, index, length })
+        }).collect()
     }
 
     /// Dispatch `yield` to the profiled ISEQ blocks. If `monomorphic_iseq`, it guards on a single ISEQ
@@ -3758,7 +3802,9 @@ impl Function {
             let captured_iseq = self.load_captured_code_iseq(block, captured);
             self.push_insn(block, Insn::GuardBitEquals { val: captured_iseq, expected: Const::Value(VALUE::from(block_iseq)), reason: Box::new(SideExitReason::InvokeBlockIseqChanged), state, recompile: Some(Recompile) });
 
-            let result = self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, state });
+            let stack_argc = args.len();
+            let args = self.setup_block_args(block, block_iseq, args, state);
+            let result = self.push_insn(block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args, stack_argc, state });
             return (block, result);
         }
 
@@ -3791,7 +3837,8 @@ impl Function {
                 if_true: BranchEdge { target: direct_block, args: vec![] },
                 if_false: BranchEdge { target: miss_block, args: vec![] },
             });
-            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: args.clone(), state });
+            let direct_args = self.setup_block_args(direct_block, block_iseq, args.clone(), state);
+            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: direct_args, stack_argc: args.len(), state });
             self.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
             compare_block = miss_block;
         }
@@ -7720,12 +7767,12 @@ impl Function {
     /// the block was inlined.
     fn try_inline_block(&mut self, block: BlockId, pos: usize) -> Option<BlockId> {
         let insn_id = self.blocks[block].insns[pos];
-        let Insn::InvokeBlockIseqDirect { iseq, captured, args, state } = self.find(insn_id) else {
+        let Insn::InvokeBlockIseqDirect { iseq, captured, args, stack_argc, state } = self.find(insn_id) else {
             unreachable!("position {insn_id} is not an InvokeBlockIseqDirect");
         };
 
         let call_state = self.frame_state(state);
-        let block_pop = InlineFramePop { iseq, argc: args.len(), state };
+        let block_pop = InlineFramePop { iseq, argc: stack_argc, state };
         let throw_targets = self.inlined_block_throw_targets(block_pop, &call_state);
 
         // Inlining a block whose `break` or `return` can become a jump saves an expensive
@@ -7746,7 +7793,7 @@ impl Function {
 
         // The block's perspective of the stack is with the arguments popped off.
         // Unlike a method call, `yield` has no receiver on the stack.
-        let caller_stack_size = call_state.stack_size() - args.len();
+        let caller_stack_size = call_state.stack_size() - stack_argc;
         let post_yield_caller = self.new_insn(Insn::Snapshot { state: Box::new(call_state.with_stack_size(caller_stack_size)) });
         let mode = AddIseqMode::Inlined {
             return_block: continuation,
@@ -7796,7 +7843,7 @@ impl Function {
 
         // Map the block body entry params [self, local0, local1, ...] to caller values.
         // can_direct_invoke_block_iseq ensures the block only has lead parameters and
-        // that `yield` passes exactly that many arguments, so the leading locals take the
+        // setup_block_args passes exactly that many arguments, so the leading locals take the
         // arguments in order and the remaining locals are nil-initialized.
         if let Some((&self_param, local_params)) = callee_body_params.split_first() {
             self.make_equal_to(self_param, block_self);
@@ -7813,7 +7860,7 @@ impl Function {
 
         // Set up the continuation block. See inline_methods.
         let return_val_param = self.push_insn(continuation, Insn::Param);
-        self.push_insn(continuation, Insn::PopInlineFrame { iseq, argc: args.len(), state });
+        self.push_insn(continuation, Insn::PopInlineFrame { iseq, argc: stack_argc, state });
         for &id in &tail[1..] {
             self.push_insn_id(continuation, id);
         }
@@ -7821,7 +7868,7 @@ impl Function {
 
         self.push_insn_id(block, post_yield_caller);
         self.push_insn(block, Insn::PushInlineBlockFrame {
-            iseq, recv: block_self, captured, num_args: args.len().try_into().unwrap(), state,
+            iseq, recv: block_self, captured, num_args: stack_argc.try_into().unwrap(), state,
         });
         self.count(block, Counter::inline_block_optimized_send_count);
         self.push_insn(block, Insn::Jump(BranchEdge { target: callee_entry_body_block, args: vec![] }));

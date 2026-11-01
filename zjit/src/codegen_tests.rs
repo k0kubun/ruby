@@ -1690,7 +1690,7 @@ fn test_yield_non_direct_iseq_profile_then_ifunc() {
     set_call_threshold(2);
     eval("
         def invoke = yield(10)
-        def two = invoke { |a, b| [a, b] }
+        def two = invoke { |a, b = nil| [a, b] }
         def via_enum = to_enum(:invoke).to_a
         two; two
     ");
@@ -1806,6 +1806,69 @@ fn test_inline_block_into_array_each() {
             test([1, 2, 3])
             test([1, 2, 3])
         "), @"6");
+    });
+}
+
+#[test]
+fn test_inline_block_splats_array_arg_into_params() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_block("
+            def test(a)
+              r = []
+              a.each { |x, y| r << x << y }
+              r + a.map { |x,| x }
+            end
+            test([[1, 2], [3]])
+            test([[1, 2, 5], [3]])
+        "), @"[1, 2, 3, nil, 1, 3]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_splatted_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_block("
+            def test(a, key)
+              a.each { |k, v| return v if k == key }
+              nil
+            end
+            test([[:a, 1], [:b, 2]], :b)
+            [test([[:a, 1], [:b, 2]], :b), test([[:a, 1]], :b)]
+        "), @"[2, nil]");
+    });
+}
+
+#[test]
+fn test_yield_non_array_to_splatting_block() {
+    with_inlining(|| {
+        eval("
+            class SplatToAry
+              def to_ary = [7, 8]
+            end
+            def test(a) = a.map { |x, y| [x, y] }
+            test([[1, 2]])
+            test([[1, 2]])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("test([[1, 2], 3, SplatToAry.new])"), @"[[1, 2], [3, nil], [7, 8]]");
+    });
+}
+
+#[test]
+fn test_yield_block_param_to_splatting_block() {
+    // The yielded value is a basic block param, whose type is not known while building HIR
+    with_inlining(|| {
+        eval("
+            def yielder(a)
+              x = a.first
+              x = [x, 1] if a.size > 1
+              yield x
+            end
+            def test(a) = yielder(a) { |p, q| [p, q] }
+            def run = [test([[1, 2]]), test([3, 4]), test([5])]
+            run
+            run
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("run"), @"[[1, 2], [3, 1], [5, nil]]");
     });
 }
 

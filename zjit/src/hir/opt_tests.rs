@@ -5951,7 +5951,7 @@ mod hir_opt_tests {
     fn test_yield_non_direct_iseq_profile_keeps_ifunc_arm() {
         let result = eval("
             def invoke = yield(10)
-            def two = invoke { |a, b| a }
+            def two = invoke { |a, b = 1| a }
             two; two; two
             two
         ");
@@ -28418,6 +28418,44 @@ mod hir_opt_tests {
             "Expected SendDirect to remain in HIR when budget is exceeded:\n{result}");
         assert!(!result.contains("PushInlineFrame"),
             "Expected no PushInlineFrame in HIR when budget is exceeded:\n{result}");
+    }
+
+    #[test]
+    fn test_invoke_block_splats_array_arg() {
+        eval("
+            def each_pair = yield [1, 2]
+            def test = each_pair { |a, b| a }
+            test
+            test
+        ");
+        assert_snapshot!(hir_string("each_pair"), @"
+        fn each_pair@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          v10:ArrayExact[VALUE(0x1000)] = Const Value(VALUE(0x1000))
+          v11:ArrayExact = ArrayDup v10
+          v13:CPtr = GetEP 0
+          v14:CInt64 = LoadField v13, :VM_ENV_DATA_INDEX_SPECVAL@0x1008
+          v15:CInt64[3] = Const CInt64(3)
+          v16:CInt64 = IntAnd v14, v15
+          v17:CInt64[1] = GuardBitEquals v16, CInt64(1) recompile
+          v18:CInt64[-4] = Const CInt64(-4)
+          v19:CInt64 = IntAnd v14, v18
+          v20:Iseq = LoadField v19, :code_iseq@0x1009
+          v21:Iseq[VALUE(0x1010)] = GuardBitEquals v20, Value(VALUE(0x1010)) recompile
+          v22:CInt64 = ArrayLength v11
+          v23:CInt64[0] = Const CInt64(0)
+          v24:BasicObject = ArrayArefChecked v11, v23, v22
+          CheckInterrupts
+          Return v24
+        ");
     }
 
     #[test]

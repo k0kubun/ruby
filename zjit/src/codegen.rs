@@ -931,7 +931,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, &function.frame_state(*state), unsafe { &**bf }, *leaf, opnds!(args)),
-        Insn::InvokeBlockIseqDirect { iseq, captured, args, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), &function.frame_state(*state)),
+        Insn::InvokeBlockIseqDirect { iseq, captured, args, stack_argc, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), *stack_argc, &function.frame_state(*state)),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, jit_entry_idx)),
         &Insn::ResumeEntryPoint { insn_idx, stack_size } => no_output!(gen_resume_entry_point(jit, asm, insn_idx, stack_size)),
         Insn::Return { val } => no_output!(gen_return(asm, opnd!(val))),
@@ -2570,6 +2570,7 @@ fn gen_invoke_block_iseq_direct(
     block_iseq: IseqPtr,
     captured: Opnd,
     args: Vec<Opnd>,
+    stack_argc: usize,
     state: &FrameState,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::block_iseq_direct_optimized_send_count);
@@ -2587,14 +2588,14 @@ fn gen_invoke_block_iseq_direct(
     // specval = VM_GUARDED_PREV_EP(captured->ep) = captured->ep | 0x01
     let specval = asm.or(captured_ep, Opnd::Imm(0x1));
 
-    let stack_size = state.stack().len() - args.len();
+    let stack_size = state.stack().len() - stack_argc;
     let stack_map = build_stack_map(jit, function, &state.with_stack_size(stack_size));
     let jit_frame = gen_write_jit_frame(asm, state);
     gen_save_sp(asm, stack_size);
 
     asm.stack_map(stack_map, jit_frame, state.depth);
 
-    gen_push_frame(asm, args.len(), state, ControlFrame {
+    gen_push_frame(asm, stack_argc, state, ControlFrame {
         recv: captured_self,
         iseq: Some(block_iseq),
         cme: std::ptr::null(),
@@ -2614,7 +2615,7 @@ fn gen_invoke_block_iseq_direct(
     asm.mov(CFP, new_cfp); // will be published at `ec->cfp` after callee's entrypoint
 
     // JIT-to-JIT convention: self as c_args[0], then positional args. The block is
-    // gated to simple + lead-only + exact arity, so there are no optionals/kw/block.
+    // gated to simple + lead-only, and HIR set up exactly one arg per lead parameter.
     let mut c_args = Vec::with_capacity(1 + args.len());
     c_args.push(captured_self);
     c_args.extend(&args);
