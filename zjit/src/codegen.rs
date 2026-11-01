@@ -5089,8 +5089,9 @@ fn gen_string_setbyte_fixnum(jit: &mut JITState, asm: &mut Assembler, string: Op
     let edge = |target| Target::Block(Box::new(lir::BranchEdge { target, args: vec![] }));
 
     // Do in JIT code what rb_str_setbyte() does when the string is already independent: store
-    // into an embedded string and clear its coderange, or store an ASCII byte into a 7-bit heap
-    // string. Call rb_str_setbyte() for anything else.
+    // into an embedded string and clear its coderange, store into a heap string whose coderange
+    // is unknown, or store an ASCII byte into a 7-bit heap string. Call rb_str_setbyte() for
+    // anything else.
     asm_comment!(asm, "String#setbyte");
     let string = asm.load_mem(string);
     let index = asm.load_mem(index);
@@ -5115,7 +5116,11 @@ fn gen_string_setbyte_fixnum(jit: &mut JITState, asm: &mut Assembler, string: Op
     asm.set_current_block(heap_block);
     let label = jit.get_label(asm, heap_block, hir_block_id);
     asm.write_label(label);
+    // An unknown coderange stays unknown, so the byte can be stored as is. A 7-bit string stays
+    // 7-bit with an ASCII byte. Other cases have to compute or clear the coderange.
     let coderange = asm.and(flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    asm.test(coderange, coderange);
+    asm.jz(jit, edge(heap_store_block));
     asm.cmp(coderange, Opnd::UImm(RUBY_ENC_CODERANGE_7BIT as u64));
     asm.jne(jit, edge(slow_block));
     asm.test(byte, Opnd::UImm(0x80));

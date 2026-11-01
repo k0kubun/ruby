@@ -6680,7 +6680,8 @@ fn test_string_setbyte() {
         def test(s, i, v) = s.setbyte(i, v)
         test(+"abc", 0, 65) # profile
     "#);
-    // Embedded strings, 7-bit heap strings with ASCII bytes, and (via rb_str_setbyte) anything else
+    // Embedded strings, 7-bit heap strings with ASCII bytes, heap strings with an unknown coderange,
+    // and (via rb_str_setbyte) anything else
     assert_snapshot!(assert_compiles(r#"
         e = +"hello"
         r = [test(e, 0, 72), test(e, -1, 0x21), test(e, 1, 0xe9), test(e, 2, 300)]
@@ -6695,7 +6696,11 @@ fn test_string_setbyte() {
         u.valid_encoding?
         r << [test(u, 0, 65), u.valid_encoding?]
         r << [e, e.valid_encoding?, e.ascii_only?]
-    "#), @r#"[72, 33, 233, 300, [66, 67, true, "aaaBa", "C"], [255, false, false, 255], [88, "b", "X"], [65, false], ["H\xE9,l!", false, false]]"#);
+        b = ("z" * 1000).force_encoding(Encoding::BINARY) # unknown coderange
+        r << [test(b, 5, 0xfe), test(b, 6, 0x41), b.getbyte(5), b[6], b.valid_encoding?, b.ascii_only?]
+        w = ("w" * 1000).force_encoding(Encoding::UTF_8) # unknown coderange
+        r << [test(w, 0, 0xff), w.valid_encoding?, w.ascii_only?]
+    "#), @r#"[72, 33, 233, 300, [66, 67, true, "aaaBa", "C"], [255, false, false, 255], [88, "b", "X"], [65, false], ["H\xE9,l!", false, false], [254, 65, 254, "A", true, false], [255, false, false]]"#);
 }
 
 // `ascii_only?` and `valid_encoding?` will force a code range scan if necessary and the code range
