@@ -96,6 +96,7 @@ fn profile_insn_sample(
         YARVINSN_expandarray   => profile_operands(profiler, profile, 1),
         YARVINSN_invokeblock   => profile_block_handler(profiler, profile),
         YARVINSN_invokesuper   => profile_invokesuper(profiler, profile),
+        YARVINSN_opt_new => profile_opt_new(profiler, profile),
         YARVINSN_opt_send_without_block | YARVINSN_send => {
             let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
             let argc = num_arguments_on_stack(cd);
@@ -198,6 +199,31 @@ fn observe_profiled_type(profiler: &Profiler, distribution: &mut TypeDistributio
 
     VALUE::from(profiler.iseq).write_barrier(class);
     distribution.observe(ty);
+}
+
+/// Profile the class receiving #new (and the arguments) to specialize on the class.
+/// In `C.new(...)`, the operand on top of the stack is the `...` local, which holds the callinfo
+/// of the call that entered the enclosing method. It is not a Ruby object: the class slot of a
+/// heap imemo_callinfo holds its kwarg pointer, and the callinfo may live on the C stack. So
+/// record it as unknown without reading its class.
+fn profile_opt_new(profiler: &mut Profiler, profile: &mut IseqProfile) {
+    let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
+    let n = num_arguments_on_stack(cd) + 1; // receiver + arguments
+    let forwarding = unsafe { rb_vm_ci_flag((*cd).ci) } & VM_CALL_FORWARDING != 0;
+    if !forwarding {
+        profile_operands(profiler, profile, n);
+        return;
+    }
+    let entry = profile.entry_mut(profiler.insn_idx);
+    if entry.opnd_types.is_empty() {
+        entry.opnd_types = vec![TypeDistribution::new(); n];
+    }
+    let (caller_ci, operands) = entry.opnd_types.split_last_mut().unwrap();
+    for (i, profile_type) in operands.iter_mut().enumerate() {
+        let obj = profiler.peek_at_stack((n - i - 1) as isize);
+        observe_profiled_type(profiler, profile_type, obj, ProfiledType::new(obj));
+    }
+    caller_ci.observe_other();
 }
 
 fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) {
