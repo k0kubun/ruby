@@ -464,6 +464,24 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_opt_new_forwarding_with_keywords
+    # Regression test: in `C.new(...)`, the top operand of opt_new is the `...`
+    # local holding the caller's callinfo, not a Ruby object. Profiling its class
+    # read the kwarg pointer that a heap callinfo keeps in its class slot and
+    # passed it to the write barrier of the old ISEQ, which crashed.
+    assert_runs '[3, {a: 99}]', <<~RUBY, call_threshold: 2
+      class C
+        def initialize(*args, **kw) = @v = [args.size, kw]
+        attr_reader :v
+      end
+      def new_c(...) = C.new(...)
+      4.times { GC.start } # make the ISEQ old so the write barrier inspects the value
+      r = nil
+      100.times { |i| r = new_c(1, 2, 3, a: i) }
+      r.v
+    RUBY
+  end
+
   def test_stack_overflow_exit_from_send_with_normalized_keywords
     # When the VM stack overflows at a SendDirect or an inlined frame, the side
     # exit re-executes the send in the interpreter. It must restore the caller's

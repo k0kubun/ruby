@@ -11972,6 +11972,22 @@ fn test_float_pow() {
 }
 
 #[test]
+fn test_opt_new_profiled_class() {
+    eval("
+        class C
+          def initialize(x) = @x = x
+          attr_reader :x
+        end
+        class D < C; end
+        def test(klass, x) = klass.new(x)
+        test(C, 0) # profile
+    ");
+    assert_snapshot!(assert_compiles("o = test(C, 1); [o.class, o.x]"), @"[C, 1]");
+    // Another class fails the guard and still works
+    assert_snapshot!(inspect("[test(D, 2).class, test(String, 'a'), test(C, 3).x]"), @r#"[D, "a", 3]"#);
+}
+
+#[test]
 fn test_send_backtrace() {
     assert_snapshot!(assert_compiles_allowing_exits(r#"
         def jit_frame2 = caller     # 1

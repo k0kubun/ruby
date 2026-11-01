@@ -11716,7 +11716,23 @@ fn add_iseq_to_hir(
                     let ci = unsafe { (*cd).ci };
                     let flags = unsafe { rb_vm_ci_flag(ci) };
                     assert_eq!(flags & VM_CALL_ARGS_BLOCKARG, 0);
-                    let val = state.stack_topn(argc)?;
+                    let mut val = state.stack_topn(argc)?;
+                    // If the profile saw a single class receiving #new (whose class is the
+                    // class's singleton class), guard that it is that class, like YJIT does with
+                    // its compile-time receiver. That lets IsMethodCfunc fold and ObjectAlloc
+                    // allocate the known class inline for e.g. `self.new` in a class method.
+                    if let Some(profiled_type) = fun.monomorphic_summary(&profiles, val, exit_id) {
+                        let singleton = profiled_type.class();
+                        if singleton.is_singleton_class() {
+                            let class = unsafe { rb_class_attached_object(singleton) };
+                            if unsafe { RB_TYPE_P(class, RUBY_T_CLASS) } {
+                                val = fun.push_insn(block, Insn::GuardBitEquals {
+                                    val, expected: Const::Value(class), reason: Box::new(SideExitReason::GuardType(types::Class)), state: exit_id, recompile: Some(Recompile),
+                                });
+                                state.stack_setn(argc, val);
+                            }
+                        }
+                    }
                     let test_id = fun.push_insn(block, Insn::IsMethodCfunc { val, cd, cfunc: rb_class_new_instance_pass_kw as *const u8, state: exit_id });
 
                     // Jump to the fallback block if it's not the expected function.
