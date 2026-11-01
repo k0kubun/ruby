@@ -5230,8 +5230,21 @@ impl Function {
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoTracePoint, state });
         if no_block {
             // Annotated methods check the types they depend on. The receiver is an instance of a
-            // class that resolves to `cme`, as a profiled receiver would be.
+            // class that resolves to `cme`, as a profiled receiver would be. When `cme` is defined in a
+            // class rather than a module, that makes it an instance of the class, which the inline
+            // implementations of e.g. String methods rely on.
             let tmp_block = self.new_block(u32::MAX);
+            let owner = unsafe { (*cme).owner };
+            let recv = if owner.builtin_type() == RUBY_T_CLASS {
+                let owner_type = Type::from_class_inexact(owner);
+                if self.type_of(recv).is_subtype(owner_type) {
+                    recv
+                } else {
+                    self.push_insn(block, Insn::RefineType { val: recv, new_type: self.type_of(recv).intersection(owner_type) })
+                }
+            } else {
+                recv
+            };
             if let Some(replacement) = (props.inline)(self, tmp_block, recv, args, state) {
                 let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
                 self.blocks[block].insns.extend(insns);

@@ -7672,6 +7672,18 @@ fn test_send_on_method_entry_cfunc() {
 }
 
 #[test]
+fn test_send_on_method_entry_inline_cfunc_on_subclasses() {
+    // Subclasses of String resolve byteslice to String#byteslice, whose inline implementation
+    // needs a String receiver. The method entry check proves the receiver is a String.
+    assert_snapshot!(inspect("
+        CLASSES = 8.times.map { Class.new(String) }
+        def test(s) = s.byteslice(1, 2)
+        test(CLASSES[0].new('abcd')); test(CLASSES[1].new('abcd'))
+        CLASSES.map { test(it.new('abcd')) } + [test('xyz')]
+    "), @r#"["bc", "bc", "bc", "bc", "bc", "bc", "bc", "bc", "yz"]"#);
+}
+
+#[test]
 fn test_send_on_method_entry_respects_visibility() {
     assert_snapshot!(inspect("
         class Base
