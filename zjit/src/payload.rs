@@ -168,6 +168,10 @@ pub struct IseqVersion {
     /// [`crate::hir::Function::klass_caches`]. Marked and moved by [`crate::gc`].
     pub klass_caches: Vec<Box<VALUE>>,
 
+    /// Ivar inline caches of attr_reader reads that the JIT code checks and writes at run
+    /// time. See [`crate::hir::Function::ivar_caches`].
+    pub ivar_caches: Vec<Box<iseq_inline_iv_cache_entry>>,
+
     /// Whether this version is for a [`ResumeEntry`] rather than the start of the ISEQ.
     pub is_resume: bool,
 }
@@ -192,6 +196,7 @@ impl IseqVersion {
             incoming: vec![],
             patch_point_objects: vec![],
             klass_caches: vec![],
+            ivar_caches: vec![],
             is_resume: false,
         };
         let version_ptr = Box::into_raw(Box::new(version));

@@ -571,6 +571,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
     // Prepare for GC
     unsafe { version.as_mut() }.outgoing.extend(iseq_calls);
     unsafe { version.as_mut() }.klass_caches.extend(function.klass_caches.take());
+    unsafe { version.as_mut() }.ivar_caches.extend(function.ivar_caches.take());
     append_gc_offsets(iseq, version, &gc_offsets);
     Ok(iseq_code_ptrs)
 }
@@ -1534,7 +1535,7 @@ fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
     }
     if ic.is_null() {
         asm_ccall!(asm, rb_zjit_getivar, recv, id.0.into())
-    } else if function.type_of(recv_id).is_subtype(types::HeapBasicObject) && ivar_inline_cache_filled(ic) {
+    } else if function.type_of(recv_id).is_subtype(types::HeapBasicObject) && (ivar_inline_cache_filled(ic) || function.is_attr_ivar_cache(ic)) {
         gen_getivar_on_inline_cache(jit, asm, recv, id, ic, state)
     } else {
         let iseq = Opnd::Value(state.iseq.into());

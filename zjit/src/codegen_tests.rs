@@ -12877,6 +12877,51 @@ fn test_ivar_inline_cache_refill_on_final_version() {
 }
 
 #[test]
+fn test_attr_reader_inline_cache_on_final_version() {
+    // The final version reads an attr_reader through an inline cache when the receiver's shape
+    // wasn't profiled. Read @foo on objects that gained ivars after compilation, in runs of the
+    // same shape and alternating shapes, with @foo at another index, unset, on a frozen object,
+    // and on an object with too many ivars to embed them.
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_max_versions(2);
+    let result = inspect(r#"
+        class LateAttrIC
+          attr_reader :foo
+          def initialize(foo, n)
+            @foo = foo
+            n.times { |i| instance_variable_set(:"@x#{i}", i) }
+          end
+        end
+
+        def get(o, x) = [o.foo, x.succ]
+
+        obj = LateAttrIC.new(0, 0)
+        get(obj, 1); get(obj, 1)      # compile v1
+        get(obj, "a"); get(obj, "a")  # invalidate v1, compile the final version
+
+        objs = [1, 2, 3].map { |n| LateAttrIC.new(n, n) }
+        late = LateAttrIC.allocate
+        late.instance_variable_set(:@x0, 0)
+        late.instance_variable_set(:@foo, 4)
+        unset = LateAttrIC.allocate
+        unset.instance_variable_set(:@x0, 0)
+        frozen = LateAttrIC.new(5, 1).freeze
+        extended = LateAttrIC.new(6, 50)
+
+        result = []
+        objs.each { |o| 2.times { result << get(o, "a").first } }
+        2.times { (objs + [late, unset, frozen, extended]).each { |o| result << get(o, "a").first } }
+        result
+    "#);
+    set_max_versions(old_max_versions);
+    set_call_threshold(old_call_threshold);
+    assert_snapshot!(result, @"[1, 1, 2, 2, 3, 3, 1, 2, 3, 4, nil, 5, 6, 1, 2, 3, 4, nil, 5, 6]");
+}
+
+#[test]
 fn test_concurrent_ep_escape() {
     // Test to see if concurrent environment escapes
     // sharing one piece of JIT code produce one consistent result.
