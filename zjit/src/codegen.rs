@@ -5157,43 +5157,118 @@ fn gen_string_setbyte_fixnum(jit: &mut JITState, asm: &mut Assembler, string: Op
 }
 
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, recv_flags: Opnd, other_flags: Opnd, state: &FrameState) -> Opnd {
-    gen_prepare_non_leaf_call(jit, asm, function, state);
-
-    // Test if string encodings differ. If different, use rb_str_buf_append. If the same,
-    // use rb_jit_str_simple_append, which calls rb_str_cat.
-    asm_comment!(asm, "<< on strings");
-
-    // XOR the object flags. If any string-encoding flags differ between the two,
-    // the encodings do not match.
-    let flags_xor = asm.xor(recv_flags, other_flags);
-    asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    // STR_DEPENDANT_MASK in string.c, see gen_string_setbyte_fixnum().
+    const STR_DEPENDANT_MASK: u64 = (RUBY_FL_FREEZE | RUBY_FL_USER7 | RUBY_FL_USER2 | RUBY_FL_USER0 | RUBY_FL_USER18) as u64;
+    // Encodings that rb_str_enc_fastpath() accepts. They are ASCII-compatible and terminated by one byte.
+    const FASTPATH_ENCODING_LIMIT: u64 = ((RUBY_ENCINDEX_US_ASCII as u64) + 1) << RUBY_ENCODING_SHIFT;
+    const _: () = assert!(RUBY_ENCINDEX_ASCII_8BIT < RUBY_ENCINDEX_US_ASCII && RUBY_ENCINDEX_UTF_8 < RUBY_ENCINDEX_US_ASCII);
 
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
+    let check_capa_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let not_7bit_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let fast_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
     let mismatch_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let mismatch_edge = Target::Block(Box::new(lir::BranchEdge { target: mismatch_block, args: vec![] }));
     let result_block = asm.new_block(hir_block_id, false, rpo_idx);
-    let result_edge = Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
+    let edge = |target| Target::Block(Box::new(lir::BranchEdge { target, args: vec![] }));
 
-    asm.jnz(jit, mismatch_edge);
+    // Like a string builder intrinsic in HotSpot or V8, copy the bytes in JIT code when the
+    // receiver has room for them and no coderange or encoding needs to change. This is what
+    // rb_str_buf_append() and rb_str_cat() end up doing for an independent heap string in an
+    // ASCII-compatible encoding, minus their checks and the frame state they need for a raise
+    // or a reallocation. The receiver keeps its coderange, which is right when:
+    // * the argument is 7-bit (and the receiver is not broken, which str_modify_keep_cr() clears), or
+    // * the encodings match and the receiver's coderange is unknown, or both are valid.
+    asm_comment!(asm, "<< on strings");
+    let string = asm.load_mem(string);
+    let val = asm.load_mem(val);
+    let recv_flags = asm.load_mem(recv_flags);
+    let other_flags = asm.load_mem(other_flags);
+    let recv_kind = asm.and(recv_flags, Opnd::UImm(STR_DEPENDANT_MASK | RSTRING_NOEMBED as u64));
+    asm.cmp(recv_kind, Opnd::UImm(RSTRING_NOEMBED as u64));
+    asm.jne(jit, edge(slow_block));
+    let recv_encoding = asm.and(recv_flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.cmp(recv_encoding, Opnd::UImm(FASTPATH_ENCODING_LIMIT));
+    asm.jge(jit, edge(slow_block));
+    let recv_cr = asm.and(recv_flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    let other_cr = asm.and(other_flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    asm.cmp(other_cr, Opnd::UImm(RUBY_ENC_CODERANGE_7BIT as u64));
+    asm.jne(jit, edge(not_7bit_block));
+    // A 7-bit argument keeps the receiver's encoding only if it's ASCII-compatible as well
+    let other_encoding = asm.and(other_flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.cmp(other_encoding, Opnd::UImm(FASTPATH_ENCODING_LIMIT));
+    asm.jge(jit, edge(slow_block));
+    asm.cmp(recv_cr, Opnd::UImm(RUBY_ENC_CODERANGE_BROKEN as u64));
+    asm.je(jit, edge(slow_block));
+    asm.jmp(edge(check_capa_block));
 
-    // If encodings match, call the simple append function
+    asm.set_current_block(not_7bit_block);
+    let label = jit.get_label(asm, not_7bit_block, hir_block_id);
+    asm.write_label(label);
+    let flags_xor = asm.xor(recv_flags, other_flags);
+    asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.jnz(jit, edge(slow_block));
+    asm.test(recv_cr, recv_cr);
+    asm.jz(jit, edge(check_capa_block));
+    asm.cmp(recv_cr, Opnd::UImm(RUBY_ENC_CODERANGE_VALID as u64));
+    asm.jne(jit, edge(slow_block));
+    asm.cmp(other_cr, Opnd::UImm(RUBY_ENC_CODERANGE_VALID as u64));
+    asm.jne(jit, edge(slow_block));
+    asm.jmp(edge(check_capa_block));
+
+    asm.set_current_block(check_capa_block);
+    let label = jit.get_label(asm, check_capa_block, hir_block_id);
+    asm.write_label(label);
+    let recv_len = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RSTRING_LEN));
+    let other_len = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RSTRING_LEN));
+    let new_len = asm.add(recv_len, other_len);
+    let capa = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RSTRING_AS_HEAP_AUX_CAPA));
+    asm.cmp(capa, new_len);
+    asm.jl(jit, edge(slow_block));
+    asm.jmp(edge(fast_block));
+
+    asm.set_current_block(fast_block);
+    let label = jit.get_label(asm, fast_block, hir_block_id);
+    asm.write_label(label);
+    let recv_ptr = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RSTRING_AS_HEAP_PTR));
+    let dst = asm.add(recv_ptr, recv_len);
+    // The heap pointer field overlaps the embedded bytes, so it's fine to load either way
+    let other_heap_ptr = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RSTRING_AS_HEAP_PTR));
+    let other_embed_ptr = asm.lea(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RSTRING_AS_ARY));
+    asm.test(other_flags, Opnd::UImm(RSTRING_NOEMBED as u64));
+    let src = asm.csel_nz(other_heap_ptr, other_embed_ptr);
+    // Copying the receiver into itself is fine: the source ends where the destination starts.
+    asm_ccall!(asm, memcpy, dst, src, other_len);
+    asm.store(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RSTRING_LEN), new_len);
+    let term_ptr = asm.add(recv_ptr, new_len);
+    asm.store(Opnd::mem(8, term_ptr, 0), Opnd::UImm(0));
+    asm.jmp(edge(result_block));
+
+    // Otherwise, use rb_jit_str_simple_append (rb_str_cat) if the encodings are the same,
+    // or rb_str_buf_append, which is encoding-aware, if they differ. They may reallocate or raise.
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    let flags_xor = asm.xor(recv_flags, other_flags);
+    asm.test(flags_xor, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.jnz(jit, edge(mismatch_block));
+    gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_jit_str_simple_append, string, val);
-    asm.jmp(result_edge.clone());
+    asm.jmp(edge(result_block));
 
-    // If encodings are different, use a slower encoding-aware concatenate
     asm.set_current_block(mismatch_block);
     let label = jit.get_label(asm, mismatch_block, hir_block_id);
     asm.write_label(label);
+    gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_str_buf_append, string, val);
-    asm.jmp(result_edge);
+    asm.jmp(edge(result_block));
 
-    // Join block
     asm.set_current_block(result_block);
     let label = jit.get_label(asm, result_block, hir_block_id);
     asm.write_label(label);
 
-    // Either append function returns the receiver
+    // Every path appends to the receiver, which is the return value
     string
 }
 

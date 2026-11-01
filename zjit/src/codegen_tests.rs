@@ -6969,6 +6969,71 @@ fn test_string_append_broken_coderange() {
 }
 
 #[test]
+fn test_string_append_heap_receiver_matches_concat() {
+    // Heap receivers with spare capacity take the in-JIT copy when the coderange can stay as
+    // it is. Compare the bytes, encoding, and coderange-derived predicates with String#concat
+    // for every coderange combination, with the receiver's coderange cached or not.
+    eval(r#"
+        def test(s, x) = s << x
+
+        def heap_string(base, scan)
+          s = String.new(capacity: 1000, encoding: base.encoding)
+          s.concat(base)
+          s.valid_encoding? if scan
+          s
+        end
+
+        def run_cases
+          broken = "\xFF".dup.force_encoding(Encoding::UTF_8)
+          bases = ["abc", "é", "abc".b, "\xFF".b, broken, "abc".dup.force_encoding(Encoding::US_ASCII), ""]
+          args = ["def", "é", "é" * 100, "x" * 100, "\xFE".b, broken, "abc".dup.force_encoding(Encoding::US_ASCII), ""]
+          bases.product(args, [false, true]).map do |base, x, scan|
+            jit = heap_string(base, scan)
+            ref = heap_string(base, scan)
+            jit_result = begin
+              test(jit, x)
+              [jit.bytes, jit.encoding, jit.ascii_only?, jit.valid_encoding?]
+            rescue Encoding::CompatibilityError
+              :error
+            end
+            ref_result = begin
+              ref.concat(x)
+              [ref.bytes, ref.encoding, ref.ascii_only?, ref.valid_encoding?]
+            rescue Encoding::CompatibilityError
+              :error
+            end
+            jit_result == ref_result || [base, x, scan, jit_result, ref_result]
+          end.uniq
+        end
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles_allowing_exits("run_cases"), @"[true]");
+}
+
+#[test]
+fn test_string_append_heap_receiver_grows() {
+    eval(r#"
+        def test(s, x)
+          i = 0
+          while i < 1000
+            s << x
+            i += 1
+          end
+          s
+        end
+    "#);
+    assert_contains_opcode("test", YARVINSN_opt_ltlt);
+    assert_snapshot!(assert_compiles(r#"
+        utf8 = test(String.new(encoding: Encoding::UTF_8), "sssssséé")
+        binary = test(String.new, "abcdefg")
+        self_append = String.new(capacity: 1000) << "ab"
+        test(self_append, "") << self_append << self_append
+        [utf8 == "sssssséé" * 1000, utf8.encoding, utf8.valid_encoding?, utf8.ascii_only?,
+         binary == "abcdefg" * 1000, binary.encoding, binary.ascii_only?, self_append]
+    "#), @r#"[true, #<Encoding:UTF-8>, true, false, true, #<Encoding:BINARY (ASCII-8BIT)>, true, "abababab"]"#);
+}
+
+#[test]
 fn test_new_hash_nonempty() {
     eval(r#"
         def test
