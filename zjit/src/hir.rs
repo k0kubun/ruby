@@ -1002,7 +1002,7 @@ pub struct CondBranchHasTypeData {
 }
 
 /// Comparison performed by [`Insn::CondBranchFixnumCmp`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FixnumCmpOp {
     Lt,
     Le,
@@ -8679,6 +8679,95 @@ impl Function {
         }
     }
 
+    /// Fold a conditional branch whose condition was already decided by a dominating branch. A
+    /// block whose only predecessor ends in a two-way branch knows that branch's outcome, and so
+    /// does every block it dominates; a branch there on the same condition always goes one way and
+    /// becomes a `Jump`. Conditions are matched by value, so `x < 1` tested by each of several
+    /// inlined frames (each with its own `Const 1`) is recognized as the same test.
+    ///
+    /// Inlining a chain of methods that each branch on the same argument, e.g.
+    /// `def f(x) = x < 1 ? g(x) : h(x)`, otherwise grows the caller exponentially in the inlining
+    /// depth: both arms of every inlined callee are kept even though only one of them is reachable.
+    /// This is V8 Turbofan's `BranchElimination` and HotSpot C2's dominated `If` folding.
+    fn eliminate_dominated_branches(&mut self) {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        enum Operand { Insn(InsnId), Fixnum(i64) }
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        enum Cond { Truthy(InsnId), CBool(InsnId), FixnumCmp(FixnumCmpOp, Operand, Operand) }
+
+        let operand = |fun: &Function, insn_id: InsnId| match fun.type_of(insn_id).fixnum_value() {
+            Some(n) => Operand::Fixnum(n),
+            None => Operand::Insn(fun.find_id(insn_id)),
+        };
+        // The condition a block's terminator branches on and its (true, false) targets.
+        let branch_cond = |fun: &Function, block: BlockId| -> Option<(Cond, BlockId, BlockId)> {
+            let &terminator = fun.blocks[block].insns.last()?;
+            let (cond, if_true, if_false) = match &fun.insns[terminator] {
+                &Insn::CondBranchTest { val, ref if_true, ref if_false } => {
+                    let cond = match *fun.find_ref(val) {
+                        Insn::FixnumLt { left, right } => Cond::FixnumCmp(FixnumCmpOp::Lt, operand(fun, left), operand(fun, right)),
+                        Insn::FixnumLe { left, right } => Cond::FixnumCmp(FixnumCmpOp::Le, operand(fun, left), operand(fun, right)),
+                        Insn::FixnumGt { left, right } => Cond::FixnumCmp(FixnumCmpOp::Gt, operand(fun, left), operand(fun, right)),
+                        Insn::FixnumGe { left, right } => Cond::FixnumCmp(FixnumCmpOp::Ge, operand(fun, left), operand(fun, right)),
+                        Insn::FixnumEq { left, right } => Cond::FixnumCmp(FixnumCmpOp::Eq, operand(fun, left), operand(fun, right)),
+                        _ => Cond::Truthy(fun.find_id(val)),
+                    };
+                    (cond, if_true.target, if_false.target)
+                }
+                &Insn::CondBranch { val, ref if_true, ref if_false } => (Cond::CBool(fun.find_id(val)), if_true.target, if_false.target),
+                Insn::CondBranchFixnumCmp(insn) =>
+                    (Cond::FixnumCmp(insn.op, operand(fun, insn.left), operand(fun, insn.right)), insn.if_true.target, insn.if_false.target),
+                _ => return None,
+            };
+            if if_true == if_false { None } else { Some((cond, if_true, if_false)) }
+        };
+
+        // Only a condition tested by more than one branch can be decided by another branch. Most
+        // functions have none, so find them first to skip computing dominators.
+        let mut seen = HashSet::new();
+        let mut repeated = HashSet::new();
+        for block in 0..self.blocks.len() {
+            if self.blocks[block].insns.is_empty() { continue; }
+            if let Some((cond, _, _)) = branch_cond(self, BlockId(block as u32)) {
+                if !seen.insert(cond) {
+                    repeated.insert(cond);
+                }
+            }
+        }
+        if repeated.is_empty() {
+            return;
+        }
+
+        let dominators = Dominators::new(self);
+        // Conditions known to hold (true) or not (false) on entry to each block.
+        let mut known: Vec<Vec<(Cond, bool)>> = vec![vec![]; self.blocks.len()];
+        for &block in dominators.cfi.reverse_post_order() {
+            let idom = dominators.idom(block);
+            let mut facts = if idom == block { vec![] } else { known[idom].clone() };
+            if let &[pred] = dominators.cfi.predecessors(block) {
+                if let Some((cond, if_true, if_false)) = branch_cond(self, pred) {
+                    if repeated.contains(&cond) && (block == if_true || block == if_false) {
+                        facts.push((cond, block == if_true));
+                    }
+                }
+            }
+            if let Some((cond, _, _)) = branch_cond(self, block) {
+                if let Some(&(_, taken)) = facts.iter().find(|(known_cond, _)| *known_cond == cond) {
+                    let terminator = *self.blocks[block].insns.last().unwrap();
+                    let edge = match &self.insns[terminator] {
+                        Insn::CondBranchTest { if_true, if_false, .. } | Insn::CondBranch { if_true, if_false, .. } =>
+                            if taken { if_true.clone() } else { if_false.clone() },
+                        Insn::CondBranchFixnumCmp(insn) => if taken { insn.if_true.clone() } else { insn.if_false.clone() },
+                        _ => unreachable!(),
+                    };
+                    // Terminators are never unioned, so it can be replaced in place.
+                    self.insns[terminator] = Insn::Jump(edge);
+                }
+            }
+            known[block] = facts;
+        }
+    }
+
     /// Fuse a fixnum compare into the `CondBranchTest` that consumes it, so codegen can branch on
     /// the compare's condition flags directly (`cmp left, right; jcc`) instead of materializing
     /// Qtrue/Qfalse and then testing it again. The compare must be defined in the same block as
@@ -9223,6 +9312,7 @@ impl Function {
             (optimize_load_store) => { Counter::compile_hir_optimize_load_store_time_ns };
             (canonicalize) => { Counter::compile_hir_canonicalize_time_ns };
             (fold_constants) => { Counter::compile_hir_fold_constants_time_ns };
+            (eliminate_dominated_branches) => { Counter::compile_hir_eliminate_dominated_branches_time_ns };
             (fuse_fixnum_compare_branches) => { Counter::compile_hir_fuse_fixnum_compare_branches_time_ns };
             (clean_cfg) => { Counter::compile_hir_clean_cfg_time_ns };
             (remove_redundant_patch_points) => { Counter::compile_hir_remove_redundant_patch_points_time_ns };
@@ -9278,6 +9368,7 @@ impl Function {
             run_pass!(optimize_load_store);
             run_pass!(canonicalize);
             run_pass!(fold_constants);
+            run_pass!(eliminate_dominated_branches);
             run_pass!(clean_cfg);
             run_pass!(remove_redundant_patch_points);
             run_pass!(remove_duplicate_check_interrupts);

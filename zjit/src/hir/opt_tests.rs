@@ -27820,27 +27820,82 @@ mod hir_opt_tests {
         bb7():
           v26:Fixnum[0] = Const Value(0)
           PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
-          CondBranchFixnumCmp Lt, v82, v26, bb8(), bb5()
-        bb8():
-          v37:Fixnum[0] = Const Value(0)
-          PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
-          CondBranchFixnumCmp Lt, v82, v37, bb9(), bb4()
-        bb9():
           v47:Fixnum[3] = Const Value(3)
           CheckInterrupts
           Return v47
-        bb4():
-          v74:NilClass = Const Value(nil)
-          CheckInterrupts
-          Return v74
-        bb5():
-          v65:NilClass = Const Value(nil)
-          CheckInterrupts
-          Return v65
         bb6():
           v56:NilClass = Const Value(nil)
           CheckInterrupts
           Return v56
+        ");
+    }
+
+    #[test]
+    fn test_eliminate_branch_dominated_by_inlined_callers_branch() {
+        set_call_threshold(3);
+        eval("
+            def leaf(x) = x
+            def inner(x) = x < 1 ? leaf(x) : leaf(x + 1)
+            def test(x) = x < 1 ? inner(x) : inner(x + 2)
+            test(0)
+            test(1)
+        ");
+        assert_snapshot!(hir_string_with_inlining("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
+          v54:Fixnum = GuardType v10, Fixnum recompile
+          CondBranchFixnumCmp Lt, v54, v15, bb5(), bb4()
+        bb5():
+          PatchPoint MethodRedefined(Object@0x1040, inner@0x1048, cme:0x1050)
+          v57:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          PushInlineFrame :inner, v57 (0x1078), num_args=1
+          v73:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
+          PatchPoint MethodRedefined(Object@0x1040, leaf@0x1098, cme:0x10a0)
+          PatchPoint NoEPEscape(inner)
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v54
+        bb4():
+          v39:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x10c8, cme:0x10d0)
+          v62:Fixnum = FixnumAdd v54, v39
+          PatchPoint MethodRedefined(Object@0x1040, inner@0x1048, cme:0x1050)
+          v64:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          PushInlineFrame :inner, v64 (0x1078), num_args=1
+          v118:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
+          CondBranchFixnumCmp Lt, v62, v118, bb13(), bb12()
+        bb13():
+          PatchPoint MethodRedefined(Object@0x1040, leaf@0x1098, cme:0x10a0)
+          PatchPoint NoEPEscape(inner)
+          Jump bb10(v62)
+        bb12():
+          v141:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x10c8, cme:0x10d0)
+          v177:Fixnum = FixnumAdd v62, v141
+          PatchPoint MethodRedefined(Object@0x1040, leaf@0x1098, cme:0x10a0)
+          PatchPoint NoEPEscape(inner)
+          Jump bb10(v177)
+        bb10(v152:Fixnum):
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v152
         ");
     }
 

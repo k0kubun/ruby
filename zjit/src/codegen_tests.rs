@@ -2127,6 +2127,18 @@ fn test_yield_inlined_caller_block_dispatches_without_guards() {
 }
 
 #[test]
+fn test_inline_branch_dominated_by_callers_branch() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_allowing_exits("
+            def leaf(x) = x
+            def inner(x) = x < 1 ? leaf(x) : leaf(x + 10)
+            def test(x) = x < 1 ? inner(x) : inner(x - 1)
+            [test(0), test(1), test(2), test(0), test(1), test(2)]
+        "), @"[0, 0, 11, 0, 0, 11]");
+    });
+}
+
+#[test]
 fn test_inline_blockarg_proc_yield() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines("
