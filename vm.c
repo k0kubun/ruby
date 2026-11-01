@@ -3282,6 +3282,18 @@ rb_zjit_spill_frame(const rb_execution_context_t *ec, rb_control_frame_t *cfp)
 }
 #endif
 
+// Take the value of a caught throw_data, which the VM doesn't use anymore, and clear it. A stale
+// pointer to the throw_data can stay in the machine stack, e.g. in a callee-saved register slot of
+// a vm_exec_core() that keeps running after the catch, and the conservative machine stack scan
+// would keep the thrown value and everything reachable from it alive until that frame returns.
+static inline VALUE
+vm_throw_data_take_val(struct vm_throw_data *err)
+{
+    VALUE val = THROW_DATA_VAL(err);
+    *(VALUE *)&err->throw_obj = Qnil;
+    return val;
+}
+
 static inline VALUE
 vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, VALUE errinfo)
 {
@@ -3344,14 +3356,14 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                             // cfp == escape_cfp here so calling with cfp_returning_with_value = true
                             hook_before_rewind(ec, true, state, err);
                             rb_vm_pop_frame(ec);
-                            return THROW_DATA_VAL(err);
+                            return vm_throw_data_take_val(err);
                         }
                     }
                     /* through */
                 }
                 else {
                     /* TAG_BREAK */
-                    *cfp->sp++ = THROW_DATA_VAL(err);
+                    *cfp->sp++ = vm_throw_data_take_val(err);
                     ec->errinfo = Qnil;
                     rb_zjit_materialize_frames(ec, cfp);
                     return Qundef;
@@ -3427,7 +3439,7 @@ vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, V
                         cfp->sp = vm_base_ptr(cfp) + entry->sp;
 
                         if (state != TAG_REDO) {
-                            *cfp->sp++ = THROW_DATA_VAL(err);
+                            *cfp->sp++ = vm_throw_data_take_val(err);
                         }
                         ec->errinfo = Qnil;
                         VM_ASSERT(ec->tag->state == TAG_NONE);
