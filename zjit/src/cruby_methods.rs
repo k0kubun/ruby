@@ -479,9 +479,9 @@ fn inline_array_aset(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
             let recv = fun.coerce_to(block, recv, types::ArrayExact, state);
             let index = fun.coerce_to(block, index, types::Fixnum, state);
             fun.guard_not_frozen(block, recv, state);
-            fun.guard_not_shared(block, recv, state);
 
-            // Store in place if 0 <= idx < length, otherwise call rb_ary_store (e.g. a push at idx == length).
+            // Store in place if 0 <= idx < length and the array is not shared, otherwise call
+            // rb_ary_store (e.g. a push at idx == length, or an unshare of an Array#dup copy).
             let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
             let length = fun.push_insn(block, hir::Insn::ArrayLength { array: recv });
             let _ = fun.push_insn(block, hir::Insn::ArrayAsetChecked { array: recv, index, length, val, state });

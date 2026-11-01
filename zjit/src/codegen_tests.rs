@@ -7020,6 +7020,24 @@ fn test_array_fixnum_aset_push_at_length() {
 }
 
 #[test]
+fn test_array_fixnum_aset_shared_compiled() {
+    eval("
+        def test(arr, idx)
+          arr[idx] = 7
+        end
+        test([1,2,3], 0)
+    ");
+    // Array#dup and slices share their elements with the original array until the first store,
+    // which must unshare them without side-exiting.
+    assert_snapshot!(assert_compiles("
+        a = (0..200).to_a
+        b = a.dup
+        c = a[2, 100]
+        [test(b, 1), test(c, 0), a.first(3), b.first(3), c.first(2)]
+    "), @"[7, 7, [0, 1, 2], [0, 7, 2], [7, 3]]");
+}
+
+#[test]
 fn test_array_fixnum_aset_out_of_bounds_compiled() {
     eval("
         def test(arr, idx)

@@ -8105,8 +8105,9 @@ impl Function {
                     &Insn::ArrayAsetChecked { .. } => {
                         // TODO: Model this better using separate effects. The in-bounds store
                         // doesn't change the array's flags. The rb_ary_store() fallback may change
-                        // its embed and length bits, but not RUBY_FL_FREEZE or RUBY_ELTS_SHARED,
-                        // which are the only bits read from an Array's flags. The current effects
+                        // its embed and length bits and clear RUBY_ELTS_SHARED, but not set
+                        // RUBY_FL_FREEZE or RUBY_ELTS_SHARED, which are the only bits read from an
+                        // Array's flags, so a cached flags value stays conservative. The current effects
                         // system lumps flags in with other memory writes, so we manually exclude
                         // the flags from invalidation for now.
                         let offset = RUBY_OFFSET_RBASIC_FLAGS;

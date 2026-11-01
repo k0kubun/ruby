@@ -2777,8 +2777,14 @@ fn gen_array_aset_checked(
     let slow_edge = Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
     let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
+    let array = asm.load_mem(array);
     let unboxed_idx = asm.load_mem(index);
     let length = asm.load_mem(length);
+    // A shared (copy-on-write) array, e.g. one created by Array#dup, must be unshared before the
+    // first store into it, which rb_ary_store() does, like V8 copies COW elements on a store.
+    let flags = asm.load(Opnd::mem(VALUE_BITS, array, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(flags, Opnd::UImm(RUBY_ELTS_SHARED as u64));
+    asm.jnz(jit, slow_edge.clone());
     // An unsigned comparison also sends negative indices to the slow path.
     asm.cmp(unboxed_idx, length);
     asm.jb(in_bounds_edge);
@@ -2793,7 +2799,8 @@ fn gen_array_aset_checked(
     asm.set_current_block(slow_block);
     let label = jit.get_label(asm, slow_block, hir_block_id);
     asm.write_label(label);
-    // rb_ary_store() may allocate or raise IndexError for a negative index out of range.
+    // rb_ary_store() may allocate (e.g. to unshare the array) or raise IndexError for a negative
+    // index out of range.
     gen_prepare_non_leaf_call(jit, asm, function, state);
     asm_ccall!(asm, rb_ary_store, array, unboxed_idx, val);
     asm.jmp(result_edge());

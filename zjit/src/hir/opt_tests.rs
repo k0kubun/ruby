@@ -16689,10 +16689,9 @@ mod hir_opt_tests {
           v35:ArrayExact = GuardType v10, ArrayExact recompile
           v36:CUInt64 = LoadField v35, :RBASIC_FLAGS@0x1040
           v37:CUInt64 = GuardNoBitsSet v36, RUBY_FL_FREEZE=CUInt64(2048)
-          v39:CUInt64 = GuardNoBitsSet v37, RUBY_ELTS_SHARED=CUInt64(4096)
-          v43:CInt64[1] = Const CInt64(1)
-          v41:CInt64 = ArrayLength v35
-          ArrayAsetChecked v35, v43, v41, v19
+          v41:CInt64[1] = Const CInt64(1)
+          v39:CInt64 = ArrayLength v35
+          ArrayAsetChecked v35, v41, v39, v19
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v19
@@ -16731,10 +16730,9 @@ mod hir_opt_tests {
           v40:Fixnum = GuardType v15, Fixnum recompile
           v41:CUInt64 = LoadField v39, :RBASIC_FLAGS@0x1040
           v42:CUInt64 = GuardNoBitsSet v41, RUBY_FL_FREEZE=CUInt64(2048)
-          v44:CUInt64 = GuardNoBitsSet v42, RUBY_ELTS_SHARED=CUInt64(4096)
-          v45:CInt64 = UnboxFixnum v40
-          v46:CInt64 = ArrayLength v39
-          ArrayAsetChecked v39, v45, v46, v16
+          v43:CInt64 = UnboxFixnum v40
+          v44:CInt64 = ArrayLength v39
+          ArrayAsetChecked v39, v43, v44, v16
           WriteBarrier v39, v16
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -30065,20 +30063,18 @@ mod hir_opt_tests {
           v47:ArrayExact = GuardType v10, ArrayExact recompile
           v48:CUInt64 = LoadField v47, :RBASIC_FLAGS@0x1040
           v49:CUInt64 = GuardNoBitsSet v48, RUBY_FL_FREEZE=CUInt64(2048)
-          v51:CUInt64 = GuardNoBitsSet v49, RUBY_ELTS_SHARED=CUInt64(4096)
-          v66:CInt64[0] = Const CInt64(0)
-          v53:CInt64 = ArrayLength v47
-          ArrayAsetChecked v47, v66, v53, v17
+          v62:CInt64[0] = Const CInt64(0)
+          v51:CInt64 = ArrayLength v47
+          ArrayAsetChecked v47, v62, v51, v17
           PatchPoint NoEPEscape(test)
           v29:Fixnum[1] = Const Value(1)
           v31:Fixnum[2] = Const Value(2)
           PatchPoint NoSingletonClass(Array@0x1008)
           PatchPoint MethodRedefined(Array@0x1008, []=@0x1010, cme:0x1018)
-          v60:CUInt64 = GuardNoBitsSet v49, RUBY_FL_FREEZE=CUInt64(2048)
-          v62:CUInt64 = GuardNoBitsSet v49, RUBY_ELTS_SHARED=CUInt64(4096)
-          v67:CInt64[1] = Const CInt64(1)
-          v64:CInt64 = ArrayLength v47
-          ArrayAsetChecked v47, v67, v64, v31
+          v58:CUInt64 = GuardNoBitsSet v49, RUBY_FL_FREEZE=CUInt64(2048)
+          v63:CInt64[1] = Const CInt64(1)
+          v60:CInt64 = ArrayLength v47
+          ArrayAsetChecked v47, v63, v60, v31
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v31
@@ -30128,32 +30124,30 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []=@0x1078, cme:0x1080)
           v84:CUInt64 = LoadField v69, :RBASIC_FLAGS@0x10a8
           v85:CUInt64 = GuardNoBitsSet v84, RUBY_FL_FREEZE=CUInt64(2048)
-          v87:CUInt64 = GuardNoBitsSet v85, RUBY_ELTS_SHARED=CUInt64(4096)
-          v88:CInt64 = UnboxFixnum v70
-          v89:CInt64 = ArrayLength v69
-          ArrayAsetChecked v69, v88, v89, v78
+          v86:CInt64 = UnboxFixnum v70
+          v87:CInt64 = ArrayLength v69
+          ArrayAsetChecked v69, v86, v87, v78
           PatchPoint NoEPEscape(test)
           v40:NilClass = Const Value(nil)
           PatchPoint NoSingletonClass(Array@0x1008)
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
-          v95:Fixnum = GuardType v16, Fixnum recompile
-          v96:CInt64 = UnboxFixnum v95
-          v97:CInt64 = ArrayLength v69
-          v98:CInt64 = AdjustBounds v96, v97
-          v99:BasicObject = ArrayArefChecked v69, v98, v97
+          v93:Fixnum = GuardType v16, Fixnum recompile
+          v94:CInt64 = UnboxFixnum v93
+          v95:CInt64 = ArrayLength v69
+          v96:CInt64 = AdjustBounds v94, v95
+          v97:BasicObject = ArrayArefChecked v69, v96, v95
           v50:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1040, +@0x1048, cme:0x1050)
-          v102:Fixnum = GuardType v99, Fixnum recompile
-          v103:Fixnum = FixnumAdd v102, v50
+          v100:Fixnum = GuardType v97, Fixnum recompile
+          v101:Fixnum = FixnumAdd v100, v50
           PatchPoint MethodRedefined(Array@0x1008, []=@0x1078, cme:0x1080)
-          v110:CUInt64 = GuardNoBitsSet v85, RUBY_FL_FREEZE=CUInt64(2048)
-          v112:CUInt64 = GuardNoBitsSet v85, RUBY_ELTS_SHARED=CUInt64(4096)
-          v113:CInt64 = UnboxFixnum v95
-          v114:CInt64 = ArrayLength v69
-          ArrayAsetChecked v69, v113, v114, v103
+          v108:CUInt64 = GuardNoBitsSet v85, RUBY_FL_FREEZE=CUInt64(2048)
+          v109:CInt64 = UnboxFixnum v93
+          v110:CInt64 = ArrayLength v69
+          ArrayAsetChecked v69, v109, v110, v101
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v103
+          Return v101
         ");
     }
 
@@ -30190,21 +30184,19 @@ mod hir_opt_tests {
           v51:ArrayExact = GuardType v14, ArrayExact recompile
           v52:CUInt64 = LoadField v51, :RBASIC_FLAGS@0x1040
           v53:CUInt64 = GuardNoBitsSet v52, RUBY_FL_FREEZE=CUInt64(2048)
-          v55:CUInt64 = GuardNoBitsSet v53, RUBY_ELTS_SHARED=CUInt64(4096)
-          v72:CInt64[0] = Const CInt64(0)
-          v57:CInt64 = ArrayLength v51
-          ArrayAsetChecked v51, v72, v57, v15
+          v68:CInt64[0] = Const CInt64(0)
+          v55:CInt64 = ArrayLength v51
+          ArrayAsetChecked v51, v68, v55, v15
           WriteBarrier v51, v15
           PatchPoint NoEPEscape(test)
           v34:Fixnum[1] = Const Value(1)
           PatchPoint NoSingletonClass(Array@0x1008)
           PatchPoint MethodRedefined(Array@0x1008, []=@0x1010, cme:0x1018)
-          v64:CUInt64 = LoadField v51, :RBASIC_FLAGS@0x1040
-          v65:CUInt64 = GuardNoBitsSet v64, RUBY_FL_FREEZE=CUInt64(2048)
-          v67:CUInt64 = GuardNoBitsSet v65, RUBY_ELTS_SHARED=CUInt64(4096)
-          v73:CInt64[1] = Const CInt64(1)
-          v69:CInt64 = ArrayLength v51
-          ArrayAsetChecked v51, v73, v69, v16
+          v62:CUInt64 = LoadField v51, :RBASIC_FLAGS@0x1040
+          v63:CUInt64 = GuardNoBitsSet v62, RUBY_FL_FREEZE=CUInt64(2048)
+          v69:CInt64[1] = Const CInt64(1)
+          v65:CInt64 = ArrayLength v51
+          ArrayAsetChecked v51, v69, v65, v16
           WriteBarrier v51, v16
           PatchPoint NoEPEscape(test)
           CheckInterrupts
