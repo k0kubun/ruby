@@ -7183,6 +7183,47 @@ pub(crate) mod hir_build_tests {
     }
 
     #[test]
+    fn test_dominator_tree_intervals() {
+        let mut function = Function::new(std::ptr::null());
+
+        let bb0 = function.entry_block;
+        let bb1 = function.new_block(0);
+        let bb2 = function.new_block(0);
+        let bb3 = function.new_block(0);
+        let bb4 = function.new_block(0);
+        let bb5 = function.new_block(0);
+        let unreachable = function.new_block(0);
+
+        function.push_insn(bb0, Insn::Jump(edge(bb1)));
+        let v0 = function.push_insn(bb1, Insn::Const { val: Const::Value(Qfalse) });
+        function.push_insn(bb1, Insn::CondBranch { val: v0, if_true: edge(bb2), if_false: edge(bb4) });
+        let v1 = function.push_insn(bb2, Insn::Const { val: Const::Value(Qfalse) });
+        function.push_insn(bb2, Insn::CondBranch { val: v1, if_true: edge(bb3), if_false: edge(bb5) });
+        function.push_insn(bb3, Insn::Jump(edge(bb5)));
+        function.push_insn(bb4, Insn::Jump(edge(bb5)));
+        let retval = function.push_insn(bb5, Insn::Const { val: Const::CBool(true) });
+        function.push_insn(bb5, Insn::Return { val: retval });
+        function.push_insn(unreachable, Insn::Return { val: retval });
+        function.seal_entries();
+
+        let dominators = Dominators::new(&function);
+        let intervals = dominators.tree_intervals();
+        let dominates = |a: BlockId, b: BlockId| {
+            let (a_pre, a_last) = intervals[a.0 as usize];
+            let b_pre = intervals[b.0 as usize].0;
+            a_pre <= b_pre && b_pre <= a_last
+        };
+        let reachable = [function.entries_block, bb0, bb1, bb2, bb3, bb4, bb5];
+        for &a in &reachable {
+            for &b in &reachable {
+                assert_eq!(dominates(a, b), dominators.dominators(b).contains(&a), "{a} dominates {b}");
+            }
+            assert!(!dominates(unreachable, a));
+            assert!(!dominates(a, unreachable));
+        }
+    }
+
+    #[test]
     fn test_back_edges() {
         let mut function = Function::new(std::ptr::null());
 

@@ -5,11 +5,12 @@
 
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
+use crate::fxhash::{HashMap, HashSet};
 use crate::{
     cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
-    cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
+    cell::RefCell, collections::VecDeque, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
     sync::atomic::Ordering,
 };
 use crate::hir_type::{Type, types};
@@ -3524,14 +3525,14 @@ impl Function {
             insn_types: vec![],
             union_find: UnionFind::new().into(),
             blocks: vec![Block::default(), Block::default()],
-            send_counters: HashMap::new(),
+            send_counters: HashMap::default(),
             entries_block: BlockId(0),
             entry_block: BlockId(1),
             jit_entry_blocks: vec![],
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
-            inline_frames: HashMap::new(),
+            inline_frames: HashMap::default(),
             inline_pass: 0,
             klass_caches: Default::default(),
             inline_budget_bonuses: 0,
@@ -4399,6 +4400,8 @@ impl Function {
         for (idx, &block_id) in rpo.iter().enumerate() {
             rpo_order[block_id] = idx;
         }
+        // Scratch buffer for the arg types of an edge, reused across edges
+        let mut arg_types: Vec<Type> = Vec::new();
         loop {
             let mut changed = false;
             let mut traversed_back_edge = false;
@@ -4419,8 +4422,9 @@ impl Function {
                         ($edge:expr) => {{
                             let edge = $edge;
                             reachable.insert(edge.target);
-                            let arg_types: Vec<Type> = edge.args.iter().map(|a| self.type_of(*a)).collect();
-                            for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                            arg_types.clear();
+                            arg_types.extend(edge.args.iter().map(|a| self.type_of(*a)));
+                            for (idx, &arg_type) in arg_types.iter().enumerate() {
                                 let param = self.blocks[edge.target].params[idx];
                                 changed |= set_type!(param, self.type_of(param).union(arg_type));
                             }
@@ -4499,8 +4503,9 @@ impl Function {
                         }
                         &Insn::Jump(BranchEdge { target, ref args }) => {
                             reachable.insert(target);
-                            let arg_types: Vec<Type> = args.iter().map(|a| self.type_of(*a)).collect();
-                            for (idx, arg_type) in arg_types.into_iter().enumerate() {
+                            arg_types.clear();
+                            arg_types.extend(args.iter().map(|a| self.type_of(*a)));
+                            for (idx, &arg_type) in arg_types.iter().enumerate() {
                                 let param = self.blocks[target].params[idx];
                                 changed |= set_type!(param, self.type_of(param).union(arg_type));
                             }
@@ -8188,11 +8193,11 @@ impl Function {
 
     fn optimize_load_store(&mut self) {
         for block in self.reverse_post_order() {
-            let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::new();
+            let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::default();
             // GetEP of each level, which stays the same until the frame changes or a write to
             // memory may have moved the environment to the heap. Reusing it lets the loads of
             // a local from a parent EP share a key in compile_time_heap.
-            let mut ep_cache: HashMap<u32, InsnId> = HashMap::new();
+            let mut ep_cache: HashMap<u32, InsnId> = HashMap::default();
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             let mut new_insns = Vec::with_capacity(old_insns.len());
             for insn_id in old_insns {
@@ -8327,12 +8332,19 @@ impl Function {
     /// Inspired by Cranelift's aegraph canonicalize step
     /// (<https://cfallin.org/blog/2026/04/09/aegraph/>).
     fn canonicalize(&mut self) {
-        // TODO(max): Don't make so many maps. Instead, use either undo-redo or dominator numbering
-        // information for dominator tree.
-        let mut rewrite_maps: Vec<Option<HashMap<InsnId, InsnId>>> = vec![None; self.blocks.len()];
+        // Each guard refines its operand for the rest of its block and for the blocks it
+        // dominates. Instead of copying a map of refinements for every block, record the guards
+        // of each operand with the dominator tree interval of the guard's block and pick the
+        // innermost one that dominates the use. Blocks are visited in RPO, so a dominating
+        // block's guards are all recorded before its dominated blocks are visited, while a
+        // block's own guards are recorded as it's visited.
         let dominators = Dominators::new(self);
+        let intervals = dominators.tree_intervals();
+        // operand -> [(dominator tree interval of the guard's block, guard)], in the order recorded
+        let mut guards: HashMap<InsnId, Vec<((u32, u32), InsnId)>> = HashMap::default();
         for &block in dominators.cfi.reverse_post_order() {
-            let mut rewrite_map = rewrite_maps[dominators.idom(block)].clone().unwrap_or_else(|| HashMap::new());
+            let block_interval = intervals[block.0 as usize];
+            let block_pre = block_interval.0;
             for i in 0..self.blocks[block].insns.len() {
                 let insn_id = self.blocks[block].insns[i];
                 let canonical_id = self.union_find.borrow().find_const(insn_id);
@@ -8340,7 +8352,20 @@ impl Function {
                 let union_find = &self.union_find;
                 self.insns[canonical_id].for_each_operand_mut(|operand| {
                     let canon = union_find.borrow().find_const(*operand);
-                    *operand = rewrite_map.get(&canon).copied().unwrap_or(canon);
+                    let mut rewritten = canon;
+                    if let Some(candidates) = guards.get(&canon) {
+                        // The guard blocks that dominate `block` form a chain in the dominator
+                        // tree, and the innermost one has the largest preorder index. Among the
+                        // guards of `block` itself, the last one wins.
+                        let mut best_pre = None;
+                        for &((pre, last), guard) in candidates {
+                            if pre <= block_pre && block_pre <= last && best_pre.is_none_or(|best| best <= pre) {
+                                best_pre = Some(pre);
+                                rewritten = guard;
+                            }
+                        }
+                    }
+                    *operand = rewritten;
                 });
 
                 // For the binary guards only `left` is registered because their infer_type is
@@ -8352,12 +8377,11 @@ impl Function {
                     | Insn::GuardNoBitsSet { val:  src, .. }
                     | Insn::GuardGreaterEq { left: src, .. }
                     | Insn::GuardLess      { left: src, .. } => {
-                        rewrite_map.insert(*src, canonical_id);
+                        guards.entry(*src).or_default().push((block_interval, canonical_id));
                     }
                     _ => {}
                 }
             }
-            rewrite_maps[block] = Some(rewrite_map);
         }
 
         crate::stats::trace_compile_phase("infer_types", || self.infer_types());
@@ -8885,8 +8909,8 @@ impl Function {
 
         // Only a condition tested by more than one branch can be decided by another branch. Most
         // functions have none, so find them first to skip computing dominators.
-        let mut seen = HashSet::new();
-        let mut repeated = HashSet::new();
+        let mut seen = HashSet::default();
+        let mut repeated = HashSet::default();
         for block in 0..self.blocks.len() {
             if self.blocks[block].insns.is_empty() { continue; }
             if let Some((cond, _, _)) = branch_cond(self, BlockId(block as u32)) {
@@ -9156,7 +9180,7 @@ impl Function {
     /// intervening instruction could invalidate it (i.e., writes to PatchPoint).
     fn remove_redundant_patch_points(&mut self) {
         for block_id in self.reverse_post_order() {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let insns = std::mem::take(&mut self.blocks[block_id].insns);
             let mut new_insns = Vec::with_capacity(insns.len());
             for insn_id in insns {
@@ -9287,7 +9311,7 @@ impl Function {
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
             // PatchPoints to move out of elided frames, with the exit state to move them to.
-            let mut rehomed_patch_points: HashMap<InsnId, InsnId> = HashMap::new();
+            let mut rehomed_patch_points: HashMap<InsnId, InsnId> = HashMap::default();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
                     &Insn::PushInlineFrame { exit_state, .. } => {
@@ -9355,7 +9379,7 @@ impl Function {
             // Elide each pair: drop the pop, and drop the push as well, except
             // that with --zjit-stats it's replaced with a counter of how many
             // times execution passes an elided pair at run-time.
-            let mut rewrites: HashMap<InsnId, Option<InsnId>> = HashMap::new();
+            let mut rewrites: HashMap<InsnId, Option<InsnId>> = HashMap::default();
             for (push_id, pop_id) in elided_pairs {
                 let replacement = get_option!(stats)
                     .then(|| self.new_insn(Insn::IncrCounter(Counter::empty_inline_frame_count)));
@@ -9406,9 +9430,10 @@ impl Function {
             VisitEdges,
             VisitSelf,
         }
-        let mut result = vec![];
+        let mut result = Vec::with_capacity(self.blocks.len());
         let mut seen = BlockSet::with_capacity(self.blocks.len());
-        let mut stack = vec![(start, Action::VisitEdges)];
+        let mut stack = Vec::with_capacity(self.blocks.len() * 2);
+        stack.push((start, Action::VisitEdges));
         while let Some((block, action)) = stack.pop() {
             if action == Action::VisitSelf {
                 result.push(block);
@@ -11253,7 +11278,7 @@ fn add_iseq_to_hir(
 
     // Make all empty basic blocks. The ordering of the BBs matters for getting fallthrough jumps
     // in good places, but it's not necessary for correctness. TODO: Higher quality scheduling during lowering.
-    let mut insn_idx_to_block = HashMap::new();
+    let mut insn_idx_to_block = HashMap::default();
     // Materialize a block at each opt-table entry PC, placing each right after
     // its JIT-to-JIT entry block so fallthrough jumps land in good places.
     // Standalone mode emits a real JIT entry block per entry. Inlined mode emits
@@ -11321,7 +11346,7 @@ fn add_iseq_to_hir(
     }
 
     // Keep compiling blocks until the queue becomes empty
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
     while let Some((incoming_state, mut block, mut insn_idx)) = queue.pop_front() {
         // Compile each block only once
@@ -13543,6 +13568,59 @@ impl Dominators {
         b1
     }
 
+    /// Number the dominator tree in preorder. For each block (indexed by BlockId), return its
+    /// preorder index and the largest preorder index in its subtree, so that `a` dominates `b`
+    /// iff `pre(a) <= pre(b) <= last(a)`. Unreachable blocks get `(u32::MAX, 0)`, so they neither
+    /// dominate nor are dominated by any block.
+    pub fn tree_intervals(&self) -> Vec<(u32, u32)> {
+        let num_blocks = self.idoms.len();
+        let rpo = self.cfi.reverse_post_order();
+        // Children of each block in the dominator tree, in RPO
+        let mut num_children = vec![0u32; num_blocks + 1];
+        for &block in rpo {
+            let idom = self.idoms[block];
+            if idom != block {
+                num_children[idom.0 as usize] += 1;
+            }
+        }
+        let mut child_starts = vec![0u32; num_blocks + 1];
+        for idx in 0..num_blocks {
+            child_starts[idx + 1] = child_starts[idx] + num_children[idx];
+        }
+        let mut fill = child_starts.clone();
+        let mut children = vec![BlockId(0); child_starts[num_blocks] as usize];
+        for &block in rpo {
+            let idom = self.idoms[block];
+            if idom != block {
+                let slot = &mut fill[idom.0 as usize];
+                children[*slot as usize] = block;
+                *slot += 1;
+            }
+        }
+
+        let mut intervals = vec![(u32::MAX, 0); num_blocks];
+        let Some(&root) = rpo.first() else { return intervals };
+        let mut next_pre = 0;
+        // (block, whether its children have been pushed)
+        let mut stack = Vec::with_capacity(num_blocks * 2);
+        stack.push((root, false));
+        while let Some((block, visited)) = stack.pop() {
+            if visited {
+                intervals[block.0 as usize].1 = next_pre - 1;
+                continue;
+            }
+            intervals[block.0 as usize].0 = next_pre;
+            next_pre += 1;
+            stack.push((block, true));
+            let start = child_starts[block.0 as usize] as usize;
+            let end = child_starts[block.0 as usize + 1] as usize;
+            for &child in children[start..end].iter().rev() {
+                stack.push((child, false));
+            }
+        }
+        intervals
+    }
+
     /// Return the immediate dominator of `block`.
     pub fn idom(&self, block: BlockId) -> BlockId {
         self.idoms[block]
@@ -13580,54 +13658,77 @@ impl Dominators {
 pub struct ControlFlowInfo {
     num_blocks: usize,
     reverse_post_order: Vec<BlockId>,
-    successor_map: HashMap<BlockId, Vec<BlockId>>,
-    predecessor_map: HashMap<BlockId, Vec<BlockId>>,
+    /// The successors of block `b` are `successors[successor_ranges[b].0..successor_ranges[b].1]`.
+    /// Indexed by BlockId. Unreachable blocks have none.
+    successor_ranges: Vec<(u32, u32)>,
+    successors: Vec<BlockId>,
+    /// The predecessors of block `b` are `predecessors[predecessor_starts[b]..predecessor_starts[b + 1]]`
+    predecessor_starts: Vec<u32>,
+    predecessors: Vec<BlockId>,
 }
 
 impl ControlFlowInfo {
     pub fn new(function: &Function) -> Self {
-        let mut successor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        let mut predecessor_map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-
+        let num_blocks = function.num_blocks();
         let reverse_post_order = function.reverse_post_order();
+
+        // Successors of each reachable block, without consecutive duplicates
+        let mut successor_ranges = vec![(0u32, 0u32); num_blocks];
+        let mut successors: Vec<BlockId> = Vec::with_capacity(reverse_post_order.len() * 2);
+        let mut predecessor_starts = vec![0u32; num_blocks + 1];
         for &block_id in &reverse_post_order {
-            let mut successors: Vec<BlockId> = function.successors(block_id).collect();
-            successors.dedup();
-
-            // Update predecessors for successor blocks.
-            for &succ_id in &successors {
-                predecessor_map
-                    .entry(succ_id)
-                    .or_default()
-                    .push(block_id);
+            let start = successors.len();
+            for succ_id in function.successors(block_id) {
+                if successors.len() > start && *successors.last().unwrap() == succ_id {
+                    continue;
+                }
+                successors.push(succ_id);
+                predecessor_starts[succ_id.0 as usize + 1] += 1;
             }
+            successor_ranges[block_id.0 as usize] = (start as u32, successors.len() as u32);
+        }
 
-            // Store successors for this block.
-            successor_map.insert(block_id, successors);
+        // Predecessors of each block, in the RPO order of their sources
+        for block_idx in 0..num_blocks {
+            predecessor_starts[block_idx + 1] += predecessor_starts[block_idx];
+        }
+        let mut next_slots = predecessor_starts.clone();
+        let mut predecessors = vec![BlockId(0); successors.len()];
+        for &block_id in &reverse_post_order {
+            let (start, end) = successor_ranges[block_id.0 as usize];
+            for &succ_id in &successors[start as usize..end as usize] {
+                let slot = &mut next_slots[succ_id.0 as usize];
+                predecessors[*slot as usize] = block_id;
+                *slot += 1;
+            }
         }
 
         Self {
-            num_blocks: function.num_blocks(),
+            num_blocks,
             reverse_post_order,
-            successor_map,
-            predecessor_map,
+            successor_ranges,
+            successors,
+            predecessor_starts,
+            predecessors,
         }
     }
 
     pub fn is_succeeded_by(&self, left: BlockId, right: BlockId) -> bool {
-        self.successor_map.get(&right).is_some_and(|set| set.contains(&left))
+        self.successors(right).contains(&left)
     }
 
     pub fn is_preceded_by(&self, left: BlockId, right: BlockId) -> bool {
-        self.predecessor_map.get(&right).is_some_and(|set| set.contains(&left))
+        self.predecessors(right).contains(&left)
     }
 
     pub fn predecessors(&self, block: BlockId) -> &[BlockId] {
-        self.predecessor_map.get(&block).map(|v| v.as_slice()).unwrap_or(&[])
+        let block = block.0 as usize;
+        &self.predecessors[self.predecessor_starts[block] as usize..self.predecessor_starts[block + 1] as usize]
     }
 
     pub fn successors(&self, block: BlockId) -> &[BlockId] {
-        self.successor_map.get(&block).map(|v| v.as_slice()).unwrap_or(&[])
+        let (start, end) = self.successor_ranges[block.0 as usize];
+        &self.successors[start as usize..end as usize]
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -13651,7 +13752,7 @@ impl<'a> LoopInfo<'a> {
     pub fn new(dominators: &'a Dominators) -> Self {
         let cfi = &dominators.cfi;
         let mut loop_headers: BlockSet = BlockSet::with_capacity(cfi.num_blocks());
-        let mut loop_depths: HashMap<BlockId, u32> = HashMap::new();
+        let mut loop_depths: HashMap<BlockId, u32> = HashMap::default();
         let mut back_edge_sources: BlockSet = BlockSet::with_capacity(cfi.num_blocks());
         let rpo = cfi.reverse_post_order();
 
@@ -13691,7 +13792,7 @@ impl<'a> LoopInfo<'a> {
         back_edge_source: BlockId,
     ) -> HashSet<BlockId> {
         // todo(aidenfoxivey): Reimplement using BlockSet
-        let mut loop_blocks = HashSet::new();
+        let mut loop_blocks = HashSet::default();
         let mut stack = vec![back_edge_source];
 
         loop_blocks.insert(header);

@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::BuildHasherDefault;
+use std::collections::VecDeque;
+use crate::fxhash::{HashMap, HashSet};
 use std::fmt;
 use std::mem::take;
 use std::rc::Rc;
@@ -18,7 +18,7 @@ use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label};
 use crate::state::ZJITState;
 use crate::exit_desc::{ExitDescriptor, ExitDescriptorExtra, ExitImms, ExitLoc, ExitStackMap};
-use crate::cast::{IntoU64, IntoUsize};
+use crate::cast::IntoUsize;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
 /// we can differentiate it from HIR block ids.
@@ -630,39 +630,6 @@ pub enum BlockHandler {
 }
 
 /// Context for a side exit. If `SideExit` matches, it reuses the same code.
-/// The hash function of rustc's FxHasher: fast, but not resistant to HashDoS, which
-/// doesn't matter for keys built by the compiler.
-#[derive(Default)]
-struct FxHasher {
-    hash: u64,
-}
-
-impl FxHasher {
-    fn add(&mut self, word: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-    }
-}
-
-impl std::hash::Hasher for FxHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.add(u64::from_le_bytes(word));
-        }
-    }
-
-    fn write_u8(&mut self, i: u8) { self.add(i.into()) }
-    fn write_u16(&mut self, i: u16) { self.add(i.into()) }
-    fn write_u32(&mut self, i: u32) { self.add(i.into()) }
-    fn write_u64(&mut self, i: u64) { self.add(i) }
-    fn write_usize(&mut self, i: usize) { self.add(i.as_u64()) }
-
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SideExit {
     pub pc: Opnd,
@@ -1993,6 +1960,11 @@ impl Assembler
         let bb_id = BlockId(self.basic_blocks.len());
         let mut lir_bb = BasicBlock::new(bb_id, old_block.hir_block_id, old_block.is_entry, old_block.rpo_index);
         lir_bb.parameters = old_block.parameters.clone();
+        // Splitting emits somewhat more instructions than it consumes. Reserve them upfront
+        // rather than growing the vectors one doubling at a time.
+        let capacity = old_block.insns.len() + old_block.insns.len() / 2;
+        lir_bb.insns.reserve(capacity);
+        lir_bb.insn_ids.reserve(capacity);
         self.basic_blocks.push(lir_bb);
         bb_id
     }
@@ -2516,7 +2488,7 @@ impl Assembler
         use crate::backend::current::SCRATCH_REG;
 
         // Count predecessors for each block
-        let mut num_predecessors: HashMap<BlockId, usize> = HashMap::new();
+        let mut num_predecessors: HashMap<BlockId, usize> = HashMap::default();
         let block_order = self.block_order();
         for &block_id in &block_order {
             for succ in self.basic_blocks[block_id.0].successors() {
@@ -2746,15 +2718,12 @@ impl Assembler
                         && intervals[out.vreg_idx()].has_bounds()
                         && !intervals[out.vreg_idx()].is_dead();
 
-                    // Build a set of VRegIds that can be referenced by JITFrame for materializing the VM stack
-                    let stack_vreg_ids: HashSet<VRegId> = if let Some(StackMap { stack, .. }) = &stack_map {
-                        stack.iter().filter_map(|entry| match entry {
-                            StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => Some(*idx),
-                            _ => None,
-                        }).collect()
-                    } else {
-                        HashSet::default()
-                    };
+                    // VRegIds that can be referenced by JITFrame for materializing the VM stack.
+                    // Duplicates are removed with the survivors below.
+                    let stack_vreg_ids = stack_map.iter().flat_map(|StackMap { stack, .. }| stack.iter()).filter_map(|entry| match entry {
+                        StackMapEntry::Opnd(Opnd::VReg { idx, .. }) => Some(*idx),
+                        _ => None,
+                    });
 
                     // Find survivors: intervals that are live across this Call
                     // instruction. We need to preserve the "surviving" registers
@@ -2773,7 +2742,7 @@ impl Assembler
                     let call_idx = ccall_numbers.binary_search(&insn_number).unwrap();
                     let mut survivors: Vec<VRegId> = covering[call_idx].iter().copied()
                         .filter(|&vreg_id| Some(vreg_id) != out_vreg_id)
-                        .chain(stack_vreg_ids.iter().copied().filter(|&vreg_id| is_register(&intervals[vreg_id])))
+                        .chain(stack_vreg_ids.filter(|&vreg_id| is_register(&intervals[vreg_id])))
                         .collect();
                     survivors.sort_unstable();
                     survivors.dedup();
@@ -3232,14 +3201,15 @@ impl Assembler
             opnds.iter().map(|opnd| format!("{opnd}")).collect::<Vec<_>>().join(delimiter)
         }
 
-        // Extract targets first so that we can update instructions while referencing part of them.
-        let mut targets = HashMap::new();
+        // Take the targets out of the instructions first so that we can compile them while
+        // emitting exit code. Every taken target is replaced with the label of its exit below.
+        let mut targets = Vec::new();
 
         for block_id in self.block_order() {
-            let block = &self.basic_blocks[block_id.0];
-            for (idx, insn) in block.insns.iter().enumerate() {
-                if let Some(target @ Target::SideExit(..)) = insn.target() {
-                    targets.insert((block_id.0, idx), target.clone());
+            let block = &mut self.basic_blocks[block_id.0];
+            for (idx, insn) in block.insns.iter_mut().enumerate() {
+                if let Some(target @ Target::SideExit(..)) = insn.target_mut() {
+                    targets.push(((block_id.0, idx), std::mem::replace(target, Target::Label(Label(usize::MAX)))));
                 }
             }
         }
@@ -3252,9 +3222,7 @@ impl Assembler
         let exit_block = self.new_block_without_id("side_exits");
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
-        // A SideExit holds every stack slot and local of each frame, so hash it with FxHasher
-        // rather than SipHash; the keys are not attacker-controlled.
-        let mut compiled_exits: HashMap<SideExit, Label, BuildHasherDefault<FxHasher>> =
+        let mut compiled_exits: HashMap<SideExit, Label> =
             HashMap::with_capacity_and_hasher(targets.len(), Default::default());
 
         // Start a new perf range for side exits.
@@ -3368,9 +3336,10 @@ impl Assembler
             VisitEdges,
             VisitSelf,
         }
-        let mut result = vec![];
+        let mut result = Vec::with_capacity(self.basic_blocks.len());
         let mut seen = BlockSet::with_capacity(self.basic_blocks.len());
-        let mut stack: Vec<_> = starts.iter().map(|&start| (start, Action::VisitEdges)).collect();
+        let mut stack: Vec<_> = Vec::with_capacity(self.basic_blocks.len() * 2);
+        stack.extend(starts.iter().map(|&start| (start, Action::VisitEdges)));
         while let Some((block, action)) = stack.pop() {
             if action == Action::VisitSelf {
                 result.push(block);
@@ -3822,7 +3791,7 @@ fn format_insn_compact(asm: &Assembler, insn: &Insn) -> String {
 impl fmt::Display for Assembler {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Count the number of duplicated label names to disambiguate them if needed
-        let mut label_counts: HashMap<&LabelName, usize> = HashMap::new();
+        let mut label_counts: HashMap<&LabelName, usize> = HashMap::default();
         let colors = crate::ttycolors::get_colors();
         let bold_begin = colors.bold_begin;
         let bold_end = colors.bold_end;

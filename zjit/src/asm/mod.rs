@@ -190,19 +190,20 @@ impl CodeBlock {
 
     /// Write a single byte at the current position.
     pub fn write_byte(&mut self, byte: u8) {
-        let write_ptr = self.get_write_ptr();
-        // TODO: check has_capacity()
-        if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
-            self.write_pos += 1;
-        } else {
-            self.dropped_bytes = true;
-        }
+        self.write_bytes(&[byte]);
     }
 
     /// Write multiple bytes starting from the current position.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_byte(*byte);
+        // TODO: check has_capacity()
+        let mut mem_block = self.mem_block.borrow_mut();
+        let write_ptr = mem_block.start_ptr().add_bytes(self.write_pos);
+        let written = mem_block.write_bytes(write_ptr, bytes);
+        self.write_pos += written;
+        if written < bytes.len() {
+            // A failed byte doesn't advance write_pos, and retrying the rest at the same
+            // position would fail the same way.
+            self.dropped_bytes = true;
         }
     }
 
@@ -214,22 +215,9 @@ impl CodeBlock {
         // Switch on the number of bits
         match num_bits {
             8 => self.write_byte(val as u8),
-            16 => self.write_bytes(&[(val & 0xff) as u8, ((val >> 8) & 0xff) as u8]),
-            32 => self.write_bytes(&[
-                (val & 0xff) as u8,
-                ((val >> 8) & 0xff) as u8,
-                ((val >> 16) & 0xff) as u8,
-                ((val >> 24) & 0xff) as u8,
-            ]),
-            _ => {
-                let mut cur = val;
-
-                // Write out the bytes
-                for _byte in 0..(num_bits / 8) {
-                    self.write_byte((cur & 0xff) as u8);
-                    cur >>= 8;
-                }
-            }
+            16 => self.write_bytes(&(val as u16).to_le_bytes()),
+            32 => self.write_bytes(&(val as u32).to_le_bytes()),
+            _ => self.write_bytes(&val.to_le_bytes()[..(num_bits / 8) as usize]),
         }
     }
 

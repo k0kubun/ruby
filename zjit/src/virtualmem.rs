@@ -159,7 +159,7 @@ impl<A: Allocator> VirtualMemory<A> {
         region_size_bytes: usize,
         memory_limit_bytes: Option<usize>,
     ) -> Self {
-        assert_ne!(0, page_size);
+        assert!(page_size.is_power_of_two(), "page size should be a power of two: {page_size}");
         let page_size_bytes = page_size as usize;
 
         Self {
@@ -203,11 +203,35 @@ impl<A: Allocator> VirtualMemory<A> {
         self.page_size_bytes
     }
 
+    /// Write `bytes` starting at `write_ptr` and return how many were written, stopping at the
+    /// first byte that fails to write. Bytes within the last written page are copied at once.
+    pub fn write_bytes(&mut self, write_ptr: CodePtr, bytes: &[u8]) -> usize {
+        let Some((&last_byte, _)) = bytes.split_last() else { return 0 };
+        let raw = write_ptr.raw_ptr(self) as *mut u8;
+        let page_mask = !(self.page_size_bytes - 1);
+        if self.current_write_page == Some(raw as usize & page_mask)
+            && self.current_write_page == Some((raw as usize).wrapping_add(bytes.len() - 1) & page_mask) {
+            // The page is already writable, so this is what write_byte would do for each byte
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw, bytes.len()) };
+            return bytes.len();
+        }
+        if bytes.len() == 1 {
+            return if self.write_byte(write_ptr, last_byte).is_ok() { 1 } else { 0 };
+        }
+        for (idx, &byte) in bytes.iter().enumerate() {
+            if self.write_byte(write_ptr.add_bytes(idx), byte).is_err() {
+                return idx;
+            }
+        }
+        bytes.len()
+    }
+
     /// Write a single byte. The first write to a page makes it readable.
     pub fn write_byte(&mut self, write_ptr: CodePtr, byte: u8) -> Result<(), WriteError> {
         let page_size = self.page_size_bytes;
         let raw: *mut u8 = write_ptr.raw_ptr(self) as *mut u8;
-        let page_addr = (raw as usize / page_size) * page_size;
+        // The page size is a power of two. Masking avoids a division for every byte written.
+        let page_addr = raw as usize & !(page_size - 1);
 
         if self.current_write_page == Some(page_addr) {
             // Writing within the last written to page, nothing to do

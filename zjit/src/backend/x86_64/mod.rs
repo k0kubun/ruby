@@ -467,9 +467,10 @@ impl Assembler {
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.linearize_instructions();
+        asm.current_block().insns.reserve(linearized_insns.len());
+        asm.current_block().insn_ids.reserve(linearized_insns.len());
 
-        for insn in linearized_insns.iter() {
-            let mut insn = insn.clone();
+        for mut insn in linearized_insns {
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
