@@ -8189,10 +8189,30 @@ impl Function {
     fn optimize_load_store(&mut self) {
         for block in self.reverse_post_order() {
             let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::new();
+            // GetEP of each level, which stays the same until the frame changes or a write to
+            // memory may have moved the environment to the heap. Reusing it lets the loads of
+            // a local from a parent EP share a key in compile_time_heap.
+            let mut ep_cache: HashMap<u32, InsnId> = HashMap::new();
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             let mut new_insns = Vec::with_capacity(old_insns.len());
             for insn_id in old_insns {
                 let replacement_insn: InsnId = match self.resolve(insn_id).insn(self) {
+                    &Insn::GetEP { level } => {
+                        if let Some(&cached_insn) = ep_cache.get(&level) {
+                            self.make_equal_to(insn_id, cached_insn);
+                            continue
+                        }
+                        ep_cache.insert(level, insn_id);
+                        insn_id
+                    }
+                    Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } | Insn::PopInlineFrame { .. } => {
+                        // They change the current frame. PushInlineFrame also writes memory.
+                        ep_cache.clear();
+                        if self.resolve(insn_id).insn(self).effects_of().includes(Effect::write(abstract_heaps::Memory)) {
+                            compile_time_heap.clear();
+                        }
+                        insn_id
+                    }
                     &Insn::StoreField { recv, offset, val, .. } => {
                         let key = (self.chase_insn(recv), offset);
                         let heap_entry = compile_time_heap.get(&key).copied();
@@ -8217,9 +8237,11 @@ impl Function {
                                 // type than the cached entry (`CPtr` vs `BasicObject`). While the loaded value would be the same in either case, the
                                 // difference in associated type causes type checking to fail. Consequently, we conservatively retain the duplicate `LoadField`.
                                 // The `optimize_load_store_does_not_alias_loads_with_incompatible_return_types` test checks the problematic case.
+                                // Likewise, a stored value may have a type that the load doesn't promise,
+                                // e.g. a CInt64 stored into a field that is loaded as CUInt64.
                                 let can_forward_cached_insn = match self.resolve(cached_insn).insn(self) {
                                     Insn::LoadField { return_type : cached_return_type,.. } => cached_return_type.is_subtype(return_type),
-                                    _ => true
+                                    _ => self.type_of(cached_insn).is_subtype(return_type),
                                 };
 
                                 if can_forward_cached_insn {
@@ -8257,8 +8279,12 @@ impl Function {
                     },
                     insn => {
                         // If an instruction affects memory and we haven't modeled it, the compile_time_heap is invalidated
-                        if insn.effects_of().includes(Effect::write(abstract_heaps::Memory)) {
+                        let effects = insn.effects_of();
+                        if effects.includes(Effect::write(abstract_heaps::Memory)) {
                             compile_time_heap.clear();
+                            ep_cache.clear();
+                        } else if effects.write_bits().overlaps(abstract_heaps::Frame) {
+                            ep_cache.clear();
                         }
                         insn_id
                     }

@@ -6077,6 +6077,86 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_reuse_parent_local_loads_in_block() {
+        eval("
+            def make(a, b) = proc { |i| (a + i) * (a + b) + b }
+            TEST = make(1, 2)
+            TEST.call(3)
+        ");
+        assert_snapshot!(hir_string_proc("TEST"), @"
+        fn block in make@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :i@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :i@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v14:CPtr = GetEP 1
+          v15:BasicObject = LoadField v14, :a@0x1000
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
+          v45:Fixnum = GuardType v15, Fixnum recompile
+          v46:Fixnum = GuardType v10, Fixnum recompile
+          v47:Fixnum = FixnumAdd v45, v46
+          v25:BasicObject = LoadField v14, :b@0x1040
+          v51:Fixnum = GuardType v25, Fixnum recompile
+          v52:Fixnum = FixnumAdd v45, v51
+          PatchPoint MethodRedefined(Integer@0x1008, *@0x1041, cme:0x1048)
+          v56:Fixnum = FixnumMult v47, v52
+          v61:Fixnum = FixnumAdd v56, v51
+          CheckInterrupts
+          Return v61
+        ");
+    }
+
+    #[test]
+    fn test_reload_parent_local_after_send_in_block() {
+        eval("
+            def make(a) = proc { |i| a + i.to_s.size + a }
+            TEST = make(1)
+            TEST.call(3)
+        ");
+        assert_snapshot!(hir_string_proc("TEST"), @"
+        fn block in make@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :i@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :i@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v14:CPtr = GetEP 1
+          v15:BasicObject = LoadField v14, :a@0x1001
+          PatchPoint MethodRedefined(Integer@0x1008, to_s@0x1010, cme:0x1018)
+          v40:Fixnum = GuardType v10, Fixnum recompile
+          v41:StringExact = CCallVariadic v40, :Integer#to_s@0x1040
+          PatchPoint NoEPEscape(block in make)
+          PatchPoint NoSingletonClass(String@0x1048)
+          PatchPoint MethodRedefined(String@0x1048, size@0x1050, cme:0x1058)
+          v46:Fixnum = CCall v41, :String#size@0x1080
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x1081, cme:0x1088)
+          v49:Fixnum = GuardType v15, Fixnum recompile
+          v50:Fixnum = FixnumAdd v49, v46
+          v28:CPtr = GetEP 1
+          v29:BasicObject = LoadField v28, :a@0x1001
+          v54:Fixnum = GuardType v29, Fixnum recompile
+          v55:Fixnum = FixnumAdd v50, v54
+          CheckInterrupts
+          Return v55
+        ");
+    }
+
+    #[test]
     fn reload_local_across_send_after_ep_escape() {
         eval("
             def foo(&block) = 1
@@ -6112,10 +6192,8 @@ mod hir_opt_tests {
           v23:CPtr = GetEP 0
           v24:BasicObject = LoadField v23, :a@0x1000
           PatchPoint MethodRedefined(Object@0x1008, foo@0x1068, cme:0x1070)
-          v36:CPtr = GetEP 0
-          v37:BasicObject = LoadField v36, :a@0x1000
           CheckInterrupts
-          Return v37
+          Return v24
         ");
     }
 
@@ -14309,15 +14387,14 @@ mod hir_opt_tests {
           v25:CInt64[512] = Const CInt64(512)
           v26:CInt64 = IntOr v24, v25
           StoreField v23, :VM_ENV_DATA_INDEX_FLAGS@0x1068, v26
-          v33:CPtr = GetEP 0
-          v34:CUInt64 = LoadField v33, :VM_ENV_DATA_INDEX_FLAGS@0x1068
+          v34:CUInt64 = LoadField v23, :VM_ENV_DATA_INDEX_FLAGS@0x1068
           v35:CBool = IsBlockParamModified v34
           CondBranch v35, bb4(), bb5()
         bb4():
-          v37:BasicObject = LoadField v33, :block@0x1001
+          v37:BasicObject = LoadField v23, :block@0x1001
           Jump bb6(v37, v37)
         bb5():
-          v39:CInt64 = LoadField v33, :VM_ENV_DATA_INDEX_SPECVAL@0x1069
+          v39:CInt64 = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1069
           v40:CInt64[1] = Const CInt64(1)
           v41:CInt64 = IntAnd v39, v40
           v42:CBool = IsBitEqual v41, v40
@@ -14349,7 +14426,7 @@ mod hir_opt_tests {
           v62:BasicObject = SymToProc :block, l0, EP@3
           Jump bb6(v62, v62)
         bb13():
-          v64:BasicObject = LoadField v33, :VM_ENV_DATA_INDEX_SPECVAL@0x1069
+          v64:BasicObject = LoadField v23, :VM_ENV_DATA_INDEX_SPECVAL@0x1069
           Jump bb6(v64, v76)
         bb6(v31:BasicObject, v32:BasicObject):
           v77:ObjectSubclass[class_exact:Proc] = GuardType v31, ObjectSubclass[class_exact:Proc] recompile
@@ -25798,8 +25875,7 @@ mod hir_opt_tests {
           SetLocal :kwsplat, l0, EP@3, v108
           v113:CPtr = GetEP 0
           v114:BasicObject = LoadField v113, :list@0x1001
-          v116:CPtr = GetEP 0
-          v117:BasicObject = LoadField v116, :iter_method@0x1005
+          v117:BasicObject = LoadField v113, :iter_method@0x1005
           v120:BasicObject = Send v114, 0x1080, :__send__, v117 # SendFallbackReason: Send: unsupported method type Optimized
           v121:CPtr = GetEP 0
           v122:BasicObject = LoadField v121, :list@0x1001
