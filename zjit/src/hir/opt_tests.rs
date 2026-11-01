@@ -22,6 +22,22 @@ mod hir_opt_tests {
     }
 
     #[track_caller]
+    /// Replace immediates whose value changes from run to run (e.g. a callinfo) with a placeholder
+    fn mask_run_dependent_immediates(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut digits = String::new();
+        for c in s.chars().chain(std::iter::once('\0')) {
+            if c.is_ascii_digit() {
+                digits.push(c);
+                continue;
+            }
+            if digits.len() >= 10 { out.push_str("[run-dependent]"); } else { out.push_str(&digits); }
+            digits.clear();
+            if c != '\0' { out.push(c); }
+        }
+        out
+    }
+
     fn hir_string(method: &str) -> String {
         hir_string_proc(&format!("{}.method(:{})", "self", method))
     }
@@ -22506,6 +22522,107 @@ mod hir_opt_tests {
           v21:BasicObject = SendDirect v20, 0x1038, :forwardable (0x1058), v11
           CheckInterrupts
           Return v21
+        ");
+    }
+
+    #[test]
+    fn specialize_send_forward_on_profiled_callinfo() {
+        eval("
+           def target(a, b) = [a, b]
+           def forwardable(...) = target(...)
+           forwardable(1, 2)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string("forwardable")), @"
+        fn forwardable@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1001
+          v26:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v27:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(Object@0x1008, target@0x1010, cme:0x1018)
+          v29:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          v30:CInt64 = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1040
+          v31:CInt64[0] = GuardBitEquals v30, CInt64(0) recompile
+          PushInlineFrame :target, v29 (0x1048), num_args=2
+          v43:ArrayExact = NewArray v25, v26
+          PopInlineFrame
+          PatchPoint NoEPEscape(forwardable)
+          CheckInterrupts
+          Return v43
+        ");
+    }
+
+    #[test]
+    fn specialize_send_forward_passes_frame_block() {
+        eval("
+           def target(a) = yield(a)
+           def forwardable(...) = target(...)
+           forwardable(1) { |v| v }
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string("forwardable")), @"
+        fn forwardable@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v26:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(Object@0x1008, target@0x1010, cme:0x1018)
+          v28:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          v29:CInt64 = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1040
+          v31:BasicObject = SendDirect v28, frame_block:v29, :target (0x1048), v25
+          PatchPoint NoEPEscape(forwardable)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
+    fn dont_specialize_send_forward_on_polymorphic_callinfo() {
+        eval("
+           def target(a, b = 2) = [a, b]
+           def forwardable(...) = target(...)
+           forwardable(1)
+           forwardable(1, 2)
+        ");
+        assert_snapshot!(hir_string("forwardable"), @"
+        fn forwardable@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:BasicObject = SendForward v9, 0x1008, :target, v10 # SendFallbackReason: SendForward: polymorphic forwarded callinfo
+          PatchPoint NoEPEscape(forwardable)
+          CheckInterrupts
+          Return v16
         ");
     }
 

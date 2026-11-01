@@ -97,6 +97,7 @@ fn profile_insn_sample(
         YARVINSN_invokeblock   => profile_block_handler(profiler, profile),
         YARVINSN_invokesuper   => profile_invokesuper(profiler, profile),
         YARVINSN_opt_new => profile_opt_new(profiler, profile),
+        YARVINSN_sendforward => profile_sendforward(profiler, profile),
         YARVINSN_opt_send_without_block | YARVINSN_send => {
             let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
             let argc = num_arguments_on_stack(cd);
@@ -224,6 +225,33 @@ fn profile_opt_new(profiler: &mut Profiler, profile: &mut IseqProfile) {
         observe_profiled_type(profiler, profile_type, obj, ProfiledType::new(obj));
     }
     caller_ci.observe_other();
+}
+
+/// Profile the receiver and the explicit arguments of `bar(...)` like a send, plus the callinfo of
+/// the call that entered the enclosing `def foo(...)`. `sendforward` finds that callinfo in the
+/// `...` local, which it pushes on top of the stack. It is not a Ruby object, so its identity is
+/// profiled instead of its class.
+fn profile_sendforward(profiler: &mut Profiler, profile: &mut IseqProfile) {
+    let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
+    let n = num_arguments_on_stack(cd) + 2; // receiver + explicit arguments + callinfo
+    let entry = profile.entry_mut(profiler.insn_idx);
+    if entry.opnd_types.is_empty() {
+        entry.opnd_types = vec![TypeDistribution::new(); n];
+    }
+    let (caller_ci, operands) = entry.opnd_types.split_last_mut().unwrap();
+    for (i, profile_type) in operands.iter_mut().enumerate() {
+        let obj = profiler.peek_at_stack((n - i - 1) as isize);
+        observe_profiled_type(profiler, profile_type, obj, ProfiledType::new(obj));
+    }
+    // A packed callinfo (`vm_ci_packed_p`) is an immediate that encodes the whole callinfo, so it
+    // can be guarded with one comparison and needs no GC marking. A heap imemo_callinfo, e.g. one
+    // with keyword arguments, is recorded as unknown, which keeps the site dynamic.
+    let ci = profiler.peek_at_stack(0);
+    if ci.special_const_p() {
+        caller_ci.observe(ProfiledType::object(ci));
+    } else {
+        caller_ci.observe_other();
+    }
 }
 
 fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) {

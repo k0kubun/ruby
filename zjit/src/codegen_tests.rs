@@ -1282,6 +1282,168 @@ fn test_zsuper_to_forwardable_callee() {
 }
 
 #[test]
+fn test_send_forward_positional_args() {
+    assert_snapshot!(inspect("
+        def target(a, b = 2) = [a, b]
+        def fwd(...) = target(...)
+        5.times.flat_map { [fwd(1), fwd(1)] }.uniq
+    "), @"[[1, 2]]");
+}
+
+#[test]
+fn test_send_forward_leading_args() {
+    assert_snapshot!(inspect("
+        def target(a, b, c) = [a, b, c]
+        def fwd(...) = target(0, ...)
+        5.times.map { fwd(1, 2) }.uniq
+    "), @"[[0, 1, 2]]");
+}
+
+#[test]
+fn test_send_forward_with_extra_locals() {
+    assert_snapshot!(inspect("
+        def target(a, b) = a * b
+        def fwd(...)
+          extra = 10
+          extra + target(...)
+        end
+        5.times.map { fwd(3, 4) }.uniq
+    "), @"[22]");
+}
+
+#[test]
+fn test_send_forward_passes_frame_block() {
+    assert_snapshot!(inspect("
+        def target(a) = block_given? ? yield(a) : [:no_block, a]
+        def fwd(...) = target(...)
+        5.times.flat_map { [fwd(1) { |v| v * 2 }, fwd(2)] }.uniq
+    "), @"[2, [:no_block, 2]]");
+}
+
+#[test]
+fn test_send_forward_block_to_target_without_block() {
+    assert_snapshot!(inspect("
+        def target(a) = a
+        def fwd(...) = target(...)
+        r = 5.times.map { fwd(1) }
+        r + 5.times.map { fwd(2) { } }
+    "), @"[1, 1, 1, 1, 1, 2, 2, 2, 2, 2]");
+}
+
+#[test]
+fn test_send_forward_block_to_target_rejecting_block() {
+    assert_snapshot!(inspect(r#"
+        def target(a, &nil) = a
+        def fwd(...) = target(...)
+        r = 5.times.map { fwd(1) }
+        r + [(fwd(2) { } rescue $!.class)]
+    "#), @"[1, 1, 1, 1, 1, ArgumentError]");
+}
+
+#[test]
+fn test_send_forward_callinfo_changes() {
+    assert_snapshot!(inspect("
+        def target(a, b = :default, k: :none) = [a, b, k]
+        def fwd(...) = target(...)
+        r = 5.times.map { fwd(1) }.uniq
+        r + 5.times.flat_map { [fwd(1, 2), fwd(3, k: 4)] }.uniq
+    "), @"[[1, :default, :none], [1, 2, :none], [3, :default, 4]]");
+}
+
+#[test]
+fn test_send_forward_wrong_number_of_arguments() {
+    assert_snapshot!(inspect(r#"
+        def target(a, b) = [a, b]
+        def fwd(...) = target(...)
+        5.times.map { (fwd(1) rescue $!.message) }.uniq
+    "#), @r#"["wrong number of arguments (given 1, expected 2)"]"#);
+}
+
+#[test]
+fn test_send_forward_receiver_changes() {
+    assert_snapshot!(inspect("
+        class FwdA
+          def target(a) = [:a, a]
+        end
+        class FwdB
+          def target(a) = [:b, a]
+        end
+        class FwdDelegator
+          def initialize(obj) = @obj = obj
+          def target(...) = @obj.target(...)
+        end
+        a = FwdDelegator.new(FwdA.new)
+        b = FwdDelegator.new(FwdB.new)
+        r = 5.times.map { a.target(1) }.uniq
+        r + 5.times.map { b.target(2) }.uniq
+    "), @"[[:a, 1], [:b, 2]]");
+}
+
+#[test]
+fn test_send_forward_private_target() {
+    assert_snapshot!(inspect(r#"
+        class FwdPrivate
+          def fwd(...) = target(...)
+          def fwd_explicit(...) = self.target(...)
+          private def target(a) = [:private, a]
+        end
+        obj = FwdPrivate.new
+        5.times.flat_map { [obj.fwd(1), obj.fwd_explicit(2)] }.uniq
+    "#), @"[[:private, 1], [:private, 2]]");
+}
+
+#[test]
+fn test_send_forward_ep_escape() {
+    assert_snapshot!(inspect("
+        def target(a, b) = [a, b]
+        def fwd(...)
+          b = binding
+          target(...)
+        end
+        5.times.map { fwd(1, 2) }.uniq
+    "), @"[[1, 2]]");
+}
+
+#[test]
+fn test_send_forward_in_block() {
+    assert_snapshot!(inspect("
+        def target(a, b) = [a, b]
+        def fwd(...) = [1].map { target(...) }
+        5.times.map { fwd(1, 2) }.uniq
+    "), @"[[[1, 2]]]");
+}
+
+#[test]
+fn test_send_forward_side_exit_in_target() {
+    assert_snapshot!(inspect("
+        def target(a, b) = a + b
+        def fwd(...) = target(...)
+        r = 5.times.map { fwd(1, 2) }
+        r + [fwd(1.5, 2), fwd('a', 'b')]
+    "), @r#"[3, 3, 3, 3, 3, 3.5, "ab"]"#);
+}
+
+#[test]
+fn test_send_forward_redefined_target() {
+    assert_snapshot!(inspect("
+        def target(a) = [:old, a]
+        def fwd(...) = target(...)
+        r = 5.times.map { fwd(1) }.uniq
+        def target(a) = [:new, a]
+        r + 5.times.map { fwd(2) }.uniq
+    "), @"[[:old, 1], [:new, 2]]");
+}
+
+#[test]
+fn test_send_forward_via_send() {
+    assert_snapshot!(inspect("
+        def target(a, b) = [a, b]
+        def fwd(...) = target(...)
+        5.times.flat_map { [fwd(1, 2), send(:fwd, 3, 4), method(:fwd).call(5, 6)] }.uniq
+    "), @"[[1, 2], [3, 4], [5, 6]]");
+}
+
+#[test]
 fn test_setlocal_on_eval() {
     assert_snapshot!(inspect("
         @b = binding
