@@ -1419,6 +1419,7 @@ pub enum Insn {
     FloatSub  { recv: InsnId, other: InsnId, state: InsnId },
     FloatMul  { recv: InsnId, other: InsnId, state: InsnId },
     FloatDiv  { recv: InsnId, other: InsnId, state: InsnId },
+    FloatPow  { recv: InsnId, other: InsnId, state: InsnId },
     /// Float#to_i: truncate float to integer via rb_jit_flo_to_i
     FloatToInt { recv: InsnId, state: InsnId },
 
@@ -1636,7 +1637,8 @@ macro_rules! for_each_operand_impl {
             Insn::FloatAdd { recv, other, state }
             | Insn::FloatSub { recv, other, state }
             | Insn::FloatMul { recv, other, state }
-            | Insn::FloatDiv { recv, other, state } => {
+            | Insn::FloatDiv { recv, other, state }
+            | Insn::FloatPow { recv, other, state } => {
                 $visit_one!(*recv);
                 $visit_one!(*other);
                 $visit_one!(*state);
@@ -2100,6 +2102,7 @@ impl Insn {
             Insn::FloatSub { .. } => effects::Any,
             Insn::FloatMul { .. } => effects::Any,
             Insn::FloatDiv { .. } => effects::Any,
+            Insn::FloatPow { .. } => effects::Any,
             Insn::FloatToInt { .. } => effects::Any,
             Insn::FixnumEq { .. } => effects::Empty,
             Insn::FixnumLt { .. } => effects::Empty,
@@ -2535,6 +2538,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FloatSub   { recv, other, .. } => { write!(f, "FloatSub {recv}, {other}") },
             Insn::FloatMul   { recv, other, .. } => { write!(f, "FloatMul {recv}, {other}") },
             Insn::FloatDiv   { recv, other, .. } => { write!(f, "FloatDiv {recv}, {other}") },
+            Insn::FloatPow   { recv, other, .. } => { write!(f, "FloatPow {recv}, {other}") },
             Insn::FloatToInt { recv, .. } => { write!(f, "FloatToInt {recv}") },
             Insn::FixnumEq   { left, right, .. } => { write!(f, "FixnumEq {left}, {right}") },
             Insn::FixnumLt   { left, right, .. } => { write!(f, "FixnumLt {left}, {right}") },
@@ -4226,6 +4230,8 @@ impl Function {
             Insn::FloatSub   { .. } => types::Float,
             Insn::FloatMul   { .. } => types::Float,
             Insn::FloatDiv   { .. } => types::Float,
+            // A negative base with a fractional exponent yields a Complex
+            Insn::FloatPow   { .. } => types::BasicObject,
             Insn::FloatToInt { .. } => types::Integer,
             Insn::FixnumEq   { .. } => types::BoolExact,
             Insn::FixnumLt   { .. } => types::BoolExact,
@@ -10034,6 +10040,7 @@ impl Function {
             | Insn::FloatSub { recv, other, .. }
             | Insn::FloatMul { recv, other, .. }
             | Insn::FloatDiv { recv, other, .. }
+            | Insn::FloatPow { recv, other, .. }
             => {
                 self.assert_subtype(insn_id, recv, types::Flonum)?;
                 // other can be Flonum or Fixnum (rb_float_plus etc. handle both)

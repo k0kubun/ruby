@@ -11960,6 +11960,18 @@ fn test_float_compare_and_integer_to_f() {
 }
 
 #[test]
+fn test_float_pow() {
+    eval("
+        def test(a, b) = a ** b
+        test(2.0, 0.5) # profile
+    ");
+    assert_snapshot!(assert_compiles("[test(2.0, 2.0), test(2.0, 0.5), test(-2.0, 3.0), test(1.5, -2.0), test(10.0, 400.0), test(-8.0, 1.0 / 3), test(-1.0, 0.5)]"),
+        @"[4.0, 1.4142135623730951, -8.0, 0.4444444444444444, Infinity, (1.0000000000000002+1.7320508075688772i), (0.0+1.0i)]");
+    // Other exponent types side-exit and still work
+    assert_snapshot!(inspect("[test(2.0, 3), test(2.0, 2**70), test(4.0, 1/2r)]"), @"[8.0, Infinity, 2.0]");
+}
+
+#[test]
 fn test_send_backtrace() {
     assert_snapshot!(assert_compiles_allowing_exits(r#"
         def jit_frame2 = caller     # 1

@@ -812,6 +812,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
+        Insn::FloatPow { recv, other, state } => gen_float_pow(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), &function.frame_state(*state)),
         Insn::FixnumEq { left, right } => gen_fixnum_eq(asm, opnd!(left), opnd!(right)),
         Insn::FixnumLt { left, right } => gen_fixnum_lt(asm, opnd!(left), opnd!(right)),
@@ -3360,6 +3361,14 @@ fn gen_float_mul(asm: &mut Assembler, recv: lir::Opnd, other: lir::Opnd, state: 
 fn gen_float_div(asm: &mut Assembler, recv: lir::Opnd, other: lir::Opnd, state: &FrameState) -> lir::Opnd {
     gen_prepare_leaf_call_with_gc(asm, state);
     asm_ccall!(asm, rb_float_div, recv, other)
+}
+
+/// Compile Float ** Float or Float ** Fixnum
+fn gen_float_pow(asm: &mut Assembler, recv: lir::Opnd, other: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    // rb_float_pow() may allocate a heap Float or a Complex (for a negative base and a fractional
+    // exponent) but calls no Ruby method for these operands.
+    gen_prepare_leaf_call_with_gc(asm, state);
+    asm_ccall!(asm, rb_float_pow, recv, other)
 }
 
 /// Compile Float#to_i (truncate to integer)

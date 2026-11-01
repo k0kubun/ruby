@@ -238,6 +238,7 @@ fn main() {
         .allowlist_function("rb_float_mul")
         .allowlist_function("rb_float_div")
         .allowlist_function("rb_flo_to_i")
+        .allowlist_function("rb_float_pow")
         .allowlist_type("ruby_rstring_private_flags")
         .allowlist_function("rb_ec_str_resurrect")
         .allowlist_function("rb_str_concat_literals")

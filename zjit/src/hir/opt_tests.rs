@@ -26752,6 +26752,38 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_optimize_float_pow() {
+        eval(r#"
+            def test(x, y) = x ** y
+            test(2.0, 0.5)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Float@0x1008, **@0x1010, cme:0x1018)
+          v29:Flonum = GuardType v12, Flonum recompile
+          v30:Flonum = GuardType v13, Flonum recompile
+          v31:BasicObject = FloatPow v29, v30
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v31
+        ");
+    }
+
+    #[test]
     fn test_float_nan_p_annotation() {
         eval(r#"
             def test(x) = x.nan?
