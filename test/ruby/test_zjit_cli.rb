@@ -431,6 +431,19 @@ class TestZJITCLI < Test::Unit::TestCase
     RUBY
   end
 
+  def test_backedge_profiling_in_multiple_ractors
+    # Back-edges counted by the interpreter enable profiling of a looping ISEQ, which creates
+    # its payload. Several Ractors run the same blocks, so they must not create it concurrently.
+    assert_runs '[200, 200, 200]', <<~RUBY, call_threshold: 30, num_profiles: 5
+      Warning[:experimental] = false
+      procs = 200.times.map do |k|
+        nil.instance_eval("proc { i = 0; x = 0; while i < 20_000; x += \#{k}; i += 1; end; x }")
+      end
+      procs = Ractor.make_shareable(procs)
+      3.times.map { Ractor.new(procs) { |ps| ps.map(&:call).size } }.map(&:value)
+    RUBY
+  end
+
   def test_send_forwarded_block_arg_nil_then_non_nil
     # Regression test: when a forwarded &block arg is profiled as nil, the nil
     # block optimization must update the frame state to match the stripped args.

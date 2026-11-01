@@ -104,7 +104,11 @@ pub extern "C" fn rb_zjit_iseq_profile_started(iseq: IseqPtr) {
 /// Remember that back-edges made an ISEQ hot. See [`IseqPayload::hot_loop`].
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_iseq_mark_hot_loop(iseq: IseqPtr) {
-    get_or_create_iseq_payload(iseq).hot_loop = true;
+    // The interpreter calls this without the VM lock. Without it, another Ractor could create
+    // the payload or compile the ISEQ at the same time.
+    with_vm_lock(src_loc!(), || {
+        get_or_create_iseq_payload(iseq).hot_loop = true;
+    });
 }
 
 /// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.
