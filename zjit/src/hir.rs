@@ -9028,6 +9028,12 @@ impl Function {
     /// walk the frame chain, so pushing and popping the frame is pure overhead.
     /// This pass deletes both instructions of each such pair.
     ///
+    /// A `PatchPoint` in a method frame doesn't keep it either, e.g. the one on `Integer#==`
+    /// in an inlined `BasicObject#!=`. It only exits when its invariant is invalidated, and
+    /// nothing before it in the frame has an effect, so it can exit by re-executing the send
+    /// that pushed the frame instead. HotSpot and V8 similarly never materialize an inlined
+    /// frame unless they deoptimize.
+    ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
@@ -9038,25 +9044,49 @@ impl Function {
         struct PendingPush {
             /// The PushInlineFrame's instruction ID.
             push_id: InsnId,
+            /// Snapshot of the send that pushed the frame, if exits can re-execute it.
+            exit_state: Option<InsnId>,
             /// Whether an instruction that may take a side exit or observe the
             /// frame has been seen since the push. If so, the pair must be kept.
             frame_observed: bool,
+            /// PatchPoints in the frame. They exit only when invalidated, and nothing before them
+            /// in the frame has an effect, so they can exit by re-executing the send instead.
+            patch_points: Vec<InsnId>,
         }
 
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
+            // PatchPoints to move out of elided frames, with the exit state to move them to.
+            let mut rehomed_patch_points: HashMap<InsnId, InsnId> = HashMap::new();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
-                    Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, frame_observed: false });
+                    &Insn::PushInlineFrame { exit_state, .. } => {
+                        pending_pushes.push(PendingPush { push_id: insn_id, exit_state: Some(exit_state), frame_observed: false, patch_points: vec![] });
+                    }
+                    Insn::PushInlineBlockFrame { .. } => {
+                        pending_pushes.push(PendingPush { push_id: insn_id, exit_state: None, frame_observed: false, patch_points: vec![] });
                     }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, frame_observed: false }) => {
+                            Some(PendingPush { push_id, exit_state, frame_observed: false, patch_points }) => {
                                 // Empty pair: elide both the push and this pop.
                                 elided_pairs.push((push_id, insn_id));
+                                if !patch_points.is_empty() {
+                                    let exit_state = exit_state.expect("frames with PatchPoints have an exit state");
+                                    for &patch_point in &patch_points {
+                                        rehomed_patch_points.insert(patch_point, exit_state);
+                                    }
+                                    // The PatchPoints now exit in the enclosing frame.
+                                    if let Some(outer) = pending_pushes.last_mut() {
+                                        if outer.exit_state.is_some() {
+                                            outer.patch_points.extend(patch_points);
+                                        } else {
+                                            outer.frame_observed = true;
+                                        }
+                                    }
+                                }
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
                                 // Keep the pair. It observes the frame chain, so the
@@ -9069,6 +9099,9 @@ impl Function {
                                 // The matching push is in another block; leave it alone.
                             }
                         }
+                    }
+                    Insn::PatchPoint { .. } if pending_pushes.last().is_some_and(|push| push.exit_state.is_some()) => {
+                        pending_pushes.last_mut().unwrap().patch_points.push(insn_id);
                     }
                     insn => {
                         if !pending_pushes.is_empty() && !self.can_elide_enclosing_frame(insn) {
@@ -9084,6 +9117,11 @@ impl Function {
             }
             if elided_pairs.is_empty() {
                 continue;
+            }
+
+            for (patch_point, exit_state) in rehomed_patch_points {
+                let Insn::PatchPoint { state, .. } = &mut self.insns[patch_point] else { unreachable!() };
+                *state = exit_state;
             }
 
             // Elide each pair: drop the pop, and drop the push as well, except

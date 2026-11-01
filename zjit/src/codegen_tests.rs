@@ -2127,6 +2127,25 @@ fn test_yield_inlined_caller_block_dispatches_without_guards() {
 }
 
 #[test]
+fn test_inlined_neq_exits_after_eq_is_redefined() {
+    // The inlined BasicObject#!= frame is elided, so the PatchPoint on NeqRedef#== in it
+    // re-executes the `!=` send in the interpreter once it's invalidated.
+    with_inlining(|| {
+        eval("
+            class NeqRedef; end
+            def test(a, b) = a != b
+            O = NeqRedef.new
+            test(O, O); test(O, O)
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("
+            r = [test(O, O)]
+            class NeqRedef; def ==(o) = false; end
+            r << test(O, O)
+        "), @"[false, true]");
+    });
+}
+
+#[test]
 fn test_inline_branch_dominated_by_callers_branch() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_allowing_exits("
