@@ -293,21 +293,11 @@ mod snapshot_tests {
           v12:Any = Snapshot FrameState { pc: 0x1008, stack: [v6, v11], locals: [] }
           PatchPoint MethodRedefined(Object@0x1010, middle@0x1018, cme:0x1020), v12
           v20:ObjectSubclass[class_exact*:Object@VALUE(0x1010)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1010)] recompile
-          v22:Any = Snapshot FrameState { pc: 0x1008, stack: [], locals: [] }
-          PushInlineFrame :middle, v20 (0x1048), num_args=1
-          v29:Any = Snapshot FrameState { pc: 0x1068, stack: [v20, v11], locals: [x=v11], caller: v22 }
-          PatchPoint MethodRedefined(Object@0x1010, inner@0x1070, cme:0x1078), v29
-          v43:Any = Snapshot FrameState { pc: 0x1068, stack: [], locals: [x=v11], caller: v22 }
-          PushInlineFrame :inner, v20 (0x10a0), num_args=1
-          v50:Fixnum[1] = Const Value(1)
-          v51:Any = Snapshot FrameState { pc: 0x10c0, stack: [v11, v50], locals: [x=v11], caller: v43 }
-          PatchPoint MethodRedefined(Integer@0x10c8, +@0x10d0, cme:0x10d8), v51
+          PatchPoint MethodRedefined(Object@0x1010, inner@0x1048, cme:0x1050), v12
+          PatchPoint MethodRedefined(Integer@0x1078, +@0x1080, cme:0x1088), v12
           v65:Fixnum[2] = Const Value(2)
-          PopInlineFrame
-          v31:Any = Snapshot FrameState { pc: 0x1100, stack: [v65], locals: [x=v11], caller: v22 }
-          PatchPoint NoEPEscape(middle), v31
-          PopInlineFrame
-          v14:Any = Snapshot FrameState { pc: 0x1108, stack: [v65], locals: [] }
+          PatchPoint NoEPEscape(middle), v12
+          v14:Any = Snapshot FrameState { pc: 0x10b0, stack: [v65], locals: [] }
           CheckInterrupts
           Return v65
         ");
