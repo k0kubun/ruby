@@ -159,6 +159,9 @@ make_counters! {
         compiled_lukewarm_iseq_count,
         // Number of lukewarm versions that got hot and were invalidated to recompile them fully
         lukewarm_tier_up_count,
+        compiled_resume_entry_count,
+        // Number of times the interpreter resumed a frame in a compiled resume entry
+        resumed_frame_count,
         failed_iseq_count,
         jit_frame_heap_bytes,
         jit_frame_stack_map_bytes,

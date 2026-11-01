@@ -70,10 +70,25 @@ pub extern "C" fn rb_zjit_update_max_compile_time_ns(max_compile_time_ns: u64) {
     unsafe { rb_zjit_max_compile_time_ns = max_compile_time_ns; }
 }
 
+/// The start of the code region, which never moves. Resolving a [`crate::virtualmem::CodePtr`]
+/// with it doesn't borrow the region like [`CodeBlock`] does, so code that runs without the VM
+/// lock can use it while another Ractor writes code.
+#[derive(Clone, Copy)]
+pub struct CodeRegionBase(std::ptr::NonNull<u8>);
+
+impl crate::virtualmem::CodePtrBase for CodeRegionBase {
+    fn base_ptr(&self) -> std::ptr::NonNull<u8> {
+        self.0
+    }
+}
+
 /// Global state needed for code generation
 pub struct ZJITState {
     /// Inline code block (fast path)
     code_block: CodeBlock,
+
+    /// The start of `code_block`'s region. See [`CodeRegionBase`].
+    code_region_base: CodeRegionBase,
 
     /// ZJIT statistics
     counters: Counters,
@@ -194,8 +209,10 @@ impl ZJITState {
         };
 
         // Initialize the codegen globals instance
+        let code_region_base = CodeRegionBase(crate::virtualmem::CodePtrBase::base_ptr(&cb));
         let zjit_state = ZJITState {
             code_block: cb,
+            code_region_base,
             counters: Counters::default(),
             exit_counters: [0; VM_INSTRUCTION_SIZE as usize],
             send_fallback_counters: [0; VM_INSTRUCTION_SIZE as usize],
@@ -259,6 +276,11 @@ impl ZJITState {
     /// Get a mutable reference to the inline code block
     pub fn get_code_block() -> &'static mut CodeBlock {
         &mut ZJITState::get_instance().code_block
+    }
+
+    /// Get the start of the code region to resolve a [`crate::virtualmem::CodePtr`] without the VM lock
+    pub fn get_code_region_base() -> CodeRegionBase {
+        ZJITState::get_instance().code_region_base
     }
 
     /// Get a mutable reference to the invariants
