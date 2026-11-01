@@ -17432,7 +17432,7 @@ mod hir_opt_tests {
           v42:CInt64 = GuardGreaterEq v40, v41
           v43:CUInt64 = LoadField v34, :RBASIC_FLAGS@0x1041
           v44:CUInt64 = GuardNoBitsSet v43, RUBY_FL_FREEZE=CUInt64(2048)
-          v45:Fixnum = StringSetbyteFixnum v34, v35, v36
+          v45:Fixnum = StringSetbyteFixnum v34, v42, v36
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v36
@@ -17480,7 +17480,7 @@ mod hir_opt_tests {
           v42:CInt64 = GuardGreaterEq v40, v41
           v43:CUInt64 = LoadField v34, :RBASIC_FLAGS@0x1041
           v44:CUInt64 = GuardNoBitsSet v43, RUBY_FL_FREEZE=CUInt64(2048)
-          v45:Fixnum = StringSetbyteFixnum v34, v35, v36
+          v45:Fixnum = StringSetbyteFixnum v34, v42, v36
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v36

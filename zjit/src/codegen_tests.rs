@@ -6350,6 +6350,30 @@ fn test_string_ascii_only_unknown_coderange() {
     "#), @"[true, true, false, false, false, true, false]");
 }
 
+#[test]
+fn test_string_setbyte() {
+    eval(r#"
+        def test(s, i, v) = s.setbyte(i, v)
+        test(+"abc", 0, 65) # profile
+    "#);
+    // Embedded strings, 7-bit heap strings with ASCII bytes, and (via rb_str_setbyte) anything else
+    assert_snapshot!(assert_compiles(r#"
+        e = +"hello"
+        r = [test(e, 0, 72), test(e, -1, 0x21), test(e, 1, 0xe9), test(e, 2, 300)]
+        h = "a" * 1000
+        h.ascii_only?
+        r << [test(h, 3, 66), test(h, 999, 67), h.ascii_only?, h[0, 5], h[-1]]
+        r << [test(h, 4, 0xff), h.valid_encoding?, h.ascii_only?, h.getbyte(4)]
+        big = "b" * 2000
+        shared = big[10, 1500]
+        r << [test(shared, 0, 88), big[10], shared[0]]
+        u = "\u00e9" * 400
+        u.valid_encoding?
+        r << [test(u, 0, 65), u.valid_encoding?]
+        r << [e, e.valid_encoding?, e.ascii_only?]
+    "#), @r#"[72, 33, 233, 300, [66, 67, true, "aaaBa", "C"], [255, false, false, 255], [88, "b", "X"], [65, false], ["H\xE9,l!", false, false]]"#);
+}
+
 // `ascii_only?` and `valid_encoding?` will force a code range scan if necessary and the code range
 // will be stored in the object header. This test intermingles operations that would invalidate the
 // code range so we ensure we aren't reporting stale values on subsequent calls.

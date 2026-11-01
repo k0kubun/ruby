@@ -764,7 +764,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringCoderange { string, cached } => gen_string_coderange(jit, asm, opnd!(string), opnd!(cached)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
         Insn::StringByteslice { string, beg, len, state } => gen_string_byteslice(asm, opnd!(string), opnd!(beg), opnd!(len), &function.frame_state(*state)),
-        Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
+        Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(jit, asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, recv_flags, other_flags, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), opnd!(recv_flags), opnd!(other_flags), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringEqual { left, right } => gen_string_equal(asm, opnd!(left), opnd!(right)),
@@ -4812,9 +4812,76 @@ fn gen_string_byteslice(asm: &mut Assembler, string: Opnd, beg: Opnd, len: Opnd,
     asm_ccall!(asm, rb_str_byte_substr, string, beg, len)
 }
 
-fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
+/// Compile String#setbyte with a non-negative in-bounds `index` (CInt64) and a Fixnum `value`.
+fn gen_string_setbyte_fixnum(jit: &mut JITState, asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
+    // STR_DEPENDANT_MASK in string.c (FL_FREEZE | STR_TMPLOCK | STR_CHILLED | STR_SHARED |
+    // STR_NOFREE): the string must be made independent or is not modifiable.
+    const STR_DEPENDANT_MASK: u64 = (RUBY_FL_FREEZE | RUBY_FL_USER7 | RUBY_FL_USER2 | RUBY_FL_USER0 | RUBY_FL_USER18) as u64;
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let embed_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let heap_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let heap_store_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let edge = |target| Target::Block(Box::new(lir::BranchEdge { target, args: vec![] }));
+
+    // Do in JIT code what rb_str_setbyte() does when the string is already independent: store
+    // into an embedded string and clear its coderange, or store an ASCII byte into a 7-bit heap
+    // string. Call rb_str_setbyte() for anything else.
+    asm_comment!(asm, "String#setbyte");
+    let string = asm.load_mem(string);
+    let index = asm.load_mem(index);
+    let byte = asm.rshift(value, Opnd::UImm(1)); // Untag; the low 8 bits are the byte to store
+    let flags = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(flags, Opnd::UImm(STR_DEPENDANT_MASK));
+    asm.jnz(jit, edge(slow_block));
+    asm.test(flags, Opnd::UImm(RSTRING_NOEMBED as u64));
+    asm.jnz(jit, edge(heap_block));
+    asm.jmp(edge(embed_block));
+
+    asm.set_current_block(embed_block);
+    let label = jit.get_label(asm, embed_block, hir_block_id);
+    asm.write_label(label);
+    // Clear the coderange. This stores back the shape ID in the upper bits of the flags as is.
+    let new_flags = asm.and(flags, Opnd::Imm(!(RUBY_ENC_CODERANGE_MASK as i64)));
+    asm.store(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RBASIC_FLAGS), new_flags);
+    let ptr = asm.add(string, index);
+    asm.store(Opnd::mem(8, ptr, RUBY_OFFSET_RSTRING_AS_ARY), byte.with_num_bits(8));
+    asm.jmp(edge(result_block));
+
+    asm.set_current_block(heap_block);
+    let label = jit.get_label(asm, heap_block, hir_block_id);
+    asm.write_label(label);
+    let coderange = asm.and(flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    asm.cmp(coderange, Opnd::UImm(RUBY_ENC_CODERANGE_7BIT as u64));
+    asm.jne(jit, edge(slow_block));
+    asm.test(byte, Opnd::UImm(0x80));
+    asm.jnz(jit, edge(slow_block));
+    asm.jmp(edge(heap_store_block));
+
+    asm.set_current_block(heap_store_block);
+    let label = jit.get_label(asm, heap_store_block, hir_block_id);
+    asm.write_label(label);
+    let heap_ptr = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RSTRING_AS_HEAP_PTR));
+    let ptr = asm.add(heap_ptr, index);
+    asm.store(Opnd::mem(8, ptr, 0), byte.with_num_bits(8));
+    asm.jmp(edge(result_block));
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
     // rb_str_setbyte is not leaf, but we guard types and index ranges in HIR
-    asm_ccall!(asm, rb_str_setbyte, string, index, value)
+    let boxed_index = asm.lshift(index, Opnd::UImm(1));
+    let boxed_index = asm.or(boxed_index, Opnd::UImm(1));
+    asm_ccall!(asm, rb_str_setbyte, string, boxed_index, value);
+    asm.jmp(edge(result_block));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    value
 }
 
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, recv_flags: Opnd, other_flags: Opnd, state: &FrameState) -> Opnd {

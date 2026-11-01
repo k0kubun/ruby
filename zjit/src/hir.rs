@@ -10106,7 +10106,7 @@ impl Function {
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;
-                self.assert_subtype(insn_id, index, types::Fixnum)?;
+                self.assert_subtype(insn_id, index, types::CInt64)?;
                 self.assert_subtype(insn_id, value, types::Fixnum)
             }
             Insn::IsA { val, class } => {
