@@ -8781,6 +8781,11 @@ impl Function {
         // Move target instructions into block
         let target_insns = std::mem::take(&mut self.blocks[target].insns);
         self.blocks[block].insns.extend(target_insns);
+        // The block now runs the target's code too. If the target isn't a slow path, e.g. it's the
+        // join block after a fallback whose other predecessors side-exit, the block isn't either.
+        // Otherwise codegen would place the code after the join out of line, after the blocks it
+        // dominates, which also puts the definitions of its values after their uses.
+        self.blocks[block].cold &= self.blocks[target].cold;
         true
     }
 

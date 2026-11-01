@@ -6872,6 +6872,44 @@ pub(crate) mod hir_build_tests {
      }
 
      #[test]
+     fn test_cold_block_absorbing_hot_block_is_not_cold() {
+        let mut function = Function::new(std::ptr::null());
+
+        let bb0 = function.entry_block;
+        let bb1 = function.new_block(0);
+        let bb2 = function.new_block(0);
+        let bb3 = function.new_block(0);
+        let bb4 = function.new_block(0);
+        let bb5 = function.new_block(0);
+        let bb6 = function.new_block(0);
+
+        // bb2 is a cold fallback whose join block bb3 has no other predecessor, e.g. because the
+        // fast path bb1 never reaches it. bb4, a cold block that absorbs a cold block, stays cold.
+        let v1 = function.push_insn(bb0, Insn::Const { val: Const::Value(Qfalse) });
+        function.push_insn(bb0, Insn::CondBranch { val: v1, if_true: edge(bb1), if_false: edge(bb2) });
+        let v2 = function.push_insn(bb1, Insn::Const { val: Const::Value(Qtrue) });
+        function.push_insn(bb1, Insn::CondBranch { val: v2, if_true: edge(bb4), if_false: edge(bb6) });
+        let retval = function.push_insn(bb6, Insn::Const { val: Const::CBool(true) });
+        function.push_insn(bb6, Insn::Return { val: retval });
+        function.push_insn(bb2, Insn::Jump(edge(bb3)));
+        function.mark_cold(bb2);
+        function.push_insn(bb4, Insn::Jump(edge(bb5)));
+        function.mark_cold(bb4);
+        function.mark_cold(bb5);
+        let retval = function.push_insn(bb5, Insn::Const { val: Const::CBool(true) });
+        function.push_insn(bb5, Insn::Return { val: retval });
+        let retval = function.push_insn(bb3, Insn::Const { val: Const::CBool(false) });
+        function.push_insn(bb3, Insn::Return { val: retval });
+        function.seal_entries();
+
+        function.clean_cfg();
+        assert!(function.blocks[bb3].insns.is_empty(), "bb3 should be absorbed: {}", FunctionPrinter::without_snapshot(&function));
+        assert!(function.blocks[bb5].insns.is_empty(), "bb5 should be absorbed: {}", FunctionPrinter::without_snapshot(&function));
+        assert!(!function.is_cold_block(bb2));
+        assert!(function.is_cold_block(bb4));
+     }
+
+     #[test]
      fn test_cfi_deduplicated_successors_and_predecessors() {
          let mut function = Function::new(std::ptr::null());
 
