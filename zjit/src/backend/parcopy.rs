@@ -48,7 +48,7 @@ pub fn sequentialize_register<T: PartialEq + Eq + Hash + Ord + std::fmt::Debug +
     // `resource` in the original code, this point to the current register
     // holding a particular initial value.
     // If a given Register is no longer needed, the value might be inaccurate.
-    let mut current_holder = std::collections::HashMap::new();
+    let mut current_holder = crate::fxhash::HashMap::default();
     // Copies that are pending, indexed by destination register.
     // Use btree map to stay deterministic.
     let mut pending = std::collections::BTreeMap::new();

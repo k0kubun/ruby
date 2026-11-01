@@ -599,6 +599,12 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
             // Skip the entries superblock -- it's an internal CFG artifact
             if block_id == function.entries_block { continue; }
             let lir_block_id = asm.new_block(block_id, function.is_entry_block(block_id), rpo_idx);
+            // Lowering emits a few LIR instructions per HIR instruction. Reserve them upfront
+            // rather than growing the vectors one doubling at a time.
+            let lir_block = &mut asm.basic_blocks[lir_block_id.0];
+            let capacity = 2 * function.block(block_id).insns().len();
+            lir_block.insns.reserve(capacity);
+            lir_block.insn_ids.reserve(capacity);
             hir_to_lir[block_id] = Some(lir_block_id);
         }
 

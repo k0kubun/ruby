@@ -35,6 +35,7 @@ mod perf;
 mod profile;
 mod invariants;
 mod bitset;
+mod fxhash;
 mod gc;
 mod jit_frame;
 mod exit_desc;
