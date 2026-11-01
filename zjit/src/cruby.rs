@@ -1037,6 +1037,10 @@ pub fn get_lvar_level(mut iseq: IseqPtr) -> u32 {
 // so be careful with them.
 pub fn iseq_get_location(iseq: IseqPtr, pos: u32) -> String {
     let iseq_path = unsafe { rb_iseq_path(iseq) };
+    // Some HIR blocks, e.g. the blocks of a method entry check, have no instruction index
+    // (u32::MAX), and the blocks of an inlined callee have an index into the callee.
+    // rb_iseq_line_no() reads out of bounds for a position past the ISEQ, so use its first line.
+    let pos = if pos < unsafe { rb_iseq_encoded_size(iseq) } { pos } else { 0 };
     let iseq_lineno = unsafe { rb_iseq_line_no(iseq, pos as usize) };
 
     let mut s = iseq_name(iseq);
