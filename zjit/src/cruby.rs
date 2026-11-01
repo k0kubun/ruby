@@ -1259,6 +1259,7 @@ mod manual_defs {
 
     pub const RUBY_OFFSET_RSTRING_AS_HEAP_PTR: i32 = 24; // struct RString, subfield "as.heap.ptr"
     pub const RUBY_OFFSET_RSTRING_AS_ARY: i32 = 24; // struct RString, subfield "as.embed.ary"
+    pub const RUBY_OFFSET_RSTRING_AS_HEAP_AUX_CAPA: i32 = 32; // struct RString, subfield "as.heap.aux.capa"
 
     // Constants from rb_control_frame_t vm_core.h
     pub const RUBY_OFFSET_CFP_PC: i32 = 0;
