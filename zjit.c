@@ -33,6 +33,9 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 // This build config impacts the pointer tagging scheme and we only want to
 // support one scheme for simplicity.
@@ -123,10 +126,35 @@ rb_zjit_reserve_low_addr_space(size_t size)
     return mem_block;
 }
 
+
+// Ask the kernel to back the given range of reserved JIT code memory with transparent huge pages.
+// Returns false if the platform or the kernel doesn't support it.
+bool
+rb_zjit_advise_huge_pages(void *mem_block, size_t size)
+{
+  #if defined(__linux__) && defined(PR_SET_THP_DISABLE) && defined(MADV_HUGEPAGE)
+    // ruby_setup() disables THP for the process to keep pages shared with forked children
+    // (copy-on-write). Since Linux 6.18, the process can keep THP disabled except for memory
+    // it advises with MADV_HUGEPAGE, which only ZJIT's code region is. On older kernels,
+    // THP stays disabled.
+    #ifndef PR_THP_DISABLE_EXCEPT_ADVISED
+    # define PR_THP_DISABLE_EXCEPT_ADVISED (1 << 1)
+    #endif
+    if (prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0) > 0 &&
+            prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0) != 0) {
+        return false;
+    }
+    return madvise(mem_block, size, MADV_HUGEPAGE) == 0;
+  #else
+    return false;
+  #endif
+}
+
 #else
 
 // Windows not supported for now
 void *rb_zjit_reserve_low_addr_space(size_t size) { return NULL; }
+bool rb_zjit_advise_huge_pages(void *mem_block, size_t size) { return false; }
 
 #endif
 
