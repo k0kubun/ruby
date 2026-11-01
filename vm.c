@@ -573,7 +573,7 @@ zjit_compile(rb_execution_context_t *ec)
 
         // At call-threshold, compile the ISEQ with ZJIT.
         if (body->jit_entry_calls == rb_zjit_call_threshold) {
-            rb_zjit_compile_iseq(iseq, ec, false);
+            rb_zjit_compile_iseq(iseq, ec);
         }
     }
     return body->jit_entry;
@@ -639,28 +639,10 @@ jit_compile_exception(rb_execution_context_t *ec)
     const rb_iseq_t *iseq = CFP_ISEQ(ec->cfp);
     struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
 
-#if USE_ZJIT
-    // rb_zjit_compiling_p is false until ZJIT is enabled, so no
-    // rb_zjit_enabled_p check is needed here.
-    if (body->jit_exception == NULL && rb_zjit_compiling_p) {
-        body->jit_exception_calls++;
-
-        // At profile-threshold, rewrite some of the YARV instructions
-        // to zjit_* instructions to profile these instructions.
-        if (body->jit_exception_calls == rb_zjit_profile_threshold) {
-            rb_zjit_profile_enable(iseq);
-        }
-
-        // At call-threshold, compile the ISEQ with ZJIT.
-        if (body->jit_exception_calls == rb_zjit_call_threshold) {
-            rb_zjit_compile_iseq(iseq, ec, true);
-        }
-    }
-#endif
-
 #if USE_YJIT
     // Increment the ISEQ's call counter and trigger JIT compilation if not compiled.
-    // Like the ZJIT branch above, no rb_yjit_enabled_p check is needed here.
+    // rb_yjit_compiling_p is false until YJIT is enabled, so no rb_yjit_enabled_p
+    // check is needed here.
     if (body->jit_exception == NULL && rb_yjit_compiling_p) {
         body->jit_exception_calls++;
         if (body->jit_exception_calls == rb_yjit_call_threshold) {
@@ -671,10 +653,50 @@ jit_compile_exception(rb_execution_context_t *ec)
     return body->jit_exception;
 }
 
+#if USE_ZJIT
+static inline VALUE *vm_base_ptr(const rb_control_frame_t *cfp);
+
+// Resume ec->cfp in ZJIT code at its current PC, and then the frames it returns to. The
+// interpreter resumes a frame this way when an exception handler runs or a non-local exit
+// returns to it, which unwinds the JIT code of the frames it went through. ZJIT code keeps
+// each frame on the native stack, so unlike YJIT's, the frames the exception returns to
+// don't have JIT code to return to. Returns Qundef to run ec->cfp in the interpreter.
+static VALUE
+zjit_exec_resume(rb_execution_context_t *ec)
+{
+    while (true) {
+        rb_control_frame_t *cfp = ec->cfp;
+        // ZJIT code expects an EP on the VM stack
+        if (!VM_FRAME_RUBYFRAME_P(cfp) || VM_ENV_ESCAPED_P(cfp->ep)) return Qundef;
+
+        const rb_iseq_t *iseq = CFP_ISEQ(cfp);
+        rb_jit_func_t func = (rb_jit_func_t)rb_zjit_resume_entry(ec, iseq, ISEQ_BODY(iseq)->jit_payload,
+                                                                 CFP_PC(cfp) - ISEQ_BODY(iseq)->iseq_encoded,
+                                                                 cfp->sp - vm_base_ptr(cfp));
+        if (!func) return Qundef;
+
+        // The JIT code pops the frame on leave. Save its FINISH flag first.
+        bool finish = VM_FRAME_FINISHED_P(cfp);
+        VALUE result = ((rb_zjit_func_t)rb_zjit_entry)(ec, cfp, func);
+        // On a side exit, the interpreter continues the exited frame.
+        if (UNDEF_P(result) || finish) return result;
+
+        // Push the return value to the caller and resume it as well.
+        *ec->cfp->sp++ = result;
+    }
+}
+#endif
+
 // Execute JIT code compiled by jit_compile_exception()
 static inline VALUE
 jit_exec_exception(rb_execution_context_t *ec)
 {
+#if USE_ZJIT
+    if (rb_zjit_entry) {
+        return zjit_exec_resume(ec);
+    }
+#endif
+
     rb_jit_func_t func = jit_compile_exception(ec);
     if (func) {
         // Call the JIT code
