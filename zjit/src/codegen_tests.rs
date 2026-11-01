@@ -7524,6 +7524,27 @@ fn test_while_loop() {
 }
 
 #[test]
+fn test_while_loop_interrupted() {
+    // The interrupt check of a fused `while i < n` exits before the compare, so the interpreter
+    // re-executes the compare and the branch, which handles the interrupt.
+    eval("
+        def test(n)
+          i = 0
+          while i < n
+            i += 1
+          end
+          i
+        end
+        test(10) # profile
+    ");
+    assert_snapshot!(inspect("
+        r = [test(10)]
+        Thread.new { sleep 0.01; Thread.main.raise 'stop' }
+        r << begin; test(1 << 60); rescue => e; e.message; end
+    "), @r#"[10, "stop"]"#);
+}
+
+#[test]
 fn test_while_loop_chain() {
     assert_snapshot!(inspect("
         def test(n)

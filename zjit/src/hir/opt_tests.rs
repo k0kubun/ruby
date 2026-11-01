@@ -26617,9 +26617,8 @@ mod hir_opt_tests {
         bb6(v18:HeapBasicObject, v19:Fixnum):
           v23:Fixnum[10] = Const Value(10)
           PatchPoint MethodRedefined(Integer@0x1000, <@0x1008, cme:0x1010)
-          v93:BoolExact = FixnumLt v19, v23
           CheckInterrupts
-          CondBranchTest v93, bb4(), bb7()
+          CondBranchFixnumCmp Lt, v19, v23, bb4(), bb7()
         bb4():
           v44:CShape = LoadField v18, :shape_id@0x1038
           v46:CShape[0x1039] = Const CShape(0x1039)
@@ -29478,9 +29477,8 @@ mod hir_opt_tests {
         bb5(v19:Fixnum):
           v23:Fixnum[10] = Const Value(10)
           PatchPoint MethodRedefined(Integer@0x1000, <@0x1008, cme:0x1010)
-          v57:BoolExact = FixnumLt v19, v23
           CheckInterrupts
-          CondBranchTest v57, bb4(), bb6()
+          CondBranchFixnumCmp Lt, v19, v23, bb4(), bb6()
         bb4():
           v47:Fixnum[1] = Const Value(1)
           PatchPoint MethodRedefined(Integer@0x1000, +@0x1038, cme:0x1040)

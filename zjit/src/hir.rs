@@ -8812,14 +8812,81 @@ impl Function {
             }
         }
         for (block_id, branch_id, cmp_id, (op, left, right)) in candidates {
-            if use_count[cmp_id] != 1 { continue; }
             if !self.blocks[block_id].insns.iter().any(|&insn_id| self.find_id(insn_id) == cmp_id) { continue; }
+            if use_count[cmp_id] == 2 && self.retarget_check_interrupts_before_compare(block_id, cmp_id, left, right, &use_count) {
+                use_count[cmp_id] -= 1;
+            }
+            if use_count[cmp_id] != 1 { continue; }
             let Insn::CondBranchTest { if_true, if_false, .. } = self.find(branch_id) else { unreachable!() };
             self.insns[branch_id] = Insn::CondBranchFixnumCmp(Box::new(CondBranchFixnumCmpData { op, left, right, if_true, if_false }));
             // The compare had exactly one use and no side effects, so it is dead now.
             let union_find = self.union_find.borrow();
             self.blocks[block_id].insns.retain(|&insn_id| union_find.find_const(insn_id) != cmp_id);
         }
+    }
+
+    /// A loop condition like `while i < n` ends its block with `cmp; CheckInterrupts; CondBranchTest
+    /// cmp`, where the interrupt check's side exit has the compare result on the stack, which
+    /// keeps the compare materialized. If everything between the compare's own `Snapshot` (taken
+    /// with `left, right` on the stack) and the `CheckInterrupts` is free of side effects, make the
+    /// interrupt check exit to that earlier `Snapshot` instead, so that the interpreter re-executes
+    /// the (pure) compare and the branch, which checks interrupts again. This is the same idea as a
+    /// HotSpot safepoint poll that deoptimizes to the start of the loop condition. Returns whether
+    /// the `CheckInterrupts` no longer uses the compare.
+    fn retarget_check_interrupts_before_compare(&mut self, block_id: BlockId, cmp_id: InsnId, left: InsnId, right: InsnId, use_count: &[u32]) -> bool {
+        let insns = &self.blocks[block_id].insns;
+        let Some(cmp_idx) = insns.iter().position(|&insn_id| self.find_id(insn_id) == cmp_id) else { return false };
+        // The block must end with `CheckInterrupts; CondBranchTest`.
+        let [.., ci_id, _branch_id] = insns[..] else { return false };
+        let &Insn::CheckInterrupts { state: exit_id } = self.find_ref(ci_id) else { return false };
+        let exit_id = self.find_id(exit_id);
+        // The exit Snapshot must be used only by the CheckInterrupts and have the compare on top of
+        // its stack, which is then its only use besides the branch.
+        if use_count[exit_id] != 1 { return false; }
+        let Insn::Snapshot { state: exit_state } = self.find_ref(exit_id) else { return false };
+        let Some((&top, stack_below)) = exit_state.stack.split_last() else { return false };
+        if self.find_id(top) != cmp_id { return false; }
+        // Find the Snapshot right before the compare: the same frame with `left, right` pushed
+        // instead of the compare result.
+        // A GuardType only refines the type of the value it guards, so look through it.
+        let unguarded = |mut id: InsnId| {
+            id = self.find_id(id);
+            while let &Insn::GuardType { val, .. } = self.find_ref(id) { id = self.find_id(val); }
+            id
+        };
+        let same_ids = |a: &[InsnId], b: &[InsnId]| a.len() == b.len() && a.iter().zip(b).all(|(&a, &b)| unguarded(a) == unguarded(b));
+        let mut before_id = None;
+        for &insn_id in insns[..cmp_idx].iter().rev() {
+            match self.find_ref(insn_id) {
+                Insn::Snapshot { state } => {
+                    let expected_stack: Vec<InsnId> = stack_below.iter().copied().chain([left, right]).collect();
+                    if state.iseq == exit_state.iseq && state.caller == exit_state.caller && state.depth == exit_state.depth
+                        && same_ids(&state.stack, &expected_stack) && same_ids(&state.locals, &exit_state.locals) {
+                        before_id = Some(insn_id);
+                    }
+                    break;
+                }
+                insn if Self::is_pure_or_guard(insn) => {}
+                _ => return false,
+            }
+        }
+        let Some(before_id) = before_id else { return false };
+        // Everything from the compare to the CheckInterrupts must be free of side effects.
+        let ci_idx = insns.len() - 2;
+        let pure = insns[cmp_idx + 1..ci_idx].iter().all(|&insn_id| {
+            self.find_id(insn_id) == exit_id || Self::is_pure_or_guard(self.find_ref(insn_id))
+        });
+        if !pure { return false; }
+        self.insns[ci_id] = Insn::CheckInterrupts { state: before_id };
+        // The old exit Snapshot is dead now.
+        self.blocks[block_id].insns.retain(|&insn_id| insn_id != exit_id);
+        true
+    }
+
+    /// Whether re-executing `insn` in the interpreter is unobservable: it has no side effects, or
+    /// it can only side-exit to its own state.
+    fn is_pure_or_guard(insn: &Insn) -> bool {
+        insn.is_elidable() || matches!(insn, Insn::PatchPoint { .. } | Insn::GuardType { .. } | Insn::GuardBitEquals { .. })
     }
 
     /// Remove instructions that do not have side effects and are not referenced by any other
