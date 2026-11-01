@@ -26598,13 +26598,13 @@ mod hir_opt_tests {
           v55:CBool = IsBitEqual v54, v47
           CondBranch v55, bb11(), bb12()
         bb11():
-          v58:StringExact = CCallVariadic v10, :Integer#to_s@0x1040
-          Jump bb13(v58)
+          v59:StringExact = CCallVariadic v10, :Integer#to_s@0x1040
+          Jump bb13(v59)
         bb12():
-          v60:BasicObject = Send v10, :to_s # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb13(v60)
-        bb13(v62:BasicObject):
-          Jump bb4(v62)
+          v61:BasicObject = Send v10, :to_s # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb13(v61)
+        bb13(v63:BasicObject):
+          Jump bb4(v63)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -26672,13 +26672,13 @@ mod hir_opt_tests {
           v55:CBool = IsBitEqual v54, v47
           CondBranch v55, bb11(), bb12()
         bb11():
-          v58:BasicObject = CCallWithFrame v10, :Float#to_s@0x1040
-          Jump bb13(v58)
+          v59:BasicObject = CCallWithFrame v10, :Float#to_s@0x1040
+          Jump bb13(v59)
         bb12():
-          v60:BasicObject = Send v10, :to_s # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb13(v60)
-        bb13(v62:BasicObject):
-          Jump bb4(v62)
+          v61:BasicObject = Send v10, :to_s # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb13(v61)
+        bb13(v63:BasicObject):
+          Jump bb4(v63)
         bb4(v15:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -29124,13 +29124,13 @@ mod hir_opt_tests {
           v59:CBool = IsBitEqual v58, v51
           CondBranch v59, bb10(), bb11()
         bb10():
-          v62:BasicObject = CCallWithFrame v12, :Float#*@0x1040, v13
-          Jump bb12(v62)
+          v63:BasicObject = CCallWithFrame v12, :Float#*@0x1040, v13
+          Jump bb12(v63)
         bb11():
-          v64:BasicObject = Send v12, :*, v13 # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb12(v64)
-        bb12(v66:BasicObject):
-          Jump bb4(v66)
+          v65:BasicObject = Send v12, :*, v13 # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb12(v65)
+        bb12(v67:BasicObject):
+          Jump bb4(v67)
         bb4(v20:BasicObject):
           CheckInterrupts
           Return v20
