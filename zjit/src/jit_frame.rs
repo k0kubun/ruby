@@ -224,6 +224,46 @@ impl StackMapWriter {
     }
 }
 
+/// The set of distinct ISEQs referenced by JITFrames. JITFrames live for the lifetime of the
+/// process and keep their ISEQs alive, so the GC marks these as roots.
+#[derive(Default)]
+pub struct JITFrameIseqs {
+    /// Distinct non-null ISEQs in insertion order
+    iseqs: Vec<IseqPtr>,
+    set: std::collections::HashSet<IseqPtr>,
+}
+
+impl JITFrameIseqs {
+    fn insert(&mut self, iseq: IseqPtr) {
+        // Consecutive JITFrames mostly share an ISEQ. Skip the set lookup for them.
+        if !iseq.is_null() && self.iseqs.last() != Some(&iseq) && self.set.insert(iseq) {
+            self.iseqs.push(iseq);
+        }
+    }
+
+    /// Mark every ISEQ
+    pub fn mark(&self) {
+        for &iseq in self.iseqs.iter() {
+            unsafe { rb_gc_mark_movable(VALUE::from(iseq)); }
+        }
+    }
+
+    /// Update every ISEQ after GC compaction
+    pub fn update_references(&mut self) {
+        let mut moved = false;
+        for iseq in self.iseqs.iter_mut() {
+            let new_iseq = unsafe { rb_gc_location(VALUE::from(*iseq)) }.as_iseq();
+            if *iseq != new_iseq {
+                *iseq = new_iseq;
+                moved = true;
+            }
+        }
+        if moved {
+            self.set = self.iseqs.iter().copied().collect();
+        }
+    }
+}
+
 impl JITFrame {
     /// Allocate a JITFrame with an empty stack map, register it with ZJITState,
     /// and return a raw pointer that remains valid for the lifetime of the process.
@@ -237,6 +277,7 @@ impl JITFrame {
             });
         }
         ZJITState::get_jit_frames().push(raw_ptr);
+        ZJITState::get_jit_frame_iseqs().insert(iseq);
         raw_ptr.cast_const()
     }
 
@@ -268,13 +309,6 @@ impl JITFrame {
     pub fn new_iseq(pc: *const VALUE, iseq: IseqPtr) -> *const Self {
         let materialize_block_code = !iseq_may_write_block_code(iseq);
         Self::alloc(pc, iseq, materialize_block_code)
-    }
-
-    /// Mark the iseq pointer for GC. Called from rb_zjit_root_mark.
-    pub fn mark(&self) {
-        if !self.iseq.is_null() {
-            unsafe { rb_gc_mark_movable(VALUE::from(self.iseq)); }
-        }
     }
 
     /// Update the iseq pointer after GC compaction.
@@ -338,9 +372,34 @@ impl std::hash::Hash for PendingJITFrame {
 
 #[cfg(test)]
 mod tests {
-    use crate::cruby::{eval, inspect, VALUE};
+    use crate::cruby::{eval, inspect, IseqPtr, VALUE};
     use insta::assert_snapshot;
-    use super::StackMapWriter;
+    use super::{JITFrameIseqs, StackMapWriter};
+
+    #[test]
+    fn test_jit_frame_iseqs_are_distinct() {
+        let iseq = |addr: usize| addr as IseqPtr;
+        let mut iseqs = JITFrameIseqs::default();
+        for addr in [0x10, 0x10, 0, 0x20, 0x10, 0x30, 0x20, 0] {
+            iseqs.insert(iseq(addr));
+        }
+        assert_eq!(iseqs.iseqs, vec![iseq(0x10), iseq(0x20), iseq(0x30)]);
+    }
+
+    #[test]
+    fn test_jit_frame_iseqs_survive_compaction() {
+        // The ISEQs marked through JITFrameIseqs move with compaction, and the next GC marks
+        // them at their new addresses.
+        assert_snapshot!(inspect("
+            def callee = caller_locations(1, 1).first.label
+            def test = callee
+            test
+            test
+            GC.verify_compaction_references(expand_heap: true, toward: :empty)
+            GC.start
+            test
+        "), @r#""Object#test""#);
+    }
 
     #[test]
     fn test_stack_map_writer_bit_layout() {

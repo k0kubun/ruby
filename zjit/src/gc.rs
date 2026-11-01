@@ -110,6 +110,7 @@ pub extern "C" fn rb_zjit_root_update_references() {
     for &jit_frame in ZJITState::get_jit_frames().iter() {
         unsafe { &mut *jit_frame }.update_references();
     }
+    ZJITState::get_jit_frame_iseqs().update_references();
 }
 
 fn iseq_mark(payload: &IseqPayload) {
@@ -251,9 +252,9 @@ pub extern "C" fn rb_zjit_root_mark() {
     if !ZJITState::has_instance() {
         return;
     }
-    for &jit_frame in ZJITState::get_jit_frames().iter() {
-        unsafe { &*jit_frame }.mark();
-    }
+    // There are far fewer distinct ISEQs than JITFrames, so mark the ISEQs without
+    // loading every JITFrame.
+    ZJITState::get_jit_frame_iseqs().mark();
 }
 
 #[cfg(test)]
