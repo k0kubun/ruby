@@ -1758,6 +1758,7 @@ pub(crate) mod ids {
         name: le                 content: b"<="
         name: gt                 content: b">"
         name: ge                 content: b">="
+        name: to_f
         name: and                content: b"&"
         name: or                 content: b"|"
         name: xor                content: b"^"

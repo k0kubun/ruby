@@ -11919,6 +11919,23 @@ fn test_float_arithmetic() {
 }
 
 #[test]
+fn test_float_compare_and_integer_to_f() {
+    eval("
+        def lt(a, b) = a < b
+        def le(a, b) = a <= b
+        def gt(a, b) = a > b
+        def ge(a, b) = a >= b
+        def to_f(a) = a.to_f
+        lt(1.0, 2.0); le(1.0, 2.0); gt(1.0, 2); ge(1.0, 2); to_f(1) # profile
+    ");
+    assert_snapshot!(assert_compiles("[lt(1.5, 2.5), le(2.5, 2.5), lt(2.5, 1.5), le(2.5, 1.5)]"), @"[true, true, false, false]");
+    assert_snapshot!(assert_compiles("[gt(3.0, 1), ge(1.0, 1), gt(1.0, 4611686018427387903), ge(2.0e18, -4611686018427387904)]"), @"[true, true, false, true]");
+    assert_snapshot!(assert_compiles("[to_f(0), to_f(-7), to_f(4611686018427387903)]"), @"[0.0, -7.0, 4.611686018427388e+18]");
+    // Heap Floats (e.g. NaN and -0.0) and other operand types side-exit and still work
+    assert_snapshot!(inspect("[lt(Float::NAN, 1.0), le(-0.0, 0.0), lt(1.0, 2**70), ge(1.0, 1r), to_f(2**1100)]"), @"[false, true, true, true, Infinity]");
+}
+
+#[test]
 fn test_send_backtrace() {
     assert_snapshot!(assert_compiles_allowing_exits(r#"
         def jit_frame2 = caller     # 1

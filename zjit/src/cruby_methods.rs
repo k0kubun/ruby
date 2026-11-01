@@ -289,6 +289,11 @@ pub fn init() -> Annotations {
     annotate!(rb_cFloat, "*", inline_float_mul);
     annotate!(rb_cFloat, "/", inline_float_div);
     annotate!(rb_cFloat, "to_i", inline_float_to_i);
+    annotate!(rb_cFloat, "<", inline_float_lt);
+    annotate!(rb_cFloat, "<=", inline_float_le);
+    annotate!(rb_cFloat, ">", inline_float_gt);
+    annotate!(rb_cFloat, ">=", inline_float_ge);
+    annotate!(rb_cInteger, "to_f", inline_integer_to_f);
     annotate!(rb_cFloat, "to_int", inline_float_to_i);
     annotate!(rb_cString, "to_s", inline_string_to_s, types::StringExact);
     annotate!(rb_cString, "to_sym", inline_string_to_sym, types::Symbol);
@@ -808,6 +813,62 @@ fn inline_float_to_i(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
         return Some(fun.push_insn(block, hir::Insn::FloatToInt { recv, state }));
     }
     None
+}
+
+/// Call the C function of the C method `klass#method_id` without pushing a frame, for callers that
+/// know it is leaf and does not allocate for the given operand types. The caller has already
+/// emitted the PatchPoints for the method.
+fn push_leaf_cfunc_call(fun: &mut hir::Function, block: hir::BlockId, klass: VALUE, method_id: ID, recv: hir::InsnId, args: Vec<hir::InsnId>, return_type: Type) -> Option<hir::InsnId> {
+    let cme = unsafe { rb_callable_method_entry(klass, method_id) };
+    if cme.is_null() || unsafe { get_cme_def_type(cme) } != VM_METHOD_TYPE_CFUNC { return None; }
+    let cfunc = unsafe { get_mct_func(get_cme_def_body_cfunc(cme)) }.cast();
+    let owner = unsafe { (*cme).owner };
+    Some(fun.push_insn(block, hir::Insn::CCall { cfunc, recv, args, name: method_id, owner, return_type, elidable: true }))
+}
+
+/// Float#<, #<=, #>, and #>= are leaf and do not allocate when comparing a Flonum with a Flonum or
+/// a Fixnum (they call coerce for other operands), so call them without a frame, like Float#+.
+fn try_inline_float_cmp(fun: &mut hir::Function, block: hir::BlockId, method_id: ID, bop: u32, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, FLOAT_REDEFINED_OP_FLAG) } {
+        return None;
+    }
+    if !fun.likely_a(recv, types::Flonum, state) { return None; }
+    let other_type = if fun.likely_a(other, types::Flonum, state) {
+        types::Flonum
+    } else if fun.likely_a(other, types::Fixnum, state) {
+        types::Fixnum
+    } else {
+        return None;
+    };
+    let recv = fun.coerce_to(block, recv, types::Flonum, state);
+    let other = fun.coerce_to(block, other, other_type, state);
+    push_leaf_cfunc_call(fun, block, unsafe { rb_cFloat }, method_id, recv, vec![other], types::BoolExact)
+}
+
+fn inline_float_lt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    try_inline_float_cmp(fun, block, ID!(lt), BOP_LT, recv, args, state)
+}
+
+fn inline_float_le(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    try_inline_float_cmp(fun, block, ID!(le), BOP_LE, recv, args, state)
+}
+
+fn inline_float_gt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    try_inline_float_cmp(fun, block, ID!(gt), BOP_GT, recv, args, state)
+}
+
+fn inline_float_ge(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    try_inline_float_cmp(fun, block, ID!(ge), BOP_GE, recv, args, state)
+}
+
+/// Integer#to_f of a Fixnum is leaf and does not allocate: every Fixnum converts to a double
+/// within the Flonum range. (A Bignum may convert to a heap Float.)
+fn inline_integer_to_f(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[] = args else { return None; };
+    if !fun.likely_a(recv, types::Fixnum, state) { return None; }
+    let recv = fun.coerce_to(block, recv, types::Fixnum, state);
+    push_leaf_cfunc_call(fun, block, unsafe { rb_cInteger }, ID!(to_f), recv, vec![], types::Flonum)
 }
 
 fn try_inline_fixnum_op(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(hir::InsnId, hir::InsnId) -> hir::Insn, bop: u32, left: hir::InsnId, right: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {
