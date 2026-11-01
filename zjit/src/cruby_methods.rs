@@ -901,21 +901,47 @@ fn inline_integer_le(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
 
 fn inline_integer_lshift(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
-    // Only convert to FixnumLShift if we know the shift amount is known at compile-time and could
-    // plausibly create a fixnum.
-    let Some(other_value) = fun.type_of(other).fixnum_value() else { return None; };
-    if other_value < 0 || other_value > 63 { return None; }
-    try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumLShift { left, right, state }, BOP_LTLT, recv, other, state)
+    // Only convert to FixnumLShift if the shift amount is in [0, 63], where it could plausibly
+    // create a fixnum. A compile-time constant is checked here; any other amount is guarded.
+    if let Some(other_value) = fun.type_of(other).fixnum_value() {
+        if other_value < 0 || other_value > 63 { return None; }
+    }
+    try_inline_fixnum_shift(fun, block, &|left, right| hir::Insn::FixnumLShift { left, right, state }, BOP_LTLT, recv, other, state)
 }
 
 fn inline_integer_rshift(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
-    // Only convert to FixnumLShift if we know the shift amount is known at compile-time and could
-    // plausibly create a fixnum.
-    let Some(other_value) = fun.type_of(other).fixnum_value() else { return None; };
-    // TODO(max): If other_value > 63, rewrite to constant zero.
-    if other_value < 0 || other_value > 63 { return None; }
-    try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumRShift { left, right }, BOP_GTGT, recv, other, state)
+    // Only convert to FixnumRShift if the shift amount is in [0, 63]. A compile-time constant is
+    // checked here; any other amount is guarded.
+    if let Some(other_value) = fun.type_of(other).fixnum_value() {
+        // TODO(max): If other_value > 63, rewrite to constant zero.
+        if other_value < 0 || other_value > 63 { return None; }
+    }
+    try_inline_fixnum_shift(fun, block, &|left, right| hir::Insn::FixnumRShift { left, right }, BOP_GTGT, recv, other, state)
+}
+
+/// Like [try_inline_fixnum_op], but for FixnumLShift and FixnumRShift, which require the shift
+/// amount to be in [0, 63]. If the amount is not a compile-time constant, guard that it is in
+/// range, like HotSpot and V8 do for their int shifts (only that they mask the amount), so that
+/// a loop like `1 << i` compiles to a native shift instead of a C call.
+fn try_inline_fixnum_shift(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(hir::InsnId, hir::InsnId) -> hir::Insn, bop: u32, left: hir::InsnId, right: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {
+    if !unsafe { rb_BASIC_OP_UNREDEFINED_P(bop, INTEGER_REDEFINED_OP_FLAG) } {
+        return None;
+    }
+    if !(fun.likely_a(left, types::Fixnum, state) && fun.likely_a(right, types::Fixnum, state)) {
+        return None;
+    }
+    let left = fun.coerce_to(block, left, types::Fixnum, state);
+    let right = fun.coerce_to(block, right, types::Fixnum, state);
+    if fun.type_of(right).fixnum_value().is_none() {
+        use crate::hir::SideExitReason;
+        let amount = fun.push_insn(block, hir::Insn::UnboxFixnum { val: right });
+        let zero = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(0) });
+        fun.push_insn(block, hir::Insn::GuardGreaterEq { left: amount, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
+        let limit = fun.push_insn(block, hir::Insn::Const { val: hir::Const::CInt64(64) });
+        fun.push_insn(block, hir::Insn::GuardLess { left: amount, right: limit, reason: Box::new(SideExitReason::GuardLess), state });
+    }
+    Some(fun.push_insn(block, f(left, right)))
 }
 
 fn inline_integer_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {

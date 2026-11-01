@@ -241,6 +241,11 @@ pub fn asr(cb: &mut CodeBlock, rd: A64Opnd, rn: A64Opnd, shift: A64Opnd) {
 
             SBFM::asr(rd.reg_no, rn.reg_no, shift.try_into().unwrap(), rd.num_bits).into()
         },
+        (A64Opnd::Reg(rd), A64Opnd::Reg(rn), A64Opnd::Reg(rm)) => {
+            assert!(rd.num_bits == rn.num_bits && rn.num_bits == rm.num_bits, "Expected registers to be the same size");
+
+            ShiftReg::asrv(rd.reg_no, rn.reg_no, rm.reg_no, rd.num_bits).into()
+        },
         _ => panic!("Invalid operand combination to asr instruction: asr {rd:?}, {rn:?}, {shift:?}"),
     };
 
@@ -655,6 +660,11 @@ pub fn lsl(cb: &mut CodeBlock, rd: A64Opnd, rn: A64Opnd, shift: A64Opnd) {
 
             ShiftImm::lsl(rd.reg_no, rn.reg_no, uimm as u8, rd.num_bits).into()
         },
+        (A64Opnd::Reg(rd), A64Opnd::Reg(rn), A64Opnd::Reg(rm)) => {
+            assert!(rd.num_bits == rn.num_bits && rn.num_bits == rm.num_bits, "Expected registers to be the same size");
+
+            ShiftReg::lslv(rd.reg_no, rn.reg_no, rm.reg_no, rd.num_bits).into()
+        },
         _ => panic!("Invalid operands combination {rd:?} {rn:?} {shift:?} to lsl instruction")
     };
 
@@ -669,6 +679,11 @@ pub fn lsr(cb: &mut CodeBlock, rd: A64Opnd, rn: A64Opnd, shift: A64Opnd) {
             assert!(uimm_fits_bits(uimm, 6), "Expected shift to be 6 bits or less");
 
             ShiftImm::lsr(rd.reg_no, rn.reg_no, uimm as u8, rd.num_bits).into()
+        },
+        (A64Opnd::Reg(rd), A64Opnd::Reg(rn), A64Opnd::Reg(rm)) => {
+            assert!(rd.num_bits == rn.num_bits && rn.num_bits == rm.num_bits, "Expected registers to be the same size");
+
+            ShiftReg::lsrv(rd.reg_no, rn.reg_no, rm.reg_no, rd.num_bits).into()
         },
         _ => panic!("Invalid operands combination to lsr instruction")
     };
@@ -1386,6 +1401,13 @@ mod tests {
     }
 
     #[test]
+    fn test_asr_register() {
+        let cb = compile(|cb| asr(cb, X20, X21, X22));
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: asr x20, x21, x22");
+        assert_snapshot!(cb.hexdump(), @"b42ad69a");
+    }
+
+    #[test]
     fn test_bcond() {
         let offset = InstructionOffset::from_insns(0x100);
         let cb = compile(|cb| bcond(cb, Condition::NE, offset));
@@ -1662,6 +1684,20 @@ mod tests {
         let cb = compile(|cb| lsl(cb, X10, X11, A64Opnd::new_uimm(14)));
         assert_disasm_snapshot!(cb.disasm(), @"  0x0: lsl x10, x11, #0xe");
         assert_snapshot!(cb.hexdump(), @"6ac572d3");
+    }
+
+    #[test]
+    fn test_lsl_register() {
+        let cb = compile(|cb| lsl(cb, X10, X11, X12));
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: lsl x10, x11, x12");
+        assert_snapshot!(cb.hexdump(), @"6a21cc9a");
+    }
+
+    #[test]
+    fn test_lsr_register() {
+        let cb = compile(|cb| lsr(cb, X10, X11, X12));
+        assert_disasm_snapshot!(cb.disasm(), @"  0x0: lsr x10, x11, x12");
+        assert_snapshot!(cb.hexdump(), @"6a25cc9a");
     }
 
     #[test]

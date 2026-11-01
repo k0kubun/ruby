@@ -17744,7 +17744,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_dont_inline_integer_ltlt_with_unknown_fixnum() {
+    fn test_inline_integer_ltlt_with_unknown_fixnum() {
         eval("
             def test(x, y) = x << y
             test(4, 5)
@@ -17768,10 +17768,16 @@ mod hir_opt_tests {
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
           PatchPoint MethodRedefined(Integer@0x1008, <<@0x1010, cme:0x1018)
           v30:Fixnum = GuardType v12, Fixnum recompile
-          v31:BasicObject = CCallWithFrame v30, :Integer#<<@0x1040, v13
+          v31:Fixnum = GuardType v13, Fixnum recompile
+          v32:CInt64 = UnboxFixnum v31
+          v33:CInt64[0] = Const CInt64(0)
+          v34:CInt64 = GuardGreaterEq v32, v33
+          v35:CInt64[64] = Const CInt64(64)
+          v36:CInt64 = GuardLess v34, v35
+          v37:Fixnum = FixnumLShift v30, v31
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v31
+          Return v37
         ");
     }
 
@@ -17866,7 +17872,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_dont_inline_integer_gtgt_with_unknown_fixnum() {
+    fn test_inline_integer_gtgt_with_unknown_fixnum() {
         eval("
             def test(x, y) = x >> y
             test(4, 5)
@@ -17889,10 +17895,16 @@ mod hir_opt_tests {
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
           PatchPoint MethodRedefined(Integer@0x1008, >>@0x1010, cme:0x1018)
           v29:Fixnum = GuardType v12, Fixnum recompile
-          v30:BasicObject = CCallWithFrame v29, :Integer#>>@0x1040, v13
+          v30:Fixnum = GuardType v13, Fixnum recompile
+          v31:CInt64 = UnboxFixnum v30
+          v32:CInt64[0] = Const CInt64(0)
+          v33:CInt64 = GuardGreaterEq v31, v32
+          v34:CInt64[64] = Const CInt64(64)
+          v35:CInt64 = GuardLess v33, v34
+          v36:Fixnum = FixnumRShift v29, v30
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v30
+          Return v36
         ");
     }
 

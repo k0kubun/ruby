@@ -544,6 +544,27 @@ impl Assembler {
                     asm.push_insn(insn);
                     asm_mov(asm, out, left, SCRATCH0_OPND);
                 }
+                // x86 can shift by a variable amount only in CL. If the amount is in any other
+                // register or memory, shift a copy of opnd in SCRATCH0 while temporarily
+                // moving the amount into RCX, saving RCX in SCRATCH1.
+                &mut Insn::LShift { opnd, shift, out } |
+                &mut Insn::RShift { opnd, shift, out } |
+                &mut Insn::URShift { opnd, shift, out } if !matches!(shift, Opnd::UImm(_) | Opnd::Imm(_) | Opnd::Reg(RCX_REG)) => {
+                    let rcx = Opnd::Reg(RCX_REG);
+                    let opnd = split_stack_membase(asm, opnd, SCRATCH0_OPND);
+                    asm.mov(SCRATCH0_OPND, opnd);
+                    asm.mov(SCRATCH1_OPND, rcx);
+                    asm.mov(rcx, lower_stack_membase(asm, shift));
+                    let shift_insn = match insn {
+                        Insn::LShift { .. } => Insn::LShift { opnd: SCRATCH0_OPND, shift: rcx, out: SCRATCH0_OPND },
+                        Insn::RShift { .. } => Insn::RShift { opnd: SCRATCH0_OPND, shift: rcx, out: SCRATCH0_OPND },
+                        _ => Insn::URShift { opnd: SCRATCH0_OPND, shift: rcx, out: SCRATCH0_OPND },
+                    };
+                    asm.push_insn(shift_insn);
+                    asm.mov(rcx, SCRATCH1_OPND);
+                    let out = lower_stack_membase(asm, out);
+                    asm_mov(asm, out, SCRATCH0_OPND, SCRATCH1_OPND);
+                }
                 &mut Insn::Not { opnd, out } |
                 &mut Insn::LShift { opnd, out, .. } |
                 &mut Insn::RShift { opnd, out, .. } |

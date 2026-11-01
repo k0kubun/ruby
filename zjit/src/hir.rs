@@ -9978,9 +9978,8 @@ impl Function {
             | Insn::FixnumRShift { left, right, .. } => {
                 self.assert_subtype(insn_id, left, types::Fixnum)?;
                 self.assert_subtype(insn_id, right, types::Fixnum)?;
-                let Some(obj) = self.type_of(right).fixnum_value() else {
-                    return Err(ValidationError::MismatchedOperandType(insn_id, right, "<a compile-time constant>".into(), "<unknown>".into()));
-                };
+                // A shift amount that is not a compile-time constant is guarded to be in [0, 63].
+                let Some(obj) = self.type_of(right).fixnum_value() else { return Ok(()); };
                 if obj < 0 {
                     return Err(ValidationError::MismatchedOperandType(insn_id, right, "<positive>".into(), format!("{obj}")));
                 }

@@ -829,15 +829,21 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::IntAnd { left, right } => asm.and(opnd!(left), opnd!(right)),
         Insn::IntOr { left, right } => gen_int_or(asm, opnd!(left), opnd!(right)),
         &Insn::FixnumLShift { left, right, state } => {
-            // We only create FixnumLShift when we know the shift amount statically and it's in [0,
-            // 63].
-            let shift_amount = function.type_of(right).fixnum_value().unwrap() as u64;
+            // The shift amount is either a compile-time constant in [0, 63] or guarded to be in
+            // that range.
+            let shift_amount = match function.type_of(right).fixnum_value() {
+                Some(shift_amount) => Opnd::UImm(shift_amount as u64),
+                None => asm.rshift(opnd!(right), Opnd::UImm(1)), // Untag the shift amount
+            };
             gen_fixnum_lshift(jit, asm, function, opnd!(left), shift_amount, &function.frame_state(state))
         }
         &Insn::FixnumRShift { left, right } => {
-            // We only create FixnumRShift when we know the shift amount statically and it's in [0,
-            // 63].
-            let shift_amount = function.type_of(right).fixnum_value().unwrap() as u64;
+            // The shift amount is either a compile-time constant in [0, 63] or guarded to be in
+            // that range.
+            let shift_amount = match function.type_of(right).fixnum_value() {
+                Some(shift_amount) => Opnd::UImm(shift_amount as u64),
+                None => asm.rshift(opnd!(right), Opnd::UImm(1)), // Untag the shift amount
+            };
             gen_fixnum_rshift(asm, opnd!(left), shift_amount)
         }
         &Insn::FixnumMod { left, right, state } => gen_fixnum_mod(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state)),
@@ -3408,12 +3414,12 @@ fn gen_fixnum_xor(asm: &mut Assembler, left: lir::Opnd, right: lir::Opnd) -> lir
 }
 
 /// Compile Fixnum << Fixnum
-fn gen_fixnum_lshift(jit: &mut JITState, asm: &mut Assembler, function: &Function, left: lir::Opnd, shift_amount: u64, state: &FrameState) -> lir::Opnd {
-    // Shift amount is known statically to be in the range [0, 63]
-    assert!(shift_amount < 64);
+fn gen_fixnum_lshift(jit: &mut JITState, asm: &mut Assembler, function: &Function, left: lir::Opnd, shift_amount: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    // Shift amount is known to be in the range [0, 63]
+    if let Opnd::UImm(shift_amount) = shift_amount { assert!(shift_amount < 64); }
     let in_val = asm.sub(left, Opnd::UImm(1));  // Drop tag bit
-    let out_val = asm.lshift(in_val, shift_amount.into());
-    let unshifted = asm.rshift(out_val, shift_amount.into());
+    let out_val = asm.lshift(in_val, shift_amount);
+    let unshifted = asm.rshift(out_val, shift_amount);
     asm.cmp(in_val, unshifted);
     asm.jne(jit, side_exit(jit, function, state, FixnumLShiftOverflow));
     // Re-tag the output value
@@ -3422,10 +3428,10 @@ fn gen_fixnum_lshift(jit: &mut JITState, asm: &mut Assembler, function: &Functio
 }
 
 /// Compile Fixnum >> Fixnum
-fn gen_fixnum_rshift(asm: &mut Assembler, left: lir::Opnd, shift_amount: u64) -> lir::Opnd {
-    // Shift amount is known statically to be in the range [0, 63]
-    assert!(shift_amount < 64);
-    let result = asm.rshift(left, shift_amount.into());
+fn gen_fixnum_rshift(asm: &mut Assembler, left: lir::Opnd, shift_amount: lir::Opnd) -> lir::Opnd {
+    // Shift amount is known to be in the range [0, 63]
+    if let Opnd::UImm(shift_amount) = shift_amount { assert!(shift_amount < 64); }
+    let result = asm.rshift(left, shift_amount);
     // Re-tag the output value
     asm.or(result, 1.into())
 }

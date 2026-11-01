@@ -5163,6 +5163,28 @@ fn test_fixnum_lshift_overflow() {
 }
 
 #[test]
+fn test_fixnum_lshift_variable() {
+    eval("
+        def test(a, b) = a << b
+        test(1, 2) # profile opt_ltlt
+    ");
+    assert_snapshot!(assert_compiles("[test(5, 0), test(5, 3), test(-5, 3), test(1, 61), test(-1, 62), test(0, 63)]"), @"[5, 40, -40, 2305843009213693952, -4611686018427387904, 0]");
+    // Overflow, a negative amount, and an amount of 64 or more side-exit to the interpreter
+    assert_snapshot!(inspect("[test(1, 62), test(3, 63), test(-3, 62), test(40, -3), test(1, 64), test(0, 100)]"), @"[4611686018427387904, 27670116110564327424, -13835058055282163712, 5, 18446744073709551616, 0]");
+}
+
+#[test]
+fn test_fixnum_rshift_variable() {
+    eval("
+        def test(a, b) = a >> b
+        test(1, 2) # profile opt_gtgt
+    ");
+    assert_snapshot!(assert_compiles("[test(40, 0), test(40, 3), test(-40, 3), test(-1, 63), test(4611686018427387903, 63), test(-4611686018427387904, 61)]"), @"[40, 5, -5, -1, 0, -2]");
+    // A negative amount and an amount of 64 or more side-exit to the interpreter
+    assert_snapshot!(inspect("[test(5, -3), test(5, 64), test(-5, 100)]"), @"[40, 0, -1]");
+}
+
+#[test]
 fn test_opt_eq() {
     eval("
         def test(a, b) = a == b

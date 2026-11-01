@@ -611,12 +611,16 @@ impl Assembler {
                     };
                     asm.push_insn(insn);
                 },
-                Insn::LShift { opnd, .. } |
-                Insn::RShift { opnd, .. } |
-                Insn::URShift { opnd, .. } => {
+                Insn::LShift { opnd, shift, .. } |
+                Insn::RShift { opnd, shift, .. } |
+                Insn::URShift { opnd, shift, .. } => {
                     // The operand must be in a register, so
                     // if we get anything else we need to load it first.
                     *opnd = split_load_operand(asm, *opnd);
+                    // A shift amount that is not an immediate must be in a register as well.
+                    if !matches!(shift, Opnd::UImm(_)) {
+                        *shift = split_load_operand(asm, *shift);
+                    }
                     asm.push_insn(insn);
                 },
                 Insn::Store { dest, .. } => {
@@ -799,9 +803,11 @@ impl Assembler {
                         asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: reg_out, shift: Opnd::UImm(63) });
                     }
                 }
-                Insn::LShift { opnd, out, .. } |
-                Insn::RShift { opnd, out, .. } => {
+                Insn::LShift { opnd, shift, out } |
+                Insn::RShift { opnd, shift, out } |
+                Insn::URShift { opnd, shift, out } => {
                     *opnd = split_memory_read(asm, *opnd, SCRATCH0_OPND);
+                    *shift = split_memory_read(asm, *shift, SCRATCH1_OPND);
                     let mem_out = split_memory_write(out, SCRATCH0_OPND);
 
                     asm.push_insn(insn);
