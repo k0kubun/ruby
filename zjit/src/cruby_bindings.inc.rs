@@ -2471,6 +2471,7 @@ unsafe extern "C" {
     pub fn rb_jit_reserve_addr_space(mem_size: u32) -> *mut u8;
     pub static rb_zjit_runtime_offsets: rb_zjit_runtime_offsets;
     pub fn rb_zjit_reserve_low_addr_space(size: usize) -> *mut ::std::os::raw::c_void;
+    pub fn rb_zjit_advise_huge_pages(mem_block: *mut ::std::os::raw::c_void, size: usize) -> bool;
     pub fn rb_zjit_profile_disable(iseq: *const rb_iseq_t);
     pub fn rb_zjit_insn_to_bare_insn(insn: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
     pub fn rb_zjit_iseq_set_jit_entry(

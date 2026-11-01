@@ -124,6 +124,20 @@ impl VirtualMem {
             "Start of virtual address block should be page-aligned",
         );
 
+        // Back the code region with 2MiB transparent huge pages where the kernel allows it. JIT code of
+        // a large application spans thousands of 4KiB pages, so its instruction fetches miss the iTLB a
+        // lot. A huge page is only used for a 2MiB-aligned range whose memory protection is uniform,
+        // so map and protect the region in 2MiB units from a 2MiB-aligned start.
+        const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+        let huge_start = (virt_block as usize).next_multiple_of(HUGE_PAGE_SIZE);
+        let huge_size = exec_mem_bytes.saturating_sub(huge_start - virt_block as usize) / HUGE_PAGE_SIZE * HUGE_PAGE_SIZE;
+        // A small memory limit, e.g. --zjit-mem-size=1, could be used up by one 2MiB unit.
+        let fits_limit = mem_bytes.is_none_or(|limit| limit >= 16 * HUGE_PAGE_SIZE);
+        if fits_limit && huge_size >= HUGE_PAGE_SIZE && unsafe { rb_zjit_advise_huge_pages(huge_start as *mut _, huge_size) } {
+            let huge_block = NonNull::new(huge_start as *mut u8).unwrap();
+            return Self::new(sys::SystemAllocator {}, HUGE_PAGE_SIZE as u32, huge_block, huge_size, mem_bytes);
+        }
+
         Self::new(sys::SystemAllocator {}, page_size, NonNull::new(virt_block).unwrap(), exec_mem_bytes, mem_bytes)
     }
 
@@ -514,5 +528,22 @@ pub mod tests {
                 ]
             ),
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn system_region_maps_huge_page_units() {
+        // When the kernel takes MADV_HUGEPAGE, the region starts at a 2MiB boundary and is mapped
+        // in 2MiB units, so that each unit can be one huge page.
+        const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+        let mut virt = VirtualMem::alloc(16 * 1024 * 1024, None);
+        virt.write_byte(virt.start_ptr(), 0xc3).unwrap();
+        virt.mark_all_executable();
+        if virt.system_page_size() == HUGE_PAGE_SIZE {
+            assert_eq!(0, virt.start_ptr().raw_addr(&virt) % HUGE_PAGE_SIZE);
+            assert_eq!(HUGE_PAGE_SIZE, virt.mapped_region_size());
+        } else {
+            assert_eq!(unsafe { rb_jit_get_page_size() } as usize, virt.mapped_region_size());
+        }
     }
 }
