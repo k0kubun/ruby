@@ -5804,6 +5804,14 @@ fn test_opt_succ() {
 }
 
 #[test]
+fn test_integer_pred() {
+    eval("
+        def test(n) = n.pred
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(1), test(0), test(-(2**62)), test(2**64)]"), @"[0, -1, -4611686018427387905, 18446744073709551615]");
+}
+
+#[test]
 fn test_opt_and() {
     eval("
         def test(x, y) = x & y
