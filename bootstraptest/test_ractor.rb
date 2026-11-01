@@ -3481,3 +3481,27 @@ assert_equal '[[:mm, :mm, :defined], [:mm, :mm, :defined]]', %q{
   rs.each { it << :go }
   rs.map(&:value)
 }
+
+# Ractors that resume a frame at the same PC for the first time at once race to create, count,
+# and compile its resume entry under ZJIT (rb_zjit_resume_entry())
+assert_equal 'ok', <<~'RUBY'
+  def resume_race(n)
+    [1].any? do |x|
+      begin
+        raise "e" if n >= 0
+      rescue
+        n
+      end
+    end
+  end
+
+  ractors = 300.times.map do
+    Ractor.new do
+      Ractor.receive
+      3.times { |i| resume_race(i) }
+      :ok
+    end
+  end
+  ractors.each { |r| r << nil }
+  ractors.map(&:value).uniq == [:ok] ? :ok : :ng
+RUBY
