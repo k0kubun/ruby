@@ -155,6 +155,10 @@ make_counters! {
     // Default counters that are available without --zjit-stats
     default {
         compiled_iseq_count,
+        // Number of ISEQ compiles that only inlined small callees because the ISEQ was lukewarm
+        compiled_lukewarm_iseq_count,
+        // Number of lukewarm versions that got hot and were invalidated to recompile them fully
+        lukewarm_tier_up_count,
         failed_iseq_count,
         jit_frame_heap_bytes,
         skipped_native_stack_full,
@@ -260,6 +264,7 @@ make_counters! {
         exit_send_while_tracing,
         exit_invokeblock_not_ifunc,
         exit_once_not_done,
+        exit_tier_up,
     }
 
     // Send fallback counters that are summed as dynamic_send_count
@@ -682,6 +687,7 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
         NoProfileSetIvar              => exit_no_profile_setivar,
         InvokeBlockNotIfunc           => exit_invokeblock_not_ifunc,
         OnceNotDone                   => exit_once_not_done,
+        TierUp                        => exit_tier_up,
     }
 }
 

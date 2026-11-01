@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lazy_exit_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lazy_exit_threshold, set_lukewarm_gc_count, set_lukewarm_tier_up_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -505,6 +505,82 @@ fn test_hot_loop_recompiles_on_first_exit() {
 
     assert_snapshot!(inspect("hot_loop_exit(3, 1.5)"), @"2.5");
     assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+}
+
+/// Define `{name}_caller`, which calls a small callee and a callee too large to inline into a
+/// lukewarm ISEQ, and call it up to the call threshold of 2, running `between` in its profiling
+/// window. Return the number of methods inlined by the compile.
+fn compile_lukewarm_candidate(name: &str, between: &str) -> u64 {
+    let counters = crate::state::ZJITState::get_counters();
+    eval(&format!("
+        def {name}_small(a) = a + 1
+        def {name}_large(a) = a + a + a + a + a
+        def {name}_caller(a) = {name}_small(a) + {name}_large(a)
+        {name}_caller(1)
+        {between}
+    "));
+    let inline_count_before = counters.inline_method_count;
+    assert_eq!(VALUE::fixnum_from_usize(13), eval(&format!("{name}_caller(2)")));
+    counters.inline_method_count - inline_count_before
+}
+
+#[test]
+fn test_lukewarm_iseq_inlines_only_small_callees() {
+    with_inlining(|| {
+        set_lukewarm_gc_count(1);
+
+        // No GC in the profiling window: both callees are inlined.
+        assert_eq!(2, compile_lukewarm_candidate("warm", ""));
+        let payload = get_or_create_iseq_payload(get_method_iseq("self", "warm_caller"));
+        assert_eq!(i64::MAX, payload.tier_up_counter);
+
+        // A GC in the profiling window makes the ISEQ lukewarm: only the small callee is inlined.
+        assert_eq!(1, compile_lukewarm_candidate("lukewarm", "GC.start"));
+        let payload = get_or_create_iseq_payload(get_method_iseq("self", "lukewarm_caller"));
+        assert_eq!(1, payload.versions.len());
+        assert_ne!(i64::MAX, payload.tier_up_counter);
+
+        set_lukewarm_gc_count(0);
+    });
+}
+
+#[test]
+fn test_lukewarm_iseq_tiers_up() {
+    with_inlining(|| {
+        set_lukewarm_gc_count(1);
+        set_lukewarm_tier_up_threshold(3);
+        set_max_versions(1);
+
+        assert_eq!(1, compile_lukewarm_candidate("tier_up", "GC.start"));
+        let iseq = get_method_iseq("self", "tier_up_caller");
+        let payload = get_or_create_iseq_payload(iseq);
+        assert_eq!(1, payload.versions.len());
+
+        // The lukewarm version counts its returns and gets invalidated once it got hot.
+        assert!(!payload.tiered_up);
+        let mut calls = 0;
+        while !payload.tiered_up && calls < 10 {
+            assert_eq!(VALUE::fixnum_from_usize(13), eval("tier_up_caller(2)"));
+            calls += 1;
+        }
+        assert!(payload.tiered_up);
+        assert!(calls >= 2, "tiered up after {calls} calls");
+        assert!(unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+
+        // The recompile inlines both callees, even with a GC in the profiling window, and
+        // tiering up didn't use up the only version --zjit-max-versions allows.
+        let counters = crate::state::ZJITState::get_counters();
+        let inline_count_before = counters.inline_method_count;
+        assert_eq!(VALUE::fixnum_from_usize(13), eval("GC.start; tier_up_caller(2); tier_up_caller(2)"));
+        assert_eq!(2, counters.inline_method_count - inline_count_before);
+        assert_eq!(2, payload.versions.len());
+        assert!(!unsafe { payload.versions.last().unwrap().as_ref() }.is_invalidated());
+        assert_eq!(i64::MAX, payload.tier_up_counter);
+
+        set_max_versions(crate::options::DEFAULT_MAX_VERSIONS);
+        set_lukewarm_tier_up_threshold(crate::options::DEFAULT_LUKEWARM_TIER_UP_THRESHOLD);
+        set_lukewarm_gc_count(0);
+    });
 }
 
 #[test]

@@ -87,6 +87,15 @@ pub struct Options {
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
 
+    /// Number of GCs that must run during the profiling window of an ISEQ for its compile to
+    /// treat it as lukewarm and only inline small callees. 0 disables it. See
+    /// `IseqPayload::is_lukewarm`.
+    pub lukewarm_gc_count: usize,
+
+    /// Number of returns and loop back-edges a lukewarm version runs before it's invalidated to
+    /// recompile the ISEQ with full inlining. See `exit_recompile`.
+    pub lukewarm_tier_up_threshold: u32,
+
     /// Number of times a side exit is materialized from its descriptor before it is
     /// compiled into machine code. 0 compiles an exit the first time it is taken, and
     /// values above `LAZY_EXIT_MAX_HITS` never compile exits. See `exit_desc::lazy_exit_hit`.
@@ -212,6 +221,21 @@ pub struct Options {
 /// little gain.
 pub const DEFAULT_LAZY_EXIT_THRESHOLD: usize = 2;
 
+/// Default for --zjit-lukewarm-gc-count. An ISEQ called fewer times than the profiling window
+/// between two GCs is called rarely enough that inlining into it doesn't pay off.
+pub const DEFAULT_LUKEWARM_GC_COUNT: usize = 2;
+
+/// Default for --zjit-lukewarm-tier-up-threshold. Like HotSpot's threshold of about 10K
+/// invocations and back-edges for its optimizing tier, it's high enough that lukewarm ISEQs
+/// stay lukewarm, but it recompiles an ISEQ that got hot after its profiling window.
+pub const DEFAULT_LUKEWARM_TIER_UP_THRESHOLD: u32 = 10000;
+
+/// Unit tests don't treat ISEQs as lukewarm unless they ask for it, since GCs can run at
+/// any time and HIR snapshots should show the full inliner.
+fn default_lukewarm_gc_count() -> usize {
+    if cfg!(test) { 0 } else { DEFAULT_LUKEWARM_GC_COUNT }
+}
+
 /// Unit tests can override the threshold with $ZJIT_TEST_LAZY_EXIT_THRESHOLD to run
 /// every test with exits compiled on their first hit, or never compiled.
 fn default_lazy_exit_threshold() -> usize {
@@ -230,6 +254,8 @@ impl Default for Options {
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             lazy_exit_threshold: default_lazy_exit_threshold(),
+            lukewarm_gc_count: default_lukewarm_gc_count(),
+            lukewarm_tier_up_threshold: DEFAULT_LUKEWARM_TIER_UP_THRESHOLD,
             stats: false,
             print_stats: false,
             print_stats_file: None,
@@ -480,6 +506,16 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => return None,
         },
 
+        ("lukewarm-gc-count", _) => match opt_val.parse() {
+            Ok(n) => options.lukewarm_gc_count = n,
+            Err(_) => return None,
+        },
+
+        ("lukewarm-tier-up-threshold", _) => match opt_val.parse() {
+            Ok(n) => options.lukewarm_tier_up_threshold = n,
+            Err(_) => return None,
+        },
+
         ("lazy-exit-threshold", _) => match opt_val.parse() {
             Ok(n) => options.lazy_exit_threshold = n,
             Err(_) => return None,
@@ -720,6 +756,20 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
     unsafe { rb_zjit_call_threshold = call_threshold; }
     rb_zjit_prepare_options();
     update_profile_threshold();
+}
+
+/// Update --zjit-lukewarm-gc-count for testing
+#[cfg(test)]
+pub fn set_lukewarm_gc_count(lukewarm_gc_count: usize) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().lukewarm_gc_count = lukewarm_gc_count; }
+}
+
+/// Update --zjit-lukewarm-tier-up-threshold for testing
+#[cfg(test)]
+pub fn set_lukewarm_tier_up_threshold(threshold: u32) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().lukewarm_tier_up_threshold = threshold; }
 }
 
 /// Update --zjit-num-exits-until-invalidate for testing

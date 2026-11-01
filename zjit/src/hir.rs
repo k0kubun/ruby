@@ -6,7 +6,7 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::match_like_matches_macro)]
 use crate::{
-    cast::IntoUsize, codegen::max_iseq_versions, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
+    cast::IntoUsize, cruby::*, invariants::{self, iseq_seen_ep_escape}, json::Json, options::{DumpHIR, InlineDepth, debug, get_option}, payload::get_or_create_iseq_payload, profile::reset_profiles_remaining, state::{self, ZJITState},
 };
 use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, ffi::{c_void, c_uint, c_int, CStr}, fmt::Display, ptr, slice::Iter,
@@ -673,6 +673,7 @@ pub enum SideExitReason {
     NoProfileSetIvar,
     InvokeBlockNotIfunc,
     OnceNotDone,
+    TierUp,
 }
 
 /// Marks a side exit as triggering profiling and recompilation.
@@ -3071,7 +3072,14 @@ struct CompilePolicy {
     /// side-exit, and instead use fallback paths (e.g. C calls) on mismatch.
     /// Set when this is the final version of an ISEQ after recompilation.
     no_side_exits: bool,
+    /// When true, the ISEQ is lukewarm (see [`crate::payload::IseqPayload::is_lukewarm`]), so
+    /// only small callees are inlined into it.
+    lukewarm: bool,
 }
+
+/// Callee size threshold for inlining into lukewarm ISEQs. Small callees like accessors and
+/// predicates make the caller cheaper to compile and run when inlined.
+const LUKEWARM_INLINE_THRESHOLD: usize = 12;
 
 #[derive(Debug, Clone, Copy)]
 struct SetIvarSpec {
@@ -3084,15 +3092,14 @@ impl CompilePolicy {
     fn new(iseq: *const rb_iseq_t) -> Self {
         // When a previous version was invalidated and we've reached the version
         // limit, avoid speculative optimizations that may side-exit.
-        let no_side_exits = if iseq.is_null() {
-            false
-        } else {
-            let payload = get_or_create_iseq_payload(iseq);
-            payload.versions.iter().any(
-                |v| unsafe { v.as_ref() }.is_invalidated()
-            ) && payload.versions.len() + 1 >= max_iseq_versions()
-        };
-        Self { no_side_exits }
+        if iseq.is_null() {
+            return Self { no_side_exits: false, lukewarm: false };
+        }
+        let payload = get_or_create_iseq_payload(iseq);
+        let no_side_exits = payload.versions.iter().any(
+            |v| unsafe { v.as_ref() }.is_invalidated()
+        ) && payload.versions.len() + 1 >= payload.max_versions();
+        Self { no_side_exits, lukewarm: payload.is_lukewarm() }
     }
 }
 
@@ -3518,6 +3525,11 @@ impl Function {
 
     pub fn iseq(&self) -> *const rb_iseq_t {
         self.iseq
+    }
+
+    /// Whether this compile treats the ISEQ as lukewarm. See [`CompilePolicy::lukewarm`].
+    pub fn is_lukewarm(&self) -> bool {
+        self.policy.lukewarm
     }
 
     // Add an instruction to the function without adding it to any block
@@ -6897,6 +6909,10 @@ impl Function {
             return false;
         }
 
+        // Only inline small callees into lukewarm ISEQs. Iterators with a literal block are
+        // still inlined since that's how a loop in a lukewarm ISEQ gets fast.
+        let threshold = if self.policy.lukewarm { threshold.min(LUKEWARM_INLINE_THRESHOLD) } else { threshold };
+
         // Check callee bytecode size against threshold.
         let callee_size = unsafe { get_iseq_encoded_size(callee_iseq) } as usize;
         if callee_size > threshold && !ignore_size_threshold {
@@ -7814,7 +7830,7 @@ impl Function {
         // SideExits would just add overhead (the exit fires every time without benefit).
         // Keep them as Send fallbacks so the interpreter handles them directly.
         let payload = get_or_create_iseq_payload(self.iseq);
-        if payload.versions.len() + 1 >= crate::codegen::max_iseq_versions() {
+        if payload.versions.len() + 1 >= payload.max_versions() {
             return;
         }
         for block in self.reverse_post_order() {

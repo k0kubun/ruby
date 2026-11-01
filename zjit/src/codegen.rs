@@ -278,7 +278,7 @@ fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) 
 pub fn invalidate_iseq_version(cb: &mut CodeBlock, iseq: IseqPtr, version: &mut IseqVersionRef) {
     let payload = get_or_create_iseq_payload(iseq);
     if !unsafe { version.as_ref() }.is_invalidated()
-        && payload.versions.len() < max_iseq_versions()
+        && payload.versions.len() < payload.max_versions()
     {
         unsafe { version.as_mut() }.status = IseqStatus::Invalidated;
         unsafe { rb_iseq_reset_jit_func(iseq) };
@@ -383,7 +383,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
         _ => {},
     }
     // If the ISEQ already has max versions, do not compile a new version.
-    if payload.versions.len() >= max_iseq_versions() {
+    if payload.versions.len() >= payload.max_versions() {
         return Err(CompileError::IseqVersionLimitReached);
     }
 
@@ -1595,6 +1595,20 @@ fn gen_check_interrupts(jit: &mut JITState, asm: &mut Assembler, function: &Func
     let interrupt_flag = asm.load(Opnd::mem(32, EC, RUBY_OFFSET_EC_INTERRUPT_FLAG));
     asm.test(interrupt_flag, interrupt_flag);
     asm.jnz(jit, side_exit(jit, function, state, SideExitReason::Interrupt));
+
+    // Lukewarm code checks interrupts on returns and loop back-edges, which is also where it
+    // counts executions to tier up. Once the count runs out, exit to recompile the compiled
+    // ISEQ. See exit_recompile().
+    if function.is_lukewarm() {
+        asm_comment!(asm, "count executions to tier up");
+        let counter = &raw mut get_or_create_iseq_payload(jit.iseq()).tier_up_counter;
+        let counter = Opnd::mem(64, asm.load(Opnd::const_ptr(counter)), 0);
+        let count = asm.load(counter);
+        let count = asm.sub(count, Opnd::UImm(1));
+        asm.store(counter, count);
+        asm.cmp(count, Opnd::Imm(0));
+        asm.jl(jit, side_exit_with_recompile(jit, function, state, SideExitReason::TierUp, Some(Recompile)));
+    }
 }
 
 fn gen_hash_dup(
@@ -4182,7 +4196,15 @@ fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
         trace_compile_phase("optimize", || function.optimize());
     }
     function.dump_hir();
-    let non_final_version = get_or_create_iseq_payload(iseq).versions.len() + 1 < max_iseq_versions();
+    let payload = get_or_create_iseq_payload(iseq);
+    // Lukewarm code counts down executions until it tiers up. See exit_recompile().
+    payload.tier_up_counter = if function.is_lukewarm() {
+        incr_counter!(compiled_lukewarm_iseq_count);
+        get_option!(lukewarm_tier_up_threshold).into()
+    } else {
+        i64::MAX
+    };
+    let non_final_version = payload.versions.len() + 1 < payload.max_versions();
     if non_final_version {
         reset_profiles_remaining(iseq);
     }
@@ -4276,9 +4298,26 @@ c_callable! {
         {
             let compiled_iseq: IseqPtr = compiled_iseq_raw.as_iseq();
             let payload = get_or_create_iseq_payload(compiled_iseq);
+
+            // Lukewarm code exits here once it has run --zjit-lukewarm-tier-up-threshold returns
+            // and loop back-edges. Invalidate it right away so that the next version, which uses
+            // full inlining, starts profiling. Unlike a failed guard, this exit can't be noise.
+            if payload.tier_up_counter < 0 && payload.versions.last().is_some_and(|v| !unsafe { v.as_ref() }.is_invalidated()) {
+                with_vm_lock(src_loc!(), || {
+                    let payload = get_or_create_iseq_payload(compiled_iseq);
+                    payload.tiered_up = true;
+                    payload.tier_up_counter = i64::MAX;
+                    let cb = ZJITState::get_code_block();
+                    invalidate_iseq_version(cb, compiled_iseq, payload.versions.last_mut().unwrap());
+                    cb.mark_all_executable();
+                });
+                incr_counter!(lukewarm_tier_up_count);
+                return;
+            }
+
             let already_done = payload.versions.last()
                 .map_or(false, |v| unsafe { v.as_ref() }.is_invalidated())
-                || payload.versions.len() >= max_iseq_versions();
+                || payload.versions.len() >= payload.max_versions();
             if already_done {
                 return;
             }

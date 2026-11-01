@@ -38,6 +38,15 @@ pub struct IseqPayload {
     /// Whether the interpreter's back-edges, rather than calls, opened the profiling window
     /// of this ISEQ (see `rb_zjit_iseq_backedge`), i.e. it runs long loops but is called rarely.
     pub hot_loop: bool,
+    /// The GC count (`rb_gc_count()`) when the interpreter last started profiling this ISEQ,
+    /// i.e. at the start of the profiling window before a compile. See [`Self::is_lukewarm`].
+    pub profile_start_gc_count: usize,
+    /// Number of returns and loop back-edges left before the current version, if it's
+    /// lukewarm, is invalidated to recompile it with full inlining. Decremented by the
+    /// lukewarm version's code. See `exit_recompile`.
+    pub tier_up_counter: i64,
+    /// Whether a lukewarm version of this ISEQ got hot. Later versions are not lukewarm.
+    pub tiered_up: bool,
 }
 
 impl IseqPayload {
@@ -51,8 +60,45 @@ impl IseqPayload {
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
             may_write_block_code: None,
             hot_loop: false,
+            profile_start_gc_count: 0,
+            tier_up_counter: i64::MAX,
+            tiered_up: false,
         }
     }
+
+    /// Maximum number of versions of this ISEQ. Tiering up from a lukewarm version doesn't use
+    /// up a version that could fix a failed speculation.
+    pub fn max_versions(&self) -> usize {
+        crate::codegen::max_iseq_versions() + self.tiered_up as usize
+    }
+
+    /// Whether the ISEQ about to be compiled is lukewarm: it reached the call threshold, but
+    /// its last `--zjit-num-profiles` calls were spread over `--zjit-lukewarm-gc-count` or more
+    /// GCs, so it's called rarely. Inlining into such an ISEQ multiplies its compile time, which
+    /// is never paid back, and makes it recompile when a guard of a callee shared by many callers
+    /// fails. GCs are counted because they measure how much the program ran without counting
+    /// compile time, and are deterministic.
+    ///
+    /// This is like how HotSpot keeps lukewarm methods out of its expensive tier: its invocation
+    /// counters decay over time (`-XX:CounterHalfLifeTime`), so only methods called frequently
+    /// enough get there. ISEQs that loops made hot are never lukewarm. Like HotSpot's tier 3
+    /// code, lukewarm code counts how often it runs, and an ISEQ that got hot after its profiling
+    /// window is recompiled once with full inlining.
+    pub fn is_lukewarm(&self) -> bool {
+        let gc_count = get_option!(lukewarm_gc_count);
+        gc_count > 0 && !self.hot_loop && !self.tiered_up
+            && unsafe { rb_gc_count() }.wrapping_sub(self.profile_start_gc_count) >= gc_count
+    }
+}
+
+/// Remember when the profiling window of an ISEQ started. See [`IseqPayload::is_lukewarm`].
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_iseq_profile_started(iseq: IseqPtr) {
+    // The interpreter calls this without the VM lock, which other Ractors need to be
+    // stopped by before creating the payload.
+    with_vm_lock(src_loc!(), || {
+        get_or_create_iseq_payload(iseq).profile_start_gc_count = unsafe { rb_gc_count() };
+    });
 }
 
 /// Remember that back-edges made an ISEQ hot. See [`IseqPayload::hot_loop`].
