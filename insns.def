@@ -925,6 +925,7 @@ opt_new
 ()
 ()
 // attr bool leaf = false;
+// attr bool zjit_profile = true;
 {
     int argc = vm_ci_argc(cd->ci);
     VALUE val = TOPN(argc);
