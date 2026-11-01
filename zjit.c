@@ -182,10 +182,14 @@ rb_zjit_iseq_set_jit_entry(const rb_iseq_t *iseq, void *code_ptr)
 
 extern VALUE *rb_vm_base_ptr(struct rb_control_frame_struct *cfp);
 
+void rb_zjit_iseq_profile_started(const rb_iseq_t *iseq); // defined in Rust
+
 // Convert a given ISEQ's instructions to zjit_* instructions
 void
 rb_zjit_profile_enable(const rb_iseq_t *iseq)
 {
+    rb_zjit_iseq_profile_started(iseq);
+
     // This table encodes an opcode into the instruction's address
     const void *const *insn_table = rb_vm_get_insns_address_table();
 
