@@ -2157,6 +2157,7 @@ pub const RUBY_OFFSET_EC_INTERRUPT_FLAG: jit_bindgen_constants = 32;
 pub const RUBY_OFFSET_EC_INTERRUPT_MASK: jit_bindgen_constants = 36;
 pub const RUBY_OFFSET_EC_THREAD_PTR: jit_bindgen_constants = 48;
 pub const RUBY_OFFSET_EC_RACTOR_ID: jit_bindgen_constants = 64;
+pub const RUBY_OFFSET_EC_ERRINFO: jit_bindgen_constants = 128;
 pub type jit_bindgen_constants = i32;
 pub const rb_invalid_shape_id: shape_id_t = 524287;
 pub type rb_iseq_param_keyword_struct =
