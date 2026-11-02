@@ -13088,6 +13088,18 @@ fn test_flonum_arithmetic_inline() {
 }
 
 #[test]
+fn test_math_sqrt_flonum() {
+    eval("
+        def test(x) = Math.sqrt(x)
+        def hyp(a, b) = Math.sqrt(a * a + b * b)
+        test(2.0); hyp(3.0, 4.0) # profile
+    ");
+    assert_snapshot!(assert_compiles("[test(4.0), test(2.0), test(0.0), test(1.0e-70), test(1.0e70), hyp(3.0, 4.0), hyp(1.0e-30, 0.0)]"), @"[2.0, 1.4142135623730951, 0.0, 1.0e-35, 1.0e+35, 5.0, 1.0e-30]");
+    // Negative numbers, heap Floats, and other types side-exit and still work
+    assert_snapshot!(inspect("[(test(-1.0) rescue $!.class), test(-0.0), test(1.0e-300), test(Float::INFINITY), test(4), test(1r)]"), @"[Math::DomainError, 0.0, 1.0e-150, Infinity, 2.0, 1.0]");
+}
+
+#[test]
 fn test_float_pow() {
     eval("
         def test(a, b) = a ** b

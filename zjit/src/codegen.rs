@@ -957,6 +957,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatPow { recv, other, state } => gen_float_pow(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), &function.frame_state(*state)),
+        &Insn::FloatSqrt { val, state } => gen_float_sqrt(jit, asm, function, insn_id, val, &function.frame_state(state)),
         Insn::FixnumEq { left, right } => gen_fixnum_eq(asm, opnd!(left), opnd!(right)),
         Insn::FixnumLt { left, right } => gen_fixnum_lt(asm, opnd!(left), opnd!(right)),
         Insn::FixnumLe { left, right } => gen_fixnum_le(asm, opnd!(left), opnd!(right)),
@@ -3622,6 +3623,21 @@ fn gen_flonum_op(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
         gen_raw_double(jit, asm, function, other)
     };
     let result = asm.float_op(op, left, right);
+    let hir_block_id = asm.current_block().hir_block_id;
+    jit.raw_doubles.insert(insn_id, (hir_block_id, result));
+    gen_box_float(jit, asm, result, state)
+}
+
+/// Compile Math.sqrt(Flonum)
+fn gen_float_sqrt(jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, val: InsnId, state: &FrameState) -> lir::Opnd {
+    asm_comment!(asm, "Math.sqrt(Flonum)");
+    let bits = gen_raw_double(jit, asm, function, val);
+    let bits = if let Opnd::UImm(_) = bits { asm.load(bits) } else { bits };
+    // A Flonum is never NaN or -0.0, so a set sign bit means a negative number, for which
+    // Math.sqrt raises Math::DomainError.
+    asm.cmp(bits, Opnd::UImm(0));
+    asm.jl(jit, side_exit(jit, function, state, FloatSqrtNegative));
+    let result = asm.float_op(FloatOpKind::Sqrt, bits, bits);
     let hir_block_id = asm.current_block().hir_block_id;
     jit.raw_doubles.insert(insn_id, (hir_block_id, result));
     gen_box_float(jit, asm, result, state)
