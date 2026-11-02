@@ -902,6 +902,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringCoderange { string, cached } => gen_string_coderange(jit, asm, opnd!(string), opnd!(cached)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
         Insn::StringByteslice { string, beg, len, state } => gen_string_byteslice(asm, opnd!(string), opnd!(beg), opnd!(len), &function.frame_state(*state)),
+        Insn::StringArefFixnum { string, index, state } => gen_string_aref_fixnum(asm, opnd!(string), opnd!(index), &function.frame_state(*state)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(jit, asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, recv_flags, other_flags, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), opnd!(recv_flags), opnd!(other_flags), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -5323,6 +5324,13 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
     // Tag the byte
     let byte = asm.lshift(byte, Opnd::UImm(1));
     asm.or(byte, Opnd::UImm(1))
+}
+
+/// Compile `string[index]` with a Fixnum index like rb_str_aref() does: str_substr() with
+/// length 1, returning nil (not "") at the end of the string.
+fn gen_string_aref_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, state: &FrameState) -> Opnd {
+    gen_prepare_leaf_call_with_gc(asm, state);
+    asm_ccall!(asm, rb_str_substr_two_fixnums, string, index, VALUE::fixnum_from_usize(1).into(), Opnd::Imm(0))
 }
 
 fn gen_string_byteslice(asm: &mut Assembler, string: Opnd, beg: Opnd, len: Opnd, state: &FrameState) -> Opnd {

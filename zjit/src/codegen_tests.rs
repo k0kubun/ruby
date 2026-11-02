@@ -8092,6 +8092,34 @@ fn test_array_pop_arg() {
 }
 
 #[test]
+fn test_string_aref_fixnum() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i) = s[i]
+        test("hello", 1)
+        [test("hello", 1), test("hello", -1), test("hello", 4), test("hello", 5), test("hello", -6), test("héllo", 1), test("h\xffllo".b, 1)]
+    "#), @r#"["e", "o", "o", nil, nil, "é", "\xFF"]"#);
+}
+
+#[test]
+fn test_string_slice_fixnum() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i) = s.slice(i)
+        test("hello", 1)
+        [test("hello", 0), test("hello", 5)]
+    "#), @r#"["h", nil]"#);
+}
+
+#[test]
+fn test_string_aref_fixnum_returns_string_for_subclass() {
+    assert_snapshot!(inspect(r#"
+        class MyString < String; end
+        def test(s, i) = s[i]
+        test(MyString.new("hello"), 1)
+        test(MyString.new("hello"), 1).class
+    "#), @"String");
+}
+
+#[test]
 fn test_string_byteslice_basic() {
     assert_snapshot!(inspect(r#"
         def test(s, beg, len) = s.byteslice(beg, len)

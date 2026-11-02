@@ -1122,6 +1122,8 @@ pub enum Insn {
     StringGetbyte { string: InsnId, index: InsnId },
     /// Call rb_str_byte_substr with known-Fixnum beg/len
     StringByteslice { string: InsnId, beg: InsnId, len: InsnId, state: InsnId },
+    /// `string[index]` with a Fixnum `index`: a new one-character String, or nil if out of range
+    StringArefFixnum { string: InsnId, index: InsnId, state: InsnId },
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
     /// Append `other` to `recv`. HIR loads both flags for load reuse. Codegen XORs the flags.
     StringAppend { recv: InsnId, other: InsnId, recv_flags: InsnId, other_flags: InsnId, state: InsnId },
@@ -1622,6 +1624,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*len);
                 $visit_one!(*state);
             }
+            Insn::StringArefFixnum { string, index, state } => {
+                $visit_one!(*string);
+                $visit_one!(*index);
+                $visit_one!(*state);
+            }
             Insn::StringSetbyteFixnum { string, index, value } => {
                 $visit_one!(*string);
                 $visit_one!(*index);
@@ -2023,6 +2030,8 @@ impl Insn {
             Insn::StringCoderange { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Other),
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
             Insn::StringByteslice { .. } => allocates.union(Effect::read(abstract_heaps::Other)),
+            // It reads the string and allocates, so it can be removed when the result is unused
+            Insn::StringArefFixnum { .. } => Effect::read_write(abstract_heaps::PC.union(abstract_heaps::Allocator).union(abstract_heaps::Other), abstract_heaps::Allocator),
             Insn::StringSetbyteFixnum { .. } => effects::Any,
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
@@ -2453,6 +2462,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::StringGetbyte { string, index, .. } => {
                 write!(f, "StringGetbyte {string}, {index}")
+            }
+            Insn::StringArefFixnum { string, index, .. } => {
+                write!(f, "StringArefFixnum {string}, {index}")
             }
             Insn::StringByteslice { string, beg, len, .. } => {
                 write!(f, "StringByteslice {string}, {beg}, {len}")
@@ -4464,6 +4476,7 @@ impl Function {
             Insn::StringCoderange { .. } => types::CInt64,
             Insn::StringGetbyte { .. } => types::Fixnum,
             Insn::StringByteslice { .. } => types::StringExact.union(types::NilClass),
+            Insn::StringArefFixnum { .. } => types::StringExact.union(types::NilClass),
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
@@ -10840,6 +10853,10 @@ impl Function {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, beg, types::Fixnum)?;
                 self.assert_subtype(insn_id, len, types::Fixnum)
+            },
+            Insn::StringArefFixnum { string, index, .. } => {
+                self.assert_subtype(insn_id, string, types::String)?;
+                self.assert_subtype(insn_id, index, types::Fixnum)
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;

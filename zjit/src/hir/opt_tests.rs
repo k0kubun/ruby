@@ -17294,6 +17294,39 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_optimize_string_aref_fixnum() {
+        eval(r#"
+            def test(s, i) = s[i]
+            test("foo", 0)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :s@0x1000
+          v4:BasicObject = LoadField v2, :i@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :s@1
+          v9:BasicObject = LoadArg :i@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, []@0x1010, cme:0x1018)
+          v31:StringExact = GuardType v12, StringExact recompile
+          v32:Fixnum = GuardType v13, Fixnum recompile
+          v33:StringExact|NilClass = StringArefFixnum v31, v32
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v33
+        ");
+    }
+
+    #[test]
     fn test_optimize_string_getbyte_fixnum() {
         eval(r#"
             def test(s, i) = s.getbyte(i)
