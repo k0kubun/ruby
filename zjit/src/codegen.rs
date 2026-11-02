@@ -5,6 +5,7 @@
 mod gc_fastpath;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::ffi::{c_int, c_long, c_void};
 use std::slice;
@@ -67,6 +68,11 @@ struct JITState {
     /// inlined frame push write a JITFrame into the slot selected by the current
     /// frame's depth; gen_prepare_non_leaf_call() writes the SP slot.
     jit_frame_size: usize,
+
+    /// Raw f64 bits of Float values that have already been decoded or computed, keyed by the
+    /// HIR instruction of the Float. Only reused within the same HIR block, where the
+    /// definition dominates every later instruction.
+    raw_doubles: HashMap<InsnId, (BlockId, Opnd)>,
 }
 
 impl JITState {
@@ -79,6 +85,7 @@ impl JITState {
             jit_entries: Vec::default(),
             iseq_calls: Vec::default(),
             jit_frame_size,
+            raw_doubles: HashMap::default(),
         }
     }
 
@@ -940,10 +947,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumMult { left, right, state } => gen_fixnum_mult(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumDiv { left, right, state } => gen_fixnum_div(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
-        &Insn::FloatAdd { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Add, recv, other, &function.frame_state(state)),
-        &Insn::FloatSub { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Sub, recv, other, &function.frame_state(state)),
-        &Insn::FloatMul { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Mul, recv, other, &function.frame_state(state)),
-        &Insn::FloatDiv { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Div, recv, other, &function.frame_state(state)),
+        &Insn::FloatAdd { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, insn_id, FloatOpKind::Add, recv, other, &function.frame_state(state)),
+        &Insn::FloatSub { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, insn_id, FloatOpKind::Sub, recv, other, &function.frame_state(state)),
+        &Insn::FloatMul { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, insn_id, FloatOpKind::Mul, recv, other, &function.frame_state(state)),
+        &Insn::FloatDiv { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, insn_id, FloatOpKind::Div, recv, other, &function.frame_state(state)),
         Insn::FloatAdd { recv, other, state } => gen_float_add(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -3606,16 +3613,40 @@ fn gen_box_float(jit: &mut JITState, asm: &mut Assembler, bits: lir::Opnd, state
 }
 
 /// Compile Flonum op Flonum with SSE2/FP instructions instead of calling rb_float_plus() etc.
-fn gen_flonum_op(jit: &mut JITState, asm: &mut Assembler, function: &Function, op: FloatOpKind, recv: InsnId, other: InsnId, state: &FrameState) -> lir::Opnd {
+fn gen_flonum_op(jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, op: FloatOpKind, recv: InsnId, other: InsnId, state: &FrameState) -> lir::Opnd {
     asm_comment!(asm, "Flonum {op:?}");
-    let left = gen_unbox_flonum(asm, jit.get_opnd(recv));
+    let left = gen_raw_double(jit, asm, function, recv);
     let right = if function.type_of(other).is_subtype(types::Fixnum) {
         gen_fixnum_to_double(asm, jit.get_opnd(other))
     } else {
-        gen_unbox_flonum(asm, jit.get_opnd(other))
+        gen_raw_double(jit, asm, function, other)
     };
     let result = asm.float_op(op, left, right);
+    let hir_block_id = asm.current_block().hir_block_id;
+    jit.raw_doubles.insert(insn_id, (hir_block_id, result));
     gen_box_float(jit, asm, result, state)
+}
+
+/// Get the raw f64 bits of a Flonum `val`. Reuse the bits if they have been computed in the
+/// same HIR block, looking through Flonum guards: a Float that passed a Flonum guard decodes
+/// to exactly the bits it was encoded from, so this skips a box-unbox round trip.
+fn gen_raw_double(jit: &mut JITState, asm: &mut Assembler, function: &Function, val: InsnId) -> lir::Opnd {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let mut insn_id = val;
+    loop {
+        if let Some(&(block, bits)) = jit.raw_doubles.get(&insn_id) && block == hir_block_id {
+            return bits;
+        }
+        match function.find(insn_id) {
+            Insn::GuardType { val, guard_type, .. } if guard_type.is_subtype(types::Float) => insn_id = val,
+            _ => break,
+        }
+    }
+    let bits = gen_unbox_flonum(asm, jit.get_opnd(val));
+    if !matches!(bits, Opnd::UImm(_)) {
+        jit.raw_doubles.insert(val, (hir_block_id, bits));
+    }
+    bits
 }
 
 /// Compile Float + Float
