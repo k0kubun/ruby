@@ -7243,6 +7243,21 @@ rb_zjit_ary_s_new_with_block_p(const rb_callable_method_entry_t *cme, const rb_c
     *init_cme = init;
     return true;
 }
+
+// Whether `cme` is Array.__new_with_block, which ZJIT calls for Array.new(size) { |index| ... }.
+// If so, return the method entries of Array#initialize and Array.new, which backtraces show
+// instead of the frame of Array.__new_with_block, as without ZJIT.
+bool
+rb_zjit_ary_new_with_block_frame_p(const rb_callable_method_entry_t *cme, const rb_callable_method_entry_t **init_cme, const rb_callable_method_entry_t **new_cme)
+{
+    if (!cme || cme->def->type != VM_METHOD_TYPE_ISEQ || cme->owner != CLASS_OF(rb_cArray) ||
+            cme->def->original_id != rb_intern("__new_with_block")) {
+        return false;
+    }
+    *init_cme = rb_callable_method_entry(rb_cArray, idInitialize);
+    *new_cme = rb_callable_method_entry(CLASS_OF(rb_cArray), idNew);
+    return *init_cme && *new_cme;
+}
 #endif
 
 static VALUE

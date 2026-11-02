@@ -8748,6 +8748,16 @@ fn test_array_new_with_block() {
 }
 
 #[test]
+fn test_array_new_with_block_backtrace() {
+    // Backtraces show Array#initialize and Array.new for the inlined Array.__new_with_block, as in the interpreter
+    assert_snapshot!(inspect("
+        def test(n) = Array.new(n) { |i| raise 'x' if i == 2; [0, 1, 2, 3].map { caller_locations(it + 1, 2).map(&:label) } }
+        test(2); test(2)
+        [test(1), (test(3) rescue $!.backtrace_locations.first(4).map(&:label))]
+    "), @r#"[[[["Array#map", "block in Object#test"], ["block in Object#test", "Array#initialize"], ["Array#initialize", "Array.new"], ["Array.new", "Object#test"]]], ["block in Object#test", "Array#initialize", "Array.new", "Object#test"]]"#);
+}
+
+#[test]
 fn test_array_new_with_block_invalid_size() {
     // A negative or too big size raises from the C methods as in the interpreter. Array.new
     // raises for a size too big to allocate before calling Array#initialize.

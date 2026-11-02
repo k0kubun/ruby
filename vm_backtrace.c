@@ -1015,12 +1015,35 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, rb_len_t start_
     for (; cfp != end_cfp && (bt->backtrace_size < num_frames); cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
         if (CFP_ISEQ(cfp)) {
             if (CFP_PC(cfp)) {
+                const rb_callable_method_entry_t *init_cme = NULL, *new_cme = NULL;
+#if USE_ZJIT
+                // ZJIT calls Array.__new_with_block for Array.new(size) { ... }. Show it as
+                // the two C methods, Array.new and Array#initialize, as without ZJIT.
+                if (ISEQ_BODY(CFP_ISEQ(cfp))->builtin_attrs & BUILTIN_ATTR_INLINE_BLOCK) {
+                    if (!rb_zjit_ary_new_with_block_frame_p(rb_vm_frame_method_entry(cfp), &init_cme, &new_cme)) {
+                        init_cme = new_cme = NULL;
+                    }
+                }
+                if (new_cme && start_frame == 1) {
+                    // Skip only Array#initialize
+                    start_frame = 0;
+                    loc = &bt->backtrace[bt->backtrace_size++];
+                    RB_OBJ_WRITE(btobj, &loc->cme, new_cme);
+                    RB_OBJ_WRITE(btobj, &loc->iseq, CFP_ISEQ(cfp));
+                    loc->pc = CFP_PC(cfp);
+                    backpatch_counter++;
+                    continue;
+                }
+                if (new_cme && start_frame > 0) {
+                    start_frame--; // and start_frame-- below for the second frame
+                }
+#endif
                 if (start_frame > 0) {
                     start_frame--;
                 }
                 else {
                     bool internal = is_internal_location(CFP_ISEQ(cfp));
-                    if (skip_internal && internal) continue;
+                    if (skip_internal && internal && !new_cme) continue;
                     if (!skip_next_frame) {
                         const rb_iseq_t *iseq = CFP_ISEQ(cfp);
                         const VALUE *pc = CFP_PC(cfp);
@@ -1039,6 +1062,19 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, rb_len_t start_
                             RB_OBJ_WRITE(btobj, &loc->iseq, iseq);
                             loc->pc = pc;
                             backpatch_counter++;
+#if USE_ZJIT
+                            if (new_cme) {
+                                // Show Array#initialize and Array.new for Array.__new_with_block
+                                RB_OBJ_WRITE(btobj, &loc->cme, init_cme);
+                                if (bt->backtrace_size < num_frames) {
+                                    loc = &bt->backtrace[bt->backtrace_size++];
+                                    RB_OBJ_WRITE(btobj, &loc->cme, new_cme);
+                                    RB_OBJ_WRITE(btobj, &loc->iseq, iseq);
+                                    loc->pc = pc;
+                                    backpatch_counter++;
+                                }
+                            }
+#endif
                         }
                         else {
                             RB_OBJ_WRITE(btobj, &loc->iseq, iseq);
