@@ -871,6 +871,15 @@ fn try_inline_float_cmp(fun: &mut hir::Function, block: hir::BlockId, method_id:
     let other_type = likely_fixnum_or_flonum(fun, other, state)?;
     let recv = fun.coerce_to(block, recv, types::Flonum, state);
     let other = fun.coerce_to(block, other, other_type, state);
+    if other_type.bit_equal(types::Flonum) {
+        let op = match bop {
+            BOP_LT => hir::FixnumCmpOp::Lt,
+            BOP_LE => hir::FixnumCmpOp::Le,
+            BOP_GT => hir::FixnumCmpOp::Gt,
+            _ => hir::FixnumCmpOp::Ge,
+        };
+        return Some(fun.push_insn(block, hir::Insn::FloatCmp { op, left: recv, right: other }));
+    }
     push_leaf_cfunc_call(fun, block, unsafe { rb_cFloat }, method_id, recv, vec![other], types::BoolExact)
 }
 
@@ -904,7 +913,7 @@ fn inline_integer_to_f(fun: &mut hir::Function, block: hir::BlockId, recv: hir::
     let &[] = args else { return None; };
     if !fun.likely_a(recv, types::Fixnum, state) { return None; }
     let recv = fun.coerce_to(block, recv, types::Fixnum, state);
-    push_leaf_cfunc_call(fun, block, unsafe { rb_cInteger }, ID!(to_f), recv, vec![], types::Flonum)
+    Some(fun.push_insn(block, hir::Insn::FixnumToFloat { val: recv }))
 }
 
 fn try_inline_fixnum_op(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(hir::InsnId, hir::InsnId) -> hir::Insn, bop: u32, left: hir::InsnId, right: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {

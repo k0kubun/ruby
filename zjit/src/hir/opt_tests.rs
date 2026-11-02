@@ -27002,7 +27002,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_float_le_float_calls_leaf_cfunc() {
+    fn test_float_le_float_compares_inline() {
         eval(r#"
             def test(x, y) = x <= y
             test(1.0, 2.0)
@@ -27026,7 +27026,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Float@0x1008, <=@0x1010, cme:0x1018)
           v28:Flonum = GuardType v12, Flonum recompile
           v29:Flonum = GuardType v13, Flonum recompile
-          v30:BoolExact = CCall v28, :Float#<=@0x1040, v29
+          v30:BoolExact = FloatCmp Le, v28, v29
           CheckInterrupts
           Return v30
         ");
@@ -27190,7 +27190,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_integer_to_f_calls_leaf_cfunc() {
+    fn test_integer_to_f_converts_inline() {
         eval(r#"
             def test(x) = x.to_f
             test(1)
@@ -27211,7 +27211,7 @@ mod hir_opt_tests {
         bb3(v9:BasicObject, v10:BasicObject):
           PatchPoint MethodRedefined(Integer@0x1008, to_f@0x1010, cme:0x1018)
           v25:Fixnum = GuardType v10, Fixnum recompile
-          v26:Flonum = CCall v25, :Integer#to_f@0x1040
+          v26:Flonum = FixnumToFloat v25
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v26

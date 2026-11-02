@@ -13088,6 +13088,34 @@ fn test_flonum_arithmetic_inline() {
 }
 
 #[test]
+fn test_flonum_compare_inline() {
+    eval("
+        def lt(a, b) = a < b
+        def le(a, b) = a <= b
+        def gt(a, b) = a > b
+        def ge(a, b) = a >= b
+        def lc(a) = a <= 0.04045
+        def gc(a) = a > -2.5
+        lt(1.0, 2.0); le(1.0, 2.0); gt(1.0, 2.0); ge(1.0, 2.0); lc(1.0); gc(1.0) # profile
+    ");
+    assert_snapshot!(assert_compiles("[lt(-2.5, -1.5), lt(-1.5, -2.5), lt(0.0, 1.0e-70), lt(-1.0e-70, 0.0), lt(1.5, 1.5), le(1.5, 1.5), le(-1.5, -1.5), le(2.5, -2.5)]"), @"[true, false, true, true, false, true, true, false]");
+    assert_snapshot!(assert_compiles("[gt(1.0e70, -1.0e70), gt(-1.0e70, 1.0e70), ge(0.0, 0.0), ge(-3.0, -2.0), lc(0.04045), lc(0.04046), lc(-1.0), gc(-2.5), gc(-2.4), gc(-3.0)]"), @"[true, false, true, false, true, false, true, false, true, false]");
+    // Heap Floats (NaN, -0.0) and other types side-exit and still work
+    assert_snapshot!(inspect("[lt(Float::NAN, 1.0), le(1.0, Float::NAN), ge(-0.0, 0.0), le(0.0, -0.0), lt(1.0, 2), gt(1.0e-300, 0.0), ge(1.0, 1r)]"), @"[false, false, true, true, true, true, true]");
+}
+
+#[test]
+fn test_fixnum_to_float_inline() {
+    eval("
+        def test(i) = i.to_f
+        def scale(i) = i.to_f / 255
+        test(1); scale(1) # profile
+    ");
+    assert_snapshot!(assert_compiles("[test(0), test(1), test(-1), test(9007199254740993), test(-4611686018427387904), test(4611686018427387903), scale(0), scale(510)]"), @"[0.0, 1.0, -1.0, 9.007199254740992e+15, -4.611686018427388e+18, 4.611686018427388e+18, 0.0, 2.0]");
+    assert_snapshot!(inspect("[test(2**70), test(1.5)]"), @"[1.1805916207174113e+21, 1.5]");
+}
+
+#[test]
 fn test_math_sqrt_flonum() {
     eval("
         def test(x) = Math.sqrt(x)

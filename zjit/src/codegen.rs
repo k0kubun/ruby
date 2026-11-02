@@ -957,6 +957,8 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatPow { recv, other, state } => gen_float_pow(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), &function.frame_state(*state)),
+        &Insn::FloatCmp { op, left, right } => gen_float_cmp(jit, asm, function, op, left, right),
+        &Insn::FixnumToFloat { val } => gen_fixnum_to_float(jit, asm, insn_id, opnd!(val)),
         &Insn::FloatSqrt { val, state } => gen_float_sqrt(jit, asm, function, insn_id, val, &function.frame_state(state)),
         Insn::FixnumEq { left, right } => gen_fixnum_eq(asm, opnd!(left), opnd!(right)),
         Insn::FixnumLt { left, right } => gen_fixnum_lt(asm, opnd!(left), opnd!(right)),
@@ -3574,7 +3576,7 @@ fn gen_unbox_flonum(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
 
 /// Encode raw f64 bits as a Float (rb_float_new_inline()). Doubles whose exponent fits
 /// the Flonum range are encoded inline, and the rest (including 0.0) are boxed in C.
-fn gen_box_float(jit: &mut JITState, asm: &mut Assembler, bits: lir::Opnd, state: &FrameState) -> lir::Opnd {
+fn gen_box_float(jit: &mut JITState, asm: &mut Assembler, bits: lir::Opnd, state: Option<&FrameState>) -> lir::Opnd {
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
     let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
@@ -3601,7 +3603,9 @@ fn gen_box_float(jit: &mut JITState, asm: &mut Assembler, bits: lir::Opnd, state
     asm.set_current_block(slow_block);
     let label = jit.get_label(asm, slow_block, hir_block_id);
     asm.write_label(label);
-    gen_prepare_leaf_call_with_gc(asm, state);
+    if let Some(state) = state {
+        gen_prepare_leaf_call_with_gc(asm, state);
+    }
     let boxed = asm_ccall!(asm, rb_zjit_float_new_bits, bits);
     asm.jmp(result_edge(boxed));
 
@@ -3625,7 +3629,49 @@ fn gen_flonum_op(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
     let result = asm.float_op(op, left, right);
     let hir_block_id = asm.current_block().hir_block_id;
     jit.raw_doubles.insert(insn_id, (hir_block_id, result));
-    gen_box_float(jit, asm, result, state)
+    gen_box_float(jit, asm, result, Some(state))
+}
+
+/// Map the raw bits of a non-NaN double to an integer that has the same order as the double
+/// in a signed comparison: flip the magnitude bits of negative numbers.
+fn gen_double_order_key(asm: &mut Assembler, bits: lir::Opnd) -> lir::Opnd {
+    if let Opnd::UImm(bits) = bits {
+        let mask = (((bits as i64) >> 63) as u64) >> 1;
+        return Opnd::Imm((bits ^ mask) as i64);
+    }
+    let sign = asm.rshift(bits, Opnd::UImm(63));
+    let mask = asm.urshift(sign, Opnd::UImm(1));
+    asm.xor(bits, mask)
+}
+
+/// Compile Flonum < Flonum etc. A Flonum is never NaN or -0.0, so the doubles can be compared
+/// as integers after flipping the magnitude bits of negative numbers.
+fn gen_float_cmp(jit: &mut JITState, asm: &mut Assembler, function: &Function, op: hir::FixnumCmpOp, left: InsnId, right: InsnId) -> lir::Opnd {
+    let left = gen_raw_double(jit, asm, function, left);
+    let right = gen_raw_double(jit, asm, function, right);
+    let left = gen_double_order_key(asm, left);
+    let right = gen_double_order_key(asm, right);
+    let left = if let Opnd::Imm(_) = left { asm.load(left) } else { left };
+    asm.cmp(left, right);
+    match op {
+        hir::FixnumCmpOp::Lt => asm.csel_l(Qtrue.into(), Qfalse.into()),
+        hir::FixnumCmpOp::Le => asm.csel_le(Qtrue.into(), Qfalse.into()),
+        hir::FixnumCmpOp::Gt => asm.csel_g(Qtrue.into(), Qfalse.into()),
+        hir::FixnumCmpOp::Ge => asm.csel_ge(Qtrue.into(), Qfalse.into()),
+        hir::FixnumCmpOp::Eq => asm.csel_e(Qtrue.into(), Qfalse.into()),
+    }
+}
+
+/// Compile Integer#to_f of a Fixnum
+fn gen_fixnum_to_float(jit: &mut JITState, asm: &mut Assembler, insn_id: InsnId, val: lir::Opnd) -> lir::Opnd {
+    asm_comment!(asm, "Fixnum#to_f");
+    let bits = gen_fixnum_to_double(asm, val);
+    let bits = if let Opnd::UImm(_) = bits { asm.load(bits) } else { bits };
+    let hir_block_id = asm.current_block().hir_block_id;
+    jit.raw_doubles.insert(insn_id, (hir_block_id, bits));
+    // Only 0 converts to a double that is not encoded inline (0.0), for which rb_float_new()
+    // returns a Flonum without allocating.
+    gen_box_float(jit, asm, bits, None)
 }
 
 /// Compile Math.sqrt(Flonum)
@@ -3640,7 +3686,7 @@ fn gen_float_sqrt(jit: &mut JITState, asm: &mut Assembler, function: &Function, 
     let result = asm.float_op(FloatOpKind::Sqrt, bits, bits);
     let hir_block_id = asm.current_block().hir_block_id;
     jit.raw_doubles.insert(insn_id, (hir_block_id, result));
-    gen_box_float(jit, asm, result, state)
+    gen_box_float(jit, asm, result, Some(state))
 }
 
 /// Get the raw f64 bits of a Flonum `val`. Reuse the bits if they have been computed in the
