@@ -17294,6 +17294,38 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_embedded_and_heap_strings_are_monomorphic() {
+        eval(r#"
+            def test(s) = s.bytesize
+            test("a")
+            test("a" * 100)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :s@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :s@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, bytesize@0x1010, cme:0x1018)
+          v26:StringExact = GuardType v10, StringExact recompile
+          v27:CInt64 = LoadField v26, :len@0x1040
+          v28:Fixnum = BoxFixnum v27
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v28
+        ");
+    }
+
+    #[test]
     fn test_optimize_string_aref_fixnum() {
         eval(r#"
             def test(s, i) = s[i]
