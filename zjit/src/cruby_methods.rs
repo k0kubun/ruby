@@ -298,6 +298,9 @@ pub fn init() -> Annotations {
     annotate!(rb_cInteger, "to_f", inline_integer_to_f);
     let math_singleton = unsafe { rb_singleton_class(rb_mMath) };
     annotate!(math_singleton, "sqrt", inline_math_sqrt);
+    annotate!(math_singleton, "cos", inline_math_cos);
+    annotate!(math_singleton, "sin", inline_math_sin);
+    annotate!(math_singleton, "exp", inline_math_exp);
     annotate!(rb_cFloat, "to_int", inline_float_to_i);
     annotate!(rb_cString, "to_s", inline_string_to_s, types::StringExact);
     annotate!(rb_cString, "to_sym", inline_string_to_sym, types::Symbol);
@@ -905,6 +908,26 @@ fn inline_math_sqrt(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::In
     if !fun.likely_a(val, types::Flonum, state) { return None; }
     let val = fun.coerce_to(block, val, types::Flonum, state);
     Some(fun.push_insn(block, hir::Insn::FloatSqrt { val, state }))
+}
+
+fn inline_float_math(fun: &mut hir::Function, block: hir::BlockId, func: hir::FloatMathFunc, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[val] = args else { return None; };
+    if !fun.likely_a(val, types::Flonum, state) { return None; }
+    let val = fun.coerce_to(block, val, types::Flonum, state);
+    Some(fun.push_insn(block, hir::Insn::FloatMath { func, val, state }))
+}
+
+/// Math.cos of a Flonum calls cos() without a frame and without converting the argument
+fn inline_math_cos(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    inline_float_math(fun, block, hir::FloatMathFunc::Cos, args, state)
+}
+
+fn inline_math_sin(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    inline_float_math(fun, block, hir::FloatMathFunc::Sin, args, state)
+}
+
+fn inline_math_exp(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    inline_float_math(fun, block, hir::FloatMathFunc::Exp, args, state)
 }
 
 /// Integer#to_f of a Fixnum is leaf and does not allocate: every Fixnum converts to a double

@@ -133,6 +133,12 @@ unsafe extern "C" {
     pub static mut rb_mMath: VALUE;
     /// rb_float_new() taking the raw bits of a double in a general-purpose register
     pub fn rb_zjit_float_new_bits(bits: u64) -> VALUE;
+    /// cos(), sin(), and exp() for raw f64 bits
+    pub fn rb_zjit_math_cos_bits(x: u64) -> u64;
+    pub fn rb_zjit_math_sin_bits(x: u64) -> u64;
+    pub fn rb_zjit_math_exp_bits(x: u64) -> u64;
+    /// Float#** for raw f64 bits of a base and an exponent
+    pub fn rb_zjit_float_pow_bits(x: u64, y: u64) -> VALUE;
 
     pub fn rb_hash_empty_p(hash: VALUE) -> VALUE;
     pub fn rb_ary_new_from_args(n: c_long, ...) -> VALUE;

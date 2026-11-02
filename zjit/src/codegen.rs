@@ -955,8 +955,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatDiv { recv, other, state } => gen_float_div(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
+        &Insn::FloatPow { recv, other, state } if function.type_of(recv).is_subtype(types::Flonum) && function.type_of(other).is_subtype(types::Flonum) => gen_flonum_pow(jit, asm, function, recv, other, &function.frame_state(state)),
         Insn::FloatPow { recv, other, state } => gen_float_pow(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatToInt { recv, state } => gen_float_to_int(asm, opnd!(recv), &function.frame_state(*state)),
+        &Insn::FloatMath { func, val, state } => gen_float_math(jit, asm, function, insn_id, func, val, &function.frame_state(state)),
         &Insn::FloatCmp { op, left, right } => gen_float_cmp(jit, asm, function, op, left, right),
         &Insn::FixnumToFloat { val } => gen_fixnum_to_float(jit, asm, insn_id, opnd!(val)),
         &Insn::FloatSqrt { val, state } => gen_float_sqrt(jit, asm, function, insn_id, val, &function.frame_state(state)),
@@ -3674,6 +3676,20 @@ fn gen_fixnum_to_float(jit: &mut JITState, asm: &mut Assembler, insn_id: InsnId,
     gen_box_float(jit, asm, bits, None)
 }
 
+/// Compile Math.cos(Flonum) etc. by calling libm through a helper that takes and returns raw f64
+/// bits, so that the result is encoded inline and its bits can be reused.
+fn gen_float_math(jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, func: hir::FloatMathFunc, val: InsnId, state: &FrameState) -> lir::Opnd {
+    let bits = gen_raw_double(jit, asm, function, val);
+    let result = match func {
+        hir::FloatMathFunc::Cos => asm_ccall!(asm, rb_zjit_math_cos_bits, bits),
+        hir::FloatMathFunc::Sin => asm_ccall!(asm, rb_zjit_math_sin_bits, bits),
+        hir::FloatMathFunc::Exp => asm_ccall!(asm, rb_zjit_math_exp_bits, bits),
+    };
+    let hir_block_id = asm.current_block().hir_block_id;
+    jit.raw_doubles.insert(insn_id, (hir_block_id, result));
+    gen_box_float(jit, asm, result, Some(state))
+}
+
 /// Compile Math.sqrt(Flonum)
 fn gen_float_sqrt(jit: &mut JITState, asm: &mut Assembler, function: &Function, insn_id: InsnId, val: InsnId, state: &FrameState) -> lir::Opnd {
     asm_comment!(asm, "Math.sqrt(Flonum)");
@@ -3741,6 +3757,16 @@ fn gen_float_pow(asm: &mut Assembler, recv: lir::Opnd, other: lir::Opnd, state: 
     // exponent) but calls no Ruby method for these operands.
     gen_prepare_leaf_call_with_gc(asm, state);
     asm_ccall!(asm, rb_float_pow, recv, other)
+}
+
+/// Compile Flonum ** Flonum, passing raw f64 bits to skip the type dispatch and decoding in
+/// rb_float_pow() and to reuse the bits of an operand that was just computed.
+fn gen_flonum_pow(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: InsnId, other: InsnId, state: &FrameState) -> lir::Opnd {
+    let x = gen_raw_double(jit, asm, function, recv);
+    let y = gen_raw_double(jit, asm, function, other);
+    // rb_zjit_float_pow_bits() may allocate a heap Float or a Complex
+    gen_prepare_leaf_call_with_gc(asm, state);
+    asm_ccall!(asm, rb_zjit_float_pow_bits, x, y)
 }
 
 /// Compile Float#to_i (truncate to integer)

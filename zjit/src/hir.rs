@@ -1034,6 +1034,14 @@ pub struct CondBranchHasTypeData {
     pub if_false: BranchEdge,
 }
 
+/// Math module function computed by [`Insn::FloatMath`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatMathFunc {
+    Cos,
+    Sin,
+    Exp,
+}
+
 /// Comparison performed by [`Insn::CondBranchFixnumCmp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FixnumCmpOp {
@@ -1468,6 +1476,8 @@ pub enum Insn {
     FloatToInt { recv: InsnId, state: InsnId },
     /// Math.sqrt of a Flonum, side-exiting for a negative operand (Math::DomainError)
     FloatSqrt { val: InsnId, state: InsnId },
+    /// Math.cos, Math.sin, or Math.exp of a Flonum
+    FloatMath { func: FloatMathFunc, val: InsnId, state: InsnId },
     /// Compare two Flonums (never NaN) with <, <=, >, or >=
     FloatCmp { op: FixnumCmpOp, left: InsnId, right: InsnId },
     /// Integer#to_f of a Fixnum
@@ -1698,7 +1708,8 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*recv);
                 $visit_one!(*state);
             }
-            Insn::FloatSqrt { val, state } => {
+            Insn::FloatSqrt { val, state } |
+            Insn::FloatMath { val, state, .. } => {
                 $visit_one!(*val);
                 $visit_one!(*state);
             }
@@ -2171,6 +2182,7 @@ impl Insn {
             Insn::FloatPow { .. } => effects::Any,
             Insn::FloatToInt { .. } => effects::Any,
             Insn::FloatSqrt { .. } => effects::Any,
+            Insn::FloatMath { .. } => effects::Any,
             Insn::FloatCmp { .. } => effects::Empty,
             Insn::FixnumToFloat { .. } => effects::Empty,
             Insn::FixnumEq { .. } => effects::Empty,
@@ -2611,6 +2623,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FloatPow   { recv, other, .. } => { write!(f, "FloatPow {recv}, {other}") },
             Insn::FloatToInt { recv, .. } => { write!(f, "FloatToInt {recv}") },
             Insn::FloatSqrt { val, .. } => { write!(f, "FloatSqrt {val}") },
+            Insn::FloatMath { func, val, .. } => { write!(f, "FloatMath {func:?}, {val}") },
             Insn::FloatCmp { op, left, right } => { write!(f, "FloatCmp {op:?}, {left}, {right}") },
             Insn::FixnumToFloat { val } => { write!(f, "FixnumToFloat {val}") },
             Insn::FixnumEq   { left, right, .. } => { write!(f, "FixnumEq {left}, {right}") },
@@ -4508,6 +4521,7 @@ impl Function {
             Insn::FloatPow   { .. } => types::BasicObject,
             Insn::FloatToInt { .. } => types::Integer,
             Insn::FloatSqrt  { .. } => types::Float,
+            Insn::FloatMath  { .. } => types::Float,
             Insn::FloatCmp   { .. } => types::BoolExact,
             // Every Fixnum converts to a double within the Flonum range
             Insn::FixnumToFloat { .. } => types::Flonum,
@@ -10755,7 +10769,7 @@ impl Function {
             Insn::FloatToInt { recv, .. } => {
                 self.assert_subtype(insn_id, recv, types::Flonum)
             }
-            Insn::FloatSqrt { val, .. } => {
+            Insn::FloatSqrt { val, .. } | Insn::FloatMath { val, .. } => {
                 self.assert_subtype(insn_id, val, types::Flonum)
             }
             Insn::FloatCmp { left, right, .. } => {

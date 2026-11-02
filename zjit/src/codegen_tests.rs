@@ -13128,6 +13128,19 @@ fn test_math_sqrt_flonum() {
 }
 
 #[test]
+fn test_math_cos_sin_exp_flonum() {
+    eval("
+        def c(x) = Math.cos(x)
+        def s(x) = Math.sin(x)
+        def e(x) = Math.exp(x)
+        c(1.0); s(1.0); e(1.0) # profile
+    ");
+    assert_snapshot!(assert_compiles("[c(0.0), c(3.141592653589793), s(0.5), e(1.0), e(-700.0), e(700.0), s(1.0e-70)]"), @"[1.0, -1.0, 0.479425538604203, 2.718281828459045, 9.85967654375977e-305, 1.0142320547350045e+304, 1.0e-70]");
+    // Heap Floats and other types side-exit and still work
+    assert_snapshot!(inspect("[c(1), e(1.0e300), s(-0.0), (c(nil) rescue $!.class)]"), @"[0.5403023058681398, Infinity, -0.0, TypeError]");
+}
+
+#[test]
 fn test_float_pow() {
     eval("
         def test(a, b) = a ** b
