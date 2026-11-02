@@ -1770,6 +1770,7 @@ pub(crate) mod ids {
         name: div                content: b"/"
         name: modulo             content: b"%"
         name: neq                content: b"!="
+        name: ord
         name: lt                 content: b"<"
         name: le                 content: b"<="
         name: gt                 content: b">"

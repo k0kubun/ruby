@@ -8110,6 +8110,67 @@ fn test_string_slice_fixnum() {
 }
 
 #[test]
+fn test_string_aref_ord() {
+    assert_snapshot!(assert_compiles(r#"
+        def test(s, i) = s[i].ord
+        test("hello".b, 1)
+        [test("hello".b, 1), test("h\xffllo".b, 1), test("hello".b, -1), test("hello", 0), test("héllo", 1), test("héllo", 2), test("h\xffllo", 0)]
+    "#), @"[101, 255, 111, 104, 233, 108, 104]");
+}
+
+#[test]
+fn test_string_aref_ord_out_of_range() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i)
+          s[i].ord
+        rescue NoMethodError => e
+          e.message
+        end
+        test("hello", 1)
+        [test("hello", 5), test("hello", -6)]
+    "#), @r#"["undefined method 'ord' for nil", "undefined method 'ord' for nil"]"#);
+}
+
+#[test]
+fn test_string_aref_ord_invalid_byte() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i)
+          s[i].ord
+        rescue ArgumentError => e
+          e.message
+        end
+        test("hello", 1)
+        test("h\xffllo", 1)
+    "#), @r#""invalid byte sequence in UTF-8""#);
+}
+
+#[test]
+fn test_string_aref_ord_with_ord_redefined() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i) = s[i].ord
+        test("hello".b, 1)
+        test("hello".b, 1)
+        class String
+          def ord = :redefined
+        end
+        test("hello".b, 1)
+    "#), @":redefined");
+}
+
+#[test]
+fn test_string_aref_ord_nil_ord_defined() {
+    assert_snapshot!(inspect(r#"
+        def test(s, i) = s[i].ord
+        test("hello".b, 1)
+        test("hello".b, 1)
+        class NilClass
+          def ord = :nil_ord
+        end
+        test("hello".b, 5)
+    "#), @":nil_ord");
+}
+
+#[test]
 fn test_string_aref_fixnum_returns_string_for_subclass() {
     assert_snapshot!(inspect(r#"
         class MyString < String; end

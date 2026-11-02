@@ -899,6 +899,15 @@ rb_zjit_expandarray_to_ary(VALUE obj)
     return ary;
 }
 
+// The slow path of `str[idx].ord` with a Fixnum idx, for strings where it isn't the byte at idx.
+// Calls #ord on whatever str[idx] returns, e.g. raises NoMethodError when it's nil.
+VALUE
+rb_zjit_str_aref_ord(VALUE str, VALUE idx)
+{
+    VALUE c = rb_str_substr_two_fixnums(str, idx, INT2FIX(1), FALSE);
+    return rb_funcallv_public(c, rb_intern("ord"), 0, NULL);
+}
+
 // Primitives used by zjit.rb. Don't put other functions below, which wouldn't use them.
 VALUE rb_zjit_enable(rb_execution_context_t *ec, VALUE self);
 VALUE rb_zjit_assert_compiles(rb_execution_context_t *ec, VALUE self);

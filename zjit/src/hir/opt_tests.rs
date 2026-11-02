@@ -17327,6 +17327,85 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_optimize_string_aref_ord() {
+        eval(r#"
+            def test(s, i) = s[i].ord
+            test("foo", 0)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :s@0x1000
+          v4:BasicObject = LoadField v2, :i@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :s@1
+          v9:BasicObject = LoadArg :i@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, []@0x1010, cme:0x1018)
+          v35:StringExact = GuardType v12, StringExact recompile
+          v36:Fixnum = GuardType v13, Fixnum recompile
+          PatchPoint MethodRedefined(String@0x1008, ord@0x1040, cme:0x1048)
+          v41:BasicObject = StringArefOrd v35, v36
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v41
+        ");
+    }
+
+    #[test]
+    fn test_dont_fuse_string_aref_ord_across_calls() {
+        eval(r#"
+            def test(s, i)
+              c = s[i]
+              foo
+              c.ord
+            end
+            def foo = nil
+            test("foo", 0)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :s@0x1000
+          v4:BasicObject = LoadField v2, :i@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v8:BasicObject = LoadArg :self@0
+          v9:BasicObject = LoadArg :s@1
+          v10:BasicObject = LoadArg :i@2
+          Jump bb3(v8, v9, v10)
+        bb3(v13:BasicObject, v14:BasicObject, v15:BasicObject):
+          v59:NilClass = Const Value(nil)
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, []@0x1010, cme:0x1018)
+          v48:StringExact = GuardType v14, StringExact recompile
+          v49:Fixnum = GuardType v15, Fixnum recompile
+          v50:StringExact|NilClass = StringArefFixnum v48, v49
+          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(Object@0x1040, foo@0x1048, cme:0x1050)
+          v52:ObjectSubclass[class_exact*:Object@VALUE(0x1040)] = GuardType v13, ObjectSubclass[class_exact*:Object@VALUE(0x1040)] recompile
+          PatchPoint MethodRedefined(String@0x1008, ord@0x1078, cme:0x1080)
+          v57:StringExact = GuardType v50, StringExact recompile
+          v58:Fixnum = CCallWithFrame v57, :String#ord@0x10a8
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v58
+        ");
+    }
+
+    #[test]
     fn test_optimize_string_getbyte_fixnum() {
         eval(r#"
             def test(s, i) = s.getbyte(i)

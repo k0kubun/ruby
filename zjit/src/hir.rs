@@ -1124,6 +1124,9 @@ pub enum Insn {
     StringByteslice { string: InsnId, beg: InsnId, len: InsnId, state: InsnId },
     /// `string[index]` with a Fixnum `index`: a new one-character String, or nil if out of range
     StringArefFixnum { string: InsnId, index: InsnId, state: InsnId },
+    /// `string[index].ord` with a Fixnum `index` and the stock String#ord, without allocating the
+    /// one-character String when it's the byte at `index`
+    StringArefOrd { string: InsnId, index: InsnId, state: InsnId },
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
     /// Append `other` to `recv`. HIR loads both flags for load reuse. Codegen XORs the flags.
     StringAppend { recv: InsnId, other: InsnId, recv_flags: InsnId, other_flags: InsnId, state: InsnId },
@@ -1624,7 +1627,8 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*len);
                 $visit_one!(*state);
             }
-            Insn::StringArefFixnum { string, index, state } => {
+            Insn::StringArefFixnum { string, index, state }
+            | Insn::StringArefOrd { string, index, state } => {
                 $visit_one!(*string);
                 $visit_one!(*index);
                 $visit_one!(*state);
@@ -2032,6 +2036,8 @@ impl Insn {
             Insn::StringByteslice { .. } => allocates.union(Effect::read(abstract_heaps::Other)),
             // It reads the string and allocates, so it can be removed when the result is unused
             Insn::StringArefFixnum { .. } => Effect::read_write(abstract_heaps::PC.union(abstract_heaps::Allocator).union(abstract_heaps::Other), abstract_heaps::Allocator),
+            // The slow path calls #ord on nil for an index out of range
+            Insn::StringArefOrd { .. } => effects::Any,
             Insn::StringSetbyteFixnum { .. } => effects::Any,
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
@@ -2465,6 +2471,9 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             }
             Insn::StringArefFixnum { string, index, .. } => {
                 write!(f, "StringArefFixnum {string}, {index}")
+            }
+            Insn::StringArefOrd { string, index, .. } => {
+                write!(f, "StringArefOrd {string}, {index}")
             }
             Insn::StringByteslice { string, beg, len, .. } => {
                 write!(f, "StringByteslice {string}, {beg}, {len}")
@@ -4477,6 +4486,7 @@ impl Function {
             Insn::StringGetbyte { .. } => types::Fixnum,
             Insn::StringByteslice { .. } => types::StringExact.union(types::NilClass),
             Insn::StringArefFixnum { .. } => types::StringExact.union(types::NilClass),
+            Insn::StringArefOrd { .. } => types::BasicObject,
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
@@ -6187,6 +6197,9 @@ impl Function {
                     continue;
                 }
                 let resolved = self.resolve(insn_id);
+                if self.try_fuse_string_aref_ord(block, resolved.0) {
+                    continue;
+                }
                 match resolved.insn(self) {
                     &Insn::Send { mut recv, cd, state, block: send_block, caller_splat_length, reason, .. } => {
                         let mut has_block = send_block.is_some();
@@ -7238,6 +7251,54 @@ impl Function {
             }
         }
         crate::stats::trace_compile_phase("infer_types", || self.infer_types());
+    }
+
+    /// Compile `str[idx].ord` with a Fixnum `idx` to StringArefOrd, which reads the byte at `idx`
+    /// instead of allocating a String for String#ord when that's the codepoint, like the
+    /// Ragel-generated lexers in the mail gem do for every input byte. This happens before `ord`
+    /// is specialized on its own because a receiver guard or a patch point at the `ord` send would
+    /// keep the one-character String alive for its side exit. Everything here exits to the state
+    /// before `str[idx]` instead, where the interpreter can redo the allocation.
+    fn try_fuse_string_aref_ord(&mut self, block: BlockId, insn_id: InsnId) -> bool {
+        let Insn::Send { recv, cd, block: None, ref args, caller_splat_length: None, state: ord_state, .. } = self.insns[insn_id] else { return false };
+        if !args.is_empty() {
+            return false;
+        }
+        let ci = unsafe { (*cd).ci };
+        if unsafe { vm_ci_mid(ci) } != ID!(ord) || unspecializable_call_type(unsafe { rb_vm_ci_flag(ci) }) {
+            return false;
+        }
+        let aref_id = self.union_find.borrow().find_const(recv);
+        let Insn::StringArefFixnum { string, index, state } = self.insns[aref_id] else { return false };
+        // Exiting to the state before `str[idx]` re-executes everything in between, so `ord` has to
+        // be the next YARV instruction.
+        let aref_state = self.frame_state(state);
+        let ord_state = self.frame_state(ord_state);
+        let aref_opcode = unsafe { rb_zjit_insn_to_bare_insn(rb_iseq_opcode_at_pc(aref_state.iseq, aref_state.pc)) } as usize;
+        if aref_state.iseq != ord_state.iseq || aref_state.insn_idx + insn_len(aref_opcode) as usize != ord_state.insn_idx {
+            return false;
+        }
+        // Only snapshots, patch points and stats counters may come between `str[idx]` and `ord`.
+        // Drop the NoEPEscape patch point after `str[idx]`, whose side exit would keep the String
+        // alive. StringArefFixnum doesn't run Ruby code, so the EP can't escape there.
+        let Some(aref_pos) = self.blocks[block].insns.iter().position(|&insn| insn == aref_id) else { return false };
+        let in_between = &self.blocks[block].insns[aref_pos + 1..];
+        if !in_between.iter().all(|&insn| matches!(self.insns[insn], Insn::Snapshot { .. } | Insn::PatchPoint { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. })) {
+            return false;
+        }
+        let in_between: Vec<InsnId> = in_between.iter().copied()
+            .filter(|&insn| !matches!(self.insns[insn], Insn::PatchPoint { invariant: Invariant::NoEPEscape(_), .. }))
+            .collect();
+        self.blocks[block].insns.truncate(aref_pos + 1);
+        self.blocks[block].insns.extend(in_between);
+        // `str[idx]` returns nil or a String (not a subclass) without a singleton class
+        let string_ord = ZJITState::get_method_annotations().string_ord;
+        if !self.assume_expected_cfunc(block, unsafe { rb_cString }, ID!(ord), string_ord, state) {
+            return false;
+        }
+        let result = self.push_insn(block, Insn::StringArefOrd { string, index, state });
+        self.make_equal_to(insn_id, result);
+        true
     }
 
     /// Specialize `bar(...)` in a `def foo(...)` into a direct send of the call that entered `foo`.
@@ -10854,7 +10915,8 @@ impl Function {
                 self.assert_subtype(insn_id, beg, types::Fixnum)?;
                 self.assert_subtype(insn_id, len, types::Fixnum)
             },
-            Insn::StringArefFixnum { string, index, .. } => {
+            Insn::StringArefFixnum { string, index, .. }
+            | Insn::StringArefOrd { string, index, .. } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::Fixnum)
             },

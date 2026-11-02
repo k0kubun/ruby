@@ -26,6 +26,8 @@ unsafe extern "C" {
 pub struct Annotations {
     cfuncs: HashMap<*mut c_void, FnProperties>,
     builtin_funcs: HashMap<*mut c_void, FnProperties>,
+    /// The C function of the stock String#ord
+    pub string_ord: *mut c_void,
 }
 
 /// Runtime behaviors of C functions that implement a Ruby method
@@ -79,8 +81,12 @@ impl Annotations {
 }
 
 fn annotate_c_method(props_map: &mut HashMap<*mut c_void, FnProperties>, class: VALUE, method_name: &'static str, props: FnProperties) {
-    // Lookup function pointer of the C method
-    let fn_ptr = unsafe {
+    props_map.insert(c_method_fn_ptr(class, method_name), props);
+}
+
+/// Look up the function pointer of a C method
+fn c_method_fn_ptr(class: VALUE, method_name: &'static str) -> *mut c_void {
+    unsafe {
         // TODO(alan): (side quest) make rust methods and clean up glue code for rb_method_cfunc_t and
         // rb_method_definition_t.
         let method_id = rb_intern2(method_name.as_ptr().cast(), method_name.len() as _);
@@ -89,9 +95,7 @@ fn annotate_c_method(props_map: &mut HashMap<*mut c_void, FnProperties>, class: 
         // ME-to-CME cast is fine due to identical layout
         debug_assert_eq!(VM_METHOD_TYPE_CFUNC, get_cme_def_type(method.cast()));
         get_mct_func(get_cme_def_body_cfunc(method.cast()))
-    };
-
-    props_map.insert(fn_ptr, props);
+    }
 }
 
 /// Look up a method and find its builtin function pointer by parsing its ISEQ
@@ -235,6 +239,7 @@ pub fn init() -> Annotations {
     annotate!(rb_cString, "byteslice", inline_string_byteslice);
     annotate!(rb_cString, "[]", inline_string_aref);
     annotate!(rb_cString, "slice", inline_string_aref);
+    annotate!(rb_cString, "ord", types::Fixnum);
     annotate!(rb_cString, "setbyte", inline_string_setbyte);
     annotate!(rb_cString, "empty?", inline_string_empty_p, types::BoolExact, no_gc, leaf, elidable);
     annotate!(rb_cString, "<<", inline_string_append);
@@ -347,6 +352,7 @@ pub fn init() -> Annotations {
     Annotations {
         cfuncs: std::mem::take(cfuncs),
         builtin_funcs: std::mem::take(builtin_funcs),
+        string_ord: c_method_fn_ptr(unsafe { rb_cString }, "ord"),
     }
 }
 

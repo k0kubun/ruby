@@ -903,6 +903,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
         Insn::StringByteslice { string, beg, len, state } => gen_string_byteslice(asm, opnd!(string), opnd!(beg), opnd!(len), &function.frame_state(*state)),
         Insn::StringArefFixnum { string, index, state } => gen_string_aref_fixnum(asm, opnd!(string), opnd!(index), &function.frame_state(*state)),
+        Insn::StringArefOrd { string, index, state } => gen_string_aref_ord(jit, asm, function, opnd!(string), opnd!(index), &function.frame_state(*state)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(jit, asm, opnd!(string), opnd!(index), opnd!(value)),
         Insn::StringAppend { recv, other, recv_flags, other_flags, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), opnd!(recv_flags), opnd!(other_flags), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -5331,6 +5332,63 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
 fn gen_string_aref_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, state: &FrameState) -> Opnd {
     gen_prepare_leaf_call_with_gc(asm, state);
     asm_ccall!(asm, rb_str_substr_two_fixnums, string, index, VALUE::fixnum_from_usize(1).into(), Opnd::Imm(0))
+}
+
+/// Compile `string[index].ord` with a Fixnum index. For a binary or 7-bit string, the character
+/// at an in-bounds index is the byte, so load it. Otherwise call rb_zjit_str_aref_ord().
+fn gen_string_aref_ord(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, index: Opnd, state: &FrameState) -> Opnd {
+    unsafe extern "C" {
+        fn rb_zjit_str_aref_ord(str: VALUE, idx: VALUE) -> VALUE;
+    }
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let bounds_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let byte_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let edge = |target, args| Target::Block(Box::new(lir::BranchEdge { target, args }));
+
+    asm_comment!(asm, "String#[] + String#ord");
+    let string = asm.load_mem(string);
+    let index = asm.load_mem(index);
+    let flags = asm.load(Opnd::mem(VALUE_BITS, string, RUBY_OFFSET_RBASIC_FLAGS));
+    // ASCII-8BIT is encoding index 0
+    asm.test(flags, Opnd::UImm(RUBY_ENCODING_MASK as u64));
+    asm.jz(jit, edge(bounds_block, vec![]));
+    let coderange = asm.and(flags, Opnd::UImm(RUBY_ENC_CODERANGE_MASK as u64));
+    asm.cmp(coderange, Opnd::UImm(RUBY_ENC_CODERANGE_7BIT as u64));
+    asm.jne(jit, edge(slow_block, vec![]));
+    asm.jmp(edge(bounds_block, vec![]));
+
+    asm.set_current_block(bounds_block);
+    let label = jit.get_label(asm, bounds_block, hir_block_id);
+    asm.write_label(label);
+    let unboxed_index = asm.rshift(index, Opnd::UImm(1));
+    let len = asm.load(Opnd::mem(64, string, RUBY_OFFSET_RSTRING_LEN));
+    // An unsigned comparison also sends negative indices to the slow path.
+    asm.cmp(unboxed_index, len);
+    asm.jb(edge(byte_block, vec![]));
+    asm.jmp(edge(slow_block, vec![]));
+
+    asm.set_current_block(byte_block);
+    let label = jit.get_label(asm, byte_block, hir_block_id);
+    asm.write_label(label);
+    let byte = gen_string_getbyte(asm, string, unboxed_index);
+    asm.jmp(edge(result_block, vec![byte]));
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    gen_prepare_non_leaf_call(jit, asm, function, state);
+    let ret = asm_ccall!(asm, rb_zjit_str_aref_ord, string, index);
+    asm.jmp(edge(result_block, vec![ret]));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let result = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(result);
+    result
 }
 
 fn gen_string_byteslice(asm: &mut Assembler, string: Opnd, beg: Opnd, len: Opnd, state: &FrameState) -> Opnd {
