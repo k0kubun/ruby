@@ -130,6 +130,7 @@ unsafe extern "C" {
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
     pub fn rb_float_new(d: f64) -> VALUE;
+    pub static mut rb_mMath: VALUE;
     /// rb_float_new() taking the raw bits of a double in a general-purpose register
     pub fn rb_zjit_float_new_bits(bits: u64) -> VALUE;
 
