@@ -25,7 +25,7 @@ use crate::stats::{counter_ptr, with_compile_time_stat, trace_compile_phase, Cou
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
 use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{self, iseq_to_hir, iseq_to_hir_resume, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
-use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CondBranchFixnumCmpData, CondBranchHasTypeData, Const, FieldName, FixnumCmpOp, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
+use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CCallWithGCData, CondBranchFixnumCmpData, CondBranchHasTypeData, Const, FieldName, FixnumCmpOp, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
 use crate::options::{get_option, InlineDepth, DEFAULT_MAX_VERSIONS};
 use crate::cast::IntoUsize;
@@ -1000,6 +1000,11 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::GuardGreaterEq { left, right, state, .. } => gen_guard_greater_eq(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(state)),
         Insn::PatchPoint { invariant, state } => no_output!(gen_patch_point(jit, asm, function, invariant, &function.frame_state(*state))),
         Insn::CCall { cfunc, recv, args, name, owner, return_type: _, elidable: _ } => gen_ccall(asm, *cfunc, *name, *owner, opnd!(recv), opnds!(args)),
+        Insn::CCallWithGC(insn) => {
+            let CCallWithGCData { cfunc, recv, args, name, owner, state, .. } = &**insn;
+            gen_prepare_leaf_call_with_gc(asm, &function.frame_state(*state));
+            gen_ccall(asm, *cfunc, *name, *owner, opnd!(recv), opnds!(args))
+        }
         Insn::CCallWithFrame(insn) => {
             let CCallWithFrameData { cfunc, recv, name, args, cme, state, block, .. } = &**insn;
             gen_ccall_with_frame(jit, asm, function, *cfunc, *name, opnd!(recv), opnds!(args), *cme, *block, &function.frame_state(*state))
@@ -3762,6 +3767,10 @@ fn gen_cond_branch_has_type(jit: &mut JITState, asm: &mut Assembler, val: lir::O
     } else if ty.is_subtype(types::FalseClass) {
         asm.cmp(val, Qfalse.into());
         lir::Insn::Je
+    } else if ty.is_subtype(types::Fixnum.union(types::Flonum)) {
+        // Only a Fixnum (0b...1) or a Flonum (0b...10) has either of the low two bits set.
+        asm.test(val, Opnd::UImm((RUBY_FIXNUM_FLAG | RUBY_FLONUM_FLAG) as u64));
+        lir::Insn::Jnz
     } else if ty.is_immediate() {
         // All immediate types' guard should have been handled above
         panic!("unexpected immediate guard type: {ty}");
@@ -3848,6 +3857,10 @@ fn gen_guard_type(jit: &mut JITState, asm: &mut Assembler, function: &Function, 
     } else if guard_type.is_subtype(types::FalseClass) {
         asm.cmp(val, Qfalse.into());
         asm.jne(jit, side_exit_with_recompile(jit, function, state, GuardType(guard_type), recompile));
+    } else if guard_type.is_subtype(types::Fixnum.union(types::Flonum)) {
+        // Only a Fixnum (0b...1) or a Flonum (0b...10) has either of the low two bits set.
+        asm.test(val, Opnd::UImm((RUBY_FIXNUM_FLAG | RUBY_FLONUM_FLAG) as u64));
+        asm.jz(jit, side_exit_with_recompile(jit, function, state, GuardType(guard_type), recompile));
     } else if guard_type.is_immediate() {
         // All immediate types' guard should have been handled above
         panic!("unexpected immediate guard type: {guard_type}");

@@ -993,6 +993,20 @@ pub struct CCallWithFrameData {
     pub block: Option<BlockHandler>,
 }
 
+/// Payload of [`Insn::CCallWithGC`]. Boxed in the enum to keep `Insn` small.
+#[derive(Debug, Clone)]
+pub struct CCallWithGCData {
+    pub cfunc: *const u8,
+    pub recv: InsnId,
+    pub args: Vec<InsnId>,
+    /// For printing purposes only
+    pub name: ID,
+    /// For printing purposes only
+    pub owner: VALUE,
+    pub return_type: Type,
+    pub state: InsnId,
+}
+
 /// Payload of [`Insn::SendDirect`]. Boxed in the enum to keep `Insn` small.
 #[derive(Debug, Clone)]
 pub struct SendDirectData {
@@ -1278,6 +1292,11 @@ pub enum Insn {
     /// Call a C function without pushing a frame
     /// `name` and `owner` are for printing purposes only
     CCall { cfunc: *const u8, recv: InsnId, args: Vec<InsnId>, name: ID, owner: VALUE, return_type: Type, elidable: bool },
+
+    /// Call a C function without pushing a frame, like CCall, for a function that may allocate
+    /// (and so run the GC) but never calls a Ruby method or raises. `state` is used to save
+    /// the SP for the GC.
+    CCallWithGC(Box<CCallWithGCData>),
 
     /// Call a C function that pushes a frame
     CCallWithFrame(Box<CCallWithFrameData>),
@@ -1827,6 +1846,11 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*recv);
                 $visit_many!(args);
             }
+            Insn::CCallWithGC(insn) => {
+                $visit_one!(insn.recv);
+                $visit_many!(insn.args);
+                $visit_one!(insn.state);
+            }
             Insn::GetIvar { self_val, state, .. }
             | Insn::DefinedIvar { self_val, state, .. } => {
                 $visit_one!(*self_val);
@@ -2075,6 +2099,7 @@ impl Insn {
                     effects::Any
                 }
             },
+            Insn::CCallWithGC(_) => effects::Any,
             Insn::CCallWithFrame(insn) => {
                 if insn.elidable {
                     Effect::write(abstract_heaps::Allocator)
@@ -2637,6 +2662,13 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::CCall { cfunc, recv, args, name, owner, return_type: _, elidable: _ } => {
                 let display_name = if *owner == Qnil { name.contents_lossy().to_string() } else { qualified_method_name(*owner, *name) };
                 write!(f, "CCall {recv}, :{}@{:p}", display_name, self.ptr_map.map_ptr(*cfunc))?;
+                write_separated!(f, ", ", ", ", args);
+                Ok(())
+            },
+            Insn::CCallWithGC(insn) => {
+                let CCallWithGCData { cfunc, recv, args, name, owner, .. } = &**insn;
+                let display_name = if *owner == Qnil { name.contents_lossy().to_string() } else { qualified_method_name(*owner, *name) };
+                write!(f, "CCallWithGC {recv}, :{}@{:p}", display_name, self.ptr_map.map_ptr(*cfunc))?;
                 write_separated!(f, ", ", ", ", args);
                 Ok(())
             },
@@ -4413,6 +4445,7 @@ impl Function {
             Insn::ObjectAllocClass { class, .. } => Type::from_class(*class),
             Insn::CCallWithFrame(insn) => self.cfunc_call_return_type(insn.return_type, insn.block, insn.state),
             Insn::CCall { return_type, .. } => *return_type,
+            Insn::CCallWithGC(insn) => insn.return_type,
             Insn::CCallVariadic(insn) => self.cfunc_call_return_type(insn.return_type, insn.block, insn.state),
             Insn::CheckMatch { .. } => types::BasicObject,
             Insn::GuardType { val, guard_type, .. } => self.type_of(*val).intersection(*guard_type),
@@ -10408,6 +10441,13 @@ impl Function {
                 }
                 if let Some(BlockHandler::FrameBlock(block_handler)) = insn.block {
                     self.assert_subtype(insn_id, block_handler, types::CInt64)?;
+                }
+                Ok(())
+            }
+            Insn::CCallWithGC(ref insn) => {
+                self.assert_subtype(insn_id, insn.recv, types::BasicObject)?;
+                for &arg in &insn.args {
+                    self.assert_subtype(insn_id, arg, types::BasicObject)?;
                 }
                 Ok(())
             }

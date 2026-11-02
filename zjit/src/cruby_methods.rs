@@ -780,15 +780,20 @@ fn try_inline_float_op(fun: &mut hir::Function, block: hir::BlockId, f: &dyn Fn(
     // The other operand can be Flonum or Fixnum since rb_float_plus/minus/mul/div
     // handle both via fast paths (FIXNUM_P check + cast to double).
     // HeapFloat falls back to CCallWithFrame via the default Send path.
-    if fun.likely_a(recv, types::Flonum, state)
-        && (fun.likely_a(other, types::Flonum, state) || fun.likely_a(other, types::Fixnum, state))
-    {
-        let recv = coerce_float_op_operand(fun, block, recv, types::Flonum, state);
-        let other_type = if fun.likely_a(other, types::Flonum, state) { types::Flonum } else { types::Fixnum };
-        let other = coerce_float_op_operand(fun, block, other, other_type, state);
-        return Some(fun.push_insn(block, f(recv, other)));
-    }
-    None
+    if !fun.likely_a(recv, types::Flonum, state) { return None; }
+    let other_type = likely_fixnum_or_flonum(fun, other, state)?;
+    let recv = coerce_float_op_operand(fun, block, recv, types::Flonum, state);
+    let other = coerce_float_op_operand(fun, block, other, other_type, state);
+    Some(fun.push_insn(block, f(recv, other)))
+}
+
+/// Fixnum, Flonum, or Fixnum|Flonum if `val` is likely one of them (the profile may have seen
+/// both). Numeric methods of Fixnum and Flonum receivers handle these operands without calling a
+/// Ruby method; for other operands, they may call #coerce.
+fn likely_fixnum_or_flonum(fun: &hir::Function, val: hir::InsnId, state: hir::InsnId) -> Option<Type> {
+    [types::Fixnum, types::Flonum, types::Fixnum.union(types::Flonum)]
+        .into_iter()
+        .find(|&ty| fun.likely_a(val, ty, state))
 }
 
 fn coerce_float_op_operand(fun: &mut hir::Function, block: hir::BlockId, val: hir::InsnId, guard_type: Type, state: hir::InsnId) -> hir::InsnId {
@@ -861,13 +866,7 @@ fn try_inline_float_cmp(fun: &mut hir::Function, block: hir::BlockId, method_id:
         return None;
     }
     if !fun.likely_a(recv, types::Flonum, state) { return None; }
-    let other_type = if fun.likely_a(other, types::Flonum, state) {
-        types::Flonum
-    } else if fun.likely_a(other, types::Fixnum, state) {
-        types::Fixnum
-    } else {
-        return None;
-    };
+    let other_type = likely_fixnum_or_flonum(fun, other, state)?;
     let recv = fun.coerce_to(block, recv, types::Flonum, state);
     let other = fun.coerce_to(block, other, other_type, state);
     push_leaf_cfunc_call(fun, block, unsafe { rb_cFloat }, method_id, recv, vec![other], types::BoolExact)
@@ -935,16 +934,47 @@ fn inline_integer_eq(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
 fn inline_integer_plus(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumAdd { left, right, state }, BOP_PLUS, recv, other, state)
+        .or_else(|| try_inline_integer_float_op(fun, block, ID!(plus), recv, other, state))
 }
 
 fn inline_integer_minus(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumSub { left, right, state }, BOP_MINUS, recv, other, state)
+        .or_else(|| try_inline_integer_float_op(fun, block, ID!(minus), recv, other, state))
 }
 
 fn inline_integer_mult(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumMult { left, right, state }, BOP_MULT, recv, other, state)
+        .or_else(|| try_inline_integer_float_op(fun, block, ID!(mult), recv, other, state))
+}
+
+/// Integer#+, #-, and #* of a Fixnum and a Flonum, or an operand that may be either a Fixnum or a
+/// Flonum, call no Ruby method and never raise. They only allocate a heap Float or a Bignum
+/// when the result doesn't fit in an immediate. So call the C method without pushing a frame,
+/// like Float#+ (FloatAdd). Fixnum operands alone are handled by FixnumAdd etc. instead.
+fn try_inline_integer_float_op(fun: &mut hir::Function, block: hir::BlockId, method_id: ID, recv: hir::InsnId, other: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {
+    if !fun.likely_a(recv, types::Fixnum, state) { return None; }
+    let other_type = likely_fixnum_or_flonum(fun, other, state)?;
+    if other_type.is_subtype(types::Fixnum) { return None; }
+    let return_type = if other_type.is_subtype(types::Flonum) { types::Float } else { types::Integer.union(types::Float) };
+    let cme = unsafe { rb_callable_method_entry(rb_cInteger, method_id) };
+    if cme.is_null() || unsafe { get_cme_def_type(cme) } != VM_METHOD_TYPE_CFUNC { return None; }
+    let cfunc = unsafe { get_mct_func(get_cme_def_body_cfunc(cme)) }.cast();
+    let recv = fun.coerce_to(block, recv, types::Fixnum, state);
+    let other = fun.coerce_to(block, other, other_type, state);
+    Some(fun.push_insn(block, hir::Insn::CCallWithGC(Box::new(hir::CCallWithGCData { cfunc, recv, args: vec![other], name: method_id, owner: unsafe { rb_cInteger }, return_type, state }))))
+}
+
+/// Integer#<, #<=, #>, and #>= of a Fixnum and a Flonum (or either) are leaf and don't allocate,
+/// so call them without a frame, like Float#<.
+fn try_inline_integer_float_cmp(fun: &mut hir::Function, block: hir::BlockId, method_id: ID, recv: hir::InsnId, other: hir::InsnId, state: hir::InsnId) -> Option<hir::InsnId> {
+    if !fun.likely_a(recv, types::Fixnum, state) { return None; }
+    let other_type = likely_fixnum_or_flonum(fun, other, state)?;
+    if other_type.is_subtype(types::Fixnum) { return None; }
+    let recv = fun.coerce_to(block, recv, types::Fixnum, state);
+    let other = fun.coerce_to(block, other, other_type, state);
+    push_leaf_cfunc_call(fun, block, unsafe { rb_cInteger }, method_id, recv, vec![other], types::BoolExact)
 }
 
 fn inline_integer_div(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
@@ -970,21 +1000,25 @@ fn inline_integer_or(fun: &mut hir::Function, block: hir::BlockId, recv: hir::In
 fn inline_integer_gt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumGt { left, right }, BOP_GT, recv, other, state)
+        .or_else(|| try_inline_integer_float_cmp(fun, block, ID!(gt), recv, other, state))
 }
 
 fn inline_integer_ge(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumGe { left, right }, BOP_GE, recv, other, state)
+        .or_else(|| try_inline_integer_float_cmp(fun, block, ID!(ge), recv, other, state))
 }
 
 fn inline_integer_lt(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumLt { left, right }, BOP_LT, recv, other, state)
+        .or_else(|| try_inline_integer_float_cmp(fun, block, ID!(lt), recv, other, state))
 }
 
 fn inline_integer_le(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
     let &[other] = args else { return None; };
     try_inline_fixnum_op(fun, block, &|left, right| hir::Insn::FixnumLe { left, right }, BOP_LE, recv, other, state)
+        .or_else(|| try_inline_integer_float_cmp(fun, block, ID!(le), recv, other, state))
 }
 
 fn inline_integer_lshift(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {

@@ -12946,6 +12946,45 @@ fn test_float_compare_and_integer_to_f() {
 }
 
 #[test]
+fn test_integer_op_with_flonum() {
+    eval("
+        def add(a, b) = a + b
+        def sub(a, b) = a - b
+        def mul(a, b) = a * b
+        def lt(a, b) = a < b
+        def le(a, b) = a <= b
+        def gt(a, b) = a > b
+        def ge(a, b) = a >= b
+        add(1, 1.5); sub(1, 1.5); mul(1, 1.5); lt(1, 1.5); le(1, 1.5); gt(1, 1.5); ge(1, 1.5) # profile
+    ");
+    assert_snapshot!(assert_compiles("[add(3, 1.5), sub(3, 1.5), mul(3, 1.5), mul(0, -1.5), add(-3, 0.25)]"), @"[4.5, 1.5, 4.5, -0.0, -2.75]");
+    assert_snapshot!(assert_compiles("[lt(3, 3.5), lt(4, 3.5), le(3, 3.0), le(3, 2.5), gt(3, 2.5), gt(3, 3.0), ge(3, 3.0), ge(-3, 3.0)]"), @"[true, false, true, false, true, false, true, false]");
+    // Fixnums beyond 2**53 don't convert to a Float exactly
+    assert_snapshot!(assert_compiles("[lt(9007199254740993, 9007199254740992.0), ge(9007199254740993, 9007199254740992.0), le(-4611686018427387904, -4.611686018427388e+18), gt(-4611686018427387904, -4.611686018427388e+18)]"), @"[false, true, true, false]");
+    // Results that need a heap Float
+    assert_snapshot!(assert_compiles("[mul(4611686018427387903, 1.0e70), mul(-1, 0.0), sub(1, 1.0e-300 * 1.0e-50).equal?(1.0)]"), @"[4.611686018427388e+88, -0.0, true]");
+    // Other operand types side-exit and still work
+    assert_snapshot!(inspect("[add(1, 2), add(1, 2**70), sub(1, 1r), lt(1, 2**70), ge(1, 1.0e-320), mul(2, -0.0), lt(1, Float::NAN), ge(1, Float::NAN), (add(1, nil) rescue $!.class)]"), @"[3, 1180591620717411303425, (0/1), true, true, -0.0, false, false, TypeError]");
+}
+
+#[test]
+fn test_integer_and_float_op_with_fixnum_or_flonum() {
+    set_call_threshold(3);
+    eval("
+        def add(a, b) = a + b
+        def mul(a, b) = a * b
+        def le(a, b) = a <= b
+        def fsub(a, b) = a - b
+        def flt(a, b) = a < b
+        [1.5, 2].each { |b| add(1, b); mul(1, b); le(1, b); fsub(1.5, b); flt(1.5, b) } # profile both
+    ");
+    assert_snapshot!(assert_compiles("[add(3, 1.5), add(3, 2), add(4611686018427387903, 1), mul(3, 0.5), mul(4611686018427387903, 4611686018427387903)]"), @"[4.5, 5, 4611686018427387904, 1.5, 21267647932558653957237540927630737409]");
+    assert_snapshot!(assert_compiles("[le(3, 3.5), le(3, 2), le(3, 3), fsub(2.5, 1), fsub(2.5, 0.5), flt(2.5, 3), flt(2.5, 2.5)]"), @"[true, false, true, 1.5, 2.0, true, false]");
+    // Other operand types side-exit and still work
+    assert_snapshot!(inspect("[add(1, 2**70), le(1, nil.to_i), fsub(1.5, 1r), (flt(1.5, nil) rescue $!.class)]"), @"[1180591620717411303425, false, 0.5, ArgumentError]");
+}
+
+#[test]
 fn test_float_pow() {
     eval("
         def test(a, b) = a ** b

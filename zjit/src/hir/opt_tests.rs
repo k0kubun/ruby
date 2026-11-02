@@ -12469,9 +12469,10 @@ mod hir_opt_tests {
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
           PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
           v28:Fixnum = GuardType v12, Fixnum recompile
-          v29:BasicObject = CCallWithFrame v28, :Integer#<@0x1040, v13
+          v29:Flonum|Fixnum = GuardType v13, Flonum|Fixnum recompile
+          v30:BoolExact = CCall v28, :Integer#<@0x1040, v29
           CheckInterrupts
-          Return v29
+          Return v30
         ");
     }
 
@@ -27041,6 +27042,132 @@ mod hir_opt_tests {
           v28:Flonum = GuardType v12, Flonum recompile
           v29:Fixnum = GuardType v13, Fixnum recompile
           v30:BoolExact = CCall v28, :Float#<@0x1040, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_integer_plus_flonum_calls_cfunc_without_frame() {
+        eval(r#"
+            def test(x, y) = x + y
+            test(1, 2.5)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Integer@0x1008, +@0x1010, cme:0x1018)
+          v28:Fixnum = GuardType v12, Fixnum recompile
+          v29:Flonum = GuardType v13, Flonum recompile
+          v30:Float = CCallWithGC v28, :Integer#+@0x1040, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_integer_minus_fixnum_or_flonum_calls_cfunc_without_frame() {
+        eval(r#"
+            def test(x, y) = x - y
+            test(1, 2.5)
+            test(1, 2)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Integer@0x1008, -@0x1010, cme:0x1018)
+          v28:Fixnum = GuardType v12, Fixnum recompile
+          v29:Flonum|Fixnum = GuardType v13, Flonum|Fixnum recompile
+          v30:Float|Integer = CCallWithGC v28, :Integer#-@0x1040, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_integer_lt_flonum_calls_leaf_cfunc() {
+        eval(r#"
+            def test(x, y) = x < y
+            test(1, 2.5)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Integer@0x1008, <@0x1010, cme:0x1018)
+          v28:Fixnum = GuardType v12, Fixnum recompile
+          v29:Flonum = GuardType v13, Flonum recompile
+          v30:BoolExact = CCall v28, :Integer#<@0x1040, v29
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_float_minus_fixnum_or_flonum_inline() {
+        eval(r#"
+            def test(x, y) = x - y
+            test(1.5, 2.5)
+            test(1.5, 2)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :y@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :x@1
+          v9:BasicObject = LoadArg :y@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint MethodRedefined(Float@0x1008, -@0x1010, cme:0x1018)
+          v28:Flonum = GuardType v12, Flonum recompile
+          v29:Flonum|Fixnum = GuardType v13, Flonum|Fixnum recompile
+          v30:Float = FloatSub v28, v29
           CheckInterrupts
           Return v30
         ");
