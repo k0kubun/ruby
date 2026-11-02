@@ -1472,6 +1472,10 @@ pub enum Insn {
     FloatToInt { recv: InsnId, state: InsnId },
     /// Math.sqrt of a Flonum, side-exiting for a negative operand (Math::DomainError)
     FloatSqrt { val: InsnId, state: InsnId },
+    /// Compare two Flonums (never NaN) with <, <=, >, or >=
+    FloatCmp { op: FixnumCmpOp, left: InsnId, right: InsnId },
+    /// Integer#to_f of a Fixnum
+    FixnumToFloat { val: InsnId },
 
     AnyToString { val: InsnId, state: InsnId },
     /// Convert a Fixnum to a String with rb_fix_to_s(), which shares frozen strings for 0..9
@@ -1710,6 +1714,10 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*val);
                 $visit_one!(*state);
             }
+            Insn::FixnumToFloat { val } => {
+                $visit_one!(*val);
+            }
+            Insn::FloatCmp { left, right, .. } |
             Insn::FixnumLt { left, right }
             | Insn::FixnumLe { left, right }
             | Insn::FixnumGt { left, right }
@@ -2176,6 +2184,8 @@ impl Insn {
             Insn::FloatPow { .. } => effects::Any,
             Insn::FloatToInt { .. } => effects::Any,
             Insn::FloatSqrt { .. } => effects::Any,
+            Insn::FloatCmp { .. } => effects::Empty,
+            Insn::FixnumToFloat { .. } => effects::Empty,
             Insn::FixnumEq { .. } => effects::Empty,
             Insn::FixnumLt { .. } => effects::Empty,
             Insn::FixnumLe { .. } => effects::Empty,
@@ -2620,6 +2630,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FloatPow   { recv, other, .. } => { write!(f, "FloatPow {recv}, {other}") },
             Insn::FloatToInt { recv, .. } => { write!(f, "FloatToInt {recv}") },
             Insn::FloatSqrt { val, .. } => { write!(f, "FloatSqrt {val}") },
+            Insn::FloatCmp { op, left, right } => { write!(f, "FloatCmp {op:?}, {left}, {right}") },
+            Insn::FixnumToFloat { val } => { write!(f, "FixnumToFloat {val}") },
             Insn::FixnumEq   { left, right, .. } => { write!(f, "FixnumEq {left}, {right}") },
             Insn::FixnumLt   { left, right, .. } => { write!(f, "FixnumLt {left}, {right}") },
             Insn::FixnumLe   { left, right, .. } => { write!(f, "FixnumLe {left}, {right}") },
@@ -4506,6 +4518,9 @@ impl Function {
             Insn::FloatPow   { .. } => types::BasicObject,
             Insn::FloatToInt { .. } => types::Integer,
             Insn::FloatSqrt  { .. } => types::Float,
+            Insn::FloatCmp   { .. } => types::BoolExact,
+            // Every Fixnum converts to a double within the Flonum range
+            Insn::FixnumToFloat { .. } => types::Flonum,
             Insn::FixnumEq   { .. } => types::BoolExact,
             Insn::FixnumLt   { .. } => types::BoolExact,
             Insn::FixnumLe   { .. } => types::BoolExact,
@@ -10805,6 +10820,13 @@ impl Function {
             }
             Insn::FloatSqrt { val, .. } => {
                 self.assert_subtype(insn_id, val, types::Flonum)
+            }
+            Insn::FloatCmp { left, right, .. } => {
+                self.assert_subtype(insn_id, left, types::Flonum)?;
+                self.assert_subtype(insn_id, right, types::Flonum)
+            }
+            Insn::FixnumToFloat { val } => {
+                self.assert_subtype(insn_id, val, types::Fixnum)
             }
             Insn::FixnumLShift { left, right, .. }
             | Insn::FixnumRShift { left, right, .. } => {
