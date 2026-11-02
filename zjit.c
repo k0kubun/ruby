@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <math.h>
 #include "internal/sanitizers.h"
 #include "internal/string.h"
 #include "internal/hash.h"
@@ -262,6 +263,36 @@ rb_zjit_float_new_bits(uint64_t bits)
     // so that NaN bits (e.g. [nan].pack('G') and Float#hash) don't depend on JIT compilation.
     if (isnan(d)) d = nan("");
     return rb_float_new(d);
+}
+
+// Math.cos, Math.sin, and Math.exp for raw IEEE 754 double bits. They never raise for a Float.
+#define ZJIT_MATH_BITS(name) \
+uint64_t \
+rb_zjit_math_##name##_bits(uint64_t x) \
+{ \
+    double d; \
+    memcpy(&d, &x, sizeof(d)); \
+    d = name(d); \
+    memcpy(&x, &d, sizeof(d)); \
+    return x; \
+}
+ZJIT_MATH_BITS(cos)
+ZJIT_MATH_BITS(sin)
+ZJIT_MATH_BITS(exp)
+#undef ZJIT_MATH_BITS
+
+// Float#** for the raw IEEE 754 double bits of a Float base and a Float exponent
+VALUE
+rb_zjit_float_pow_bits(uint64_t x, uint64_t y)
+{
+    double dx, dy;
+    memcpy(&dx, &x, sizeof(dx));
+    memcpy(&dy, &y, sizeof(dy));
+    if (dx < 0 && dy != round(dy)) {
+        // A negative base with a fractional exponent yields a Complex
+        return rb_float_pow(DBL2NUM(dx), DBL2NUM(dy));
+    }
+    return DBL2NUM(pow(dx, dy));
 }
 
 VALUE
