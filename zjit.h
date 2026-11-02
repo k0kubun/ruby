@@ -98,6 +98,7 @@ bool rb_zjit_array_new_can_fastpath(rb_len_t len, size_t *alloc_size_out, VALUE 
 bool rb_zjit_hash_dup_can_fastpath(VALUE hash, size_t *alloc_size_out, VALUE *flags_out, VALUE *ifnone_out, rb_len_t *bound_out);
 void rb_zjit_range_new_fastpath(bool exclude_end, size_t *alloc_size_out, VALUE *flags_out);
 void rb_zjit_array_new_fastpath(size_t *alloc_size_out, VALUE *flags_out);
+bool rb_zjit_ary_s_new_with_block_p(const rb_callable_method_entry_t *cme, const rb_callable_method_entry_t **init_cme);
 bool rb_zjit_newobj_hook_enabled_p(void);
 
 // Special value for cfp->jit_return that means "this is a C method frame, use

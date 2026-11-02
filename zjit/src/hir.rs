@@ -5295,6 +5295,52 @@ impl Function {
     /// ISEQ methods named by a constant `name` or by the static Symbols profiled for `name`. Profiled
     /// names are dispatched with IsBitEqual, falling back to the generic send on a miss.
     /// Returns the block to continue specializing in, or None if nothing was emitted.
+    /// Call Array.__new_with_block (array.rb) for `Array.new(size) { |index| ... }` with a Fixnum
+    /// `size`. Array#initialize would yield to the block from C, which pushes a frame and enters
+    /// the JIT code of the block on every element. Array.__new_with_block yields from Ruby instead,
+    /// so the inliner can inline it with the block like Array#map with a literal block.
+    fn try_array_new_with_block(&mut self, block: BlockId, recv: InsnId, cd: *const rb_call_data, cme: *const rb_callable_method_entry_t, args: &[InsnId], blockiseq: IseqPtr, state: InsnId) -> Option<InsnId> {
+        let &[size] = args else { return None };
+        let mut init_cme: *const rb_callable_method_entry_t = std::ptr::null();
+        if !unsafe { rb_zjit_ary_s_new_with_block_p(cme, &mut init_cme) } {
+            return None;
+        }
+        // Array.new(array) { ... } copies the array, and Array.new(size) calls size.to_int.
+        if !self.likely_a(size, types::Fixnum, state) {
+            return None;
+        }
+        let array_singleton = unsafe { rb_cArray }.class_of();
+        let helper_mid = unsafe { rb_intern(c"__new_with_block".as_ptr()) };
+        let helper_cme = unsafe { rb_callable_method_entry(array_singleton, helper_mid) };
+        if helper_cme.is_null() || unsafe { get_cme_def_type(helper_cme) } != VM_METHOD_TYPE_ISEQ {
+            return None;
+        }
+        let iseq = unsafe { get_def_iseq_ptr((*helper_cme).def) };
+        if unsafe { rb_jit_iseq_builtin_attrs(iseq) } & BUILTIN_ATTR_INLINE_BLOCK == 0 {
+            return None;
+        }
+        let ci = unsafe { (*cd).ci };
+        let Ok(call) = self.build_send_direct_args(&CallerArguments::new(&[size], ci), None, iseq, true) else { return None };
+
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: unsafe { rb_cArray }, method: ID!(initialize), cme: init_cme }, state });
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: array_singleton, method: helper_mid, cme: helper_cme }, state });
+        let size = self.coerce_to(block, size, types::Fixnum, state);
+        // Array.new raises for a negative or too big size. Side-exit to raise it from the C
+        // method, so that the backtrace shows Array.new and Array#initialize, not the helper.
+        let unboxed_size = self.push_insn(block, Insn::UnboxFixnum { val: size });
+        let zero = self.push_insn(block, Insn::Const { val: Const::CInt64(0) });
+        self.push_insn(block, Insn::GuardGreaterEq { left: unboxed_size, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
+        // ARY_MAX_SIZE in array.c
+        let max_size = self.push_insn(block, Insn::Const { val: Const::CInt64(i64::MAX / SIZEOF_VALUE as i64 + 1) });
+        self.push_insn(block, Insn::GuardLess { left: unboxed_size, right: max_size, reason: Box::new(SideExitReason::GuardLess), state });
+        let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+            self.emit_send_direct_args(block, call, &[size], state, state);
+        Some(self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
+            recv, cd, cme: helper_cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state,
+            block: Some(BlockHandler::BlockIseq(blockiseq)),
+        }))))
+    }
+
     /// Specialize a send whose receiver classes vary but all resolve to one ISEQ method, e.g. a
     /// method of a superclass called on instances of many subclasses, or a singleton method of a
     /// base class called on many subclasses. Instead of a class guard, check at run time that the
@@ -6720,6 +6766,16 @@ impl Function {
                                             recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
                                         }
                                         fun.guard_protected_send(block, protected_class, state);
+
+                                        // Array.new(size) { |index| ... } on Array itself
+                                        if let Some(blockiseq) = blockiseq
+                                            && forwarded_block_arg.is_none()
+                                            && recv_class == unsafe { rb_cArray }.class_of()
+                                            && let Some(result) = fun.try_array_new_with_block(block, recv, cd, cme, &args, blockiseq, state)
+                                        {
+                                            fun.make_equal_to(send_insn_id, result);
+                                            return Ok(block);
+                                        }
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
                                         if no_block {

@@ -7211,6 +7211,40 @@ ary_sized_alloc(rb_execution_context_t *ec, VALUE self)
     return rb_ary_new2(RARRAY_LEN(self));
 }
 
+// Allocate the Array that Array.new(size) { |index| ... } fills, like rb_ary_initialize() does.
+// `size` is a Fixnum.
+static VALUE
+ary_alloc_for_block(rb_execution_context_t *ec, VALUE self, VALUE size)
+{
+    rb_len_t len = FIX2LONG(size);
+    if (len < 0) {
+        rb_raise(rb_eArgError, "negative array size");
+    }
+    if (len > ARY_MAX_SIZE) {
+        rb_raise(rb_eArgError, "array size too big");
+    }
+    return rb_ary_new_capa(len);
+}
+
+#if USE_ZJIT
+// Whether `cme` is Array.new and Array#initialize is not redefined, so that ZJIT can call
+// Array.__new_with_block for Array.new(size) { |index| ... }. Returns Array#initialize's
+// method entry in `init_cme` for the JIT code to be invalidated when it is redefined.
+bool
+rb_zjit_ary_s_new_with_block_p(const rb_callable_method_entry_t *cme, const rb_callable_method_entry_t **init_cme)
+{
+    if (cme->def->type != VM_METHOD_TYPE_CFUNC || cme->def->body.cfunc.func != (rb_cfunc_t)rb_ary_s_new) {
+        return false;
+    }
+    const rb_callable_method_entry_t *init = rb_callable_method_entry(rb_cArray, idInitialize);
+    if (!init || init->def->type != VM_METHOD_TYPE_CFUNC || init->def->body.cfunc.func != (rb_cfunc_t)rb_ary_initialize) {
+        return false;
+    }
+    *init_cme = init;
+    return true;
+}
+#endif
+
 static VALUE
 rb_ary_cycle_size(VALUE self, VALUE args, VALUE eobj)
 {

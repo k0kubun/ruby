@@ -1784,6 +1784,7 @@ pub(crate) mod ids {
         name: induce_breakpoint_bang      content: b"induce_breakpoint!"
         name: send
         name: __send__
+        name: initialize
     }
 
     /// Get an CRuby `ID` to an interned string, e.g. a particular method name.

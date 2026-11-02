@@ -212,6 +212,24 @@ class Array
     indexes
   end
 
+  with_zjit do
+    # ZJIT calls this for Array.new(size) { |index| ... } with a Fixnum +size+ so that it can
+    # inline the block, which Array#initialize would yield to from C.
+    def self.__new_with_block(size) # :nodoc:
+      Primitive.attr! :inline_block, :c_trace, :without_interrupts
+
+      result = Primitive.ary_alloc_for_block(size)
+      i = 0
+      while i < size
+        value = yield(i)
+        Primitive.rb_jit_ary_push(result, value)
+        i = Primitive.rb_builtin_fixnum_inc(i)
+      end
+      result
+    end
+    private_class_method :__new_with_block
+  end
+
   with_jit do
     if Primitive.rb_builtin_basic_definition_p(:each)
       undef :each

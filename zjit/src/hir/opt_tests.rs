@@ -25691,6 +25691,22 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_array_new_with_block() {
+        eval("
+        def test(n) = Array.new(n) { |i| i * 2 }
+        test(2); test(3)
+        ");
+        let hir = hir_string("test");
+        // Array.__new_with_block and the block are inlined instead of calling Array.new.
+        assert!(hir.contains("PushInlineFrame :__new_with_block"), "{hir}");
+        // A negative or too big size side-exits to raise from Array.new.
+        assert!(hir.contains("GuardGreaterEq"), "{hir}");
+        assert!(hir.contains("GuardLess"), "{hir}");
+        assert!(!hir.contains("Array.new"), "{hir}");
+        assert!(!hir.contains("InvokeBlock"), "{hir}");
+    }
+
+    #[test]
     fn test_no_send_on_method_entry_for_different_methods() {
         set_call_threshold(4);
         eval("

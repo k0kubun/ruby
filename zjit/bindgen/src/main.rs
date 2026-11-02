@@ -123,6 +123,7 @@ fn main() {
         .allowlist_function("rb_zjit_str_resurrect_fastpath")
         .allowlist_function("rb_zjit_array_dup_can_fastpath")
         .allowlist_function("rb_zjit_array_new_can_fastpath")
+        .allowlist_function("rb_zjit_ary_s_new_with_block_p")
         .allowlist_function("rb_zjit_hash_dup_can_fastpath")
         .allowlist_function("rb_zjit_range_new_fastpath")
         .allowlist_function("rb_zjit_array_aref_with_adjusted_index")

@@ -8639,6 +8639,38 @@ fn test_send_on_method_entry_cached_class() {
 }
 
 #[test]
+fn test_array_new_with_block() {
+    assert_snapshot!(inspect("
+        class SubArray < Array; end
+        def test(n) = Array.new(n) { |i| i * 2 }
+        def test_break(n) = Array.new(n) { |i| break :broken if i == 1; i }
+        def test_class(klass, n) = klass.new(n) { |i| i }
+        test(2); test(3)
+        test_break(1); test_break(1)
+        test_class(Array, 1); test_class(Array, 1)
+        r = [test(0), test(3), test_break(1), test_break(3), (test(-1) rescue $!.message), test([7, 8]), test(2.0)]
+        r << test_class(SubArray, 2).class
+        class Array
+          alias_method :orig_initialize, :initialize
+          def initialize(...) = orig_initialize(...).push(:redefined)
+        end
+        r << test(2)
+    "), @r#"[[], [0, 2, 4], [0], :broken, "negative array size", [7, 8], [0, 2], SubArray, [0, 2, :redefined]]"#);
+}
+
+#[test]
+fn test_array_new_with_block_invalid_size() {
+    // A negative or too big size raises from the C methods as in the interpreter. Array.new
+    // raises for a size too big to allocate before calling Array#initialize.
+    assert_snapshot!(inspect("
+        def test(n) = Array.new(n) { |i| i }
+        test(2); test(3)
+        labels = ->(e) { [e.message, *e.backtrace_locations.first(3).map(&:label)] }
+        [(test(-1) rescue labels.($!)), (test(2**61) rescue labels.($!))]
+    "), @r#"[["negative array size", "Array#initialize", "Array.new", "Object#test"], ["array size too big", "Array.new", "Object#test", "<compiled>"]]"#);
+}
+
+#[test]
 fn test_send_on_method_entry_cfunc() {
     assert_snapshot!(inspect("
         class Base; end

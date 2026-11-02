@@ -2464,6 +2464,10 @@ unsafe extern "C" {
         alloc_size_out: *mut usize,
         flags_out: *mut VALUE,
     );
+    pub fn rb_zjit_ary_s_new_with_block_p(
+        cme: *const rb_callable_method_entry_t,
+        init_cme: *mut *const rb_callable_method_entry_t,
+    ) -> bool;
     pub fn rb_profile_frames(
         start: ::std::os::raw::c_int,
         limit: ::std::os::raw::c_int,
