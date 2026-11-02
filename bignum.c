@@ -5462,6 +5462,14 @@ rb_big2dbl(VALUE x)
     return d;
 }
 
+/* Whether the long n converts to a double exactly. Every integer whose magnitude is at most
+ * 2**DBL_MANT_DIG does. */
+#if SIZEOF_LONG * CHAR_BIT < DBL_MANT_DIG /* assume FLT_RADIX == 2 */
+# define FIXNUM_EXACT_DBL_P(n) ((void)(n), 1)
+#else
+# define FIXNUM_EXACT_DBL_P(n) (-(1L << DBL_MANT_DIG) <= (n) && (n) <= (1L << DBL_MANT_DIG))
+#endif
+
 VALUE
 rb_integer_float_cmp(VALUE x, VALUE y)
 {
@@ -5474,6 +5482,15 @@ rb_integer_float_cmp(VALUE x, VALUE y)
     if (isinf(yd)) {
         if (yd > 0.0) return INT2FIX(-1);
         else return INT2FIX(1);
+    }
+    if (FIXNUM_P(x) && FIXNUM_EXACT_DBL_P(FIX2LONG(x))) {
+        /* (double)x is exact, so comparing the doubles compares the numbers. */
+        double xd = (double)FIX2LONG(x);
+        if (xd < yd)
+            return INT2FIX(-1);
+        if (xd > yd)
+            return INT2FIX(1);
+        return INT2FIX(0);
     }
     yf = modf(yd, &yi);
     if (FIXNUM_P(x)) {
@@ -5529,6 +5546,10 @@ rb_integer_float_eq(VALUE x, VALUE y)
 
     if (!isfinite(yd))
         return Qfalse;
+    if (FIXNUM_P(x) && FIXNUM_EXACT_DBL_P(FIX2LONG(x))) {
+        /* (double)x is exact, so comparing the doubles compares the numbers. */
+        return RBOOL((double)FIX2LONG(x) == yd);
+    }
     yf = modf(yd, &yi);
     if (yf != 0)
         return Qfalse;
