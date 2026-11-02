@@ -761,6 +761,18 @@ pub struct PatchPointData {
     pub version: IseqVersionRef,
 }
 
+/// Kind of an f64 operation for [Insn::FloatOp]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatOpKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    /// Convert a signed 64-bit integer to f64
+    FromInt,
+}
+
 /// ZJIT Low-level IR instruction
 #[derive(Clone)]
 pub enum Insn {
@@ -986,6 +998,12 @@ pub enum Insn {
     // Integer multiplication
     Mul { left: Opnd, right: Opnd, out: Opnd },
 
+    /// IEEE 754 double arithmetic on raw f64 bits held in general-purpose registers.
+    /// The backend moves the operands into scratch FP registers, operates, and moves
+    /// the result back, so no FP register is live across LIR instructions.
+    /// `right` is ignored for unary operations (FloatOpKind::Sqrt and FloatOpKind::FromInt).
+    FloatOp { op: FloatOpKind, left: Opnd, right: Opnd, out: Opnd },
+
     // Bitwise AND test instruction
     Test { left: Opnd, right: Opnd },
 
@@ -1098,6 +1116,7 @@ macro_rules! for_each_operand_impl {
             Insn::Store { dest: opnd0, src: opnd1 } |
             Insn::Sub { left: opnd0, right: opnd1, .. } |
             Insn::Mul { left: opnd0, right: opnd1, .. } |
+            Insn::FloatOp { left: opnd0, right: opnd1, .. } |
             Insn::Test { left: opnd0, right: opnd1 } |
             Insn::URShift { opnd: opnd0, shift: opnd1, .. } |
             Insn::Xor { left: opnd0, right: opnd1, .. } => {
@@ -1257,6 +1276,7 @@ impl Insn {
             Insn::Store { .. } => "Store",
             Insn::Sub { .. } => "Sub",
             Insn::Mul { .. } => "Mul",
+            Insn::FloatOp { .. } => "FloatOp",
             Insn::Test { .. } => "Test",
             Insn::URShift { .. } => "URShift",
             Insn::Xor { .. } => "Xor"
@@ -1289,6 +1309,7 @@ impl Insn {
             Insn::RShift { out, .. } |
             Insn::Sub { out, .. } |
             Insn::Mul { out, .. } |
+            Insn::FloatOp { out, .. } |
             Insn::URShift { out, .. } |
             Insn::Xor { out, .. } => Some(out),
             Insn::CCall { data, .. } => Some(&data.out),
@@ -1322,6 +1343,7 @@ impl Insn {
             Insn::RShift { out, .. } |
             Insn::Sub { out, .. } |
             Insn::Mul { out, .. } |
+            Insn::FloatOp { out, .. } |
             Insn::URShift { out, .. } |
             Insn::Xor { out, .. } => Some(out),
             Insn::CCall { data, .. } => Some(&mut data.out),
@@ -4332,6 +4354,14 @@ impl Assembler {
     pub fn mul(&mut self, left: Opnd, right: Opnd) -> Opnd {
         let out = self.new_vreg(Opnd::match_num_bits(&[left, right]));
         self.push_insn(Insn::Mul { left, right, out });
+        out
+    }
+
+    /// Apply an f64 operation to raw f64 bits in general-purpose operands. Returns raw f64 bits.
+    #[must_use]
+    pub fn float_op(&mut self, op: FloatOpKind, left: Opnd, right: Opnd) -> Opnd {
+        let out = self.new_vreg(64);
+        self.push_insn(Insn::FloatOp { op, left, right, out });
         out
     }
 
