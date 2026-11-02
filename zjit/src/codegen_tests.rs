@@ -13062,6 +13062,32 @@ fn test_integer_and_float_op_with_fixnum_or_flonum() {
 }
 
 #[test]
+fn test_flonum_arithmetic_inline() {
+    eval("
+        def add(a, b) = a + b
+        def sub(a, b) = a - b
+        def mul(a, b) = a * b
+        def div(a, b) = a / b
+        def muli(a, b) = a * b
+        def divc(a) = a / 255
+        def chain(a, b) = (a * a + b * b) / (a - b)
+        add(1.5, 2.5); sub(1.5, 2.5); mul(1.5, 2.5); div(1.5, 2.5); muli(1.5, 2); divc(1.5); chain(1.5, 2.5) # profile
+    ");
+    assert_snapshot!(assert_compiles("[add(1.5, 2.25), sub(1.5, 2.25), mul(1.5, -2.25), div(1.0, 3.0), chain(3.0, 1.0)]"), @"[3.75, -0.75, -3.375, 0.3333333333333333, 5.0]");
+    // Fixnum operands convert to doubles inline
+    assert_snapshot!(assert_compiles("[muli(1.5, 3), muli(1.5, -4611686018427387904), muli(0.5, 0), divc(510.0), divc(-1.0)]"), @"[4.5, -6.917529027641082e+18, 0.0, 2.0, -0.00392156862745098]");
+    // Results outside the Flonum range (0.0, -0.0, tiny, huge, Infinity, NaN) are boxed in C
+    assert_snapshot!(assert_compiles("[sub(1.5, 1.5), mul(1.0e-40, 1.0e-40), mul(-1.0e-40, 1.0e-40), mul(1.0e50, 1.0e50), div(1.0, 0.0), mul(-1.0, 0.0), mul(1.0e-50, 1.0e-30), mul(1.0e70, 1.0e10)]"), @"[0.0, 9.999999999999998e-81, -9.999999999999998e-81, 1.0000000000000002e+100, Infinity, -0.0, 1.0000000000000001e-80, 1.0000000000000001e+80]");
+    // Results at the edges of the Flonum range
+    assert_snapshot!(assert_compiles("[div(0.0, 0.0).nan?, muli(0.5, 0).equal?(0.0), div(1.7272337110188893e-76, 10.0), div(1.7272337110188896e-76, 10.0), mul(2.0e38, 1.0e39), mul(1.0e38, 2.3158417847463237e+38)]"), @"[true, true, 1.7272337110188893e-77, 1.7272337110188897e-77, 1.9999999999999997e+77, 2.3158417847463237e+76]");
+    // NaN results have the same bits as the interpreter's 0.0 / 0.0, i.e. the sign bit is clear
+    assert_snapshot!(assert_compiles("[div(0.0, 0.0)].pack('G').unpack1('H*')"), @r#""7ff8000000000000""#);
+    assert_snapshot!(assert_compiles("div(0.0, 0.0).hash == Float::NAN.hash"), @"true");
+    // Heap Float and other operand types side-exit and still work
+    assert_snapshot!(inspect("[add(-0.0, 1.0e-300), mul(1.0e-300, 2.0), sub(1.5, 1r), (div(1.5, nil) rescue $!.class)]"), @"[1.0e-300, 2.0e-300, 0.5, TypeError]");
+}
+
+#[test]
 fn test_float_pow() {
     eval("
         def test(a, b) = a ** b

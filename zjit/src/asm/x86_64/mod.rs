@@ -29,7 +29,7 @@ pub struct X86UImm
 pub enum RegType
 {
     GP,
-    //FP,
+    FP,
     //XMM,
     IP,
 }
@@ -198,6 +198,11 @@ pub const R12_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no
 pub const R13_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no: R13_REG_NO };
 pub const R14_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no: 14 };
 pub const R15_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no: 15 };
+
+pub const XMM0_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::FP, reg_no: 0 };
+pub const XMM1_REG: X86Reg = X86Reg { num_bits: 64, reg_type: RegType::FP, reg_no: 1 };
+pub const XMM0: X86Opnd = X86Opnd::Reg(XMM0_REG);
+pub const XMM1: X86Opnd = X86Opnd::Reg(XMM1_REG);
 
 pub const RAX: X86Opnd  = X86Opnd::Reg(RAX_REG);
 pub const RCX: X86Opnd  = X86Opnd::Reg(RCX_REG);
@@ -742,6 +747,60 @@ pub fn cmovpe(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_cmov(cb, 0
 pub fn cmovpo(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_cmov(cb, 0x4b, dst, src); }
 pub fn cmovs(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_cmov(cb, 0x48, dst, src); }
 pub fn cmovz(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_cmov(cb, 0x44, dst, src); }
+
+fn assert_xmm_reg(opnd: X86Opnd) {
+    assert!(matches!(opnd, X86Opnd::Reg(X86Reg { reg_type: RegType::FP, num_bits: 64, .. })), "expected an XMM register, got {opnd:?}");
+}
+
+fn assert_gp_rm64(opnd: X86Opnd) {
+    assert!(
+        matches!(opnd, X86Opnd::Reg(X86Reg { reg_type: RegType::GP, num_bits: 64, .. }) | X86Opnd::Mem(X86Mem { num_bits: 64, .. })),
+        "expected a 64-bit GP register or m64, got {opnd:?}"
+    );
+}
+
+/// Scalar double SSE2 instruction: F2 0F opcode /r with an XMM destination and XMM source
+fn write_sse_f2_xmm(cb: &mut CodeBlock, opcode: u8, dst: X86Opnd, src: X86Opnd) {
+    assert_xmm_reg(dst);
+    assert_xmm_reg(src);
+    cb.write_byte(0xf2);
+    write_rm(cb, false, false, dst, src, None, &[0x0f, opcode]);
+}
+
+/// movq xmm, r/m64
+pub fn movq_to_xmm(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
+    assert_xmm_reg(dst);
+    assert_gp_rm64(src);
+    write_rm(cb, true, true, dst, src, None, &[0x0f, 0x6e]);
+}
+
+/// movq r/m64, xmm
+pub fn movq_from_xmm(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
+    assert_gp_rm64(dst);
+    assert_xmm_reg(src);
+    write_rm(cb, true, true, src, dst, None, &[0x0f, 0x7e]);
+}
+
+pub fn addsd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_sse_f2_xmm(cb, 0x58, dst, src); }
+pub fn subsd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_sse_f2_xmm(cb, 0x5c, dst, src); }
+pub fn mulsd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_sse_f2_xmm(cb, 0x59, dst, src); }
+pub fn divsd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_sse_f2_xmm(cb, 0x5e, dst, src); }
+pub fn sqrtsd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) { write_sse_f2_xmm(cb, 0x51, dst, src); }
+
+/// xorps xmm, xmm
+pub fn xorps(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
+    assert_xmm_reg(dst);
+    assert_xmm_reg(src);
+    write_rm(cb, false, false, dst, src, None, &[0x0f, 0x57]);
+}
+
+/// cvtsi2sd xmm, r/m64
+pub fn cvtsi2sd(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
+    assert_xmm_reg(dst);
+    assert_gp_rm64(src);
+    cb.write_byte(0xf2);
+    write_rm(cb, false, true, dst, src, None, &[0x0f, 0x2a]);
+}
 
 /// cmp - Compare and set flags
 pub fn cmp(cb: &mut CodeBlock, opnd0: X86Opnd, opnd1: X86Opnd) {

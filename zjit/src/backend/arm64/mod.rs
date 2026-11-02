@@ -127,6 +127,20 @@ fn emit_jmp_ptr(cb: &mut CodeBlock, dst_ptr: CodePtr) {
 /// Emit the required instructions to load the given value into the
 /// given register. Our goal here is to use as few instructions as
 /// possible to get this value into the register.
+/// fmov dN, xN
+fn emit_fmov_f64_from_gp(cb: &mut CodeBlock, dst_f64_reg_no: u8, src_gp: A64Opnd) {
+    let A64Opnd::Reg(src_gp) = src_gp else { unreachable!("fmov dN, xN expects a GP register source") };
+    assert_eq!(src_gp.num_bits, 64, "fmov dN, xN expects a 64-bit GP source");
+    cb.write_bytes(&(0x9e67_0000u32 | ((src_gp.reg_no as u32) << 5) | dst_f64_reg_no as u32).to_le_bytes());
+}
+
+/// fmov xN, dN
+fn emit_fmov_gp_from_f64(cb: &mut CodeBlock, dst_gp: A64Opnd, src_f64_reg_no: u8) {
+    let A64Opnd::Reg(dst_gp) = dst_gp else { unreachable!("fmov xN, dN expects a GP register destination") };
+    assert_eq!(dst_gp.num_bits, 64, "fmov xN, dN expects a 64-bit GP destination");
+    cb.write_bytes(&(0x9e66_0000u32 | ((src_f64_reg_no as u32) << 5) | dst_gp.reg_no as u32).to_le_bytes());
+}
+
 fn emit_load_value(cb: &mut CodeBlock, rd: A64Opnd, value: u64) -> usize {
     let mut current = value;
 
@@ -629,7 +643,8 @@ impl Assembler {
                     }
                     asm.push_insn(insn);
                 },
-                Insn::Mul { left, right, .. } => {
+                Insn::Mul { left, right, .. } |
+                Insn::FloatOp { left, right, .. } => {
                     *left = split_load_operand(asm, *left);
                     *right = split_load_operand(asm, *right);
                     asm.push_insn(insn);
@@ -772,6 +787,18 @@ impl Assembler {
                 Insn::CSelLE { truthy: left, falsy: right, out } |
                 Insn::CSelG  { truthy: left, falsy: right, out } |
                 Insn::CSelGE { truthy: left, falsy: right, out } => {
+                    *left = split_memory_read(asm, *left, SCRATCH0_OPND);
+                    *right = split_memory_read(asm, *right, SCRATCH1_OPND);
+                    let mem_out = split_memory_write(out, SCRATCH0_OPND);
+
+                    asm.push_insn(insn);
+
+                    if let Some(mem_out) = mem_out {
+                        let mem_out = split_stack_membase(asm, mem_out, SCRATCH1_OPND);
+                        asm.store(mem_out, SCRATCH0_OPND);
+                    }
+                }
+                Insn::FloatOp { left, right, out, .. } => {
                     *left = split_memory_read(asm, *left, SCRATCH0_OPND);
                     *right = split_memory_read(asm, *right, SCRATCH1_OPND);
                     let mem_out = split_memory_write(out, SCRATCH0_OPND);
@@ -1278,6 +1305,35 @@ impl Assembler {
                 },
                 Insn::Xor { left, right, out } => {
                     eor(cb, out.into(), left.into(), right.into());
+                },
+                Insn::FloatOp { op, left, right, out } => {
+                    // Operands are raw f64 bits in GP registers. Use D0/D1 as scratch;
+                    // they are caller-saved and never live across LIR instructions.
+                    let insn = match op {
+                        FloatOpKind::FromInt => {
+                            // scvtf d0, xN
+                            let A64Opnd::Reg(src) = left.into() else { unreachable!("scvtf expects a GP register") };
+                            0x9e62_0000 | ((src.reg_no as u32) << 5)
+                        }
+                        FloatOpKind::Sqrt => {
+                            emit_fmov_f64_from_gp(cb, 0, left.into());
+                            0x1e61_c000 // fsqrt d0, d0
+                        }
+                        _ => {
+                            emit_fmov_f64_from_gp(cb, 0, left.into());
+                            emit_fmov_f64_from_gp(cb, 1, right.into());
+                            let base = match op {
+                                FloatOpKind::Mul => 0x1e60_0800,
+                                FloatOpKind::Div => 0x1e60_1800,
+                                FloatOpKind::Add => 0x1e60_2800,
+                                FloatOpKind::Sub => 0x1e60_3800,
+                                FloatOpKind::Sqrt | FloatOpKind::FromInt => unreachable!(),
+                            };
+                            base | (1 << 16) // fop d0, d0, d1
+                        }
+                    };
+                    cb.write_bytes(&(insn as u32).to_le_bytes());
+                    emit_fmov_gp_from_f64(cb, out.into(), 0);
                 },
                 Insn::Not { opnd, out } => {
                     mvn(cb, out.into(), opnd.into());

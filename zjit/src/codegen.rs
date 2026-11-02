@@ -23,7 +23,7 @@ use crate::state::{rb_zjit_compiling_p, ZJITState};
 use crate::stats::{CompileError, exit_counter_for_compile_error, exit_counter_for_unhandled_hir_insn, incr_counter, incr_counter_by, send_fallback_counter, send_fallback_counter_for_method_type, send_fallback_counter_for_super_method_type, send_fallback_counter_ptr_for_opcode, send_fallback_counter_for_optimized_method_type};
 use crate::stats::{counter_ptr, with_compile_time_stat, trace_compile_phase, Counter, Counter::{compile_time_ns, exit_compile_error}};
 use crate::{asm::CodeBlock, cruby::*, options::debug, virtualmem::CodePtr};
-use crate::backend::lir::{self, Assembler, CArgLocation, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
+use crate::backend::lir::{self, Assembler, CArgLocation, FloatOpKind, C_ARG_OPNDS, C_RET_OPND, CFP, EC, NATIVE_BASE_PTR, NATIVE_STACK_PTR, Opnd, SP, SideExit, SideExitRecompile, SideExitTarget, StackMap, StackMapEntry, Target, asm_ccall, asm_comment};
 use crate::hir::{self, iseq_to_hir, iseq_to_hir_resume, BlockId, Invariant, RangeType, SideExitReason::{self, *}, SpecialBackrefSymbol, SpecialObjectType};
 use crate::hir::{BlockHandler, CCallVariadicData, CCallWithFrameData, CCallWithGCData, CondBranchFixnumCmpData, CondBranchHasTypeData, Const, FieldName, FixnumCmpOp, FrameState, Function, Insn, InsnId, Recompile, SendDirectData, SendFallbackReason, qualified_method_name};
 use crate::hir_type::{types, Type};
@@ -940,6 +940,10 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FixnumSub { left, right, state } => gen_fixnum_sub(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumMult { left, right, state } => gen_fixnum_mult(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
         Insn::FixnumDiv { left, right, state } => gen_fixnum_div(jit, asm, function, opnd!(left), opnd!(right), &function.frame_state(*state)),
+        &Insn::FloatAdd { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Add, recv, other, &function.frame_state(state)),
+        &Insn::FloatSub { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Sub, recv, other, &function.frame_state(state)),
+        &Insn::FloatMul { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Mul, recv, other, &function.frame_state(state)),
+        &Insn::FloatDiv { recv, other, state } if is_flonum_pair(function, recv, other) => gen_flonum_op(jit, asm, function, FloatOpKind::Div, recv, other, &function.frame_state(state)),
         Insn::FloatAdd { recv, other, state } => gen_float_add(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatSub { recv, other, state } => gen_float_sub(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::FloatMul { recv, other, state } => gen_float_mul(asm, opnd!(recv), opnd!(other), &function.frame_state(*state)),
@@ -3526,6 +3530,92 @@ fn gen_fixnum_div(jit: &mut JITState, asm: &mut Assembler, function: &Function, 
     asm.cmp(right, Opnd::from(VALUE::fixnum_from_usize(0)));
     asm.je(jit, side_exit(jit, function, state, FixnumDivByZero));
     asm_ccall!(asm, rb_jit_fix_div_fix, left, right)
+}
+
+/// Whether both operands of a Float binary operation are Flonums, so it can be done inline
+fn is_flonum_pair(function: &Function, recv: InsnId, other: InsnId) -> bool {
+    function.type_of(recv).is_subtype(types::Flonum)
+        && (function.type_of(other).is_subtype(types::Flonum) || function.type_of(other).is_subtype(types::Fixnum))
+}
+
+/// Convert a Fixnum into raw f64 bits
+fn gen_fixnum_to_double(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
+    if let Opnd::Value(value) = val && value.fixnum_p() {
+        return Opnd::UImm((value.as_fixnum() as f64).to_bits());
+    }
+    let int = asm.rshift(val, Opnd::UImm(1));
+    asm.float_op(FloatOpKind::FromInt, int, int)
+}
+
+/// Decode a Flonum into raw f64 bits (rb_float_flonum_value()). The Flonum tag bits are
+/// 0b10, so `(2 - b63) | (v & ~3)` in the C version is `v - b63`, which is then rotated right
+/// by 3. The only Flonum outside that encoding is 0.0.
+fn gen_unbox_flonum(asm: &mut Assembler, val: lir::Opnd) -> lir::Opnd {
+    if let Opnd::Value(value) = val && value.flonum_p() {
+        let v = value.as_u64();
+        return Opnd::UImm(if v == 0x8000_0000_0000_0002 { 0 } else { (v - (v >> 63)).rotate_right(3) });
+    }
+    let b63 = asm.urshift(val, Opnd::UImm(63));
+    let bits = asm.sub(val, b63);
+    let hi = asm.urshift(bits, Opnd::UImm(3));
+    let lo = asm.lshift(bits, Opnd::UImm(61));
+    let bits = asm.or(hi, lo);
+    asm.cmp(val, Opnd::UImm(0x8000_0000_0000_0002));
+    asm.csel_e(Opnd::UImm(0), bits)
+}
+
+/// Encode raw f64 bits as a Float (rb_float_new_inline()). Doubles whose exponent fits
+/// the Flonum range are encoded inline, and the rest (including 0.0) are boxed in C.
+fn gen_box_float(jit: &mut JITState, asm: &mut Assembler, bits: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let slow_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let slow_edge = || Target::Block(Box::new(lir::BranchEdge { target: slow_block, args: vec![] }));
+    let result_edge = |v: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![v] }));
+
+    // Flonum iff bits 62..60 are 0b011 or 0b100, except 0x3000000000000000.
+    let exp = asm.urshift(bits, Opnd::UImm(60));
+    let exp = asm.and(exp, Opnd::UImm(0x7));
+    let exp = asm.sub(exp, Opnd::UImm(3));
+    asm.test(exp, Opnd::Imm(!1));
+    asm.jnz(jit, slow_edge());
+    asm.cmp(bits, Opnd::UImm(0x3000_0000_0000_0000));
+    asm.je(jit, slow_edge());
+    // (RUBY_BIT_ROTL(bits, 3) & ~1) | 2
+    let hi = asm.lshift(bits, Opnd::UImm(3));
+    let lo = asm.urshift(bits, Opnd::UImm(61));
+    let rotated = asm.or(hi, lo);
+    let flonum = asm.and(rotated, Opnd::Imm(!1));
+    let flonum = asm.or(flonum, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
+    asm.jmp(result_edge(flonum));
+
+    asm.set_current_block(slow_block);
+    let label = jit.get_label(asm, slow_block, hir_block_id);
+    asm.write_label(label);
+    gen_prepare_leaf_call_with_gc(asm, state);
+    let boxed = asm_ccall!(asm, rb_zjit_float_new_bits, bits);
+    asm.jmp(result_edge(boxed));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
+}
+
+/// Compile Flonum op Flonum with SSE2/FP instructions instead of calling rb_float_plus() etc.
+fn gen_flonum_op(jit: &mut JITState, asm: &mut Assembler, function: &Function, op: FloatOpKind, recv: InsnId, other: InsnId, state: &FrameState) -> lir::Opnd {
+    asm_comment!(asm, "Flonum {op:?}");
+    let left = gen_unbox_flonum(asm, jit.get_opnd(recv));
+    let right = if function.type_of(other).is_subtype(types::Fixnum) {
+        gen_fixnum_to_double(asm, jit.get_opnd(other))
+    } else {
+        gen_unbox_flonum(asm, jit.get_opnd(other))
+    };
+    let result = asm.float_op(op, left, right);
+    gen_box_float(jit, asm, result, state)
 }
 
 /// Compile Float + Float

@@ -964,3 +964,20 @@ fn basic_capstone_usage() -> std::result::Result<(), capstone::Error> {
         )),
     }
 }
+
+#[test]
+fn test_sse2_double() {
+    check_bytes("66480f6ec7", |cb| movq_to_xmm(cb, XMM0, RDI));
+    check_bytes("66490f6ecc", |cb| movq_to_xmm(cb, XMM1, R12));
+    check_bytes("66480f6e4308", |cb| movq_to_xmm(cb, XMM0, mem_opnd(64, RBX, 8)));
+    check_bytes("66480f7ec0", |cb| movq_from_xmm(cb, RAX, XMM0));
+    check_bytes("66490f7ec1", |cb| movq_from_xmm(cb, R9, XMM0));
+    check_bytes("f20f58c1", |cb| addsd(cb, XMM0, XMM1));
+    check_bytes("f20f5cc1", |cb| subsd(cb, XMM0, XMM1));
+    check_bytes("f20f59c1", |cb| mulsd(cb, XMM0, XMM1));
+    check_bytes("f20f5ec1", |cb| divsd(cb, XMM0, XMM1));
+    check_bytes("f20f51c0", |cb| sqrtsd(cb, XMM0, XMM0));
+    check_bytes("0f57c0", |cb| xorps(cb, XMM0, XMM0));
+    check_bytes("f2480f2ac7", |cb| cvtsi2sd(cb, XMM0, RDI));
+    check_bytes("f2490f2ac2", |cb| cvtsi2sd(cb, XMM0, R10));
+}

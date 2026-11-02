@@ -315,6 +315,16 @@ impl Assembler {
                 Insn::Lea { .. } => {
                     asm.push_insn(insn);
                 },
+                Insn::FloatOp { left, right, .. } => {
+                    // movq xmm, r/m64 can't take an immediate
+                    if !matches!(left, Opnd::VReg { .. } | Opnd::Mem(_)) {
+                        *left = asm.load(*left);
+                    }
+                    if !matches!(right, Opnd::VReg { .. } | Opnd::Mem(_)) {
+                        *right = asm.load(*right);
+                    }
+                    asm.push_insn(insn);
+                },
                 _ => {
                     asm.push_insn(insn);
                 }
@@ -525,6 +535,13 @@ impl Assembler {
                     *right = split_64bit_immediate(asm, *right, SCRATCH1_OPND);
 
                     // Phase 7: Emit the instruction.
+                    asm.push_insn(insn);
+                }
+                Insn::FloatOp { left, right, out, .. } => {
+                    assert_out_is_phys_reg_or_stack_mem(*out);
+                    *left = split_stack_membase(asm, *left, SCRATCH0_OPND);
+                    *right = split_stack_membase(asm, *right, SCRATCH1_OPND);
+                    *out = lower_stack_membase(asm, *out);
                     asm.push_insn(insn);
                 }
                 Insn::Mul { left, right, out } => {
@@ -888,6 +905,34 @@ impl Assembler {
 
                 Insn::Mul { left, right, .. } => {
                     imul(cb, left.into(), right.into());
+                },
+
+                Insn::FloatOp { op, left, right, out } => {
+                    // Operands are raw f64 bits in GP registers or memory. Use XMM0/XMM1
+                    // as scratch; they are caller-saved and never live across LIR insns.
+                    match op {
+                        FloatOpKind::FromInt => {
+                            // Break the dependency on the previous XMM0 value
+                            xorps(cb, XMM0, XMM0);
+                            cvtsi2sd(cb, XMM0, left.into());
+                        }
+                        _ => movq_to_xmm(cb, XMM0, left.into()),
+                    }
+                    match op {
+                        FloatOpKind::FromInt => {},
+                        FloatOpKind::Sqrt => sqrtsd(cb, XMM0, XMM0),
+                        _ => {
+                            movq_to_xmm(cb, XMM1, right.into());
+                            match op {
+                                FloatOpKind::Add => addsd(cb, XMM0, XMM1),
+                                FloatOpKind::Sub => subsd(cb, XMM0, XMM1),
+                                FloatOpKind::Mul => mulsd(cb, XMM0, XMM1),
+                                FloatOpKind::Div => divsd(cb, XMM0, XMM1),
+                                FloatOpKind::Sqrt | FloatOpKind::FromInt => unreachable!(),
+                            }
+                        }
+                    }
+                    movq_from_xmm(cb, out.into(), XMM0);
                 },
 
                 Insn::And { left, right, .. } => {
