@@ -234,6 +234,8 @@ pub fn init() -> Annotations {
     annotate!(rb_cString, "length", types::Fixnum, no_gc, leaf, elidable);
     annotate!(rb_cString, "getbyte", inline_string_getbyte);
     annotate!(rb_cString, "byteslice", inline_string_byteslice);
+    annotate!(rb_cString, "[]", inline_string_aref);
+    annotate!(rb_cString, "slice", inline_string_aref);
     annotate!(rb_cString, "setbyte", inline_string_setbyte);
     annotate!(rb_cString, "empty?", inline_string_empty_p, types::BoolExact, no_gc, leaf, elidable);
     annotate!(rb_cString, "<<", inline_string_append);
@@ -662,6 +664,16 @@ fn inline_io_buffer_get_value(fun: &mut hir::Function, block: hir::BlockId, recv
     });
     let ptr = fun.push_insn(block, hir::Insn::GuardNotNull { val: ptr, reason: Box::new(SideExitReason::GuardIOBufferReadable), state });
     Some(fun.push_insn(block, hir::Insn::LoadFixnum { ptr, num_bytes, byteswap: value_type.byteswap() }))
+}
+
+fn inline_string_aref(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[index] = args else { return None; };
+    // String#[] with a Fixnum index doesn't call any Ruby method; it allocates the substring.
+    if fun.likely_a(index, types::Fixnum, state) {
+        let index = fun.coerce_to(block, index, types::Fixnum, state);
+        return Some(fun.push_insn(block, hir::Insn::StringArefFixnum { string: recv, index, state }));
+    }
+    None
 }
 
 fn inline_string_byteslice(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
