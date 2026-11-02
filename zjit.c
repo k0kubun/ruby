@@ -250,6 +250,20 @@ VALUE rb_vm_exec_interpreter(rb_execution_context_t *ec);
 
 // Run the frame of a callee that JIT code pushed for a JIT-to-JIT call in the interpreter, and
 // return the callee's result to the JIT code, which continues running the caller.
+// Box raw IEEE 754 double bits as a Float. JIT code passes the bits in a general-purpose
+// register, so it can call this without moving the double to a floating-point register.
+VALUE
+rb_zjit_float_new_bits(uint64_t bits)
+{
+    double d;
+    memcpy(&d, &bits, sizeof(d));
+    // x86-64 SSE2 produces the "default NaN" 0xfff8000000000000 for 0.0 / 0.0, but the
+    // interpreter's double_div_double() returns nan(""), which is positive. Return the same NaN
+    // so that NaN bits (e.g. [nan].pack('G') and Float#hash) don't depend on JIT compilation.
+    if (isnan(d)) d = nan("");
+    return rb_float_new(d);
+}
+
 VALUE
 rb_zjit_exec_callee_frame(rb_execution_context_t *ec)
 {
