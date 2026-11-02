@@ -677,6 +677,7 @@ pub enum SideExitReason {
     StackOverflow,
     FixnumModByZero,
     FixnumDivByZero,
+    FloatSqrtNegative,
     BoxFixnumOverflow,
     CallerSplatLengthMismatch,
     CallerSplatRuby2Keywords,
@@ -1486,6 +1487,8 @@ pub enum Insn {
     FloatDiv  { recv: InsnId, other: InsnId, state: InsnId },
     /// Float#to_i: truncate float to integer via rb_jit_flo_to_i
     FloatToInt { recv: InsnId, state: InsnId },
+    /// Math.sqrt of a Flonum, side-exiting for a negative operand (Math::DomainError)
+    FloatSqrt { val: InsnId, state: InsnId },
 
     AnyToString { val: InsnId, state: InsnId },
     /// Convert a Fixnum to a String with rb_fix_to_s(), which shares frozen strings for 0..9
@@ -1722,6 +1725,10 @@ macro_rules! for_each_operand_impl {
             }
             Insn::FloatToInt { recv, state } => {
                 $visit_one!(*recv);
+                $visit_one!(*state);
+            }
+            Insn::FloatSqrt { val, state } => {
+                $visit_one!(*val);
                 $visit_one!(*state);
             }
             Insn::FixnumLt { left, right }
@@ -2195,6 +2202,7 @@ impl Insn {
             Insn::FloatMul { .. } => effects::Any,
             Insn::FloatDiv { .. } => effects::Any,
             Insn::FloatToInt { .. } => effects::Any,
+            Insn::FloatSqrt { .. } => effects::Any,
             Insn::FixnumEq { .. } => effects::Empty,
             Insn::FixnumLt { .. } => effects::Empty,
             Insn::FixnumLe { .. } => effects::Empty,
@@ -2641,6 +2649,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FloatMul   { recv, other, .. } => { write!(f, "FloatMul {recv}, {other}") },
             Insn::FloatDiv   { recv, other, .. } => { write!(f, "FloatDiv {recv}, {other}") },
             Insn::FloatToInt { recv, .. } => { write!(f, "FloatToInt {recv}") },
+            Insn::FloatSqrt { val, .. } => { write!(f, "FloatSqrt {val}") },
             Insn::FixnumEq   { left, right, .. } => { write!(f, "FixnumEq {left}, {right}") },
             Insn::FixnumLt   { left, right, .. } => { write!(f, "FixnumLt {left}, {right}") },
             Insn::FixnumLe   { left, right, .. } => { write!(f, "FixnumLe {left}, {right}") },
@@ -4475,6 +4484,7 @@ impl Function {
             Insn::FloatMul   { .. } => types::Float,
             Insn::FloatDiv   { .. } => types::Float,
             Insn::FloatToInt { .. } => types::Integer,
+            Insn::FloatSqrt  { .. } => types::Float,
             Insn::FixnumEq   { .. } => types::BoolExact,
             Insn::FixnumLt   { .. } => types::BoolExact,
             Insn::FixnumLe   { .. } => types::BoolExact,
@@ -11016,6 +11026,9 @@ impl Function {
             }
             Insn::FloatToInt { recv, .. } => {
                 self.assert_subtype(insn_id, recv, types::Flonum)
+            }
+            Insn::FloatSqrt { val, .. } => {
+                self.assert_subtype(insn_id, val, types::Flonum)
             }
             Insn::FixnumLShift { left, right, .. }
             | Insn::FixnumRShift { left, right, .. } => {
