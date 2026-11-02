@@ -2973,6 +2973,131 @@ fn test_ccall_catching_return_with_trace_point() {
     "), @"[2, [[:c_return, :+], [:b_return, :call!], [:c_return, :catch], [:return, :call!], [:return, :run], [:b_return, nil]]]");
 }
 
+/// Run `program` after `warmup`, asserting that the warmup turned a non-local `return` into a jump.
+fn assert_return_jumps(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let inline_throw_count_before = counters.inline_throw_count;
+    let result = assert_no_resumes(warmup, program);
+    assert!(counters.inline_throw_count > inline_throw_count_before, "expected a non-local return to become a jump");
+    result
+}
+
+#[test]
+fn test_inlined_block_return_runs_ensure_clause() {
+    // The `return` jumps to the inline copy of the ensure clause, which then returns.
+    set_call_threshold(2);
+    let warmup = "
+        def find(env, pairs)
+          path = env[:path]
+          pairs.each do |key, value|
+            next unless key == env[:key]
+            env[:path] = value
+            return [key, env[:path]]
+          end
+          [:none, path]
+        ensure
+          env[:path] = path
+          env[:log] << :ensure
+        end
+        def test(key)
+          env = {path: :root, key:, log: []}
+          [find(env, [[:a, 1], [:b, 2]]), env]
+        end
+        def run = [test(:b), test(:c)]
+        30.times { run } # enough to compile resume entries if it threw
+    ";
+    assert_snapshot!(assert_return_jumps(warmup, "run"), @"[[[:b, 2], {path: :root, key: :b, log: [:ensure]}], [[:none, :root], {path: :root, key: :c, log: [:ensure]}]]");
+}
+
+#[test]
+fn test_inlined_block_return_through_ensure_reloads_locals() {
+    // The ensure clause sees the local that the block assigned before returning
+    set_call_threshold(2);
+    let warmup = "
+        def find(xs, log)
+          found = nil
+          xs.each do |x|
+            found = x
+            return x * 2 if x > 1
+          end
+          nil
+        ensure
+          log << found
+        end
+        def run
+          log = []
+          [find([1, 2, 3], log), find([0], log), log]
+        end
+        30.times { run }
+    ";
+    assert_snapshot!(assert_return_jumps(warmup, "run"), @"[4, nil, [2, 0]]");
+}
+
+#[test]
+fn test_inlined_block_return_through_ensure_in_inlined_method() {
+    // The method with the ensure clause is inlined into its caller
+    set_call_threshold(2);
+    let warmup = "
+        class Finder
+          def find(xs, log)
+            xs.each { |x| return x if x > 1 }
+            :none
+          ensure
+            log << :ensure
+          end
+        end
+        F = Finder.new
+        def test(xs, log) = [F.find(xs, log), :after]
+        def run
+          log = []
+          [test([1, 2], log), test([1], log), log]
+        end
+        30.times { run }
+    ";
+    assert_snapshot!(assert_return_jumps(warmup, "run"), @"[[2, :after], [:none, :after], [:ensure, :ensure]]");
+}
+
+#[test]
+fn test_inlined_block_return_through_nested_ensure() {
+    // A `return` through two ensure clauses is left to the VM
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def find(xs, log)
+          begin
+            xs.each { |x| return x if x > 1 }
+            :none
+          ensure
+            log << :inner
+          end
+        ensure
+          log << :outer
+        end
+        def run
+          log = []
+          [find([1, 2], log), find([1], log), log]
+        end
+        30.times { run }
+        run
+    "), @"[2, :none, [:inner, :outer, :inner, :outer]]");
+}
+
+#[test]
+fn test_inlined_block_return_through_ensure_that_raises() {
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def find(xs, raise_in_ensure)
+          xs.each { |x| return x if x > 1 }
+          :none
+        ensure
+          raise 'ensure' if raise_in_ensure
+        end
+        def run = [find([1, 2], false), (find([1, 2], true) rescue $!.message), find([1], false)]
+        30.times { run }
+        run
+    "), @r#"[2, "ensure", :none]"#);
+}
+
 #[test]
 fn test_throw_return_from_proc() {
     set_call_threshold(2);

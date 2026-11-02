@@ -582,6 +582,50 @@ rb_zjit_iseq_ensure_covers_p(const rb_iseq_t *iseq, unsigned int epc)
     return false;
 }
 
+// Return true if `iseq` has an ensure clause
+bool
+rb_zjit_iseq_has_ensure_p(const rb_iseq_t *iseq)
+{
+    const struct iseq_catch_table *ct = ISEQ_BODY(iseq)->catch_table;
+    if (!ct) return false;
+    for (unsigned int i = 0; i < ct->size; i++) {
+        if (UNALIGNED_MEMBER_PTR(ct, entries[i])->type == CATCH_TYPE_ENSURE) return true;
+    }
+    return false;
+}
+
+// Return true if unwinding a non-local `return` through a frame of `iseq` stopped at `epc` runs
+// exactly one ensure clause. Then set *lend to the PC offset of the ensure clause's inline copy
+// that the compiler emits for leaving the begin/ensure normally, *cont to the PC offset after it,
+// which is where vm_exec_handle_exception() resumes after running the ensure clause, and *sp to
+// the stack depth there. The inline copy starts at the end of the last range of the clause.
+bool
+rb_zjit_iseq_ensure_for_return(const rb_iseq_t *iseq, unsigned int epc, unsigned int *lend, unsigned int *cont, unsigned int *sp)
+{
+    const struct iseq_catch_table *ct = ISEQ_BODY(iseq)->catch_table;
+    if (!ct) return false;
+    const struct iseq_catch_table_entry *found = NULL;
+    for (unsigned int i = 0; i < ct->size; i++) {
+        const struct iseq_catch_table_entry *entry = UNALIGNED_MEMBER_PTR(ct, entries[i]);
+        if (entry->type == CATCH_TYPE_ENSURE && entry->start < epc && entry->end >= epc) {
+            if (found) return false; // nested ensure clauses
+            found = entry;
+        }
+    }
+    if (!found) return false;
+    unsigned int end = 0;
+    for (unsigned int i = 0; i < ct->size; i++) {
+        const struct iseq_catch_table_entry *entry = UNALIGNED_MEMBER_PTR(ct, entries[i]);
+        if (entry->type == CATCH_TYPE_ENSURE && entry->iseq == found->iseq && entry->end > end) {
+            end = entry->end;
+        }
+    }
+    *lend = end;
+    *cont = found->cont;
+    *sp = found->sp;
+    return true;
+}
+
 // Return true if a `break` from `block_iseq` lands at `epc` (the PC offset after the
 // call that was passed `block_iseq`) in a frame of `iseq`. This mirrors the catch
 // table lookup that vm_throw_start() does to check for an orphan `break`.

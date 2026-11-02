@@ -3208,6 +3208,10 @@ pub struct Function {
     /// Qundef for a non-local `return` caught by rb_zjit_ccall_catching_throw(). A C method call
     /// for them may let the helper catch a `return`. See [`cfunc_call_catches_return`].
     catch_return_sites: HashSet<(IseqPtr, u32)>,
+    /// Blocks of the inline copies of ensure clauses that an inlined block's non-local `return`
+    /// may jump to, keyed by the caller `Snapshot` of the method frame (None for the frame of this
+    /// function), its ISEQ and the PC offset of the copy. They're pinned. See [`ensure_return_insn_idx`].
+    ensure_return_blocks: HashMap<(Option<InsnId>, IseqPtr, u32), BlockId>,
 }
 
 /// Maximum number of `inline_block` iterators, e.g. Array#each with a literal block, that a
@@ -3264,6 +3268,21 @@ struct InlinedReturnTarget {
     /// The home method frame's return block if it is inlined, or None if the home method frame
     /// is the frame of this function, which returns with Insn::Return.
     home_return_block: Option<BlockId>,
+    /// If an ensure clause of the home method frame covers the call that was passed the block,
+    /// where to run the ensure clause before returning. See [`Function::ensure_return_blocks`].
+    ensure_return: Option<EnsureReturn>,
+}
+
+/// The block of the inline copy of an ensure clause that a non-local `return` jumps to with the
+/// return value on the stack, so that it runs the ensure clause and then `leave`s.
+#[derive(Debug, Clone, Copy)]
+struct EnsureReturn {
+    /// The block at `insn_idx` of the home method frame
+    block: BlockId,
+    /// The PC offset of the inline copy of the ensure clause
+    insn_idx: u32,
+    /// The `Snapshot` of the home method frame at the call that was passed the block
+    home_state: InsnId,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3557,6 +3576,59 @@ pub fn cfunc_call_catches_break(iseq: IseqPtr, insn_idx: u32, block_iseq: IseqPt
         && unsafe { rb_zjit_iseq_break_lands_p(iseq, block_iseq, epc) }
 }
 
+/// If a non-local `return` through a frame of the method `iseq` stopped at `epc` runs exactly one
+/// ensure clause and then returns, return the PC offset of the clause's inline copy that the
+/// compiler emits for leaving the begin/ensure normally, e.g. for a method-level ensure:
+///
+///   def call(env)
+///     @mapping.each { |app| return app.call(env) if ... } # return at epc
+///     not_found                                           # leaves the value on the stack
+///   ensure
+///     env[PATH_INFO] = path                               # inline copy at the returned offset
+///   end                                                   # leave
+///
+/// Jumping there with the return value as the only stack value runs the ensure clause and returns
+/// the value, like vm_exec_handle_exception() does by running the ensure ISEQ.
+fn ensure_return_insn_idx(iseq: IseqPtr, epc: u32) -> Option<u32> {
+    if unsafe { rb_get_iseq_body_type(iseq) } != ISEQ_TYPE_METHOD {
+        return None;
+    }
+    let (mut lend, mut cont, mut sp) = (0, 0, 0);
+    if !unsafe { rb_zjit_iseq_ensure_for_return(iseq, epc, &mut lend, &mut cont, &mut sp) } {
+        return None;
+    }
+    let cont_opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, rb_iseq_pc_at_idx(iseq, cont)) } as u32;
+    (sp == 1 && epc <= lend && lend < cont && cont_opcode == YARVINSN_leave).then_some(lend)
+}
+
+/// The PC offsets returned by [`ensure_return_insn_idx`] for the calls in `iseq` that are passed a
+/// literal block that may `return`.
+fn ensure_return_insn_idxs(iseq: IseqPtr) -> Vec<u32> {
+    let mut result = vec![];
+    if unsafe { rb_get_iseq_body_type(iseq) } != ISEQ_TYPE_METHOD || !unsafe { rb_zjit_iseq_has_ensure_p(iseq) } {
+        return result;
+    }
+    let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
+    let mut insn_idx: u32 = 0;
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
+        let next_idx = insn_idx + insn_len(opcode as usize);
+        if opcode == YARVINSN_send {
+            let block_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+            if !block_iseq.is_null() && block_iseq_may_throw_tag(block_iseq, RUBY_TAG_RETURN, true) {
+                if let Some(lend) = ensure_return_insn_idx(iseq, next_idx) {
+                    if !result.contains(&lend) {
+                        result.push(lend);
+                    }
+                }
+            }
+        }
+        insn_idx = next_idx;
+    }
+    result
+}
+
 /// True if `yield` with `argc` positional args to the simple block `iseq` splats its only
 /// argument into the block's lead parameters when it's an Array, e.g. `|key, value|` or `|a,|`.
 /// See `vm_callee_setup_block_arg`.
@@ -3608,6 +3680,7 @@ impl Function {
             klass_caches: Default::default(),
             inline_budget_bonuses: 0,
             catch_return_sites: HashSet::default(),
+            ensure_return_blocks: HashMap::default(),
         }
     }
 
@@ -7441,6 +7514,7 @@ impl Function {
                         self.insns.truncate(pre_insns_len);
                         self.insn_types.truncate(pre_insn_types_len);
                         self.blocks.truncate(pre_blocks_len);
+                        self.ensure_return_blocks.retain(|_, block| block.0.to_usize() < pre_blocks_len);
                         incr_counter!(inline_reject_compile_failure);
                         search_start = send_pos + 1;
                         continue;
@@ -7736,21 +7810,32 @@ impl Function {
         // be pinned so that it's not optimized assuming its existing incoming edges. It also must
         // still be reachable: dead code elimination doesn't keep values that only unreachable
         // blocks use.
-        let return_target = if unsafe { rb_get_iseq_body_type(home_iseq) } == ISEQ_TYPE_METHOD
-            && unsafe { rb_get_iseq_body_parent_iseq(block_iseq) } == home_iseq
-            && !unsafe { rb_zjit_iseq_ensure_covers_p(home_iseq, call_epc) }
+        let return_target = if unsafe { rb_get_iseq_body_type(home_iseq) } != ISEQ_TYPE_METHOD
+            || unsafe { rb_get_iseq_body_parent_iseq(block_iseq) } != home_iseq
         {
+            None
+        } else if unsafe { rb_zjit_iseq_ensure_covers_p(home_iseq, call_epc) } {
+            // If an ensure clause covers the call, jump to its inline copy, which then returns.
+            // The block must still be reachable for the same reason as the return block below.
+            ensure_return_insn_idx(home_iseq, call_epc)
+                .and_then(|insn_idx| self.ensure_return_blocks.get(&(home_state.caller(), home_iseq, insn_idx)).map(|&block| (insn_idx, block)))
+                .filter(|&(_, block)| (home_state.caller().is_some() || home_iseq == self.iseq) && self.blocks[block].pinned)
+                .filter(|&(_, block)| self.reverse_post_order().contains(&block))
+                .map(|(insn_idx, block)| InlinedReturnTarget {
+                    yielder_pop: yielder.pop,
+                    home_return_block: None,
+                    ensure_return: Some(EnsureReturn { block, insn_idx, home_state: yielder.pop.state }),
+                })
+        } else {
             match home_state.caller() {
                 // The home frame is the frame of this function
-                None if home_iseq == self.iseq => Some(InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: None }),
+                None if home_iseq == self.iseq => Some(InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: None, ensure_return: None }),
                 None => None,
                 Some(home_caller) => self.inline_frames.get(&home_caller)
                     .filter(|home| home.iseq == home_iseq && self.blocks[home.return_block].pinned)
                     .filter(|home| self.reverse_post_order().contains(&home.return_block))
-                    .map(|home| InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: Some(home.return_block) }),
+                    .map(|home| InlinedReturnTarget { yielder_pop: yielder.pop, home_return_block: Some(home.return_block), ensure_return: None }),
             }
-        } else {
-            None
         };
 
         if break_target.is_none() && return_target.is_none() {
@@ -11566,7 +11651,11 @@ fn add_iseq_to_hir(
     let seen_ep_escape = iseq_seen_ep_escape(iseq);
     let ep_escaped = ep_starts_escaped || seen_ep_escape;
 
-    let BytecodeInfo { jump_targets } = compute_bytecode_info(iseq, &jit_entry_insns);
+    let BytecodeInfo { mut jump_targets } = compute_bytecode_info(iseq, &jit_entry_insns);
+    // Start a block at the inline copies of ensure clauses that a non-local `return` from an
+    // inlined block may jump to. See ensure_return_insn_idx.
+    let ensure_return_insn_idxs = ensure_return_insn_idxs(iseq);
+    jump_targets.extend(ensure_return_insn_idxs.iter().copied());
 
     let compile_jit_entries = matches!(mode, AddIseqMode::Standalone) && iseq_supports_jit_entry(iseq);
 
@@ -12709,6 +12798,25 @@ fn add_iseq_to_hir(
                                 pop_block_frames(fun);
                                 let pop = return_target.yielder_pop;
                                 fun.push_insn(block, Insn::PopInlineFrame { iseq: pop.iseq, argc: pop.argc, state: pop.state });
+                                if let Some(ensure) = return_target.ensure_return {
+                                    // Run the ensure clause of the home frame with the return value on
+                                    // the stack. Locals that the block may have written are in memory.
+                                    let mut ensure_state = fun.frame_state(ensure.home_state);
+                                    let home_iseq = ensure_state.iseq;
+                                    ensure_state.stack = vec![val];
+                                    ensure_state.insn_idx = ensure.insn_idx.to_usize();
+                                    ensure_state.pc = unsafe { rb_iseq_pc_at_idx(home_iseq, ensure.insn_idx) };
+                                    let home_ep_escaped = iseq_ep_escaped(home_iseq);
+                                    fun.reload_locals_modified_by_block(block, home_iseq, targets.block_pop.iseq, &mut ensure_state, home_ep_escaped);
+                                    if !home_ep_escaped {
+                                        // Like after a call with a block, which this jump completes
+                                        let ensure_exit_id = fun.push_insn(block, Insn::Snapshot { state: Box::new(ensure_state.clone()) });
+                                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoEPEscape(home_iseq), state: ensure_exit_id });
+                                    }
+                                    // The block's self is the self of its home frame
+                                    fun.push_insn(block, Insn::Jump(BranchEdge { target: ensure.block, args: ensure_state.as_args(self_param) }));
+                                    break;  // Don't enqueue the next block as a successor
+                                }
                                 match return_target.home_return_block {
                                     Some(home_return_block) => fun.push_insn(block, Insn::Jump(BranchEdge { target: home_return_block, args: vec![val] })),
                                     None => fun.push_insn(block, Insn::Return { val }),
@@ -13567,6 +13675,17 @@ fn add_iseq_to_hir(
                 queue.push_back((state, target, insn_idx));
                 break;  // End the block
             }
+        }
+    }
+
+    // Record the blocks of the inline copies of ensure clauses that we compiled. Pin them since a
+    // non-local `return` from a block inlined later may add edges to them.
+    let frame_caller = match mode { AddIseqMode::Inlined { caller, .. } => Some(caller), _ => None };
+    for insn_idx in ensure_return_insn_idxs {
+        let block = insn_idx_to_block[&insn_idx];
+        if visited.contains(&block) {
+            fun.blocks[block].pinned = true;
+            fun.ensure_return_blocks.insert((frame_caller, iseq, insn_idx), block);
         }
     }
 
