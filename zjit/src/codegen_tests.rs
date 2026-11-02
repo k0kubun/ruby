@@ -2788,6 +2788,128 @@ fn test_resume_entry_after_trace_point() {
     "), @r#"[[1, "boom", 3], 1]"#);
 }
 
+/// Run `program` after `warmup` and assert that it doesn't resume any frame, i.e. that every
+/// `break` or `return` from a block passed to a C method was caught in the frame it unwinds to.
+fn assert_no_resumes(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    eval(warmup);
+    let counters = crate::state::ZJITState::get_counters();
+    let resumed_frame_count_before = counters.resumed_frame_count;
+    let result = assert_compiles(program);
+    assert_eq!(resumed_frame_count_before, counters.resumed_frame_count, "expected no resumed frames");
+    result
+}
+
+#[test]
+fn test_ccall_catches_return_from_block() {
+    // A non-local `return` from the block of Kernel#catch returns from call! without
+    // unwinding the JIT code of its callers.
+    set_call_threshold(2);
+    let warmup = "
+        def call!(x) = catch(:error) { return x + 1 }
+        def call(x) = call!(x) * 2
+        def run = (1..3).map { |x| call(x) + 1 }
+        30.times { run } # enough to compile resume entries without the catch
+    ";
+    assert_snapshot!(assert_no_resumes(warmup, "run"), @"[5, 7, 9]");
+}
+
+#[test]
+fn test_ccall_catches_return_from_block_in_inlined_frame() {
+    // The `return` returns from the frame of call! that is inlined into call.
+    set_call_threshold(2);
+    let warmup = "
+        class Inner
+          def call!(x)
+            catch(:error) { return x + 1 }
+            :unreachable
+          end
+        end
+        class Outer
+          def initialize = @inner = Inner.new
+          def call(x) = [@inner.call!(x), :after]
+        end
+        O = Outer.new
+        def run = O.call(1)
+        30.times { run } # enough to compile resume entries without the catch
+    ";
+    assert_snapshot!(assert_no_resumes(warmup, "run"), @"[2, :after]");
+}
+
+#[test]
+fn test_ccall_catches_break_from_block() {
+    set_call_threshold(2);
+    let warmup = "
+        def find_value(h) = h.each { |k, v| break v if k == :b }
+        def run = [find_value({a: 1, b: 2}), find_value({a: 1})]
+        30.times { run } # enough to compile resume entries without the catch
+    ";
+    assert_snapshot!(assert_no_resumes(warmup, "run"), @"[2, {a: 1}]");
+}
+
+#[test]
+fn test_ccall_catching_return_survives_compaction() {
+    // rb_zjit_ccall_catching_throw() takes the cme of the C method, which compaction may move
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def search(h, key) = h.fetch(key) { return nil }
+        h = {a: 1}
+        3.times { search(h, :a); search(h, :b) }
+        GC.verify_compaction_references(expand_heap: true, toward: :empty) if GC.respond_to?(:compact)
+        [search(h, :a), search(h, :b)]
+    "), @"[1, nil]");
+}
+
+#[test]
+fn test_ccall_catching_return_runs_ensure() {
+    // A `return` covered by ensure is left to the VM, which runs the ensure clause.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def call!(log)
+          catch(:error) { return log << :return }
+        ensure
+          log << :ensure
+        end
+        def run = call!([])
+        3.times { run }
+        run
+    "), @"[:return, :ensure]");
+}
+
+#[test]
+fn test_ccall_catching_return_passes_throw_and_raise() {
+    // A `throw` of the catch tag and an exception from the block still work
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def call!(x)
+          r = catch(:error) do
+            return x if x == 1
+            throw :error, :thrown if x == 2
+            raise 'boom'
+          end
+          [r, :after_catch]
+        end
+        def run = [1, 2, 3].map { |x| call!(x) rescue $!.message }
+        3.times { run }
+        run
+    "), @r#"[1, [:thrown, :after_catch], "boom"]"#);
+}
+
+#[test]
+fn test_ccall_catching_return_with_trace_point() {
+    // With a TracePoint enabled, the VM unwinds the frames and fires their return events like the interpreter
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def call!(x) = catch(:error) { return x + 1 }
+        def run = call!(1)
+        3.times { run }
+        events = []
+        tp = TracePoint.new(:return, :c_return, :b_return) { |tp| events << [tp.event, tp.method_id] }
+        result = tp.enable { run }
+        [result, events]
+    "), @"[2, [[:c_return, :+], [:b_return, :call!], [:c_return, :catch], [:return, :call!], [:return, :run], [:b_return, nil]]]");
+}
+
 #[test]
 fn test_throw_return_from_proc() {
     set_call_threshold(2);

@@ -949,6 +949,7 @@ pub enum FieldName {
     as_heap,
     fields_obj,
     thread_ptr,
+    errinfo,
     len,
     SelfParam,
     /// A slot of the operand stack, counted from its bottom
@@ -3200,6 +3201,10 @@ pub struct Function {
     pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
     /// Number of `inline_block` iterators inlined past the inlining budget. See `inline_methods`.
     inline_budget_bonuses: usize,
+    /// `send`s, as (ISEQ, insn_idx), after which this function checks if the callee returned
+    /// Qundef for a non-local `return` caught by rb_zjit_ccall_catching_throw(). A C method call
+    /// for them may let the helper catch a `return`. See [`cfunc_call_catches_return`].
+    catch_return_sites: HashSet<(IseqPtr, u32)>,
 }
 
 /// Maximum number of `inline_block` iterators, e.g. Array#each with a literal block, that a
@@ -3503,6 +3508,52 @@ fn iseq_has_literal_block_with_return(iseq: IseqPtr) -> bool {
     })
 }
 
+/// Return true if `block_iseq` has a `throw` of `tag` that may escape the block, also in its
+/// nested literal blocks if `nested`.
+fn block_iseq_may_throw_tag(block_iseq: IseqPtr, tag: ruby_tag_type, nested: bool) -> bool {
+    let encoded_size = unsafe { rb_iseq_encoded_size(block_iseq) };
+    let mut insn_idx: u32 = 0;
+    while insn_idx < encoded_size {
+        let pc = unsafe { rb_iseq_pc_at_idx(block_iseq, insn_idx) };
+        let opcode = unsafe { rb_iseq_bare_opcode_at_pc(block_iseq, pc) } as u32;
+        if opcode == YARVINSN_throw {
+            let throw_state = unsafe { *pc.add(1) }.as_u32();
+            if throw_state & VM_THROW_STATE_MASK == tag && throw_state & VM_THROW_NO_ESCAPE_FLAG == 0 {
+                return true;
+            }
+        } else if nested && (opcode == YARVINSN_send || opcode == YARVINSN_invokesuper) {
+            let nested_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+            if !nested_iseq.is_null() && block_iseq_may_throw_tag(nested_iseq, tag, nested) {
+                return true;
+            }
+        }
+        insn_idx += insn_len(opcode as usize);
+    }
+    false
+}
+
+/// Return true if a C method called with the literal block `block_iseq` by the `send` at
+/// `insn_idx` of the method `iseq` should catch a non-local `return` from the block that returns
+/// from `iseq`'s frame. See rb_zjit_ccall_catching_throw(). The `return` must not run an ensure
+/// clause of `iseq`, which vm_exec_handle_exception() would run.
+pub fn cfunc_call_catches_return(iseq: IseqPtr, insn_idx: u32, block_iseq: IseqPtr) -> bool {
+    let epc = insn_idx + insn_len(YARVINSN_send as usize);
+    let is_method = unsafe { rb_get_iseq_body_type(iseq) } == ISEQ_TYPE_METHOD;
+    is_method
+        && unsafe { rb_get_iseq_body_parent_iseq(block_iseq) } == iseq
+        && block_iseq_may_throw_tag(block_iseq, RUBY_TAG_RETURN, true)
+        && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, epc) }
+}
+
+/// Return true if a C method called with the literal block `block_iseq` by the `send` at
+/// `insn_idx` of `iseq` should catch a `break` from the block, which makes the call return the
+/// value of the `break`. See rb_zjit_ccall_catching_throw().
+pub fn cfunc_call_catches_break(iseq: IseqPtr, insn_idx: u32, block_iseq: IseqPtr) -> bool {
+    let epc = insn_idx + insn_len(YARVINSN_send as usize);
+    block_iseq_may_throw_tag(block_iseq, RUBY_TAG_BREAK, false)
+        && unsafe { rb_zjit_iseq_break_lands_p(iseq, block_iseq, epc) }
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
@@ -3547,7 +3598,27 @@ impl Function {
             inline_pass: 0,
             klass_caches: Default::default(),
             inline_budget_bonuses: 0,
+            catch_return_sites: HashSet::default(),
         }
+    }
+
+    /// The return type of a C method call, or a send that may become one: it may also return
+    /// Qundef for a non-local `return` that rb_zjit_ccall_catching_throw() caught. See
+    /// [`Function::catches_return_at`].
+    fn cfunc_call_return_type(&self, return_type: Type, block: Option<BlockHandler>, state: InsnId) -> Type {
+        if matches!(block, Some(BlockHandler::BlockIseq(_))) {
+            let state = self.frame_state(state);
+            if self.catches_return_at(state.iseq, state.insn_idx() as u32) {
+                return return_type.union(types::Undef);
+            }
+        }
+        return_type
+    }
+
+    /// Whether the code after the `send` at `insn_idx` of `iseq` handles a non-local `return`
+    /// caught by rb_zjit_ccall_catching_throw(). See [`Function::catch_return_sites`].
+    pub fn catches_return_at(&self, iseq: IseqPtr, insn_idx: u32) -> bool {
+        self.catch_return_sites.contains(&(iseq, insn_idx))
     }
 
     pub fn iseq(&self) -> *const rb_iseq_t {
@@ -4220,9 +4291,9 @@ impl Function {
             Insn::NewRangeFixnum { .. } => types::RangeExact,
             Insn::ObjectAlloc { .. } => types::HeapBasicObject,
             Insn::ObjectAllocClass { class, .. } => Type::from_class(*class),
-            Insn::CCallWithFrame(insn) => insn.return_type,
+            Insn::CCallWithFrame(insn) => self.cfunc_call_return_type(insn.return_type, insn.block, insn.state),
             Insn::CCall { return_type, .. } => *return_type,
-            Insn::CCallVariadic(insn) => insn.return_type,
+            Insn::CCallVariadic(insn) => self.cfunc_call_return_type(insn.return_type, insn.block, insn.state),
             Insn::CheckMatch { .. } => types::BasicObject,
             Insn::GuardType { val, guard_type, .. } => self.type_of(*val).intersection(*guard_type),
             Insn::RefineType { val, new_type, .. } => self.type_of(*val).intersection(*new_type),
@@ -4272,7 +4343,8 @@ impl Function {
             Insn::FixnumRShift { .. } => types::Fixnum,
             Insn::PutSpecialObject { .. } => types::BasicObject,
             Insn::SendDirect(_) => types::BasicObject,
-            Insn::Send { .. } => types::BasicObject,
+            // A Send may still become a C method call that catches a `return`
+            Insn::Send { block, state, .. } => self.cfunc_call_return_type(types::BasicObject, *block, *state),
             Insn::SendForward { .. } => types::BasicObject,
             Insn::InvokeSuper { .. } => types::BasicObject,
             Insn::InvokeSuperForward { .. } => types::BasicObject,
@@ -8967,6 +9039,10 @@ impl Function {
                             insn_id
                         }
                     }
+                    // Only C method calls that catch a `return` return Qundef. See cfunc_call_return_type.
+                    &Insn::IsBitEqual { left, right } if self.is_a(right, types::Undef) && !self.type_of(left).could_be(types::Undef) => {
+                        self.new_insn(Insn::Const { val: Const::CBool(false) })
+                    }
                     &Insn::CondBranch { val, ref if_true, .. } if self.is_a(val, Type::from_cbool(true)) => {
                         self.new_insn(Insn::Jump(if_true.clone()))
                     }
@@ -12828,6 +12904,44 @@ fn add_iseq_to_hir(
                         // Maybe monomorphic; handled in type_specialize
                         let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: send_state, reason: Uncategorized(opcode.into()) });
                         state.stack_push(send);
+                    }
+
+                    // If the callee turns out to be a C method, it catches a non-local `return` from
+                    // the block that returns from this frame and returns Qundef instead. Then return
+                    // the caught value from this frame. See rb_zjit_ccall_catching_throw(). For other
+                    // callees, the check is folded away since they don't return Qundef.
+                    if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {
+                        let send_insn_idx = exit_state.insn_idx() as u32;
+                        if cfunc_call_catches_return(iseq, send_insn_idx, blockiseq) {
+                            fun.catch_return_sites.insert((iseq, send_insn_idx));
+                            let result = state.stack_top()?;
+                            let undef = fun.push_insn(block, Insn::Const { val: Const::Value(Qundef) });
+                            let caught = fun.push_insn(block, Insn::IsBitEqual { left: result, right: undef });
+                            let return_block = fun.new_block(insn_idx);
+                            let fall_through = fun.new_block(insn_idx);
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: caught,
+                                if_true: BranchEdge { target: return_block, args: vec![] },
+                                if_false: BranchEdge { target: fall_through, args: vec![] },
+                            });
+                            // Take the value that the helper left in ec->errinfo
+                            let ec = fun.load_ec(return_block);
+                            let val = fun.load_field(return_block, ec, FieldName::errinfo, RUBY_OFFSET_EC_ERRINFO, types::BasicObject);
+                            let nil = fun.push_insn(return_block, Insn::Const { val: Const::Value(Qnil) });
+                            fun.push_insn(return_block, Insn::StoreField { recv: ec, id: FieldName::errinfo, offset: RUBY_OFFSET_EC_ERRINFO, val: nil, num_bits: 64 });
+                            // Like `leave` but without CheckInterrupts, whose side exit would resume after the call.
+                            match mode {
+                                AddIseqMode::Standalone | AddIseqMode::Resume { .. } => {
+                                    fun.push_insn(return_block, Insn::Return { val });
+                                }
+                                AddIseqMode::Inlined { return_block: inlined_return_block, .. } => {
+                                    fun.push_insn(return_block, Insn::Jump(BranchEdge { target: inlined_return_block, args: vec![val] }));
+                                }
+                            }
+                            block = fall_through;
+                            let refined = fun.push_insn(block, Insn::RefineType { val: result, new_type: types::BasicObject });
+                            state.replace(result, refined);
+                        }
                     }
 
                     if let Some(BlockHandler::BlockIseq(blockiseq)) = block_handler {

@@ -1355,10 +1355,17 @@ fn gen_ccall_with_frame(
     asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
 
-    let mut cfunc_args = vec![recv];
-    cfunc_args.extend(args);
-    asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
-    let result = asm.ccall(cfunc, cfunc_args);
+    let result = if let Some(catch_return) = cfunc_call_catches_throw(function, block, state) {
+        let argv_ptr = gen_push_opnds(jit, asm, &args);
+        asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
+        // Pass the cme as a VALUE so that GC compaction updates it in the code
+        asm_ccall!(asm, rb_zjit_ccall_catching_throw, EC, VALUE::from(cme).into(), recv, args.len().into(), argv_ptr, Opnd::UImm(catch_return.into()))
+    } else {
+        let mut cfunc_args = vec![recv];
+        cfunc_args.extend(args);
+        asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
+        asm.ccall(cfunc, cfunc_args)
+    };
 
     asm_comment!(asm, "pop C frame");
     let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
@@ -1370,6 +1377,22 @@ fn gen_ccall_with_frame(
     asm.mov(SP, new_sp);
 
     result
+}
+
+unsafe extern "C" {
+    fn rb_zjit_ccall_catching_throw(ec: EcPtr, cme: *const rb_callable_method_entry_t, recv: VALUE, argc: i32, argv: *const VALUE, catch_return: bool) -> VALUE;
+}
+
+/// If a C method call with the literal block `block` should catch a `break` or a non-local
+/// `return` from the block that unwinds to the calling frame, return whether it catches `return`.
+/// The caller then checks if the call returned Qundef for a caught `return`. Catching them saves
+/// the longjmp to a vm_exec() below this frame, after which the interpreter would resume this
+/// frame and its JIT callers one by one. See rb_zjit_ccall_catching_throw().
+fn cfunc_call_catches_throw(function: &Function, block: Option<BlockHandler>, state: &FrameState) -> Option<bool> {
+    let Some(BlockHandler::BlockIseq(blockiseq)) = block else { return None };
+    let insn_idx = state.insn_idx() as u32;
+    let catch_return = function.catches_return_at(state.iseq, insn_idx);
+    (catch_return || crate::hir::cfunc_call_catches_break(state.iseq, insn_idx, blockiseq)).then_some(catch_return)
 }
 
 /// Lowering for [`Insn::CCall`]. This is a low-level raw call that doesn't know
@@ -1479,7 +1502,11 @@ fn gen_ccall_variadic(
 
     let argv_ptr = gen_push_opnds(jit, asm, &args);
     asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
-    let result = asm.ccall(cfunc, vec![args.len().into(), argv_ptr, recv]);
+    let result = if let Some(catch_return) = cfunc_call_catches_throw(function, block, state) {
+        asm_ccall!(asm, rb_zjit_ccall_catching_throw, EC, VALUE::from(cme).into(), recv, args.len().into(), argv_ptr, Opnd::UImm(catch_return.into()))
+    } else {
+        asm.ccall(cfunc, vec![args.len().into(), argv_ptr, recv])
+    };
 
     asm_comment!(asm, "pop C frame");
     let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());

@@ -3294,6 +3294,59 @@ vm_throw_data_take_val(struct vm_throw_data *err)
     return val;
 }
 
+#if USE_ZJIT
+// Call the C method `cme` from a JIT frame with a literal block that may `break` or `return`
+// non-locally, e.g. `catch(:error) { return @app.call(env) }`. A `throw` longjmps to the most recent
+// EC tag, which would otherwise be a vm_exec() below the JIT frame. That unwinds the native
+// frames of the JIT frame and its JIT callers, which then have to be resumed one by one. Like
+// rb_iterate0() does for `break`, catch the throw here when it targets the calling JIT frame, so
+// that the JIT frame just continues. A `break` returns its value as the result of the call. If
+// `catch_return`, a `return` returns Qundef and leaves its value in ec->errinfo, which the JIT
+// code checks for, takes and returns. ZJIT passes `catch_return` only when no ensure clause
+// covers the call, which vm_exec_handle_exception() would run.
+VALUE
+rb_zjit_ccall_catching_throw(rb_execution_context_t *ec, const rb_callable_method_entry_t *cme, VALUE recv,
+                             int argc, const VALUE *argv, bool catch_return)
+{
+    rb_control_frame_t *volatile const cfunc_cfp = ec->cfp;
+    const rb_method_cfunc_t *cfunc = UNALIGNED_MEMBER_PTR(cme->def, body.cfunc);
+    volatile VALUE val = Qnil;
+    enum ruby_tag_type state;
+
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        val = (*cfunc->invoker)(recv, argc, argv, cfunc->func);
+    }
+    else if (state == TAG_BREAK || (state == TAG_RETURN && catch_return)) {
+        struct vm_throw_data *err = (struct vm_throw_data *)ec->errinfo;
+        rb_control_frame_t *cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfunc_cfp);
+        // Leave it to the VM when hooks need to see the frames unwound or the method return
+        if (THROW_DATA_CATCH_FRAME(err) == cfp &&
+            !(ruby_vm_event_flags & ISEQ_TRACE_EVENTS) && CFP_ISEQ(cfp)->aux.exec.local_hooks_cnt == 0) {
+            rb_vm_rewind_cfp(ec, cfunc_cfp); // JIT code pops the C method frame
+            ec->tag->state = TAG_NONE;
+            if (state == TAG_RETURN) {
+                THROW_DATA_CATCH_FRAME_SET(err, cfp + 1);
+                ec->errinfo = vm_throw_data_take_val(err);
+                val = Qundef;
+            }
+            else {
+                ec->errinfo = Qnil;
+                val = vm_throw_data_take_val(err);
+            }
+            state = TAG_NONE;
+        }
+    }
+    EC_POP_TAG();
+
+    if (state != TAG_NONE) {
+        EC_JUMP_TAG(ec, state);
+    }
+    return val;
+}
+
+#endif
+
 static inline VALUE
 vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, VALUE errinfo)
 {
