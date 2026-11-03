@@ -167,9 +167,10 @@ pub struct Options {
     /// Note: this is a different unit than `inline_budget`; see that field's doc comment.
     pub inline_threshold: InlineThreshold,
 
-    /// Per-caller cumulative size budget for inlining, measured as the caller
-    /// `Function::num_instructions` at the moment `should_inline` is consulted (during
-    /// `inline_methods` inside the `optimize()` fixed-point loop). Once a caller has
+    /// Per-caller cumulative size budget for inlining, compared against both the caller's
+    /// `Function::num_instructions` at the moment `should_inline` is consulted and the
+    /// caller's `insns.len()` (allocation high-water mark) at the start of the current
+    /// `inline_methods` pass inside the `optimize()` fixed-point loop. Once a caller has
     /// grown past this many HIR instructions, `should_inline` rejects further callees,
     /// bounding runaway code-size growth from depth-N inlining (and providing the
     /// optimization fixed-point loop's effective terminating condition).
