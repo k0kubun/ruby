@@ -75,6 +75,13 @@ pub struct CodeBlock {
     // Current writing position
     write_pos: usize,
 
+    // Start of mem_block, cached so that writes don't need to borrow mem_block
+    base_ptr: *mut u8,
+
+    // Positions that VirtualMem has already made writable. Writes inside it skip
+    // VirtualMem::write_byte() and its page checks. Empty when unknown.
+    writable_range: Range<usize>,
+
     // Table of registered label addresses
     label_addrs: Vec<usize>,
 
@@ -100,10 +107,13 @@ impl CodeBlock {
     /// Make a new CodeBlock
     pub fn new(mem_block: Rc<RefCell<VirtualMem>>, keep_comments: bool) -> Self {
         let mem_size = mem_block.borrow().virtual_region_size();
+        let base_ptr = mem_block.borrow().base_ptr().as_ptr();
         Self {
             mem_block,
             mem_size,
             write_pos: 0,
+            base_ptr,
+            writable_range: 0..0,
             label_addrs: Vec::new(),
             label_names: Vec::new(),
             label_refs: Vec::new(),
@@ -189,20 +199,51 @@ impl CodeBlock {
     }
 
     /// Write a single byte at the current position.
+    #[inline]
     pub fn write_byte(&mut self, byte: u8) {
+        let pos = self.write_pos;
+        if self.writable_range.contains(&pos) {
+            // SAFETY: writable_range only covers mapped memory that is still writable
+            unsafe { self.base_ptr.add(pos).write(byte) };
+            self.write_pos = pos + 1;
+        } else {
+            self.write_byte_slow(byte);
+        }
+    }
+
+    /// Write a byte through VirtualMem, which maps the page and makes it writable,
+    /// and then remember that page so that the following writes take the fast path.
+    #[inline(never)]
+    fn write_byte_slow(&mut self, byte: u8) {
         let write_ptr = self.get_write_ptr();
+        let mut mem_block = self.mem_block.borrow_mut();
         // TODO: check has_capacity()
-        if self.mem_block.borrow_mut().write_byte(write_ptr, byte).is_ok() {
+        if mem_block.write_byte(write_ptr, byte).is_ok() {
             self.write_pos += 1;
+            // Another owner of mem_block could make the page executable behind our back,
+            // so cache the page only if this CodeBlock is the sole owner, which it is
+            // outside of tests.
+            if Rc::strong_count(&self.mem_block) == 1 {
+                self.writable_range = mem_block.current_write_page_range().unwrap_or(0..0);
+            }
         } else {
             self.dropped_bytes = true;
         }
     }
 
     /// Write multiple bytes starting from the current position.
+    #[inline]
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_byte(*byte);
+        let pos = self.write_pos;
+        if pos >= self.writable_range.start && pos + bytes.len() <= self.writable_range.end {
+            // SAFETY: writable_range only covers mapped memory that is still writable
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base_ptr.add(pos), bytes.len()) };
+            self.write_pos = pos + bytes.len();
+        } else {
+            // Crossing a page boundary (or not writable yet). Map pages as we go.
+            for byte in bytes {
+                self.write_byte(*byte);
+            }
         }
     }
 
@@ -211,26 +252,8 @@ impl CodeBlock {
         assert!(num_bits > 0);
         assert!(num_bits % 8 == 0);
 
-        // Switch on the number of bits
-        match num_bits {
-            8 => self.write_byte(val as u8),
-            16 => self.write_bytes(&[(val & 0xff) as u8, ((val >> 8) & 0xff) as u8]),
-            32 => self.write_bytes(&[
-                (val & 0xff) as u8,
-                ((val >> 8) & 0xff) as u8,
-                ((val >> 16) & 0xff) as u8,
-                ((val >> 24) & 0xff) as u8,
-            ]),
-            _ => {
-                let mut cur = val;
-
-                // Write out the bytes
-                for _byte in 0..(num_bits / 8) {
-                    self.write_byte((cur & 0xff) as u8);
-                    cur >>= 8;
-                }
-            }
-        }
+        assert!(num_bits <= 64);
+        self.write_bytes(&val.to_le_bytes()[..(num_bits / 8) as usize]);
     }
 
     /// Check if bytes have been dropped (unwritten because of insufficient space)
@@ -331,12 +354,16 @@ impl CodeBlock {
         self.label_refs.clear();
     }
 
-    /// Make all the code in the region executable. Call this at the end of a write session.
+    /// Make all the code in the region writable. Call this before bulk writes (e.g. GC
+    /// reference updates).
     pub fn mark_all_writable(&mut self) {
+        self.writable_range = 0..0;
         self.mem_block.borrow_mut().mark_all_writable();
     }
 
+    /// Make all the code in the region executable. Call this at the end of a write session.
     pub fn mark_all_executable(&mut self) {
+        self.writable_range = 0..0;
         self.mem_block.borrow_mut().mark_all_executable();
     }
 
@@ -497,6 +524,37 @@ mod tests
 
         assert_eq!(uimm_num_bits((u32::MAX as u64) + 1), 64);
         assert_eq!(uimm_num_bits(u64::MAX), 64);
+    }
+
+    #[test]
+    fn test_write_bytes_across_pages() {
+        let page_size = unsafe { crate::cruby::rb_jit_get_page_size() } as usize;
+        // VirtualMem never maps the last page of a region, so use three pages.
+        let mut cb = CodeBlock::new_dummy_sized(3 * page_size);
+
+        // Leave 3 bytes on the first page so that an 8-byte write straddles both pages.
+        for _ in 0..(page_size - 3) {
+            cb.write_byte(0x90);
+        }
+        cb.write_int(0x0807060504030201, 64);
+        assert!(!cb.has_dropped_bytes());
+        assert_eq!(cb.get_write_pos(), page_size + 5);
+        assert!(cb.hexdump().ends_with("900102030405060708"));
+    }
+
+    #[test]
+    fn test_write_after_mark_all_executable() {
+        let mut cb = CodeBlock::new_dummy();
+        cb.write_bytes(&[1, 2, 3, 4]);
+        cb.mark_all_executable();
+
+        // The page is executable now. CodeBlock must not keep writing to it through
+        // the page it cached before, or these writes would segfault.
+        cb.write_bytes(&[5, 6, 7, 8]);
+        cb.mark_all_executable();
+        cb.with_write_ptr(cb.get_ptr(0), |cb| cb.write_byte(9));
+        assert!(!cb.has_dropped_bytes());
+        assert_eq!(cb.hexdump(), "0902030405060708");
     }
 
     #[test]

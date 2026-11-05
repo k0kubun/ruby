@@ -3,6 +3,7 @@
 // usize->pointer casts is viable. It seems like a lot of work for us to participate for not much
 // benefit.
 
+use std::ops::Range;
 use std::ptr::NonNull;
 use crate::cruby::*;
 use crate::stats::zjit_alloc_bytes;
@@ -264,6 +265,16 @@ impl<A: Allocator> VirtualMemory<A> {
         unsafe { raw.write(byte) };
 
         Ok(())
+    }
+
+    /// Byte offsets of the page that the last successful [Self::write_byte] made writable,
+    /// clamped to the region. The page stays writable until [Self::mark_all_executable]
+    /// or [Self::free_bytes], so a sole owner may cache it until then and skip calling
+    /// [Self::write_byte] for every byte.
+    pub fn current_write_page_range(&self) -> Option<Range<usize>> {
+        let page_start = self.current_write_page? - self.region_start.as_ptr() as usize;
+        let page_end = (page_start + self.page_size_bytes).min(self.region_size_bytes);
+        Some(page_start..page_end)
     }
 
     /// Return true if write_byte() can allocate a new page
