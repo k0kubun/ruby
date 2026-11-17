@@ -573,6 +573,11 @@ struct rb_iseq_constant_body {
     // Set once an EP escape of this iseq has been reported to the enabled JIT.
     rb_atomic_t jit_ep_escape_recorded;
 
+    // Set once this iseq has been bound as a method of a class whose instances
+    // are not all heap objects (e.g. Integer), so JITs must not assume that
+    // `self` is a heap object.
+    rb_atomic_t jit_non_heap_self_recorded;
+
     union {
         iseq_bits_t * list; /* Find references for GC */
         iseq_bits_t single;

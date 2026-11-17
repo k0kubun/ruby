@@ -1624,6 +1624,12 @@ rb_method_entry_make(VALUE klass, ID mid, VALUE defined_class, rb_method_visibil
     }
     rb_method_definition_set(me, def, opts);
 
+    // The same ISEQ can be bound as a method of multiple classes (e.g. by passing one block
+    // containing `def` to class_eval of each class), and ZJIT types `self` based on the class.
+    if (me->def->type == VM_METHOD_TYPE_ISEQ) {
+        rb_zjit_iseq_method_bound(me->def->body.iseq.iseqptr, me->owner);
+    }
+
     rb_clear_method_cache(klass, mid);
 
     /* check mid */

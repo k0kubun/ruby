@@ -5,7 +5,7 @@ use std::{collections::{HashMap, HashSet}, mem};
 use crate::{backend::lir::{Assembler, asm_comment}, cruby::{ID, IseqPtr, RedefinitionFlag, VALUE, iseq_name, rb_callable_method_entry_t, rb_gc_location, ruby_basic_operators, src_loc, with_vm_lock}, hir::Invariant, options::debug, state::{ZJITState, zjit_enabled_p, trace_invalidation}, virtualmem::CodePtr};
 use crate::payload::{IseqVersionRef, get_or_create_iseq_payload};
 use crate::codegen::invalidate_iseq_version;
-use crate::cruby::{rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded};
+use crate::cruby::{method_self_is_heap_object, rb_iseq_reset_jit_func, rb_jit_iseq_ep_escape_recorded_p, rb_jit_iseq_mark_ep_escape_recorded, rb_jit_iseq_mark_non_heap_self_recorded, rb_jit_iseq_non_heap_self_recorded_p};
 use crate::stats::with_time_stat;
 use crate::stats::Counter::invalidation_time_ns;
 use crate::gc::remove_gc_offsets;
@@ -73,6 +73,9 @@ pub struct Invariants {
     /// Map from ISEQ that's assumed to not escape EP to a set of patch points
     no_ep_escape_iseq_patch_points: HashMap<IseqPtr, HashSet<PatchPoint>>,
 
+    /// Map from ISEQ whose `self` is assumed to be a heap object to a set of patch points
+    self_is_heap_object_iseq_patch_points: HashMap<IseqPtr, HashSet<PatchPoint>>,
+
     /// Map from a class and its associated basic operator to a set of patch points
     bop_patch_points: HashMap<(RedefinitionFlag, ruby_basic_operators), HashSet<PatchPoint>>,
 
@@ -105,7 +108,8 @@ pub struct Invariants {
 impl Invariants {
     /// Update object references in Invariants
     pub fn update_references(&mut self) {
-        self.update_no_ep_escape_iseq_patch_points();
+        Self::update_iseq_patch_points(&mut self.no_ep_escape_iseq_patch_points);
+        Self::update_iseq_patch_points(&mut self.self_is_heap_object_iseq_patch_points);
         self.update_cme_patch_points();
         self.update_no_singleton_class_patch_points();
     }
@@ -118,6 +122,7 @@ impl Invariants {
         // generated code referencing the ISEQ are unreachable. We mark the ISEQs baked into
         // generated code.
         self.no_ep_escape_iseq_patch_points.remove(&iseq);
+        self.self_is_heap_object_iseq_patch_points.remove(&iseq);
     }
 
     /// Forget a CME when freeing it. See [Self::forget_iseq] for reasoning.
@@ -130,16 +135,16 @@ impl Invariants {
         self.no_singleton_class_patch_points.remove(&klass);
     }
 
-    /// Update ISEQ references in Invariants::no_ep_escape_iseq_patch_points
-    fn update_no_ep_escape_iseq_patch_points(&mut self) {
-        let updated = std::mem::take(&mut self.no_ep_escape_iseq_patch_points)
+    /// Update ISEQ references in a map from ISEQ to patch points
+    fn update_iseq_patch_points(iseq_patch_points: &mut HashMap<IseqPtr, HashSet<PatchPoint>>) {
+        let updated = std::mem::take(iseq_patch_points)
             .into_iter()
             .map(|(iseq, patch_points)| {
                 let new_iseq = unsafe { rb_gc_location(iseq.into()) };
                 (new_iseq.as_iseq(), patch_points)
             })
             .collect();
-        self.no_ep_escape_iseq_patch_points = updated;
+        *iseq_patch_points = updated;
     }
 
     fn update_cme_patch_points(&mut self) {
@@ -264,6 +269,52 @@ pub fn track_no_ep_escape_assumption(
 ) {
     let invariants = ZJITState::get_invariants();
     invariants.no_ep_escape_iseq_patch_points.entry(iseq).or_default().insert(PatchPoint::new(
+        patch_point_ptr,
+        side_exit_ptr,
+        version,
+    ));
+}
+
+/// Called when `iseq` is bound as a method of `owner`, including when it's bound to a class
+/// that is not its first owner, e.g. `blk = proc { def foo = @x }; C.class_eval(&blk); Integer.class_eval(&blk)`.
+/// If `self` of the new method may not be a heap object, remember that on the ISEQ so that it's
+/// never compiled with that assumption again, and invalidate JIT code that already assumes it.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_zjit_iseq_method_bound(iseq: IseqPtr, owner: VALUE) {
+    // Nothing to do if it's already recorded, or if `self` is still a heap object.
+    // This runs regardless of whether ZJIT is enabled so that the record is complete
+    // when ZJIT is enabled later, so keep it cheap.
+    if unsafe { rb_jit_iseq_non_heap_self_recorded_p(iseq) } { return; }
+    if method_self_is_heap_object(iseq, owner) { return; }
+    unsafe { rb_jit_iseq_mark_non_heap_self_recorded(iseq) };
+
+    // If ZJIT isn't enabled, nothing could have been compiled with the assumption
+    if !zjit_enabled_p() {
+        return;
+    }
+
+    with_vm_lock(src_loc!(), || {
+        let invariants = ZJITState::get_invariants();
+        if let Some(patch_points) = invariants.self_is_heap_object_iseq_patch_points.remove(&iseq) {
+            debug!("self may not be a heap object: {}", iseq_name(iseq));
+
+            let cb = ZJITState::get_code_block();
+            compile_patch_points!(cb, patch_points, SelfIsHeapObject, "self may not be a heap object: {}", iseq_name(iseq));
+
+            cb.mark_all_executable();
+        }
+    });
+}
+
+/// Track that JIT code for an ISEQ will assume that `self` is a heap object.
+pub fn track_self_is_heap_object_assumption(
+    iseq: IseqPtr,
+    patch_point_ptr: CodePtr,
+    side_exit_ptr: CodePtr,
+    version: IseqVersionRef,
+) {
+    let invariants = ZJITState::get_invariants();
+    invariants.self_is_heap_object_iseq_patch_points.entry(iseq).or_default().insert(PatchPoint::new(
         patch_point_ptr,
         side_exit_ptr,
         version,

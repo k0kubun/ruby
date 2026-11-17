@@ -227,6 +227,10 @@ pub enum Invariant {
     NoNewObjHook,
     /// cfp->ep is not escaped to the heap on the ISEQ
     NoEPEscape(IseqPtr),
+    /// `self` of the ISEQ is a heap object because the ISEQ has only been bound as a method of
+    /// classes whose instances are heap objects. Invalidated when the ISEQ is bound to another
+    /// class whose instances may not be (e.g. Integer). See `iseq_self_is_heap_object`.
+    SelfIsHeapObject(IseqPtr),
     /// There is one ractor running. If a non-root ractor gets spawned, this is invalidated.
     SingleRactorMode,
     /// Objects of this class have no singleton class.
@@ -370,6 +374,7 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
             Invariant::NoTracePoint => write!(f, "NoTracePoint"),
             Invariant::NoNewObjHook => write!(f, "NoNewObjHook"),
             Invariant::NoEPEscape(iseq) => write!(f, "NoEPEscape({})", &iseq_name(iseq)),
+            Invariant::SelfIsHeapObject(iseq) => write!(f, "SelfIsHeapObject({})", &iseq_name(iseq)),
             Invariant::SingleRactorMode => write!(f, "SingleRactorMode"),
             Invariant::NoSingletonClass { klass } => {
                 let class_name = get_class_name(klass);
@@ -9716,6 +9721,14 @@ fn add_iseq_to_hir(
 
             if unsafe { rb_iseq_event_flags(iseq, insn_idx as usize) } != 0 {
                 fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoTracePoint, state: exit_id });
+            }
+
+            // Entry blocks type `self` as HeapBasicObject when this ISEQ has only been bound as a
+            // method of classes whose instances are heap objects (see `iseq_self_is_heap_object`).
+            // The same ISEQ may later be bound to a class like Integer, so guard every entry PC with
+            // a patch point that rb_zjit_iseq_method_bound() invalidates.
+            if fun.self_is_heap_object && matches!(mode, AddIseqMode::Standalone) && jit_entry_insns.contains(&insn_idx) {
+                fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::SelfIsHeapObject(iseq), state: exit_id });
             }
 
             // Increment zjit_insn_count for each YARV instruction if --zjit-stats is enabled.

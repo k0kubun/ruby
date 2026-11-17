@@ -2122,7 +2122,7 @@ pub type rb_iseq_callback = ::std::option::Option<
     unsafe extern "C" fn(arg1: *const rb_iseq_t, arg2: *mut ::std::os::raw::c_void),
 >;
 pub const ISEQ_BODY_OFFSET_PARAM: zjit_struct_offsets = 16;
-pub const ISEQ_BODY_OFFSET_OUTER_VARIABLES: zjit_struct_offsets = 256;
+pub const ISEQ_BODY_OFFSET_OUTER_VARIABLES: zjit_struct_offsets = 264;
 pub const RUBY_OFFSET_THREAD_RACTOR: zjit_struct_offsets = 24;
 pub type zjit_struct_offsets = u32;
 #[repr(C)]

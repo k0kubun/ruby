@@ -259,6 +259,21 @@ rb_jit_iseq_ep_escape_recorded_p(const rb_iseq_t *iseq)
     return rbimpl_atomic_load(&ISEQ_BODY(iseq)->jit_ep_escape_recorded, RBIMPL_ATOMIC_RELAXED) != 0;
 }
 
+// Remember that this iseq has been bound as a method whose `self` may not be a heap object.
+// Relaxed memory ordering, but called with VM lock.
+void
+rb_jit_iseq_mark_non_heap_self_recorded(const rb_iseq_t *iseq)
+{
+    rbimpl_atomic_store(&ISEQ_BODY(iseq)->jit_non_heap_self_recorded, 1, RBIMPL_ATOMIC_RELAXED);
+}
+
+// Whether this iseq has ever been bound as a method whose `self` may not be a heap object.
+bool
+rb_jit_iseq_non_heap_self_recorded_p(const rb_iseq_t *iseq)
+{
+    return rbimpl_atomic_load(&ISEQ_BODY(iseq)->jit_non_heap_self_recorded, RBIMPL_ATOMIC_RELAXED) != 0;
+}
+
 int
 rb_get_mct_argc(const rb_method_cfunc_t *mct)
 {

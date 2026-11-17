@@ -12,7 +12,7 @@ use std::slice;
 use crate::asm::LabelName;
 use crate::backend::current::ALLOC_REGS;
 use crate::invariants::{
-    track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_no_trace_point_assumption,
+    track_bop_assumption, track_cme_assumption, track_no_ep_escape_assumption, track_self_is_heap_object_assumption, track_no_trace_point_assumption,
     track_single_ractor_assumption, track_stable_constant_names_assumption, track_no_singleton_class_assumption,
     track_root_box_assumption, track_no_newobj_hook_assumption
 };
@@ -1085,6 +1085,9 @@ pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invari
             }
             Invariant::NoEPEscape(iseq) => {
                 track_no_ep_escape_assumption(iseq, code_ptr, side_exit_ptr, version);
+            }
+            Invariant::SelfIsHeapObject(iseq) => {
+                track_self_is_heap_object_assumption(iseq, code_ptr, side_exit_ptr, version);
             }
             Invariant::SingleRactorMode => {
                 track_single_ractor_assumption(code_ptr, side_exit_ptr, version);

@@ -2046,6 +2046,66 @@ fn test_no_ep_escape_side_exit_restores_locals_while_oom() {
 }
 
 #[test]
+fn test_shared_iseq_bound_to_integer_invalidates_heap_self() {
+    // One `def` ISEQ can be bound as a method of multiple classes. Binding it to Integer after
+    // it was compiled with `self` typed as HeapBasicObject must invalidate the compiled code.
+    assert_snapshot!(inspect(r#"
+        class HeapSelfInvalidate
+          def initialize = @x = :heap
+        end
+        blk = proc { def heap_self_peek = @x }
+        HeapSelfInvalidate.class_eval(&blk)
+        obj = HeapSelfInvalidate.new
+        obj.heap_self_peek
+        obj.heap_self_peek # compile heap_self_peek assuming self is a heap object
+        Integer.class_eval(&blk) # self may be a Fixnum now
+        results = [5.heap_self_peek, obj.heap_self_peek]
+        5.heap_self_peek
+        results << 5.heap_self_peek # recompiled without the assumption
+    "#), @"[nil, :heap, nil]");
+}
+
+#[test]
+fn test_shared_iseq_bound_to_integer_before_compile() {
+    // The ISEQ is already bound to Integer when it's compiled through another class,
+    // so it must not be compiled with `self` typed as HeapBasicObject in the first place.
+    assert_snapshot!(inspect(r#"
+        class HeapSelfBeforeCompile
+          def initialize = @x = :heap
+        end
+        blk = proc { def heap_self_peek2 = @x }
+        Integer.class_eval(&blk)
+        HeapSelfBeforeCompile.class_eval(&blk)
+        obj = HeapSelfBeforeCompile.new
+        obj.heap_self_peek2
+        obj.heap_self_peek2 # compile heap_self_peek2 while called through HeapSelfBeforeCompile
+        [5.heap_self_peek2, obj.heap_self_peek2]
+    "#), @"[nil, :heap]");
+}
+
+#[test]
+fn test_shared_iseq_bound_to_float_setivar_raises_frozen_error() {
+    // A flonum is frozen and has no ivar storage; the ivar write must not skip the frozen check.
+    assert_snapshot!(inspect(r#"
+        class HeapSelfFloat
+          def initialize = @x = 0
+        end
+        blk = proc { def heap_self_poke = @x = 1 }
+        HeapSelfFloat.class_eval(&blk)
+        obj = HeapSelfFloat.new
+        obj.heap_self_poke
+        obj.heap_self_poke # compile heap_self_poke assuming self is a heap object
+        Float.class_eval(&blk) # self may be a flonum now
+        begin
+          1.5.heap_self_poke
+          :no_error
+        rescue FrozenError
+          :frozen_error
+        end
+    "#), @":frozen_error");
+}
+
+#[test]
 fn test_send_without_block() {
     assert_snapshot!(inspect("
         def foo = 1

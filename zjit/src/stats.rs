@@ -230,6 +230,7 @@ make_counters! {
         exit_patchpoint_no_tracepoint,
         exit_patchpoint_no_newobj_hook,
         exit_patchpoint_no_ep_escape,
+        exit_patchpoint_self_is_heap_object,
         exit_patchpoint_single_ractor_mode,
         exit_patchpoint_no_singleton_class,
         exit_patchpoint_root_box_only,
@@ -635,6 +636,8 @@ pub fn side_exit_counter(reason: crate::hir::SideExitReason) -> Counter {
                                       => exit_patchpoint_no_newobj_hook,
         PatchPoint(Invariant::NoEPEscape(_))
                                       => exit_patchpoint_no_ep_escape,
+        PatchPoint(Invariant::SelfIsHeapObject(_))
+                                      => exit_patchpoint_self_is_heap_object,
         PatchPoint(Invariant::SingleRactorMode)
                                       => exit_patchpoint_single_ractor_mode,
         PatchPoint(Invariant::NoSingletonClass { .. })

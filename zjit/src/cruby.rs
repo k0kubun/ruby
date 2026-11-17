@@ -125,6 +125,8 @@ unsafe extern "C" {
 
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
+    pub fn rb_jit_iseq_mark_non_heap_self_recorded(iseq: IseqPtr);
+    pub fn rb_jit_iseq_non_heap_self_recorded_p(iseq: IseqPtr) -> bool;
 
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
@@ -1689,7 +1691,18 @@ pub fn class_has_leaf_allocator(class: VALUE) -> bool {
 ///
 /// Returns `false` conservatively for anything that doesn't clearly qualify
 /// (modules, singleton classes, custom allocators, non-`def` ISEQs, etc.).
+///
+/// The same ISEQ can be bound as a method of multiple classes, so this also
+/// returns `false` once the ISEQ has ever been bound to a class that doesn't
+/// qualify, regardless of `owner`. See `rb_zjit_iseq_method_bound`.
 pub fn iseq_self_is_heap_object(iseq: IseqPtr, owner: VALUE) -> bool {
+    if unsafe { rb_jit_iseq_non_heap_self_recorded_p(iseq) } { return false; }
+    method_self_is_heap_object(iseq, owner)
+}
+
+/// Whether `self` of `iseq` is a heap object when it's called as a method of `owner`.
+/// Unlike [iseq_self_is_heap_object], this only looks at the given `owner`.
+pub fn method_self_is_heap_object(iseq: IseqPtr, owner: VALUE) -> bool {
     if unsafe { rb_get_iseq_body_type(iseq) } != ISEQ_TYPE_METHOD { return false; }
     if !unsafe { RB_TYPE_P(owner, RUBY_T_CLASS) } { return false; }
     // Check non-singleton before reading the allocator (reading it otherwise
