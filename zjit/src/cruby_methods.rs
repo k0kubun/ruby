@@ -233,6 +233,7 @@ pub fn init() -> Annotations {
     annotate!(rb_mKernel, "block_given?", inline_kernel_block_given_p);
     annotate!(rb_mKernel, "===", inline_eqq);
     annotate!(rb_mKernel, "is_a?", inline_kernel_is_a_p);
+    annotate!(rb_mKernel, "instance_of?", inline_kernel_instance_of_p);
     annotate!(rb_cString, "bytesize", inline_string_bytesize);
     annotate!(rb_cString, "size", types::Fixnum, no_gc, leaf, elidable);
     annotate!(rb_cString, "length", types::Fixnum, no_gc, leaf, elidable);
@@ -1340,6 +1341,20 @@ fn inline_kernel_is_a_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir:
     if fun.is_a(other, types::Class) {
         let result = fun.push_insn(block, hir::Insn::IsA { val: recv, class: other });
         return Some(result);
+    }
+    None
+}
+
+fn inline_kernel_instance_of_p(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[other] = args else { return None; };
+    let class = fun.type_of(other).ruby_object()?;
+    if fun.is_a(other, types::Class) {
+        let result = fun.push_insn(block, hir::Insn::IsInstanceOf { val: recv, class: other });
+        return Some(result);
+    }
+    // rb_obj_class() never returns a module. Other objects raise TypeError in the C function.
+    if unsafe { RB_TYPE_P(class, RUBY_T_MODULE) } {
+        return Some(fun.push_insn(block, hir::Insn::Const { val: hir::Const::Value(Qfalse) }));
     }
     None
 }
