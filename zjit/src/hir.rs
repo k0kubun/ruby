@@ -7336,12 +7336,14 @@ impl Function {
                         let flags = unsafe { rb_vm_ci_flag(ci) };
                         assert!(flags & VM_CALL_FCALL != 0);
 
-                        // Reject calls with complex argument handling.
-                        if unspecializable_c_call_type(flags) {
+                        // Reject calls with complex argument handling. Keyword arguments are
+                        // supported only for ISEQ targets, which are checked below.
+                        if unspecializable_call_type(flags) {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
                             continue;
                         }
+                        let has_kwarg = flags & VM_CALL_KWARG != 0;
 
                         // Get the profiled CME from the current method.
                         if self.profiles.is_none() {
@@ -7434,6 +7436,11 @@ impl Function {
                             })));
                             self.make_equal_to(insn_id, replacement);
 
+                        } else if has_kwarg {
+                            // A C function or struct member gets keyword arguments as a Hash.
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
+                            continue;
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
                             let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
                             let cfunc_argc = unsafe { get_mct_argc(cfunc) };
