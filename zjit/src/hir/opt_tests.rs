@@ -26679,6 +26679,63 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_zsuper_with_keyword_params_optimizes() {
+        eval("
+            class A
+              def foo(x, b: 0, a:) = [x, a, b]
+            end
+            class B < A
+              def foo(x, a:, b: 2)
+                super
+              end
+            end
+
+            B.new.foo(0, a: 1)
+        ");
+
+        let hir = hir_string_proc("B.new.method(:foo)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn foo@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :a@0x1001
+          v5:BasicObject = LoadField v2, :b@0x1002
+          v6:BasicObject = LoadField v2, :<empty>@0x1003
+          Jump bb3(v1, v3, v4, v5, v6)
+        bb2():
+          EntryPoint JIT(0)
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :x@1
+          v11:BasicObject = LoadArg :a@2
+          v12:BasicObject = LoadArg :b@3
+          v13:CPtr = GetEP 0
+          v14:BasicObject = LoadField v13, :<empty>@0x1004
+          Jump bb3(v9, v10, v11, v12, v14)
+        bb3(v16:BasicObject, v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject):
+          v26:StaticSymbol[:a] = Const Value(VALUE(0x1008))
+          v29:StaticSymbol[:b] = Const Value(VALUE(0x1010))
+          v32:HashExact = NewHash v26: v18, v29: v19
+          PatchPoint NoEPEscape(foo)
+          PatchPoint MethodRedefined(A@0x1018, foo@0x1020, cme:0x1028)
+          v45:CPtr = GetEP 0
+          v46:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_ME_CREF@0x1050
+          v47:CallableMethodEntry[VALUE(0x1058)] = GuardBitEquals v46, Value(VALUE(0x1058))
+          v48:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
+          v49:FalseClass = GuardBitEquals v48, Value(false) recompile
+          v68:Fixnum[0] = Const Value(0)
+          PushInlineFrame :foo, v16 (0x1068), num_args=3
+          v64:ArrayExact = NewArray v17, v18, v19
+          PopInlineFrame
+          CheckInterrupts
+          Return v64
+        ");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A
