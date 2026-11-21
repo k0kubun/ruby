@@ -4845,6 +4845,49 @@ fn test_zsuper_with_keyword_params() {
 }
 
 #[test]
+fn test_send_to_zsuper_method() {
+    assert_snapshot!(inspect(r#"
+        class C
+          attr_reader :x
+          def initialize(x)
+            @x = x
+          end
+          private_class_method :new
+          def self.make(x) = new(x)
+        end
+        class Base
+          def foo = :base
+        end
+        class A < Base
+        end
+        class B < A
+          private :foo
+          def bar = foo
+        end
+
+        def test(b) = [C.make(1).x, b.bar]
+
+        b = B.new
+        test(b)
+        results = [test(b)]
+        class A
+          def foo = :intermediate
+        end
+        results << test(b)
+        class A
+          def foo = :redefined
+        end
+        results << test(b)
+        errors = [-> { C.new(1) }, -> { b.foo }].map do |f|
+          f.call
+        rescue NoMethodError => e
+          e.message
+        end
+        results + errors
+    "#), @r#"[[1, :base], [1, :intermediate], [1, :redefined], "private method 'new' called for class C", "private method 'foo' called for an instance of B"]"#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String
