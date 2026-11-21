@@ -1304,6 +1304,8 @@ impl Assembler {
         asm_dump!(asm, split);
 
         trace_compile_phase("regalloc", || {
+            // Register allocation doesn't change the CFG until resolve_ssa splits critical edges
+            asm.cache_reverse_post_order();
             trace_compile_phase("number_instructions", || asm.number_instructions(0));
 
             let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());

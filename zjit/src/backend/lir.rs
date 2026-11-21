@@ -1899,6 +1899,10 @@ pub struct Assembler {
     /// HIR blocks that are slow paths. Their LIR blocks are placed after the other blocks.
     /// See [`hir::Block::cold`].
     cold_hir_blocks: HashSet<hir::BlockId>,
+
+    /// The reverse post-order of the CFG, cached by [`Assembler::cache_reverse_post_order`] for
+    /// the passes that don't change the CFG. Creating a block clears it.
+    reverse_post_order_cache: Option<Vec<BlockId>>,
 }
 
 impl Assembler
@@ -1916,6 +1920,7 @@ impl Assembler
             idx: 0,
             stack_map: None,
             cold_hir_blocks: HashSet::default(),
+            reverse_post_order_cache: None,
         }
     }
 
@@ -1963,6 +1968,7 @@ impl Assembler
 
     // Create a new LIR basic block.  Returns the newly created block ID
     pub fn new_block(&mut self, hir_block_id: hir::BlockId, is_entry: bool, rpo_index: usize) -> BlockId {
+        self.reverse_post_order_cache = None;
         let bb_id = BlockId(self.basic_blocks.len());
         let lir_bb = BasicBlock::new(bb_id, hir_block_id, is_entry, rpo_index);
         self.basic_blocks.push(lir_bb);
@@ -1976,6 +1982,7 @@ impl Assembler
     // when creating new assemblers during passes when we want to translate
     // one assembler to a new one.
     pub fn new_block_from_old_block(&mut self, old_block: &BasicBlock) -> BlockId {
+        self.reverse_post_order_cache = None;
         let bb_id = BlockId(self.basic_blocks.len());
         let mut lir_bb = BasicBlock::new(bb_id, old_block.hir_block_id, old_block.is_entry, old_block.rpo_index);
         lir_bb.parameters = old_block.parameters.clone();
@@ -3305,6 +3312,20 @@ impl Assembler
 
     /// Return a traversal of the block graph in reverse post-order.
     pub fn reverse_post_order(&self) -> Vec<BlockId> {
+        if let Some(rpo) = &self.reverse_post_order_cache {
+            debug_assert_eq!(*rpo, self.compute_reverse_post_order(), "the CFG changed after cache_reverse_post_order");
+            return rpo.clone();
+        }
+        self.compute_reverse_post_order()
+    }
+
+    /// Cache the reverse post-order of the CFG for the passes that follow until a block is
+    /// created. The passes must not change the CFG in other ways, e.g. jump targets.
+    pub fn cache_reverse_post_order(&mut self) {
+        self.reverse_post_order_cache = Some(self.compute_reverse_post_order());
+    }
+
+    fn compute_reverse_post_order(&self) -> Vec<BlockId> {
         let entry_blocks: Vec<BlockId> = self.basic_blocks.iter()
             .filter(|block| block.is_entry)
             .map(|block| block.id)
@@ -3469,6 +3490,7 @@ impl Assembler
 
     /// Mark a HIR block as a slow path to be placed after the other blocks.
     pub fn mark_cold_hir_block(&mut self, hir_block_id: hir::BlockId) {
+        self.reverse_post_order_cache = None;
         self.cold_hir_blocks.insert(hir_block_id);
     }
 
@@ -3528,13 +3550,8 @@ impl Assembler
     /// A VReg is live-in to a block if it may be used before being defined.
     pub fn analyze_liveness(&self) -> Liveness {
         // Get blocks in postorder
-        let po_blocks = {
-            let entry_blocks: Vec<BlockId> = self.basic_blocks.iter()
-                .filter(|block| block.is_entry)
-                .map(|block| block.id)
-                .collect();
-            self.po_from(entry_blocks)
-        };
+        let mut po_blocks = self.reverse_post_order();
+        po_blocks.reverse();
 
         // A VReg can only be live-in to a block if some block uses it without defining it.
         // Most VRegs are temporaries that are only used in the block that defines them, so
