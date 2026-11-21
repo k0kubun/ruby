@@ -605,6 +605,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         let mut hir_to_lir: Vec<Option<lir::BlockId>> = vec![None; function.num_blocks()];
 
         let reverse_post_order = function.reverse_post_order();
+        let fused_bit_equals = function.bit_equals_fused_into_branches();
 
         // Create all LIR basic blocks corresponding to HIR basic blocks
         for (rpo_idx, &block_id) in reverse_post_order.iter().enumerate() {
@@ -671,6 +672,10 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
             // Compile all instructions
             for (insn_idx, &insn_id) in block.insns().enumerate() {
+                // The CondBranch ending the block compares the operands itself.
+                if fused_bit_equals[function.find_id(insn_id)] {
+                    continue;
+                }
                 // A Snapshot generates no code, so don't clone it with its FrameState unless
                 // it's printed in a comment or the perf map.
                 if !print_snapshots && matches!(function.find_ref(insn_id), Insn::Snapshot { .. }) {
@@ -683,7 +688,6 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                 asm_comment!(asm, "Insn: {insn_id} {insn}");
                 let result = match &insn {
                     Insn::CondBranch { val, if_true, if_false } => {
-                        let val_opnd = jit.get_opnd(*val);
                         let true_target = hir_to_lir[if_true.target].unwrap();
                         let false_target = hir_to_lir[if_false.target].unwrap();
 
@@ -697,8 +701,16 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
                             args: if_false.args.iter().map(|insn_id| jit.get_opnd(*insn_id)).collect()
                         };
 
-                        asm.test(val_opnd, val_opnd);
-                        asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(true_branch))));
+                        let val = function.find_id(*val);
+                        if fused_bit_equals[val] {
+                            let &Insn::IsBitEqual { left, right } = function.find_ref(val) else { unreachable!() };
+                            asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
+                            asm.push_insn(lir::Insn::Je(Target::Block(Box::new(true_branch))));
+                        } else {
+                            let val_opnd = jit.get_opnd(val);
+                            asm.test(val_opnd, val_opnd);
+                            asm.push_insn(lir::Insn::Jnz(Target::Block(Box::new(true_branch))));
+                        }
                         asm.jmp(Target::Block(Box::new(false_branch)));
 
                         assert!(asm.current_block().insns.last().unwrap().is_terminator());
