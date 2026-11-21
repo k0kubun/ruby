@@ -4253,6 +4253,50 @@ fn test_send_caller_splat_with_ruby2_keywords_hash_to_cfunc() {
 }
 
 #[test]
+fn test_send_forwarded_nil_kw_splat_to_iseq() {
+    eval("
+        def test(*a, **kw, &b) = [a, kw, b&.call]
+        def entry(x, ...) = test(x, ...)
+        def run = entry(1) { 3 }
+        run
+    ");
+    assert_snapshot!(assert_compiles("[entry(1), run]"), @"[[[1], {}, nil], [[1], {}, 3]]");
+    // Keywords after a nil profile side-exit and recompile
+    assert_snapshot!(inspect("[entry(1, k: 2), entry(1, k: 2), entry(1)]"), @"[[[1], {k: 2}, nil], [[1], {k: 2}, nil], [[1], {}, nil]]");
+}
+
+#[test]
+fn test_send_forwarded_nil_kw_splat_to_cfunc() {
+    eval("
+        def entry(n, ...) = Array.new(n, ...)
+        def run = entry(2) { _1 * 10 }
+        run
+    ");
+    assert_snapshot!(assert_compiles("[entry(2), run]"), @"[[nil, nil], [0, 10]]");
+}
+
+#[test]
+fn test_send_anonymous_nil_kw_splat() {
+    eval("
+        def test(*a, **kw, &b) = [a, kw, b&.call]
+        def entry(*, **, &) = test(*, **, &)
+        entry(1)
+    ");
+    assert_snapshot!(assert_compiles("entry(1)"), @"[[1], {}, nil]");
+    assert_snapshot!(inspect("[entry(1, k: 2), entry(1, k: 2)]"), @"[[[1], {k: 2}, nil], [[1], {k: 2}, nil]]");
+}
+
+#[test]
+fn test_send_literal_nil_kw_splat() {
+    eval("
+        def test(*a, **kw) = [a, kw]
+        def entry = test(1, **nil)
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[1], {}]");
+}
+
+#[test]
 fn test_send_symbol_block_arg_with_refinements_activated_after_compile() {
     assert_snapshot!(inspect("
         module Doubling
@@ -4647,7 +4691,8 @@ fn test_send_anonymous_kwrest() {
     eval("
         def inner(*a, **kw) = [a, kw]
         def test(**) = inner(**)
-        def entry = [test, test(a: 1)]
+        def test_kw(**) = inner(**)
+        def entry = [test, test_kw(a: 1)]
         entry
     ");
     assert_snapshot!(assert_compiles("entry"), @"[[[], {}], [[], {a: 1}]]");
