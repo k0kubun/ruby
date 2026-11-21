@@ -153,7 +153,9 @@ impl Assembler {
 
         while let Some((_index, mut insn)) = iterator.next(asm) {
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
-            let is_jump = insn.is_jump();
+            // Like jumps, a PatchPoint keeps Opnd::Value in its side exit, which doesn't need a
+            // register. Loading them would leave dead loads at the patch point.
+            let is_jump = insn.is_jump() || matches!(insn, Insn::PatchPoint(_));
 
             if !is_jump {
                 insn.for_each_operand_mut(|opnd| {
