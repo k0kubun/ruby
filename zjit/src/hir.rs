@@ -3271,6 +3271,9 @@ pub struct Function {
     /// Whether previously, a function for this ISEQ was invalidated due to
     /// singleton class creation (violation of NoSingletonClass invariant).
     was_invalidated_for_singleton_class_creation: bool,
+    /// Whether every operand points to its representative in the union-find, which
+    /// [`Self::resolve_all_operands`] ensures until the next new instruction or union.
+    operands_resolved: bool,
     /// Whether `self` is guaranteed to be a heap (non-immediate) object. When set,
     /// the `self`-producing instructions (`LoadSelf` and the `SelfParam` `LoadArg`)
     /// are typed `HeapBasicObject` instead of `BasicObject`. Sourced from
@@ -3769,6 +3772,7 @@ impl Function {
         Function {
             iseq,
             was_invalidated_for_singleton_class_creation: false,
+            operands_resolved: false,
             self_is_heap_object: false,
             policy: CompilePolicy::new(iseq),
             insns: vec![],
@@ -3821,6 +3825,7 @@ impl Function {
 
     // Add an instruction to the function without adding it to any block
     fn new_insn(&mut self, insn: Insn) -> InsnId {
+        self.operands_resolved = false;
         let id = InsnId::from(self.insns.len());
         if insn.has_output() {
             self.insn_types.push(types::Any);
@@ -4435,6 +4440,44 @@ impl Function {
                 "Can't replace instruction that has output with instruction that has no output");
         // Don't push it to the block
         self.union_find.borrow_mut().make_equal_to(insn, replacement);
+        self.operands_resolved = false;
+    }
+
+    /// Make every operand point to its representative, so that [`Self::resolved_insn`] and
+    /// [`Self::resolved_frame_state`] can borrow instructions instead of resolving copies.
+    pub fn resolve_all_operands(&mut self) {
+        let union_find = self.union_find.get_mut();
+        for idx in 0..self.insns.len() {
+            let insn_id = InsnId::from(idx);
+            if union_find.find_const(insn_id) == insn_id {
+                self.insns[insn_id].for_each_operand_mut(&mut |operand: &mut InsnId| {
+                    *operand = union_find.find_const(*operand);
+                });
+            }
+        }
+        self.operands_resolved = true;
+    }
+
+    /// Return the instruction at `find(insn_id)` with resolved operands like [`Self::find`],
+    /// but borrow it if [`Self::resolve_all_operands`] has resolved them.
+    pub fn resolved_insn(&self, insn_id: InsnId) -> std::borrow::Cow<'_, Insn> {
+        if !self.operands_resolved {
+            return std::borrow::Cow::Owned(self.find(insn_id));
+        }
+        let insn = self.find_ref(insn_id);
+        debug_assert_eq!(format!("{insn:?}"), format!("{:?}", self.find(insn_id)), "unresolved operand in {insn_id}");
+        std::borrow::Cow::Borrowed(insn)
+    }
+
+    /// Return the FrameState at the given instruction like [`Self::frame_state`], but borrow
+    /// it if [`Self::resolve_all_operands`] has resolved the operands.
+    pub fn resolved_frame_state(&self, insn_id: InsnId) -> std::borrow::Cow<'_, FrameState> {
+        if !self.operands_resolved {
+            return std::borrow::Cow::Owned(self.frame_state(insn_id));
+        }
+        let state = self.frame_state_ref(insn_id);
+        debug_assert_eq!(format!("{state:?}"), format!("{:?}", self.frame_state(insn_id)), "unresolved operand in {insn_id}");
+        std::borrow::Cow::Borrowed(state)
     }
 
     pub fn type_of(&self, insn: InsnId) -> Type {
