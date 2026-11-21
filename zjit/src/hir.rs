@@ -7576,7 +7576,7 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, insns_at_pass_start: usize, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -7615,7 +7615,7 @@ impl Function {
         // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
         // `Options::inline_budget` for the full unit/semantics caveat.
         let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && !ignore_budget && (insns_at_pass_start > budget || self.num_instructions > budget) {
+        if budget != INLINE_BUDGET_UNLIMITED && !ignore_budget && self.num_instructions > budget {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -7641,13 +7641,6 @@ impl Function {
         if get_option!(inline_threshold) == 0 {
             return false;
         }
-
-        // Make sure we sample `self.insns.len()` at the beginning of the pass. `should_inline`
-        // checks it against the inlining budget so that every SendDirect that exists at the start
-        // of the pass is judged by the size of the caller. If we checked only `num_instructions`,
-        // callers would inline several times more and could exhaust the code region (e.g. 30k_ifelse).
-        // TODO: Check only `num_instructions` with a lower `inline_budget` and remove this.
-        let insns_at_pass_start = self.insns.len();
 
         let mut did_inline = false;
         self.inline_pass += 1;
@@ -7741,7 +7734,7 @@ impl Function {
                 let inline_block = inline_block || yields_literal_block;
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || !self.should_inline(iseq, cme, insns_at_pass_start, inline_block || throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
+                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -8162,11 +8155,7 @@ impl Function {
         // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
         // This is bounded by the number of literal blocks in the inlined methods' callers.
         let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
-        // A literal block's InvokeBlockIseqDirect only appears once the iterator that yields to
-        // it is inlined, usually in the same pass, so the size of the function at the start of
-        // the pass would charge the block for the instructions of the pass that inlined its
-        // iterator (e.g. an `:always_inline` Array#each). Judge it by `num_instructions` alone.
-        if !self.should_inline(iseq, ptr::null(), 0, throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
+        if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
             return None;
         }
 
