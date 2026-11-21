@@ -420,7 +420,7 @@ impl Assembler {
             }
         }
 
-        let mut asm_local = Assembler::new_with_asm(&self);
+        let mut asm_local = Assembler::new_with_asm(&mut self);
         let mut iterator = self.instruction_iterator();
         let asm = &mut asm_local;
 
@@ -698,7 +698,7 @@ impl Assembler {
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so this
     /// splits them and uses scratch registers for it.
     /// Linearizes all blocks into a single giant block.
-    fn arm64_scratch_split(self) -> Assembler {
+    fn arm64_scratch_split(mut self) -> Assembler {
         /// If opnd is Opnd::Mem with a too large disp, make the disp smaller using lea.
         fn split_large_disp(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             match opnd {
@@ -782,7 +782,7 @@ impl Assembler {
             }
         }
 
-        let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
+        let mut asm_local = Assembler::new_with_asm_without_blocks(&mut self);
         asm_local.accept_scratch_reg = true;
 
         // Create one giant block to linearize everything into

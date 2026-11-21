@@ -1958,7 +1958,8 @@ impl Assembler
 
     /// Create an Assembler with parameters of another Assembler and empty instructions.
     /// Compiler passes build a next Assembler with this API and insert new instructions to it.
-    pub(super) fn new_with_asm(old_asm: &Assembler) -> Self {
+    /// The label names move to the new Assembler.
+    pub(super) fn new_with_asm(old_asm: &mut Assembler) -> Self {
         let mut asm = Self::new_with_asm_without_blocks(old_asm);
 
         // Initialize basic blocks from the old assembler, preserving hir_block_id and entry flag
@@ -1971,9 +1972,10 @@ impl Assembler
     }
 
     /// Create an Assembler with parameters of another Assembler, but without basic blocks.
-    pub(super) fn new_with_asm_without_blocks(old_asm: &Assembler) -> Self {
+    /// The label names move to the new Assembler.
+    pub(super) fn new_with_asm_without_blocks(old_asm: &mut Assembler) -> Self {
         let mut asm = Self {
-            label_names: old_asm.label_names.clone(),
+            label_names: take(&mut old_asm.label_names),
             accept_scratch_reg: old_asm.accept_scratch_reg,
             stack_state: old_asm.stack_state.clone(),
             cold_hir_blocks: old_asm.cold_hir_blocks.clone(),
@@ -4544,8 +4546,8 @@ impl Assembler {
 
     /// This is used for trampolines that don't allow scratch registers.
     /// Linearizes all blocks into a single giant block.
-    pub fn resolve_parallel_mov_pass(self) -> Assembler {
-        let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
+    pub fn resolve_parallel_mov_pass(mut self) -> Assembler {
+        let mut asm_local = Assembler::new_with_asm_without_blocks(&mut self);
 
         // Create one giant block to linearize everything into
         asm_local.new_block_without_id("linearized");

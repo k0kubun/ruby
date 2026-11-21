@@ -153,7 +153,7 @@ impl Assembler {
     /// Split IR instructions for the x86 platform
     fn x86_split(mut self) -> Assembler
     {
-        let mut asm_local = Assembler::new_with_asm(&self);
+        let mut asm_local = Assembler::new_with_asm(&mut self);
         let asm = &mut asm_local;
         let mut iterator = self.instruction_iterator();
 
@@ -335,7 +335,7 @@ impl Assembler {
     /// for VRegs, most splits should happen in [`Self::x86_split`]. However, some instructions
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so
     /// this splits them and uses scratch registers for it.
-    pub fn x86_scratch_split(self) -> Assembler {
+    pub fn x86_scratch_split(mut self) -> Assembler {
         /// For some instructions, we want to be able to lower a 64-bit operand
         /// without requiring more registers to be available in the register
         /// allocator. So we just use the SCRATCH0_OPND register temporarily to hold
@@ -464,7 +464,7 @@ impl Assembler {
             }
         }
 
-        let mut asm_local = Assembler::new_with_asm_without_blocks(&self);
+        let mut asm_local = Assembler::new_with_asm_without_blocks(&mut self);
         asm_local.accept_scratch_reg = true;
 
         // Create one giant block to linearize everything into
