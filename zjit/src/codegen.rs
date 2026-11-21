@@ -4526,10 +4526,12 @@ fn gen_prepare_fallback_call(jit: &JITState, asm: &mut Assembler, function: &Fun
 fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> Vec<StackMapEntry> {
     // The top frame's entries and the frame marker. Frames it's inlined into add more.
     let mut stack = Vec::with_capacity(state.stack_size() + state.locals().len() + 1);
-    let mut current_state = std::borrow::Cow::Borrowed(state);
+    let mut current_state = state;
     loop {
+        // Read the frames `state` is inlined into without cloning their FrameStates, so resolve
+        // their operands here like Function::frame_state() would.
         let to_entry = |insn_id| {
-            let opnd = jit.get_opnd(insn_id);
+            let opnd = jit.get_opnd(function.find_id(insn_id));
             assert!(
                 matches!(opnd, Opnd::Value(_) | Opnd::VReg { .. }),
                 "FrameState should only reference Opnd::Value or Opnd::VReg, but got: {opnd:?}",
@@ -4563,14 +4565,14 @@ fn build_stack_map(jit: &JITState, function: &Function, state: &FrameState) -> V
         let Some(caller) = current_state.caller() else {
             break;
         };
-        let caller_state = function.frame_state(caller);
+        let caller_state = function.frame_state_ref(caller);
         // The inlined callee's receiver, if any, is below its local table.
-        let receiver_slots = inline_frame_receiver_slots(&caller_state);
+        let receiver_slots = inline_frame_receiver_slots(caller_state);
         if receiver_slots > 0 {
             stack.push(StackMapEntry::Skip(receiver_slots));
         }
         stack.push(StackMapEntry::PrevFrame);
-        current_state = std::borrow::Cow::Owned(caller_state);
+        current_state = caller_state;
     }
     stack
 }
