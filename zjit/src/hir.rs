@@ -3334,10 +3334,10 @@ pub struct Function {
     inline_pass: usize,
     /// The number of tiny callees inlined past the inlining budget. See [`TINY_INLINE_MAX_CALLEE_SIZE`].
     tiny_inlines_past_budget: usize,
-    /// Per-call-site caches of the last receiver class found to resolve to the method entry
+    /// Per-call-site caches of the last receiver classes found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
-    pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
+    pub klass_caches: std::cell::RefCell<Vec<Box<KlassCache>>>,
     /// Per-call-site ivar inline caches for attr_reader reads that the profiled shapes didn't
     /// cover. Like the inline cache of a getinstancevariable instruction, the compiled code
     /// checks them and refills them on a miss. Codegen hands them over to the
@@ -3352,6 +3352,17 @@ pub struct Function {
     /// function), its ISEQ and the PC offset of the copy. They're pinned. See [`ensure_return_insn_idx`].
     ensure_return_blocks: HashMap<(Option<InsnId>, IseqPtr, u32), BlockId>,
 }
+
+/// Number of receiver classes that a method entry check caches per call site. JIT code checks
+/// the first one inline, and rb_zjit_cached_cme() checks the rest before the class's method
+/// cache. They fill one cache line. Keep it in sync with ZJIT_KLASS_CACHE_SIZE in zjit.c.
+pub const KLASS_CACHE_SIZE: usize = 8;
+
+/// A per-call-site cache of the receiver classes found to resolve to a method entry, most
+/// recently used first. Unused entries are Qfalse.
+#[derive(Debug)]
+#[repr(C, align(64))]
+pub struct KlassCache(pub [VALUE; KLASS_CACHE_SIZE]);
 
 /// An inlined method or block frame. The inliner records these so that inlining a block
 /// later can find the frames that a `break` or non-local `return` from the block unwinds to.
@@ -5703,8 +5714,8 @@ impl Function {
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
         let mid_opnd = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { rb_id2sym(mid) }) });
         // Qfalse is never the class of an object, so a new cache misses.
-        let klass_cache = Box::new(Qfalse);
-        let klass_cache_opnd = self.push_insn(block, Insn::Const { val: Const::CPtr(&*klass_cache as *const VALUE as *const u8) });
+        let klass_cache = Box::new(KlassCache([Qfalse; KLASS_CACHE_SIZE]));
+        let klass_cache_opnd = self.push_insn(block, Insn::Const { val: Const::CPtr(klass_cache.0.as_ptr() as *const u8) });
         self.klass_caches.borrow_mut().push(klass_cache);
         let cache_owner = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(self.iseq)) });
         let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
