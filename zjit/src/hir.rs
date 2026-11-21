@@ -6888,7 +6888,12 @@ impl Function {
                     && crate::codegen::iseq_may_yield(iseq);
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, insns_at_pass_start, throw_yielder)) || !Self::can_inline(iseq) {
+                // A literal block's InvokeBlockIseqDirect only appears once the iterator that yields to
+                // it is inlined, so the size of the function at the start of the pass would charge the
+                // block for the instructions of the pass that inlined its iterator (e.g. an
+                // `:always_inline` Array#each). Judge a block by `num_instructions` alone.
+                let pass_start = if matches!(inline_call, InlineCall::InvokeBlock { .. }) { 0 } else { insns_at_pass_start };
+                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, pass_start, throw_yielder)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
