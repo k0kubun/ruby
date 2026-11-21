@@ -10043,6 +10043,42 @@ impl Function {
         }
     }
 
+    /// Return the `IsBitEqual` instructions that codegen can fuse into the `CondBranch` ending
+    /// their block, branching on the compare's condition flags (`cmp left, right; je`) instead of
+    /// materializing the boolean and testing it again. Like `fuse_fixnum_compare_branches`, the
+    /// compare must be defined in the same block as the branch and have no other use. Dispatch
+    /// chains, e.g. the shape and class checks of polymorphic ivar accesses and sends, are made of
+    /// such branches.
+    pub fn bit_equals_fused_into_branches(&self) -> Vec<bool> {
+        let mut fused = vec![false; self.insns.len()];
+        let rpo = self.reverse_post_order();
+        let mut candidates = vec![];
+        for &block_id in &rpo {
+            // Terminators are never unioned, so the block's last insn id is the branch itself.
+            let Some(&branch_id) = self.blocks[block_id].insns.last() else { continue };
+            let &Insn::CondBranch { val, .. } = &self.insns[branch_id] else { continue };
+            let cmp_id = self.find_id(val);
+            if !matches!(self.find_ref(cmp_id), Insn::IsBitEqual { .. }) { continue; }
+            if !self.blocks[block_id].insns.iter().any(|&insn_id| self.find_id(insn_id) == cmp_id) { continue; }
+            candidates.push(cmp_id);
+        }
+        if candidates.is_empty() {
+            return fused;
+        }
+        let mut use_count = vec![0u32; self.insns.len()];
+        for &block_id in &rpo {
+            for &insn_id in &self.blocks[block_id].insns {
+                self.find_ref(insn_id).for_each_operand(|operand| {
+                    use_count[self.find_id(operand)] += 1;
+                });
+            }
+        }
+        for cmp_id in candidates {
+            fused[cmp_id] = use_count[cmp_id] == 1;
+        }
+        fused
+    }
+
     /// A loop condition like `while i < n` ends its block with `cmp; CheckInterrupts; CondBranchTest
     /// cmp`, where the interrupt check's side exit has the compare result on the stack, which
     /// keeps the compare materialized. If everything between the compare's own `Snapshot` (taken
@@ -15502,6 +15538,33 @@ mod validation_tests {
             assert!(matches!(function.find_ref(last), Insn::Unreachable),
                 "expected entry terminator to fold to Unreachable");
         });
+    }
+
+    // An `IsBitEqual` whose only use is the `CondBranch` ending its block is fused into the
+    // branch. One that is also used elsewhere or defined in another block stays materialized.
+    #[test]
+    fn bit_equals_fused_into_branches() {
+        let mut function = Function::new(std::ptr::null());
+        let entry = function.entry_block;
+        let second = function.new_block(0);
+        let third = function.new_block(0);
+        let exit = function.new_block(0);
+        function.push_insn(exit, Insn::Unreachable);
+        let left = function.push_insn(entry, Insn::Const { val: Const::CShape(ShapeId(1)) });
+        let right = function.push_insn(entry, Insn::Const { val: Const::CShape(ShapeId(2)) });
+        let fused = function.push_insn(entry, Insn::IsBitEqual { left, right });
+        let other_block = function.push_insn(entry, Insn::IsBitEqual { left: right, right });
+        let edge = |target| BranchEdge { target, args: vec![] };
+        function.push_insn(entry, Insn::CondBranch { val: fused, if_true: edge(second), if_false: edge(exit) });
+        let reused = function.push_insn(second, Insn::IsBitEqual { left, right: left });
+        function.push_insn(second, Insn::BoxBool { val: reused });
+        function.push_insn(second, Insn::CondBranch { val: reused, if_true: edge(third), if_false: edge(exit) });
+        function.push_insn(third, Insn::CondBranch { val: other_block, if_true: edge(exit), if_false: edge(exit) });
+        function.seal_entries();
+        let result = function.bit_equals_fused_into_branches();
+        assert!(result[fused]);
+        assert!(!result[reused]);
+        assert!(!result[other_block]);
     }
 
     #[test]
