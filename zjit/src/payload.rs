@@ -165,7 +165,7 @@ pub struct IseqVersion {
 
     /// Per-call-site caches of a receiver class that the JIT code writes at run time. See
     /// [`crate::hir::Function::klass_caches`]. Marked and moved by [`crate::gc`].
-    pub klass_caches: Vec<Box<VALUE>>,
+    pub klass_caches: Vec<Box<crate::hir::KlassCache>>,
 
     /// Ivar inline caches of attr_reader reads that the JIT code checks and writes at run
     /// time. See [`crate::hir::Function::ivar_caches`].
