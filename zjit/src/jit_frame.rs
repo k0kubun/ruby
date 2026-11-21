@@ -139,9 +139,18 @@ fn test_stack_map_example() {
     assert_eq!(writer.finish(), [0, ZJIT_STACK_MAP_OP_END as u8]);
 }
 
+thread_local! {
+    /// The buffer of the last stack map installed by [JITFrame::set_stack_map], reused by the
+    /// next [StackMapWriter] to avoid allocating one for every call and side exit.
+    static STACK_MAP_BUFFER: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 impl StackMapWriter {
     pub fn new(materialize_block_code: bool) -> Self {
-        Self { bytes: vec![u8::from(materialize_block_code)], written_len: 1, short_skip_pos: None }
+        let mut bytes = STACK_MAP_BUFFER.take();
+        bytes.clear();
+        bytes.push(u8::from(materialize_block_code));
+        Self { bytes, written_len: 1, short_skip_pos: None }
     }
 
     fn write_op(&mut self, op: u32) {
@@ -324,6 +333,7 @@ impl JITFrame {
         debug_assert_eq!(writer.bytes.first().map(|byte| byte & 1 != 0), Some(self.materialize_block_code()));
         // Avoid allocating memory more than once for the same stack map
         if EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty.as_ptr())) {
+            STACK_MAP_BUFFER.set(writer.bytes);
             return;
         }
         let bytes = writer.finish();
@@ -331,6 +341,7 @@ impl JITFrame {
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), stack_map, bytes.len()); }
         incr_counter_by(Counter::jit_frame_stack_map_bytes, bytes.len().as_u64());
         self.stack_map = stack_map;
+        STACK_MAP_BUFFER.set(bytes);
     }
 
     /// Create a JITFrame for an ISEQ frame.
