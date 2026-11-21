@@ -999,6 +999,15 @@ vm_get_cref(const VALUE *ep)
     }
 }
 
+// For JITs: non-zero when vm_caller_setup_arg_block() in the current frame would turn
+// a Symbol block arg into a refinement-aware lambda instead of passing the Symbol as is.
+size_t
+rb_vm_symbol_block_arg_refined_p(VALUE sym)
+{
+    const rb_cref_t *cref = vm_env_cref(GET_EC()->cfp->ep);
+    return cref && !NIL_P(CREF_REFINEMENTS(cref));
+}
+
 rb_cref_t *
 rb_vm_get_cref(const VALUE *ep)
 {
