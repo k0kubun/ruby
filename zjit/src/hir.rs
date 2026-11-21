@@ -10197,9 +10197,14 @@ impl Function {
             VisitEdges,
             VisitSelf,
         }
+        thread_local! {
+            /// The DFS stack and the visited set, reused across the many traversals of each compilation
+            static SCRATCH: std::cell::Cell<Option<(Vec<(BlockId, Action)>, BlockSet)>> = const { std::cell::Cell::new(None) };
+        }
         let mut result = Vec::with_capacity(self.blocks.len());
-        let mut seen = BlockSet::with_capacity(self.blocks.len());
-        let mut stack = Vec::with_capacity(self.blocks.len() * 2);
+        let (mut stack, mut seen) = SCRATCH.take().unwrap_or_else(|| (vec![], BlockSet::with_capacity(0)));
+        stack.clear();
+        seen.reset(self.blocks.len());
         stack.push((start, Action::VisitEdges));
         while let Some((block, action)) = stack.pop() {
             if action == Action::VisitSelf {
@@ -10212,6 +10217,7 @@ impl Function {
                 stack.push((target, Action::VisitEdges));
             }
         }
+        SCRATCH.set(Some((stack, seen)));
         result
     }
 
