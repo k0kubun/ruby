@@ -1507,6 +1507,9 @@ pub enum Insn {
     GuardType { val: InsnId, guard_type: Type, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if val is not the expected Const.
     GuardBitEquals { val: InsnId, expected: Const, reason: Box<SideExitReason>, state: InsnId, recompile: Option<Recompile> },
+    /// Side-exit if val, an `ep[VM_ENV_DATA_INDEX_ME_CREF]` of a method frame, doesn't hold the
+    /// expected method entry, either directly or in the svar that the frame created for `$~`/`$_`.
+    GuardMethodEntry { val: InsnId, expected: Const, state: InsnId },
     /// Side-exit if (val & mask) == 0
     GuardAnyBitSet { val: InsnId, mask: Const, mask_name: Option<ID>, reason: Box<SideExitReason>, state: InsnId, recompile: Option<Recompile> },
     /// Side-exit if (val & mask) != 0
@@ -1686,6 +1689,7 @@ macro_rules! for_each_operand_impl {
             | Insn::ObjectAlloc { val, state }
             | Insn::GuardType { val, state, .. }
             | Insn::GuardBitEquals { val, state, .. }
+            | Insn::GuardMethodEntry { val, state, .. }
             | Insn::GuardAnyBitSet { val, state, .. }
             | Insn::GuardNoBitsSet { val, state, .. }
             | Insn::GuardNotNull { val, state, .. }
@@ -2240,6 +2244,8 @@ impl Insn {
                     abstract_heaps::Control
                 ),
             Insn::GuardBitEquals { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
+            // Reads the svar's cref_or_me field
+            Insn::GuardMethodEntry { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Control),
             Insn::GuardAnyBitSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardNoBitsSet { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
             Insn::GuardNotNull { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Control),
@@ -2700,6 +2706,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 }
                 return Ok(())
             },
+            Insn::GuardMethodEntry { val, expected, .. } => { write!(f, "GuardMethodEntry {val}, {}", expected.print(self.ptr_map)) },
             Insn::GuardAnyBitSet { val, mask, mask_name, recompile, .. } => {
                 let mask = mask.print(self.ptr_map);
                 let recompile = if recompile.is_some() { " recompile" } else { "" };
@@ -4580,6 +4587,7 @@ impl Function {
             Insn::GuardType { val, guard_type, .. } => self.type_of(*val).intersection(*guard_type),
             Insn::RefineType { val, new_type, .. } => self.type_of(*val).intersection(*new_type),
             Insn::GuardBitEquals { val, expected, .. } => self.type_of(*val).intersection(Type::from_const(*expected)),
+            Insn::GuardMethodEntry { val, .. } => self.type_of(*val),
             Insn::GuardAnyBitSet { val, .. } => self.type_of(*val),
             Insn::GuardNoBitsSet { val, .. } => self.type_of(*val),
             Insn::GuardNotNull { val, .. } => self.type_of(*val),
@@ -7189,9 +7197,9 @@ impl Function {
                             let level = get_lvar_level(local_iseq);
                             let lep = fun.get_ep(block, level);
                             // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
-                            let method_entry = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
-                            // Guard that it matches the expected CME
-                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
+                            let me_cref = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
+                            // Guard that it holds the expected CME
+                            fun.push_insn(block, Insn::GuardMethodEntry { val: me_cref, expected: Const::Value(current_cme.into()), state });
 
                             let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
                             fun.push_insn(block, Insn::GuardBitEquals {
@@ -9955,7 +9963,7 @@ impl Function {
     /// Whether re-executing `insn` in the interpreter is unobservable: it has no side effects, or
     /// it can only side-exit to its own state.
     fn is_pure_or_guard(insn: &Insn) -> bool {
-        insn.is_elidable() || matches!(insn, Insn::PatchPoint { .. } | Insn::GuardType { .. } | Insn::GuardBitEquals { .. })
+        insn.is_elidable() || matches!(insn, Insn::PatchPoint { .. } | Insn::GuardType { .. } | Insn::GuardBitEquals { .. } | Insn::GuardMethodEntry { .. })
     }
 
     /// Remove instructions that do not have side effects and are not referenced by any other
@@ -11187,6 +11195,7 @@ impl Function {
                 }
             }
             Insn::GuardNotNull { val, .. } => self.assert_subtype(insn_id, val, types::CPtr),
+            Insn::GuardMethodEntry { val, .. } => self.assert_subtype(insn_id, val, types::RubyValue),
             Insn::GuardLess { left, right, .. }
             | Insn::GuardGreaterEq { left, right, .. } => {
                 self.assert_subtype(insn_id, left, types::CInt64)?;

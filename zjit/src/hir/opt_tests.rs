@@ -16396,7 +16396,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Struct@0x1088, initialize@0x1038, cme:0x1090)
           v76:CPtr = GetEP 0
           v77:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_ME_CREF@0x10b8
-          v78:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v77, Value(VALUE(0x1040))
+          v78:RubyValue = GuardMethodEntry v77, Value(VALUE(0x1040))
           v79:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_SPECVAL@0x10b9
           v80:FalseClass = GuardBitEquals v79, Value(false) recompile
           v81:CUInt64 = LoadField v46, :RBASIC_FLAGS@0x10ba
@@ -17640,7 +17640,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, <<@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
+          v27:RubyValue = GuardMethodEntry v26, Value(VALUE(0x1048))
           v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v29:FalseClass = GuardBitEquals v28, Value(false) recompile
           v30:Array = GuardType v9, Array recompile
@@ -17676,7 +17676,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, pop@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:Array = GuardType v6, Array recompile
@@ -17715,7 +17715,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
+          v27:RubyValue = GuardMethodEntry v26, Value(VALUE(0x1048))
           v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v29:FalseClass = GuardBitEquals v28, Value(false) recompile
           v30:Array = GuardType v9, Array recompile
@@ -17756,7 +17756,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
+          v27:RubyValue = GuardMethodEntry v26, Value(VALUE(0x1048))
           v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v29:FalseClass = GuardBitEquals v28, Value(false) recompile
           v30:BasicObject = CCallVariadic v9, :Array#[]@0x1051, v10
@@ -24257,7 +24257,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(SuperFwdBase@0x1008, run@0x1010, cme:0x1018)
           v29:CPtr = GetEP 0
           v30:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v31:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v30, Value(VALUE(0x1048))
+          v31:RubyValue = GuardMethodEntry v30, Value(VALUE(0x1048))
           v32:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v33:FalseClass = GuardBitEquals v32, Value(false) recompile
           v34:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
@@ -26002,7 +26002,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1000, foo@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           PushInlineFrame :foo, v6 (0x1050), num_args=0
@@ -26076,7 +26076,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
           v30:CPtr = GetEP 0
           v31:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v32:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v31, Value(VALUE(0x1048))
+          v32:RubyValue = GuardMethodEntry v31, Value(VALUE(0x1048))
           v33:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v34:FalseClass = GuardBitEquals v33, Value(false) recompile
           PushInlineFrame :foo, v9 (0x1058), num_args=1
@@ -26208,7 +26208,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Hash@0x1000, size@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:Fixnum = CCall v6, :Hash#size@0x1049
@@ -26246,7 +26246,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, reverse@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:ArrayExact = CCallWithFrame v6, :Array#reverse@0x1049
@@ -26299,7 +26299,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, join@0x1010, cme:0x1018)
           v40:CPtr = GetEP 0
           v41:RubyValue = LoadField v40, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v42:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v41, Value(VALUE(0x1048))
+          v42:RubyValue = GuardMethodEntry v41, Value(VALUE(0x1048))
           v43:RubyValue = LoadField v40, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v44:FalseClass = GuardBitEquals v43, Value(false) recompile
           v45:StringExact = CCallVariadic v24, :Array#join@0x1051, v25
@@ -26339,7 +26339,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, reverse@0x1008, cme:0x1010)
           v21:CPtr = GetEP 0
           v22:RubyValue = LoadField v21, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v23:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v22, Value(VALUE(0x1040))
+          v23:RubyValue = GuardMethodEntry v22, Value(VALUE(0x1040))
           v24:RubyValue = LoadField v21, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v25:FalseClass = GuardBitEquals v24, Value(false) recompile
           CheckInterrupts
@@ -26372,7 +26372,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(BasicObject@0x1000, initialize@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:NilClass = Const Value(nil)
@@ -26430,7 +26430,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(String@0x1008, byteindex@0x1010, cme:0x1018)
           v46:CPtr = GetEP 0
           v47:RubyValue = LoadField v46, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v48:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v47, Value(VALUE(0x1048))
+          v48:RubyValue = GuardMethodEntry v47, Value(VALUE(0x1048))
           v49:RubyValue = LoadField v46, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v50:FalseClass = GuardBitEquals v49, Value(false) recompile
           v51:BasicObject = CCallVariadic v28, :String#byteindex@0x1051, v29, v30
@@ -26469,7 +26469,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(S@0x1000, b@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:BasicObject = LoadField v6, :b@0x1049
@@ -26510,7 +26510,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(S@0x1008, b=@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
+          v27:RubyValue = GuardMethodEntry v26, Value(VALUE(0x1048))
           v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v29:FalseClass = GuardBitEquals v28, Value(false) recompile
           v30:CUInt64 = LoadField v9, :RBASIC_FLAGS@0x1051
@@ -26552,7 +26552,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(D@0x1000, a@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
+          v20:RubyValue = GuardMethodEntry v19, Value(VALUE(0x1040))
           v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
           v22:FalseClass = GuardBitEquals v21, Value(false) recompile
           v23:BasicObject = LoadField v6, :a@0x1049
@@ -26613,7 +26613,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
           v27:CPtr = GetEP 0
           v28:RubyValue = LoadField v27, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v29:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v28, Value(VALUE(0x1048))
+          v29:RubyValue = GuardMethodEntry v28, Value(VALUE(0x1048))
           v30:RubyValue = LoadField v27, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
           v31:FalseClass = GuardBitEquals v30, Value(false) recompile
           v32:Fixnum[2] = Const Value(2)
@@ -26723,7 +26723,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1018, foo@0x1020, cme:0x1028)
           v45:CPtr = GetEP 0
           v46:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_ME_CREF@0x1050
-          v47:CallableMethodEntry[VALUE(0x1058)] = GuardBitEquals v46, Value(VALUE(0x1058))
+          v47:RubyValue = GuardMethodEntry v46, Value(VALUE(0x1058))
           v48:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
           v49:FalseClass = GuardBitEquals v48, Value(false) recompile
           v68:Fixnum[0] = Const Value(0)
@@ -26964,7 +26964,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1010, foo@0x1018, cme:0x1020)
           v41:CPtr = GetEP 0
           v42:RubyValue = LoadField v41, :VM_ENV_DATA_INDEX_ME_CREF@0x1048
-          v43:CallableMethodEntry[VALUE(0x1050)] = GuardBitEquals v42, Value(VALUE(0x1050))
+          v43:RubyValue = GuardMethodEntry v42, Value(VALUE(0x1050))
           v44:RubyValue = LoadField v41, :VM_ENV_DATA_INDEX_SPECVAL@0x1058
           v45:FalseClass = GuardBitEquals v44, Value(false) recompile
           v46:StaticSymbol[:content] = Const Value(VALUE(0x1060))
@@ -31004,7 +31004,7 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Parent@0x1060, greet@0x1010, cme:0x1068)
           v48:CPtr = GetEP 0
           v49:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_ME_CREF@0x1090
-          v50:CallableMethodEntry[VALUE(0x1018)] = GuardBitEquals v49, Value(VALUE(0x1018))
+          v50:RubyValue = GuardMethodEntry v49, Value(VALUE(0x1018))
           v51:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1091
           v52:FalseClass = GuardBitEquals v51, Value(false) recompile
           PushInlineFrame :greet, v25 (0x1098), num_args=0

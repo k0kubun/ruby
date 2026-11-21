@@ -1020,6 +1020,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::GuardBitEquals { val, expected, ref reason, state, recompile } => gen_guard_bit_equals(jit, asm, function, opnd!(val), expected, **reason, recompile, &function.resolved_frame_state(state)),
         &Insn::GuardAnyBitSet { val, mask, ref reason, state, recompile, .. } => gen_guard_any_bit_set(jit, asm, function, opnd!(val), mask, **reason, recompile, &function.resolved_frame_state(state)),
         &Insn::GuardNoBitsSet { val, mask, ref reason, state, .. } => gen_guard_no_bits_set(jit, asm, function, opnd!(val), mask, **reason, &function.resolved_frame_state(state)),
+        &Insn::GuardMethodEntry { val, expected, state } => gen_guard_method_entry(jit, asm, function, opnd!(val), expected, &function.resolved_frame_state(state)),
         &Insn::GuardNotNull { val, ref reason, state } => gen_guard_not_null(jit, asm, function, opnd!(val), **reason, &function.resolved_frame_state(state)),
         &Insn::GuardLess { left, right, ref reason, state } => gen_guard_less(jit, asm, function, opnd!(left), opnd!(right), **reason, &function.resolved_frame_state(state)),
         &Insn::GuardGreaterEq { left, right, state, .. } => gen_guard_greater_eq(jit, asm, function, opnd!(left), opnd!(right), &function.resolved_frame_state(state)),
@@ -4263,6 +4264,26 @@ fn gen_guard_no_bits_set(jit: &mut JITState, asm: &mut Assembler, function: &Fun
     asm.test(val, mask_opnd);
     asm.jnz(jit, side_exit(jit, function, state, reason));
     val
+}
+
+/// Compile a guard that `me_cref`, the `ep[VM_ENV_DATA_INDEX_ME_CREF]` of a method frame, holds the
+/// method entry `expected`. Once the frame writes `$~` or `$_`, lep_svar_write() replaces the
+/// method entry in that slot with an svar imemo whose `cref_or_me` holds it, so compare that field
+/// too, like rb_vm_frame_method_entry() does. Otherwise, every call that matched a regexp before
+/// `super` would side-exit.
+///
+/// The slot of a method frame always points to an imemo, so reading the word after its flags is
+/// safe. For an svar it's `cref_or_me`. For a method entry it's `defined_class`, and for a cref it's
+/// `refinements`, neither of which can be a method entry, so it never matches spuriously.
+fn gen_guard_method_entry(jit: &mut JITState, asm: &mut Assembler, function: &Function, me_cref: lir::Opnd, expected: hir::Const, state: &FrameState) -> lir::Opnd {
+    let hir::Const::Value(expected) = expected else { panic!("gen_guard_method_entry: unexpected hir::Const {expected:?}") };
+    asm_comment!(asm, "guard method entry, possibly in an svar");
+    let svar_cref_or_me = asm.load(Opnd::mem(64, me_cref, RUBY_OFFSET_SVAR_CREF_OR_ME));
+    asm.cmp(me_cref, Opnd::Value(expected));
+    let method_entry = asm.csel_e(me_cref, svar_cref_or_me);
+    asm.cmp(method_entry, Opnd::Value(expected));
+    asm.jnz(jit, side_exit(jit, function, state, SideExitReason::GuardSuperMethodEntry));
+    me_cref
 }
 
 fn gen_guard_not_null(jit: &mut JITState, asm: &mut Assembler, function: &Function, ptr: lir::Opnd, reason: SideExitReason, state: &FrameState) -> lir::Opnd {

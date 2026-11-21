@@ -4636,6 +4636,61 @@ fn test_invokesuper_to_iseq() {
 }
 
 #[test]
+fn test_invokesuper_after_regexp_match() {
+    // Matching a regexp makes the frame keep its method entry in an svar along with $~,
+    // which the guard on the current method entry has to look through.
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval(r#"
+        class A
+          def foo(s) = "A"
+        end
+
+        class B < A
+          def foo(s)
+            s =~ /b/
+            [$~&.to_s, super]
+          end
+        end
+
+        def test(s) = B.new.foo(s)
+        test("a") # profile invokesuper
+        test("a") # compile
+    "#);
+    let exits_before = counters.exit_guard_super_method_entry;
+    assert_snapshot!(inspect(r#"[test("a"), test("b"), test("abc")]"#), @r#"[[nil, "A"], ["b", "A"], ["b", "A"]]"#);
+    assert_eq!(0, counters.exit_guard_super_method_entry - exits_before);
+}
+
+#[test]
+fn test_invokesuper_guards_method_entry_in_svar() {
+    // A module method has a method entry for each class that includes it, and each one has its
+    // own super method. A frame of another class must still fail the guard when the method entry
+    // is in an svar.
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval(r#"
+        module M
+          def foo(s)
+            s =~ /b/ if s
+            [$~&.to_s, super]
+          end
+        end
+        class A; def foo(s) = "A"; end
+        class B; def foo(s) = "B"; end
+        class A2 < A; include M; end
+        class B2 < B; include M; end
+
+        a2 = A2.new
+        a2.foo("b") # profile invokesuper with A2's method entry
+        a2.foo(nil) # compile
+    "#);
+    let exits_before = counters.exit_guard_super_method_entry;
+    assert_snapshot!(inspect(r#"[A2.new.foo("b"), B2.new.foo(nil), B2.new.foo("b"), A2.new.foo(nil)]"#), @r#"[["b", "A"], [nil, "B"], ["b", "B"], [nil, "A"]]"#);
+    assert_eq!(2, counters.exit_guard_super_method_entry - exits_before, "B2's frames should exit");
+}
+
+#[test]
 fn test_invokesuper_with_args() {
     assert_snapshot!(inspect(r#"
         class A
