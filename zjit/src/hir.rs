@@ -3304,6 +3304,9 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// The reverse post-order of the CFG, cached by [`Function::optimize`] for the passes that
+    /// don't change the CFG.
+    reverse_post_order_cache: Option<Vec<BlockId>>,
     /// Frames inlined into this function, keyed by the caller `Snapshot` that the inlined
     /// frame's FrameStates point to as their `caller`.
     inline_frames: HashMap<InsnId, InlineFrame>,
@@ -3792,6 +3795,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            reverse_post_order_cache: None,
             inline_frames: HashMap::default(),
             inline_pass: 0,
             klass_caches: Default::default(),
@@ -10358,6 +10362,14 @@ impl Function {
 
     /// Return a traversal of the `Function`'s `BlockId`s in reverse post-order.
     pub fn reverse_post_order(&self) -> Vec<BlockId> {
+        if let Some(rpo) = &self.reverse_post_order_cache {
+            debug_assert_eq!(*rpo, self.compute_reverse_post_order(), "a pass that doesn't change the CFG changed it");
+            return rpo.clone();
+        }
+        self.compute_reverse_post_order()
+    }
+
+    fn compute_reverse_post_order(&self) -> Vec<BlockId> {
         let mut result = self.post_order_from(self.entries_block);
         result.reverse();
         result
@@ -10559,7 +10571,20 @@ impl Function {
         }
 
         macro_rules! run_pass {
+            // A pass that may change the CFG computes its reverse post-order afresh
             ($name:ident) => {{
+                self.reverse_post_order_cache = None;
+                run_pass!(@run $name)
+            }};
+            // A pass that doesn't change the CFG reuses the reverse post-order of the previous
+            // such pass if no pass changed the CFG in between
+            ($name:ident, preserves_cfg) => {{
+                if self.reverse_post_order_cache.is_none() {
+                    self.reverse_post_order_cache = Some(self.compute_reverse_post_order());
+                }
+                run_pass!(@run $name)
+            }};
+            (@run $name:ident) => {{
                 let counter = counter_for!($name);
                 let result = crate::stats::trace_compile_phase(stringify!($name), ||
                     crate::stats::with_time_stat(counter, || self.$name())
@@ -10600,26 +10625,28 @@ impl Function {
             };
             has_ever_inlined |= did_inline;
             run_pass!(convert_no_profile_sends);
-            run_pass!(remove_trivial_block_params);
-            run_pass!(optimize_load_store);
-            run_pass!(canonicalize);
+            run_pass!(remove_trivial_block_params, preserves_cfg);
+            run_pass!(optimize_load_store, preserves_cfg);
+            run_pass!(canonicalize, preserves_cfg);
             run_pass!(fold_constants);
             run_pass!(eliminate_dominated_branches);
             run_pass!(clean_cfg);
-            run_pass!(remove_redundant_patch_points);
-            run_pass!(remove_duplicate_check_interrupts);
+            run_pass!(remove_redundant_patch_points, preserves_cfg);
+            run_pass!(remove_duplicate_check_interrupts, preserves_cfg);
             if has_ever_inlined {
-                run_pass!(eliminate_empty_inline_frames);
+                run_pass!(eliminate_empty_inline_frames, preserves_cfg);
             }
-            run_pass!(eliminate_dead_code);
+            run_pass!(eliminate_dead_code, preserves_cfg);
             // After DCE so that dead Snapshots (one per YARV instruction) no longer count as
             // uses of the compare; only side exits that actually need it keep it alive.
-            run_pass!(fuse_fixnum_compare_branches);
+            run_pass!(fuse_fixnum_compare_branches, preserves_cfg);
 
             if !did_inline {
                 break;
             }
         }
+        // Don't let the code after optimization trust the cache
+        self.reverse_post_order_cache = None;
 
         if should_dump {
             let iseq_name = iseq_get_location(self.iseq, 0);
