@@ -4025,6 +4025,46 @@ fn test_send_symbol_block_arg_with_refinements() {
 }
 
 #[test]
+fn test_send_caller_splat_arguments_to_cfunc() {
+    eval("
+        def test(s, args) = s.insert(*args)
+        test(+'abc', [1, 'x'])
+    ");
+    assert_snapshot!(assert_compiles("test(+'abc', [1, 'x'])"), @r#""axbc""#);
+}
+
+#[test]
+fn test_send_caller_splat_arguments_to_variadic_cfunc() {
+    eval("
+        def splat_dig(h, keys) = h.dig(*keys)
+        def splat_push(a, x) = a.push(*x)
+        def splat_public_send(o, args) = o.public_send(*args)
+        def test = [splat_dig({a: {b: 1}}, [:a, :b]), splat_push([1], []), splat_public_send(1, [:+, 2])]
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[1, [1], 3]");
+}
+
+#[test]
+fn test_send_caller_splat_arguments_to_cfunc_with_symbol_block_arg() {
+    eval("
+        def test(h, args) = h.fetch(*args, &:to_s)
+        test({}, [:a])
+    ");
+    assert_snapshot!(assert_compiles("test({}, [:a])"), @r#""a""#);
+}
+
+#[test]
+fn test_send_caller_splat_with_ruby2_keywords_hash_to_cfunc() {
+    eval("
+        ruby2_keywords def r2k(*a) = a
+        def test(args) = {}.merge(*args)
+        test([{k: 1}])
+    ");
+    assert_snapshot!(inspect("[test([{k: 1}]), test(r2k(k: 2))]"), @"[{k: 1}, {k: 2}]");
+}
+
+#[test]
 fn test_send_symbol_block_arg_with_refinements_activated_after_compile() {
     assert_snapshot!(inspect("
         module Doubling

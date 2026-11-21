@@ -6296,8 +6296,9 @@ impl Function {
                         let mut stripped_block_arg = false;
                         let iseq_callee = def_type == VM_METHOD_TYPE_ISEQ;
                         let specializable_cfunc = def_type == VM_METHOD_TYPE_CFUNC && !unspecializable_c_call_type(flags & !VM_CALL_ARGS_BLOCKARG);
-                        // Caller splats are expanded below for ISEQ callees, also with a block arg.
-                        let block_arg_flags = if def_type == VM_METHOD_TYPE_ISEQ {
+                        // Caller splats with a profiled length are expanded below for ISEQ and C callees,
+                        // also with a block arg.
+                        let block_arg_flags = if caller_splat_length.is_some() && (def_type == VM_METHOD_TYPE_ISEQ || def_type == VM_METHOD_TYPE_CFUNC) {
                             VM_CALL_ARGS_BLOCKARG | VM_CALL_ARGS_SPLAT
                         } else {
                             VM_CALL_ARGS_BLOCKARG
@@ -6695,7 +6696,8 @@ impl Function {
                                 send_block: Option<BlockHandler>,
                                 forwarded_block_arg: Option<InsnId>,
                                 stripped_block_arg: bool,
-                                args: Vec<InsnId>,
+                                caller_splat_length: Option<SplatLength>,
+                                mut args: Vec<InsnId>,
                                 state: InsnId,
                                 direct_state: InsnId,
                                 recv_class: VALUE,
@@ -6705,7 +6707,7 @@ impl Function {
                                 protected_class: Option<VALUE>,
                             ) -> Result<BlockId, ()> {
                                 let call_info = unsafe { (*cd).ci };
-                                let argc = unsafe { vm_ci_argc(call_info) };
+                                let mut argc = unsafe { vm_ci_argc(call_info) };
                                 let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
                                 let mut ci_flags = unsafe { vm_ci_flag(call_info) };
@@ -6714,6 +6716,34 @@ impl Function {
                                 if stripped_block_arg {
                                     ci_flags &= !VM_CALL_ARGS_BLOCKARG;
                                 }
+                                // Expand a caller splat by its profiled length like SendDirect does for ISEQ callees.
+                                // The splat array is the last argument since C calls with keywords stay dynamic.
+                                let caller_splat = match caller_splat_length {
+                                    Some(length) if ci_flags & VM_CALL_ARGS_SPLAT != 0 => {
+                                        ci_flags &= !VM_CALL_ARGS_SPLAT;
+                                        argc = argc - 1 + u32::from(length);
+                                        args.last().map(|&array| CallerSplat { arg_idx: args.len() - 1, array, length })
+                                    }
+                                    _ => None,
+                                };
+                                let original_args_len = args.len();
+                                // Guard the splat length and replace the splat with its elements once the call is committed.
+                                let emit_caller_splat = |fun: &mut Function, block: BlockId, args: &mut Vec<InsnId>| {
+                                    let Some(caller_splat) = caller_splat else { return };
+                                    fun.emit_caller_splat(block, caller_splat, state);
+                                    fun.count(block, Counter::caller_splat_optimized);
+                                    let elements: Vec<_> = (0..caller_splat.length).map(|index| {
+                                        let index = fun.push_insn(block, Insn::Const { val: Const::CInt64(i64::from(index)) });
+                                        fun.push_insn(block, Insn::ArrayAref { array: caller_splat.array, index })
+                                    }).collect();
+                                    args.splice(caller_splat.arg_idx..=caller_splat.arg_idx, elements);
+                                };
+                                // The frame state of the call has the expanded arguments on the stack.
+                                let replace_splat_state = |fun: &mut Function, block: BlockId, call_state: InsnId, args: &[InsnId]| {
+                                    if caller_splat.is_none() { return call_state; }
+                                    let new_state = fun.frame_state(call_state).with_replaced_args(args, original_args_len);
+                                    fun.push_insn(block, Insn::Snapshot { state: Box::new(new_state) })
+                                };
                                 // When seeing another &block argument, fall back to dynamic dispatch for now
                                 // TODO: Support block forwarding
                                 if unspecializable_c_call_type(ci_flags) {
@@ -6783,6 +6813,7 @@ impl Function {
                                             recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
                                         }
                                         fun.guard_protected_send(block, protected_class, state);
+                                        emit_caller_splat(fun, block, &mut args);
 
                                         // Try inlining the cfunc into HIR. Only inline if we don't have a block argument
                                         if !has_block {
@@ -6818,6 +6849,7 @@ impl Function {
                                             fun.count_not_inlined_cfunc(block, cme);
                                         }
                                         let (block, call_block) = emit_call_block(fun, block);
+                                        let direct_state = replace_splat_state(fun, block, direct_state, &args);
                                         let ccall = fun.push_insn(block, Insn::CCallWithFrame(Box::new(CCallWithFrameData {
                                             cd,
                                             cfunc: cfunc_ptr,
@@ -6854,6 +6886,7 @@ impl Function {
                                             recv = fun.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
                                         }
                                         fun.guard_protected_send(block, protected_class, state);
+                                        emit_caller_splat(fun, block, &mut args);
 
                                         // Array.new(size) { |index| ... } on Array itself
                                         if let Some(BlockHandler::BlockIseq(blockiseq)) = send_block {
@@ -6900,6 +6933,7 @@ impl Function {
                                         }
 
                                         let (block, call_block) = emit_call_block(fun, block);
+                                        let direct_state = replace_splat_state(fun, block, direct_state, &args);
                                         let ccall = fun.push_insn(block, Insn::CCallVariadic(Box::new(CCallVariadicData {
                                             cfunc: cfunc_ptr,
                                             recv,
@@ -6925,7 +6959,7 @@ impl Function {
                                 }
                             }
 
-                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
+                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, caller_splat_length, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
                                 block = join_block;
                                 continue;
                             }
