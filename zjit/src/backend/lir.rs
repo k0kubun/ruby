@@ -3320,6 +3320,9 @@ impl Assembler
         // for appending after scratch_split.
         let saved_block = self.current_block_id;
         let exit_block = self.new_block_without_id("side_exits");
+        // Each exit saves the VM state, writes its stack map, and jumps to the trampoline.
+        self.basic_blocks[exit_block.0].insns.reserve(targets.len() * 12);
+        self.basic_blocks[exit_block.0].insn_ids.reserve(targets.len() * 12);
 
         // Map from SideExit to compiled Label. This table is used to deduplicate side exit code.
         let mut compiled_exits: HashMap<SideExit, Label> =

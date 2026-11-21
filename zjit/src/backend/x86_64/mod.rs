@@ -474,8 +474,10 @@ impl Assembler {
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
         let linearized_insns = self.into_linearized_instructions();
-        asm.current_block().insns.reserve(linearized_insns.len());
-        asm.current_block().insn_ids.reserve(linearized_insns.len());
+        // Splitting adds some instructions, e.g. moves to scratch registers.
+        let capacity = linearized_insns.len() + linearized_insns.len() / 4;
+        asm.current_block().insns.reserve(capacity);
+        asm.current_block().insn_ids.reserve(capacity);
 
         for mut insn in linearized_insns {
             match &mut insn {
