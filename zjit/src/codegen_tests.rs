@@ -5427,6 +5427,42 @@ fn test_send_braceless_hash_kw_splat() {
 }
 
 #[test]
+fn test_zsuper_with_keyword_params() {
+    assert_snapshot!(inspect(r#"
+        class A
+          def foo(x, b: 0, a:) = [x, a, b]
+          def bar(a:) = a
+          def baz(**kw) = kw
+        end
+        class B < A
+          def foo(x, a:, b: 2)
+            a += 1
+            super
+          end
+          def bar(a:, extra: 1) = super
+          def baz(a:, b: 2) = super
+        end
+        S = Struct.new(:a, keyword_init: true)
+        class C < S
+          def initialize(a:) = super
+        end
+
+        def test(b)
+          error = begin
+            b.bar(a: 1)
+          rescue ArgumentError => e
+            e.message
+          end
+          [b.foo(0, a: 1), b.foo(0, a: 1, b: 3), b.baz(a: 1), C.new(a: 4).a, error]
+        end
+
+        b = B.new
+        test(b)
+        test(b)
+    "#), @r#"[[0, 2, 2], [0, 2, 3], {a: 1, b: 2}, 4, "unknown keyword: :extra"]"#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String
