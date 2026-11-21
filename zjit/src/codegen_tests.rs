@@ -5396,6 +5396,37 @@ fn test_invokesuper_with_kwarg() {
 }
 
 #[test]
+fn test_send_braceless_hash_kw_splat() {
+    assert_snapshot!(inspect(r#"
+        def pos(h) = h
+        def opt(a, h = nil) = [a, h]
+        def rest(*r) = r
+        def kw(k: 0) = k
+        ruby2_keywords def r2k(*a) = a
+        def nokw(h, **nil) = h
+        def two(a, b) = [a, b]
+
+        def test(v)
+          errors = [-> { kw('k' => v, 'j' => v) }, -> { nokw('k' => v, 'j' => v) }, -> { two('k' => v, 'j' => v) }].map do |f|
+            f.call
+          rescue ArgumentError => e
+            e.message
+          end
+          h = pos('k' => v, 'j' => v)
+          h['other'] = true
+          # A single pair and a splatted local are duplicated for the callee
+          single = pos('k' => v)
+          local = {'k' => v}
+          pos(**local)['other'] = true
+          [h, opt(0, 'k' => v, 'j' => v), rest('k' => v, 'j' => v), Hash.ruby2_keywords_hash?(r2k('k' => v, 'j' => v).last), single, local, errors]
+        end
+
+        test(1)
+        test(2)
+    "#), @r#"[{"k" => 2, "j" => 2, "other" => true}, [0, {"k" => 2, "j" => 2}], [{"k" => 2, "j" => 2}], true, {"k" => 2}, {"k" => 2}, ["unknown keywords: \"k\", \"j\"", "no keywords accepted", "wrong number of arguments (given 1, expected 2)"]]"#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String
