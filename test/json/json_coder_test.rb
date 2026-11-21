@@ -282,6 +282,22 @@ class JSONCoderTest < Test::Unit::TestCase
     assert_equal "[[]]", coder.dump([[]])
   end
 
+  def test_dump_with_compaction_in_callback
+    omit "GC compaction is not supported" unless GC.respond_to?(:verify_compaction_references)
+
+    # An embedded State lives in its object's slot, so moving the object mid-dump must not
+    # leave the generator with a stale pointer to it. With a JIT enabled (e.g.
+    # --yjit-call-threshold=1), nothing else keeps the State object pinned during the callback.
+    custom = Struct.new(:value)
+    coder = JSON::Coder.new do |object|
+      GC.verify_compaction_references(expand_heap: true, toward: :empty)
+      object.value
+    end
+    10.times do
+      assert_equal '[1,2,{"k":3}]', coder.dump([custom.new(1), custom.new(2), { "k" => custom.new(3) }])
+    end
+  end
+
   def test_dump_concurrently_with_depth
     coder = JSON::Coder.new(depth: 1, max_nesting: 3)
     results = run_concurrently(10, 500) { coder.dump([[1]]) }

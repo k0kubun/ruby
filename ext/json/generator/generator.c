@@ -1414,7 +1414,11 @@ static inline VALUE cState_partial_generate(VALUE self, VALUE obj, generator_fun
         .obj = obj,
         .func = func
     };
-    return rb_ensure(generate_json_try, (VALUE)&data, generate_json_ensure, (VALUE)&data);
+    VALUE result = rb_ensure(generate_json_try, (VALUE)&data, generate_json_ensure, (VALUE)&data);
+    // `state` points into self when it's an embedded TypedData. Keep self on the stack so that
+    // GC compaction during to_json/as_json callbacks can't move it out from under `state`.
+    RB_GC_GUARD(self);
+    return result;
 }
 
 /* call-seq:
