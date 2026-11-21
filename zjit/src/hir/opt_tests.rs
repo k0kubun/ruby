@@ -26645,6 +26645,40 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_braceless_hash_kw_splat_to_positional_param() {
+        eval("
+            def foo(h) = h
+            def test(v) = foo('a' => v, 'b' => v)
+            test(1)
+        ");
+        let hir = hir_string("test");
+        assert!(!hir.contains("Send v"), "Expected no dynamic Send but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :v@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :v@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:StringExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v18:StringExact[VALUE(0x1010)] = Const Value(VALUE(0x1010))
+          v21:HashExact = NewHash v15: v10, v18: v10
+          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(Object@0x1018, foo@0x1020, cme:0x1028)
+          v34:ObjectSubclass[class_exact*:Object@VALUE(0x1018)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1018)] recompile
+          CheckInterrupts
+          Return v21
+        ");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A
