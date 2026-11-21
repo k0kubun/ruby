@@ -1192,8 +1192,9 @@ impl Assembler {
         // Buffered list of PosMarker callbacks to fire if codegen is successful
         let mut pos_markers: Vec<(usize, CodePtr)> = vec![];
 
-        // The write_pos for the last Insn::PatchPoint, if any
+        // The write_pos for the last Insn::PatchPoint, if any, and the label of its side exit
         let mut last_patch_pos: Option<usize> = None;
+        let mut last_patch_exit: Option<Label> = None;
 
         // For each instruction
         // NOTE: At this point, the assembler should have been linearized into a single giant block
@@ -1686,11 +1687,16 @@ impl Assembler {
                     emit_cmp_zero_jump(cb, opnd.into(), false, target.clone());
                 },
                 Insn::PatchPoint(..) => unreachable!("PatchPoint should have been lowered to PatchPointPad in arm64_scratch_split"),
-                Insn::PatchPointPad => {
-                    emit_pad_after_patch_point(cb, last_patch_pos);
-                    // This position is itself where a jump gets written on invalidation, so it
-                    // becomes what following code has to keep its distance from.
-                    last_patch_pos = Some(cb.get_write_pos());
+                Insn::PatchPointPad(exit_label) => {
+                    // A patch point at the same address as the last one, jumping to the same side
+                    // exit, shares the last one's jump. Otherwise, keep the last one's distance.
+                    if last_patch_pos != Some(cb.get_write_pos()) || last_patch_exit != Some(*exit_label) {
+                        emit_pad_after_patch_point(cb, last_patch_pos);
+                        // This position is itself where a jump gets written on invalidation, so it
+                        // becomes what following code has to keep its distance from.
+                        last_patch_pos = Some(cb.get_write_pos());
+                        last_patch_exit = Some(*exit_label);
+                    }
                 },
                 Insn::BoundaryPad => {
                     // A boundary is never patched, so it doesn't become a position to keep away

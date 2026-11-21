@@ -1317,7 +1317,7 @@ pub fn split_patch_point(asm: &mut Assembler, target: &Target, invariant: Invari
     };
 
     // Fill nop instructions if the last patch point is too close.
-    asm.patch_point_pad();
+    asm.patch_point_pad(exit_label);
 
     // Remember the current address as a patch point
     asm.pos_marker(move |code_ptr, cb| {
