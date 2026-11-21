@@ -3095,6 +3095,7 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
 
 unsafe extern "C" {
     fn rb_vm_symbol_block_arg_refined_p(sym: VALUE) -> usize;
+    fn rb_hash_dup(hash: VALUE) -> VALUE;
 }
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
@@ -3447,6 +3448,15 @@ struct CallerArguments<'a> {
     kwarg_count: usize,
     /// Index of the caller splat array, when VM_CALL_ARGS_SPLAT is set.
     splat_arg_idx: Option<usize>,
+    /// A caller `**hash`, removed from `original`, that becomes the callee's `**kwrest` as is or,
+    /// when `dup` is set, copied.
+    kwrest_hash: Option<KwrestHash>,
+}
+
+#[derive(Clone, Copy)]
+struct KwrestHash {
+    hash: InsnId,
+    dup: bool,
 }
 
 impl<'a> CallerArguments<'a> {
@@ -3467,7 +3477,7 @@ impl<'a> CallerArguments<'a> {
             None
         };
 
-        Self { original, flags, kwarg, kwarg_count, splat_arg_idx }
+        Self { original, flags, kwarg, kwarg_count, splat_arg_idx, kwrest_hash: None }
     }
 }
 
@@ -3499,6 +3509,8 @@ enum SendDirectArg {
     KeywordHash(Vec<SendDirectArg>),
     /// Values to materialize as the Array passed to a callee rest parameter.
     RestArray(Vec<SendDirectArg>),
+    /// A Hash to copy with rb_hash_dup() on the selected path.
+    HashDup(InsnId),
 }
 
 /// Side-effect-free SendDirect argument setup before HIR emission.
@@ -5036,6 +5048,17 @@ impl Function {
                     .collect();
                 self.push_insn(block, Insn::NewArray { elements, state })
             }
+            SendDirectArg::HashDup(hash) => {
+                self.push_insn(block, Insn::CCallWithGC(Box::new(CCallWithGCData {
+                    cfunc: rb_hash_dup as *const u8,
+                    recv: hash,
+                    args: vec![],
+                    name: ID!(rb_hash_dup),
+                    owner: Qnil,
+                    return_type: types::HashExact,
+                    state,
+                })))
+            }
         }
     }
 
@@ -5337,7 +5360,12 @@ impl Function {
                 }
             }
             let params = unsafe { iseq.params() };
-            if elements.is_empty() && params.flags.anon_kwrest() != 0 && params.flags.has_kw() == 0 {
+            if let Some(KwrestHash { hash, dup }) = caller_args.kwrest_hash {
+                // Like ignore_keyword_hash_p(), a caller `**hash` is copied unless the caller made it
+                // (VM_CALL_KW_SPLAT_MUT) or the callee only forwards it (anonymous `**` without keywords).
+                assert!(elements.is_empty(), "the caller passes no other keywords with **hash");
+                processed_args.push(if dup { SendDirectArg::HashDup(hash) } else { SendDirectArg::Existing(hash) });
+            } else if elements.is_empty() && params.flags.anon_kwrest() != 0 && params.flags.has_kw() == 0 {
                 processed_args.push(SendDirectArg::Constant(Qnil));
             } else {
                 processed_args.push(SendDirectArg::KeywordHash(elements));
@@ -6551,6 +6579,33 @@ impl Function {
                                 send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                             }
                         }
+                        // A `**hash` to a callee with only `**kwrest` becomes the kwrest Hash, so take it out of
+                        // the arguments and pass it to the callee's kwrest parameter.
+                        let mut kwrest_hash = None;
+                        if flags & VM_CALL_KW_SPLAT != 0
+                            && def_type == VM_METHOD_TYPE_ISEQ
+                            && !unspecializable_call_type(flags & !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT | block_arg_flags))
+                            && let params = unsafe { get_def_iseq_ptr((*cme).def).params() }
+                            && params.flags.has_kwrest() != 0 && params.flags.has_kw() == 0
+                            && params.flags.ruby2_keywords() == 0 && params.flags.forwardable() == 0
+                        {
+                            let kw_splat_idx = args.len() - 1 - usize::from(flags & VM_CALL_ARGS_BLOCKARG != 0);
+                            let kw_splat = args[kw_splat_idx];
+                            if let ReceiverTypeResolution::Monomorphic { profiled_type } = self.resolve_receiver_type_from_profile(kw_splat, state)
+                                && profiled_type.class() == unsafe { rb_cHash }
+                            {
+                                let guarded = self.guard_type_recompile(block, kw_splat, Type::from_profiled_type(profiled_type), state, Recompile);
+                                let original_argc = args.len();
+                                args.remove(kw_splat_idx);
+                                kwrest_hash = Some(KwrestHash {
+                                    hash: guarded,
+                                    dup: flags & VM_CALL_KW_SPLAT_MUT == 0 && params.flags.anon_kwrest() == 0,
+                                });
+                                flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                                let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
+                                send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                            }
+                        }
                         // A block arg that is the block param proxy (or nil) from `getblockparamproxy`.
                         // Its frame block handler is passed through right before the call.
                         let mut forwarded_block_arg = None;
@@ -6700,6 +6755,10 @@ impl Function {
                             // A forwardable callee takes the callinfo as is, so it can't skip the `**kw`.
                             if stripped_kw_splat && unsafe { iseq.params() }.flags.forwardable() == 0 {
                                 caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                            }
+                            if kwrest_hash.is_some() {
+                                caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                                caller_args.kwrest_hash = kwrest_hash;
                             }
                             let caller_splat = if let Some(arg_idx) = caller_args.splat_arg_idx {
                                 // Count the profile shape for every caller-splat execution;
@@ -7751,6 +7810,7 @@ impl Function {
             kwarg,
             kwarg_count: if kwarg.is_null() { 0 } else { (unsafe { get_cikw_keyword_len(kwarg) }) as usize },
             splat_arg_idx: None,
+            kwrest_hash: None,
         };
         // `sendforward` passes on this frame's block handler, which is only known at run time.
         // Pass it through when the target may take a block. Otherwise, guard that there is none:
