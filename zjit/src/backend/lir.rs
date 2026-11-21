@@ -2814,8 +2814,11 @@ impl Assembler
                         new_ids.push(None);
                     }
 
-                    if let Some(StackMap { stack, jit_frame, frame_depth }) = stack_map {
-                        let jit_frame = unsafe { &mut *jit_frame.cast_mut() };
+                    // A JITFrame keeps the first stack map set to it, so skip building the others
+                    if let Some(StackMap { stack, jit_frame, frame_depth }) = stack_map
+                        && let jit_frame = unsafe { &mut *jit_frame.cast_mut() }
+                        && !jit_frame.has_stack_map()
+                    {
                         let mut writer = jit_frame.stack_map_writer();
                         for stack_entry in stack.iter() {
                             match *stack_entry {
@@ -3138,34 +3141,45 @@ impl Assembler
         fn compile_exit_stack_map(asm: &Assembler, stack_map: &StackMap) -> Vec<(ExitLoc, i32)> {
             let StackMap { stack, jit_frame, frame_depth } = stack_map;
             let jit_frame = *jit_frame;
-            let mut writer = unsafe { &*jit_frame }.stack_map_writer();
+            // A JITFrame keeps the first stack map set to it, so skip building the others.
+            // The captures are still needed for every exit.
+            let mut writer = (!unsafe { &*jit_frame }.has_stack_map()).then(|| unsafe { &*jit_frame }.stack_map_writer());
+            macro_rules! write_stack_map {
+                ($($call:tt)*) => { if let Some(writer) = writer.as_mut() { writer.$($call)*; } };
+            }
 
             let mut captures = vec![];
             for stack_entry in stack.iter() {
                 match *stack_entry {
                     StackMapEntry::Opnd(opnd @ (Opnd::Value(_) | Opnd::UImm(_))) => {
                         match immediate_stack_map_value(opnd) {
-                            Some(value) => writer.imm(value),
-                            None => writer.vreg(capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth)),
+                            Some(value) => write_stack_map!(imm(value)),
+                            None => {
+                                let slot_index = capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth);
+                                write_stack_map!(vreg(slot_index));
+                            }
                         }
                     }
-                    StackMapEntry::Skip(size) => writer.skip(size),
+                    StackMapEntry::Skip(size) => write_stack_map!(skip(size)),
                     StackMapEntry::BasePtr { .. } => {
                         unreachable!("no BasePtr stackmap code in side-exit for now");
                     }
-                    StackMapEntry::SkipVmEnvData => writer.skip_vm_env_data(),
-                    StackMapEntry::PrevFrame => writer.prev_frame(),
+                    StackMapEntry::SkipVmEnvData => write_stack_map!(skip_vm_env_data()),
+                    StackMapEntry::PrevFrame => write_stack_map!(prev_frame()),
                     StackMapEntry::Opnd(Opnd::Mem(Mem { base: MemBase::Stack { stack_idx, .. }, disp, .. })) => {
                         assert_eq!(disp, 0, "StackMap stack slot should not have a displacement");
-                        writer.vreg(asm.stack_state.stack_map_index_for_spill(stack_idx.to_usize(), *frame_depth));
+                        write_stack_map!(vreg(asm.stack_state.stack_map_index_for_spill(stack_idx.to_usize(), *frame_depth)));
                     }
                     StackMapEntry::Opnd(opnd @ Opnd::Reg(_)) => {
-                        writer.vreg(capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth));
+                        let slot_index = capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth);
+                        write_stack_map!(vreg(slot_index));
                     }
                     StackMapEntry::Opnd(_) => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 }
             }
-            unsafe { &mut *jit_frame.cast_mut() }.set_stack_map(writer);
+            if let Some(writer) = writer {
+                unsafe { &mut *jit_frame.cast_mut() }.set_stack_map(writer);
+            }
 
             assert!(captures.len() <= asm.stack_state.num_side_exit_stack_map_slots);
             captures
