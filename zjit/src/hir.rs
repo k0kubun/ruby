@@ -6308,7 +6308,9 @@ impl Function {
             // Specializing an instruction may split `block`; the rest of the old instructions
             // are then pushed onto its join block.
             let mut block = block;
-            let old_insns = std::mem::take(&mut self.blocks[block].insns);
+            // Most instructions are pushed back, so reserve room for them upfront
+            let capacity = self.blocks[block].insns.len();
+            let old_insns = std::mem::replace(&mut self.blocks[block].insns, Vec::with_capacity(capacity));
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
                 // Retry dynamic sends without accumulating counters from previous attempts.
@@ -8701,7 +8703,9 @@ impl Function {
             return;
         }
         for block in self.reverse_post_order() {
-            let old_insns = std::mem::take(&mut self.blocks[block].insns);
+            // Most instructions are pushed back, so reserve room for them upfront
+            let capacity = self.blocks[block].insns.len();
+            let old_insns = std::mem::replace(&mut self.blocks[block].insns, Vec::with_capacity(capacity));
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
                 match self.resolve(insn_id).insn(self) {
