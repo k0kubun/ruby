@@ -4498,7 +4498,10 @@ impl Function {
     }
 
     pub fn type_of(&self, insn: InsnId) -> Type {
-        assert!(self.insns[insn].has_output());
+        // Reading the instruction just for this check takes most of the time of this hot
+        // function, so check it only in debug builds. An instruction without output has the
+        // Empty type.
+        debug_assert!(self.insns[insn].has_output());
         self.insn_types[self.union_find.borrow_mut().find(insn)]
     }
 
