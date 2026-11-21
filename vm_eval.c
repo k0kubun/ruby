@@ -77,12 +77,59 @@ rb_vm_call_with_refinements(rb_execution_context_t *ec, VALUE recv, ID id, int a
     }
 }
 
+#if USE_ZJIT
+// Call an ISEQ method from C by entering its ZJIT code directly when the ISEQ has ZJIT code
+// and the arguments need no setup. This skips vm_callee_setup_arg() and jit_exec(). Return
+// Qundef if the call needs the interpreter's setup. vm_callee_setup_arg() warns about an
+// unused block, so leave that case to it too. The caller must ensure that the arguments
+// have no splat or keywords. This takes the block handler from ec->passed_block_handler
+// like vm_call0_cc().
+static inline VALUE
+vm_call0_zjit(rb_execution_context_t *ec, VALUE recv, int argc, const VALUE *argv,
+              const rb_callable_method_entry_t *cme)
+{
+    VM_ASSERT(cme->def->type == VM_METHOD_TYPE_ISEQ);
+    const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
+    rb_jit_func_t zjit_func = zjit_simple_iseq_entry(iseq, argc);
+    if (!zjit_func) return Qundef;
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    // Leave ec->passed_block_handler to the caller if this returns Qundef
+    if (ec->passed_block_handler != VM_BLOCK_HANDLER_NONE && !body->param.flags.use_block) return Qundef;
+    VALUE block_handler = vm_passed_block_handler(ec);
+
+    // Same as pushing the receiver and arguments and calling vm_call_iseq_setup_normal(),
+    // which leaves cfp->sp at the receiver.
+    rb_control_frame_t *cfp = ec->cfp;
+    CHECK_VM_STACK_OVERFLOW(cfp, argc + 1);
+    vm_check_canary(ec, cfp->sp);
+    VALUE *sp = cfp->sp;
+    *sp++ = recv;
+    for (int i = 0; i < argc; i++) {
+        sp[i] = argv[i];
+    }
+    vm_push_frame_inline(ec, iseq, VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH, recv,
+                         block_handler, (VALUE)cme,
+                         body->iseq_encoded, sp + body->param.size,
+                         body->local_table_size - body->param.size,
+                         body->stack_max);
+    return vm_exec_zjit_func(ec, zjit_func);
+}
+#endif
+
 static inline VALUE
 vm_call0_cc(rb_execution_context_t *ec, VALUE recv, ID id, int argc, const VALUE *argv, const struct rb_callcache *cc, int kw_splat)
 {
     int flags = kw_splat ? VM_CALL_KW_SPLAT : 0;
     VALUE *use_argv = (VALUE *)argv;
     VALUE av[2];
+
+#if USE_ZJIT
+    // Enter the ZJIT code of the callee without building the call info for vm_call0_body()
+    if (rb_zjit_entry && vm_cc_cme(cc)->def->type == VM_METHOD_TYPE_ISEQ && !kw_splat && argc <= VM_ARGC_STACK_MAX) {
+        VALUE ret = vm_call0_zjit(ec, recv, argc, argv, vm_cc_cme(cc));
+        if (!UNDEF_P(ret)) return ret;
+    }
+#endif
 
     if (UNLIKELY(vm_cc_cme(cc)->def->type == VM_METHOD_TYPE_ISEQ && argc > VM_ARGC_STACK_MAX)) {
         use_argv = vm_argv_ruby_array(av, argv, &flags, &argc, kw_splat);
@@ -212,41 +259,10 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, const
             CHECK_VM_STACK_OVERFLOW(reg_cfp, calling->argc + 1);
             vm_check_canary(ec, reg_cfp->sp);
 
-#if USE_ZJIT
-            // Skip vm_callee_setup_arg() and jit_exec() when the callee has ZJIT code
-            // and the arguments need no setup. vm_callee_setup_arg() warns about an
-            // unused block, so leave that case to it.
-            if (rb_zjit_entry &&
-                !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_TAILCALL)) &&
-                !calling->kw_splat) {
-                const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
-                const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
-                rb_jit_func_t zjit_func = zjit_simple_iseq_entry(iseq, calling->argc);
-                if (zjit_func &&
-                    (calling->block_handler == VM_BLOCK_HANDLER_NONE || ISEQ_BODY(iseq)->param.flags.use_block)) {
-                    // Same as pushing the receiver and arguments and calling vm_call_iseq_setup_normal(),
-                    // which leaves reg_cfp->sp at the receiver.
-                    VALUE *sp = reg_cfp->sp;
-                    *sp++ = calling->recv;
-                    for (i = 0; i < calling->argc; i++) {
-                        sp[i] = argv[i];
-                    }
-                    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
-                    vm_push_frame_inline(ec, iseq, VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH, calling->recv,
-                                         calling->block_handler, (VALUE)cme,
-                                         body->iseq_encoded, sp + body->param.size,
-                                         body->local_table_size - body->param.size,
-                                         body->stack_max);
-                    return vm_exec_zjit_func(ec, zjit_func);
-                }
-            }
-#endif
-
             *reg_cfp->sp++ = calling->recv;
             for (i = 0; i < calling->argc; i++) {
                 *reg_cfp->sp++ = argv[i];
             }
-
 
             if (ISEQ_BODY(def_iseq_ptr(vm_cc_cme(cc)->def))->param.flags.forwardable) {
                 vm_call_iseq_fwd_setup(ec, reg_cfp, calling);
