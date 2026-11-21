@@ -1008,6 +1008,13 @@ rb_vm_symbol_block_arg_refined_p(VALUE sym)
     return cref && !NIL_P(CREF_REFINEMENTS(cref));
 }
 
+// For JITs: non-zero when refinements are active in a cref
+size_t
+rb_vm_cref_has_refinements_p(VALUE cref)
+{
+    return !NIL_P(CREF_REFINEMENTS((const rb_cref_t *)cref));
+}
+
 rb_cref_t *
 rb_vm_get_cref(const VALUE *ep)
 {
