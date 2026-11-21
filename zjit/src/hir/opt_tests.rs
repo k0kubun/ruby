@@ -15177,6 +15177,41 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_cfunc_with_symbol_block_arg() {
+        eval(r#"
+            def test(h) = h.fetch(:a, &:to_s)
+            test({}); test({})
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :h@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :h@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:StaticSymbol[:a] = Const Value(VALUE(0x1008))
+          v17:StaticSymbol[:to_s] = Const Value(VALUE(0x1010))
+          PatchPoint MethodRedefined(Symbol@0x1018, to_proc@0x1020, cme:0x1028)
+          v29:CInt64 = CCall v17, :rb_vm_symbol_block_arg_refined_p@0x1050
+          v30:CInt64[0] = GuardBitEquals v29, CInt64(0)
+          PatchPoint NoSingletonClass(Hash@0x1058)
+          PatchPoint MethodRedefined(Hash@0x1058, fetch@0x1060, cme:0x1068)
+          v35:HashExact = GuardType v10, HashExact recompile
+          v36:BasicObject = CCallVariadic v35, :Hash#fetch@0x1090, v15, block=&v17
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v36
+        ");
+    }
+
+    #[test]
     fn test_send_with_non_nil_block_arg() {
         eval(r#"
             def foo = 42
