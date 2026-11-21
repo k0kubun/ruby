@@ -4669,6 +4669,26 @@ impl Function {
     }
 
     fn infer_types(&mut self) {
+        self.infer_types_from_scratch(true);
+
+        // Check that skipping the walk of blocks that can't change finds the same fixpoint
+        // as walking every block again.
+        #[cfg(debug_assertions)]
+        {
+            let insn_types = self.insn_types.clone();
+            let num_instructions = self.num_instructions;
+            self.infer_types_from_scratch(false);
+            assert!(insn_types.iter().zip(self.insn_types.iter()).all(|(a, b)| a.bit_equal(*b)),
+                    "skipping unchanged blocks in infer_types found a different fixpoint");
+            assert_eq!(num_instructions, self.num_instructions);
+        }
+    }
+
+    /// Infer the types of all instructions, starting from Empty. If `skip_unchanged` is true,
+    /// a walk that follows another walk starts from the first block whose parameters or
+    /// reachability a back edge changed in the previous walk, as the blocks before it can't
+    /// change.
+    fn infer_types_from_scratch(&mut self, skip_unchanged: bool) {
         // Reset all types
         self.insn_types.fill(types::Empty);
 
@@ -4718,6 +4738,11 @@ impl Function {
         // be propagated forwards. It follows that a node's type can only be inferred from its
         // predecessors. RPO ordering ensures all of a node's predecessors have been processed;
         // therefore, a single walk of the RPO ordering will reach the fixpoint.
+        //
+        // A walk only needs to revisit the blocks from the first block whose parameters or
+        // reachability a back edge changed in the previous walk. The blocks before it in RPO read
+        // the same types as in the previous walk: their other inputs come from the blocks before
+        // them, and the back edges to them didn't change what they read.
         let rpo = self.reverse_post_order();
         // Map BlockId -> rpo index. Used to detect back edge traversal. If an edge targets a block
         // with rpo index <= the current rpo index it's a back edge. Note that `rpo_order` must be
@@ -4729,16 +4754,23 @@ impl Function {
         }
         // Scratch buffer for the arg types of an edge, reused across edges
         let mut arg_types: Vec<Type> = Vec::new();
+        // The number of instructions counting against the inlining budget in each block, by
+        // rpo index, as of the last walk that visited the block
+        let mut block_num_instructions = vec![0; rpo.len()];
+        // The rpo index of the first block to visit in a walk
+        let mut start_index = 0;
         loop {
             let mut changed = false;
             let mut traversed_back_edge = false;
-            let mut num_instructions = 0;
-            for (rpo_index, &block) in rpo.iter().enumerate() {
+            // The lowest rpo index of a block whose params or reachability a back edge changed
+            let mut back_edge_changed_index = usize::MAX;
+            for (rpo_index, &block) in rpo.iter().enumerate().skip(start_index) {
+                block_num_instructions[rpo_index] = 0;
                 if !reachable.get(block) { continue; }
                 for i in 0..self.blocks[block].insns.len() {
                     let insn_id = self.blocks[block].insns[i];
                     if self.insns[insn_id].counts_against_inlining_budget() {
-                        num_instructions += 1;
+                        block_num_instructions[rpo_index] += 1;
                     }
                     // Instructions without output, including branch instructions, can't be targets
                     // of make_equal_to, so we don't need find() here.
@@ -4747,15 +4779,22 @@ impl Function {
                     // parallel (the args of a self-loop may name params of `target` itself).
                     macro_rules! mark_reachable {
                         ($edge:expr) => {{
-                            let edge = $edge;
-                            reachable.insert(edge.target);
+                            let BranchEdge { target, ref args } = *$edge;
+                            let mut edge_changed = reachable.insert(target);
                             arg_types.clear();
-                            arg_types.extend(edge.args.iter().map(|a| self.type_of(*a)));
+                            arg_types.extend(args.iter().map(|a| self.type_of(*a)));
                             for (idx, &arg_type) in arg_types.iter().enumerate() {
-                                let param = self.blocks[edge.target].params[idx];
-                                changed |= set_type!(param, self.type_of(param).union(arg_type));
+                                let param = self.blocks[target].params[idx];
+                                let param_changed = set_type!(param, self.type_of(param).union(arg_type));
+                                changed |= param_changed;
+                                edge_changed |= param_changed;
                             }
-                            traversed_back_edge |= rpo_order[edge.target] <= rpo_index;
+                            if rpo_order[target] <= rpo_index {
+                                traversed_back_edge = true;
+                                if edge_changed {
+                                    back_edge_changed_index = back_edge_changed_index.min(rpo_order[target]);
+                                }
+                            }
                         }};
                     }
                     let insn_type = match &self.insns[insn_id] {
@@ -4828,15 +4867,8 @@ impl Function {
                             }
                             continue;
                         }
-                        &Insn::Jump(BranchEdge { target, ref args }) => {
-                            reachable.insert(target);
-                            arg_types.clear();
-                            arg_types.extend(args.iter().map(|a| self.type_of(*a)));
-                            for (idx, &arg_type) in arg_types.iter().enumerate() {
-                                let param = self.blocks[target].params[idx];
-                                changed |= set_type!(param, self.type_of(param).union(arg_type));
-                            }
-                            traversed_back_edge |= rpo_order[target] <= rpo_index;
+                        Insn::Jump(edge) => {
+                            mark_reachable!(edge);
                             continue;
                         }
                         Insn::Entries { targets } => {
@@ -4851,9 +4883,12 @@ impl Function {
                     changed |= set_type!(insn_id, insn_type);
                 }
             }
-            if !changed || !traversed_back_edge {
-                self.num_instructions = num_instructions;
+            if !changed || !traversed_back_edge || (skip_unchanged && back_edge_changed_index == usize::MAX) {
+                self.num_instructions = block_num_instructions.iter().sum();
                 break;
+            }
+            if skip_unchanged {
+                start_index = back_edge_changed_index;
             }
         }
     }
