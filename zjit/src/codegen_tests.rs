@@ -2094,6 +2094,26 @@ fn test_yield_polymorphic_block_handlers_with_procs() {
 }
 
 #[test]
+fn test_inline_blockarg_proc_uses_profile_of_block_arg() {
+    // The yield in `two` was profiled with other blocks. Inlined into `test`, it uses the profile of
+    // the Procs that `test` passes instead.
+    crate::options::enable_zjit_stats();
+    with_inlining(|| {
+        eval("
+            def two = yield(1, 2)
+            def warm = [two { |a, b| a }, two { |a, b| b }]
+            warm; warm; warm
+            def test(pr) = two(&pr)
+            L = ->(a, b) { a * 10 + b }
+            P = proc { |a| a }
+            test(L)
+        ");
+        assert_snapshot!(assert_yields_directly("[test(L), test(L)]"), @"[12, 12]");
+        assert_snapshot!(assert_compiles_allowing_exits("[test(P), test(L), test(P)]"), @"[1, 12, 1]");
+    });
+}
+
+#[test]
 fn test_inline_blockarg_proc_yield_dispatches_directly() {
     crate::options::enable_zjit_stats();
     with_inlining(|| {
