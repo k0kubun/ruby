@@ -4889,9 +4889,7 @@ fn side_exit_with_recompile(jit: &JITState, function: &Function, state: &FrameSt
 
 /// Build a side-exit context
 fn build_side_exit(jit: &JITState, function: &Function, state: &FrameState) -> SideExit {
-    let stack_map = build_stack_map(jit, function, state);
-    let jit_frame = JITFrame::new_iseq(state.pc, state.iseq);
-    let stack_map = StackMap::new(stack_map, jit_frame, state.depth);
+    let stack_map = StackMap::for_side_exit(build_stack_map(jit, function, state), state.depth);
     SideExit {
         pc: Opnd::const_ptr(state.pc),
         vm_stack_size: state.stack().len(),

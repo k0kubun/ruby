@@ -17,6 +17,7 @@ use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label, LabelName};
 use crate::state::ZJITState;
 use crate::exit_desc::{ExitDescriptor, ExitLoc};
+use crate::jit_frame::JITFrame;
 use crate::cast::IntoUsize;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
@@ -1871,7 +1872,9 @@ pub struct StackMap {
     /// Ruby stack slots to reconstruct if this frame is materialized.
     stack: Vec<StackMapEntry>,
     /// Heap-allocated JITFrame that receives the encoded stack map once this
-    /// CCall's register allocation is known.
+    /// CCall's register allocation is known. Null for a side exit: compile_exits
+    /// allocates one JITFrame per distinct side exit, so that identical side
+    /// exits compare equal and share their code, descriptor, and JITFrame.
     jit_frame: *const zjit_jit_frame,
     /// Inlining depth of the frame whose stack is described by this map.
     /// Stack-map indexes are decoded from that frame's cfp->jit_return.
@@ -1881,6 +1884,11 @@ pub struct StackMap {
 impl StackMap {
     pub fn new(stack: Vec<StackMapEntry>, jit_frame: *const zjit_jit_frame, frame_depth: usize) -> Self {
         Self { stack, jit_frame, frame_depth }
+    }
+
+    /// Stack map for a side exit, whose JITFrame is allocated by compile_exits
+    pub fn for_side_exit(stack: Vec<StackMapEntry>, frame_depth: usize) -> Self {
+        Self { stack, jit_frame: std::ptr::null(), frame_depth }
     }
 }
 
@@ -3305,14 +3313,11 @@ impl Assembler
 
         /// Encode the JITFrame entries of a stack map at compile time, and describe the
         /// register values the exit has to capture into native stack slots at run time.
-        fn compile_exit_stack_map(asm: &Assembler, stack_map: &StackMap) -> Vec<(ExitLoc, i32)> {
-            let StackMap { stack, jit_frame, frame_depth } = stack_map;
-            let jit_frame = *jit_frame;
-            // A JITFrame keeps the first stack map set to it, so skip building the others.
-            // The captures are still needed for every exit.
-            let mut writer = (!unsafe { &*jit_frame }.has_stack_map()).then(|| unsafe { &*jit_frame }.stack_map_writer());
+        fn compile_exit_stack_map(asm: &Assembler, stack_map: &StackMap, jit_frame: *const zjit_jit_frame) -> Vec<(ExitLoc, i32)> {
+            let StackMap { stack, frame_depth, .. } = stack_map;
+            let mut writer = unsafe { &*jit_frame }.stack_map_writer();
             macro_rules! write_stack_map {
-                ($($call:tt)*) => { if let Some(writer) = writer.as_mut() { writer.$($call)*; } };
+                ($($call:tt)*) => { writer.$($call)* };
             }
 
             let mut captures = vec![];
@@ -3344,9 +3349,7 @@ impl Assembler
                     StackMapEntry::Opnd(_) => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 }
             }
-            if let Some(writer) = writer {
-                unsafe { &mut *jit_frame.cast_mut() }.set_stack_map(writer);
-            }
+            unsafe { &mut *jit_frame.cast_mut() }.set_stack_map(writer);
 
             assert!(captures.len() <= asm.stack_state.num_side_exit_stack_map_slots);
             captures
@@ -3354,8 +3357,11 @@ impl Assembler
 
         /// Build the descriptor of a side exit: everything the exit does when taken.
         fn compile_exit_descriptor(asm: &Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) -> ExitDescriptor {
-            let SideExit { vm_stack_size, stack_map, recompile, .. } = exit;
-            let captures = compile_exit_stack_map(asm, stack_map);
+            let SideExit { pc, vm_stack_size, iseq, stack_map, recompile } = exit;
+            debug_assert!(stack_map.jit_frame.is_null(), "a side exit's JITFrame should be allocated here");
+            let Opnd::UImm(pc) = *pc else { unreachable!("side exit PC should be a pointer, got {pc:?}") };
+            let jit_frame = JITFrame::new_iseq(pc as *const VALUE, *iseq);
+            let captures = compile_exit_stack_map(asm, stack_map, jit_frame);
             let trace_reason = trace_reason.map(|reason| {
                 // Leak a CString with the reason so it's available at runtime
                 let reason_cstr = std::ffi::CString::new(reason.to_string())
@@ -3369,7 +3375,7 @@ impl Assembler
             };
             ExitDescriptor {
                 vm_stack_size: *vm_stack_size,
-                jit_frame: stack_map.jit_frame,
+                jit_frame,
                 frame_depth: stack_map.frame_depth,
                 captures,
                 recompile,
