@@ -5092,7 +5092,7 @@ c_callable! {
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
 
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(compile_error));
-                return ZJITState::get_materialize_exit_trampoline_with_counter().raw_ptr(cb);
+                return stub_fallback_for_compile_error(compile_error).raw_ptr(cb);
             }
 
             // Run the callee in the interpreter until it collects enough profiles. Return its
@@ -5117,11 +5117,28 @@ c_callable! {
                 unsafe { Rc::increment_strong_count(iseq_call_ptr as *const IseqCall); }
 
                 prepare_for_exit(iseq, cfp, sp, argc, num_opts_filled, Some(&compile_error));
-                ZJITState::get_materialize_exit_trampoline_with_counter()
+                stub_fallback_for_compile_error(&compile_error)
             });
             cb.mark_all_executable();
             code_ptr.raw_ptr(cb)
         })
+    }
+}
+
+/// Where a function stub sends a call whose callee can't be compiled. The frame has been prepared
+/// for the interpreter by prepare_for_exit().
+///
+/// Most compile errors don't go away by retrying: the ISEQ is CantCompile, or the code region is
+/// full. Exiting the caller for them would make every later call from the caller's JIT code hit the
+/// stub and exit the caller again, so run just the callee in the interpreter and return its result
+/// to the caller, like a callee that hasn't been profiled enough. A full native stack is transient,
+/// so that one still exits the caller, letting the interpreter unwind or raise SystemStackError.
+fn stub_fallback_for_compile_error(compile_error: &CompileError) -> CodePtr {
+    if matches!(compile_error, CompileError::NativeStackTooLarge) {
+        ZJITState::get_materialize_exit_trampoline_with_counter()
+    } else {
+        incr_counter!(function_stub_interp_after_compile_error);
+        ZJITState::get_exec_callee_trampoline()
     }
 }
 
