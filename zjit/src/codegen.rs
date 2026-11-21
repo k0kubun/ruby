@@ -898,7 +898,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
-        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)), .. } => unreachable!("BlockArgProc and FrameBlock only appear in direct calls"),
+        &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_) | BlockHandler::FrameBlock(_)), .. } => unreachable!("BlockArgProc, BlockArgSymbol, and FrameBlock only appear in direct calls"),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect(insn) => {
             let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, exit_state, .. } = &**insn;
@@ -1414,9 +1414,10 @@ fn gen_block_handler_specval(asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Op
 fn gen_cfunc_block_handler_specval(jit: &JITState, asm: &mut Assembler, block: Option<BlockHandler>) -> lir::Opnd {
     match block {
         Some(BlockHandler::BlockIseq(blockiseq)) => gen_block_handler_specval(asm, blockiseq),
-        Some(BlockHandler::FrameBlock(block_handler)) => jit.get_opnd(block_handler),
+        // A raw block handler, a Proc, or a Symbol is already a valid specval.
+        Some(BlockHandler::FrameBlock(block_handler) | BlockHandler::BlockArgProc(block_handler) | BlockHandler::BlockArgSymbol(block_handler)) => jit.get_opnd(block_handler),
         None => VM_BLOCK_HANDLER_NONE.into(),
-        Some(BlockHandler::BlockArg | BlockHandler::BlockArgProc(_)) => unreachable!("unsupported block handler in a C method call"),
+        Some(BlockHandler::BlockArg) => unreachable!("unsupported block handler in a C method call"),
     }
 }
 
@@ -1424,6 +1425,8 @@ fn lower_block_handler(jit: &JITState, bh: BlockHandler) -> lir::BlockHandler {
     match bh {
         BlockHandler::BlockIseq(blockiseq) => lir::BlockHandler::Iseq(blockiseq),
         BlockHandler::BlockArgProc(proc_id) => lir::BlockHandler::Proc(jit.get_opnd(proc_id)),
+        // A Symbol is a valid specval as is, like a Proc.
+        BlockHandler::BlockArgSymbol(symbol_id) => lir::BlockHandler::Proc(jit.get_opnd(symbol_id)),
         // A raw block handler is already a valid specval.
         BlockHandler::FrameBlock(block_handler) => lir::BlockHandler::Proc(jit.get_opnd(block_handler)),
         BlockHandler::BlockArg => unreachable!("BlockArg in a direct iseq call"),

@@ -1795,6 +1795,8 @@ pub(crate) mod ids {
         name: send
         name: __send__
         name: initialize
+        name: to_proc
+        name: rb_vm_symbol_block_arg_refined_p
     }
 
     /// Get an CRuby `ID` to an interned string, e.g. a particular method name.
