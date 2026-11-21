@@ -26712,6 +26712,71 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_zsuper_with_keyword_params_optimizes() {
+        eval("
+            class A
+              def foo(x, b: 0, a:) = [x, a, b]
+            end
+            class B < A
+              def foo(x, a:, b: 2)
+                super
+              end
+            end
+
+            B.new.foo(0, a: 1)
+        ");
+
+        let hir = hir_string_proc("B.new.method(:foo)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn foo@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          v4:BasicObject = LoadField v2, :a@0x1001
+          v5:BasicObject = LoadField v2, :b@0x1002
+          v6:BasicObject = LoadField v2, :<empty>@0x1003
+          Jump bb3(v1, v3, v4, v5, v6)
+        bb2():
+          EntryPoint JIT(0)
+          v9:BasicObject = LoadArg :self@0
+          v10:BasicObject = LoadArg :x@1
+          v11:BasicObject = LoadArg :a@2
+          v12:BasicObject = LoadArg :b@3
+          v13:CPtr = GetEP 0
+          v14:BasicObject = LoadField v13, :<empty>@0x1004
+          Jump bb3(v9, v10, v11, v12, v14)
+        bb3(v16:BasicObject, v17:BasicObject, v18:BasicObject, v19:BasicObject, v20:BasicObject):
+          v26:StaticSymbol[:a] = Const Value(VALUE(0x1008))
+          v29:StaticSymbol[:b] = Const Value(VALUE(0x1010))
+          v32:HashExact = NewHash v26: v18, v29: v19
+          PatchPoint NoEPEscape(foo)
+          PatchPoint MethodRedefined(A@0x1018, foo@0x1020, cme:0x1028)
+          v45:CPtr = GetEP 0
+          v46:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_ME_CREF@0x1050
+          v47:CallableMethodEntry[VALUE(0x1058)] = Const Value(VALUE(0x1058))
+          v48:CBool = IsBitEqual v46, v47
+          CondBranch v48, bb5(), bb4()
+        bb4():
+          v50:RubyValue = CCall v16, :rb_vm_lep_method_entry@0x1060, v46
+          v51:CallableMethodEntry[VALUE(0x1058)] = GuardBitEquals v50, Value(VALUE(0x1058))
+          Jump bb5()
+        bb5():
+          v53:RubyValue = LoadField v45, :VM_ENV_DATA_INDEX_SPECVAL@0x1061
+          v54:FalseClass = GuardBitEquals v53, Value(false) recompile
+          v73:Fixnum[0] = Const Value(0)
+          PushInlineFrame :foo, v16 (0x1068), num_args=3
+          v69:ArrayExact = NewArray v17, v18, v19
+          PopInlineFrame
+          PatchPoint NoEPEscape(foo)
+          CheckInterrupts
+          Return v69
+        ");
+    }
+
+    #[test]
     fn test_send_to_zsuper_private_class_method_new() {
         eval("
             class C
