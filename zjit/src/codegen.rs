@@ -1343,7 +1343,9 @@ fn gen_ccall_with_frame(
     gen_save_sp(asm, caller_stack_size);
     asm_comment!(asm, "save SP as the stack map anchor");
     asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, jit.base_ptr_slot_native_base_ptr_offset()), SP);
-    gen_spill_stack(jit, asm, function, state);
+    // The receiver and arguments are passed in registers or on the C stack, and the C frame
+    // overwrites their VM stack slots, so spill only the caller's stack below them.
+    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     let block_handler_specval = gen_cfunc_block_handler_specval(jit, asm, block);
@@ -1480,7 +1482,9 @@ fn gen_ccall_variadic(
     gen_save_sp(asm, caller_stack_size);
     asm_comment!(asm, "save SP as the stack map anchor");
     asm.mov(Opnd::mem(64, NATIVE_BASE_PTR, jit.base_ptr_slot_native_base_ptr_offset()), SP);
-    gen_spill_stack(jit, asm, function, state);
+    // The receiver and arguments are passed in registers or on the C stack, and the C frame
+    // overwrites their VM stack slots, so spill only the caller's stack below them.
+    gen_spill_stack(jit, asm, function, &state.with_stack_size(caller_stack_size));
     asm.stack_map(stack_map, jit_frame, state.depth);
 
     let block_handler_specval = gen_cfunc_block_handler_specval(jit, asm, block);
