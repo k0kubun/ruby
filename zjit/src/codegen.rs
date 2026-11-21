@@ -4616,7 +4616,8 @@ c_callable! {
                     let opts_filled = num_opts_filled.to_usize();
                     let opts_unfilled = opt_num.saturating_sub(opts_filled);
                     if opts_unfilled > 0 {
-                        let argc = argc.to_usize();
+                        // gen_function_stub spills the **kwrest argument to its own local, outside the packed args.
+                        let argc = argc.to_usize() - usize::from(params.flags.has_kwrest() != 0);
                         let lead_num: usize = params.lead_num.try_into().expect("ISEQ lead_num should be non-negative");
                         let param_locals = &mut locals[..params_size];
                         // Gap of unspecified optional parameters
@@ -4745,7 +4746,7 @@ fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodeP
     let local_size = unsafe { get_iseq_body_local_table_size(iseq_call.iseq.get()) }.to_usize();
 
     // Mirror the argument layout of gen_send_direct: self, then the packed
-    // positional arguments, and the block handler if it exists.
+    // positional and keyword arguments, the **kwrest Hash, and the block handler if they exist.
     // TODO: Unify the argument order to avoid having to manually keep in sync
     let params = unsafe { iseq_call.iseq.get().params() };
     let block_spill = (params.flags.has_block() != 0).then(|| {
@@ -4753,8 +4754,16 @@ fn gen_function_stub(cb: &mut CodeBlock, iseq_call: IseqCallRef) -> Result<CodeP
             .expect("ISEQ block_start should be non-negative");
         (argc + 1, block_local_idx) // +1 for self
     });
+    // The **kwrest argument comes last, but its local sits past the hidden kw_bits local.
+    let kwrest_spill = (params.flags.has_kwrest() != 0).then(|| {
+        let kwrest_local_idx: usize = unsafe { (*params.keyword).rest_start }.try_into()
+            .expect("ISEQ keyword rest_start should be non-negative");
+        (argc, kwrest_local_idx) // +1 for self, -1 for the last argument
+    });
+    let packed_argc = argc - usize::from(kwrest_spill.is_some());
 
-    let spills = (0..argc).map(|arg_idx| (arg_idx + 1, arg_idx)) // +1 for self
+    let spills = (0..packed_argc).map(|arg_idx| (arg_idx + 1, arg_idx)) // +1 for self
+        .chain(kwrest_spill)
         .chain(block_spill);
     for (c_arg_idx, local_idx) in spills {
         let src = match lir::c_arg_location(c_arg_idx) {

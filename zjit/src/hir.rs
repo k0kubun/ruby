@@ -3034,7 +3034,11 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
     let forwardable = 0 != params.flags.forwardable();
     if forwardable && caller_args.flags & FORWARDABLE_CALLEE_BLOCKERS != 0
                                        { count_failure(complex_arg_pass_param_forwardable) }
-    if 0 != params.flags.has_kwrest()  { count_failure(complex_arg_pass_param_kwrest) }
+    // A caller **hash would have to be split into the callee's keywords and a copy for **kwrest.
+    // Explicit caller keywords are known statically, so they can be packed into a new Hash.
+    let has_kwrest = 0 != params.flags.has_kwrest();
+    if has_kwrest && caller_args.flags & VM_CALL_KW_SPLAT != 0
+                                       { count_failure(complex_arg_pass_param_kwrest) }
 
     // If the caller passes a block (literal or &block), we need to fall back to the
     // interpreter for two cases it handles that we don't:
@@ -3119,23 +3123,25 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
     // After keyword-to-positional-hash, SendDirect receives no keyword slots;
     // the caller keywords are represented by one extra positional Hash.
     let effective_keyword_count = if keywords_as_positional_hash { 0 } else { caller_kw_count };
+    // Keywords the callee doesn't declare go to its **kwrest Hash.
+    let kw_max_num = if has_kwrest { c_int::MAX } else { kw_total_num };
     let keyword_ok = c_int::try_from(effective_keyword_count)
         .as_ref()
-        .map(|argc| (kw_req_num..=kw_total_num).contains(argc))
+        .map(|argc| (kw_req_num..=kw_max_num).contains(argc))
         .unwrap_or(false);
     if !keyword_ok {
         return Err(SendDirectFailure::new(ArgcParamMismatch));
     }
 
     // Compute the final argc after keyword setup and rest packing:
-    // send_argc = packed positional args + callee's total keywords (all kw slots are filled).
+    // send_argc = packed positional args + callee's total keywords (all kw slots are filled) + **kwrest slot.
     // With *rest, SendDirect receives one rest-array slot instead of each rest
     // element, so cap positional argc at required/post + filled opts + rest slot.
     let passed_opt_num = (caller_positional_i32 - min_positional).min(opt_num) as usize;
     // Without *rest, use the converted positional count so the synthesized
     // keyword Hash is included in the SendDirect argument count.
     let send_positional_argc = if has_rest { min_positional as usize + passed_opt_num + 1 } else { effective_positional };
-    let send_argc = send_positional_argc + kw_total_num as usize;
+    let send_argc = send_positional_argc + kw_total_num as usize + usize::from(has_kwrest);
 
     // IseqCall stores the JIT entry index and argc as u16.
     if u16::try_from(send_argc).is_err() {
@@ -4824,8 +4830,10 @@ impl Function {
         let callee_kw_table = unsafe { (*callee_keyword).table };
         let default_values = unsafe { (*callee_keyword).default_values };
 
-        // Caller can't provide more keywords than callee expects (no **kwrest support yet).
-        if caller_kw_count > callee_kw_count {
+        let has_kwrest = unsafe { iseq.params() }.flags.has_kwrest() != 0;
+
+        // Without **kwrest, caller can't provide more keywords than callee expects.
+        if !has_kwrest && caller_kw_count > callee_kw_count {
             return Err(SendDirectKeywordCountMismatch);
         }
 
@@ -4853,7 +4861,7 @@ impl Function {
                     break;
                 }
             }
-            if !found {
+            if !found && !has_kwrest {
                 // Caller is passing an unknown keyword - this will raise ArgumentError.
                 // Fall back to VM dispatch to handle the error.
                 return Err(SendDirectKeywordMismatch);
@@ -4909,6 +4917,26 @@ impl Function {
 
         // Replace the keyword arguments with the reordered ones.
         processed_args.extend(reordered_kw_args);
+
+        if has_kwrest {
+            // Match vm_args.c: keywords the callee doesn't declare go to a new **kwrest Hash in
+            // the caller's order (make_rest_kw_hash, args_kw_argv_to_hash). With no keywords
+            // left, a named **kwrest gets a new empty Hash, but an anonymous `**` without other
+            // keyword parameters gets nil (args_setup_kw_rest_parameter).
+            let mut elements = vec![];
+            for (j, value) in keyword_values.into_iter().enumerate() {
+                if let Some(value) = value {
+                    elements.push(SendDirectArg::Constant(unsafe { get_cikw_keywords_idx(kwarg, j as i32) }));
+                    elements.push(value);
+                }
+            }
+            let params = unsafe { iseq.params() };
+            if elements.is_empty() && params.flags.anon_kwrest() != 0 && params.flags.has_kw() == 0 {
+                processed_args.push(SendDirectArg::Constant(Qnil));
+            } else {
+                processed_args.push(SendDirectArg::KeywordHash(elements));
+            }
+        }
         Ok((processed_args, kw_bits))
     }
 
@@ -4934,7 +4962,7 @@ impl Function {
         let lead_num = params.lead_num as usize;
         let opt_num = params.opt_num as usize;
         let post_num = params.post_num as usize;
-        let kw_num = callee_kw_num(iseq);
+        let kw_num = callee_kw_num(iseq) + usize::from(params.flags.has_kwrest() != 0);
 
         let positional_argc = args.len().checked_sub(kw_num).ok_or(ArgcParamMismatch)?;
         let min_positional_argc = lead_num + post_num;
