@@ -5799,9 +5799,9 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_yield_lambda_falls_back() {
-        // A lambda passed via &l becomes a proc block handler (not imemo_iseq), so it never inlines invocation.
-        // Compiles to Send.
+    fn test_yield_lambda_dispatches_directly() {
+        // A lambda passed via &l becomes a Proc block handler. With as many arguments as its
+        // parameters, it's called with a lambda frame, which isn't inlined.
         let result = eval("
             def foo = yield(5)
             def test(l) = foo(&l)
@@ -5829,11 +5829,28 @@ mod hir_opt_tests {
           v27:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
           PushInlineFrame :foo, v27 (0x1040), num_args=0, block=&v24
           v34:Fixnum[5] = Const Value(5)
-          v36:BasicObject = InvokeBlock v34 # SendFallbackReason: InvokeBlock: not yet specialized
+          v36:CPtr = GetEP 0
+          v37:CInt64 = LoadField v36, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
+          v40:CInt64[7] = Const CInt64(7)
+          v41:CInt64 = IntAnd v37, v40
+          v42:CInt64[0] = GuardBitEquals v41, CInt64(0) recompile
+          v43:CInt64 = GuardAnyBitSet v37, CUInt64(0xfffffffffffffff8) recompile
+          v44:Class = LoadField v43, :RBASIC_KLASS@0x1061
+          v45:ClassSubclass[Proc@0x1062] = GuardBitEquals v44, Value(VALUE(0x1062)) recompile
+          v46:CInt64 = LoadField v43, :proc_data@0x1063
+          v47:CInt64 = LoadField v46, :proc_header@0x1064
+          v48:CInt64[2815] = Const CInt64(2815)
+          v49:CInt64 = IntAnd v47, v48
+          v50:CInt64[512] = GuardBitEquals v49, CInt64(512) recompile
+          v51:CInt64[8] = Const CInt64(8)
+          v52:CInt64 = IntAdd v46, v51
+          v53:Iseq = LoadField v52, :code_iseq@0x1065
+          v54:Iseq[VALUE(0x1068)] = GuardBitEquals v53, Value(VALUE(0x1068)) recompile
+          v55:BasicObject = InvokeBlockIseqDirect lambda (0x1068), v52, v34
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v36
+          Return v55
         ");
     }
 

@@ -371,6 +371,8 @@ impl Flags {
     const IS_PROC_BLOCK_HANDLER: u32 = 1 << 6;
     /// Only the shape and layout flags were recorded; the class is not retained.
     const IS_SHAPE_ONLY: u32 = 1 << 7;
+    /// The profiled Proc block handler with an ISEQ is a lambda
+    const IS_LAMBDA_BLOCK_HANDLER: u32 = 1 << 8;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -387,10 +389,11 @@ impl Flags {
     pub fn eq_ignoring_embedded(self, other: Self) -> bool { (self.0 & !Self::IS_EMBEDDED) == (other.0 & !Self::IS_EMBEDDED) }
 }
 
-/// If `yield` to the Proc `procv` would run its block like an ISEQ block handler, return the ISEQ.
-/// That's a Proc of exactly class Proc, so that the class tells a guard it's a Proc, which wraps an
-/// ISEQ block and is neither a lambda nor refined (Proc#refined). See `vm_invoke_proc_block`.
-pub fn proc_block_iseq(procv: VALUE) -> Option<IseqPtr> {
+/// If `yield` to the Proc `procv` would run its block like an ISEQ block handler, return the ISEQ
+/// and whether it's a lambda, whose frame has VM_FRAME_FLAG_LAMBDA. That's a Proc of exactly class
+/// Proc, so that the class tells a guard it's a Proc, which wraps an ISEQ block and is not refined
+/// (Proc#refined). See `vm_invoke_proc_block`.
+pub fn proc_block_iseq(procv: VALUE) -> Option<(IseqPtr, bool)> {
     if procv.special_const_p() || procv.class_of() != unsafe { rb_cProc } {
         return None;
     }
@@ -400,23 +403,35 @@ pub fn proc_block_iseq(procv: VALUE) -> Option<IseqPtr> {
         return None;
     }
     let header = unsafe { (*proc).header.as_ref() };
-    if header.type_() != block_type_iseq || header.is_lambda() != 0 || header.is_refined() != 0 {
+    if header.type_() != block_type_iseq || header.is_refined() != 0 {
         return None;
     }
-    Some(unsafe { *(*proc).captured.as_ref().captured.code.iseq.as_ref() })
+    Some((unsafe { *(*proc).captured.as_ref().captured.code.iseq.as_ref() }, header.is_lambda() != 0))
 }
 
 /// Offset of `data` in `struct RTypedData`: after RBasic (flags, klass), fields_obj, and type.
 pub const RUBY_OFFSET_RTYPEDDATA_DATA: i32 = 4 * SIZEOF_VALUE_I32;
 
-/// Mask of the bits in the header of a Proc that need to be zero for [`proc_block_iseq`]:
-/// the block type (`block_type_iseq` is 0), `is_lambda`, and `is_refined`.
+/// Mask of the bits in the header of a Proc that [`proc_block_iseq`] checks: the block type
+/// (`block_type_iseq` is 0), `is_lambda`, and `is_refined`. See [`proc_header_bits`] for the
+/// expected value.
 pub fn proc_header_iseq_block_mask() -> u64 {
     const _: () = assert!(block_type_iseq == 0);
+    proc_header_bits(|header| {
+        header.set_type(0xff);
+        header.set_is_lambda(1);
+        header.set_is_refined(1);
+    })
+}
+
+/// The bits of [`proc_header_iseq_block_mask`] in the header of a Proc of an ISEQ block
+pub fn proc_header_iseq_block_bits(lambda: bool) -> u64 {
+    proc_header_bits(|header| header.set_is_lambda(lambda.into()))
+}
+
+fn proc_header_bits(set: impl FnOnce(&mut rb_proc_header_t)) -> u64 {
     let mut header: rb_proc_header_t = unsafe { std::mem::zeroed() };
-    header.set_type(0xff);
-    header.set_is_lambda(1);
-    header.set_is_refined(1);
+    set(&mut header);
     let mut bits = [0u8; 4];
     unsafe { std::ptr::copy_nonoverlapping(&header as *const rb_proc_header_t as *const u8, bits.as_mut_ptr(), 4) };
     u32::from_ne_bytes(bits) as u64
@@ -466,20 +481,21 @@ impl ProfiledType {
         } else {
             return Self::object(block_handler);
         };
-        let recorded = match proc_block_iseq(block_handler) {
-            Some(iseq) if flag == Flags::IS_PROC_BLOCK_HANDLER => VALUE::from(iseq),
-            _ => Qnil,
+        let (recorded, flag) = match proc_block_iseq(block_handler) {
+            Some((iseq, false)) if flag == Flags::IS_PROC_BLOCK_HANDLER => (VALUE::from(iseq), flag),
+            Some((iseq, true)) if flag == Flags::IS_PROC_BLOCK_HANDLER => (VALUE::from(iseq), flag | Flags::IS_LAMBDA_BLOCK_HANDLER),
+            _ => (Qnil, flag),
         };
         let mut ty = Self::object(recorded);
         ty.flags.0 |= flag;
         ty
     }
 
-    /// The ISEQ of a profiled Proc block handler that `yield` can call like an ISEQ block.
-    /// See [`proc_block_iseq`].
-    pub fn proc_block_iseq(&self) -> Option<IseqPtr> {
+    /// The ISEQ of a profiled Proc block handler that `yield` can call like an ISEQ block, and
+    /// whether it's a lambda. See [`proc_block_iseq`].
+    pub fn proc_block_iseq(&self) -> Option<(IseqPtr, bool)> {
         if self.flags.is_proc_block_handler() && self.class != Qnil {
-            Some(self.class.as_iseq())
+            Some((self.class.as_iseq(), self.flags.0 & Flags::IS_LAMBDA_BLOCK_HANDLER != 0))
         } else {
             None
         }
