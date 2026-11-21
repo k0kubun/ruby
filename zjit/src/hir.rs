@@ -6489,6 +6489,28 @@ impl Function {
                             cme = unsafe { rb_aliased_callable_method_entry(cme) };
                             def_type = unsafe { get_cme_def_type(cme) };
                         }
+                        // A ZSUPER entry, e.g. made by `private_class_method :new`, changes only the
+                        // visibility of the method of the superclass. Call that like vm_call_zsuper(),
+                        // which doesn't check its visibility, and guard it like a super target.
+                        if def_type == VM_METHOD_TYPE_ZSUPER {
+                            let superclass = unsafe { rb_class_get_superclass(RCLASS_ORIGIN((*cme).defined_class)) };
+                            let target = if superclass.nil_p() || superclass == Qfalse || unsafe { RB_TYPE_P(superclass, RUBY_T_ICLASS) } {
+                                std::ptr::null()
+                            } else {
+                                unsafe { rb_callable_method_entry(superclass, mid) }
+                            };
+                            if target.is_null() || matches!(unsafe { get_cme_def_type(target) }, VM_METHOD_TYPE_ZSUPER | VM_METHOD_TYPE_REFINED) {
+                                self.set_dynamic_send_reason(insn_id, SendNotOptimizedMethodType(MethodType::Zsuper));
+                                self.push_insn_id(block, insn_id); continue;
+                            }
+                            self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: superclass, method: mid, cme: target }, state });
+                            cme = target;
+                            def_type = unsafe { get_cme_def_type(cme) };
+                            while def_type == VM_METHOD_TYPE_ALIAS {
+                                cme = unsafe { rb_aliased_callable_method_entry(cme) };
+                                def_type = unsafe { get_cme_def_type(cme) };
+                            }
+                        }
 
                         if def_type == VM_METHOD_TYPE_OPTIMIZED
                             && unsafe { get_cme_def_body_optimized_type(cme) } == OPTIMIZED_METHOD_TYPE_SEND
