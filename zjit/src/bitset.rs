@@ -35,6 +35,13 @@ impl<T: Into<usize> + Copy> BitSet<T> {
         self.entries.fill(0);
     }
 
+    /// Make the set empty with room for `num_bits` bits, reusing its allocation.
+    pub fn reset(&mut self, num_bits: usize) {
+        self.entries.clear();
+        self.entries.resize(num_bits.div_ceil(ENTRY_NUM_BITS), 0);
+        self.num_bits = num_bits;
+    }
+
     /// Set all bits to 1.
     pub fn insert_all(&mut self) {
         for i in 0..self.entries.len() {
