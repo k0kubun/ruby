@@ -364,6 +364,7 @@ fn main() {
         .allowlist_function("rb_zjit_singleton_class_p")
         .allowlist_function("rb_zjit_iclass_for_refinement_p")
         .allowlist_function("rb_zjit_cached_cme")
+        .allowlist_function("rb_zjit_call_data_cme")
         .allowlist_function("rb_zjit_defined_ivar")
         .allowlist_function("rb_zjit_insn_leaf")
         .allowlist_type("jit_bindgen_constants")

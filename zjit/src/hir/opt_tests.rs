@@ -26677,6 +26677,63 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_on_method_entry_of_call_cache_for_singleton_receivers() {
+        set_call_threshold(2);
+        eval("
+        module Tagged; end
+        class Logger
+          def level = 1
+        end
+        LOGGER = Logger.new.extend(Tagged)
+
+        def test(o) = o.level
+
+        test(LOGGER); test(LOGGER)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:8:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Logger@0x1008, level@0x1010, cme:0x1018)
+          v24:StaticSymbol[:level] = Const Value(VALUE(0x1040))
+          v25:CPtr[CPtr(0x1048)] = Const CPtr(0x1048)
+          v26:Iseq[VALUE(0x1050)] = Const Value(VALUE(0x1050))
+          v27:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v28:CBool[false] = Const CBool(false)
+          CondBranchHasType v10, HeapBasicObject, bb8(), bb7()
+        bb8():
+          v30:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1058
+          v31:CUInt64 = LoadField v25, :klass_cache@0x1059
+          v32:CBool = IsBitEqual v30, v31
+          CondBranch v32, bb4(), bb7()
+        bb7():
+          v34:RubyValue = CCall v10, :rb_zjit_cached_cme@0x105a, v24, v25, v26, v27, v28
+          v35:CBool = IsBitEqual v34, v27
+          CondBranch v35, bb4(), bb5()
+        bb4():
+          v37:Fixnum[1] = Const Value(1)
+          Jump bb6(v37)
+        bb5():
+          v39:BasicObject = Send v10, :level # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb6(v39)
+        bb6(v41:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v41
+        ");
+    }
+
+    #[test]
     fn test_no_send_on_method_entry_for_different_methods() {
         set_call_threshold(4);
         eval("
