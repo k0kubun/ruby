@@ -6282,6 +6282,7 @@ impl Function {
             let mut block = block;
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             assert!(self.blocks[block].insns.is_empty());
+            self.blocks[block].insns.reserve(old_insns.len());
             for insn_id in old_insns {
                 // Retry dynamic sends without accumulating counters from previous attempts.
                 // Keep counters for successful replacements, even if an inlined call's
@@ -8686,6 +8687,7 @@ impl Function {
         for block in self.reverse_post_order() {
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             assert!(self.blocks[block].insns.is_empty());
+            self.blocks[block].insns.reserve(old_insns.len());
             for insn_id in old_insns {
                 match self.resolve(insn_id).insn(self) {
                     &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } => {
