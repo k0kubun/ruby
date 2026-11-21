@@ -692,7 +692,7 @@ impl Assembler {
     /// need to be split with registers after `alloc_regs`, e.g. for `compile_exits`, so this
     /// splits them and uses scratch registers for it.
     /// Linearizes all blocks into a single giant block.
-    fn arm64_scratch_split(self) -> Assembler {
+    fn arm64_scratch_split(mut self) -> Assembler {
         /// If opnd is Opnd::Mem with a too large disp, make the disp smaller using lea.
         fn split_large_disp(asm: &mut Assembler, opnd: Opnd, scratch_opnd: Opnd) -> Opnd {
             match opnd {
