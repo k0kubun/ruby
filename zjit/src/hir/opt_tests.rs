@@ -26061,6 +26061,81 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_to_zsuper_private_class_method_new() {
+        eval("
+            class C
+              def initialize(x)
+                @x = x
+              end
+              private_class_method :new
+              def self.make(x) = new(x)
+            end
+            C.make(1)
+        ");
+        let hir = hir_string_proc("C.method(:make)");
+        assert!(!hir.contains("Send v"), "Expected no dynamic Send but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn make@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v14:NilClass = Const Value(nil)
+          v18:ClassSubclass[C@0x1001] = GuardBitEquals v9, Value(VALUE(0x1001)) recompile
+          PatchPoint MethodRedefined(C@0x1001, new@0x1002, cme:0x1008)
+          PatchPoint MethodRedefined(Class@0x1030, new@0x1002, cme:0x1038)
+          PatchPoint MethodRedefined(Class@0x1060, new@0x1002, cme:0x1008)
+          v63:BasicObject = CCallVariadic v18, :Class#new@0x1068, v10
+          PatchPoint NoEPEscape(make)
+          CheckInterrupts
+          Return v63
+        ");
+    }
+
+    #[test]
+    fn test_send_to_zsuper_private_method() {
+        eval("
+            class A
+              def foo = 1
+            end
+            class B < A
+              private :foo
+              def bar = foo
+            end
+            B.new.bar
+        ");
+        let hir = hir_string_proc("B.new.method(:bar)");
+        assert!(!hir.contains("Send v"), "Expected no dynamic Send but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn bar@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(A@0x1000, foo@0x1008, cme:0x1010)
+          PatchPoint NoSingletonClass(B@0x1038)
+          PatchPoint MethodRedefined(B@0x1038, foo@0x1008, cme:0x1040)
+          v20:ObjectSubclass[class_exact:B] = GuardType v6, ObjectSubclass[class_exact:B] recompile
+          v21:Fixnum[1] = Const Value(1)
+          CheckInterrupts
+          Return v21
+        ");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A
