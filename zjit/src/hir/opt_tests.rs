@@ -15558,11 +15558,9 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_send_with_splat_and_proc_block_arg_falls_back() {
-        // Splat plus a block arg is complex argument passing, so this falls back to a
-        // dynamic send. The fallback must happen *before* the Proc `GuardType` is
-        // emitted: a guard in front of a dynamic send gates nothing and would only pay
-        // a side exit plus a recompile on every non-Proc block arg.
+    fn test_send_with_splat_and_proc_block_arg() {
+        // A caller splat to an ISEQ callee is expanded by its profiled length, and the Proc
+        // block arg is passed through as the callee frame's block handler.
         eval(r#"
             def foo(a) = yield a
 
@@ -15589,8 +15587,8 @@ mod hir_opt_tests {
           StoreField v8, :args@0x1001, v10
           Jump bb3(v6)
         bb3(v13:BasicObject):
-          v55:NilClass = Const Value(nil)
-          v54:NilClass = Const Value(nil)
+          v84:NilClass = Const Value(nil)
+          v83:NilClass = Const Value(nil)
           PatchPoint MethodRedefined(Object@0x1008, proc@0x1010, cme:0x1018)
           v52:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v13, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
           v53:BasicObject = CCallWithFrame v52, :Kernel#proc@0x1040, block=0x1048
@@ -15606,9 +15604,20 @@ mod hir_opt_tests {
           v39:ArrayExact = ToArray v37
           v41:CPtr = GetEP 0
           v42:BasicObject = LoadField v41, :blk@0x1000
-          v44:BasicObject = Send v52, &block, :foo, v39, v42 # SendFallbackReason: Complex argument passing
+          v54:ObjectSubclass[class_exact:Proc] = GuardType v42, ObjectSubclass[class_exact:Proc] recompile
+          v56:CInt64 = ArrayLength v39
+          v57:CInt64[1] = GuardBitEquals v56, CInt64(1) recompile
+          v58:CInt64 = CCall v39, :rb_jit_ruby2_keywords_splat_p@0x1070
+          v59:CInt64[0] = GuardBitEquals v58, CInt64(0)
+          PatchPoint MethodRedefined(Object@0x1008, foo@0x1071, cme:0x1078)
+          v62:CInt64[0] = Const CInt64(0)
+          v63:BasicObject = ArrayAref v39, v62
+          PushInlineFrame :foo, v52 (0x10a0), num_args=1, block=&v54
+          v73:BasicObject = InvokeBlock v63 # SendFallbackReason: InvokeBlock: not yet specialized
+          PatchPoint NoEPEscape(foo)
+          PopInlineFrame
           CheckInterrupts
-          Return v44
+          Return v73
         ");
     }
 
