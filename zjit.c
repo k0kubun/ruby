@@ -35,6 +35,9 @@
 // support one scheme for simplicity.
 STATIC_ASSERT(pointer_tagging_scheme, USE_FLONUM);
 
+// RUBY_OFFSET_SVAR_CREF_OR_ME in zjit/src/cruby.rs
+STATIC_ASSERT(svar_cref_or_me_offset, offsetof(struct vm_svar, cref_or_me) == 8);
+
 enum zjit_struct_offsets {
     ISEQ_BODY_OFFSET_PARAM = offsetof(struct rb_iseq_constant_body, param),
     ISEQ_BODY_OFFSET_OUTER_VARIABLES = offsetof(struct rb_iseq_constant_body, outer_variables),

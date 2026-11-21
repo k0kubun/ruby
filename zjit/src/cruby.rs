@@ -1262,6 +1262,9 @@ mod manual_defs {
     // Constants from iseq_inline_constant_cache (IC) and iseq_inline_constant_cache_entry (ICE) in vm_core.h
     pub const RUBY_OFFSET_IC_ENTRY: i32 = 0;
     pub const RUBY_OFFSET_ICE_VALUE: i32 = 8;
+
+    // Constants from struct vm_svar in internal/imemo.h
+    pub const RUBY_OFFSET_SVAR_CREF_OR_ME: i32 = 8;
 }
 pub use manual_defs::*;
 
