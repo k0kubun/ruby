@@ -1200,6 +1200,7 @@ impl Assembler {
             }
 
             trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
+            trace_compile_phase("call_crossing_intervals", || asm.stack_slots_for_call_crossing_intervals(&mut intervals));
             let num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs));
 
             asm.stack_state.num_spill_slots = num_stack_slots;
