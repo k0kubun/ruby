@@ -507,6 +507,7 @@ make_counters! {
     // HIR-level method inliner counters. Rejection counters are incremented once per
     // SendDirect the inliner considers.
     inline_method_count,
+    inline_tiny_past_budget_count,
     inline_block_count,
     inline_throw_count,
     inline_frame_push_count,

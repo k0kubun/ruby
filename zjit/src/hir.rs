@@ -3102,6 +3102,15 @@ pub enum ValidationError {
 /// `break` or `return`, it's inlined regardless of the budget as well, so the throw can become a jump.
 const ITERATOR_INLINE_MAX_CALLEE_SIZE: usize = 128;
 
+/// The largest callee, in YARV code size, that a caller may still inline once it spent its
+/// inlining budget, e.g. `def resolve_class(name) = class_loader.load(name)`. A callee this
+/// small is about as much code as the call it replaces.
+const TINY_INLINE_MAX_CALLEE_SIZE: usize = 8;
+
+/// The number of tiny callees a caller may inline past its budget. Tiny callees can still
+/// call each other, so this bounds the growth.
+const MAX_TINY_INLINES_PAST_BUDGET: usize = 16;
+
 const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     // `gen_send_iseq_direct` currently handles only the interpreter's `vm_call_iseq_forwardable`
     // fastpath case on forwardable ISEQs: pass non-`...` arguments to a `...` callee, which sets
@@ -3353,6 +3362,8 @@ pub struct Function {
     inline_frame_selfs: HashMap<InsnId, InsnId>,
     /// Inlined method frames whose method entry's cref has no refinements, by caller Snapshot
     unrefined_inline_method_frames: HashSet<InsnId>,
+    /// The number of tiny callees inlined past the inlining budget. See [`TINY_INLINE_MAX_CALLEE_SIZE`].
+    tiny_inlines_past_budget: usize,
     /// Per-call-site caches of the last receiver classes found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
@@ -3721,6 +3732,7 @@ impl Function {
             pinned_return_blocks: HashMap::default(),
             inline_frame_selfs: HashMap::default(),
             unrefined_inline_method_frames: HashSet::default(),
+            tiny_inlines_past_budget: 0,
             klass_caches: Default::default(),
             catch_return_sites: HashSet::default(),
         }
@@ -7708,6 +7720,12 @@ impl Function {
         true
     }
 
+    /// Whether the function has spent its inlining budget. See [`Self::should_inline`].
+    fn over_inline_budget(&self) -> bool {
+        let budget = get_option!(inline_budget);
+        budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
+    }
+
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
     fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
@@ -7748,8 +7766,7 @@ impl Function {
         // Per-caller cumulative budget. Once that count crosses the budget, every further callee
         // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
         // `Options::inline_budget` for the full unit/semantics caveat.
-        let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && !ignore_budget && self.num_instructions > budget {
+        if !ignore_budget && self.over_inline_budget() {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
@@ -7861,7 +7878,12 @@ impl Function {
                     && matches!(call_block, Some(BlockHandler::BlockIseq(blockiseq)) if crate::codegen::block_iseq_may_throw(blockiseq));
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || (throw_targets.is_none() && !self.should_inline(iseq, cme, yields_literal_block, throw_yielder)) || !Self::can_inline(iseq) {
+                // A big caller like a parser's dispatch method spends its budget on its own body, but
+                // inlining a tiny callee, e.g. one that forwards to another method, costs about nothing.
+                let tiny_past_budget = self.over_inline_budget()
+                    && self.tiny_inlines_past_budget < MAX_TINY_INLINES_PAST_BUDGET
+                    && unsafe { get_iseq_encoded_size(iseq) } as usize <= TINY_INLINE_MAX_CALLEE_SIZE;
+                if frame_block || (throw_targets.is_none() && !self.should_inline(iseq, cme, yields_literal_block, throw_yielder || tiny_past_budget)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -7943,6 +7965,10 @@ impl Function {
                 match inline_call {
                     InlineCall::Send { .. } => incr_counter!(inline_method_count),
                     InlineCall::InvokeBlock { .. } => incr_counter!(inline_block_count),
+                }
+                if tiny_past_budget {
+                    self.tiny_inlines_past_budget += 1;
+                    incr_counter!(inline_tiny_past_budget_count);
                 }
                 did_inline = true;
                 let throwing_blockiseq = match call_block {
