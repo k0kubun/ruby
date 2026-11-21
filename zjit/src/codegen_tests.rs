@@ -12102,6 +12102,82 @@ fn test_send_caller_splat_with_ruby2_keywords_hash_and_nil_block_arg() {
 }
 
 #[test]
+fn test_send_cfunc_with_symbol_block_arg() {
+    eval("
+        def test(h) = h.fetch(:a, &:to_s)
+        test({})
+    ");
+    assert_snapshot!(assert_compiles("[test({}), test({a: 1})]"), @r#"["a", 1]"#);
+}
+
+#[test]
+fn test_send_cfunc_with_nil_and_proc_block_args() {
+    eval("
+        def test(h, blk) = h.merge({a: 2}, &blk)
+        def entry = [test({a: 1}, nil), test({a: 1}, nil)]
+        def entry_proc(blk) = [test({a: 1}, blk), test({a: 1}, blk)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[{a: 2}, {a: 2}]");
+    // A Proc after nil side-exits and recompiles
+    assert_snapshot!(inspect("blk = proc { |k, o, n| o + n }; entry_proc(blk); entry_proc(blk)"), @"[{a: 3}, {a: 3}]");
+}
+
+#[test]
+fn test_send_variadic_cfunc_with_symbol_block_arg() {
+    eval("
+        def test(a) = a.sort_by(&:-@)
+        test([1, 3, 2])
+    ");
+    assert_snapshot!(assert_compiles("test([1, 3, 2])"), @"[3, 2, 1]");
+}
+
+#[test]
+fn test_send_iseq_with_symbol_block_arg() {
+    eval("
+        def yielder(x) = yield(x)
+        def block_param(&b) = [b.lambda?, b.call(2)]
+        def test = [yielder(1, &:succ), block_param(&:pred), [1, 2].each(&:succ)]
+        test
+    ");
+    assert_snapshot!(assert_compiles("test"), @"[2, [true, 1], [1, 2]]");
+}
+
+#[test]
+fn test_send_symbol_block_arg_with_refinements() {
+    eval("
+        module SuccRefinement
+          refine(Integer) { def succ = :refined }
+        end
+        class Refined
+          using SuccRefinement
+          def cfunc(a) = a.sort_by(&:succ).map(&:succ)
+          def iseq(x) = x.then(&:succ)
+        end
+        def test = [Refined.new.cfunc([2, 1]), Refined.new.iseq(1)]
+        test
+    ");
+    // Refined call sites stay dynamic instead of side-exiting on every call
+    assert_snapshot!(assert_compiles("test"), @"[[:refined, :refined], :refined]");
+}
+
+#[test]
+fn test_send_symbol_block_arg_after_redefining_to_proc() {
+    eval("
+        def yielder(x) = yield(x)
+        def test(a) = [a.sort_by(&:-@), yielder(1, &:succ)]
+        test([1, 3, 2])
+        test([1, 3, 2])
+    ");
+    assert_snapshot!(inspect("
+        class Symbol
+          def to_proc = proc { :redefined }
+        end
+        test([1, 3, 2])
+    "), @"[[1, 3, 2], :redefined]");
+}
+
+#[test]
 fn test_send_polymorphic_caller_splat_arguments() {
     set_call_threshold(3);
     eval("
