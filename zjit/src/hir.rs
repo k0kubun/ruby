@@ -6302,6 +6302,12 @@ impl Function {
                         let mut stripped_block_arg = false;
                         let iseq_callee = def_type == VM_METHOD_TYPE_ISEQ;
                         let specializable_cfunc = def_type == VM_METHOD_TYPE_CFUNC && !unspecializable_c_call_type(flags & !VM_CALL_ARGS_BLOCKARG);
+                        // Caller splats are expanded below for ISEQ callees, also with a block arg.
+                        let block_arg_flags = if def_type == VM_METHOD_TYPE_ISEQ {
+                            VM_CALL_ARGS_BLOCKARG | VM_CALL_ARGS_SPLAT
+                        } else {
+                            VM_CALL_ARGS_BLOCKARG
+                        };
                         // A block arg that is the block param proxy (or nil) from `getblockparamproxy`.
                         // Its frame block handler is passed through right before the call.
                         let mut forwarded_block_arg = None;
@@ -6310,7 +6316,7 @@ impl Function {
                             _ => None,
                         };
                         if let Some(block_arg) = forwarded_block_param {
-                            if unspecializable_call_type(flags & !VM_CALL_ARGS_BLOCKARG) {
+                            if unspecializable_call_type(flags & !block_arg_flags) {
                                 self.count_complex_call_features(block, insn_id, flags, state);
                                 self.set_dynamic_send_reason(insn_id, ComplexArgPass);
                                 self.push_insn_id(block, insn_id); continue;
@@ -6325,7 +6331,7 @@ impl Function {
                         } else if send_block == Some(BlockHandler::BlockArg) && (iseq_callee || specializable_cfunc) {
                             // Reject complex argument passing before emitting any block-arg guard;
                             // a guard in front of a send that stays dynamic gates nothing.
-                            if iseq_callee && unspecializable_call_type(flags & !VM_CALL_ARGS_BLOCKARG) {
+                            if iseq_callee && unspecializable_call_type(flags & !block_arg_flags) {
                                 self.count_complex_call_features(block, insn_id, flags, state);
                                 self.set_dynamic_send_reason(insn_id, ComplexArgPass);
                                 self.push_insn_id(block, insn_id); continue;
