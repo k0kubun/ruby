@@ -1392,15 +1392,10 @@ fn gen_ccall_with_frame(
         forwarded_argc: None, // cfunc doesn't support forwarded arguments
     });
 
-    asm_comment!(asm, "switch to new SP register");
-    let sp_offset = (caller_stack_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
-    let new_sp = asm.add(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
-
-    asm_comment!(asm, "switch to new CFP");
-    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
-    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    // The SP and CFP registers stay on the caller's frame since nothing reads them in the C frame.
+    asm_comment!(asm, "set ec->cfp to the C frame");
+    let new_cfp = asm.lea(Opnd::mem(64, CFP, -(RUBY_SIZEOF_CONTROL_FRAME as i32)));
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), new_cfp);
 
     let result = if let Some(catch_return) = cfunc_call_catches_throw(function, block, state) {
         let argv_ptr = gen_push_opnds(jit, asm, &args);
@@ -1415,13 +1410,7 @@ fn gen_ccall_with_frame(
     };
 
     asm_comment!(asm, "pop C frame");
-    let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
-
-    asm_comment!(asm, "restore SP register for the caller");
-    let new_sp = asm.sub(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
 
     result
 }
@@ -1542,15 +1531,10 @@ fn gen_ccall_variadic(
         forwarded_argc: None, // cfunc doesn't support forwarded arguments
     });
 
-    asm_comment!(asm, "switch to new SP register");
-    let sp_offset = (caller_stack_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
-    let new_sp = asm.add(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
-
-    asm_comment!(asm, "switch to new CFP");
-    let new_cfp = asm.sub(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
-    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
+    // The SP and CFP registers stay on the caller's frame since nothing reads them in the C frame.
+    asm_comment!(asm, "set ec->cfp to the C frame");
+    let new_cfp = asm.lea(Opnd::mem(64, CFP, -(RUBY_SIZEOF_CONTROL_FRAME as i32)));
+    asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), new_cfp);
 
     let argv_ptr = gen_push_opnds(jit, asm, &args);
     asm.count_call_to_with(|| qualified_method_name(unsafe { (*cme).owner }, name));
@@ -1561,13 +1545,7 @@ fn gen_ccall_variadic(
     };
 
     asm_comment!(asm, "pop C frame");
-    let new_cfp = asm.add(CFP, RUBY_SIZEOF_CONTROL_FRAME.into());
-    asm.mov(CFP, new_cfp);
     asm.store(Opnd::mem(64, EC, RUBY_OFFSET_EC_CFP), CFP);
-
-    asm_comment!(asm, "restore SP register for the caller");
-    let new_sp = asm.sub(SP, sp_offset.into());
-    asm.mov(SP, new_sp);
 
     result
 }
