@@ -3585,6 +3585,94 @@ fn test_send_kwrest() {
 }
 
 #[test]
+fn test_send_kwrest_without_keywords() {
+    eval("
+        def test(**kw) = kw
+        def entry = test
+        entry
+    ");
+    // Each call gets a new, mutable Hash
+    assert_snapshot!(assert_compiles("
+        a = entry
+        b = entry
+        a[:x] = 1
+        [entry, a.equal?(b), b.frozen?, b.compare_by_identity?]
+    "), @"[{}, false, false, false]");
+}
+
+#[test]
+fn test_send_kwrest_with_unknown_keywords() {
+    eval("
+        def test(a, **kw) = [a, kw, kw.keys]
+        def entry = test(1, z: 3, y: 2)
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[1, {z: 3, y: 2}, [:z, :y]]");
+}
+
+#[test]
+fn test_send_kw_and_kwrest() {
+    eval("
+        def test(k: 1, **kw) = [k, kw]
+        def entry = [test(b: 2, k: 5, a: 1), test, test(c: 3)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[5, {b: 2, a: 1}], [1, {}], [1, {c: 3}]]");
+}
+
+#[test]
+fn test_send_anonymous_kwrest() {
+    eval("
+        def inner(*a, **kw) = [a, kw]
+        def test(**) = inner(**)
+        def entry = [test, test(a: 1)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[[], {}], [[], {a: 1}]]");
+}
+
+#[test]
+fn test_send_kw_and_anonymous_kwrest() {
+    eval("
+        def inner(*a, **kw) = [a, kw]
+        def test(k: 1, **) = inner(**)
+        def entry = [test, test(k: 2), test(j: 3)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[[], {}], [[], {}], [[], {j: 3}]]");
+}
+
+#[test]
+fn test_send_kwrest_with_complex_parameters() {
+    eval("
+        def test(x = 10, *r, y, k: x + 1, **kw, &b) = [x, r, y, k, kw, b&.call]
+        def entry = [test(1) { 9 }, test(1, 2, 3, j: 4) { 8 }, test(1, 2, k: 7, l: 0)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[10, [], 1, 11, {}, 9], [1, [2], 3, 2, {j: 4}, 8], [1, [], 2, 7, {l: 0}, nil]]");
+}
+
+#[test]
+fn test_send_bmethod_kwrest() {
+    eval("
+        define_method(:test) { |a, *b, kw: 100, **kw_rest, &block| [a, b, kw, kw_rest, block&.call] }
+        def entry = [test(1), test(1, 2, kw: 3, z: 4), test(1, y: 2)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[[1, [], 100, {}, nil], [1, [2], 3, {z: 4}, nil], [1, [], 100, {y: 2}, nil]]");
+}
+
+#[test]
+fn test_send_kwrest_missing_required_keyword() {
+    eval("
+        def test(k:, **kw) = [k, kw]
+        def entry = begin; test(a: 1); rescue ArgumentError => e; e.message; end
+        entry
+    ");
+    assert_snapshot!(inspect("entry"), @r#""missing keyword: :k""#);
+}
+
+#[test]
 fn test_send_req_kwreq() {
     assert_snapshot!(inspect("
         def test(a, c:) = [a, c]
