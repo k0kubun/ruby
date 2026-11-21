@@ -168,26 +168,32 @@ impl BasicBlock {
     }
 
     pub fn edges(&self) -> EdgePair {
+        let [edge1, edge2] = self.edge_refs();
+        EdgePair(edge1.cloned(), edge2.cloned())
+    }
+
+    /// Borrow the outgoing edges like [`Self::edges`] without cloning their arguments.
+    pub fn edge_refs(&self) -> [Option<&BranchEdge>; 2] {
         // Stub blocks (from new_block_without_id) have no real CFG structure.
         if self.rpo_index == DUMMY_RPO_INDEX {
-            return EdgePair(None, None);
+            return [None, None];
         }
         assert!(self.insns.last().unwrap().is_terminator());
-        let extract_edge = |insn: &Insn| -> Option<BranchEdge> {
+        fn extract_edge(insn: &Insn) -> Option<&BranchEdge> {
             if let Some(Target::Block(edge)) = insn.target() {
-                Some((**edge).clone())
+                Some(&**edge)
             } else {
                 None
             }
-        };
+        }
 
         match self.insns.as_slice() {
             [] => panic!("empty block"),
             [.., second_last, last] => {
-                EdgePair(extract_edge(second_last), extract_edge(last))
+                [extract_edge(second_last), extract_edge(last)]
             },
             [.., last] => {
-                EdgePair(extract_edge(last), None)
+                [extract_edge(last), None]
             }
         }
     }
@@ -228,7 +234,7 @@ impl BasicBlock {
     /// This function is used for live range calculations and should _not_
     /// be used for parallel moves between blocks
     pub fn out_vregs(&self) -> Vec<VRegId> {
-        let EdgePair(edge1, edge2) = self.edges();
+        let [edge1, edge2] = self.edge_refs();
         let mut out_vregs = Vec::new();
         if let Some(edge) = edge1 {
             for arg in &edge.args {
@@ -2605,10 +2611,13 @@ impl Assembler
         for &pred_id in &block_order {
             let pred_hir_block_id = self.basic_blocks[pred_id.0].hir_block_id;
             let pred_rpo_index = self.basic_blocks[pred_id.0].rpo_index;
-            let EdgePair(edge1, edge2) = self.basic_blocks[pred_id.0].edges();
-
-            let edges: Vec<BranchEdge> = [edge1, edge2].into_iter().flatten().collect();
-            let num_successors = edges.len();
+            let [edge1, edge2] = self.basic_blocks[pred_id.0].edge_refs();
+            let num_successors = edge1.is_some() as usize + edge2.is_some() as usize;
+            // An edge without arguments needs no moves.
+            let edges: Vec<BranchEdge> = [edge1, edge2].into_iter().flatten()
+                .filter(|edge| !edge.args.is_empty())
+                .cloned()
+                .collect();
 
             for edge in edges {
                 let successor = edge.target;
