@@ -924,3 +924,108 @@ VALUE rb_zjit_get_exit_locations(rb_execution_context_t *ec, VALUE self);
 
 // Preprocessed zjit.rb generated during build
 #include "zjit.rbinc"
+
+// ---- TEMPORARY ivar diagnostics (not for commit) ----
+struct ivdiag_site {
+    const rb_iseq_t *iseq; ID id; const void *ic; int kind;
+    uint64_t count, last_hit, complex, not_obj;
+    shape_id_t last;
+    int nshapes; shape_id_t shapes[64]; uint64_t shape_counts[64];
+    int nklass; VALUE klass[8];
+};
+#define IVDIAG_N 8192
+static struct ivdiag_site ivdiag_sites[IVDIAG_N];
+static int ivdiag_used;
+
+static void
+ivdiag_record(int kind, const rb_iseq_t *iseq, VALUE obj, ID id, const void *ic)
+{
+    uintptr_t h = ((uintptr_t)iseq * 31 + (uintptr_t)id * 7 + (uintptr_t)ic * 13 + kind) % IVDIAG_N;
+    struct ivdiag_site *s = NULL;
+    for (int i = 0; i < IVDIAG_N; i++) {
+        struct ivdiag_site *c = &ivdiag_sites[(h + i) % IVDIAG_N];
+        if (c->count == 0) { c->iseq = iseq; c->id = id; c->ic = ic; c->kind = kind; ivdiag_used++; s = c; break; }
+        if (c->iseq == iseq && c->id == id && c->ic == ic && c->kind == kind) { s = c; break; }
+    }
+    if (!s) return;
+    s->count++;
+    if (SPECIAL_CONST_P(obj) || BUILTIN_TYPE(obj) != T_OBJECT) { s->not_obj++; return; }
+    shape_id_t sh = RBASIC_SHAPE_ID(obj);
+    if (rb_shape_complex_p(sh)) s->complex++;
+    if (sh == s->last) s->last_hit++; else s->last = sh;
+    int j;
+    for (j = 0; j < s->nshapes; j++) if (s->shapes[j] == sh) { s->shape_counts[j]++; break; }
+    if (j == s->nshapes && j < 64) { s->shapes[j] = sh; s->shape_counts[j] = 1; s->nshapes++; }
+    VALUE k = rb_obj_class(obj);
+    for (j = 0; j < s->nklass; j++) if (s->klass[j] == k) break;
+    if (j == s->nklass && j < 8) s->klass[s->nklass++] = k;
+}
+
+static int
+ivdiag_cmp(const void *a, const void *b)
+{
+    const struct ivdiag_site *x = a, *y = b;
+    return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+
+static void
+ivdiag_dump(VALUE _)
+{
+    const char *path = getenv("ZJIT_IVAR_DIAG");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    static struct ivdiag_site sorted[IVDIAG_N];
+    memcpy(sorted, ivdiag_sites, sizeof(sorted));
+    qsort(sorted, IVDIAG_N, sizeof(sorted[0]), ivdiag_cmp);
+    uint64_t total = 0;
+    for (int i = 0; i < IVDIAG_N; i++) total += sorted[i].count;
+    fprintf(f, "sites=%d total=%llu\n", ivdiag_used, (unsigned long long)total);
+    for (int i = 0; i < 80 && sorted[i].count; i++) {
+        struct ivdiag_site *s = &sorted[i];
+        VALUE path = rb_iseq_path(s->iseq);
+        // sort shapes by count desc for top-8 coverage
+        uint64_t c[64]; memcpy(c, s->shape_counts, sizeof(c));
+        for (int a = 0; a < s->nshapes; a++) for (int b = a + 1; b < s->nshapes; b++) if (c[b] > c[a]) { uint64_t t = c[a]; c[a] = c[b]; c[b] = t; }
+        uint64_t top8 = 0, top16 = 0; for (int a = 0; a < s->nshapes; a++) { if (a < 8) top8 += c[a]; if (a < 16) top16 += c[a]; }
+        uint64_t objs = s->count - s->not_obj;
+        fprintf(f, "%s %llu %s:%d %s @%s ic=%p shapes=%d%s lasthit=%.1f%% top8=%.1f%% top16=%.1f%% complex=%llu notobj=%llu classes=",
+                s->kind ? "SET" : "GET", (unsigned long long)s->count,
+                RSTRING_PTR(path), FIX2INT(ISEQ_BODY(s->iseq)->location.first_lineno),
+                RSTRING_PTR(rb_iseq_label(s->iseq)), rb_id2name(s->id), s->ic, s->nshapes, s->nshapes >= 64 ? "+" : "",
+                objs ? 100.0 * s->last_hit / objs : 0.0, objs ? 100.0 * top8 / objs : 0.0, objs ? 100.0 * top16 / objs : 0.0,
+                (unsigned long long)s->complex, (unsigned long long)s->not_obj);
+        for (int j = 0; j < s->nklass; j++) fprintf(f, "%s%s", j ? "," : "", rb_class2name(s->klass[j]));
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+static int ivdiag_enabled = -1;
+static inline void
+ivdiag_maybe(int kind, const rb_iseq_t *iseq, VALUE obj, ID id, const void *ic)
+{
+    if (ivdiag_enabled < 0) {
+        ivdiag_enabled = getenv("ZJIT_IVAR_DIAG") != NULL;
+    }
+    if (ivdiag_enabled) ivdiag_record(kind, iseq, obj, id, ic);
+}
+
+VALUE
+rb_zjit_ivdiag_getivar(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
+{
+    ivdiag_maybe(0, iseq, obj, id, ic);
+    if (ic) return rb_zjit_getinstancevariable(iseq, obj, id, ic);
+    return rb_zjit_getivar(obj, id);
+}
+
+void
+rb_zjit_ivdiag_setivar(const rb_iseq_t *iseq, VALUE obj, ID id)
+{
+    ivdiag_maybe(1, iseq, obj, id, NULL);
+}
+
+void
+rb_zjit_ivdiag_init(void)
+{
+    if (getenv("ZJIT_IVAR_DIAG")) rb_set_end_proc(ivdiag_dump, Qnil);
+}

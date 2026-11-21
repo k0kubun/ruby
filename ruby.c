@@ -1888,6 +1888,7 @@ ruby_opt_init(ruby_cmdline_options_t *opt)
 #if USE_ZJIT
     extern void rb_zjit_init(bool);
     rb_zjit_init(opt->zjit);
+    { extern void rb_zjit_ivdiag_init(void); rb_zjit_ivdiag_init(); }
 #endif
 
     ruby_set_script_name(opt->script_name);

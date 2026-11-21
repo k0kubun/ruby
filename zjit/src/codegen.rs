@@ -1563,6 +1563,10 @@ fn gen_getivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
         // Reading a class or module ivar from a non-owner Ractor raises Ractor::IsolationError.
         gen_prepare_non_leaf_call(jit, asm, function, state);
     }
+    if std::env::var_os("ZJIT_IVAR_DIAG").is_some() {
+        let iseq = Opnd::Value(state.iseq.into());
+        return asm_ccall!(asm, rb_zjit_ivdiag_getivar, iseq, recv, id.0.into(), Opnd::const_ptr(ic));
+    }
     if ic.is_null() {
         asm_ccall!(asm, rb_zjit_getivar, recv, id.0.into())
     } else if function.type_of(recv_id).is_subtype(types::HeapBasicObject) && (ivar_inline_cache_filled(ic) || function.is_attr_ivar_cache(ic)) {
@@ -1640,6 +1644,10 @@ fn gen_getivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, recv: Op
 /// Emit an uncached instance variable store
 fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv_id: InsnId, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val_id: InsnId, val: Opnd, state: &FrameState) {
     gen_trace_fallback(asm, "setivar");
+    if std::env::var_os("ZJIT_IVAR_DIAG").is_some() {
+        let iseq = Opnd::Value(state.iseq.into());
+        asm_ccall!(asm, rb_zjit_ivdiag_setivar, iseq, recv, id.0.into());
+    }
     if !ic.is_null() && function.type_of(recv_id).is_subtype(types::HeapBasicObject) && ivar_inline_cache_filled(ic) {
         gen_setivar_on_inline_cache(jit, asm, function, recv, id, ic, val, function.type_of(val_id), state);
         return;

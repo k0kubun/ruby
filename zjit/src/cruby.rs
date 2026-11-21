@@ -163,6 +163,8 @@ unsafe extern "C" {
     pub fn rb_zjit_getinstancevariable(iseq: IseqPtr, obj: VALUE, id: ID, ic: IVC) -> VALUE;
     pub fn rb_zjit_getinstancevariable_on_cache_miss(iseq: IseqPtr, obj: VALUE, id: ID, ic: IVC) -> VALUE;
     pub fn rb_zjit_getivar(obj: VALUE, id: ID) -> VALUE;
+    pub fn rb_zjit_ivdiag_getivar(iseq: IseqPtr, obj: VALUE, id: ID, ic: IVC) -> VALUE;
+    pub fn rb_zjit_ivdiag_setivar(iseq: IseqPtr, obj: VALUE, id: ID);
     pub fn rb_aliased_callable_method_entry(
         me: *const rb_callable_method_entry_t,
     ) -> *const rb_callable_method_entry_t;
