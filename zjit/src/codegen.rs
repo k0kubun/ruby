@@ -1658,25 +1658,29 @@ fn gen_setivar(jit: &mut JITState, asm: &mut Assembler, function: &Function, rec
 
 /// Write an ivar of a heap object that the profiled shapes didn't cover. Like the
 /// interpreter's setinstancevariable, check the inline cache and store the field directly
-/// when the cache holds the object's shape without a shape transition. The cache only holds
-/// unfrozen shapes, and the layout bits make a hit imply embedded T_OBJECT fields. Other
-/// cases call rb_vm_setinstancevariable(), which handles transitions and refills the cache.
+/// when the cache holds the object's shape. On a cached shape transition, which adds the
+/// ivar, also write the destination shape if the field fits in the embedded capacity. The
+/// cache only holds unfrozen shapes, and the layout bits make a hit imply embedded T_OBJECT
+/// fields. Other cases call rb_vm_setinstancevariable(), which refills the cache.
 fn gen_setivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, function: &Function, recv: Opnd, id: ID, ic: *const iseq_inline_iv_cache_entry, val: Opnd, val_type: Type, state: &FrameState) {
     let hir_block_id = asm.current_block().hir_block_id;
     let rpo_idx = asm.current_block().rpo_index;
     let hit_block = asm.new_block(hir_block_id, false, rpo_idx);
     let miss_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let transition_block = asm.new_block(hir_block_id, false, rpo_idx);
     let result_block = asm.new_block(hir_block_id, false, rpo_idx);
     let hit_edge = Target::Block(Box::new(lir::BranchEdge { target: hit_block, args: vec![] }));
     let miss_edge = Target::Block(Box::new(lir::BranchEdge { target: miss_block, args: vec![] }));
+    let transition_edge = Target::Block(Box::new(lir::BranchEdge { target: transition_block, args: vec![] }));
     let result_edge = || Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![] }));
 
     asm_comment!(asm, "setivar on inline cache");
     let recv = asm.load_mem(recv);
     // See rb_setivar_cache_revalidate(): the cache compares shape_id & SHAPE_ID_WRITE_MASK,
     // which keeps the frozen bit. Also keep the layout bits, which are 0 for embedded fields.
-    let shape_id = asm.load(Opnd::mem(32, recv, unsafe { rb_shape_id_offset() })).with_num_bits(64);
-    let shape_id = asm.and(shape_id, Opnd::UImm((SHAPE_ID_OFFSET_MASK | SHAPE_ID_FL_COMPLEX | SHAPE_ID_FL_FROZEN | SHAPE_ID_LAYOUT_MASK) as u64));
+    let shape_id_offset = unsafe { rb_shape_id_offset() };
+    let full_shape_id = asm.load(Opnd::mem(32, recv, shape_id_offset)).with_num_bits(64);
+    let shape_id = asm.and(full_shape_id, Opnd::UImm((SHAPE_ID_OFFSET_MASK | SHAPE_ID_FL_COMPLEX | SHAPE_ID_FL_FROZEN | SHAPE_ID_LAYOUT_MASK) as u64));
     // See rb_setivar_cache_pack(): the attr_index_t is in the low byte, followed by the
     // source and the destination shape offsets.
     let ic_ptr = asm.load(Opnd::const_ptr(ic));
@@ -1685,10 +1689,27 @@ fn gen_setivar_on_inline_cache(jit: &mut JITState, asm: &mut Assembler, function
     let source_shape = asm.and(source_shape, Opnd::UImm(SHAPE_ID_OFFSET_MASK as u64));
     asm.cmp(shape_id, source_shape);
     asm.jne(jit, miss_edge.clone());
-    // Shape transitions take the miss path.
     let dest_shape = asm.urshift(cache, Opnd::UImm((attr_index_t::BITS + SHAPE_ID_OFFSET_MASK.count_ones()) as u64));
     asm.cmp(shape_id, dest_shape);
-    asm.jne(jit, miss_edge);
+    asm.je(jit, hit_edge.clone());
+    // A shape transition. Like rb_setivar_cache_revalidate(), leave a field that doesn't fit
+    // in the object to the miss path, which resizes it. Embedded fields can't grow past the
+    // capacity in the shape ID.
+    let index = asm.and(cache, Opnd::UImm(attr_index_t::MAX as u64));
+    let capacity = asm.and(full_shape_id, Opnd::UImm(SHAPE_ID_CAPACITY_MASK as u64));
+    let capacity = asm.urshift(capacity, Opnd::UImm(SHAPE_ID_OFFSET_MASK.count_ones() as u64));
+    asm.cmp(index, capacity);
+    asm.jb(transition_edge);
+    asm.jmp(miss_edge.clone());
+
+    asm.set_current_block(transition_block);
+    let label = jit.get_label(asm, transition_block, hir_block_id);
+    asm.write_label(label);
+    // See rb_shape_transition_offset() and RBASIC_SET_SHAPE_ID(): keep the flags of the
+    // object's shape and replace its offset.
+    let new_shape_id = asm.and(full_shape_id, Opnd::UImm((!SHAPE_ID_OFFSET_MASK) as u64));
+    let new_shape_id = asm.or(new_shape_id, dest_shape);
+    asm.store(Opnd::mem(32, recv, shape_id_offset), new_shape_id.with_num_bits(32));
     asm.jmp(hit_edge);
 
     asm.set_current_block(hit_block);
