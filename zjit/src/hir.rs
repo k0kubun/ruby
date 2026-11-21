@@ -3421,8 +3421,8 @@ struct CallerArguments<'a> {
     original: &'a [InsnId],
     /// Call-site flags from the Send's callinfo.
     flags: u32,
-    /// Explicit keyword metadata, or null when the caller has no keywords.
-    kwarg: *const rb_callinfo_kwarg,
+    /// Symbols of the explicit keywords, empty when the caller has no keywords.
+    keywords: Vec<VALUE>,
     /// Number of explicit keyword values at the end of `original`.
     kwarg_count: usize,
     /// Index of the caller splat array, when VM_CALL_ARGS_SPLAT is set.
@@ -3443,12 +3443,8 @@ impl<'a> CallerArguments<'a> {
     /// Do this once per Send so builds for different splat lengths share the same layout.
     fn new(original: &'a [InsnId], ci: *const rb_callinfo) -> Self {
         let flags = unsafe { rb_vm_ci_flag(ci) };
-        let kwarg = unsafe { rb_vm_ci_kwarg(ci) };
-        let kwarg_count = if kwarg.is_null() {
-            0
-        } else {
-            (unsafe { get_cikw_keyword_len(kwarg) }) as usize
-        };
+        let keywords = ci_keywords(ci);
+        let kwarg_count = keywords.len();
         let splat_arg_idx = if flags & VM_CALL_ARGS_SPLAT != 0 {
             // The splat array is the final positional operand, before explicit keyword values.
             Some(original.len() - kwarg_count - 1)
@@ -3456,8 +3452,18 @@ impl<'a> CallerArguments<'a> {
             None
         };
 
-        Self { original, flags, kwarg, kwarg_count, splat_arg_idx, kwrest_hash: None }
+        Self { original, flags, keywords, kwarg_count, splat_arg_idx, kwrest_hash: None }
     }
+}
+
+/// Symbols of the explicit keywords of a callinfo
+fn ci_keywords(ci: *const rb_callinfo) -> Vec<VALUE> {
+    let kwarg = unsafe { rb_vm_ci_kwarg(ci) };
+    if kwarg.is_null() {
+        return vec![];
+    }
+    let len = unsafe { get_cikw_keyword_len(kwarg) };
+    (0..len).map(|i| unsafe { get_cikw_keywords_idx(kwarg, i) }).collect()
 }
 
 /// Caller splat expansion selected for one SendDirect path.
@@ -4868,6 +4874,31 @@ impl Function {
         matches!(args.last().map(|&hash| self.find_ref(hash)), Some(Insn::NewHash { elements, .. }) if !elements.is_empty())
     }
 
+    /// The keywords and values of a keyword splat that is a new Hash literal with unique static
+    /// Symbol keys, e.g. the one that a zsuper from a method with keyword parameters makes of
+    /// them. Passing them as explicit keywords is the same as passing the Hash as a keyword splat.
+    fn static_keyword_splat(&self, flags: u32, args: &[InsnId]) -> Option<Vec<(VALUE, InsnId)>> {
+        if flags & (VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT) != (VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT)
+            || flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0
+        {
+            return None;
+        }
+        let Insn::NewHash { elements, .. } = self.find_ref(*args.last()?) else { return None };
+        if elements.is_empty() {
+            return None;
+        }
+        let mut pairs: Vec<(VALUE, InsnId)> = Vec::with_capacity(elements.len() / 2);
+        for pair in elements.chunks(2) {
+            let &[key, value] = pair else { return None };
+            let key = self.type_of(key).ruby_object().filter(|key| key.static_sym_p())?;
+            if pairs.iter().any(|&(other, _)| other == key) {
+                return None;
+            }
+            pairs.push((key, value));
+        }
+        Some(pairs)
+    }
+
     fn profiled_type_of_at(&self, insn: InsnId, state: InsnId) -> Option<ProfiledType> {
         match self.resolve_receiver_type_from_profile(insn, state) {
             ReceiverTypeResolution::Monomorphic { profiled_type }
@@ -5110,10 +5141,10 @@ impl Function {
         caller_args: &CallerArguments,
         iseq: IseqPtr,
     ) -> Result<(Vec<SendDirectArg>, u32), SendFallbackReason> {
-        let kwarg = caller_args.kwarg;
+        let keywords = &caller_args.keywords;
         let callee_keyword = unsafe { rb_get_iseq_body_param_keyword(iseq) };
         if callee_keyword.is_null() {
-            if kwarg.is_null() {
+            if keywords.is_empty() {
                 // Neither caller nor callee have keywords - nothing to do
                 return Ok((args, 0));
             }
@@ -5134,13 +5165,12 @@ impl Function {
             // Match vm_args.c's setup_parameters_complex via args_kw_argv_to_hash:
             // explicit caller keywords passed to a method with no keyword table
             // become one final positional Hash before regular parameter setup.
-            let caller_kw_count = unsafe { get_cikw_keyword_len(kwarg) } as usize;
+            let caller_kw_count = keywords.len();
             let kw_args_start = args.len() - caller_kw_count;
             let mut processed_args = args;
             let keyword_values = processed_args.split_off(kw_args_start);
             let mut elements = Vec::with_capacity(caller_kw_count * 2);
-            for (i, value) in keyword_values.into_iter().enumerate() {
-                let keyword = unsafe { get_cikw_keywords_idx(kwarg, i as i32) };
+            for (&keyword, value) in keywords.iter().zip(keyword_values) {
                 elements.push(SendDirectArg::Constant(keyword));
                 elements.push(value);
             }
@@ -5149,8 +5179,8 @@ impl Function {
             return Ok((processed_args, 0));
         }
 
-        // kwarg may be null if caller passes no keywords but callee has optional keywords
-        let caller_kw_count = if kwarg.is_null() { 0 } else { (unsafe { get_cikw_keyword_len(kwarg) }) as usize };
+        // keywords may be empty if caller passes no keywords but callee has optional keywords
+        let caller_kw_count = keywords.len();
         let callee_kw_count = unsafe { (*callee_keyword).num } as usize;
 
         // When there are 31+ keywords, CRuby uses a hash instead of a fixnum bitmask
@@ -5174,14 +5204,7 @@ impl Function {
         let kw_args_start = args.len() - caller_kw_count;
 
         // Build a mapping from caller keywords to their positions.
-        let mut caller_kw_order: Vec<ID> = Vec::with_capacity(caller_kw_count);
-        if !kwarg.is_null() {
-            for i in 0..caller_kw_count {
-                let sym = unsafe { get_cikw_keywords_idx(kwarg, i as i32) };
-                let id = unsafe { rb_sym2id(sym) };
-                caller_kw_order.push(id);
-            }
-        }
+        let caller_kw_order: Vec<ID> = keywords.iter().map(|&sym| unsafe { rb_sym2id(sym) }).collect();
 
         // Verify all caller keywords are expected by callee (no unknown keywords).
         // Without **kwrest, unexpected keywords should raise ArgumentError at runtime.
@@ -5259,7 +5282,7 @@ impl Function {
             let mut elements = vec![];
             for (j, value) in keyword_values.into_iter().enumerate() {
                 if let Some(value) = value {
-                    elements.push(SendDirectArg::Constant(unsafe { get_cikw_keywords_idx(kwarg, j as i32) }));
+                    elements.push(SendDirectArg::Constant(keywords[j]));
                     elements.push(value);
                 }
             }
@@ -7360,14 +7383,21 @@ impl Function {
                         let flags = unsafe { rb_vm_ci_flag(ci) };
                         assert!(flags & VM_CALL_FCALL != 0);
 
+                        // The keyword splat of a zsuper from a method with keyword parameters is a
+                        // Hash literal of the keywords, which we pass as explicit keywords.
+                        let static_kw_splat = match resolved.insn(self) {
+                            Insn::InvokeSuper { args, .. } => self.static_keyword_splat(flags, args),
+                            _ => unreachable!("expected InvokeSuper insn"),
+                        };
                         // Reject calls with complex argument handling. Keyword arguments are
                         // supported only for ISEQ targets, which are checked below.
-                        if unspecializable_call_type(flags) {
+                        let flags_for_check = if static_kw_splat.is_some() { flags & !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT) } else { flags };
+                        if unspecializable_call_type(flags_for_check) {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
                             continue;
                         }
-                        let has_kwarg = flags & VM_CALL_KWARG != 0;
+                        let has_kwarg = flags & VM_CALL_KWARG != 0 || static_kw_splat.is_some();
 
                         // Get the profiled CME from the current method.
                         if self.profiles.is_none() {
@@ -7435,7 +7465,21 @@ impl Function {
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
                             // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
-                            let caller_args = CallerArguments::new(&args, ci);
+                            let keyword_args: Vec<InsnId>;
+                            let caller_args = if let Some(pairs) = &static_kw_splat {
+                                // Replace the Hash with its values, passed as explicit keywords.
+                                keyword_args = args[..args.len() - 1].iter().copied().chain(pairs.iter().map(|&(_, value)| value)).collect();
+                                CallerArguments {
+                                    original: &keyword_args,
+                                    flags: (flags & !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT)) | VM_CALL_KWARG,
+                                    keywords: pairs.iter().map(|&(key, _)| key).collect(),
+                                    kwarg_count: pairs.len(),
+                                    splat_arg_idx: None,
+                                    kwrest_hash: None,
+                                }
+                            } else {
+                                CallerArguments::new(&args, ci)
+                            };
                             let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false)
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
@@ -7729,12 +7773,12 @@ impl Function {
         }
         // The merged callinfo of vm_caller_setup_fwd_args(): the caller's arguments and keywords
         // after the site's leading positional arguments, called with the site's FCALL-ness.
-        let kwarg = unsafe { rb_vm_ci_kwarg(caller_ci) };
+        let keywords = ci_keywords(caller_ci);
         let caller_args = CallerArguments {
             original: &merged_args,
             flags: (caller_flags & !(VM_CALL_ARGS_SIMPLE | VM_CALL_FCALL)) | (site_flags & VM_CALL_FCALL),
-            kwarg,
-            kwarg_count: if kwarg.is_null() { 0 } else { (unsafe { get_cikw_keyword_len(kwarg) }) as usize },
+            kwarg_count: keywords.len(),
+            keywords,
             splat_arg_idx: None,
             kwrest_hash: None,
         };
