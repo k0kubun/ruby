@@ -29692,6 +29692,33 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_inline_tiny_callee_past_budget() {
+        // A caller that spent its budget still inlines a tiny callee, e.g. one that forwards to
+        // another method, but only so many of them.
+        eval("
+            def fwd(x) = id(x)
+            def id(x) = x
+            def test(n)
+              n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n)
+              n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n)
+              n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n)
+              n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n); n = fwd(n)
+              n
+            end
+            test(1)
+            test(1)
+        ");
+        let counters = crate::state::ZJITState::get_counters();
+        let tiny_before = counters.inline_tiny_past_budget_count;
+        let old_budget = get_option!(inline_budget);
+        unsafe { OPTIONS.as_mut().unwrap().inline_budget = 1; }
+        hir_string("test");
+        unsafe { OPTIONS.as_mut().unwrap().inline_budget = old_budget; }
+        // 20 calls to fwd, capped at MAX_TINY_INLINES_PAST_BUDGET
+        assert_eq!(counters.inline_tiny_past_budget_count - tiny_before, MAX_TINY_INLINES_PAST_BUDGET as u64);
+    }
+
+    #[test]
     fn test_inline_budget_rejects_when_exceeded() {
         // The same workload as test_inline_arithmetic_method, which we know inlines
         // successfully under the default settings (budget=500, threshold=30). Setting
@@ -29700,9 +29727,10 @@ mod hir_opt_tests {
         // what blocked the inline (not e.g. the size threshold or a parameter-shape
         // check), we read the inline_reject_budget_exceeded counter and confirm it
         // incremented while inline_method_count did not.
+        // add_one is big enough not to be a tiny callee, which is inlined past the budget.
         eval("
             def add_one(x)
-              x + 1
+              x + 1 + 0
             end
             def test(n)
               add_one(n)
@@ -29787,7 +29815,8 @@ mod hir_opt_tests {
         eval("
             class CustomEq
               def ==(o)
-                self.equal?(o)
+                # Big enough not to be a tiny callee, which is inlined past the budget
+                self.equal?(o) ? true : false
               end
             end
 
@@ -29811,7 +29840,7 @@ mod hir_opt_tests {
         assert!(counters.inline_reject_budget_exceeded > budget_rejects_before,
             "Expected CustomEq#== to be rejected by the budget");
         assert_snapshot!(result, @"
-        fn test@<compiled>:8:
+        fn test@<compiled>:9:
         bb1():
           EntryPoint interpreter
           v1:BasicObject = LoadSelf
