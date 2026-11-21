@@ -3217,6 +3217,11 @@ struct CompilePolicy {
     /// When true, the ISEQ is lukewarm (see [`crate::payload::IseqPayload::is_lukewarm`]), so
     /// only small callees are inlined into it.
     lukewarm: bool,
+    /// When true, inline up to the full budget. Otherwise the inliner also stops at the size of
+    /// the function at the start of each inlining pass, including instructions that optimization
+    /// passes since removed, which keeps first compiles cheap. A compile that this stops from
+    /// inlining counts its executions to tier up like a lukewarm one. See [`Function::inline_budget_limited`].
+    full_inline_budget: bool,
 }
 
 /// Callee size threshold for inlining into lukewarm ISEQs. Small callees like accessors and
@@ -3235,13 +3240,15 @@ impl CompilePolicy {
         // When a previous version was invalidated and we've reached the version
         // limit, avoid speculative optimizations that may side-exit.
         if iseq.is_null() {
-            return Self { no_side_exits: false, lukewarm: false };
+            return Self { no_side_exits: false, lukewarm: false, full_inline_budget: true };
         }
         let payload = get_or_create_iseq_payload(iseq);
         let no_side_exits = payload.versions.iter().any(
             |v| unsafe { v.as_ref() }.is_invalidated()
         ) && payload.versions.len() + 1 >= payload.max_versions();
-        Self { no_side_exits, lukewarm: payload.is_lukewarm() }
+        // A version that tiered up, and an ISEQ that loops made hot, inline up to the full budget.
+        let full_inline_budget = payload.tiered_up || payload.hot_loop || !get_option!(inline_tier_up);
+        Self { no_side_exits, lukewarm: payload.is_lukewarm(), full_inline_budget }
     }
 }
 
@@ -3311,6 +3318,12 @@ pub struct Function {
     inline_pass: usize,
     /// The number of tiny callees inlined past the inlining budget. See [`TINY_INLINE_MAX_CALLEE_SIZE`].
     tiny_inlines_past_budget: usize,
+    /// `self.insns.len()` at the start of the current inlining pass. See [`CompilePolicy::full_inline_budget`].
+    insns_at_pass_start: usize,
+    /// Whether the size of the function at the start of an inlining pass stopped an inline that the
+    /// full budget would have allowed. The compiled code then counts executions to recompile with
+    /// the full budget once it gets hot. See [`CompilePolicy::full_inline_budget`].
+    inline_budget_limited: bool,
     /// Per-call-site caches of the last receiver class found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
@@ -3790,6 +3803,8 @@ impl Function {
             inline_frames: HashMap::default(),
             inline_pass: 0,
             tiny_inlines_past_budget: 0,
+            insns_at_pass_start: 0,
+            inline_budget_limited: false,
             klass_caches: Default::default(),
             ivar_caches: Default::default(),
             catch_return_sites: HashSet::default(),
@@ -3823,6 +3838,12 @@ impl Function {
     /// Whether this compile treats the ISEQ as lukewarm. See [`CompilePolicy::lukewarm`].
     pub fn is_lukewarm(&self) -> bool {
         self.policy.lukewarm
+    }
+
+    /// Whether the compiled code counts its executions to recompile once it gets hot: it's
+    /// lukewarm, or the inliner held back for a cheap first compile.
+    pub fn counts_for_tier_up(&self) -> bool {
+        self.policy.lukewarm || self.inline_budget_limited
     }
 
     // Add an instruction to the function without adding it to any block
@@ -7594,7 +7615,7 @@ impl Function {
         budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
     }
 
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
+    fn should_inline(&mut self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool, check_pass_start: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -7636,6 +7657,20 @@ impl Function {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
+        // Unless this compile uses the full budget, also judge the callee by the size of the function
+        // at the start of the pass, which counts the instructions that optimizations removed since. It
+        // is much bigger than the live size once a function got through a few passes, so a first
+        // compile inlines several times less, which keeps warmup cheap. A hot ISEQ tiers up to the
+        // full budget. Callers of literal blocks don't check this: a block only becomes inlinable
+        // once its iterator is, in the same pass.
+        if !ignore_budget && check_pass_start && !self.policy.full_inline_budget {
+            let budget = get_option!(inline_budget);
+            if budget != INLINE_BUDGET_UNLIMITED && self.insns_at_pass_start > budget {
+                incr_counter!(inline_reject_budget_until_tier_up);
+                self.inline_budget_limited = true;
+                return false;
+            }
+        }
 
         // Only inline small callees into lukewarm ISEQs. Iterators with a literal block are
         // still inlined since that's how a loop in a lukewarm ISEQ gets fast.
@@ -7661,6 +7696,7 @@ impl Function {
 
         let mut did_inline = false;
         self.inline_pass += 1;
+        self.insns_at_pass_start = self.insns.len();
 
         // Worklist of blocks left to scan for inlinable SendDirects. Seeded with
         // the function's current RPO so we visit every existing block, and
@@ -7756,7 +7792,7 @@ impl Function {
                 let tiny_past_budget = self.over_inline_budget()
                     && self.tiny_inlines_past_budget < MAX_TINY_INLINES_PAST_BUDGET
                     && unsafe { get_iseq_encoded_size(iseq) } as usize <= TINY_INLINE_MAX_CALLEE_SIZE;
-                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable || tiny_past_budget) || !Self::can_inline(iseq) {
+                if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable || tiny_past_budget, true) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -8181,7 +8217,7 @@ impl Function {
         // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
         // This is bounded by the number of literal blocks in the inlined methods' callers.
         let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
-        if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
+        if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable, false) || !Self::can_inline(iseq) {
             return None;
         }
 

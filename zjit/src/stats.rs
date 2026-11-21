@@ -157,6 +157,7 @@ make_counters! {
         compiled_iseq_count,
         // Number of ISEQ compiles that only inlined small callees because the ISEQ was lukewarm
         compiled_lukewarm_iseq_count,
+        compiled_budget_limited_iseq_count,
         // Number of lukewarm versions that got hot and were invalidated to recompile them fully
         lukewarm_tier_up_count,
         compiled_resume_entry_count,
@@ -507,6 +508,7 @@ make_counters! {
     // SendDirect the inliner considers.
     inline_method_count,
     inline_tiny_past_budget_count,
+    inline_reject_budget_until_tier_up,
     inline_block_count,
     inline_throw_count,
     empty_inline_frame_count,

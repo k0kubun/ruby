@@ -1811,7 +1811,7 @@ fn gen_check_interrupts(jit: &mut JITState, asm: &mut Assembler, function: &Func
     // Lukewarm code checks interrupts on returns and loop back-edges, which is also where it
     // counts executions to tier up. Once the count runs out, exit to recompile the compiled
     // ISEQ. See exit_recompile(). A resume entry's version doesn't, since it can't recompile.
-    if function.is_lukewarm() && !unsafe { jit.version.as_ref() }.is_resume {
+    if function.counts_for_tier_up() && !unsafe { jit.version.as_ref() }.is_resume {
         asm_comment!(asm, "count executions to tier up");
         let counter = &raw mut get_or_create_iseq_payload(jit.iseq()).tier_up_counter;
         let counter = Opnd::mem(64, asm.load(Opnd::const_ptr(counter)), 0);
@@ -4747,8 +4747,12 @@ fn compile_iseq_with_resume(iseq: IseqPtr, resume: Option<(u16, u8)>) -> Result<
     if resume.is_none() {
         let payload = get_or_create_iseq_payload(iseq);
         // Lukewarm code counts down executions until it tiers up. See exit_recompile().
-        payload.tier_up_counter = if function.is_lukewarm() {
-            incr_counter!(compiled_lukewarm_iseq_count);
+        payload.tier_up_counter = if function.counts_for_tier_up() {
+            if function.is_lukewarm() {
+                incr_counter!(compiled_lukewarm_iseq_count);
+            } else {
+                incr_counter!(compiled_budget_limited_iseq_count);
+            }
             get_option!(lukewarm_tier_up_threshold).into()
         } else {
             i64::MAX

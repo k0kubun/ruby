@@ -92,6 +92,11 @@ pub struct Options {
     /// `IseqPayload::is_lukewarm`.
     pub lukewarm_gc_count: usize,
 
+    /// Whether a first compile inlines up to a cheaper limit and tiers up to the full budget once
+    /// the ISEQ gets hot. Otherwise every compile uses the full budget. See
+    /// `CompilePolicy::full_inline_budget`.
+    pub inline_tier_up: bool,
+
     /// Number of returns and loop back-edges a lukewarm version runs before it's invalidated to
     /// recompile the ISEQ with full inlining. See `exit_recompile`.
     pub lukewarm_tier_up_threshold: u32,
@@ -238,6 +243,9 @@ impl Default for Options {
             num_profiles: DEFAULT_NUM_PROFILES,
             num_exits_until_invalidate: DEFAULT_NUM_EXITS_UNTIL_INVALIDATE,
             lukewarm_gc_count: default_lukewarm_gc_count(),
+            // Unit tests use the full budget unless they ask, so HIR snapshots show the full inliner
+            // and tier-up exits don't count as side exits of the program under test.
+            inline_tier_up: !cfg!(test),
             lukewarm_tier_up_threshold: DEFAULT_LUKEWARM_TIER_UP_THRESHOLD,
             stats: false,
             print_stats: false,
@@ -747,6 +755,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
 
 /// Update --zjit-lukewarm-gc-count for testing
 #[cfg(test)]
+/// Update `inline_tier_up` for testing
+#[cfg(test)]
+pub fn set_inline_tier_up(inline_tier_up: bool) {
+    rb_zjit_prepare_options();
+    unsafe { OPTIONS.as_mut().unwrap().inline_tier_up = inline_tier_up; }
+}
+
 pub fn set_lukewarm_gc_count(lukewarm_gc_count: usize) {
     rb_zjit_prepare_options();
     unsafe { OPTIONS.as_mut().unwrap().lukewarm_gc_count = lukewarm_gc_count; }

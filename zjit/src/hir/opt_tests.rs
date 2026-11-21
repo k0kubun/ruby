@@ -29873,9 +29873,10 @@ mod hir_opt_tests {
     fn test_inline_budget_bounds_binary_call_tree() {
         // Shaped like ruby-bench's 30k_ifelse: every level calls the next level from both
         // arms of a branch, so each round of inlining doubles the number of SendDirects.
-        // Inlining must stop before the whole tree (62 calls) is inlined. These callees are
-        // tiny, so here it's the optimizer's `inline_max_iterations` cap rather than the budget
-        // that stops it.
+        // A first compile judges each pass by the function's size at the start of the pass,
+        // including removed instructions, which stops this well before the whole tree (62
+        // calls) is inlined. If that held back an inline, the code counts executions to
+        // recompile with the full budget once it gets hot.
         eval("
             def l5(x) = x
             def l4(x) = x < 1 ? l5(x) : l5(x)
@@ -29887,9 +29888,14 @@ mod hir_opt_tests {
         ");
         let counters = crate::state::ZJITState::get_counters();
         let inline_count_before = counters.inline_method_count;
+        let tier_up_rejects_before = counters.inline_reject_budget_until_tier_up;
+        crate::options::set_inline_tier_up(true);
         hir_string("test");
+        crate::options::set_inline_tier_up(false);
         let inlined = counters.inline_method_count - inline_count_before;
-        assert_eq!(inlined, 14, "Unexpected number of inlined calls under the default budget");
+        assert!(counters.inline_reject_budget_until_tier_up > tier_up_rejects_before,
+            "Expected the budget to hold back part of the call tree until tier-up");
+        assert_eq!(inlined, 6, "Unexpected number of inlined calls under the default budget");
     }
 
     #[test]
