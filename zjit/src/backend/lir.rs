@@ -3309,6 +3309,11 @@ impl Assembler
             }
         }
 
+        // Without side exits, there's no exit code. The exit block would only hold its label.
+        if targets.is_empty() && !crate::perf::hir_symbol_ranges_enabled() {
+            return vec![];
+        }
+
         // Create a dedicated block for exit code. This block is not part of the
         // CFG (DUMMY_RPO_INDEX), so it won't be included in block_order() or
         // linearize_instructions(). Its instructions are returned to the caller
