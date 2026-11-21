@@ -1233,6 +1233,9 @@ pub enum Insn {
     /// Return Qtrue if `val` is kind_of? `class` (a Class or Module), else Qfalse.
     /// Equivalent to `rb_obj_is_kind_of(val, class)`.
     IsA { val: InsnId, class: InsnId },
+    /// Return Qtrue if the class of `val`, skipping singleton classes, is `class` (a constant Class), else Qfalse.
+    /// Equivalent to `rb_obj_is_instance_of(val, class)`.
+    IsInstanceOf { val: InsnId, class: InsnId },
     /// `case`/`when`/`rescue` match check for `pattern` against `target`.
     CheckMatch { target: InsnId, pattern: InsnId, flag: u32, state: InsnId },
 
@@ -1954,7 +1957,7 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*recv);
                 $visit_one!(*index);
             }
-            Insn::IsA { val, class } => {
+            Insn::IsA { val, class } | Insn::IsInstanceOf { val, class } => {
                 $visit_one!(*val);
                 $visit_one!(*class);
             }
@@ -2109,6 +2112,8 @@ impl Insn {
             Insn::FixnumBitCheck { .. } => effects::Empty,
             // IsA needs to read the class of the value and traverse the class hierarchy, which we model as reading from Memory.
             Insn::IsA { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
+            // IsInstanceOf reads the class of the value and, for a singleton class, its superclass chain.
+            Insn::IsInstanceOf { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::GetGlobal { .. } => effects::Any,
             Insn::SetGlobal { .. } => effects::Any,
             Insn::GetIvar { .. } => effects::Any,
@@ -2865,6 +2870,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::IncrCounter(counter) => write!(f, "IncrCounter {counter:?}"),
             Insn::CheckInterrupts { .. } => write!(f, "CheckInterrupts"),
             Insn::IsA { val, class } => write!(f, "IsA {val}, {class}"),
+            Insn::IsInstanceOf { val, class } => write!(f, "IsInstanceOf {val}, {class}"),
             Insn::BreakPoint => write!(f, "BreakPoint"),
             Insn::Unreachable => write!(f, "Unreachable"),
         }
@@ -4619,6 +4625,7 @@ impl Function {
             // as a reference for FrameState, which we use to generate side-exit code.
             Insn::Snapshot { .. } => types::Any,
             Insn::IsA { .. } => types::BoolExact,
+            Insn::IsInstanceOf { .. } => types::BoolExact,
         }
     }
 
@@ -9242,6 +9249,25 @@ impl Function {
                             insn_id
                         }
                     }
+                    &Insn::IsInstanceOf { val, class } => 'is_instance_of: {
+                        let Some(class_value) = self.type_of(class).ruby_object() else {
+                            break 'is_instance_of insn_id;
+                        };
+                        // rb_obj_class() skips singleton classes, so it never returns one.
+                        if class_value.is_singleton_class() {
+                            break 'is_instance_of self.new_insn(Insn::Const { val: Const::Value(Qfalse) });
+                        }
+                        let val_type = self.type_of(val);
+                        let result = if let Some(val_class) = val_type.runtime_exact_ruby_class() {
+                            // The exact class may be a singleton class, e.g. that of a constant object.
+                            (unsafe { rb_class_real(val_class) }) == class_value
+                        } else if !val_type.could_be(Type::from_class_inexact(class_value)) {
+                            false
+                        } else {
+                            break 'is_instance_of insn_id;
+                        };
+                        self.new_insn(Insn::Const { val: Const::Value(if result { Qtrue } else { Qfalse }) })
+                    }
                     &Insn::StringEqual { left, right } => {
                         // If both operands resolve to the same SSA value,
                         // String#== is guaranteed to be true.
@@ -11024,6 +11050,10 @@ impl Function {
             Insn::IsA { val, class } => {
                 self.assert_subtype(insn_id, val, types::BasicObject)?;
                 self.assert_subtype(insn_id, class, types::Class.union(types::Module))
+            }
+            Insn::IsInstanceOf { val, class } => {
+                self.assert_subtype(insn_id, val, types::BasicObject)?;
+                self.assert_subtype(insn_id, class, types::Class)
             }
             Insn::RefineType { .. } => Ok(()),
             Insn::CondBranchHasType(ref insn) => self.assert_subtype(insn_id, insn.val, types::BasicObject),
