@@ -1803,6 +1803,7 @@ impl Assembler {
 
             let num_stack_slots = if has_vregs {
                 trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
+                trace_compile_phase("call_crossing_intervals", || asm.stack_slots_for_call_crossing_intervals(&mut intervals));
                 trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs))
             } else {
                 0
