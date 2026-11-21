@@ -1483,10 +1483,11 @@ fn test_getblockparamproxy() {
         def test(&block)
           0.then(&block)
         end
-        test { 1 }
+        def run = test { 1 }
+        run
     ");
     assert_contains_opcode("test", YARVINSN_getblockparamproxy);
-    assert_snapshot!(assert_compiles("test { 1 }"), @"1");
+    assert_snapshot!(assert_compiles("run"), @"1");
 }
 
 #[test]
@@ -1523,11 +1524,12 @@ fn test_getblockparamproxy_polymorphic_none_and_iseq() {
         def test(&block)
           0.then(&block)
         end
+        def run = test { 2 }
         test
-        test { 1 }
+        run
     ");
     assert_contains_opcode("test", YARVINSN_getblockparamproxy);
-    assert_snapshot!(assert_compiles("test { 2 }"), @"2");
+    assert_snapshot!(assert_compiles("run"), @"2");
 }
 
 #[test]
@@ -1731,6 +1733,81 @@ fn test_yield_inline_invocation_with_args() {
         test
     ");
     assert_snapshot!(assert_compiles("test"), @"7");
+}
+
+/// Like `assert_compiles`, but also asserts that the program dispatched a `yield` directly to
+/// a block ISEQ and never fell back to the generic `invokeblock` for a block it didn't
+/// specialize. Call `crate::options::enable_zjit_stats()` before compiling the program.
+#[track_caller]
+fn assert_yields_directly(program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let direct_before = counters.block_iseq_direct_optimized_send_count + counters.inline_block_optimized_send_count;
+    let fallback_before = counters.send_fallback_invokeblock_not_specialized + counters.send_fallback_invokeblock_polymorphic_miss;
+    let result = assert_compiles(program);
+    assert!(counters.block_iseq_direct_optimized_send_count + counters.inline_block_optimized_send_count > direct_before,
+        "expected a direct block dispatch, but neither block_iseq_direct_optimized_send_count nor inline_block_optimized_send_count increased");
+    assert_eq!(counters.send_fallback_invokeblock_not_specialized + counters.send_fallback_invokeblock_polymorphic_miss, fallback_before,
+        "expected no generic invokeblock fallback");
+    result
+}
+
+#[test]
+fn test_yield_fewer_args_than_block_params() {
+    // Missing block parameters are nil, like vm_callee_setup_block_arg pads them.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def none = yield
+        def one = yield(1)
+        def two = yield(1, 2)
+        def test = [none { |a, b| [a, b] }, two { |a, b, c| [a, b, c] }, one { |a, b| [a, b] }]
+        test
+        test
+    ");
+    assert_snapshot!(assert_yields_directly("test"), @"[[nil, nil], [1, 2, nil], [1, nil]]");
+}
+
+#[test]
+fn test_yield_more_args_than_block_params() {
+    // Extra arguments are dropped, and an Array is not splatted when it's not the only argument.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def one = yield(1)
+        def three = yield([1, 2], 3, 4)
+        def test = [one { 0 }, three { |a| a }, three { |a,| a }, three { |a, b| [a, b] }, three { 0 }]
+        test
+        test
+    ");
+    assert_snapshot!(assert_yields_directly("test"), @"[0, [1, 2], [1, 2], [[1, 2], 3], 0]");
+}
+
+#[test]
+fn test_yield_polymorphic_blocks_with_different_arities() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def two = yield(1, 2)
+        def test = [two { |a| a }, two { |a, b, c| [a, b, c] }, two { |a, b| a + b }]
+        test
+        test
+    ");
+    assert_snapshot!(assert_yields_directly("test"), @"[1, [1, 2, nil], 3]");
+}
+
+#[test]
+fn test_inline_block_with_arity_mismatch() {
+    with_inlining(|| {
+        // Compile `none` and `three` with all the blocks profiled before `test` inlines them.
+        eval("
+            def none = yield
+            def three = yield(1, 2, 3)
+            def test = [none { |a, b| [a, b] }, three { |a| a }, three { |a, b| [a, b] }, three { 0 }]
+            test
+        ");
+        assert_snapshot!(assert_inlines_block("test; test"), @"[[nil, nil], 1, [1, 2], 0]");
+    });
 }
 
 #[test]
@@ -9258,7 +9335,7 @@ fn test_attr_writer_shape_transition() {
         2.times { c = C.new; test(c, 1); test(c, 2) }
     ");
     assert_snapshot!(assert_compiles("
-        objs = 3.times.map { C.new }
+        objs = [C.new, C.new, C.new]
         objs.each_with_index { |c, i| test(c, i) }
         objs.each_with_index { |c, i| test(c, i * 10) }
         objs.map(&:foo)

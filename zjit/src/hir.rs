@@ -1384,14 +1384,14 @@ pub enum Insn {
     /// inline and jump straight to its JIT entry. `iseq` is the comptime-known block iseq; the
     /// tag + iseq-identity guards live in preceding HIR instructions, and `captured` is the
     /// guarded, untagged `struct rb_captured_block *` codegen reads self/ep from. Args are the
-    /// positional arguments (lead-only, exact arity).
+    /// block's lead parameters, set up by [`Function::setup_block_args`].
     InvokeBlockIseqDirect {
         iseq: IseqPtr,
         /// Guarded `struct rb_captured_block *` (block handler with the ISEQ tag masked off).
         captured: InsnId,
         args: Vec<InsnId>,
-        /// Number of `yield` arguments on the caller's stack. It's 1 when the block splats its
-        /// sole Array argument into `args`.
+        /// Number of `yield` arguments on the caller's stack. It differs from `args.len()` when
+        /// the block splats its sole Array argument, or when it nil-pads or drops arguments.
         stack_argc: usize,
         state: InsnId,
     },
@@ -3750,17 +3750,13 @@ fn block_arg0_splat_p(iseq: IseqPtr, argc: usize) -> bool {
         && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) }
 }
 
-/// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
-/// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
-/// with an exact arity match or an arg0 auto-splat, and contain no `throw` (break /
-/// non-local return) unless `allow_throw`. Anything else falls back to the generic
-/// `invokeblock` dispatch, with the returned reason attached to the fallback instruction.
-fn can_direct_invoke_block_iseq(iseq: IseqPtr, argc: usize, allow_throw: bool) -> Result<(), SendFallbackReason> {
+/// Ok if `yield` can dispatch by inlining the block ISEQ frame. The block must take the
+/// simple callee-setup path (`rb_simple_iseq_p`), which accepts any number of arguments (see
+/// [`Function::setup_block_args`]), and contain no `throw` (break / non-local return) unless
+/// `allow_throw`. Anything else falls back to the generic `invokeblock` dispatch, with the
+/// returned reason attached to the fallback instruction.
+fn can_direct_invoke_block_iseq(iseq: IseqPtr, allow_throw: bool) -> Result<(), SendFallbackReason> {
     if !unsafe { rb_simple_iseq_p(iseq) } {
-        return Err(InvokeBlockNotSpecialized);
-    }
-    let lead_num = unsafe { rb_get_iseq_body_param_lead_num(iseq) } as usize;
-    if argc != lead_num && !block_arg0_splat_p(iseq, argc) {
         return Err(InvokeBlockNotSpecialized);
     }
     if !allow_throw && crate::codegen::block_iseq_may_throw(iseq) {
@@ -3922,9 +3918,17 @@ impl Function {
 
     /// Set up the arguments of a `yield` to the simple block `block_iseq` for its lead parameters.
     /// Like `vm_callee_setup_block_arg`, a sole Array argument is splatted, e.g. each pair yielded
-    /// to `|key, value|`, padding missing elements with nil and dropping extra ones.
-    fn setup_block_args(&mut self, block: BlockId, block_iseq: IseqPtr, args: Vec<InsnId>, state: InsnId) -> Vec<InsnId> {
+    /// to `|key, value|`, padding missing elements with nil and dropping extra ones. Otherwise,
+    /// missing arguments are also padded with nil and extra ones are dropped.
+    fn setup_block_args(&mut self, block: BlockId, block_iseq: IseqPtr, mut args: Vec<InsnId>, state: InsnId) -> Vec<InsnId> {
         if !block_arg0_splat_p(block_iseq, args.len()) {
+            let lead_num = unsafe { rb_get_iseq_body_param_lead_num(block_iseq) } as usize;
+            if args.len() != lead_num {
+                args.truncate(lead_num);
+                while args.len() < lead_num {
+                    args.push(self.push_insn(block, Insn::Const { val: Const::Value(Qnil) }));
+                }
+            }
             return args;
         }
         let arg0 = args[0];
@@ -13578,7 +13582,7 @@ fn add_iseq_to_hir(
                                 let obj = profiled_type.class();
                                 if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
                                     let iseq = obj.as_iseq();
-                                    match can_direct_invoke_block_iseq(iseq, args.len(), false) {
+                                    match can_direct_invoke_block_iseq(iseq, false) {
                                         // Push an ISEQ that can be dispatched directly, deduplicating direct_iseqs.
                                         Ok(()) => if !direct_iseqs.contains(&iseq) {
                                             direct_iseqs.push(iseq);
@@ -13602,7 +13606,7 @@ fn add_iseq_to_hir(
                             && get_lvar_level(exit_state.iseq) == 0 {
                             // The literal block's home frame is part of this function, so the inliner may be able
                             // to turn its `break` and non-local `return` into jumps. Allow blocks that may throw.
-                            match can_direct_invoke_block_iseq(bi, args.len(), true) {
+                            match can_direct_invoke_block_iseq(bi, true) {
                                 Ok(()) => Some(bi),
                                 Err(reason) => {
                                     fallback_reason = reason;
@@ -13619,7 +13623,7 @@ fn add_iseq_to_hir(
                             .filter(|_| can_direct_invoke_block(flags))
                             .filter(|local_state| local_state.iseq == unsafe { rb_get_iseq_body_local_iseq(exit_state.iseq) })
                             .and_then(|local_state| fun.inline_frames.get(&local_state.caller()?)?.blockiseq)
-                            .and_then(|bi| match can_direct_invoke_block_iseq(bi, args.len(), true) {
+                            .and_then(|bi| match can_direct_invoke_block_iseq(bi, true) {
                                 Ok(()) => Some(bi),
                                 Err(reason) => {
                                     fallback_reason = reason;
