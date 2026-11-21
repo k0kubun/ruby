@@ -12039,6 +12039,20 @@ fn test_send_literal_nil_kw_splat() {
 }
 
 #[test]
+fn test_send_attr_reader_with_nil_block_arg() {
+    eval("
+        class AttrReaderWithBlock
+          attr_reader :x
+          def initialize = @x = 1
+        end
+        def test(obj, &block) = obj.x(&block)
+        test(AttrReaderWithBlock.new)
+    ");
+    assert_snapshot!(assert_compiles("test(AttrReaderWithBlock.new)"), @"1");
+    assert_snapshot!(inspect("test(AttrReaderWithBlock.new) { 2 }"), @"1");
+}
+
+#[test]
 fn test_send_polymorphic_caller_splat_arguments() {
     set_call_threshold(3);
     eval("
