@@ -643,6 +643,8 @@ pub enum SideExitReason {
     UnhandledCallType(CallType),
     UnhandledBlockArg,
     BlockArgNotNil,
+    /// A Symbol block arg would become a refinement-aware lambda
+    SymbolBlockArgRefined,
     /// `bar(...)` was specialized for a different callinfo of the call that entered `def foo(...)`
     GuardForwardedCallInfo,
     TooManyKeywordParameters,
@@ -925,6 +927,9 @@ pub enum BlockHandler {
     /// guarded Proc value, which becomes the callee frame's block handler
     /// (a Proc VALUE is itself a valid block handler).
     BlockArgProc(InsnId),
+    /// Block arg proven to be a static Symbol by a guard, with Symbol#to_proc not redefined
+    /// and no refinements in scope. A Symbol is itself a valid block handler.
+    BlockArgSymbol(InsnId),
     /// The block handler of the current method frame, passed through as the callee frame's
     /// specval like `super` does implicitly, or like `foo(&block)` does when `block` is the
     /// block param proxy. The InsnId is a raw (CInt64) block handler, which may be
@@ -1838,7 +1843,7 @@ macro_rules! for_each_operand_impl {
             }
             Insn::PushInlineFrame { recv, state, exit_state, block, .. } => {
                 $visit_one!(*recv);
-                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::FrameBlock(id)) = &$($mut)? *block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? *block {
                     $visit_one!(*id);
                 }
                 $visit_one!(*state);
@@ -1855,7 +1860,7 @@ macro_rules! for_each_operand_impl {
             Insn::SendDirect(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -1864,7 +1869,7 @@ macro_rules! for_each_operand_impl {
             Insn::CCallWithFrame(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -1872,7 +1877,7 @@ macro_rules! for_each_operand_impl {
             Insn::CCallVariadic(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -2305,6 +2310,7 @@ impl<'a> InsnPrinter<'a> {
     fn block_handler(&self, block: &BlockHandler) -> String {
         match block {
             BlockHandler::BlockArgProc(proc_id) => format!("&{proc_id}"),
+            BlockHandler::BlockArgSymbol(symbol_id) => format!("&{symbol_id}"),
             BlockHandler::FrameBlock(block_handler) => format!("frame_block:{block_handler}"),
             BlockHandler::BlockIseq(blockiseq) => format!("{:p}", self.ptr_map.map_ptr(*blockiseq)),
             BlockHandler::BlockArg => "&block".to_string(),
@@ -2587,8 +2593,8 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                         write!(f, "Send {recv}, {:p}, :{}", self.ptr_map.map_ptr(blockiseq), ruby_call_method_name(*cd))?,
                     Some(BlockHandler::BlockArg) =>
                         write!(f, "Send {recv}, &block, :{}", ruby_call_method_name(*cd))?,
-                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)) =>
-                        unreachable!("BlockArgProc and FrameBlock are not sent through Send"),
+                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_) | BlockHandler::FrameBlock(_)) =>
+                        unreachable!("BlockArgProc, BlockArgSymbol, and FrameBlock are not sent through Send"),
                     None =>
                         write!(f, "Send {recv}, :{}", ruby_call_method_name(*cd))?,
                 }
@@ -2760,7 +2766,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 let CCallVariadicData { cfunc, recv, args, name, cme, block, .. } = &**insn;
                 write!(f, "CCallVariadic {recv}, :{}@{:p}", qualified_method_name(unsafe { (**cme).owner }, *name), self.ptr_map.map_ptr(*cfunc))?;
                 write_separated!(f, ", ", ", ", args);
-                if let Some(block @ BlockHandler::FrameBlock(_)) = block {
+                if let Some(block @ (BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_) | BlockHandler::FrameBlock(_))) = block {
                     write!(f, ", block={}", self.block_handler(block))?;
                 }
                 Ok(())
@@ -3084,6 +3090,10 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     VM_CALL_FORWARDING
     // We only support `def foo(...)` cases for now.
     | VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG;
+
+unsafe extern "C" {
+    fn rb_vm_symbol_block_arg_refined_p(sym: VALUE) -> usize;
+}
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
 fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_block: bool, caller_splat: Option<CallerSplat>) -> Result<(), SendDirectFailure> {
@@ -5359,6 +5369,17 @@ impl Function {
     /// Whether the `&block_arg` of a send to `cme` can pass the current frame's block handler
     /// through: the method has a block param, and `block_arg` has only been profiled as nil or
     /// as the block param proxy that `getblockparamproxy` pushes for an ISEQ or ifunc block.
+    /// The method entry of Symbol#to_proc if it's not redefined, which vm_caller_setup_arg_block()
+    /// requires to pass a Symbol block arg as is.
+    fn basic_symbol_to_proc_cme(&self) -> Option<*const rb_callable_method_entry_t> {
+        let symbol_class = unsafe { rb_cSymbol };
+        if unsafe { rb_method_basic_definition_p(symbol_class, ID!(to_proc)) } == 0 {
+            return None;
+        }
+        let cme = unsafe { rb_callable_method_entry(symbol_class, ID!(to_proc)) };
+        (!cme.is_null()).then_some(cme)
+    }
+
     fn is_forwarded_block_param(&self, block_arg: InsnId, state: InsnId, cme: *const rb_callable_method_entry_t, def_type: rb_method_type_t) -> bool {
         // A statically nil block arg is just stripped.
         if self.is_a(block_arg, types::NilClass) {
@@ -6453,10 +6474,12 @@ impl Function {
                             stripped_block_arg = true;
                             let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
                             send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
-                        } else if send_block == Some(BlockHandler::BlockArg) && def_type == VM_METHOD_TYPE_ISEQ {
+                        } else if send_block == Some(BlockHandler::BlockArg) && (def_type == VM_METHOD_TYPE_ISEQ
+                            || def_type == VM_METHOD_TYPE_CFUNC && !unsafe { rb_zjit_method_tracing_currently_enabled() }) {
                             // Reject complex argument passing before emitting any block-arg guard;
                             // a guard in front of a send that stays dynamic gates nothing.
-                            if unspecializable_call_type(flags & !block_arg_flags) {
+                            let unspecializable = if def_type == VM_METHOD_TYPE_CFUNC { unspecializable_c_call_type } else { unspecializable_call_type };
+                            if unspecializable(flags & !block_arg_flags) {
                                 self.count_complex_call_features(block, insn_id, flags, state);
                                 self.set_dynamic_send_reason(insn_id, ComplexArgPass);
                                 self.push_insn_id(block, insn_id); continue;
@@ -6508,8 +6531,43 @@ impl Function {
                                     stripped_block_arg = true;
                                     let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                                } else if block_arg_profiled_type.is_some_and(|pt| pt.is_static_symbol())
+                                    && (def_type == VM_METHOD_TYPE_CFUNC || {
+                                        // Don't guard for a send that stays dynamic for &nil or unused blocks
+                                        let params = unsafe { get_def_iseq_ptr((*cme).def).params() };
+                                        params.flags.accepts_no_block() == 0 && params.flags.use_block() != 0
+                                    })
+                                    && let Some(to_proc_cme) = self.basic_symbol_to_proc_cme()
+                                {
+                                    // Like vm_caller_setup_arg_block(), pass the Symbol through as the callee
+                                    // frame's specval while Symbol#to_proc is not redefined and no refinements
+                                    // turn it into a lambda.
+                                    let guarded = self.guard_type_recompile(block, block_arg, types::StaticSymbol, state, Recompile);
+                                    let symbol_class = unsafe { rb_cSymbol };
+                                    self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: symbol_class, method: ID!(to_proc), cme: to_proc_cme }, state });
+                                    let refined = self.push_insn(block, Insn::CCall {
+                                        cfunc: rb_vm_symbol_block_arg_refined_p as *const u8,
+                                        recv: guarded,
+                                        args: vec![],
+                                        name: ID!(rb_vm_symbol_block_arg_refined_p),
+                                        owner: Qnil,
+                                        return_type: types::CInt64,
+                                        elidable: false,
+                                    });
+                                    self.push_insn(block, Insn::GuardBitEquals {
+                                        val: refined,
+                                        expected: Const::CInt64(0),
+                                        reason: Box::new(SideExitReason::SymbolBlockArgRefined),
+                                        state,
+                                        recompile: None,
+                                    });
+                                    _ = args.pop();
+                                    send_block = Some(BlockHandler::BlockArgSymbol(guarded));
+                                    stripped_block_arg = true;
+                                    let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                                    send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else {
-                                    // Can't prove block arg is nil or a Proc
+                                    // Can't prove block arg is nil, a Proc, or a Symbol
                                     self.set_dynamic_send_reason(insn_id, SendBlockArgNotNil);
                                     self.push_insn_id(block, insn_id); continue;
                                 }
@@ -6809,6 +6867,7 @@ impl Function {
                                 cd: *const rb_call_data,
                                 send_block: Option<BlockHandler>,
                                 forwarded_block_arg: Option<InsnId>,
+                                stripped_block_arg: bool,
                                 args: Vec<InsnId>,
                                 state: InsnId,
                                 call_state: InsnId,
@@ -6823,8 +6882,9 @@ impl Function {
                                 let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
                                 let mut ci_flags = unsafe { vm_ci_flag(call_info) };
-                                if forwarded_block_arg.is_some() {
-                                    // The forwarded block handler is passed like a literal block.
+                                if forwarded_block_arg.is_some() || stripped_block_arg {
+                                    // The forwarded block handler is passed like a literal block, and a
+                                    // nil, Proc, or Symbol block arg has been stripped from the arguments.
                                     ci_flags &= !VM_CALL_ARGS_BLOCKARG;
                                 }
                                 // When seeing &block argument, fall back to dynamic dispatch for now
@@ -6838,19 +6898,23 @@ impl Function {
                                     return Err(());
                                 }
 
-                                let blockiseq = match send_block {
+                                let (blockiseq, block_arg_value) = match send_block {
                                     Some(BlockHandler::BlockArg) => unreachable!("unsupported &block should have been filtered out"),
-                                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)) => unreachable!("BlockArgProc and FrameBlock are built right before the call"),
-                                    Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq),
-                                    None => None,
+                                    Some(BlockHandler::FrameBlock(_)) => unreachable!("FrameBlock is built right before the call"),
+                                    Some(block_arg_value @ (BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_))) => (None, Some(block_arg_value)),
+                                    Some(BlockHandler::BlockIseq(blockiseq)) => (Some(blockiseq), None),
+                                    None => (None, None),
                                 };
-                                let no_block = blockiseq.is_none() && forwarded_block_arg.is_none();
-                                // Pass the literal block or the forwarded frame block handler. Splitting the
-                                // block for the latter is deferred until the call is committed.
+                                let no_block = blockiseq.is_none() && forwarded_block_arg.is_none() && block_arg_value.is_none();
+                                // Pass the literal block, the guarded Proc or Symbol block arg, or the forwarded
+                                // frame block handler. Splitting the block for the latter is deferred until the
+                                // call is committed. A stripped block arg needs the state without it on the stack.
                                 let emit_call_block = |fun: &mut Function, block: BlockId| -> (BlockId, Option<BlockHandler>, InsnId) {
                                     if let Some(block_arg) = forwarded_block_arg {
                                         let (join_block, block_handler) = fun.emit_forwarded_block_handler(block, block_arg, state);
                                         (join_block, Some(BlockHandler::FrameBlock(block_handler)), call_state)
+                                    } else if stripped_block_arg {
+                                        (block, block_arg_value, call_state)
                                     } else {
                                         (block, blockiseq.map(BlockHandler::BlockIseq), state)
                                     }
@@ -7035,7 +7099,7 @@ impl Function {
                                 }
                             }
 
-                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
+                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
                                 block = join_block;
                                 continue;
                             }
@@ -7783,8 +7847,8 @@ impl Function {
                 let throw_inlinable = throw_block && (inline_block || yields_literal_block
                     || (small_iterator && crate::codegen::iseq_or_blocks_may_yield(iseq)));
                 let inline_block = inline_block || yields_literal_block;
-                // The inliner doesn't know how to yield to a block handler loaded from the frame.
-                let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
+                // The inliner doesn't know how to yield to a block handler loaded from the frame or a Symbol.
+                let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_) | BlockHandler::BlockArgSymbol(_)));
                 // A big caller like a parser's dispatch method spends its budget on its own body, but
                 // inlining a tiny callee, e.g. one that forwards to another method, costs about nothing.
                 let tiny_past_budget = self.over_inline_budget()
@@ -10748,6 +10812,9 @@ impl Function {
                 if let Some(BlockHandler::BlockArgProc(proc_id)) = block {
                     self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
                 }
+                if let Some(BlockHandler::BlockArgSymbol(symbol_id)) = block {
+                    self.assert_subtype(insn_id, symbol_id, types::StaticSymbol)?;
+                }
                 Ok(())
             }
             Insn::PushInlineBlockFrame { recv, .. } => {
@@ -10775,6 +10842,9 @@ impl Function {
                 if let Some(BlockHandler::BlockArgProc(proc_id)) = insn.block {
                     self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
                 }
+                if let Some(BlockHandler::BlockArgSymbol(symbol_id)) = insn.block {
+                    self.assert_subtype(insn_id, symbol_id, types::StaticSymbol)?;
+                }
                 if let Some(BlockHandler::FrameBlock(block_handler)) = insn.block {
                     self.assert_subtype(insn_id, block_handler, types::CInt64)?;
                 }
@@ -10795,6 +10865,12 @@ impl Function {
                 if let Some(BlockHandler::FrameBlock(block_handler)) = insn.block {
                     self.assert_subtype(insn_id, block_handler, types::CInt64)?;
                 }
+                if let Some(BlockHandler::BlockArgProc(proc_id)) = insn.block {
+                    self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
+                }
+                if let Some(BlockHandler::BlockArgSymbol(symbol_id)) = insn.block {
+                    self.assert_subtype(insn_id, symbol_id, types::StaticSymbol)?;
+                }
                 Ok(())
             }
             Insn::CCallVariadic(ref insn) => {
@@ -10804,6 +10880,12 @@ impl Function {
                 }
                 if let Some(BlockHandler::FrameBlock(block_handler)) = insn.block {
                     self.assert_subtype(insn_id, block_handler, types::CInt64)?;
+                }
+                if let Some(BlockHandler::BlockArgProc(proc_id)) = insn.block {
+                    self.assert_subtype(insn_id, proc_id, Type::from_class(unsafe { rb_cProc }))?;
+                }
+                if let Some(BlockHandler::BlockArgSymbol(symbol_id)) = insn.block {
+                    self.assert_subtype(insn_id, symbol_id, types::StaticSymbol)?;
                 }
                 Ok(())
             }
