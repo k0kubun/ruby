@@ -1810,6 +1810,7 @@ pub(crate) mod ids {
         name: send
         name: __send__
         name: initialize
+        name: rb_hash_dup
     }
 
     /// Get an CRuby `ID` to an interned string, e.g. a particular method name.
