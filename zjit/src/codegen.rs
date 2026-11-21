@@ -945,7 +945,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::InvokeBlockIfunc { cd, block_handler, args, state, .. } => gen_invokeblock_ifunc(jit, asm, function, *cd, opnd!(block_handler), opnds!(args), &function.frame_state(*state)),
         Insn::InvokeProc { recv, args, state, kw_splat } => gen_invokeproc(jit, asm, function, opnd!(recv), opnds!(args), *kw_splat, &function.frame_state(*state)),
         Insn::InvokeBuiltin { bf, leaf, args, state, .. } => gen_invokebuiltin(jit, asm, function, &function.frame_state(*state), unsafe { &**bf }, *leaf, opnds!(args)),
-        Insn::InvokeBlockIseqDirect { iseq, captured, args, stack_argc, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), *stack_argc, &function.frame_state(*state)),
+        Insn::InvokeBlockIseqDirect { iseq, captured, args, stack_argc, lambda, state } => gen_invoke_block_iseq_direct(cb, jit, asm, function, *iseq, opnd!(captured), opnds!(args), *stack_argc, *lambda, &function.frame_state(*state)),
         &Insn::EntryPoint { jit_entry_idx } => no_output!(gen_entry_point(jit, asm, jit_entry_idx)),
         &Insn::ResumeEntryPoint { insn_idx, stack_size } => no_output!(gen_resume_entry_point(jit, asm, insn_idx, stack_size)),
         Insn::Return { val } => no_output!(gen_return(asm, opnd!(val))),
@@ -2603,6 +2603,7 @@ fn gen_invoke_block_iseq_direct(
     captured: Opnd,
     args: Vec<Opnd>,
     stack_argc: usize,
+    lambda: bool,
     state: &FrameState,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::block_iseq_direct_optimized_send_count);
@@ -2631,7 +2632,7 @@ fn gen_invoke_block_iseq_direct(
         recv: captured_self,
         iseq: Some(block_iseq),
         cme: std::ptr::null(),
-        frame_type: VM_FRAME_MAGIC_BLOCK,
+        frame_type: VM_FRAME_MAGIC_BLOCK | if lambda { VM_FRAME_FLAG_LAMBDA } else { 0 },
         specval,
         write_block_code: iseq_may_write_block_code(block_iseq),
         forwarded_argc: None, // `...` is not allowed in block arguments

@@ -1930,6 +1930,82 @@ fn test_yield_to_proc_with_next_and_arity_mismatch() {
 }
 
 #[test]
+fn test_yield_to_lambda_dispatches_directly() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def two = yield(1, 2)
+        def test(l) = two(&l)
+        L = ->(a, b) { a + b }
+        test(L)
+        test(L)
+    ");
+    assert_snapshot!(assert_yields_directly("test(L)"), @"3");
+}
+
+#[test]
+fn test_yield_to_lambda_with_arity_mismatch() {
+    // A lambda has strict arity, so it's not called directly with other number of arguments.
+    set_call_threshold(2);
+    eval("
+        def one = yield(1)
+        def test(l) = (one(&l) rescue $!.message)
+        L = ->(a, b) { [a, b] }
+        test(L)
+        test(L)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test(L)"), @r#""wrong number of arguments (given 1, expected 2)""#);
+}
+
+#[test]
+fn test_yield_to_lambda_with_return_from_nested_block() {
+    // `return` in a block in a lambda returns from the lambda, whose frame needs VM_FRAME_FLAG_LAMBDA.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def one(x) = [yield(x), :after]
+        def test(l, x) = one(x, &l)
+        L = ->(x) { [1].each { return x * 10 }; :not_returned }
+        test(L, 1)
+        test(L, 2)
+    ");
+    assert_snapshot!(assert_yields_directly("test(L, 5)"), @"[50, :after]");
+}
+
+#[test]
+fn test_yield_to_proc_of_profiled_lambda_iseq() {
+    // `return` in a block in a Proc of the same block ISEQ as the profiled lambda returns from the
+    // method that made the Proc, which has returned.
+    set_call_threshold(2);
+    eval("
+        def one(x) = [yield(x), :after]
+        def test(l, x) = (one(x, &l) rescue $!.class)
+        def mk(m) = send(m) { |x| [1].each { return x * 10 }; :not_returned }
+        L = mk(:lambda)
+        P = mk(:proc)
+        test(L, 1)
+        test(L, 2)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(L, 3), test(P, 4), test(L, 5)]"), @"[[30, :after], LocalJumpError, [50, :after]]");
+}
+
+#[test]
+fn test_yield_polymorphic_lambdas_procs_and_blocks() {
+    set_call_threshold(5);
+    eval("
+        def two = yield(1, 2)
+        def test_iseq = two { |a, b| a * b }
+        def test_proc(pr) = two(&pr)
+        P = proc { |a| a }
+        L1 = ->(a, b) { a - b }
+        L2 = ->(a) { a }
+        def run = [test_iseq, test_proc(P), test_proc(L1), (test_proc(L2) rescue $!.class)]
+        run
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[run, run]"), @"[[2, 1, -1, ArgumentError], [2, 1, -1, ArgumentError]]");
+}
+
+#[test]
 fn test_yield_to_proc_with_break_or_return() {
     // A Proc that may throw is not called directly. Its break and return raise LocalJumpError
     // since the home frame is gone.
