@@ -26811,6 +26811,26 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_sendforward_to_attr_reader() {
+        eval("
+            class Inner
+              attr_reader :x
+              def initialize = (@x = 1)
+            end
+            class Outer
+              def initialize = (@inner = Inner.new)
+              def x(...) = @inner.x(...)
+            end
+            o = Outer.new
+            o.x; o.x
+        ");
+        let hir = hir_string_proc("Outer.new.method(:x)");
+        assert!(!hir.contains("SendForward "), "Expected no dynamic SendForward but got:\n{hir}");
+        // The packed callinfo in the guard encodes an ID, which isn't stable across test runs.
+        assert!(hir.contains(":@x@"), "Expected an ivar load but got:\n{hir}");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A

@@ -4888,6 +4888,36 @@ fn test_send_to_zsuper_method() {
 }
 
 #[test]
+fn test_sendforward_to_attr_reader() {
+    assert_snapshot!(inspect(r#"
+        class Inner
+          attr_reader :x
+          def initialize = (@x = 1)
+        end
+        class Outer
+          def initialize = (@inner = Inner.new)
+          def x(...) = @inner.x(...)
+        end
+
+        def test(o) = [o.x, o.x { :ignored }]
+
+        o = Outer.new
+        test(o)
+        results = [test(o)]
+        errors = [-> { o.x(1) }, -> { o.x(k: 1) }].map do |f|
+          f.call
+        rescue ArgumentError => e
+          e.message
+        end
+        class Inner
+          def x = :redefined
+        end
+        results << test(o)
+        results + errors
+    "#), @r#"[[1, 1], [:redefined, :redefined], "wrong number of arguments (given 1, expected 0)", "wrong number of arguments (given 1, expected 0)"]"#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String

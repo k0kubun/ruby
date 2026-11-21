@@ -7504,9 +7504,12 @@ impl Function {
                         }
                     }
                     Insn::SendForward { .. } => {
-                        if let Err(reason) = self.try_specialize_send_forward(block, insn_id) {
-                            self.set_dynamic_send_reason(insn_id, reason);
-                            self.push_insn_id(block, insn_id);
+                        match self.try_specialize_send_forward(block, insn_id) {
+                            Ok(next_block) => block = next_block,
+                            Err(reason) => {
+                                self.set_dynamic_send_reason(insn_id, reason);
+                                self.push_insn_id(block, insn_id);
+                            }
                         }
                     }
                     _ => { self.push_insn_id(block, insn_id); }
@@ -7573,7 +7576,7 @@ impl Function {
     /// callinfo, guarded on its identity, so the merged call can be specialized like a plain send.
     /// Like a polymorphic inline cache keyed on the forwarded argument shape, a site that sees
     /// several callinfos stays dynamic.
-    fn try_specialize_send_forward(&mut self, block: BlockId, insn_id: InsnId) -> Result<(), SendFallbackReason> {
+    fn try_specialize_send_forward(&mut self, block: BlockId, insn_id: InsnId) -> Result<BlockId, SendFallbackReason> {
         let Insn::SendForward { mut recv, cd, blockiseq, ref args, state, .. } = *self.resolve(insn_id).insn(self) else { unreachable!() };
         let args = args.to_vec();
         let site_ci = unsafe { (*cd).ci };
@@ -7639,6 +7642,9 @@ impl Function {
             cme = unsafe { rb_aliased_callable_method_entry(cme) };
         }
         let def_type = unsafe { get_cme_def_type(cme) };
+        if def_type == VM_METHOD_TYPE_IVAR {
+            return self.specialize_send_forward_to_attr_reader(block, insn_id, recv, profiled_type, klass, mid, lookup_cme, cme, ci_opnd, caller_ci_value, args.len() - 1, state);
+        }
         if def_type != VM_METHOD_TYPE_ISEQ {
             return Err(SendNotOptimizedMethodType(MethodType::from(def_type)));
         }
@@ -7715,7 +7721,57 @@ impl Function {
             recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block,
         })));
         self.make_equal_to(insn_id, replacement);
-        Ok(())
+        Ok(block)
+    }
+
+    /// Specialize `bar(...)` to the attr_reader `cme` when the profiled callinfo `caller_ci_value`
+    /// of the forwarded call passes no arguments. Like vm_call_ivar(), an attr_reader takes no
+    /// arguments and ignores a block. Returns the block to continue in.
+    fn specialize_send_forward_to_attr_reader(
+        &mut self,
+        mut block: BlockId,
+        insn_id: InsnId,
+        mut recv: InsnId,
+        profiled_type: Option<ProfiledType>,
+        klass: VALUE,
+        mid: ID,
+        lookup_cme: *const rb_callable_method_entry_t,
+        cme: *const rb_callable_method_entry_t,
+        ci_opnd: InsnId,
+        caller_ci_value: VALUE,
+        num_site_args: usize,
+        state: InsnId,
+    ) -> Result<BlockId, SendFallbackReason> {
+        let caller_ci: *const rb_callinfo = caller_ci_value.as_ptr();
+        // Arguments make the VM raise an ArgumentError, which the dynamic send does.
+        if num_site_args != 0 || unsafe { vm_ci_argc(caller_ci) } != 0 || !ci_keywords(caller_ci).is_empty() {
+            return Err(ArgcParamMismatch);
+        }
+        let Some(profiled_type) = profiled_type else {
+            return Err(SendNoProfiles);
+        };
+        if !self.assume_no_singleton_classes(block, klass, state) {
+            return Err(SingletonClassSeen);
+        }
+
+        // Commit to the attr_reader. A guard miss re-executes the `sendforward` in the interpreter.
+        self.push_insn(block, Insn::GuardBitEquals {
+            val: ci_opnd,
+            expected: Const::Value(caller_ci_value),
+            reason: Box::new(SideExitReason::GuardForwardedCallInfo),
+            state,
+            recompile: Some(Recompile),
+        });
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
+        recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
+        let id = unsafe { get_cme_def_body_attr_id(cme) };
+        let (next_block, replacement) = self.try_emit_optimized_getivar(block, recv, id, profiled_type, state).unwrap_or_else(|counter| {
+            self.count(block, counter);
+            (block, self.push_insn(block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state }))
+        });
+        block = next_block;
+        self.make_equal_to(insn_id, replacement);
+        Ok(block)
     }
 
     /// Check whether a callee ISEQ can be inlined.
