@@ -3222,11 +3222,22 @@ pub struct Function {
     /// Inlined frames, keyed by the caller Snapshot that FrameStates in the frame point to.
     /// See inlined_local_frame.
     inlined_frames: HashMap<InsnId, InlinedFrame>,
-    /// Per-call-site caches of the last receiver class found to resolve to the method entry
+    /// Per-call-site caches of the last receiver classes found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
-    pub klass_caches: std::cell::RefCell<Vec<Box<VALUE>>>,
+    pub klass_caches: std::cell::RefCell<Vec<Box<KlassCache>>>,
 }
+
+/// Number of receiver classes that a method entry check caches per call site. JIT code checks
+/// the first one inline, and rb_zjit_cached_cme() checks the rest before the class's method
+/// cache. They fill one cache line. Keep it in sync with ZJIT_KLASS_CACHE_SIZE in zjit.c.
+pub const KLASS_CACHE_SIZE: usize = 8;
+
+/// A per-call-site cache of the receiver classes found to resolve to a method entry, most
+/// recently used first. Unused entries are Qfalse.
+#[derive(Debug)]
+#[repr(C, align(64))]
+pub struct KlassCache(pub [VALUE; KLASS_CACHE_SIZE]);
 
 /// The kind of a value an ISEQ returns
 enum IseqReturn {
@@ -5123,8 +5134,8 @@ impl Function {
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
         let mid_opnd = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { rb_id2sym(mid) }) });
         // Qfalse is never the class of an object, so a new cache misses.
-        let klass_cache = Box::new(Qfalse);
-        let klass_cache_opnd = self.push_insn(block, Insn::Const { val: Const::CPtr(&*klass_cache as *const VALUE as *const u8) });
+        let klass_cache = Box::new(KlassCache([Qfalse; KLASS_CACHE_SIZE]));
+        let klass_cache_opnd = self.push_insn(block, Insn::Const { val: Const::CPtr(klass_cache.0.as_ptr() as *const u8) });
         self.klass_caches.borrow_mut().push(klass_cache);
         let cache_owner = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(self.iseq)) });
         let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(VALUE::from(lookup_cme)) });
