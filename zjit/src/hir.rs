@@ -10262,12 +10262,32 @@ impl Function {
         }
     }
 
-    /// Remove duplicate PatchPoint instructions within each basic block.
+    /// Remove duplicate PatchPoint instructions, within each basic block and across forward edges.
     /// Two PatchPoints are redundant if they assert the same Invariant and no
     /// intervening instruction could invalidate it (i.e., writes to PatchPoint).
     fn remove_redundant_patch_points(&mut self) {
-        for block_id in self.reverse_post_order() {
-            let mut seen = HashSet::default();
+        let cfi = ControlFlowInfo::new(self);
+        let mut rpo_indexes = vec![usize::MAX; self.blocks.len()];
+        for (rpo_index, &block_id) in cfi.reverse_post_order().iter().enumerate() {
+            rpo_indexes[block_id] = rpo_index;
+        }
+        // The invariants that every path to the end of each block has checked since the last write
+        // to PatchPoint, by block
+        let mut checked_at_end: Vec<HashSet<Invariant>> = vec![HashSet::default(); self.blocks.len()];
+        for (rpo_index, &block_id) in cfi.reverse_post_order().iter().enumerate() {
+            // A block starts with the invariants checked at the end of all of its predecessors.
+            // Don't look through back edges, whose sources haven't been visited yet.
+            let preds = cfi.predecessors(block_id);
+            let mut seen = match preds.split_first() {
+                Some((&first, rest)) if preds.iter().all(|&pred| rpo_indexes[pred] < rpo_index) => {
+                    let mut seen = checked_at_end[first].clone();
+                    for &pred in rest {
+                        seen.retain(|invariant| checked_at_end[pred].contains(invariant));
+                    }
+                    seen
+                }
+                _ => HashSet::default(),
+            };
             let insns = std::mem::take(&mut self.blocks[block_id].insns);
             let mut new_insns = Vec::with_capacity(insns.len());
             for insn_id in insns {
@@ -10275,7 +10295,7 @@ impl Function {
                 // ResolvedInsnId.
                 let insn = ResolvedInsnId(insn_id).insn(self);
                 if let Insn::PatchPoint { invariant, .. } = insn {
-                    if !seen.insert(invariant) {
+                    if !seen.insert(*invariant) {
                         continue;
                     }
                 } else if insn.effects_of().write_bits().overlaps(abstract_heaps::PatchPoint) {
@@ -10284,6 +10304,7 @@ impl Function {
                 new_insns.push(insn_id);
             }
             self.blocks[block_id].insns = new_insns;
+            checked_at_end[block_id] = seen;
         }
     }
 
