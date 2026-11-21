@@ -4846,6 +4846,28 @@ impl Function {
         }
     }
 
+    /// Whether the keyword splat of a call with `flags` and `args` is passed to `iseq` as its last
+    /// positional argument as is. The VM passes a non-empty keyword splat Hash to a method without
+    /// keyword parameters as a positional argument, duplicating it unless the caller made a new
+    /// Hash for the call (VM_CALL_KW_SPLAT_MUT). We only handle the Hash literals of braceless
+    /// non-Symbol keys, e.g. `foo('k' => v)`, which are known to be non-empty Hashes.
+    fn kw_splat_is_positional_hash(&self, iseq: IseqPtr, flags: u32, args: &[InsnId]) -> bool {
+        if flags & (VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT) != (VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT)
+            || flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0
+        {
+            return false;
+        }
+        let params = unsafe { iseq.params() };
+        // Keyword parameters, **kwrest, **nil, and ruby2_keywords handle the keywords differently.
+        if !params.keyword.is_null() || params.flags.has_kwrest() != 0
+            || params.flags.accepts_no_kwarg() != 0 || params.flags.ruby2_keywords() != 0
+            || params.flags.forwardable() != 0
+        {
+            return false;
+        }
+        matches!(args.last().map(|&hash| self.find_ref(hash)), Some(Insn::NewHash { elements, .. }) if !elements.is_empty())
+    }
+
     fn profiled_type_of_at(&self, insn: InsnId, state: InsnId) -> Option<ProfiledType> {
         match self.resolve_receiver_type_from_profile(insn, state) {
             ReceiverTypeResolution::Monomorphic { profiled_type }
@@ -6662,6 +6684,11 @@ impl Function {
                             // skip the generic splat rejection here and validate its profile below.
                             flags_for_check &= !VM_CALL_ARGS_SPLAT;
                         }
+                        let kw_splat_as_positional = def_type == VM_METHOD_TYPE_ISEQ
+                            && self.kw_splat_is_positional_hash(unsafe { get_def_iseq_ptr((*cme).def) }, flags, &args);
+                        if kw_splat_as_positional {
+                            flags_for_check &= !VM_CALL_KW_SPLAT;
+                        }
                         if def_type != VM_METHOD_TYPE_OPTIMIZED && def_type != VM_METHOD_TYPE_CFUNC && unspecializable_call_type(flags_for_check) {
                             self.count_complex_call_features(block, insn_id, flags, state);
                             self.set_dynamic_send_reason(insn_id, ComplexArgPass);
@@ -6685,6 +6712,9 @@ impl Function {
                             if kwrest_hash.is_some() {
                                 caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
                                 caller_args.kwrest_hash = kwrest_hash;
+                            }
+                            if kw_splat_as_positional {
+                                caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
                             }
                             let caller_splat = if let Some(arg_idx) = caller_args.splat_arg_idx {
                                 // Count the profile shape for every caller-splat execution;
