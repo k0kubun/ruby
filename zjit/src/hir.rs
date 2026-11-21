@@ -4174,6 +4174,8 @@ impl Function {
         let id = BlockId::from(self.blocks.len());
         let block = Block {
             insn_idx,
+            // Most blocks get a few instructions. Skip the first doublings of the vector.
+            insns: Vec::with_capacity(16),
             .. Block::default()
         };
         self.blocks.push(block);
