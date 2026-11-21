@@ -10490,7 +10490,7 @@ impl Function {
     /// 1. Basic block jump args match parameter arity.
     /// 2. Every terminator must be in the last position.
     /// 3. Every block must have a terminator.
-    fn validate_block_terminators_and_jumps(&self) -> Result<(), ValidationError> {
+    fn validate_block_terminators_and_jumps(&self, rpo: &[BlockId]) -> Result<(), ValidationError> {
         let check_edge = |block_id: BlockId, edge: &BranchEdge| -> Result<(), ValidationError> {
             let target_len = self.blocks[edge.target].params.len();
             let args_len = edge.args.len();
@@ -10500,7 +10500,7 @@ impl Function {
             Ok(())
         };
 
-        for block_id in self.reverse_post_order() {
+        for &block_id in rpo {
             let insns = &self.blocks[block_id].insns;
             for (idx, insn_id) in insns.iter().enumerate() {
                 // No need for resolve(): we only look at edge targets/arity and terminators.
@@ -10552,14 +10552,13 @@ impl Function {
     ///
     /// A CFG is irreducible if it contains a back-edge `B->H` to a loop header `H` where `B` is
     /// not dominated by `H`.
-    fn validate_reducible(&self) -> Result<(), ValidationError> {
-        let rpo = self.reverse_post_order();
+    fn validate_reducible(&self, rpo: &[BlockId]) -> Result<(), ValidationError> {
         let mut rpo_index = vec![0; self.blocks.len()];
         for (idx, &block) in rpo.iter().enumerate() {
             rpo_index[block] = idx;
         }
         let dominators = Dominators::new(self);
-        for block in rpo {
+        for &block in rpo {
             for target in self.successors(block) {
                 if rpo_index[target] <= rpo_index[block] {
                     // This is a back-edge. Check that the target dominates the source.
@@ -10575,14 +10574,17 @@ impl Function {
     // This performs a dataflow def-analysis over the entire CFG to detect any
     // possibly undefined instruction operands.
     fn validate_definite_assignment(&self) -> Result<(), ValidationError> {
+        self.validate_definite_assignment_in(&self.reverse_post_order())
+    }
+
+    fn validate_definite_assignment_in(&self, rpo: &[BlockId]) -> Result<(), ValidationError> {
         // Map of block ID -> InsnSet
         // Initialize with all missing values at first, to catch if a jump target points to a
         // missing location.
         let mut assigned_in = vec![None; self.num_blocks()];
-        let rpo = self.reverse_post_order();
         // Begin with every block having every variable defined, except for entries_block, which
         // starts with nothing defined.
-        for &block in &rpo {
+        for &block in rpo {
             if block == self.entries_block {
                 assigned_in[block] = Some(InsnSet::with_capacity(self.insns.len()));
             } else {
@@ -10643,7 +10645,7 @@ impl Function {
             }
         }
         // Check that each instruction's operands are assigned
-        for &block in &rpo {
+        for &block in rpo {
             let mut assigned = assigned_in[block].clone().unwrap();
             for &param in &self.blocks[block].params {
                 assigned.insert(param);
@@ -10666,9 +10668,9 @@ impl Function {
     }
 
     /// Checks that each instruction('s representative) appears only once in the CFG.
-    fn validate_insn_uniqueness(&self) -> Result<(), ValidationError> {
+    fn validate_insn_uniqueness(&self, rpo: &[BlockId]) -> Result<(), ValidationError> {
         let mut seen = InsnSet::with_capacity(self.insns.len());
-        for block_id in self.reverse_post_order() {
+        for &block_id in rpo {
             for &insn_id in &self.blocks[block_id].insns {
                 let insn_id = self.union_find.borrow().find_const(insn_id);
                 if !seen.insert(insn_id) {
@@ -11116,8 +11118,8 @@ impl Function {
     }
 
     /// Check that insn types match the expected types for each instruction.
-    fn validate_types(&self) -> Result<(), ValidationError> {
-        for block_id in self.reverse_post_order() {
+    fn validate_types(&self, rpo: &[BlockId]) -> Result<(), ValidationError> {
+        for &block_id in rpo {
             for &insn_id in &self.blocks[block_id].insns {
                 self.validate_insn_type(insn_id)?;
             }
@@ -11127,11 +11129,13 @@ impl Function {
 
     /// Run all validation passes we have.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        self.validate_block_terminators_and_jumps()?;
-        self.validate_reducible()?;
-        self.validate_definite_assignment()?;
-        self.validate_insn_uniqueness()?;
-        self.validate_types()?;
+        // The passes don't change the function, so they share one reverse post-order.
+        let rpo = self.reverse_post_order();
+        self.validate_block_terminators_and_jumps(&rpo)?;
+        self.validate_reducible(&rpo)?;
+        self.validate_definite_assignment_in(&rpo)?;
+        self.validate_insn_uniqueness(&rpo)?;
+        self.validate_types(&rpo)?;
         Ok(())
     }
 
