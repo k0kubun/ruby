@@ -4120,8 +4120,17 @@ impl Function {
 
     /// Return a resolved, freshly allocated FrameState at the given instruction index.
     pub fn frame_state(&self, insn_id: InsnId) -> FrameState {
-        match self.find(insn_id) {
-            Insn::Snapshot { state } => *state,
+        // Like find(), but clone only the FrameState rather than the whole Insn
+        match self.find_ref(insn_id) {
+            Insn::Snapshot { state } => {
+                let mut state = FrameState::clone(state);
+                let union_find = self.union_find.borrow();
+                // The operands of a Snapshot, as visited by for_each_operand_mut()
+                for operand in state.stack.iter_mut().chain(state.locals.iter_mut()).chain(state.caller.iter_mut()) {
+                    *operand = union_find.find_const(*operand);
+                }
+                state
+            }
             insn => panic!("Unexpected non-Snapshot {insn} when looking up FrameState"),
         }
     }
