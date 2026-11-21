@@ -473,7 +473,7 @@ impl Assembler {
         let asm = &mut asm_local;
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
-        let linearized_insns = self.linearize_instructions();
+        let linearized_insns = self.into_linearized_instructions();
         asm.current_block().insns.reserve(linearized_insns.len());
         asm.current_block().insn_ids.reserve(linearized_insns.len());
 

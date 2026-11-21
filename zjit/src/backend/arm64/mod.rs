@@ -791,11 +791,11 @@ impl Assembler {
         let asm = &mut asm_local;
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
-        let linearized_insns = self.linearize_instructions();
+        let linearized_insns = self.into_linearized_instructions();
 
         // Process each linearized instruction
-        for (idx, insn) in linearized_insns.iter().enumerate() {
-            let mut insn = insn.clone();
+        let mut linearized_insns = linearized_insns.into_iter().peekable();
+        while let Some(mut insn) = linearized_insns.next() {
             match &mut insn {
                 Insn::Add { left, right, out } |
                 Insn::Sub { left, right, out } |
@@ -847,7 +847,7 @@ impl Assembler {
                     };
 
                     // If the next instruction is JoMul
-                    if idx + 1 < linearized_insns.len() && matches!(linearized_insns[idx + 1], Insn::JoMul(_)) {
+                    if matches!(linearized_insns.peek(), Some(Insn::JoMul(_))) {
                         // Produce a register that is all zeros or all ones
                         // Based on the sign bit of the 64-bit mul result
                         asm.push_insn(Insn::RShift { out: SCRATCH0_OPND, opnd: reg_out, shift: Opnd::UImm(63) });

@@ -2076,14 +2076,33 @@ impl Assembler
         iter
     }
 
+    /// Linearize a copy of the instructions. See [`Self::into_linearized_instructions`].
     pub fn linearize_instructions(&self) -> Vec<Insn> {
+        self.clone().into_linearized_instructions()
+    }
 
-        // Emit instructions with labels, expanding branch parameters
-        let mut insns = Vec::with_capacity(ASSEMBLER_INSNS_CAPACITY);
+    /// Linearize the instructions of all blocks in block order, converting branch targets
+    /// to labels. It moves the instructions out of the blocks instead of cloning them.
+    pub fn into_linearized_instructions(mut self) -> Vec<Insn> {
         let block_ids = self.block_order();
+        // Look up the labels of the blocks that follow another before taking the instructions.
+        let next_labels: Vec<Label> = block_ids.iter().skip(1).map(|&block_id| self.block_label(block_id)).collect();
+        let label_of_block: Vec<Option<Label>> = self.basic_blocks.iter()
+            .map(|block| match block.insns.first() {
+                Some(Insn::Label(Target::Label(label))) => Some(*label),
+                _ => None,
+            })
+            .collect();
+        let block_label = |block_id: BlockId| -> Label {
+            label_of_block[block_id.0].unwrap_or_else(|| panic!("Expected first instruction of block {block_id:?} to be a Label"))
+        };
+
+        // Each block may add a BoundaryPad and a PosMarker, plus the final BoundaryPad.
+        let capacity = block_ids.iter().map(|block_id| self.basic_blocks[block_id.0].insns.len() + 2).sum::<usize>() + 1;
+        let mut insns = Vec::with_capacity(capacity);
 
         for (i, block_id) in block_ids.iter().enumerate() {
-            let block = &self.basic_blocks[block_id.0];
+            let block = &mut self.basic_blocks[block_id.0];
             // Entry blocks shouldn't ever be preceded by something that can
             // stomp on this block.
             if !block.is_entry {
@@ -2094,20 +2113,19 @@ impl Assembler
 
             // Process each instruction, expanding branch params if needed
             let mut block_end_pos_marker = None;
-            for insn in &block.insns {
+            for insn in take(&mut block.insns) {
                 if let Insn::PosMarkerAtBlockEnd(marker) = insn {
                     assert!(block_end_pos_marker.is_none(), "only one PosMarkerAtBlockEnd is supported per block");
-                    block_end_pos_marker = Some(marker.clone());
+                    block_end_pos_marker = Some(marker);
                 } else {
-                    self.expand_branch_insn(insn, &mut insns);
+                    insns.push(Self::expand_branch_insn(insn, block_label));
                 }
             }
 
             // Eliminate redundant jumps: if the last instruction is an
             // unconditional jump to the next block in the linear order,
             // remove it and let execution fall through.
-            if let Some(next_block_id) = block_ids.get(i + 1) {
-                let next_label = self.block_label(*next_block_id);
+            if let Some(&next_label) = next_labels.get(i) {
                 if let Some(Insn::Jmp(Target::Label(label))) = insns.last() {
                     if *label == next_label {
                         insns.pop();
@@ -2149,38 +2167,27 @@ impl Assembler
         insns
     }
 
-    /// Expand and linearize a branch instruction:
-    /// 1. If the branch has Target::Block with arguments, insert a ParallelMov first
-    /// 2. Convert Target::Block to Target::Label
-    /// 3. Push the converted instruction
-    fn expand_branch_insn(&self, insn: &Insn, insns: &mut Vec<Insn>) {
-        // Helper to process branch arguments and return the label target
-        let process_edge = |edge: &BranchEdge| -> Label {
-            self.block_label(edge.target)
-        };
-
-        // Convert Target::Block to Target::Label, processing args if needed
-        let stripped_insn = match insn {
-            Insn::Jmp(Target::Block(edge)) => Insn::Jmp(Target::Label(process_edge(edge))),
-            Insn::Jz(Target::Block(edge)) => Insn::Jz(Target::Label(process_edge(edge))),
-            Insn::Jnz(Target::Block(edge)) => Insn::Jnz(Target::Label(process_edge(edge))),
-            Insn::Je(Target::Block(edge)) => Insn::Je(Target::Label(process_edge(edge))),
-            Insn::Jne(Target::Block(edge)) => Insn::Jne(Target::Label(process_edge(edge))),
-            Insn::Jl(Target::Block(edge)) => Insn::Jl(Target::Label(process_edge(edge))),
-            Insn::Jle(Target::Block(edge)) => Insn::Jle(Target::Label(process_edge(edge))),
-            Insn::Jg(Target::Block(edge)) => Insn::Jg(Target::Label(process_edge(edge))),
-            Insn::Jge(Target::Block(edge)) => Insn::Jge(Target::Label(process_edge(edge))),
-            Insn::Jbe(Target::Block(edge)) => Insn::Jbe(Target::Label(process_edge(edge))),
-            Insn::Jb(Target::Block(edge)) => Insn::Jb(Target::Label(process_edge(edge))),
-            Insn::Jo(Target::Block(edge)) => Insn::Jo(Target::Label(process_edge(edge))),
-            Insn::JoMul(Target::Block(edge)) => Insn::JoMul(Target::Label(process_edge(edge))),
-            Insn::Joz(opnd, Target::Block(edge)) => Insn::Joz(*opnd, Target::Label(process_edge(edge))),
-            Insn::Jonz(opnd, Target::Block(edge)) => Insn::Jonz(*opnd, Target::Label(process_edge(edge))),
-            _ => insn.clone()
-        };
-
-        // Push the stripped instruction
-        insns.push(stripped_insn);
+    /// Convert a Target::Block of a branch instruction to the Target::Label of the block.
+    fn expand_branch_insn(insn: Insn, block_label: impl Fn(BlockId) -> Label) -> Insn {
+        let label = |edge: Box<BranchEdge>| Target::Label(block_label(edge.target));
+        match insn {
+            Insn::Jmp(Target::Block(edge)) => Insn::Jmp(label(edge)),
+            Insn::Jz(Target::Block(edge)) => Insn::Jz(label(edge)),
+            Insn::Jnz(Target::Block(edge)) => Insn::Jnz(label(edge)),
+            Insn::Je(Target::Block(edge)) => Insn::Je(label(edge)),
+            Insn::Jne(Target::Block(edge)) => Insn::Jne(label(edge)),
+            Insn::Jl(Target::Block(edge)) => Insn::Jl(label(edge)),
+            Insn::Jle(Target::Block(edge)) => Insn::Jle(label(edge)),
+            Insn::Jg(Target::Block(edge)) => Insn::Jg(label(edge)),
+            Insn::Jge(Target::Block(edge)) => Insn::Jge(label(edge)),
+            Insn::Jbe(Target::Block(edge)) => Insn::Jbe(label(edge)),
+            Insn::Jb(Target::Block(edge)) => Insn::Jb(label(edge)),
+            Insn::Jo(Target::Block(edge)) => Insn::Jo(label(edge)),
+            Insn::JoMul(Target::Block(edge)) => Insn::JoMul(label(edge)),
+            Insn::Joz(opnd, Target::Block(edge)) => Insn::Joz(opnd, label(edge)),
+            Insn::Jonz(opnd, Target::Block(edge)) => Insn::Jonz(opnd, label(edge)),
+            insn => insn,
+        }
     }
 
     // Get the label for a given block by extracting it from the first instruction.
@@ -4503,7 +4510,7 @@ impl Assembler {
         asm_local.new_block_without_id("linearized");
 
         // Get linearized instructions with branch parameters expanded into ParallelMov
-        let linearized_insns = self.linearize_instructions();
+        let linearized_insns = self.into_linearized_instructions();
 
         // TODO: Aaron, this could be better. We don't need to do this, FIXME
         // Process each linearized instruction
