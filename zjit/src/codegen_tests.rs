@@ -2005,6 +2005,63 @@ fn test_yield_polymorphic_lambdas_procs_and_blocks() {
     assert_snapshot!(assert_compiles_allowing_exits("[run, run]"), @"[[2, 1, -1, ArgumentError], [2, 1, -1, ArgumentError]]");
 }
 
+/// Like `assert_compiles`, but also asserts that the program never fell back to the generic
+/// `invokeblock`. Call `crate::options::enable_zjit_stats()` before compiling the program.
+#[track_caller]
+fn assert_no_invokeblock_fallback(program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let fallback_before = counters.send_fallback_invokeblock_not_specialized + counters.send_fallback_invokeblock_polymorphic_miss;
+    let result = assert_compiles(program);
+    assert_eq!(counters.send_fallback_invokeblock_not_specialized + counters.send_fallback_invokeblock_polymorphic_miss, fallback_before,
+        "expected no generic invokeblock fallback");
+    result
+}
+
+#[test]
+fn test_yield_to_ifunc_procs() {
+    // Procs of Method#to_proc and Hash#to_proc have IFUNC blocks.
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def one(x) = yield(x)
+        def two(x, y) = yield(x, y)
+        def dbl(x) = x * 2
+        def add(a, b) = a + b
+        H = { a: 1 }
+        def test(x) = [one(x, &method(:dbl)), two(x, 1, &method(:add)), one(:a, &H)]
+        test(1)
+        test(2)
+    ");
+    assert_snapshot!(assert_no_invokeblock_fallback("test(3)"), @"[6, 4, 1]");
+}
+
+#[test]
+fn test_yield_to_ifunc_proc_with_arity_mismatch() {
+    set_call_threshold(2);
+    eval("
+        def one(x) = yield(x)
+        def add(a, b) = a + b
+        def test(m) = (one(1, &method(m)) rescue $!.message)
+        test(:add)
+        test(:add)
+    ");
+    assert_snapshot!(assert_compiles("test(:add)"), @r#""wrong number of arguments (given 1, expected 2)""#);
+}
+
+#[test]
+fn test_yield_polymorphic_ifunc_procs_and_blocks() {
+    set_call_threshold(5);
+    eval("
+        def one(x) = yield(x)
+        def dbl(x) = x * 2
+        PR = proc { |x| x + 1 }
+        def run = [one(1) { |x| x - 1 }, one(2, &method(:dbl)), one(3, &PR), one(4, &:to_s), one(5, &->(x) { -x })]
+        run
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[run, run]"), @r#"[[0, 4, 4, "4", -5], [0, 4, 4, "4", -5]]"#);
+}
+
 #[test]
 fn test_yield_to_proc_with_break_or_return() {
     // A Proc that may throw is not called directly. Its break and return raise LocalJumpError
@@ -2921,6 +2978,24 @@ fn test_yield_block_iseq_guard_survives_compaction() {
             GC.verify_compaction_references(expand_heap: true, toward: :empty) if GC.respond_to?(:compact)
         ");
         assert_snapshot!(assert_compiles("test"), @"42");
+    });
+}
+
+#[test]
+fn test_yield_to_procs_survives_compaction() {
+    // The profiled and guarded ISEQs of Procs and lambdas move with compaction.
+    with_inlining_threshold(0, || {
+        eval("
+            def p1(x) = yield(x)
+            def l1(x) = yield(x)
+            def m1(x) = yield(x)
+            PR = proc { |x| x + 1 }
+            L = ->(x) { x + 2 }
+            def test(x) = [p1(x, &PR), l1(x, &L), m1(x, &method(:Integer))]
+            4.times { test(1) }
+            GC.verify_compaction_references(expand_heap: true, toward: :empty) if GC.respond_to?(:compact)
+        ");
+        assert_snapshot!(assert_compiles("test(2)"), @"[3, 4, 2]");
     });
 }
 
