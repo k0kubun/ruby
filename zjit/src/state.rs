@@ -1,6 +1,6 @@
 //! Runtime state of ZJIT.
 
-use crate::codegen::{gen_entry_trampoline, gen_exec_callee_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter, trace_compile_size};
+use crate::codegen::{gen_entry_trampoline, gen_exec_callee_trampoline, gen_exit_descriptor_trampoline, gen_exit_trampoline, gen_function_stub_hit_trampoline, gen_materialize_exit_trampoline, gen_materialize_exit_trampoline_with_counter, trace_compile_size};
 use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insn_count, src_loc, EcPtr, Qnil, Qtrue, rb_profile_frames, rb_profile_frame_full_label, rb_profile_frame_absolute_path, rb_profile_frame_path, VALUE, VM_INSTRUCTION_SIZE, with_vm_lock, rust_str_to_id, rb_funcallv, rb_const_get, rb_cRubyVM};
 use crate::cruby_methods;
 use cruby::{ID, rb_callable_method_entry, get_def_method_serial, rb_gc_register_mark_object, ruby_str_to_rust_string_result};
@@ -11,6 +11,7 @@ use crate::options::{get_option, rb_zjit_prepare_options};
 use crate::jit_frame::{JITFrame, JITFrameAllocator};
 use crate::stats::{Counters, InsnCounters, PerfettoTracer};
 use crate::virtualmem::CodePtr;
+use crate::exit_desc::ExitDescriptorTable;
 use std::sync::atomic::AtomicUsize;
 use std::collections::HashMap;
 use std::ptr::null;
@@ -120,6 +121,9 @@ pub struct ZJITState {
     /// Trampoline to run the callee of a JIT-to-JIT call in the interpreter
     exec_callee_trampoline: CodePtr,
 
+    /// Trampoline every side exit calls. See [`crate::exit_desc`].
+    exit_descriptor_trampoline: CodePtr,
+
     /// Trampoline to call function_stub_hit
     function_stub_hit_trampoline: CodePtr,
 
@@ -145,6 +149,10 @@ pub struct ZJITState {
     /// INT32_MAX, so that call sites can store frame pointers as 32-bit immediates.
     /// None when the platform cannot provide low memory.
     jit_frame_allocator: Option<JITFrameAllocator>,
+
+    /// Descriptors of compiled side exits, keyed by the return address of their
+    /// call to exit_descriptor_trampoline. See [`crate::exit_desc`].
+    exit_descriptors: std::sync::RwLock<ExitDescriptorTable>,
 }
 
 /// Tracks the initialization progress
@@ -232,6 +240,8 @@ impl ZJITState {
             materialize_exit_trampoline: exit_trampoline,
             materialize_exit_trampoline_with_counter: exit_trampoline,
             exec_callee_trampoline,
+            exit_descriptor_trampoline: exit_trampoline,
+            exit_descriptors: std::sync::RwLock::new(ExitDescriptorTable::default()),
         };
         unsafe { ZJIT_STATE = Enabled(zjit_state); }
 
@@ -241,6 +251,8 @@ impl ZJITState {
             let cb = ZJITState::get_code_block();
             let materialize_exit_trampoline = gen_materialize_exit_trampoline(cb, exit_trampoline).unwrap();
             ZJITState::get_instance().materialize_exit_trampoline = materialize_exit_trampoline;
+            ZJITState::get_instance().exit_descriptor_trampoline =
+                gen_exit_descriptor_trampoline(cb, materialize_exit_trampoline).unwrap();
 
             // With --zjit-stats, use a different trampoline on function stub exits
             // to count exit_compilation_failure.
@@ -286,6 +298,23 @@ impl ZJITState {
     /// Get a mutable reference to the invariants
     pub fn get_invariants() -> &'static mut Invariants {
         &mut ZJITState::get_instance().invariants
+    }
+
+    /// Get the side-exit descriptor table
+    pub fn get_exit_descriptors() -> &'static std::sync::RwLock<ExitDescriptorTable> {
+        &ZJITState::get_instance().exit_descriptors
+    }
+
+    /// Get the side-exit descriptor table without locking. Only for when no other
+    /// Ractor can be running, see [`crate::exit_desc::rb_zjit_side_exit_descriptor`].
+    pub fn get_exit_descriptors_unlocked() -> &'static ExitDescriptorTable {
+        let lock = &mut ZJITState::get_instance().exit_descriptors;
+        lock.get_mut().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Return a code pointer to the trampoline every side exit calls
+    pub fn get_exit_descriptor_trampoline() -> CodePtr {
+        ZJITState::get_instance().exit_descriptor_trampoline
     }
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
