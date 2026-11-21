@@ -3418,8 +3418,8 @@ impl Assembler
     /// change the edges of existing blocks until it creates a block, which clears the cache.
     pub fn cache_block_orders(&mut self) {
         self.cached_block_orders = None;
-        let reverse_post_order = self.reverse_post_order();
-        let block_order = self.block_order();
+        let reverse_post_order = self.compute_reverse_post_order();
+        let block_order = self.block_order_from_rpo(reverse_post_order.clone());
         self.cached_block_orders = Some(CachedBlockOrders { reverse_post_order, block_order });
     }
 
@@ -3587,7 +3587,10 @@ impl Assembler
     }
 
     fn compute_block_order(&self) -> Vec<BlockId> {
-        let rpo = self.compute_reverse_post_order();
+        self.block_order_from_rpo(self.compute_reverse_post_order())
+    }
+
+    fn block_order_from_rpo(&self, rpo: Vec<BlockId>) -> Vec<BlockId> {
         if self.cold_hir_blocks.is_empty() {
             return rpo;
         }
