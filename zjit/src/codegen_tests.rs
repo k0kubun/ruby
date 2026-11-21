@@ -6821,6 +6821,96 @@ fn test_getivar_frozen_constant_with_other_shape() {
 }
 
 #[test]
+fn test_getivar_frozen_constant_gaining_object_id() {
+    // A frozen object can still change its shape: object_id adds a field, and
+    // when the embedded slots are full the fields move out of line. So the shape
+    // of a frozen constant must not be folded at compile time.
+    set_call_threshold(2);
+    eval(r#"
+      class FrozenBox
+        def initialize = (@a, @b, @c = :a, :b, :c)
+        def a = @a
+      end
+      BOX = FrozenBox.new.freeze
+      def test = BOX.a
+      test; test # compile with the shape BOX has before it gets an object_id
+      BOX.object_id
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test, test]"), @"[:a, :a]");
+}
+
+#[test]
+fn test_getivar_extended_frozen_constant_gaining_object_id() {
+    set_call_threshold(2);
+    eval(r#"
+      class FrozenBigBox
+        def initialize
+          20.times { |i| instance_variable_set(:"@a#{i}", i) }
+          @v = :v
+        end
+        def v = @v
+      end
+      BIG_BOX = FrozenBigBox.new.freeze
+      def test = BIG_BOX.v
+      test; test
+      BIG_BOX.object_id
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test, test]"), @"[:v, :v]");
+}
+
+#[test]
+fn test_getivar_frozen_module_constant_gaining_object_id() {
+    set_call_threshold(2);
+    eval(r#"
+      module FrozenMod
+        @a, @b, @c = :a, :b, :c
+        def self.a = @a
+        freeze
+      end
+      def test = FrozenMod.a
+      test; test
+      FrozenMod.object_id
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test, test]"), @"[:a, :a]");
+}
+
+#[test]
+fn test_getivar_frozen_generic_ivar_constant_gaining_object_id() {
+    set_call_threshold(2);
+    eval(r#"
+      class IvarString < String
+        def initialize(s)
+          super
+          @a, @b, @c = :a, :b, :c
+        end
+        def a = @a
+      end
+      FROZEN_STR = IvarString.new("s").freeze
+      def test = FROZEN_STR.a
+      test; test
+      FROZEN_STR.object_id
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test, test]"), @"[:a, :a]");
+}
+
+#[test]
+fn test_send_to_frozen_constant_gaining_singleton_class() {
+    set_call_threshold(2);
+    eval(r#"
+      class FrozenSingletonBox
+        def initialize = (@a, @b, @c = :a, :b, :c)
+        def a = @a
+      end
+      SINGLETON_BOX = FrozenSingletonBox.new.freeze
+      def test = SINGLETON_BOX.a
+      test; test
+      SINGLETON_BOX.singleton_class
+      SINGLETON_BOX.object_id
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test, test]"), @"[:a, :a]");
+}
+
+#[test]
 fn test_attr_accessor_setivar() {
     eval("
         class C
