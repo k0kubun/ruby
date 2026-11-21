@@ -292,7 +292,8 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
         && let IseqStatus::Compiled(code_ptrs) = &unsafe { version.as_ref() }.status
     {
         incr_counter!(resumed_frame_count);
-        return code_ptrs.start_ptr.raw_ptr(ZJITState::get_code_block());
+        // Without the VM lock, another Ractor may be writing code, so don't borrow the code block.
+        return code_ptrs.start_ptr.raw_ptr(&ZJITState::get_code_region_base());
     }
     let entry_idx = match entry_idx {
         Some(entry_idx) => entry_idx,
