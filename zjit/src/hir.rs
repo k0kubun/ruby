@@ -6704,7 +6704,9 @@ impl Function {
                             let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                             send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                         } else if send_block == Some(BlockHandler::BlockArg) && (def_type == VM_METHOD_TYPE_ISEQ
-                            || def_type == VM_METHOD_TYPE_CFUNC && !unsafe { rb_zjit_method_tracing_currently_enabled() }) {
+                            || def_type == VM_METHOD_TYPE_CFUNC && !unsafe { rb_zjit_method_tracing_currently_enabled() }
+                            // An attr_reader ignores the block, but a nil block arg is passed like no block at all.
+                            || def_type == VM_METHOD_TYPE_IVAR) {
                             // Reject complex argument passing before emitting any block-arg guard;
                             // a guard in front of a send that stays dynamic gates nothing.
                             let unspecializable = if def_type == VM_METHOD_TYPE_CFUNC { unspecializable_c_call_type } else { unspecializable_call_type };
@@ -6747,7 +6749,7 @@ impl Function {
                                     // from the stack so the callee frame is laid out correctly.
                                     let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
-                                } else if block_arg_profiled_type.is_some_and(|pt| pt.is_proc()) {
+                                } else if def_type != VM_METHOD_TYPE_IVAR && block_arg_profiled_type.is_some_and(|pt| pt.is_proc()) {
                                     // Guard the Proc and pass it through as the callee frame's
                                     // specval.
                                     let guarded = self.guard_type_recompile(
@@ -6761,7 +6763,7 @@ impl Function {
                                     let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else if block_arg_profiled_type.is_some_and(|pt| pt.is_static_symbol())
-                                    && (def_type == VM_METHOD_TYPE_CFUNC || {
+                                    && (def_type == VM_METHOD_TYPE_CFUNC || def_type == VM_METHOD_TYPE_ISEQ && {
                                         // Don't guard for a send that stays dynamic for &nil or unused blocks
                                         let params = unsafe { get_def_iseq_ptr((*cme).def).params() };
                                         params.flags.accepts_no_block() == 0 && params.flags.use_block() != 0
