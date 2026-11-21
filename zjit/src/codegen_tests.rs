@@ -4383,6 +4383,84 @@ fn test_send_bmethod_kwrest() {
 }
 
 #[test]
+fn test_send_kw_splat_to_kwrest() {
+    eval("
+        def test(a, **kw) = kw
+        def entry(h) = test(1, **h)
+        entry({x: 1})
+    ");
+    // The kwrest Hash is a copy of the caller's Hash
+    assert_snapshot!(assert_compiles("
+        h = {x: 1}
+        r = entry(h)
+        r[:y] = 2
+        [entry(h), r.equal?(h), h, entry({})]
+    "), @"[{x: 1}, false, {x: 1}, {}]");
+}
+
+#[test]
+fn test_send_kw_splat_to_kwrest_keeps_hash_properties() {
+    eval("
+        def test(a, **kw) = kw
+        def entry(h) = test(1, **h)
+        entry({x: 1})
+    ");
+    assert_snapshot!(assert_compiles("
+        d = Hash.new { 9 }
+        d[:a] = 1
+        i = {}.compare_by_identity
+        i[:a] = 1
+        f = {k: 1}.freeze
+        [entry(d)[:zz], entry(i).compare_by_identity?, entry(f).frozen?, entry(f)]
+    "), @"[9, true, false, {k: 1}]");
+}
+
+#[test]
+fn test_send_kw_splat_with_keywords_to_kwrest() {
+    eval("
+        def test(a, **kw) = kw
+        def entry(h) = test(1, z: 0, **h)
+        entry({x: 1})
+    ");
+    assert_snapshot!(assert_compiles("entry({x: 1})"), @"{z: 0, x: 1}");
+}
+
+#[test]
+fn test_send_kw_splat_to_anonymous_kwrest() {
+    eval("
+        def inner(**kw) = kw
+        def test(**) = inner(**)
+        def entry(h) = test(**h)
+        entry({x: 1})
+    ");
+    assert_snapshot!(assert_compiles("h = {x: 1}; [entry(h), entry(h).equal?(h)]"), @"[{x: 1}, false]");
+}
+
+#[test]
+fn test_send_caller_splat_and_kw_splat_to_kwrest() {
+    eval("
+        def test(*r, **kw) = [r, kw]
+        def entry(a, h) = test(*a, **h)
+        entry([1, 2], {x: 1})
+    ");
+    assert_snapshot!(assert_compiles("entry([1, 2], {x: 1})"), @"[[1, 2], {x: 1}]");
+}
+
+#[test]
+fn test_send_kw_splat_to_kwrest_with_non_hash() {
+    eval("
+        def test(a, **kw) = kw
+        def entry(h) = test(1, **h)
+        entry({x: 1})
+    ");
+    assert_snapshot!(inspect("
+        o = Object.new
+        def o.to_hash = {y: 2}
+        [entry(o), entry(nil), entry({x: 1})]
+    "), @"[{y: 2}, {}, {x: 1}]");
+}
+
+#[test]
 fn test_send_kwrest_missing_required_keyword() {
     eval("
         def test(k:, **kw) = [k, kw]
