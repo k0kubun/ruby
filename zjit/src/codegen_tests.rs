@@ -7527,6 +7527,81 @@ fn test_send_on_method_entry_after_singleton_method() {
 }
 
 #[test]
+fn test_send_on_method_entry_of_call_cache_for_singleton_receivers() {
+    // Singleton classes aren't profiled, so the site checks for the method entry in its call cache.
+    assert_snapshot!(inspect("
+        module Tagged
+          def tag = :tagged
+        end
+        class Logger
+          def level = level_key
+          def method_missing(name, *) = :missing
+          private def level_key = :key
+        end
+        LOGGERS = 4.times.map { Logger.new.extend(Tagged) }
+        def test(o) = o.level
+        def test_tag(o) = o.tag
+        test(LOGGERS[0]); test(LOGGERS[0]); test_tag(LOGGERS[0]); test_tag(LOGGERS[0])
+        r = [test(LOGGERS[0]), test(LOGGERS[1]), test(Logger.new), test_tag(LOGGERS[1]), test_tag(Logger.new)]
+        LOGGERS[2].define_singleton_method(:level) { :singleton }
+        r << test(LOGGERS[2]) << test(LOGGERS[3])
+        Tagged.define_method(:tag) { :redefined }
+        r << test_tag(LOGGERS[0])
+        Logger.class_eval { private :level }
+        r << test(LOGGERS[3])
+        other = Object.new.extend(Module.new { def level = :other })
+        r << test(other) << (test(3) rescue :no_method)
+    "), @"[:key, :key, :key, :tagged, :missing, :singleton, :key, :redefined, :missing, :other, :no_method]");
+}
+
+#[test]
+fn test_send_on_method_entry_does_not_retain_extended_object() {
+    assert_snapshot!(inspect("
+        module Extension
+          def foo = 1
+        end
+        def extended_send(obj) = obj.foo
+
+        EXTENDED_OBJECTS = ObjectSpace::WeakMap.new
+        def extended_make(i)
+          obj = Object.new.extend(Extension)
+          EXTENDED_OBJECTS[i] = obj
+          extended_send(obj)
+          nil
+        end
+
+        100.times { |i| extended_make(i) }
+        4.times { GC.start(full_mark: true, immediate_sweep: true) }
+        # Allow one object kept alive by conservative stack scanning
+        EXTENDED_OBJECTS.keys.size <= 1
+    "), @"false");
+}
+
+#[test]
+fn test_send_on_method_entry_does_not_retain_young_singleton_object() {
+    assert_snapshot!(inspect("
+        class Base
+          def foo = 1
+        end
+        def singleton_send(obj) = obj.foo
+
+        SINGLETON_OBJECTS = ObjectSpace::WeakMap.new
+        def singleton_make(i)
+          obj = Base.new
+          obj.singleton_class
+          SINGLETON_OBJECTS[i] = obj
+          singleton_send(obj)
+          nil
+        end
+
+        100.times { |i| singleton_make(i) }
+        4.times { GC.start(full_mark: true, immediate_sweep: true) }
+        # Allow one object kept alive by conservative stack scanning
+        SINGLETON_OBJECTS.keys.size <= 1
+    "), @"true");
+}
+
+#[test]
 fn test_polymorphic_iseq_dispatch_same_site() {
     assert_snapshot!(inspect("
         class A; def foo = 1; end
