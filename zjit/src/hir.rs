@@ -648,6 +648,8 @@ pub enum SideExitReason {
     BlockArgNotNil,
     /// A Symbol block arg would become a refinement-aware lambda
     SymbolBlockArgRefined,
+    /// A `**kw` profiled as nil was not nil
+    KwSplatNotNil,
     /// `bar(...)` was specialized for a different callinfo of the call that entered `def foo(...)`
     GuardForwardedCallInfo,
     TooManyKeywordParameters,
@@ -6260,7 +6262,7 @@ impl Function {
                         };
                         let ci = unsafe { (*cd).ci }; // info about the call site
 
-                        let flags = unsafe { rb_vm_ci_flag(ci) };
+                        let mut flags = unsafe { rb_vm_ci_flag(ci) };
 
                         let mid = unsafe { vm_ci_mid(ci) };
                         // Do method lookup
@@ -6328,6 +6330,39 @@ impl Function {
                         } else {
                             VM_CALL_ARGS_BLOCKARG
                         };
+                        // A `**kw` that is nil, e.g. from anonymous `**` or `...` forwarding without keywords,
+                        // passes no keywords like vm_args.c's ignore_keyword_hash_p(), so strip it.
+                        let mut stripped_kw_splat = false;
+                        if flags & VM_CALL_KW_SPLAT != 0
+                            && (def_type == VM_METHOD_TYPE_ISEQ || def_type == VM_METHOD_TYPE_CFUNC)
+                            // Don't guard for a send that stays dynamic for other reasons anyway.
+                            && !unspecializable_call_type(flags & !(VM_CALL_KW_SPLAT | block_arg_flags))
+                        {
+                            let kw_splat_idx = args.len() - 1 - usize::from(flags & VM_CALL_ARGS_BLOCKARG != 0);
+                            let kw_splat = args[kw_splat_idx];
+                            let statically_nil = self.is_a(kw_splat, types::NilClass);
+                            // Unlike a block arg, a `**kw` that is sometimes nil is often a Hash otherwise, so
+                            // speculate only on a monomorphic profile.
+                            let profiled_nil = matches!(self.resolve_receiver_type_from_profile(kw_splat, state),
+                                ReceiverTypeResolution::Monomorphic { profiled_type } if profiled_type.is_nil());
+                            if statically_nil || profiled_nil {
+                                if !statically_nil {
+                                    self.push_insn(block, Insn::GuardBitEquals {
+                                        val: kw_splat,
+                                        expected: Const::Value(Qnil),
+                                        reason: Box::new(SideExitReason::KwSplatNotNil),
+                                        state,
+                                        recompile: Some(Recompile),
+                                    });
+                                }
+                                let original_argc = args.len();
+                                args.remove(kw_splat_idx);
+                                flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                                stripped_kw_splat = true;
+                                let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
+                                send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                            }
+                        }
                         // A block arg that is the block param proxy (or nil) from `getblockparamproxy`.
                         // Its frame block handler is passed through right before the call.
                         let mut forwarded_block_arg = None;
@@ -6345,7 +6380,7 @@ impl Function {
                             forwarded_block_arg = Some(block_arg);
                             send_block = None;
                             stripped_block_arg = true;
-                            let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                            let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                             send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                         } else if send_block == Some(BlockHandler::BlockArg) && (def_type == VM_METHOD_TYPE_ISEQ
                             || def_type == VM_METHOD_TYPE_CFUNC && !unsafe { rb_zjit_method_tracing_currently_enabled() }) {
@@ -6389,7 +6424,7 @@ impl Function {
                                     stripped_block_arg = true;
                                     // Frame state for the direct send only: the block arg is removed
                                     // from the stack so the callee frame is laid out correctly.
-                                    let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                                    let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else if block_arg_profiled_type.is_some_and(|pt| pt.is_proc()) {
                                     // Guard the Proc and pass it through as the callee frame's
@@ -6402,7 +6437,7 @@ impl Function {
                                     _ = args.pop();
                                     send_block = Some(BlockHandler::BlockArgProc(guarded));
                                     stripped_block_arg = true;
-                                    let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                                    let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else if block_arg_profiled_type.is_some_and(|pt| pt.is_static_symbol())
                                     && (def_type == VM_METHOD_TYPE_CFUNC || {
@@ -6439,7 +6474,7 @@ impl Function {
                                     _ = args.pop();
                                     send_block = Some(BlockHandler::BlockArgSymbol(guarded));
                                     stripped_block_arg = true;
-                                    let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
+                                    let new_state = self.frame_state(send_frame_state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
                                 } else {
                                     // Can't prove block arg is nil, a Proc, or a Symbol
@@ -6473,6 +6508,10 @@ impl Function {
                             if forwarded_block_arg.is_some() {
                                 // The forwarded block handler is passed like a literal block.
                                 caller_args.flags &= !VM_CALL_ARGS_BLOCKARG;
+                            }
+                            // A forwardable callee takes the callinfo as is, so it can't skip the `**kw`.
+                            if stripped_kw_splat && unsafe { iseq.params() }.flags.forwardable() == 0 {
+                                caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
                             }
                             let caller_splat = if let Some(arg_idx) = caller_args.splat_arg_idx {
                                 // Count the profile shape for every caller-splat execution;
@@ -6740,6 +6779,7 @@ impl Function {
                                 send_block: Option<BlockHandler>,
                                 forwarded_block_arg: Option<InsnId>,
                                 stripped_block_arg: bool,
+                                stripped_kw_splat: bool,
                                 caller_splat_length: Option<SplatLength>,
                                 mut args: Vec<InsnId>,
                                 state: InsnId,
@@ -6759,6 +6799,11 @@ impl Function {
                                     // The forwarded block handler is passed like a literal block, and a
                                     // nil, Proc, or Symbol block arg has been stripped from the arguments.
                                     ci_flags &= !VM_CALL_ARGS_BLOCKARG;
+                                }
+                                if stripped_kw_splat {
+                                    // A nil `**kw` has been stripped from the arguments.
+                                    ci_flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                                    argc -= 1;
                                 }
                                 // Expand a caller splat by its profiled length like SendDirect does for ISEQ callees.
                                 // The splat array is the last argument since C calls with keywords stay dynamic.
@@ -7003,7 +7048,7 @@ impl Function {
                                 }
                             }
 
-                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, caller_splat_length, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
+                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, stripped_kw_splat, caller_splat_length, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
                                 block = join_block;
                                 continue;
                             }
