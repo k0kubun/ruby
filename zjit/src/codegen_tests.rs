@@ -12001,7 +12001,7 @@ fn test_send_iseq_with_symbol_block_arg() {
 
 #[test]
 fn test_send_symbol_block_arg_with_refinements() {
-    assert_snapshot!(inspect("
+    eval("
         module SuccRefinement
           refine(Integer) { def succ = :refined }
         end
@@ -12012,8 +12012,9 @@ fn test_send_symbol_block_arg_with_refinements() {
         end
         def test = [Refined.new.cfunc([2, 1]), Refined.new.iseq(1)]
         test
-        test
-    "), @"[[:refined, :refined], :refined]");
+    ");
+    // Refined call sites stay dynamic instead of side-exiting on every call
+    assert_snapshot!(assert_compiles("test"), @"[[:refined, :refined], :refined]");
 }
 
 #[test]

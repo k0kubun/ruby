@@ -3096,6 +3096,7 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
 unsafe extern "C" {
     fn rb_vm_symbol_block_arg_refined_p(sym: VALUE) -> usize;
     fn rb_hash_dup(hash: VALUE) -> VALUE;
+    fn rb_vm_cref_has_refinements_p(cref: VALUE) -> usize;
 }
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
@@ -3370,6 +3371,8 @@ struct InlineFrame {
     inline_pass: usize,
     /// `self` of the inlined frame: the receiver of a method or the captured self of a block
     recv: InsnId,
+    /// The lexical scope of an inlined method frame. None if unknown, e.g. for a block.
+    cref: Option<VALUE>,
 }
 
 /// Operands of an [`Insn::PopInlineFrame`]
@@ -5468,6 +5471,16 @@ impl Function {
         (!cme.is_null()).then_some(cme)
     }
 
+    /// Whether refinements may be active in the lexical scope of the frame of `state`, which turn a
+    /// Symbol block arg into a lambda. An unknown scope counts as refined.
+    fn frame_may_have_refinements(&self, state: InsnId) -> bool {
+        let cref = match self.frame_state_ref(state).caller() {
+            None => get_or_create_iseq_payload(self.iseq).compile_cref,
+            Some(caller) => self.inline_frames.get(&caller).and_then(|frame| frame.cref),
+        };
+        cref.is_none_or(|cref| unsafe { rb_vm_cref_has_refinements_p(cref) } != 0)
+    }
+
     fn is_forwarded_block_param(&self, block_arg: InsnId, state: InsnId, cme: *const rb_callable_method_entry_t, def_type: rb_method_type_t) -> bool {
         // A statically nil block arg is just stripped.
         if self.is_a(block_arg, types::NilClass) {
@@ -6691,6 +6704,8 @@ impl Function {
                                         params.flags.accepts_no_block() == 0 && params.flags.use_block() != 0
                                     })
                                     && let Some(to_proc_cme) = self.basic_symbol_to_proc_cme()
+                                    // A refined call site would always side-exit on the refinement check
+                                    && !self.frame_may_have_refinements(state)
                                 {
                                     // Like vm_caller_setup_arg_block(), pass the Symbol through as the callee
                                     // frame's specval while Symbol#to_proc is not redefined and no refinements
@@ -8107,6 +8122,10 @@ impl Function {
                 // The callee's perspective of the stack is with the receiver and arguments popped off.
                 let caller_stack_size = call_state.stack_size() - args_len - 1; // -1 for receiver
                 let post_send_caller = self.new_insn(Insn::Snapshot { state: Box::new(call_state.with_stack_size(caller_stack_size)) });
+                let frame_cref = {
+                    let cref = unsafe { rb_zjit_cme_cref(cme) };
+                    if cref.is_null() { None } else { Some(VALUE(cref as usize)) }
+                };
                 let mode = AddIseqMode::Inlined {
                     return_block: continuation,
                     caller: post_send_caller,
@@ -8114,10 +8133,7 @@ impl Function {
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
                     throw_targets: None,
-                    cref: {
-                        let cref = unsafe { rb_zjit_cme_cref(cme) };
-                        if cref.is_null() { None } else { Some(VALUE(cref as usize)) }
-                    },
+                    cref: frame_cref,
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -8154,6 +8170,7 @@ impl Function {
                     blockiseq,
                     inline_pass: self.inline_pass,
                     recv,
+                    cref: frame_cref,
                 });
 
                 let args = match send.insn(self) {
@@ -8539,6 +8556,7 @@ impl Function {
             blockiseq: None,
             inline_pass: self.inline_pass,
             recv: block_self,
+            cref: None,
         });
 
         // Map the block body entry params [self, local0, local1, ...] to caller values.
