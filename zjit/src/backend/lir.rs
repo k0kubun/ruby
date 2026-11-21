@@ -1873,8 +1873,6 @@ pub enum StackMapEntry {
     PrevFrame,
 }
 
-/// Initial capacity for asm.insns vector
-const ASSEMBLER_INSNS_CAPACITY: usize = 256;
 
 /// Object into which we assemble instructions to be
 /// optimized and lowered
@@ -2086,8 +2084,10 @@ impl Assembler
     pub fn linearize_instructions(&self) -> Vec<Insn> {
 
         // Emit instructions with labels, expanding branch parameters
-        let mut insns = Vec::with_capacity(ASSEMBLER_INSNS_CAPACITY);
         let block_ids = self.block_order();
+        // Each block's instructions, plus a BoundaryPad
+        let capacity = block_ids.iter().map(|block_id| self.basic_blocks[block_id.0].insns.len() + 1).sum();
+        let mut insns = Vec::with_capacity(capacity);
 
         for (i, block_id) in block_ids.iter().enumerate() {
             let block = &self.basic_blocks[block_id.0];
