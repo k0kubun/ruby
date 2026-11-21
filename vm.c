@@ -1887,6 +1887,34 @@ invoke_bmethod(rb_execution_context_t *ec, const rb_iseq_t *iseq, VALUE self, co
     VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);
 }
 
+#if USE_ZJIT
+// Set up the arguments of a non-lambda block of a simple ISEQ at sp like vm_callee_setup_block_arg()
+// does: autosplat a single Array argument, and fill missing parameters with nil or drop extra
+// arguments. Return false for the autosplat of a non-Array, which may call #to_ary.
+NOINLINE(static bool zjit_setup_simple_block_args(const struct rb_iseq_constant_body *body, VALUE *sp, int argc, const VALUE *argv));
+static bool
+zjit_setup_simple_block_args(const struct rb_iseq_constant_body *body, VALUE *sp, int argc, const VALUE *argv)
+{
+    int lead_num = body->param.lead_num;
+    const VALUE *args = argv;
+    long len = argc;
+    if (argc == 1 && body->param.flags.has_lead && !body->param.flags.ambiguous_param0) {
+        if (!RB_TYPE_P(argv[0], T_ARRAY)) return false;
+        args = RARRAY_CONST_PTR(argv[0]);
+        len = RARRAY_LEN(argv[0]);
+    }
+
+    int i;
+    for (i = 0; i < len && i < lead_num; i++) {
+        sp[i] = args[i];
+    }
+    for (; i < lead_num; i++) {
+        sp[i] = Qnil;
+    }
+    return true;
+}
+#endif
+
 ALWAYS_INLINE(static VALUE
               invoke_iseq_block_from_c(rb_execution_context_t *ec, const struct rb_captured_block *captured,
                                        VALUE self, int argc, const VALUE *argv, int kw_splat, VALUE passed_block_handler,
@@ -1919,13 +1947,19 @@ invoke_iseq_block_from_c(rb_execution_context_t *ec, const struct rb_captured_bl
         CHECK_VM_STACK_OVERFLOW(cfp, lead_num);
         vm_check_canary(ec, sp);
 
-        // A non-lambda block autosplats a single argument for a parameter list like |a, b|
-        // or |a, |, so leave that case to vm_yield_setup_args().
-        if (argc == lead_num && (is_lambda || argc != 1 || body->param.flags.ambiguous_param0)) {
+        bool args_ready;
+        if (LIKELY(argc == lead_num && (is_lambda || argc != 1 || body->param.flags.ambiguous_param0))) {
             // Copy a few arguments without calling memcpy()
             for (int i = 0; i < argc; i++) {
                 sp[i] = argv[i];
             }
+            args_ready = true;
+        }
+        else {
+            args_ready = !is_lambda && zjit_setup_simple_block_args(body, sp, argc, argv);
+        }
+
+        if (args_ready) {
             // Same frame as invoke_block() pushes
             vm_push_frame_inline(ec, iseq, type | VM_FRAME_FLAG_FINISH, self,
                                  VM_GUARDED_PREV_EP(captured->ep),
