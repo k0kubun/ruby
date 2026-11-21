@@ -20440,7 +20440,7 @@ mod hir_opt_tests {
           v5:BasicObject = LoadArg :self@0
           Jump bb3(v5)
         bb3(v8:BasicObject):
-          v77:NilClass = Const Value(nil)
+          v90:NilClass = Const Value(nil)
           v13:ArrayExact = NewArray
           v19:ArrayExact = ToArray v13
           PatchPoint NoEPEscape(test)
@@ -20453,14 +20453,19 @@ mod hir_opt_tests {
           v30:StringExact = StringCopy v29
           v33:ArrayExact = ToArray v13
           PatchPoint NoEPEscape(test)
-          v37:BasicObject = Send v30, :display, v33 # SendFallbackReason: Complex argument passing
+          PatchPoint NoSingletonClass(String@0x1070)
+          PatchPoint MethodRedefined(String@0x1070, display@0x1078, cme:0x1080)
+          v67:CInt64 = ArrayLength v33
+          v68:CInt64[0] = GuardBitEquals v67, CInt64(0) recompile
+          v70:BasicObject = CCallVariadic v30, :Kernel#display@0x10a8
           PatchPoint NoEPEscape(test)
           v45:ArrayExact = ToArray v13
           PatchPoint NoEPEscape(test)
-          v49:BasicObject = Send v60, :itself, v45 # SendFallbackReason: Complex argument passing
-          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(Object@0x1000, itself@0x1038, cme:0x1040)
+          v74:CInt64 = ArrayLength v45
+          v75:CInt64[0] = GuardBitEquals v74, CInt64(0) recompile
           CheckInterrupts
-          Return v49
+          Return v60
         ");
     }
 
