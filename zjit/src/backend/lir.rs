@@ -1514,7 +1514,17 @@ impl Interval {
     }
 
     pub fn next_intersection(&self, other: &Interval) -> Option<usize> {
-        let (mut i, mut j) = (0, 0);
+        // The ranges of `self` that end before `other` starts can't overlap with it, and
+        // the walk below would skip them one by one. Skip them with a binary search instead.
+        let first = other.ranges.first().map_or(0, |b| self.ranges.partition_point(|a| a.to <= b.from));
+        let intersection = self.next_intersection_from(other, first);
+        debug_assert_eq!(intersection, self.next_intersection_from(other, 0));
+        intersection
+    }
+
+    /// Find the first overlap of the ranges of `self` from `self.ranges[i]` with `other`
+    fn next_intersection_from(&self, other: &Interval, mut i: usize) -> Option<usize> {
+        let mut j = 0;
 
         // Both range lists are sorted and disjoint, so advancing whichever
         // range ends first can never skip past an overlap. That makes the
@@ -1537,7 +1547,12 @@ impl Interval {
     /// Returns true if position falls inside one of the ranges in this
     /// interval.
     pub fn covers(&self, position: usize) -> bool {
-        self.ranges.iter().any(|range| range.from <= position && position < range.to)
+        // The ranges are sorted and disjoint, so only the first range that ends after
+        // `position` can cover it.
+        let idx = self.ranges.partition_point(|range| range.to <= position);
+        let covers = self.ranges.get(idx).is_some_and(|range| range.from <= position);
+        debug_assert_eq!(covers, self.ranges.iter().any(|range| range.from <= position && position < range.to));
+        covers
     }
 
     pub fn born_at(&self, x: usize) -> bool {
