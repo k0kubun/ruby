@@ -721,3 +721,6 @@ fn capture_ruby_frames() -> Vec<String> {
         .map(|i| resolve_frame_label(frames_buffer[i], lines_buffer[i]))
         .collect()
 }
+
+// TEMP layout control: pad the cold text section
+std::arch::global_asm!(".section .text.unlikely.zjit_layout_pad,\"ax\",@progbits", ".globl rb_zjit_layout_pad", "rb_zjit_layout_pad:", ".skip 16, 0xcc", ".text");
