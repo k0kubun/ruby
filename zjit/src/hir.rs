@@ -3386,7 +3386,7 @@ enum InlineFrameUse {
     Exit,
     /// A PatchPoint, which may side-exit like `Exit`
     PatchPoint,
-    /// It needs the frame since it may raise, but it has no effect
+    /// It needs the frame since it may raise, but it has no other effect
     Read,
     /// It needs the frame
     Frame,
@@ -10343,8 +10343,10 @@ impl Function {
             // It only sets GC bits of the written object.
             Insn::WriteBarrier { .. } => InlineFrameUse::Write,
             Insn::PatchPoint { .. } => InlineFrameUse::PatchPoint,
-            // They may raise, e.g. on a class ivar in a non-main Ractor, but have no effect
-            Insn::GetIvar { .. } | Insn::DefinedIvar { .. } => InlineFrameUse::Read,
+            // Reading an ivar of a class or a module may raise in a non-main Ractor, which
+            // needs the frame. Others are leaf calls without an effect, like DefinedIvar.
+            Insn::GetIvar { self_val, .. } if self.type_of(*self_val).could_be(types::Module) => InlineFrameUse::Read,
+            Insn::GetIvar { .. } | Insn::DefinedIvar { .. } => InlineFrameUse::None,
             // Instructions whose only effect is a side exit
             Insn::GuardType { .. } | Insn::GuardBitEquals { .. } | Insn::GuardAnyBitSet { .. }
             | Insn::GuardNoBitsSet { .. } | Insn::GuardNotNull { .. } | Insn::GuardGreaterEq { .. }

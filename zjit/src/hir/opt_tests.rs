@@ -2288,93 +2288,91 @@ mod hir_opt_tests {
           v150:CBool = IsBitEqual v147, v149
           CondBranch v150, bb30(), bb31()
         bb30():
-          PushInlineFrame :!=, v20 (0x1078), num_args=1
-          v152:BasicObject = LoadField v20, :@count@0x1098
+          v152:BasicObject = LoadField v20, :@count@0x1072
           Jump bb29(v152)
         bb31():
-          v154:CShape[0x1099] = Const CShape(0x1099)
+          v154:CShape[0x1073] = Const CShape(0x1073)
           v155:CBool = IsBitEqual v147, v154
           CondBranch v155, bb32(), bb33()
         bb32():
-          PushInlineFrame :!=, v20 (0x1078), num_args=1
           v159:NilClass = Const Value(nil)
           Jump bb29(v159)
         bb33():
-          PushInlineFrame :!=, v20 (0x1078), num_args=1
-          PushInlineFrame :==, v20 (0x10a0), num_args=1
           v157:BasicObject = GetIvar v20, :@count
-          PopInlineFrame
           Jump bb29(v157)
         bb29(v148:BasicObject):
           PatchPoint NoEPEscape(==)
           CondBranchHasType v148, Fixnum, bb36(), bb37()
         bb36():
-          PushInlineFrame :==, v20 (0x10a0), num_args=1
+          PushInlineFrame :!=, v20 (0x1078), num_args=1
+          PushInlineFrame :==, v20 (0x1098), num_args=1
           v167:Fixnum = RefineType v148, Fixnum
-          PatchPoint MethodRedefined(Integer@0x10c0, to_i@0x10c8, cme:0x10d0)
+          PatchPoint MethodRedefined(Integer@0x10b8, to_i@0x10c0, cme:0x10c8)
           Jump bb34(v167)
         bb37():
           CondBranchHasType v148, NilClass, bb38(), bb35()
         bb38():
-          PushInlineFrame :==, v20 (0x10a0), num_args=1
-          PatchPoint MethodRedefined(NilClass@0x10f8, to_i@0x10c8, cme:0x1100)
-          v348:Fixnum[0] = Const Value(0)
-          Jump bb34(v348)
+          PushInlineFrame :!=, v20 (0x1078), num_args=1
+          PushInlineFrame :==, v20 (0x1098), num_args=1
+          PatchPoint MethodRedefined(NilClass@0x10f0, to_i@0x10c0, cme:0x10f8)
+          v344:Fixnum[0] = Const Value(0)
+          Jump bb34(v344)
         bb35():
-          PushInlineFrame :==, v20 (0x10a0), num_args=1
+          PushInlineFrame :!=, v20 (0x1078), num_args=1
+          PushInlineFrame :==, v20 (0x1098), num_args=1
           v175:BasicObject = Send v148, :to_i # SendFallbackReason: Send: polymorphic fallback
           Jump bb34(v175)
         bb34(v164:BasicObject):
           PatchPoint NoEPEscape(==)
           v180:Fixnum[1] = Const Value(1)
-          PatchPoint MethodRedefined(Integer@0x10c0, +@0x1128, cme:0x1130)
-          v320:Fixnum = GuardType v164, Fixnum recompile
-          v321:Fixnum = FixnumAdd v320, v180
+          PatchPoint MethodRedefined(Integer@0x10b8, +@0x1120, cme:0x1128)
+          v316:Fixnum = GuardType v164, Fixnum recompile
+          v317:Fixnum = FixnumAdd v316, v180
           v186:CShape = LoadField v20, :shape_id@0x1070
           v187:CShape[0x1071] = Const CShape(0x1071)
           v188:CBool = IsBitEqual v186, v187
           CondBranch v188, bb40(), bb41()
         bb40():
-          StoreField v20, :@count@0x1098, v321
+          StoreField v20, :@count@0x1072, v317
           Jump bb39()
         bb41():
-          v193:CShape[0x1099] = Const CShape(0x1099)
+          v193:CShape[0x1073] = Const CShape(0x1073)
           v194:CBool = IsBitEqual v186, v193
           CondBranch v194, bb42(), bb43()
         bb42():
-          StoreField v20, :@count@0x1098, v321
+          StoreField v20, :@count@0x1072, v317
           v200:CShape[0x1071] = Const CShape(0x1071)
           StoreField v20, :shape_id@0x1070, v200
           Jump bb39()
         bb43():
-          SetIvar v20, :@count, v321
+          SetIvar v20, :@count, v317
           Jump bb39()
         bb39():
           PatchPoint NoEPEscape(==)
           PatchPoint NoSingletonClass(CustomEq@0x1008)
-          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1158, cme:0x1160)
-          v326:CBool = IsBitEqual v20, v10
-          v327:BoolExact = BoxBool v326
+          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1150, cme:0x1158)
+          v322:CBool = IsBitEqual v20, v10
+          v323:BoolExact = BoxBool v322
           PopInlineFrame
-          v74:BoolExact = BoolNegate v327
+          v74:BoolExact = BoolNegate v323
           PatchPoint NoEPEscape(!=)
           PopInlineFrame
           Jump bb4(v74)
         bb5():
           PatchPoint MethodRedefined(CustomEq@0x1008, !=@0x1010, cme:0x1018)
-          v38:StaticSymbol[:!=] = Const Value(VALUE(0x1188))
-          v39:CPtr[CPtr(0x1190)] = Const CPtr(0x1190)
-          v40:Iseq[VALUE(0x1198)] = Const Value(VALUE(0x1198))
+          v38:StaticSymbol[:!=] = Const Value(VALUE(0x1180))
+          v39:CPtr[CPtr(0x1188)] = Const CPtr(0x1188)
+          v40:Iseq[VALUE(0x1190)] = Const Value(VALUE(0x1190))
           v41:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
           v42:CBool[false] = Const CBool(false)
           CondBranchHasType v10, HeapBasicObject, bb11(), bb10()
         bb11():
-          v44:CUInt64 = LoadField v10, :RBASIC_KLASS@0x11a0
-          v45:CUInt64 = LoadField v39, :klass_cache@0x11a1
+          v44:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1198
+          v45:CUInt64 = LoadField v39, :klass_cache@0x1199
           v46:CBool = IsBitEqual v44, v45
           CondBranch v46, bb7(), bb10()
         bb10():
-          v48:RubyValue = CCall v10, :rb_zjit_cached_cme@0x11a2, v38, v39, v40, v41, v42
+          v48:RubyValue = CCall v10, :rb_zjit_cached_cme@0x119a, v38, v39, v40, v41, v42
           v49:CBool = IsBitEqual v48, v41
           CondBranch v49, bb7(), bb8()
         bb7():
@@ -2389,163 +2387,161 @@ mod hir_opt_tests {
           v230:CBool = IsBitEqual v227, v229
           CondBranch v230, bb47(), bb48()
         bb47():
-          v232:BasicObject = LoadField v96, :@count@0x1098
+          v232:BasicObject = LoadField v96, :@count@0x1072
           Jump bb46(v232)
         bb48():
-          v234:CShape[0x1099] = Const CShape(0x1099)
+          v234:CShape[0x1073] = Const CShape(0x1073)
           v235:CBool = IsBitEqual v227, v234
           CondBranch v235, bb49(), bb50()
         bb49():
           v239:NilClass = Const Value(nil)
           Jump bb46(v239)
         bb50():
-          PushInlineFrame :==, v96 (0x10a0), num_args=1
           v237:BasicObject = GetIvar v96, :@count
-          PopInlineFrame
           Jump bb46(v237)
         bb46(v228:BasicObject):
           PatchPoint NoEPEscape(==)
           CondBranchHasType v228, Fixnum, bb53(), bb54()
         bb53():
-          PushInlineFrame :==, v96 (0x10a0), num_args=1
+          PushInlineFrame :==, v96 (0x1098), num_args=1
           v247:Fixnum = RefineType v228, Fixnum
-          PatchPoint MethodRedefined(Integer@0x10c0, to_i@0x10c8, cme:0x10d0)
+          PatchPoint MethodRedefined(Integer@0x10b8, to_i@0x10c0, cme:0x10c8)
           Jump bb51(v247)
         bb54():
           CondBranchHasType v228, NilClass, bb55(), bb52()
         bb55():
-          PushInlineFrame :==, v96 (0x10a0), num_args=1
-          PatchPoint MethodRedefined(NilClass@0x10f8, to_i@0x10c8, cme:0x1100)
-          v361:Fixnum[0] = Const Value(0)
-          Jump bb51(v361)
+          PushInlineFrame :==, v96 (0x1098), num_args=1
+          PatchPoint MethodRedefined(NilClass@0x10f0, to_i@0x10c0, cme:0x10f8)
+          v357:Fixnum[0] = Const Value(0)
+          Jump bb51(v357)
         bb52():
-          PushInlineFrame :==, v96 (0x10a0), num_args=1
+          PushInlineFrame :==, v96 (0x1098), num_args=1
           v255:BasicObject = Send v228, :to_i # SendFallbackReason: Send: polymorphic fallback
           Jump bb51(v255)
         bb51(v244:BasicObject):
           PatchPoint NoEPEscape(==)
           v260:Fixnum[1] = Const Value(1)
-          PatchPoint MethodRedefined(Integer@0x10c0, +@0x1128, cme:0x1130)
-          v335:Fixnum = GuardType v244, Fixnum recompile
-          v336:Fixnum = FixnumAdd v335, v260
+          PatchPoint MethodRedefined(Integer@0x10b8, +@0x1120, cme:0x1128)
+          v331:Fixnum = GuardType v244, Fixnum recompile
+          v332:Fixnum = FixnumAdd v331, v260
           v266:CShape = LoadField v96, :shape_id@0x1070
           v267:CShape[0x1071] = Const CShape(0x1071)
           v268:CBool = IsBitEqual v266, v267
           CondBranch v268, bb57(), bb58()
         bb57():
-          StoreField v96, :@count@0x1098, v336
+          StoreField v96, :@count@0x1072, v332
           Jump bb56()
         bb58():
-          v273:CShape[0x1099] = Const CShape(0x1099)
+          v273:CShape[0x1073] = Const CShape(0x1073)
           v274:CBool = IsBitEqual v266, v273
           CondBranch v274, bb59(), bb60()
         bb59():
-          StoreField v96, :@count@0x1098, v336
+          StoreField v96, :@count@0x1072, v332
           v280:CShape[0x1071] = Const CShape(0x1071)
           StoreField v96, :shape_id@0x1070, v280
           Jump bb56()
         bb60():
-          SetIvar v96, :@count, v336
+          SetIvar v96, :@count, v332
           Jump bb56()
         bb56():
           PatchPoint NoEPEscape(==)
           PatchPoint NoSingletonClass(CustomEq@0x1008)
-          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1158, cme:0x1160)
-          v341:CBool = IsBitEqual v96, v10
-          v342:BoolExact = BoxBool v341
+          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1150, cme:0x1158)
+          v337:CBool = IsBitEqual v96, v10
+          v338:BoolExact = BoxBool v337
           PopInlineFrame
-          Jump bb19(v342)
+          Jump bb19(v338)
         bb20():
           PushInlineFrame :!=, v10 (0x1078), num_args=1
           PatchPoint MethodRedefined(CustomEq@0x1008, ==@0x1040, cme:0x1048)
-          v122:StaticSymbol[:==] = Const Value(VALUE(0x11a8))
-          v123:CPtr[CPtr(0x11b0)] = Const CPtr(0x11b0)
-          v124:Iseq[VALUE(0x1198)] = Const Value(VALUE(0x1198))
+          v122:StaticSymbol[:==] = Const Value(VALUE(0x11a0))
+          v123:CPtr[CPtr(0x11a8)] = Const CPtr(0x11a8)
+          v124:Iseq[VALUE(0x1190)] = Const Value(VALUE(0x1190))
           v125:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
           v126:CBool[false] = Const CBool(false)
           CondBranchHasType v10, HeapBasicObject, bb26(), bb25()
         bb26():
-          v128:CUInt64 = LoadField v10, :RBASIC_KLASS@0x11a0
-          v129:CUInt64 = LoadField v123, :klass_cache@0x11a1
+          v128:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1198
+          v129:CUInt64 = LoadField v123, :klass_cache@0x1199
           v130:CBool = IsBitEqual v128, v129
           CondBranch v130, bb22(), bb25()
         bb25():
-          v132:RubyValue = CCall v10, :rb_zjit_cached_cme@0x11a2, v122, v123, v124, v125, v126
+          v132:RubyValue = CCall v10, :rb_zjit_cached_cme@0x119a, v122, v123, v124, v125, v126
           v133:CBool = IsBitEqual v132, v125
           CondBranch v133, bb22(), bb23()
         bb22():
-          v375:HeapBasicObject = GuardType v10, HeapBasicObject
-          v376:CShape = LoadField v375, :shape_id@0x1070
-          v378:CShape[0x1071] = Const CShape(0x1071)
-          v379:CBool = IsBitEqual v376, v378
-          CondBranch v379, bb70(), bb71()
+          v371:HeapBasicObject = GuardType v10, HeapBasicObject
+          v372:CShape = LoadField v371, :shape_id@0x1070
+          v374:CShape[0x1071] = Const CShape(0x1071)
+          v375:CBool = IsBitEqual v372, v374
+          CondBranch v375, bb70(), bb71()
         bb70():
-          v381:BasicObject = LoadField v375, :@count@0x1098
-          Jump bb69(v381)
+          v377:BasicObject = LoadField v371, :@count@0x1072
+          Jump bb69(v377)
         bb71():
-          v383:CShape[0x1099] = Const CShape(0x1099)
-          v384:CBool = IsBitEqual v376, v383
-          CondBranch v384, bb72(), bb73()
+          v379:CShape[0x1073] = Const CShape(0x1073)
+          v380:CBool = IsBitEqual v372, v379
+          CondBranch v380, bb72(), bb73()
         bb72():
-          v388:NilClass = Const Value(nil)
-          Jump bb69(v388)
+          v384:NilClass = Const Value(nil)
+          Jump bb69(v384)
         bb73():
-          PushInlineFrame :==, v375 (0x10a0), num_args=1
-          v386:BasicObject = GetIvar v375, :@count
+          PushInlineFrame :==, v371 (0x1098), num_args=1
+          v382:BasicObject = GetIvar v371, :@count
           PopInlineFrame
-          Jump bb69(v386)
-        bb69(v377:BasicObject):
+          Jump bb69(v382)
+        bb69(v373:BasicObject):
           PatchPoint NoEPEscape(==)
-          CondBranchHasType v377, Fixnum, bb76(), bb77()
+          CondBranchHasType v373, Fixnum, bb76(), bb77()
         bb76():
-          PushInlineFrame :==, v375 (0x10a0), num_args=1
-          v396:Fixnum = RefineType v377, Fixnum
-          PatchPoint MethodRedefined(Integer@0x10c0, to_i@0x10c8, cme:0x10d0)
-          Jump bb74(v396)
+          PushInlineFrame :==, v371 (0x1098), num_args=1
+          v392:Fixnum = RefineType v373, Fixnum
+          PatchPoint MethodRedefined(Integer@0x10b8, to_i@0x10c0, cme:0x10c8)
+          Jump bb74(v392)
         bb77():
-          CondBranchHasType v377, NilClass, bb78(), bb75()
+          CondBranchHasType v373, NilClass, bb78(), bb75()
         bb78():
-          PushInlineFrame :==, v375 (0x10a0), num_args=1
-          PatchPoint MethodRedefined(NilClass@0x10f8, to_i@0x10c8, cme:0x1100)
-          v474:Fixnum[0] = Const Value(0)
-          Jump bb74(v474)
+          PushInlineFrame :==, v371 (0x1098), num_args=1
+          PatchPoint MethodRedefined(NilClass@0x10f0, to_i@0x10c0, cme:0x10f8)
+          v470:Fixnum[0] = Const Value(0)
+          Jump bb74(v470)
         bb75():
-          PushInlineFrame :==, v375 (0x10a0), num_args=1
-          v404:BasicObject = Send v377, :to_i # SendFallbackReason: Send: polymorphic fallback
-          Jump bb74(v404)
-        bb74(v393:BasicObject):
+          PushInlineFrame :==, v371 (0x1098), num_args=1
+          v400:BasicObject = Send v373, :to_i # SendFallbackReason: Send: polymorphic fallback
+          Jump bb74(v400)
+        bb74(v389:BasicObject):
           PatchPoint NoEPEscape(==)
-          v409:Fixnum[1] = Const Value(1)
-          PatchPoint MethodRedefined(Integer@0x10c0, +@0x1128, cme:0x1130)
-          v461:Fixnum = GuardType v393, Fixnum recompile
-          v462:Fixnum = FixnumAdd v461, v409
-          v415:CShape = LoadField v375, :shape_id@0x1070
-          v416:CShape[0x1071] = Const CShape(0x1071)
-          v417:CBool = IsBitEqual v415, v416
-          CondBranch v417, bb80(), bb81()
+          v405:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x10b8, +@0x1120, cme:0x1128)
+          v457:Fixnum = GuardType v389, Fixnum recompile
+          v458:Fixnum = FixnumAdd v457, v405
+          v411:CShape = LoadField v371, :shape_id@0x1070
+          v412:CShape[0x1071] = Const CShape(0x1071)
+          v413:CBool = IsBitEqual v411, v412
+          CondBranch v413, bb80(), bb81()
         bb80():
-          StoreField v375, :@count@0x1098, v462
+          StoreField v371, :@count@0x1072, v458
           Jump bb79()
         bb81():
-          v422:CShape[0x1099] = Const CShape(0x1099)
-          v423:CBool = IsBitEqual v415, v422
-          CondBranch v423, bb82(), bb83()
+          v418:CShape[0x1073] = Const CShape(0x1073)
+          v419:CBool = IsBitEqual v411, v418
+          CondBranch v419, bb82(), bb83()
         bb82():
-          StoreField v375, :@count@0x1098, v462
-          v429:CShape[0x1071] = Const CShape(0x1071)
-          StoreField v375, :shape_id@0x1070, v429
+          StoreField v371, :@count@0x1072, v458
+          v425:CShape[0x1071] = Const CShape(0x1071)
+          StoreField v371, :shape_id@0x1070, v425
           Jump bb79()
         bb83():
-          SetIvar v375, :@count, v462
+          SetIvar v371, :@count, v458
           Jump bb79()
         bb79():
           PatchPoint NoEPEscape(==)
           PatchPoint NoSingletonClass(CustomEq@0x1008)
-          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1158, cme:0x1160)
-          v466:ObjectSubclass[class_exact:CustomEq] = GuardType v375, ObjectSubclass[class_exact:CustomEq] recompile
-          v483:TrueClass = Const Value(true)
+          PatchPoint MethodRedefined(CustomEq@0x1008, equal?@0x1150, cme:0x1158)
+          v462:ObjectSubclass[class_exact:CustomEq] = GuardType v371, ObjectSubclass[class_exact:CustomEq] recompile
+          v479:TrueClass = Const Value(true)
           PopInlineFrame
-          Jump bb24(v483)
+          Jump bb24(v479)
         bb23():
           v137:BasicObject = Send v10, :==, v10 # SendFallbackReason: Send: receiver class doesn't call the profiled method
           Jump bb24(v137)
@@ -25517,9 +25513,7 @@ mod hir_opt_tests {
           v42:BasicObject = LoadField v11, :@v@0x1049
           Jump bb6(v42)
         bb10():
-          PushInlineFrame :v, v11 (0x1050), num_args=0
           v40:BasicObject = GetIvar v11, :@v
-          PopInlineFrame
           Jump bb6(v40)
         bb6(v30:BasicObject):
           CheckInterrupts
