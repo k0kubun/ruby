@@ -6,7 +6,7 @@ use std::mem::take;
 use std::rc::Rc;
 use crate::bitset::BitSet;
 use crate::perf;
-use crate::cruby::{IseqPtr, RUBY_OFFSET_CFP_SP, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame};
+use crate::cruby::{IseqPtr, SIZEOF_VALUE_I32, VALUE, vm_stack_canary, zjit_jit_frame};
 use crate::hir::{Invariant, SideExitReason};
 use crate::hir;
 use crate::options::{TraceExits, get_option};
@@ -15,7 +15,8 @@ use crate::jit_frame::PendingJITFrame;
 use crate::stats::{exit_counter_ptr, exit_counter_ptr_for_opcode, side_exit_counter, CompileError};
 use crate::virtualmem::CodePtr;
 use crate::asm::{CodeBlock, Label, LabelName};
-use crate::state::{ZJITState, rb_zjit_record_exit_stack};
+use crate::state::ZJITState;
+use crate::exit_desc::{ExitDescriptor, ExitLoc};
 use crate::cast::IntoUsize;
 
 /// LIR Block ID. Unique ID for each block, and also defined in LIR so
@@ -972,6 +973,12 @@ pub enum Insn {
     /// case.
     BoundaryPad,
 
+    /// Call a side-exit trampoline without moving any arguments: `call rel32` on
+    /// x86_64 and `bl` on arm64, or a far call through the scratch register when
+    /// the target is out of range. The trampoline never returns here; it uses the
+    /// return address to find this exit's descriptor. See [`crate::exit_desc`].
+    CallExitTrampoline(CodePtr),
+
     // Mark a position in the generated code
     PosMarker(PosMarkerFn),
 
@@ -1057,6 +1064,7 @@ macro_rules! for_each_operand_impl {
 
             Insn::BakeString(_) |
             Insn::BoundaryPad |
+            Insn::CallExitTrampoline(_) |
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
@@ -1203,6 +1211,7 @@ impl Insn {
             Insn::And { .. } => "And",
             Insn::BakeString(_) => "BakeString",
             Insn::BoundaryPad => "BoundaryPad",
+            Insn::CallExitTrampoline(_) => "CallExitTrampoline",
             Insn::Breakpoint => "Breakpoint",
             Insn::Abort => "Abort",
             Insn::ByteSwap { .. } => "ByteSwap",
@@ -3078,31 +3087,33 @@ impl Assembler
             value.special_const_p().then_some(value)
         }
 
-        /// Copy `opnd` into a reserved native stack slot and return the slot's stack map index.
-        fn capture_stack_map_opnd(asm: &mut Assembler, opnd: Opnd, capture_idx: &mut usize, frame_depth: usize) -> usize {
-            let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(*capture_idx);
-            *capture_idx += 1;
-            let capture_slot = Opnd::Mem(Mem {
-                base: MemBase::Stack { stack_idx: stack_idx.try_into().unwrap(), num_bits: 64 },
-                disp: 0,
-                num_bits: 64,
-            });
-            let opnd = if matches!(opnd, Opnd::Reg(_)) { opnd.with_num_bits(64) } else { opnd };
-            asm.store(capture_slot, opnd);
+        /// Describe the native stack slot `opnd` is captured into and return the slot's stack map index.
+        fn capture_stack_map_opnd(asm: &Assembler, opnd: Opnd, captures: &mut Vec<(ExitLoc, i32)>, frame_depth: usize) -> usize {
+            let stack_idx = asm.stack_state.stack_idx_for_side_exit_stack_map(captures.len());
+            let slot = asm.stack_state.stack_idx_to_disp(stack_idx.try_into().unwrap());
+            let loc = match opnd {
+                Opnd::Reg(reg) => ExitLoc::Reg(reg.reg_no),
+                Opnd::Value(value) => ExitLoc::Value(value),
+                Opnd::UImm(imm) => ExitLoc::Imm(imm),
+                _ => unreachable!("unexpected captured StackMap operand: {opnd:?}"),
+            };
+            captures.push((loc, slot));
             asm.stack_state.stack_map_index_for_spill(stack_idx, frame_depth)
         }
 
-        fn compile_exit_stack_map(asm: &mut Assembler, stack_map: &SideExitStackMap) {
+        /// Encode the JITFrame entries of a stack map at compile time, allocate the JITFrame, and
+        /// describe the register values the exit has to capture into native stack slots at run time.
+        fn compile_exit_stack_map(asm: &Assembler, stack_map: &SideExitStackMap) -> (*const zjit_jit_frame, Vec<(ExitLoc, i32)>) {
             let SideExitStackMap { stack, frame_depth, jit_frame } = stack_map;
             let mut writer = jit_frame.stack_map_writer();
 
-            let mut capture_idx = 0;
+            let mut captures = vec![];
             for stack_entry in stack.iter() {
                 match *stack_entry {
                     StackMapEntry::Opnd(opnd @ (Opnd::Value(_) | Opnd::UImm(_))) => {
                         match immediate_stack_map_value(opnd) {
                             Some(value) => writer.imm(value),
-                            None => writer.vreg(capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth)),
+                            None => writer.vreg(capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth)),
                         }
                     }
                     StackMapEntry::Skip(size) => writer.skip(size),
@@ -3116,76 +3127,72 @@ impl Assembler
                         writer.vreg(asm.stack_state.stack_map_index_for_spill(stack_idx.to_usize(), *frame_depth));
                     }
                     StackMapEntry::Opnd(opnd @ Opnd::Reg(_)) => {
-                        writer.vreg(capture_stack_map_opnd(asm, opnd, &mut capture_idx, *frame_depth));
+                        writer.vreg(capture_stack_map_opnd(asm, opnd, &mut captures, *frame_depth));
                     }
                     StackMapEntry::Opnd(_) => unreachable!("unexpected entry in SideExit StackMap: {stack_entry:?}"),
                 }
             }
             let jit_frame = jit_frame.alloc(writer);
 
-            assert!(capture_idx <= asm.stack_state.num_side_exit_stack_map_slots);
-            asm_comment!(asm, "install side-exit JITFrame for caller depth {}", frame_depth);
-            let jit_frame_slot = Opnd::mem(64, NATIVE_BASE_PTR, -((*frame_depth as i32 + 1) * SIZEOF_VALUE_I32));
-            asm.store(jit_frame_slot, Opnd::const_ptr(jit_frame));
+            assert!(captures.len() <= asm.stack_state.num_side_exit_stack_map_slots);
+            (jit_frame, captures)
         }
 
-        /// Restore VM state for the side exit.
-        fn compile_exit_save_state(asm: &mut Assembler, exit: &SideExit) {
-            let SideExit { vm_stack_size, stack_map, .. } = exit;
+        /// Build the descriptor of a side exit: everything the exit does when taken.
+        fn compile_exit_descriptor(asm: &Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) -> ExitDescriptor {
+            let SideExit { vm_stack_size, stack_map, recompile, .. } = exit;
+            let (jit_frame, captures) = compile_exit_stack_map(asm, stack_map);
+            let trace_reason = trace_reason.map(|reason| {
+                // Leak a CString with the reason so it's available at runtime
+                let reason_cstr = std::ffi::CString::new(reason.to_string())
+                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
+                reason_cstr.into_raw() as *const std::ffi::c_char
+            });
+            let (recompile, refined_iseq) = match recompile {
+                Some(SideExitRecompile { compiled_iseq: Opnd::Value(compiled_iseq), refined_iseq }) => {
+                    let refined_iseq = match refined_iseq {
+                        Some(Opnd::Value(refined_iseq)) => refined_iseq.as_iseq(),
+                        Some(opnd) => unreachable!("refined ISEQ should be an ISEQ VALUE, got {opnd:?}"),
+                        None => std::ptr::null(),
+                    };
+                    (compiled_iseq.as_iseq(), refined_iseq)
+                }
+                Some(recompile) => unreachable!("recompile target should be an ISEQ VALUE, got {:?}", recompile.compiled_iseq),
+                None => (std::ptr::null(), std::ptr::null()),
+            };
+            ExitDescriptor {
+                vm_stack_size: *vm_stack_size,
+                jit_frame,
+                frame_depth: stack_map.frame_depth,
+                captures,
+                recompile,
+                refined_iseq,
+                trace_reason,
+            }
+        }
 
+        /// Compile the main side-exit code: a single call to exit_descriptor_trampoline.
+        /// Everything else the exit does -- saving cfp->sp, capturing register values
+        /// for the JITFrame's stack map, installing the JITFrame, and optionally
+        /// recording a traced exit stack and triggering recompilation -- is done by
+        /// rb_zjit_side_exit_descriptor() from the descriptor registered for the call's
+        /// return address. Shared exits pass no trace reason so they can still be
+        /// deduplicated by SideExit. IOW, we should never pass a trace reason if we
+        /// expect the exit to be deduplicated.
+        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
             // Side exit blocks are not part of the CFG at the moment,
             // so we need to manually ensure that patchpoints get padded
             // so that nobody stomps on us
             asm.boundary_pad();
 
-            // TODO(alan): Use the stack map to handle cfp->sp
-            asm_comment!(asm, "save cfp->sp");
-            asm.lea_into(Opnd::mem(64, CFP, RUBY_OFFSET_CFP_SP), Opnd::mem(64, SP, *vm_stack_size as i32 * SIZEOF_VALUE_I32));
-
-            compile_exit_stack_map(asm, stack_map);
-        }
-
-        /// Tear down the JIT frame and return to the interpreter.
-        fn compile_exit_return(asm: &mut Assembler) {
-            asm_comment!(asm, "exit to the interpreter");
-            asm.jmp(Target::CodePtr(ZJITState::get_materialize_exit_trampoline()));
-        }
-
-        fn compile_exit_recompile(asm: &mut Assembler, exit: &SideExit) {
-            if let Some(recompile) = &exit.recompile {
-                use crate::codegen::{exit_recompile, exit_block_arg_refinements};
-                if let Some(refined_iseq) = recompile.refined_iseq {
-                    asm_ccall!(asm, exit_block_arg_refinements, refined_iseq);
-                }
+            if exit.recompile.is_some() {
                 asm_comment!(asm, "invalidate for recompilation");
-                asm_ccall!(asm, exit_recompile, recompile.compiled_iseq);
             }
-        }
-
-        /// Compile the main side-exit code.  The side exit will optionally record a traced exit
-        /// stack, optionally trigger recompilation, and then return to the interpreter. Shared
-        /// exits pass no trace reason so they can still be deduplicated by SideExit.
-        /// IOW, we should never pass a trace reason if we expect the exit to be
-        /// deduplicated.
-        fn compile_exit(asm: &mut Assembler, exit: &SideExit, trace_reason: Option<SideExitReason>) {
-            // Save VM state before the ccall so that
-            // rb_profile_frames sees valid cfp->pc and the
-            // ccall doesn't clobber caller-saved registers
-            // holding stack/local operands.
-            compile_exit_save_state(asm, exit);
-            if let Some(reason) = trace_reason {
-                // Leak a CString with the reason so it's available at runtime
-                let reason_cstr = std::ffi::CString::new(reason.to_string())
-                    .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
-                let reason_ptr = reason_cstr.into_raw() as *const u8;
-                asm_ccall!(asm, rb_zjit_record_exit_stack, Opnd::const_ptr(reason_ptr));
-            }
-            compile_exit_recompile(asm, exit);
-            compile_exit_return(asm);
-        }
-
-        fn join_opnds(opnds: &Vec<Opnd>, delimiter: &str) -> String {
-            opnds.iter().map(|opnd| format!("{opnd}")).collect::<Vec<_>>().join(delimiter)
+            let desc = compile_exit_descriptor(asm, exit, trace_reason).encode();
+            asm_comment!(asm, "exit to the interpreter");
+            asm.push_insn(Insn::CallExitTrampoline(ZJITState::get_exit_descriptor_trampoline()));
+            // The position right after the call is its return address
+            asm.pos_marker(move |ret_addr, cb| crate::exit_desc::register(ret_addr, cb, &desc));
         }
 
         // Extract targets first so that we can update instructions while referencing part of them.
