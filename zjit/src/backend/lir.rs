@@ -2743,6 +2743,10 @@ impl Assembler
 
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
+            // Only CCalls are rewritten, so leave the other blocks as is
+            if !block.insns.iter().any(|insn| matches!(insn, Insn::CCall { .. })) {
+                continue;
+            }
             let old_insns = take(&mut block.insns);
             let old_ids = take(&mut block.insn_ids);
 
