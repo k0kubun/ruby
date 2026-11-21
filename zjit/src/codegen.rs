@@ -5743,7 +5743,7 @@ impl Assembler {
     /// and return a pointer to the allocated space.
     fn alloc_stack(&mut self, jit: &JITState, stack_size: usize) -> Opnd {
         let total_stack_size = self.stack_state.reserve_stack_slots(jit.jit_frame_size, stack_size);
-        self.sub(NATIVE_BASE_PTR, (SIZEOF_VALUE * total_stack_size).into())
+        self.lea(Opnd::mem(64, NATIVE_BASE_PTR, -((SIZEOF_VALUE * total_stack_size) as i32)))
     }
 
     /// Emits a load for memory based operands and returns a vreg,
