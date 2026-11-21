@@ -512,6 +512,7 @@ make_counters! {
     inline_block_count,
     inline_throw_count,
     empty_inline_frame_count,
+    sunk_inline_frame_count,
     inline_reject_too_large,
     inline_reject_complex_params,
     inline_reject_ep_escapes,

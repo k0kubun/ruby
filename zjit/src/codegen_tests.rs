@@ -2481,6 +2481,127 @@ fn test_inlined_neq_exits_after_eq_is_redefined() {
 }
 
 #[test]
+fn test_sunk_inline_frame_caller_locations() {
+    // The memoizing reader pushes its inlined frame only on its slow path, which needs it
+    // for the backtrace.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            class SunkFrameLocations
+              def initialize = @width = nil
+              def width = @width ||= compute
+              def compute = caller_locations(0, 3).map(&:label)
+            end
+            def test(c) = c.width
+            o = SunkFrameLocations.new
+            test(o); test(o)
+            test(SunkFrameLocations.new)
+        "), @r#"["SunkFrameLocations#compute", "SunkFrameLocations#width", "Object#test"]"#);
+    });
+}
+
+#[test]
+fn test_sunk_inline_frame_backtrace() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            class SunkFrameBacktrace
+              def initialize = @width = nil
+              def width = @width ||= compute
+              def compute = raise('boom')
+            end
+            def test(c) = (c.width rescue $!.backtrace_locations.first(3).map(&:label))
+            o = SunkFrameBacktrace.new
+            test(o); test(o)
+            test(SunkFrameBacktrace.new)
+        "), @r#"["SunkFrameBacktrace#compute", "SunkFrameBacktrace#width", "Object#test"]"#);
+    });
+}
+
+#[test]
+fn test_sunk_inline_frame_method_name() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            class SunkFrameMethodName
+              def initialize = @name = nil
+              def name = @name ||= __method__
+            end
+            def test(c) = c.name
+            o = SunkFrameMethodName.new
+            test(o); test(o)
+            test(SunkFrameMethodName.new)
+        "), @":name");
+    });
+}
+
+#[test]
+fn test_sunk_inline_frame_return_event_enabled_on_slow_path() {
+    // The TracePoint is enabled by a call in the slow path, which has the frame. The
+    // PatchPoint at the reader's `leave` is copied to the end of the slow path so that it
+    // exits with the reader's frame and fires its `return` event.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class SunkFrameTrace
+              def initialize = @width = nil
+              def width = @width ||= compute
+              def compute
+                $tp.enable if $enable
+                1
+              end
+            end
+            $events = []
+            $tp = TracePoint.new(:return) { |tp| $events << tp.method_id }
+            def test(c) = c.width
+            o = SunkFrameTrace.new
+            test(o); test(o)
+            $enable = true
+            test(SunkFrameTrace.new)
+            $tp.disable
+            $events
+        "), @"[:compute, :width, :test]");
+    });
+}
+
+#[test]
+fn test_elided_inline_frame_shape_guard_exit() {
+    // The shape guard in the elided frame of `x` exits by re-executing `c.x`
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class ElidedFrameShape
+              def initialize(x) = @x = x
+              def x = @x
+            end
+            def test(c) = c.x
+            c1 = ElidedFrameShape.new(1)
+            test(c1); test(c1)
+            c2 = ElidedFrameShape.new(2)
+            c2.instance_variable_set(:@y, 3)
+            [test(c1), test(c2)]
+        "), @"[1, 2]");
+    });
+}
+
+#[test]
+fn test_elided_inline_frame_patch_point_after_store() {
+    // The PatchPoint on `helper` follows the ivar store in the elided frame of `bump`. It's
+    // moved before the store, so once it's invalidated, the exit re-executes `O.bump` without
+    // incrementing @n twice.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class ElidedFramePatchPoint
+              def initialize = @n = 0
+              def bump = (@n += 1; helper)
+              def helper = nil
+              attr_reader :n
+            end
+            O = ElidedFramePatchPoint.new
+            def test = O.bump
+            test; test
+            class ElidedFramePatchPoint; def helper = :redefined; end
+            [test, O.n]
+        "), @"[:redefined, 3]");
+    });
+}
+
+#[test]
 fn test_inline_branch_dominated_by_callers_branch() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_allowing_exits("
@@ -5828,9 +5949,10 @@ fn test_exit_descriptor_survives_compaction() {
 #[test]
 fn test_exit_descriptor_stack_map() {
     // The exit out of the inlined callee also has to materialize the caller's frame,
-    // whose stack holds `a` and `x` at the call.
+    // whose stack holds `a` and `x` at the call. The ivar store keeps the callee's frame:
+    // the exit after it can't re-execute the call instead.
     let result = with_inlining(|| assert_inlines_allowing_exits("
-        def exit_desc_callee(n) = n + 1
+        def exit_desc_callee(n) = (@exit_desc = n) + 1
         def exit_desc_caller(a, n)
           x = a * 2
           [a, x, exit_desc_callee(n)]

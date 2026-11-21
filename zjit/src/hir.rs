@@ -3375,6 +3375,23 @@ struct InlineFrame {
     cref: Option<VALUE>,
 }
 
+/// How an instruction in an inlined method frame relies on the frame
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InlineFrameUse {
+    /// It doesn't
+    None,
+    /// It has an effect, so a later side exit can't re-execute the send that pushed the frame
+    Write,
+    /// It may side-exit, which needs the frame unless it can re-execute the send instead
+    Exit,
+    /// A PatchPoint, which may side-exit like `Exit`
+    PatchPoint,
+    /// It needs the frame since it may raise, but it has no effect
+    Read,
+    /// It needs the frame
+    Frame,
+}
+
 /// Operands of an [`Insn::PopInlineFrame`]
 #[derive(Debug, Clone, Copy)]
 struct InlineFramePop {
@@ -10309,6 +10326,375 @@ impl Function {
         !references_snapshot
     }
 
+    /// How an instruction in an inlined method frame relies on that frame, for
+    /// [`Function::sink_inline_frames`].
+    fn inline_frame_use(&self, insn: &Insn) -> InlineFrameUse {
+        match insn {
+            // Branches within the frame. Their effects are conservative, but they only pick a
+            // successor.
+            Insn::Jump(_) | Insn::CondBranch { .. } | Insn::CondBranchTest { .. }
+            | Insn::CondBranchHasType(_) | Insn::CondBranchFixnumCmp(_) => InlineFrameUse::None,
+            // Fields of Ruby objects, including IMemos like the fields object of an object with
+            // many ivars. Frame memory is only reachable through raw pointers, e.g. from GetEP,
+            // so a load or a store on a Ruby value can't observe the frame.
+            Insn::LoadField { recv, .. } if self.type_of(*recv).is_subtype(types::RubyValue) => InlineFrameUse::None,
+            Insn::IsA { val, .. } if self.type_of(*val).is_subtype(types::BasicObject) => InlineFrameUse::None,
+            Insn::StoreField { recv, .. } if self.type_of(*recv).is_subtype(types::RubyValue) => InlineFrameUse::Write,
+            // It only sets GC bits of the written object.
+            Insn::WriteBarrier { .. } => InlineFrameUse::Write,
+            Insn::PatchPoint { .. } => InlineFrameUse::PatchPoint,
+            // They may raise, e.g. on a class ivar in a non-main Ractor, but have no effect
+            Insn::GetIvar { .. } | Insn::DefinedIvar { .. } => InlineFrameUse::Read,
+            // Instructions whose only effect is a side exit
+            Insn::GuardType { .. } | Insn::GuardBitEquals { .. } | Insn::GuardAnyBitSet { .. }
+            | Insn::GuardNoBitsSet { .. } | Insn::GuardNotNull { .. } | Insn::GuardGreaterEq { .. }
+            | Insn::GuardLess { .. } | Insn::FixnumAdd { .. } | Insn::FixnumSub { .. }
+            | Insn::FixnumMult { .. } => InlineFrameUse::Exit,
+            _ if self.can_elide_enclosing_frame(insn) => InlineFrameUse::None,
+            _ => InlineFrameUse::Frame,
+        }
+    }
+
+    /// Push inlined method frames only on the paths that need them.
+    ///
+    /// An inlined method frame is needed only by instructions that may observe it (calls,
+    /// allocations, reads of locals through the EP, ...) and by side exits that resume in the
+    /// callee. Small callees such as `def width = @width` or a memoizing reader like
+    /// `def width = @width ||= compute_width` have none of them on their hot path: a shape
+    /// guard, a load, and a branch to the slow path at most.
+    ///
+    /// So for each PushInlineFrame, this finds the blocks of its frame (the blocks reachable
+    /// from it before its PopInlineFrame) and the subset of them that needs the frame. Then it
+    /// moves the push to the entries of that subset and the pop to its exits, or removes both
+    /// if no block needs the frame.
+    ///
+    /// A side exit in a block without the frame exits by re-executing the send that pushed the
+    /// frame instead, like a PatchPoint in [`Function::eliminate_empty_inline_frames`]. That's
+    /// correct only if nothing before it in the frame had an effect, so a side exit after a
+    /// store, or after a block that has the frame, needs the frame. So does a push that's moved
+    /// after a store, since its stack overflow check exits by re-executing the send too.
+    ///
+    /// A PatchPoint after a store doesn't need the frame though. Code without the frame
+    /// doesn't call anything, allocate, or check interrupts, so nothing can invalidate an
+    /// invariant from the original push to the PatchPoint. The PatchPoint is moved to the
+    /// original push, where it can re-execute the send.
+    ///
+    /// The frame's blocks must be entered only through the push, and the push must not be in
+    /// a loop of the frame's blocks. Frames whose blocks are pinned are left alone since a
+    /// non-local `return` inlined later may jump to them expecting the frame.
+    fn sink_inline_frames(&mut self) {
+        let cfi = ControlFlowInfo::new(self);
+        let mut pushes = vec![];
+        for block_id in self.reverse_post_order() {
+            for &insn_id in &self.blocks[block_id].insns {
+                if matches!(self.find_ref(insn_id), Insn::PushInlineFrame { .. }) {
+                    pushes.push((block_id, insn_id));
+                }
+            }
+        }
+        // Visit inner frames first: an inner frame that gets elided or sunk no longer keeps
+        // the outer frame on the paths that don't need it.
+        for (block_id, push_id) in pushes.into_iter().rev() {
+            self.sink_inline_frame(&cfi, block_id, push_id);
+        }
+    }
+
+    /// See [`Function::sink_inline_frames`]
+    fn sink_inline_frame(&mut self, cfi: &ControlFlowInfo, push_block: BlockId, push_id: InsnId) {
+        /// The part of a block in the frame of the push
+        struct FrameBlock {
+            /// The frame's PopInlineFrame if it's in this block
+            pop: Option<InsnId>,
+            /// Whether an instruction needs the frame regardless of effects before it
+            needs_frame: bool,
+            /// Whether an instruction may call something, which may have any effect
+            calls: bool,
+            /// Index of the first instruction that has an effect, if any
+            first_write: Option<usize>,
+            /// Side exits with their indexes and whether they're PatchPoints
+            exits: Vec<(usize, InsnId, bool)>,
+        }
+        const MAX_FRAME_BLOCKS: usize = 64;
+
+        let Some(push_idx) = self.blocks[push_block].insns.iter().position(|&insn| insn == push_id) else { return };
+        let &Insn::PushInlineFrame { exit_state, .. } = self.find_ref(push_id) else { unreachable!() };
+
+        // Find the frame's blocks
+        let mut frame_blocks: HashMap<BlockId, FrameBlock> = HashMap::default();
+        let mut order = vec![push_block];
+        let mut entry_depths: HashMap<BlockId, usize> = HashMap::default();
+        entry_depths.insert(push_block, 0);
+        let mut pop_operands = None;
+        let mut worklist = vec![push_block];
+        while let Some(block_id) = worklist.pop() {
+            if self.blocks[block_id].pinned {
+                return;
+            }
+            let start = if block_id == push_block { push_idx + 1 } else { 0 };
+            let mut depth = entry_depths[&block_id];
+            let mut frame_block = FrameBlock { pop: None, needs_frame: depth > 0, calls: depth > 0, first_write: None, exits: vec![] };
+            for (idx, &insn_id) in self.blocks[block_id].insns.iter().enumerate().skip(start) {
+                let insn = self.find_ref(insn_id);
+                match *insn {
+                    Insn::PushInlineFrame { .. } | Insn::PushInlineBlockFrame { .. } => {
+                        frame_block.needs_frame = true;
+                        frame_block.calls = true;
+                        depth += 1;
+                        continue;
+                    }
+                    Insn::PopInlineFrame { iseq, argc, state } if depth == 0 => {
+                        frame_block.pop = Some(insn_id);
+                        pop_operands = Some((iseq, argc, state));
+                        break;
+                    }
+                    Insn::PopInlineFrame { .. } => {
+                        depth -= 1;
+                        continue;
+                    }
+                    _ if depth > 0 => continue,
+                    _ => {}
+                }
+                match self.inline_frame_use(insn) {
+                    InlineFrameUse::None => {}
+                    InlineFrameUse::Write => { frame_block.first_write.get_or_insert(idx); }
+                    InlineFrameUse::Exit => frame_block.exits.push((idx, insn_id, false)),
+                    InlineFrameUse::PatchPoint => frame_block.exits.push((idx, insn_id, true)),
+                    InlineFrameUse::Read => frame_block.needs_frame = true,
+                    InlineFrameUse::Frame => {
+                        frame_block.needs_frame = true;
+                        frame_block.calls = true;
+                    }
+                }
+            }
+            if frame_block.pop.is_none() {
+                for &succ in cfi.successors(block_id) {
+                    if succ == push_block {
+                        return;
+                    }
+                    match entry_depths.get(&succ) {
+                        Some(&succ_depth) if succ_depth != depth => return,
+                        Some(_) => {}
+                        None => {
+                            entry_depths.insert(succ, depth);
+                            order.push(succ);
+                            worklist.push(succ);
+                        }
+                    }
+                }
+            }
+            frame_blocks.insert(block_id, frame_block);
+            if frame_blocks.len() > MAX_FRAME_BLOCKS {
+                return;
+            }
+        }
+        let Some((pop_iseq, pop_argc, pop_state)) = pop_operands else { return };
+        // The frame must be entered only through the push
+        for &block_id in &order {
+            if block_id != push_block && cfi.predecessors(block_id).iter().any(|pred| !frame_blocks.contains_key(pred)) {
+                return;
+            }
+        }
+        let in_frame_successors = |block_id: BlockId| -> &[BlockId] {
+            if frame_blocks[&block_id].pop.is_some() { &[] } else { cfi.successors(block_id) }
+        };
+        let in_frame_predecessors = |block_id: BlockId| -> &[BlockId] {
+            if block_id == push_block { &[] } else { cfi.predecessors(block_id) }
+        };
+        // Whether a PatchPoint at `idx` in `block_id` after calls in the frame can be split into
+        // copies at the ends of its predecessors that may have called something, which check the
+        // invariant after the calls, and a copy at the original push for the other paths. Those
+        // predecessors need the frame then, and must end with a Jump to the block.
+        let can_split_patch_point = |call_in: &HashMap<BlockId, bool>, block_id: BlockId, idx: usize| -> bool {
+            block_id != push_block
+                && self.blocks[block_id].insns[..idx].iter().all(|&insn_id| matches!(self.find_ref(insn_id),
+                    Insn::Snapshot { .. } | Insn::PatchPoint { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }))
+                && cfi.predecessors(block_id).iter().all(|&pred| {
+                    !(call_in[&pred] || frame_blocks[&pred].calls)
+                        || matches!(self.find_ref(*self.blocks[pred].insns.last().unwrap()), Insn::Jump(_))
+                })
+        };
+
+        // Whether a store or a call may have run in the frame before each block, and whether
+        // a call may have
+        let mut effect_in: HashMap<BlockId, bool> = order.iter().map(|&block_id| (block_id, false)).collect();
+        let mut call_in = effect_in.clone();
+        loop {
+            let mut changed = false;
+            for &block_id in &order {
+                let frame_block = &frame_blocks[&block_id];
+                let call_out = call_in[&block_id] || frame_block.calls;
+                let effect_out = effect_in[&block_id] || call_out || frame_block.first_write.is_some();
+                for &succ in in_frame_successors(block_id) {
+                    if call_out && !call_in[&succ] {
+                        call_in.insert(succ, true);
+                        changed = true;
+                    }
+                    if effect_out && !effect_in[&succ] {
+                        effect_in.insert(succ, true);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Find the blocks that need the frame
+        let mut framed: HashSet<BlockId> = HashSet::default();
+        for &block_id in &order {
+            let frame_block = &frame_blocks[&block_id];
+            let mut exit_needs_frame = false;
+            for &(idx, _, is_patch_point) in &frame_block.exits {
+                if !is_patch_point {
+                    exit_needs_frame |= effect_in[&block_id] || frame_block.first_write.is_some_and(|write| write < idx);
+                } else if call_in[&block_id] {
+                    if can_split_patch_point(&call_in, block_id, idx) {
+                        // The copies go to the predecessors that may have called something
+                        for &pred in cfi.predecessors(block_id) {
+                            if call_in[&pred] || frame_blocks[&pred].calls {
+                                framed.insert(pred);
+                            }
+                        }
+                    } else {
+                        exit_needs_frame = true;
+                    }
+                }
+            }
+            if frame_block.needs_frame || exit_needs_frame {
+                framed.insert(block_id);
+            }
+        }
+        // A block with the frame must not have both successors with and without it, and the
+        // same goes for predecessors, so that the push and the pop can be placed in blocks. A
+        // push moved into a block can't follow an effect.
+        loop {
+            let mut changed = false;
+            for &block_id in &order {
+                if !framed.contains(&block_id) {
+                    continue;
+                }
+                let succs = in_frame_successors(block_id);
+                if succs.iter().any(|succ| framed.contains(succ)) {
+                    for &succ in succs {
+                        changed |= framed.insert(succ);
+                    }
+                }
+                let preds = in_frame_predecessors(block_id);
+                if preds.iter().any(|pred| framed.contains(pred)) || effect_in[&block_id] {
+                    for &pred in preds {
+                        changed |= framed.insert(pred);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if framed.contains(&push_block) {
+            // The push stays. Sinking the pop alone wouldn't save anything.
+            return;
+        }
+
+        // Side exits without the frame re-execute the send instead. PatchPoints after a store
+        // move to the original push, and ones after blocks with the frame are split.
+        let mut rehomed_exits = vec![];
+        let mut hoisted_patch_points = vec![];
+        let mut split_patch_points = vec![];
+        for &block_id in &order {
+            if framed.contains(&block_id) {
+                continue;
+            }
+            let frame_block = &frame_blocks[&block_id];
+            for &(idx, exit_id, is_patch_point) in &frame_block.exits {
+                rehomed_exits.push(exit_id);
+                if is_patch_point && call_in[&block_id] {
+                    split_patch_points.push((block_id, exit_id));
+                }
+                if is_patch_point && (effect_in[&block_id] || frame_block.first_write.is_some_and(|write| write < idx)) {
+                    hoisted_patch_points.push((block_id, exit_id));
+                }
+            }
+        }
+        for &(block_id, patch_point) in &split_patch_points {
+            self.copy_patch_point_to_framed_predecessors(cfi, &framed, block_id, patch_point);
+        }
+        for exit_id in rehomed_exits {
+            let union_find = self.union_find.borrow();
+            let insns = &self.insns;
+            let mut new_insn = insns[exit_id].clone();
+            new_insn.for_each_operand_mut(|opnd| {
+                if matches!(insns[union_find.find_const(*opnd)], Insn::Snapshot { .. }) {
+                    *opnd = exit_state;
+                }
+            });
+            drop(union_find);
+            self.insns[exit_id] = new_insn;
+        }
+        for &(block_id, patch_point) in &hoisted_patch_points {
+            self.blocks[block_id].insns.retain(|&insn_id| insn_id != patch_point);
+        }
+
+        // Move the push and the pop
+        let push_insn = self.find_ref(push_id).clone();
+        let mut replacement: Vec<InsnId> = hoisted_patch_points.iter().map(|&(_, patch_point)| patch_point).collect();
+        if get_option!(stats) {
+            let counter = if framed.is_empty() { Counter::empty_inline_frame_count } else { Counter::sunk_inline_frame_count };
+            replacement.push(self.new_insn(Insn::IncrCounter(counter)));
+        }
+        self.blocks[push_block].insns.splice(push_idx..push_idx + 1, replacement);
+        for &block_id in &order {
+            let has_frame = framed.contains(&block_id);
+            if let Some(pop_id) = frame_blocks[&block_id].pop && !has_frame {
+                self.blocks[block_id].insns.retain(|&insn_id| insn_id != pop_id);
+            }
+            if !has_frame {
+                continue;
+            }
+            let succs = in_frame_successors(block_id);
+            if !succs.is_empty() && succs.iter().all(|succ| !framed.contains(succ)) {
+                let pop = self.new_insn(Insn::PopInlineFrame { iseq: pop_iseq, argc: pop_argc, state: pop_state });
+                let terminator_idx = self.blocks[block_id].insns.len() - 1;
+                self.blocks[block_id].insns.insert(terminator_idx, pop);
+            }
+            if in_frame_predecessors(block_id).iter().all(|pred| !framed.contains(pred)) {
+                let push = self.new_insn(push_insn.clone());
+                self.blocks[block_id].insns.insert(0, push);
+            }
+        }
+    }
+
+    /// Copy a PatchPoint at the start of `block_id` to the ends of its predecessors in `framed`
+    /// that end with a Jump to it. See [`Function::sink_inline_frame`].
+    fn copy_patch_point_to_framed_predecessors(&mut self, cfi: &ControlFlowInfo, framed: &HashSet<BlockId>, block_id: BlockId, patch_point: InsnId) {
+        let &Insn::PatchPoint { state, .. } = self.find_ref(patch_point) else { unreachable!() };
+        let state = self.frame_state(state);
+        let params: Vec<InsnId> = self.blocks[block_id].params.iter().map(|&param| self.union_find.borrow().find_const(param)).collect();
+        for &pred in cfi.predecessors(block_id) {
+            if !framed.contains(&pred) {
+                continue;
+            }
+            // Predecessors that may call something end with a Jump. Others don't need a copy.
+            let terminator = *self.blocks[pred].insns.last().unwrap();
+            let Insn::Jump(edge) = self.find_ref(terminator) else { continue };
+            let args = edge.args.clone();
+            // Pass the predecessor's jump arguments for the block's params
+            let mut snapshot = Insn::Snapshot { state: Box::new(state.clone()) };
+            snapshot.for_each_operand_mut(|opnd| {
+                if let Some(param_idx) = params.iter().position(|param| param == opnd) {
+                    *opnd = args[param_idx];
+                }
+            });
+            let snapshot = self.new_insn(snapshot);
+            let mut copy = self.find_ref(patch_point).clone();
+            let Insn::PatchPoint { state, .. } = &mut copy else { unreachable!() };
+            *state = snapshot;
+            let copy = self.new_insn(copy);
+            let terminator_idx = self.blocks[pred].insns.len() - 1;
+            self.blocks[pred].insns.splice(terminator_idx..terminator_idx, [snapshot, copy]);
+        }
+    }
+
     /// Remove PushInlineFrame/PopInlineFrame pairs whose inlined body has been
     /// optimized away entirely.
     ///
@@ -10334,6 +10720,8 @@ impl Function {
     /// (the kept push/pop observe and modify the frame chain). A PushInlineFrame
     /// whose PopInlineFrame lives in another block is left untouched.
     fn eliminate_empty_inline_frames(&mut self) {
+        self.sink_inline_frames();
+
         /// A PushInlineFrame whose matching PopInlineFrame hasn't been seen yet.
         struct PendingPush {
             /// The PushInlineFrame's instruction ID.
