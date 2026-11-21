@@ -7689,7 +7689,7 @@ impl Function {
 
                 // A `yield` to a known block ISEQ: inline the block body.
                 if self.is_invoke_block_iseq_direct(send_insn_id) {
-                    match self.try_inline_block(block, send_pos, insns_at_pass_start) {
+                    match self.try_inline_block(block, send_pos) {
                         Some(continuation) => {
                             did_inline = true;
                             worklist.push_back(continuation);
@@ -8148,7 +8148,7 @@ impl Function {
     /// the post-call instructions move to a fresh continuation block that receives the
     /// block's return value and pops the block frame. Returns the continuation block if
     /// the block was inlined.
-    fn try_inline_block(&mut self, block: BlockId, pos: usize, insns_at_pass_start: usize) -> Option<BlockId> {
+    fn try_inline_block(&mut self, block: BlockId, pos: usize) -> Option<BlockId> {
         let insn_id = self.blocks[block].insns[pos];
         let Insn::InvokeBlockIseqDirect { iseq, captured, args, stack_argc, state } = self.find(insn_id) else {
             unreachable!("position {insn_id} is not an InvokeBlockIseqDirect");
@@ -8162,7 +8162,11 @@ impl Function {
         // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
         // This is bounded by the number of literal blocks in the inlined methods' callers.
         let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
-        if !self.should_inline(iseq, ptr::null(), insns_at_pass_start, throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
+        // A literal block's InvokeBlockIseqDirect only appears once the iterator that yields to
+        // it is inlined, usually in the same pass, so the size of the function at the start of
+        // the pass would charge the block for the instructions of the pass that inlined its
+        // iterator (e.g. an `:always_inline` Array#each). Judge it by `num_instructions` alone.
+        if !self.should_inline(iseq, ptr::null(), 0, throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
             return None;
         }
 
