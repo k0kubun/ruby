@@ -5570,35 +5570,41 @@ pub(crate) mod hir_build_tests {
           v71:BasicObject = SymToProc :block, l0, EP@4
           Jump bb8(v71, v71)
         bb15():
-          v66:BasicObject = LoadField v35, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
-          Jump bb8(v66, v22)
-        bb8(v33:BasicObject, v34:BasicObject):
-          v69:Falsy = RefineType v33, Falsy
-          CondBranchTest v33, bb16(), bb4(v18, v19, v20, v21, v34, v27)
+          v73:BasicObject = LoadField v42, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
+          Jump bb8(v73, v22)
+        bb8(v40:BasicObject, v41:BasicObject):
+          v76:Falsy = RefineType v40, Falsy
+          CondBranchTest v40, bb16(), bb4(v18, v19, v20, v21, v41, v34)
         bb16():
-          v71:Truthy = RefineType v33, Truthy
-          v75:CPtr = GetEP 0
-          v76:CInt64 = LoadField v75, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
-          v77:CInt64[3] = Const CInt64(3)
-          v78:CInt64 = IntAnd v76, v77
-          v79:CInt64[3] = Const CInt64(3)
-          v80:CBool = IsBitEqual v78, v79
-          CondBranch v80, bb18(), bb19()
+          v78:Truthy = RefineType v40, Truthy
+          v82:CPtr = GetEP 0
+          v83:CInt64 = LoadField v82, :VM_ENV_DATA_INDEX_SPECVAL@0x1006
+          v84:CInt64[3] = Const CInt64(3)
+          v85:CInt64 = IntAnd v83, v84
+          v86:CInt64[3] = Const CInt64(3)
+          v87:CBool = IsBitEqual v85, v86
+          CondBranch v87, bb18(), bb19()
         bb18():
-          v83:BasicObject = InvokeBlockIfunc v76, v27
-          Jump bb17(v83)
+          v90:BasicObject = InvokeBlockIfunc v83, v34
+          Jump bb17(v90)
         bb19():
-          v85:BasicObject = InvokeBlock v27 # SendFallbackReason: InvokeBlock: not yet specialized
-          Jump bb17(v85)
-        bb17(v81:BasicObject):
+          v92:BasicObject = InvokeBlock v34 # SendFallbackReason: InvokeBlock: not yet specialized
+          Jump bb17(v92)
+        bb17(v88:BasicObject):
           PatchPoint NoEPEscape(open)
-          v91:BasicObject = InvokeBuiltin dir_s_close, v18, v27
+          v98:CPtr = LoadSP
+          StoreField v98, :name@0x1000, v19
+          StoreField v98, :encoding@0x1001, v20
+          StoreField v98, :<empty>@0x1002, v21
+          StoreField v98, :block@0x1003, v41
+          StoreField v98, :dir@0x1004, v34
+          v105:BasicObject = InvokeBuiltin dir_s_close, v18, v34
           PatchPoint NoEPEscape(open)
           CheckInterrupts
-          Return v81
-        bb4(v99:BasicObject, v100:BasicObject, v101:BasicObject, v102:BasicObject, v103:BasicObject, v104:BasicObject):
+          Return v88
+        bb4(v113:BasicObject, v114:BasicObject, v115:BasicObject, v116:BasicObject, v117:BasicObject, v118:BasicObject):
           CheckInterrupts
-          Return v104
+          Return v118
         ");
     }
 
@@ -6376,6 +6382,8 @@ pub(crate) mod hir_build_tests {
           PatchPoint MethodRedefined(NilClass@0x1008, respond_to_missing?@0x1070, cme:0x1078)
           PatchPoint MethodRedefined(NilClass@0x1008, method_missing@0x10a0, cme:0x10a8)
           v26:NilClass = GuardType v14, NilClass recompile
+          v27:NilClass = Const Value(nil)
+          v28:NilClass = Const Value(nil)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v14
@@ -6415,6 +6423,7 @@ pub(crate) mod hir_build_tests {
           PatchPoint MethodRedefined(NilClass@0x1008, method_missing@0x10a0, cme:0x10a8)
           v26:NilClass = GuardType v14, NilClass recompile
           v27:ArrayExact = NewArray
+          v28:NilClass = Const Value(nil)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v14
@@ -6448,7 +6457,7 @@ pub(crate) mod hir_build_tests {
           v11:NilClass = Const Value(nil)
           Jump bb3(v8, v9, v10, v11)
         bb3(v13:BasicObject, v14:BasicObject, v15:NilClass, v16:NilClass):
-          v22:ArrayExact = GuardType v14, ArrayExact
+          v22:ArrayExact = GuardType v14, ArrayExact recompile
           v23:CInt64 = ArrayLength v22
           v24:CInt64[1] = Const CInt64(1)
           v25:BasicObject = ArrayArefChecked v22, v24, v23
@@ -6661,12 +6670,14 @@ pub(crate) mod hir_build_tests {
           PatchPoint NoEPEscape(each)
           Jump bb8(v76, v107)
         bb4(v22:BasicObject, v23:NilClass):
-          v27:BasicObject = InvokeBuiltin <inline_expr>, v22
+          v27:CPtr = LoadSP
+          StoreField v27, :i@0x1001, v23
+          v30:BasicObject = InvokeBuiltin <inline_expr>, v22
           PatchPoint NoEPEscape(each)
-          Jump bb5(v22, v23, v27)
-        bb5(v41:BasicObject, v42:NilClass, v43:BasicObject):
+          Jump bb5(v22, v23, v30)
+        bb5(v44:BasicObject, v45:NilClass, v46:BasicObject):
           CheckInterrupts
-          Return v43
+          Return v46
         ");
     }
 
