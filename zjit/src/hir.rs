@@ -4678,7 +4678,15 @@ impl Function {
     }
 
     fn infer_types(&mut self) {
-        self.infer_types_from_scratch(true);
+        let rpo = self.reverse_post_order();
+        self.infer_types_with_rpo(&rpo);
+    }
+
+    /// [`Function::infer_types`] for a caller that has computed the reverse post-order of the
+    /// current CFG already.
+    fn infer_types_with_rpo(&mut self, rpo: &[BlockId]) {
+        debug_assert_eq!(rpo, self.reverse_post_order(), "the CFG changed after computing the reverse post-order");
+        self.infer_types_from_scratch(true, rpo);
 
         // Check that skipping the walk of blocks that can't change finds the same fixpoint
         // as walking every block again.
@@ -4686,7 +4694,7 @@ impl Function {
         {
             let insn_types = self.insn_types.clone();
             let num_instructions = self.num_instructions;
-            self.infer_types_from_scratch(false);
+            self.infer_types_from_scratch(false, rpo);
             assert!(insn_types.iter().zip(self.insn_types.iter()).all(|(a, b)| a.bit_equal(*b)),
                     "skipping unchanged blocks in infer_types found a different fixpoint");
             assert_eq!(num_instructions, self.num_instructions);
@@ -4697,7 +4705,7 @@ impl Function {
     /// a walk that follows another walk starts from the first block whose parameters or
     /// reachability a back edge changed in the previous walk, as the blocks before it can't
     /// change.
-    fn infer_types_from_scratch(&mut self, skip_unchanged: bool) {
+    fn infer_types_from_scratch(&mut self, skip_unchanged: bool, rpo: &[BlockId]) {
         // Reset all types
         self.insn_types.fill(types::Empty);
 
@@ -4752,7 +4760,6 @@ impl Function {
         // reachability a back edge changed in the previous walk. The blocks before it in RPO read
         // the same types as in the previous walk: their other inputs come from the blocks before
         // them, and the back edges to them didn't change what they read.
-        let rpo = self.reverse_post_order();
         // Map BlockId -> rpo index. Used to detect back edge traversal. If an edge targets a block
         // with rpo index <= the current rpo index it's a back edge. Note that `rpo_order` must be
         // of size `self.blocks.len()` to support all possible block IDs; however, `rpo` only
@@ -9143,7 +9150,8 @@ impl Function {
         }
         drop(union_find);
 
-        crate::stats::trace_compile_phase("infer_types", || self.infer_types());
+        // canonicalize doesn't change the CFG
+        crate::stats::trace_compile_phase("infer_types", || self.infer_types_with_rpo(dominators.cfi.reverse_post_order()));
     }
 
     fn is_bit_equal(&self, left: InsnId, right: InsnId) -> bool {
@@ -9919,9 +9927,10 @@ impl Function {
             }
         }
         let mut changed = false;
-        loop {
+        let rpo = loop {
             let mut iter_changed = false;
-            for block in self.reverse_post_order() {
+            let rpo = self.reverse_post_order();
+            for &block in &rpo {
                 // Ignore transient empty blocks
                 if self.blocks[block].insns.is_empty() { continue; }
                 loop {
@@ -9930,11 +9939,12 @@ impl Function {
                     iter_changed = true;
                 }
             }
-            if !iter_changed { break; }
+            // The last walk didn't change the CFG, so its reverse post-order is still valid
+            if !iter_changed { break rpo; }
             changed = true;
-        }
+        };
         if changed {
-            crate::stats::trace_compile_phase("infer_types", || self.infer_types());
+            crate::stats::trace_compile_phase("infer_types", || self.infer_types_with_rpo(&rpo));
         }
     }
 
