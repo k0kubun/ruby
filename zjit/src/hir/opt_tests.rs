@@ -26753,6 +26753,165 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_invokesuper_to_struct_member_reader() {
+        eval("
+            S = Struct.new(:a, :b)
+            class C < S
+              def b
+                super
+              end
+            end
+
+            C.new(1, 2).b
+        ");
+
+        let hir = hir_string_proc("C.new(1, 2).method(:b)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn b@<compiled>:5:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(S@0x1000, b@0x1008, cme:0x1010)
+          v18:CPtr = GetEP 0
+          v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb5(), bb4()
+        bb4():
+          v23:RubyValue = CCall v6, :rb_vm_lep_method_entry@0x1048, v19
+          v24:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v23, Value(VALUE(0x1040))
+          Jump bb5()
+        bb5():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1049
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:BasicObject = LoadField v6, :b@0x104a
+          CheckInterrupts
+          Return v28
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_to_struct_member_writer() {
+        eval("
+            S = Struct.new(:a, :b)
+            class C < S
+              def b=(val)
+                super
+              end
+            end
+
+            C.new(1, 2).b = 3
+        ");
+
+        let hir = hir_string_proc("C.new(1, 2).method(:b=)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn b=@<compiled>:5:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :val@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :val@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(S@0x1008, b=@0x1010, cme:0x1018)
+          v25:CPtr = GetEP 0
+          v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v27:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v28:CBool = IsBitEqual v26, v27
+          CondBranch v28, bb5(), bb4()
+        bb4():
+          v30:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v26
+          v31:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v30, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v33:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v34:FalseClass = GuardBitEquals v33, Value(false) recompile
+          v35:CUInt64 = LoadField v9, :RBASIC_FLAGS@0x1052
+          v36:CUInt64 = GuardNoBitsSet v35, RUBY_FL_FREEZE=CUInt64(2048)
+          StoreField v9, :b=@0x1053, v10
+          WriteBarrier v9, v10
+          PatchPoint NoEPEscape(b=)
+          CheckInterrupts
+          Return v10
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_to_data_member_reader() {
+        eval("
+            D = Data.define(:a, :b)
+            class C < D
+              def a
+                super
+              end
+            end
+
+            C.new(a: 1, b: 2).a
+        ");
+
+        let hir = hir_string_proc("C.new(a: 1, b: 2).method(:a)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn a@<compiled>:5:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(D@0x1000, a@0x1008, cme:0x1010)
+          v18:CPtr = GetEP 0
+          v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb5(), bb4()
+        bb4():
+          v23:RubyValue = CCall v6, :rb_vm_lep_method_entry@0x1048, v19
+          v24:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v23, Value(VALUE(0x1040))
+          Jump bb5()
+        bb5():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1049
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:BasicObject = LoadField v6, :a@0x104a
+          CheckInterrupts
+          Return v28
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_to_struct_member_reader_with_args_remains_invokesuper() {
+        eval("
+            S = Struct.new(:a, :b)
+            class C < S
+              def b(x)
+                super(x) rescue nil
+              end
+            end
+
+            C.new(1, 2).b(1)
+        ");
+
+        let hir = hir_string_proc("C.new(1, 2).method(:b)");
+        assert!(hir.contains("InvokeSuper "), "Expected an unoptimized InvokeSuper but got:\n{hir}");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A
