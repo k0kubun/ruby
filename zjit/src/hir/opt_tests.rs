@@ -27482,62 +27482,31 @@ mod hir_opt_tests {
           v34:Fixnum[3] = Const Value(3)
           v36:CPtr = GetEP 0
           v37:CInt64 = LoadField v36, :VM_ENV_DATA_INDEX_SPECVAL@0x1060
-          v38:CInt64[3] = Const CInt64(3)
-          v39:CInt64 = IntAnd v37, v38
-          v42:CInt64[7] = Const CInt64(7)
-          v43:CInt64 = IntAnd v37, v42
-          v44:CInt64[0] = Const CInt64(0)
-          v45:CBool = IsBitEqual v43, v44
-          CondBranch v45, bb9(), bb7()
-        bb9():
-          v47:CBool = IsBitNotEqual v37, v44
-          CondBranch v47, bb10(), bb7()
-        bb10():
-          v49:Class = LoadField v37, :RBASIC_KLASS@0x1061
-          v50:ClassSubclass[Proc@0x1062] = Const Value(VALUE(0x1062))
-          v51:CBool = IsBitEqual v49, v50
-          CondBranch v51, bb11(), bb7()
-        bb11():
-          v53:CInt64 = LoadField v37, :proc_data@0x1063
-          v54:CInt64 = LoadField v53, :proc_header@0x1064
-          v55:CInt64[2815] = Const CInt64(2815)
-          v56:CInt64 = IntAnd v54, v55
-          v57:CBool = IsBitEqual v56, v44
-          CondBranch v57, bb12(), bb7()
-        bb12():
-          v59:CInt64[8] = Const CInt64(8)
-          v60:CInt64 = IntAdd v53, v59
-          v61:Iseq = LoadField v60, :code_iseq@0x1065
-          v62:Iseq[VALUE(0x1068)] = Const Value(VALUE(0x1068))
-          v63:CBool = IsBitEqual v61, v62
-          CondBranch v63, bb13(), bb14()
-        bb13():
-          v98:BasicObject = LoadField v60, :captured_self@0x1064
-          PushInlineBlockFrame v98, v60 (0x1068), num_args=1
-          v91:Fixnum[7] = Const Value(7)
+          v40:CInt64[7] = Const CInt64(7)
+          v41:CInt64 = IntAnd v37, v40
+          v42:CInt64[0] = GuardBitEquals v41, CInt64(0) recompile
+          v43:CInt64 = GuardAnyBitSet v37, CUInt64(0xfffffffffffffff8) recompile
+          v44:Class = LoadField v43, :RBASIC_KLASS@0x1061
+          v45:ClassSubclass[Proc@0x1062] = GuardBitEquals v44, Value(VALUE(0x1062)) recompile
+          v46:CInt64 = LoadField v43, :proc_data@0x1063
+          v47:CInt64 = LoadField v46, :proc_header@0x1064
+          v48:CInt64[2815] = Const CInt64(2815)
+          v49:CInt64 = IntAnd v47, v48
+          v50:CInt64[0] = GuardBitEquals v49, CInt64(0) recompile
+          v51:CInt64[8] = Const CInt64(8)
+          v52:CInt64 = IntAdd v46, v51
+          v53:Iseq = LoadField v52, :code_iseq@0x1065
+          v54:Iseq[VALUE(0x1068)] = GuardBitEquals v53, Value(VALUE(0x1068)) recompile
+          v77:BasicObject = LoadField v52, :captured_self@0x1064
+          PushInlineBlockFrame v77, v52 (0x1068), num_args=1
+          v70:Fixnum[7] = Const Value(7)
           PatchPoint MethodRedefined(Integer@0x1070, *@0x1078, cme:0x1080)
-          v107:Fixnum[21] = Const Value(21)
+          v86:Fixnum[21] = Const Value(21)
           PopInlineFrame
-          Jump bb6(v107)
-        bb14():
-          Jump bb7()
-        bb7():
-          v68:CInt64[3] = Const CInt64(3)
-          v69:CBool = IsBitEqual v39, v68
-          CondBranch v69, bb16(), bb17()
-        bb16():
-          v72:BasicObject = InvokeBlockIfunc v37, v34
-          Jump bb15(v72)
-        bb17():
-          v74:BasicObject = InvokeBlock v34 # SendFallbackReason: InvokeBlock: polymorphic dispatch miss
-          Jump bb15(v74)
-        bb15(v70:BasicObject):
-          Jump bb6(v70)
-        bb6(v40:BasicObject):
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v40
+          Return v86
         ");
     }
 

@@ -13688,6 +13688,16 @@ fn add_iseq_to_hir(
                     // The profile is per callee ISEQ and may describe other callers' blocks.
                     // For a known &proc its IFUNC/ISEQ guards would always fail.
                     let inlined_blockarg_proc = matches!(mode, AddIseqMode::Inlined { block: Some(BlockHandler::BlockArgProc(_)), .. });
+                    // For a known &proc, prefer the Procs that the caller's send passed.
+                    let block_handler_summary = match mode {
+                        AddIseqMode::Inlined { caller, block: Some(BlockHandler::BlockArgProc(_)), .. } => {
+                            let caller_state = fun.frame_state(caller);
+                            get_or_create_iseq_payload(caller_state.iseq).profile.get_block_arg_procs(caller_state.insn_idx)
+                                .map(TypeDistributionSummary::new)
+                                .or(block_handler_summary)
+                        }
+                        _ => block_handler_summary,
+                    };
 
                     // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
                     let mut fallback_reason = InvokeBlockNotSpecialized;

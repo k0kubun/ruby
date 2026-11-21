@@ -105,6 +105,7 @@ fn profile_insn_sample(
             profile_operands(profiler, profile, argc + 1);
             profile_splat_length(profiler, profile, unsafe { (*cd).ci });
             profile_send_symbol(profiler, profile, unsafe { (*cd).ci }, argc);
+            profile_block_arg_proc(profiler, profile, unsafe { (*cd).ci });
         }
         _ => return false,
     }
@@ -280,6 +281,22 @@ fn profile_splat_length(profiler: &mut Profiler, profile: &mut IseqProfile, ci: 
 
 /// Profile the method name Symbol given to `send(name, ...)` or `__send__(name, ...)`.
 /// Only static Symbols are recorded. They are immediates, so they don't need GC marking.
+/// Profile the Proc passed as `&block` to a send like the block handler of `invokeblock`, so that
+/// a `yield` in the callee inlined at this send can dispatch to it. The profile of the `yield`
+/// itself may come from other callers.
+fn profile_block_arg_proc(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo) {
+    if unsafe { rb_vm_ci_flag(ci) } & VM_CALL_ARGS_BLOCKARG == 0 {
+        return;
+    }
+    let block_arg = profiler.peek_at_stack(0);
+    if !unsafe { rb_obj_is_proc(block_arg).test() } {
+        return;
+    }
+    let ty = ProfiledType::block_handler(block_arg);
+    VALUE::from(profiler.iseq).write_barrier(ty.class());
+    profile.block_arg_procs.entry(profiler.insn_idx).or_insert_with(TypeDistribution::new).observe(ty);
+}
+
 fn profile_send_symbol(profiler: &mut Profiler, profile: &mut IseqProfile, ci: *const rb_callinfo, argc: usize) {
     let mid = unsafe { vm_ci_mid(ci) };
     let flags = unsafe { rb_vm_ci_flag(ci) };
@@ -657,6 +674,9 @@ pub struct IseqProfile {
 
     /// Static Symbols given to `send` as the method name. Not GC objects, so not visited by `each_object`.
     send_symbols: HashMap<YarvInsnIdx, TypeDistribution>,
+
+    /// Procs passed as `&block` to sends, profiled like block handlers. See [`profile_block_arg_proc`].
+    block_arg_procs: HashMap<YarvInsnIdx, TypeDistribution>,
 }
 
 impl IseqProfile {
@@ -666,6 +686,7 @@ impl IseqProfile {
             super_cme: HashMap::new(),
             splat_lengths: HashMap::new(),
             send_symbols: HashMap::new(),
+            block_arg_procs: HashMap::new(),
         }
     }
 
@@ -701,6 +722,11 @@ impl IseqProfile {
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
         self.splat_lengths.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
+    }
+
+    /// The Procs passed as `&block` to the send at `insn_idx`, profiled like block handlers
+    pub fn get_block_arg_procs(&self, insn_idx: YarvInsnIdx) -> Option<&TypeDistribution> {
+        self.block_arg_procs.get(&insn_idx)
     }
 
     /// Get the static Symbols profiled as the method name of `send`, most common first.
@@ -740,6 +766,12 @@ impl IseqProfile {
                 callback(profiled_type.class)
             }
         }
+
+        for distribution in self.block_arg_procs.values() {
+            for profiled_type in distribution.each_item() {
+                callback(profiled_type.class)
+            }
+        }
     }
 
     /// Run a given callback with a mutable reference to every object in IseqProfile.
@@ -756,6 +788,12 @@ impl IseqProfile {
         // Update CME references if they move during compaction.
         for super_cme_values in self.super_cme.values_mut() {
             for ref mut profiled_type in super_cme_values.each_item_mut() {
+                callback(&mut profiled_type.class)
+            }
+        }
+
+        for distribution in self.block_arg_procs.values_mut() {
+            for ref mut profiled_type in distribution.each_item_mut() {
                 callback(&mut profiled_type.class)
             }
         }
