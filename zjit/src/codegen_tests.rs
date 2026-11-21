@@ -12056,6 +12056,48 @@ fn test_send_caller_splat_arguments_with_block_literal() {
 }
 
 #[test]
+fn test_send_caller_splat_arguments_with_nil_block_arg() {
+    eval("
+        def test(a, b) = [a, b, block_given?]
+        def entry(args, blk) = test(*args, &blk)
+        entry([1, 2], nil)
+    ");
+    assert_snapshot!(assert_compiles("entry([1, 2], nil)"), @"[1, 2, false]");
+}
+
+#[test]
+fn test_send_caller_splat_arguments_with_proc_block_arg() {
+    eval("
+        def test(*r, &b) = [r, b.call]
+        def entry(args, blk) = test(0, *args, &blk)
+        entry([1, 2], proc { 9 })
+    ");
+    assert_snapshot!(assert_compiles("entry([1, 2], proc { 9 })"), @"[[0, 1, 2], 9]");
+}
+
+#[test]
+fn test_send_caller_splat_arguments_with_forwarded_block_param() {
+    eval("
+        def test(*r) = [r, yield]
+        def entry(*args, &block) = test(*args, &block)
+        def run = entry(1, 2) { 3 }
+        run
+    ");
+    assert_snapshot!(assert_compiles("run"), @"[[1, 2], 3]");
+}
+
+#[test]
+fn test_send_caller_splat_with_ruby2_keywords_hash_and_nil_block_arg() {
+    eval("
+        def test(*r, **kw) = [r, kw]
+        def entry(args) = test(*args, &nil)
+        ruby2_keywords def r2k(*a) = a
+        entry([1, {k: 1}])
+    ");
+    assert_snapshot!(inspect("[entry([1, {k: 1}]), entry(r2k(1, k: 2))]"), @"[[[1, {k: 1}], {}], [[1], {k: 2}]]");
+}
+
+#[test]
 fn test_send_polymorphic_caller_splat_arguments() {
     set_call_threshold(3);
     eval("
