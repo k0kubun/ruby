@@ -4997,6 +4997,32 @@ fn test_invokesuper_recompiles_when_block_appears() {
 }
 
 #[test]
+fn test_invokesuper_falls_back_for_unprofiled_method_entry() {
+    // A module method has a method entry per class that includes it, so a profile of one
+    // includer is monomorphic even though `super` is polymorphic. Another includer's call
+    // should take a dynamic super call instead of side-exiting, and without recompiling.
+    set_call_threshold(2);
+    eval(r#"
+        class FallbackBase1; def greet = "base1"; end
+        class FallbackBase2; def greet = "base2"; end
+        module FallbackGreeter
+          def greet = "hi " + super
+        end
+        class FallbackC1 < FallbackBase1; include FallbackGreeter; end
+        class FallbackC2 < FallbackBase2; include FallbackGreeter; end
+        c1 = FallbackC1.new
+        c1.greet; c1.greet
+    "#);
+    let iseq = get_method_iseq("FallbackC1.new", "greet");
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+    let num_exits = get_option!(num_exits_until_invalidate);
+    for _ in 0..num_exits + 1 {
+        assert_eq!(r#"["hi base1", "hi base2"]"#, assert_compiles("[FallbackC1.new.greet, FallbackC2.new.greet]"));
+    }
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len(), "the fallback should not recompile");
+}
+
+#[test]
 fn test_invokesuper_with_own_block_ignores_frame_block() {
     set_call_threshold(2);
     eval(r#"

@@ -11,6 +11,11 @@ mod hir_opt_tests {
         format!("{}", FunctionPrinter::without_snapshot(function))
     }
 
+    /// Whether `hir` has an InvokeSuper that isn't the fallback of a specialized super call
+    fn has_unspecialized_invokesuper(hir: &str) -> bool {
+        hir.lines().any(|line| line.contains("InvokeSuper ") && !line.contains("running method entry isn't the profiled one"))
+    }
+
     #[track_caller]
     fn hir_string_proc(proc: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(proc));
@@ -16396,14 +16401,22 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Struct@0x1088, initialize@0x1038, cme:0x1090)
           v76:CPtr = GetEP 0
           v77:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_ME_CREF@0x10b8
-          v78:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v77, Value(VALUE(0x1040))
-          v79:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_SPECVAL@0x10b9
-          v80:FalseClass = GuardBitEquals v79, Value(false) recompile
-          v81:CUInt64 = LoadField v46, :RBASIC_FLAGS@0x10ba
-          v82:CUInt64 = GuardNoBitsSet v81, RUBY_FL_FREEZE=CUInt64(2048)
-          v83:NilClass = Const Value(nil)
+          v78:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v79:CBool = IsBitEqual v77, v78
+          CondBranch v79, bb10(), bb11()
+        bb10():
+          v84:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_SPECVAL@0x10b9
+          v85:FalseClass = GuardBitEquals v84, Value(false) recompile
+          v86:CUInt64 = LoadField v46, :RBASIC_FLAGS@0x10ba
+          v87:CUInt64 = GuardNoBitsSet v86, RUBY_FL_FREEZE=CUInt64(2048)
+          v88:NilClass = Const Value(nil)
           StoreField v46, :a@0x10bb, v15
           StoreField v46, :b@0x10bc, v62
+          Jump bb12(v88)
+        bb11():
+          v81:BasicObject = InvokeSuper v46, 0x10ba, v15, v62 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb12(v81)
+        bb12(v83:BasicObject):
           PatchPoint NoEPEscape(initialize)
           PopInlineFrame
           CheckInterrupts
@@ -17640,16 +17653,24 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, <<@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
-          v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v29:FalseClass = GuardBitEquals v28, Value(false) recompile
-          v30:Array = GuardType v9, Array recompile
-          v31:CUInt64 = LoadField v30, :RBASIC_FLAGS@0x1051
-          v32:CUInt64 = GuardNoBitsSet v31, RUBY_FL_FREEZE=CUInt64(2048)
-          ArrayPush v30, v10
+          v27:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v28:CBool = IsBitEqual v26, v27
+          CondBranch v28, bb4(), bb5()
+        bb4():
+          v33:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v34:FalseClass = GuardBitEquals v33, Value(false) recompile
+          v35:Array = GuardType v9, Array recompile
+          v36:CUInt64 = LoadField v35, :RBASIC_FLAGS@0x1051
+          v37:CUInt64 = GuardNoBitsSet v36, RUBY_FL_FREEZE=CUInt64(2048)
+          ArrayPush v35, v10
+          Jump bb6(v35)
+        bb5():
+          v30:BasicObject = InvokeSuper v9, 0x1051, v10 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v30)
+        bb6(v32:BasicObject):
           PatchPoint NoEPEscape(<<)
           CheckInterrupts
-          Return v30
+          Return v32
         ");
     }
 
@@ -17676,16 +17697,24 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, pop@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
-          v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v22:FalseClass = GuardBitEquals v21, Value(false) recompile
-          v23:Array = GuardType v6, Array recompile
-          v24:CUInt64 = LoadField v23, :RBASIC_FLAGS@0x1049
-          v25:CUInt64 = GuardNoBitsSet v24, RUBY_FL_FREEZE=CUInt64(2048)
-          v27:CUInt64 = GuardNoBitsSet v25, RUBY_ELTS_SHARED=CUInt64(4096)
-          v28:BasicObject = ArrayPop v23
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb4(), bb5()
+        bb4():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:Array = GuardType v6, Array recompile
+          v29:CUInt64 = LoadField v28, :RBASIC_FLAGS@0x1049
+          v30:CUInt64 = GuardNoBitsSet v29, RUBY_FL_FREEZE=CUInt64(2048)
+          v32:CUInt64 = GuardNoBitsSet v30, RUBY_ELTS_SHARED=CUInt64(4096)
+          v33:BasicObject = ArrayPop v28
+          Jump bb6(v33)
+        bb5():
+          v23:BasicObject = InvokeSuper v6, 0x1049 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v23)
+        bb6(v25:BasicObject):
           CheckInterrupts
-          Return v28
+          Return v25
         ");
     }
 
@@ -17715,18 +17744,26 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
-          v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v29:FalseClass = GuardBitEquals v28, Value(false) recompile
-          v30:Array = GuardType v9, Array recompile
-          v31:Fixnum = GuardType v10, Fixnum recompile
-          v32:CInt64 = UnboxFixnum v31
-          v33:CInt64 = ArrayLength v30
-          v34:CInt64 = AdjustBounds v32, v33
-          v35:BasicObject = ArrayArefChecked v30, v34, v33
+          v27:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v28:CBool = IsBitEqual v26, v27
+          CondBranch v28, bb4(), bb5()
+        bb4():
+          v33:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v34:FalseClass = GuardBitEquals v33, Value(false) recompile
+          v35:Array = GuardType v9, Array recompile
+          v36:Fixnum = GuardType v10, Fixnum recompile
+          v37:CInt64 = UnboxFixnum v36
+          v38:CInt64 = ArrayLength v35
+          v39:CInt64 = AdjustBounds v37, v38
+          v40:BasicObject = ArrayArefChecked v35, v39, v38
+          Jump bb6(v40)
+        bb5():
+          v30:BasicObject = InvokeSuper v9, 0x1058, v10 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v30)
+        bb6(v32:BasicObject):
           PatchPoint NoEPEscape([])
           CheckInterrupts
-          Return v35
+          Return v32
         ");
     }
 
@@ -17756,13 +17793,21 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, []@0x1010, cme:0x1018)
           v25:CPtr = GetEP 0
           v26:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v27:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v26, Value(VALUE(0x1048))
-          v28:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v29:FalseClass = GuardBitEquals v28, Value(false) recompile
-          v30:BasicObject = CCallVariadic v9, :Array#[]@0x1051, v10
+          v27:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v28:CBool = IsBitEqual v26, v27
+          CondBranch v28, bb4(), bb5()
+        bb4():
+          v33:RubyValue = LoadField v25, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v34:FalseClass = GuardBitEquals v33, Value(false) recompile
+          v35:BasicObject = CCallVariadic v9, :Array#[]@0x1051, v10
+          Jump bb6(v35)
+        bb5():
+          v30:BasicObject = InvokeSuper v9, 0x1058, v10 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v30)
+        bb6(v32:BasicObject):
           PatchPoint NoEPEscape([])
           CheckInterrupts
-          Return v30
+          Return v32
         ");
     }
 
@@ -24257,13 +24302,21 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(SuperFwdBase@0x1008, run@0x1010, cme:0x1018)
           v29:CPtr = GetEP 0
           v30:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v31:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v30, Value(VALUE(0x1048))
-          v32:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v33:FalseClass = GuardBitEquals v32, Value(false) recompile
-          v34:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
+          v31:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v32:CBool = IsBitEqual v30, v31
+          CondBranch v32, bb4(), bb5()
+        bb4():
+          v37:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v38:FalseClass = GuardBitEquals v37, Value(false) recompile
+          v39:BasicObject = SendDirect v11, 0x0, :run (0x1058), v12, v13
+          Jump bb6(v39)
+        bb5():
+          v34:BasicObject = InvokeSuper v11, 0x1078, v12, v13 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v34)
+        bb6(v36:BasicObject):
           PatchPoint NoEPEscape(run)
           CheckInterrupts
-          Return v34
+          Return v36
         ");
     }
 
@@ -25986,7 +26039,7 @@ mod hir_opt_tests {
 
         // A Ruby method as the target of `super` should optimize provided no block is given.
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(!hir.contains("InvokeSuper "), "InvokeSuper should optimize to SendDirect but got:\n{hir}");
+        assert!(!has_unspecialized_invokesuper(&hir), "InvokeSuper should optimize to SendDirect but got:\n{hir}");
 
         assert_snapshot!(hir, @"
         fn foo@<compiled>:10:
@@ -26002,15 +26055,23 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1000, foo@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
-          v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v22:FalseClass = GuardBitEquals v21, Value(false) recompile
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb4(), bb5()
+        bb4():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
           PushInlineFrame :foo, v6 (0x1050), num_args=0
-          v29:StringExact[VALUE(0x1070)] = Const Value(VALUE(0x1070))
-          v30:StringExact = StringCopy v29
+          v35:StringExact[VALUE(0x1070)] = Const Value(VALUE(0x1070))
+          v36:StringExact = StringCopy v35
           PopInlineFrame
+          Jump bb6(v36)
+        bb5():
+          v23:BasicObject = InvokeSuper v6, 0x1078 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v23)
+        bb6(v25:BasicObject):
           CheckInterrupts
-          Return v30
+          Return v25
         ");
     }
 
@@ -26057,7 +26118,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(!hir.contains("InvokeSuper "), "InvokeSuper should optimize to SendDirect but got:\n{hir}");
+        assert!(!has_unspecialized_invokesuper(&hir), "InvokeSuper should optimize to SendDirect but got:\n{hir}");
 
         assert_snapshot!(hir, @"
         fn foo@<compiled>:10:
@@ -26076,21 +26137,30 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
           v30:CPtr = GetEP 0
           v31:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v32:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v31, Value(VALUE(0x1048))
-          v33:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v34:FalseClass = GuardBitEquals v33, Value(false) recompile
+          v32:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v33:CBool = IsBitEqual v31, v32
+          CondBranch v33, bb4(), bb5()
+        bb4():
+          v38:RubyValue = LoadField v30, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v39:FalseClass = GuardBitEquals v38, Value(false) recompile
           PushInlineFrame :foo, v9 (0x1058), num_args=1
-          v47:Fixnum[2] = Const Value(2)
+          v53:Fixnum[2] = Const Value(2)
           PatchPoint MethodRedefined(Integer@0x1078, *@0x1080, cme:0x1088)
-          v60:Fixnum = GuardType v10, Fixnum recompile
-          v61:Fixnum = FixnumMult v60, v47
+          v66:Fixnum = GuardType v10, Fixnum recompile
+          v67:Fixnum = FixnumMult v66, v53
           PopInlineFrame
+          Jump bb6(v67)
+        bb5():
+          v35:BasicObject = InvokeSuper v9, 0x10b0, v10 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v35)
+        bb6(v37:BasicObject):
           PatchPoint NoEPEscape(foo)
           v20:Fixnum[1] = Const Value(1)
-          PatchPoint MethodRedefined(Integer@0x1078, +@0x10b0, cme:0x10b8)
-          v39:Fixnum = FixnumAdd v61, v20
+          PatchPoint MethodRedefined(Integer@0x1078, +@0x10d0, cme:0x10d8)
+          v44:Fixnum = GuardType v37, Fixnum recompile
+          v45:Fixnum = FixnumAdd v44, v20
           CheckInterrupts
-          Return v39
+          Return v45
         ");
     }
 
@@ -26113,7 +26183,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
         assert!(!hir.contains("SendDirect"), "Should not optimize to SendDirect for explicit blockarg:\n{hir}");
 
         assert_snapshot!(hir, @"
@@ -26158,7 +26228,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
         assert!(!hir.contains("SendDirect"), "Should not optimize to SendDirect for block literal:\n{hir}");
 
         // With a block, we don't optimize to SendDirect
@@ -26192,7 +26262,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("C.new.method(:size)");
-        assert!(!hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(!has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
 
         assert_snapshot!(hir, @"
         fn size@<compiled>:4:
@@ -26208,12 +26278,20 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Hash@0x1000, size@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
-          v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v22:FalseClass = GuardBitEquals v21, Value(false) recompile
-          v23:Fixnum = CCall v6, :Hash#size@0x1049
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb4(), bb5()
+        bb4():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:Fixnum = CCall v6, :Hash#size@0x1049
+          Jump bb6(v28)
+        bb5():
+          v23:BasicObject = InvokeSuper v6, 0x1050 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v23)
+        bb6(v25:BasicObject):
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -26246,12 +26324,20 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, reverse@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
-          v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v22:FalseClass = GuardBitEquals v21, Value(false) recompile
-          v23:ArrayExact = CCallWithFrame v6, :Array#reverse@0x1049
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb4(), bb5()
+        bb4():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:ArrayExact = CCallWithFrame v6, :Array#reverse@0x1049
+          Jump bb6(v28)
+        bb5():
+          v23:BasicObject = InvokeSuper v6, 0x1050 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v23)
+        bb6(v25:BasicObject):
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -26299,13 +26385,21 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1008, join@0x1010, cme:0x1018)
           v40:CPtr = GetEP 0
           v41:RubyValue = LoadField v40, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v42:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v41, Value(VALUE(0x1048))
-          v43:RubyValue = LoadField v40, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v44:FalseClass = GuardBitEquals v43, Value(false) recompile
-          v45:StringExact = CCallVariadic v24, :Array#join@0x1051, v25
+          v42:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v43:CBool = IsBitEqual v41, v42
+          CondBranch v43, bb7(), bb8()
+        bb7():
+          v48:RubyValue = LoadField v40, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v49:FalseClass = GuardBitEquals v48, Value(false) recompile
+          v50:StringExact = CCallVariadic v24, :Array#join@0x1051, v25
+          Jump bb9(v50)
+        bb8():
+          v45:BasicObject = InvokeSuper v24, 0x1058, v25 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb9(v45)
+        bb9(v47:BasicObject):
           PatchPoint NoEPEscape(join)
           CheckInterrupts
-          Return v45
+          Return v47
         ");
     }
 
@@ -26339,9 +26433,18 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Array@0x1000, reverse@0x1008, cme:0x1010)
           v21:CPtr = GetEP 0
           v22:RubyValue = LoadField v21, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v23:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v22, Value(VALUE(0x1040))
-          v24:RubyValue = LoadField v21, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v25:FalseClass = GuardBitEquals v24, Value(false) recompile
+          v23:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v24:CBool = IsBitEqual v22, v23
+          CondBranch v24, bb4(), bb5()
+        bb4():
+          v29:RubyValue = LoadField v21, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v30:FalseClass = GuardBitEquals v29, Value(false) recompile
+          v31:ArrayExact = CCallWithFrame v6, :Array#reverse@0x1049
+          Jump bb6(v31)
+        bb5():
+          v26:BasicObject = InvokeSuper v6, 0x1050 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v26)
+        bb6(v28:BasicObject):
           CheckInterrupts
           Return v6
         ");
@@ -26372,12 +26475,20 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(BasicObject@0x1000, initialize@0x1008, cme:0x1010)
           v18:CPtr = GetEP 0
           v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
-          v20:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v19, Value(VALUE(0x1040))
-          v21:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
-          v22:FalseClass = GuardBitEquals v21, Value(false) recompile
-          v23:NilClass = Const Value(nil)
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb4(), bb5()
+        bb4():
+          v26:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_SPECVAL@0x1048
+          v27:FalseClass = GuardBitEquals v26, Value(false) recompile
+          v28:NilClass = Const Value(nil)
+          Jump bb6(v28)
+        bb5():
+          v23:BasicObject = InvokeSuper v6, 0x1050 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb6(v23)
+        bb6(v25:BasicObject):
           CheckInterrupts
-          Return v23
+          Return v25
         ");
     }
 
@@ -26394,7 +26505,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("MyString.new('hello world').method(:byteindex)");
-        assert!(!hir.contains("InvokeSuper "), "InvokeSuper should optimize to CCallVariadic but got:\n{hir}");
+        assert!(!has_unspecialized_invokesuper(&hir), "InvokeSuper should optimize to CCallVariadic but got:\n{hir}");
         assert!(hir.contains("CCallVariadic"), "Should optimize to CCallVariadic for variadic cfunc:\n{hir}");
 
         assert_snapshot!(hir, @"
@@ -26430,13 +26541,21 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(String@0x1008, byteindex@0x1010, cme:0x1018)
           v46:CPtr = GetEP 0
           v47:RubyValue = LoadField v46, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
-          v48:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v47, Value(VALUE(0x1048))
-          v49:RubyValue = LoadField v46, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
-          v50:FalseClass = GuardBitEquals v49, Value(false) recompile
-          v51:BasicObject = CCallVariadic v28, :String#byteindex@0x1051, v29, v30
+          v48:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v49:CBool = IsBitEqual v47, v48
+          CondBranch v49, bb7(), bb8()
+        bb7():
+          v54:RubyValue = LoadField v46, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v55:FalseClass = GuardBitEquals v54, Value(false) recompile
+          v56:BasicObject = CCallVariadic v28, :String#byteindex@0x1051, v29, v30
+          Jump bb9(v56)
+        bb8():
+          v51:BasicObject = InvokeSuper v28, 0x1058, v29, v30 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb9(v51)
+        bb9(v53:BasicObject):
           PatchPoint NoEPEscape(byteindex)
           CheckInterrupts
-          Return v51
+          Return v53
         ");
     }
 
@@ -26460,7 +26579,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
         assert!(!hir.contains("SendDirect"), "Should not optimize to SendDirect for explicit blockarg:\n{hir}");
 
         assert_snapshot!(hir, @"
@@ -26517,7 +26636,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
         assert!(!hir.contains("SendDirect"), "Should not optimize to SendDirect for symbol-to-proc:\n{hir}");
 
         assert_snapshot!(hir, @"
@@ -26561,7 +26680,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(has_unspecialized_invokesuper(&hir), "Expected unoptimized InvokeSuper but got:\n{hir}");
 
         assert_snapshot!(hir, @"
         fn foo@<compiled>:9:
@@ -30618,22 +30737,31 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Parent@0x1060, greet@0x1010, cme:0x1068)
           v48:CPtr = GetEP 0
           v49:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_ME_CREF@0x1090
-          v50:CallableMethodEntry[VALUE(0x1018)] = GuardBitEquals v49, Value(VALUE(0x1018))
-          v51:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1091
-          v52:FalseClass = GuardBitEquals v51, Value(false) recompile
+          v50:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v51:CBool = IsBitEqual v49, v50
+          CondBranch v51, bb6(), bb7()
+        bb6():
+          v56:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1091
+          v57:FalseClass = GuardBitEquals v56, Value(false) recompile
           PushInlineFrame :greet, v25 (0x1098), num_args=0
-          v64:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
-          v65:StringExact = StringCopy v64
+          v70:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
+          v71:StringExact = StringCopy v70
           PopInlineFrame
-          v35:StringExact[VALUE(0x10c0)] = Const Value(VALUE(0x10c0))
+          Jump bb8(v71)
+        bb7():
+          v53:BasicObject = InvokeSuper v25, 0x10c0 # SendFallbackReason: super: running method entry isn't the profiled one
+          Jump bb8(v53)
+        bb8(v55:BasicObject):
+          v35:StringExact[VALUE(0x10e0)] = Const Value(VALUE(0x10e0))
           v36:StringExact = StringCopy v35
-          PatchPoint NoSingletonClass(String@0x10c8)
-          PatchPoint MethodRedefined(String@0x10c8, +@0x10d0, cme:0x10d8)
-          v58:BasicObject = CCallWithFrame v65, :String#+@0x1100, v36
+          PatchPoint NoSingletonClass(String@0x10e8)
+          PatchPoint MethodRedefined(String@0x10e8, +@0x10f0, cme:0x10f8)
+          v63:StringExact = GuardType v55, StringExact recompile
+          v64:BasicObject = CCallWithFrame v63, :String#+@0x1120, v36
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v58
+          Return v64
         ");
     }
 

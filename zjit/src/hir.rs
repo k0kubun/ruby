@@ -843,6 +843,9 @@ pub enum SendFallbackReason {
     SuperNotOptimizedMethodType(MethodType),
     /// The `super` call is polymorpic.
     SuperPolymorphic,
+    /// The fallback of a specialized `super` call, for a running method entry other than the
+    /// profiled one.
+    SuperMethodEntryMiss,
     /// The `invokeblock` instruction is not yet optimized in `type_specialize`.
     InvokeBlockNotSpecialized,
     /// The runtime block handler at a polymorphic `invokeblock` site did not match any
@@ -901,6 +904,7 @@ impl Display for SendFallbackReason {
             SuperNoProfiles => write!(f, "super: no profile data available"),
             SuperNotOptimizedMethodType(method_type) => write!(f, "super: unsupported target method type {:?}", method_type),
             SuperPolymorphic => write!(f, "super: polymorphic call site"),
+            SuperMethodEntryMiss => write!(f, "super: running method entry isn't the profiled one"),
             SuperTargetNotFound => write!(f, "super: profiled target method cannot be found"),
             InvokeBlockNotSpecialized => write!(f, "InvokeBlock: not yet specialized"),
             InvokeBlockPolymorphicMiss => write!(f, "InvokeBlock: polymorphic dispatch miss"),
@@ -4424,7 +4428,7 @@ impl Function {
             => {
                 // Ignore the case where the instruction is intentionally a fallback for a
                 // polymorphic send. We already know that case is a lost cause.
-                if !matches!(*reason, SendFallbackReason::SendPolymorphicFallback | SendFallbackReason::SendNameMiss | SendFallbackReason::SendMethodEntryMiss) {
+                if !matches!(*reason, SendFallbackReason::SendPolymorphicFallback | SendFallbackReason::SendNameMiss | SendFallbackReason::SendMethodEntryMiss | SendFallbackReason::SuperMethodEntryMiss) {
                     *reason = dynamic_send_reason;
                 }
             }
@@ -7091,18 +7095,31 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                         };
                     }
+                    &Insn::InvokeSuper { reason: SuperMethodEntryMiss, .. } => {
+                        // The fallback of a specialized super call. Specializing it again would just
+                        // repeat the specialization it falls back from.
+                        self.push_insn_id(block, insn_id);
+                    }
                     &Insn::InvokeSuper { recv, cd, blockiseq, state, .. } => {
-                        // Helper to emit common guards for super call optimization.
+                        // The block that a specialized super call falls back to when the running method
+                        // entry isn't the profiled one, and the join block both paths meet in.
+                        struct SuperFallback { join_block: BlockId, result: InsnId }
+
+                        // Helper to emit common guards for super call optimization. On return, `block`
+                        // is the block to emit the specialized call into. Pass its result to
+                        // `finish_super_call`.
                         fn emit_super_call_guards(
                             fun: &mut Function,
-                            block: BlockId,
+                            block: &mut BlockId,
+                            insn_id: InsnId,
                             super_cme: *const rb_callable_method_entry_t,
                             current_cme: *const rb_callable_method_entry_t,
                             mid: ID,
                             state: InsnId,
                             local_iseq: IseqPtr,
-                        ) {
-                            fun.push_insn(block, Insn::PatchPoint {
+                        ) -> SuperFallback {
+                            let insn_idx = fun.frame_state_ref(state).insn_idx as u32;
+                            fun.push_insn(*block, Insn::PatchPoint {
                                 invariant: Invariant::MethodRedefined {
                                     klass: unsafe { (*super_cme).defined_class },
                                     method: mid,
@@ -7116,20 +7133,50 @@ impl Function {
                             // outer compilation's, so that an inlined super call walks from the
                             // callee's CFP rather than the caller's.
                             let level = get_lvar_level(local_iseq);
-                            let lep = fun.get_ep(block, level);
+                            let lep = fun.get_ep(*block, level);
                             // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
-                            let method_entry = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
-                            // Guard that it matches the expected CME
-                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
+                            let method_entry = fun.load_field(*block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
 
-                            let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
-                            fun.push_insn(block, Insn::GuardBitEquals {
+                            // Specialize for the profiled CME, and do a dynamic super call for any other.
+                            // A profile can be monomorphic while the site isn't, e.g. a method that
+                            // classes reach through different method entries, and an exit here can't
+                            // recompile into anything better: the next profile would be polymorphic, which
+                            // gives up the specialized call for the profiled CME as well.
+                            let expected = fun.push_insn(*block, Insn::Const { val: Const::Value(current_cme.into()) });
+                            let is_expected = fun.push_insn(*block, Insn::IsBitEqual { left: method_entry, right: expected });
+                            let fast_block = fun.new_block(insn_idx);
+                            let fallback_block = fun.new_block(insn_idx);
+                            let join_block = fun.new_block(insn_idx);
+                            fun.push_insn(*block, Insn::CondBranch {
+                                val: is_expected,
+                                if_true: BranchEdge { target: fast_block, args: vec![] },
+                                if_false: BranchEdge { target: fallback_block, args: vec![] },
+                            });
+                            fun.mark_cold(fallback_block);
+                            let fallback = fun.push_insn(fallback_block, fun.insns[insn_id].clone());
+                            fun.set_dynamic_send_reason(fallback, SuperMethodEntryMiss);
+                            fun.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+                            let result = fun.push_insn(join_block, Insn::Param);
+                            fun.insn_types[result] = types::BasicObject;
+                            *block = fast_block;
+
+                            let block_handler = fun.load_field(*block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
+                            fun.push_insn(*block, Insn::GuardBitEquals {
                                 val: block_handler,
                                 expected: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)),
                                 reason: Box::new(SideExitReason::UnhandledBlockArg),
                                 state,
                                 recompile: Some(Recompile),
                             });
+                            SuperFallback { join_block, result }
+                        }
+
+                        // Join the specialized super call's `result` with the fallback and continue in the
+                        // join block.
+                        fn finish_super_call(fun: &mut Function, block: &mut BlockId, insn_id: InsnId, result: InsnId, fallback: SuperFallback) {
+                            fun.push_insn(*block, Insn::Jump(BranchEdge { target: fallback.join_block, args: vec![result] }));
+                            fun.make_equal_to(insn_id, fallback.result);
+                            *block = fallback.join_block;
                         }
 
                         // Don't handle calls with literal blocks (e.g., super { ... })
@@ -7234,7 +7281,7 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
-                            emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                            let fallback = emit_super_call_guards(self, &mut block, insn_id, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
@@ -7251,7 +7298,7 @@ impl Function {
                                 exit_state: state,
                                 block: None,
                             })));
-                            self.make_equal_to(insn_id, replacement);
+                            finish_super_call(self, &mut block, insn_id, replacement, fallback);
 
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
                             let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
@@ -7273,7 +7320,7 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    let fallback = emit_super_call_guards(self, &mut block, insn_id, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7283,11 +7330,11 @@ impl Function {
                                         let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
                                         self.blocks[block].insns.extend(insns);
                                         self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
                                         if self.type_of(replacement).bit_equal(types::Any) {
                                             // Not set yet; infer type
                                             self.insn_types[replacement] = self.infer_type(replacement);
                                         }
+                                        finish_super_call(self, &mut block, insn_id, replacement, fallback);
                                         self.remove_block(tmp_block);
                                         continue;
                                     }
@@ -7318,12 +7365,12 @@ impl Function {
                                             block: None,
                                         })))
                                     };
-                                    self.make_equal_to(insn_id, ccall);
+                                    finish_super_call(self, &mut block, insn_id, ccall, fallback);
                                 }
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
-                                    emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    let fallback = emit_super_call_guards(self, &mut block, insn_id, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7333,11 +7380,11 @@ impl Function {
                                         let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
                                         self.blocks[block].insns.extend(insns);
                                         self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
                                         if self.type_of(replacement).bit_equal(types::Any) {
                                             // Not set yet; infer type
                                             self.insn_types[replacement] = self.infer_type(replacement);
                                         }
+                                        finish_super_call(self, &mut block, insn_id, replacement, fallback);
                                         self.remove_block(tmp_block);
                                         continue;
                                     }
@@ -7367,7 +7414,7 @@ impl Function {
                                             block: None,
                                         })))
                                     };
-                                    self.make_equal_to(insn_id, ccall);
+                                    finish_super_call(self, &mut block, insn_id, ccall, fallback);
                                 }
 
                                 // Array-variadic: (self, args_ruby_array).
