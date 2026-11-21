@@ -972,8 +972,9 @@ pub enum Insn {
     /// distance from it in turn.
     ///
     /// Zero-width whenever there is already enough room, which is the common
-    /// case.
-    PatchPointPad,
+    /// case, or when the preceding patch point is at the same address and jumps
+    /// to the same side exit (the `Label`), so that the two share one jump.
+    PatchPointPad(Label),
 
     /// Space reserved at a boundary that a preceding PatchPoint's invalidation
     /// jump must not cross: the start of a non-entry block, the start of a side
@@ -1087,7 +1088,7 @@ macro_rules! for_each_operand_impl {
             Insn::Breakpoint | Insn::Abort |
             Insn::Comment(_) |
             Insn::CPop { .. } |
-            Insn::PatchPointPad |
+            Insn::PatchPointPad(_) |
             Insn::PosMarker(_) |
             Insn::PosMarkerAtBlockEnd(_) => {},
 
@@ -1282,7 +1283,7 @@ impl Insn {
             Insn::Not { .. } => "Not",
             Insn::Or { .. } => "Or",
             Insn::PatchPoint(..) => "PatchPoint",
-            Insn::PatchPointPad => "PatchPointPad",
+            Insn::PatchPointPad(_) => "PatchPointPad",
             Insn::PosMarker(_) => "PosMarker",
             Insn::PosMarkerAtBlockEnd(_) => "PosMarkerAtBlockEnd",
             Insn::RShift { .. } => "RShift",
@@ -4293,8 +4294,8 @@ impl Assembler {
         self.push_insn(Insn::PatchPoint(Box::new(PatchPointData { target, invariant, version })));
     }
 
-    pub fn patch_point_pad(&mut self) {
-        self.push_insn(Insn::PatchPointPad);
+    pub fn patch_point_pad(&mut self, exit_label: Label) {
+        self.push_insn(Insn::PatchPointPad(exit_label));
     }
 
     pub fn boundary_pad(&mut self) {
