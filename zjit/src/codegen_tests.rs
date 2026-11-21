@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, disable_hir_opt, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lukewarm_gc_count, set_lukewarm_tier_up_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, disable_hir_opt, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lukewarm_gc_count, set_lukewarm_tier_up_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate, set_stub_call_weight};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -386,6 +386,74 @@ fn test_function_stub_profiles_before_compiling() {
 
     // The following hit observes a completed profiling window and compiles.
     assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_profile_stub_entry(true)"));
+    assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
+}
+
+#[test]
+fn test_function_stub_call_weight_delays_profiling() {
+    // With --zjit-stub-call-weight, a stub hit counts as that many calls toward the profile
+    // threshold instead of skipping the callee's unprofiled warmup.
+    rb_zjit_prepare_options();
+    set_inline_threshold(0);
+    let num_profiles = get_option!(num_profiles);
+    let profile_threshold: CallThreshold = 20;
+    let call_threshold = profile_threshold + CallThreshold::from(num_profiles);
+    set_call_threshold(call_threshold);
+    set_stub_call_weight(5);
+
+    eval(&format!("
+        class Integer
+          def zjit_weighted_stub_target = self + 1
+        end
+
+        def zjit_weighted_stub_entry(run)
+          1.zjit_weighted_stub_target if run
+        end
+
+        i = 0
+        while i < {call_threshold}
+          zjit_weighted_stub_entry(false)
+          i += 1
+        end
+    "));
+
+    let entry_iseq = get_method_iseq("self", "zjit_weighted_stub_entry");
+    let entry_version = unsafe { get_or_create_iseq_payload(entry_iseq).versions.last().unwrap().as_ref() };
+    assert_eq!(1, entry_version.outgoing.len(), "expected a JIT-to-JIT function stub");
+
+    let target_iseq = get_method_iseq("1", "zjit_weighted_stub_target");
+    let is_profiling = || {
+        let mut insn_idx = 0;
+        let iseq_size = unsafe { get_iseq_encoded_size(target_iseq) };
+        while insn_idx < iseq_size {
+            let opcode = iseq_opcode_at_idx(target_iseq, insn_idx);
+            if opcode == YARVINSN_zjit_opt_plus {
+                return true;
+            }
+            insn_idx += insn_len(opcode as usize);
+        }
+        false
+    };
+
+    // The first 3 hits count as 5, 10 and 15 calls: below the profile threshold of 20, so the
+    // callee runs in the interpreter without profiling.
+    for _ in 0..3 {
+        assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_weighted_stub_entry(true)"));
+        assert!(!is_profiling());
+        assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+    }
+
+    // The 4th hit reaches the profile threshold and starts the profiling window.
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_weighted_stub_entry(true)"));
+    assert!(is_profiling());
+
+    // As without a weight, the window lasts --zjit-num-profiles hits including the one that
+    // started it, and the hit after it compiles the callee.
+    for _ in 1..num_profiles {
+        assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_weighted_stub_entry(true)"));
+        assert!(get_or_create_iseq_payload(target_iseq).versions.is_empty());
+    }
+    assert_eq!(VALUE::fixnum_from_usize(2), eval("zjit_weighted_stub_entry(true)"));
     assert_eq!(1, get_or_create_iseq_payload(target_iseq).versions.len());
 }
 

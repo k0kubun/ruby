@@ -61,6 +61,7 @@ extern bool rb_zjit_compiling_p;
 extern const zjit_jit_frame_t rb_zjit_c_frame;
 extern unsigned int rb_zjit_call_threshold;
 extern unsigned int rb_zjit_profile_threshold;
+extern unsigned int rb_zjit_stub_call_weight;
 extern unsigned int rb_zjit_backedge_count;
 extern uint64_t rb_zjit_max_compile_time_ns;
 extern uint64_t rb_zjit_total_compile_time_ns;

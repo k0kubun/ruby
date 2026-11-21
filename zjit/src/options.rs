@@ -67,6 +67,16 @@ pub static mut rb_zjit_profile_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD
 #[allow(non_upper_case_globals)]
 pub static mut rb_zjit_call_threshold: CallThreshold = DEFAULT_CALL_THRESHOLD;
 
+/// Number of calls that a call from JIT code to a not-yet-compiled ISEQ, i.e. a function stub
+/// hit, counts as toward rb_zjit_profile_threshold. With the default 0, the first stub hit
+/// skips the callee's unprofiled warmup, so the callee is compiled after --zjit-num-profiles
+/// more calls. A nonzero weight leaves a callee that JIT code rarely calls in the interpreter
+/// longer, which avoids compiling methods that are called only a handful of times after they
+/// are first reached, e.g. late in a request benchmark with a high --zjit-call-threshold.
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static mut rb_zjit_stub_call_weight: CallThreshold = 0;
+
 /// ZJIT command-line options. This is set before rb_zjit_init() sets
 /// ZJITState so that we can query some options while loading builtins.
 pub static mut OPTIONS: Option<Options> = None;
@@ -481,6 +491,11 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             Err(_) => return None,
         },
 
+        ("stub-call-weight", _) => match opt_val.parse() {
+            Ok(n) => unsafe { rb_zjit_stub_call_weight = n; },
+            Err(_) => return None,
+        },
+
         ("num-profiles", _) => match opt_val.parse() {
             Ok(n) => {
                 options.num_profiles = n;
@@ -743,6 +758,13 @@ pub fn set_call_threshold(call_threshold: CallThreshold) {
     unsafe { rb_zjit_call_threshold = call_threshold; }
     rb_zjit_prepare_options();
     update_profile_threshold();
+}
+
+/// Update --zjit-stub-call-weight for testing
+#[cfg(test)]
+pub fn set_stub_call_weight(stub_call_weight: CallThreshold) {
+    rb_zjit_prepare_options();
+    unsafe { rb_zjit_stub_call_weight = stub_call_weight; }
 }
 
 /// Update --zjit-lukewarm-gc-count for testing

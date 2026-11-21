@@ -235,10 +235,17 @@ rb_zjit_iseq_has_profiled_enough(const rb_iseq_t *iseq)
     struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
 
     if (body->jit_entry_calls < rb_zjit_profile_threshold) {
-        // Skip the unprofiled warmup. The compiled caller already establishes
-        // that the callee is hot, so go straight to the profiling window.
-        body->jit_entry_calls = rb_zjit_profile_threshold;
-        rb_zjit_profile_enable(iseq);
+        if (rb_zjit_stub_call_weight == 0 || rb_zjit_profile_threshold - body->jit_entry_calls <= rb_zjit_stub_call_weight) {
+            // Skip the unprofiled warmup. The compiled caller already establishes
+            // that the callee is hot, so go straight to the profiling window.
+            body->jit_entry_calls = rb_zjit_profile_threshold;
+            rb_zjit_profile_enable(iseq);
+        }
+        else {
+            // With --zjit-stub-call-weight, count the call as that many calls instead, so that
+            // a callee that JIT code calls only a few times stays in the interpreter.
+            body->jit_entry_calls += rb_zjit_stub_call_weight;
+        }
     }
     else {
         body->jit_entry_calls++;
