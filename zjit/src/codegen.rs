@@ -800,7 +800,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
             assert!(asm.current_block().insns.last().unwrap().is_terminator());
         }
 
-        assert!(!asm.reverse_post_order().is_empty());
+        // The reverse post-order is not empty, i.e. there is an entry block
+        assert!(asm.basic_blocks.iter().any(|block| block.is_entry));
 
         // Validate CFG invariants after HIR to LIR lowering
         asm.validate_jump_positions();
