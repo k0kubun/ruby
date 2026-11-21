@@ -2806,11 +2806,18 @@ impl Assembler
 
         for block_id in self.block_order() {
             let block = &mut self.basic_blocks[block_id.0];
+            // Blocks without a CCall would be copied unchanged.
+            let num_ccalls = block.insns.iter().filter(|insn| matches!(insn, Insn::CCall { .. })).count();
+            if num_ccalls == 0 {
+                continue;
+            }
             let old_insns = take(&mut block.insns);
             let old_ids = take(&mut block.insn_ids);
 
-            let mut new_insns = Vec::with_capacity(old_insns.len());
-            let mut new_ids = Vec::with_capacity(old_ids.len());
+            // Each CCall expands to pushes, argument moves, and pops around it.
+            let capacity = old_insns.len() + num_ccalls * 16;
+            let mut new_insns = Vec::with_capacity(capacity);
+            let mut new_ids = Vec::with_capacity(capacity);
 
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids) {
                 if let Insn::CCall { data } = insn {
