@@ -1560,6 +1560,140 @@ fn test_getblockparamproxy_polymorphic_none_and_iseq_and_proc() {
 }
 
 #[test]
+fn test_c_call_to_compiled_method() {
+    // Array#include? calls #== from C. Once #== is compiled, the C call enters its JIT code directly.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class EqC
+          def initialize(v) = @v = v
+          def ==(other) = other == @v
+        end
+        ary = [EqC.new(1), EqC.new(2), EqC.new(3)]
+        5.times.map { |i| ary.include?(i) }
+    "), @"[false, true, true, true, false]");
+}
+
+#[test]
+fn test_c_call_to_compiled_method_with_block_and_frames() {
+    // The JIT code called from C must see the passed block and a full backtrace.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class CallC
+          def call_me(a, b) = [a, b, block_given?, caller_locations(1, 1)[0].label]
+        end
+        obj = CallC.new
+        m = obj.method(:call_me)
+        3.times.map { m.call(1, 2) } + [m.call(3, 4) { }]
+    "), @r#"[[1, 2, false, "Method#call"], [1, 2, false, "Method#call"], [1, 2, false, "Method#call"], [3, 4, true, "Method#call"]]"#);
+}
+
+#[test]
+fn test_c_call_to_compiled_method_raises() {
+    // An exception raised by JIT code called from C is rescued in the callee or propagates through the C frame.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class RaiseC
+          def initialize(v) = @v = v
+          def ==(other)
+            raise ArgumentError, 'boom' if other == :raise
+            begin
+              raise 'inner' if other == :rescue
+              false
+            rescue
+              true
+            end
+          end
+        end
+        ary = [RaiseC.new(1)]
+        results = []
+        4.times do
+          results << ary.include?(:rescue)
+          results << (ary.include?(:raise) rescue $!.message)
+          results << ary.include?(1)
+        end
+        results.uniq
+    "), @r#"[true, "boom", false]"#);
+}
+
+#[test]
+fn test_c_call_to_compiled_method_arity_error() {
+    // A C call with the wrong number of arguments still raises ArgumentError after the callee is compiled.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class ArityC
+          def two(a, b) = a + b
+        end
+        obj = ArityC.new
+        m = obj.method(:two)
+        r = 3.times.map { m.call(1, 2) }
+        r << (m.call(1) rescue $!.class)
+        r << (m.call(1, 2, 3) rescue $!.class)
+        r
+    "), @"[3, 3, 3, ArgumentError, ArgumentError]");
+}
+
+#[test]
+fn test_c_call_to_compiled_method_tracepoint() {
+    // TracePoint call/return events fire for a compiled method called from C.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class TraceC
+          def ==(other) = false
+        end
+        ary = [TraceC.new]
+        3.times { ary.include?(1) }
+        events = []
+        tp = TracePoint.new(:call, :return) { |tp| events << [tp.event, tp.method_id] if tp.method_id == :== }
+        tp.enable { ary.include?(1) }
+        3.times { ary.include?(1) }
+        events
+    "), @"[[:call, :==], [:return, :==]]");
+}
+
+#[test]
+fn test_c_yield_to_compiled_block() {
+    // Array#count yields from C. Once the block is compiled, rb_yield enters its JIT code directly.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def count_big(ary) = ary.count { |x| x > 1 }
+        def pairs(ary) = ary.each_with_index.map { |x, i| x * i }
+        5.times.map { [count_big([1, 2, 3]), pairs([4, 5, 6])] }.uniq
+    "), @"[[2, [0, 5, 12]]]");
+}
+
+#[test]
+fn test_c_yield_to_compiled_block_arg_setup() {
+    // Blocks whose arguments need setup (autosplat, padding, truncation, lambda arity) keep their semantics.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def splat2(ary) = ary.map { |a, b| [a, b] }
+        def splat1(ary) = ary.map { |a, | a }
+        def no_splat(ary) = ary.map { |a| a }
+        def none(ary) = ary.count { true }
+        def lam(ary, l) = ary.count(&l)
+        l1 = ->(x) { x > 1 }
+        l2 = ->(a, b) { true }
+        5.times.map do
+          [splat2([[1, 2], 3]), splat1([[1, 2]]), no_splat([[1, 2]]), none([1, 2]), lam([1, 2], l1),
+           (lam([[1, 2]], l2) rescue $!.class)]
+        end.uniq
+    "), @"[[[[1, 2], [3, nil]], [1], [[1, 2]], 2, 1, ArgumentError]]");
+}
+
+#[test]
+fn test_c_yield_to_compiled_block_break_throw_raise() {
+    // break, throw, and exceptions from a compiled block yielded from C unwind the C frame.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        def brk(ary) = ary.count { |x| break x * 10 if x == 2; true }
+        def thr(ary) = catch(:t) { ary.count { |x| throw :t, x if x == 3; true } }
+        def rse(ary) = (ary.count { |x| raise 'e' if x == 1; true } rescue $!.message)
+        def nxt(ary) = ary.count { |x| next false if x == 1; true }
+        5.times.map { [brk([1, 2, 3]), thr([1, 2, 3]), rse([0, 1]), nxt([1, 2])] }.uniq
+    "), @r#"[[20, 3, "e", 1]]"#);
+}
+
+#[test]
 fn test_yield_inline_self_is_captured_self() {
     // The inlined frame's self must be the block's captured self, not the yielding receiver.
     set_call_threshold(2);
