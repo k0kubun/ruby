@@ -4627,6 +4627,116 @@ fn test_invokesuper_to_cfunc_no_args() {
 }
 
 #[test]
+fn test_invokesuper_to_struct_member() {
+    assert_snapshot!(inspect(r#"
+        Small = Struct.new(:a, :b)
+        # Too many members to be embedded
+        Large = Struct.new(*(0...40).map { :"m#{it}" })
+        class SmallSub < Small
+          def b = [:sub, super]
+          def b=(val)
+            super(val * 2)
+          end
+        end
+        class LargeSub < Large
+          def m39 = [:sub, super]
+          def m39=(val)
+            super(val * 2)
+          end
+        end
+
+        def test(small, large)
+          small.b = 3
+          large.m39 = 4
+          [small.b, large.m39]
+        end
+
+        small = SmallSub.new(1, 2)
+        large = LargeSub.new
+        test(small, large)
+        [test(small, large), small.to_a, large.m39]
+    "#), @"[[[:sub, 6], [:sub, 8]], [1, 6], [:sub, 8]]");
+}
+
+#[test]
+fn test_invokesuper_to_struct_member_writer_frozen() {
+    assert_snapshot!(inspect(r#"
+        S = Struct.new(:a)
+        class C < S
+          def a=(val)
+            super
+          end
+        end
+
+        def test(obj) = (obj.a = 1)
+
+        test(C.new(0))
+        begin
+          test(C.new(0).freeze)
+        rescue => e
+          e.class
+        end
+    "#), @"FrozenError");
+}
+
+#[test]
+fn test_invokesuper_to_struct_member_redefined() {
+    assert_snapshot!(inspect(r#"
+        S = Struct.new(:a)
+        class C < S
+          def a = super
+        end
+
+        def test(obj) = obj.a
+
+        obj = C.new(1)
+        test(obj)
+        before = test(obj)
+        class S
+          def a = :redefined
+        end
+        [before, test(obj)]
+    "#), @"[1, :redefined]");
+}
+
+#[test]
+fn test_invokesuper_to_struct_member_from_module_and_singleton() {
+    assert_snapshot!(inspect(r#"
+        S = Struct.new(:a)
+        module Doubled
+          def a = super * 2
+        end
+        class C < S
+          prepend Doubled
+        end
+        obj = C.new(5)
+        singleton = S.new(7)
+        def singleton.a = super + 1
+
+        def test(obj, singleton) = [obj.a, singleton.a]
+
+        test(obj, singleton)
+        test(obj, singleton)
+    "#), @"[10, 8]");
+}
+
+#[test]
+fn test_invokesuper_to_data_member() {
+    assert_snapshot!(inspect(r#"
+        D = Data.define(:a, :b)
+        class C < D
+          def b = super.to_s
+        end
+
+        def test(obj) = obj.b
+
+        obj = C.new(a: 1, b: 2)
+        test(obj)
+        test(obj)
+    "#), @r#""2""#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String
