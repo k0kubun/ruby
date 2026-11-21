@@ -1074,6 +1074,8 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::DupArrayInclude { ary, target, state } => gen_dup_array_include(jit, asm, function, ary, opnd!(target), &function.frame_state(state)),
         Insn::ArrayHash { elements, state } => gen_opt_newarray_hash(jit, asm, function, opnds!(elements), &function.frame_state(*state)),
         &Insn::IsA { val, class } => gen_is_a(jit, asm, opnd!(val), opnd!(class)),
+        // The inline handler only emits IsInstanceOf for a constant class.
+        &Insn::IsInstanceOf { val, class } => gen_is_instance_of(jit, asm, opnd!(val), function.type_of(class).ruby_object().expect("IsInstanceOf with a non-constant class")),
         &Insn::ArrayMax { ref elements, state } => gen_array_max(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::ArrayMin { ref elements, state } => gen_array_min(jit, asm, function, opnds!(elements), &function.frame_state(state)),
         &Insn::Throw { throw_state, val, state } => no_output!(gen_throw(jit, asm, function, throw_state, opnd!(val), &function.frame_state(state))),
@@ -3233,6 +3235,81 @@ fn gen_is_a(jit: &mut JITState, asm: &mut Assembler, obj: Opnd, class: Opnd) -> 
     } else {
         asm_ccall!(asm, rb_obj_is_kind_of, obj, class)
     }
+}
+
+/// Compile `rb_obj_is_instance_of(obj, class)` for a constant Class: `rb_obj_class(obj) == class`.
+fn gen_is_instance_of(jit: &mut JITState, asm: &mut Assembler, obj: Opnd, class: VALUE) -> lir::Opnd {
+    // rb_obj_class() skips singleton classes, so it never returns one.
+    if class.is_singleton_class() {
+        return Qfalse.into();
+    }
+
+    asm_comment!(asm, "IsInstanceOf {}", get_class_name(class));
+    let val = asm.load_mem(obj);
+
+    // These classes have no instances other than the special constant.
+    if let Some(special_const) = [(unsafe { rb_cNilClass }, Qnil), (unsafe { rb_cTrueClass }, Qtrue), (unsafe { rb_cFalseClass }, Qfalse)]
+        .into_iter().find_map(|(special_class, special_const)| (special_class == class).then_some(special_const)) {
+        asm.cmp(val, special_const.into());
+        return asm.csel_e(Qtrue.into(), Qfalse.into());
+    }
+
+    let hir_block_id = asm.current_block().hir_block_id;
+    let rpo_idx = asm.current_block().rpo_index;
+    let heap_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let singleton_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let result_block = asm.new_block(hir_block_id, false, rpo_idx);
+    let heap_edge = || Target::Block(Box::new(lir::BranchEdge { target: heap_block, args: vec![] }));
+    let result_edge = |v: Opnd| Target::Block(Box::new(lir::BranchEdge { target: result_block, args: vec![v] }));
+
+    // Special constants have no class pointer. Check the ones whose class is `class`, then the
+    // rest are instances of other classes.
+    if class == unsafe { rb_cInteger } {
+        asm.test(val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
+        asm.jnz(jit, result_edge(Qtrue.into()));
+    } else if class == unsafe { rb_cFloat } {
+        let masked = asm.and(val, Opnd::UImm(RUBY_FLONUM_MASK as u64));
+        asm.cmp(masked, Opnd::UImm(RUBY_FLONUM_FLAG as u64));
+        asm.je(jit, result_edge(Qtrue.into()));
+    } else if class == unsafe { rb_cSymbol } {
+        let val = asm.load_imm(val);
+        asm.cmp(val.with_num_bits(8), Opnd::UImm(RUBY_SYMBOL_FLAG as u64));
+        asm.je(jit, result_edge(Qtrue.into()));
+    }
+    asm.test(val, Opnd::UImm(RUBY_IMMEDIATE_MASK as u64));
+    asm.jnz(jit, result_edge(Qfalse.into()));
+    asm.cmp(val, Qfalse.into());
+    asm.je(jit, result_edge(Qfalse.into()));
+    asm.jmp(heap_edge());
+
+    // Heap object -> compare the class pointer
+    asm.set_current_block(heap_block);
+    let label = jit.get_label(asm, heap_block, hir_block_id);
+    asm.write_label(label);
+    let klass = asm.load(Opnd::mem(VALUE_BITS, val, RUBY_OFFSET_RBASIC_KLASS));
+    asm.cmp(klass, Opnd::Value(class));
+    asm.je(jit, result_edge(Qtrue.into()));
+    // `class` isn't a singleton class, so any other non-singleton class doesn't match.
+    let klass_flags = asm.load(Opnd::mem(VALUE_BITS, klass, RUBY_OFFSET_RBASIC_FLAGS));
+    asm.test(klass_flags, Opnd::UImm(RUBY_FL_SINGLETON as u64));
+    asm.jz(jit, result_edge(Qfalse.into()));
+    asm.jmp(Target::Block(Box::new(lir::BranchEdge { target: singleton_block, args: vec![] })));
+
+    // Singleton class -> let rb_obj_class() skip it and included modules
+    asm.set_current_block(singleton_block);
+    let label = jit.get_label(asm, singleton_block, hir_block_id);
+    asm.write_label(label);
+    let obj_class = asm_ccall!(asm, rb_obj_class, val);
+    asm.cmp(obj_class, Opnd::Value(class));
+    let result = asm.csel_e(Qtrue.into(), Qfalse.into());
+    asm.jmp(result_edge(result));
+
+    asm.set_current_block(result_block);
+    let label = jit.get_label(asm, result_block, hir_block_id);
+    asm.write_label(label);
+    let param = asm.new_block_param(VALUE_BITS);
+    asm.current_block().add_parameter(param);
+    param
 }
 
 /// Compile a new hash instruction
