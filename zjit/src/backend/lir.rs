@@ -2259,7 +2259,7 @@ impl Assembler
     /// operands to this instruction.
     pub fn push_insn(&mut self, insn: Insn) {
         // If this Assembler should not accept scratch registers, assert no use of them.
-        if !self.accept_scratch_reg {
+        if cfg!(debug_assertions) && !self.accept_scratch_reg {
             insn.for_each_operand(|opnd| {
                 assert!(!Self::has_scratch_reg(opnd), "should not use scratch register: {opnd:?}");
             });
