@@ -5728,8 +5728,19 @@ impl Function {
         }
         let mut cmes: Vec<(*const rb_callable_method_entry_t, VALUE, usize)> = vec![];
         let mut defs: Vec<(*const rb_method_definition_t, *const rb_callable_method_entry_t, VALUE, usize)> = vec![];
-        for klass in classes {
-            let cme = unsafe { rb_callable_method_entry(klass, mid) };
+        // Receivers whose class is a singleton class aren't profiled, e.g. a logger extended with a
+        // module. If the profile saw nothing else, check for the method entry that the call cache
+        // of the call site holds, which the last receiver called.
+        let mut lookups: Vec<(VALUE, *const rb_callable_method_entry_t)> = classes.iter()
+            .map(|&klass| (klass, unsafe { rb_callable_method_entry(klass, mid) })).collect();
+        if lookups.is_empty() && reason != SendPolymorphicFallback {
+            let cme = unsafe { rb_zjit_call_data_cme(cd) };
+            if cme.is_null() {
+                return None;
+            }
+            lookups.push((unsafe { (*cme).owner }, cme));
+        }
+        for (klass, cme) in lookups {
             if cme.is_null() {
                 return None;
             }
