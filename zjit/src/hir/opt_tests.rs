@@ -25878,7 +25878,7 @@ mod hir_opt_tests {
         set_inline_threshold(100);
         eval(r#"
             class C
-              protected def secret(**kwargs) = kwargs
+              protected def secret(k: 0, **kwargs) = kwargs
               def helper = 1 + 2
               def test(other, kwargs)
                 helper
