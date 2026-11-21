@@ -1458,6 +1458,9 @@ pub struct Interval {
 
     pub assigned: Cell<Option<Allocation>>,
     pub preferred: Option<Allocation>,
+    /// Whether linear_scan() should put this interval in a stack slot rather than in a
+    /// register. See [Assembler::stack_slots_for_call_crossing_intervals].
+    pub prefer_stack: bool,
 }
 
 impl Interval {
@@ -1469,6 +1472,7 @@ impl Interval {
             state: Cell::new(IntervalState::Unhandled),
             assigned: Cell::new(None),
             preferred: None,
+            prefer_stack: false,
         }
     }
 
@@ -2256,6 +2260,63 @@ impl Assembler
         }
     }
 
+    /// Mark intervals that are cheaper in a stack slot than in a register. A register
+    /// allocated to an interval that is live across a CCall is pushed and popped around
+    /// the call by handle_caller_saved_regs(), while a stack slot costs a load or store per
+    /// use instead. So prefer a stack slot when an interval crosses more CCalls than it has
+    /// uses, e.g. a local that only side exits and stack maps read across a loop of C
+    /// method calls. Operands in side exits and stack maps don't count as uses since they
+    /// read a stack slot as well as a register.
+    pub fn stack_slots_for_call_crossing_intervals(&self, intervals: &mut [Interval]) {
+        let mut ccall_numbers: Vec<usize> = vec![];
+        let mut uses: Vec<isize> = vec![0; intervals.len()];
+        let mut count = |opnd: Opnd, delta: isize| {
+            match opnd {
+                Opnd::VReg { idx, .. } | Opnd::Mem(Mem { base: MemBase::VReg(idx), .. }) => uses[idx.0 as usize] += delta,
+                _ => {}
+            }
+        };
+        for block in &self.basic_blocks {
+            for (insn, insn_id) in block.insns.iter().zip(block.insn_ids.iter()) {
+                insn.for_each_operand(|opnd| count(opnd, 1));
+                if let Some(out) = insn.out_opnd() {
+                    count(*out, 1);
+                }
+                let stack = match insn {
+                    Insn::CCall { data } => {
+                        ccall_numbers.push(insn_id.map(|id| id.0).unwrap_or(0));
+                        data.stack_map.as_ref().map(|StackMap { stack, .. }| stack)
+                    }
+                    _ => match insn.target() {
+                        Some(Target::SideExit(data)) => Some(&data.exit.stack_map.stack),
+                        _ => None,
+                    },
+                };
+                for entry in stack.into_iter().flatten() {
+                    if let StackMapEntry::Opnd(opnd) = entry {
+                        count(*opnd, -1);
+                    }
+                }
+            }
+        }
+        if ccall_numbers.is_empty() {
+            return;
+        }
+        ccall_numbers.sort_unstable();
+        ccall_numbers.dedup();
+
+        for interval in intervals.iter_mut().filter(|interval| interval.has_bounds() && interval.preferred.is_none()) {
+            // A CCall defining the interval doesn't preserve it.
+            let start = interval.start();
+            let mut crossings = 0;
+            for range in interval.ranges.iter() {
+                let first = ccall_numbers.partition_point(|&n| n < range.from);
+                crossings += ccall_numbers[first..].iter().take_while(|&&n| n < range.to).filter(|&&n| n != start).count();
+            }
+            interval.prefer_stack = crossings as isize > uses[interval.vreg_id.0 as usize];
+        }
+    }
+
     // TODO: We want to make the following refactoring so that we DON'T have
     // to parcopy in to entry blocks
     //
@@ -2288,6 +2349,13 @@ impl Assembler
         while let Some(cur) = unhandled.pop_front() {
             let position = cur.start();
             let cur_end = cur.end();
+
+            if cur.prefer_stack {
+                cur.assigned.set(Some(Allocation::Stack(num_stack_slots)));
+                num_stack_slots += 1;
+                cur.state.set(IntervalState::Handled);
+                continue;
+            }
 
             // Expire old intervals.
             active.retain(|&it| {
@@ -5203,6 +5271,62 @@ mod tests {
             let second_last = &b2_insns[b2_insns.len() - 2];
             assert!(matches!(second_last, Insn::Mov { .. }), "Expected Mov before Jmp in b2");
         }
+    }
+
+    #[test]
+    fn test_stack_slots_for_call_crossing_intervals() {
+        let mut asm = Assembler::new();
+        let b1 = asm.new_block(hir::BlockId(0), true, 0);
+        asm.set_current_block(b1);
+        let label = asm.new_label("bb0");
+        asm.write_label(label);
+
+        let ccall = |asm: &mut Assembler| {
+            let out = asm.new_vreg(64);
+            asm.basic_blocks[b1.0].push_insn(Insn::CCall {
+                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out }),
+            });
+        };
+        let load = |asm: &mut Assembler| {
+            let out = asm.new_vreg(64);
+            asm.basic_blocks[b1.0].push_insn(Insn::Load { opnd: Opnd::UImm(5), out });
+            out
+        };
+        let store = |asm: &mut Assembler, src: Opnd| {
+            asm.basic_blocks[b1.0].push_insn(Insn::Store { dest: Opnd::mem(64, SP, 0), src });
+        };
+
+        // v_many crosses 3 CCalls with a def and a use: a stack slot is cheaper.
+        let v_many = load(&mut asm);
+        ccall(&mut asm);
+        ccall(&mut asm);
+        ccall(&mut asm);
+        store(&mut asm, v_many);
+        // v_also crosses 3 CCalls after v_many ends.
+        let v_also = load(&mut asm);
+        ccall(&mut asm);
+        ccall(&mut asm);
+        ccall(&mut asm);
+        store(&mut asm, v_also);
+        // v_few crosses 2 CCalls with a def and a use: a register is as cheap.
+        let v_few = load(&mut asm);
+        ccall(&mut asm);
+        ccall(&mut asm);
+        store(&mut asm, v_few);
+        asm.basic_blocks[b1.0].push_insn(Insn::CRet(Opnd::UImm(0)));
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in);
+        let mut regs = alloc_reg_pool(4);
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        asm.stack_slots_for_call_crossing_intervals(&mut intervals);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+
+        assert_eq!(intervals[v_many.vreg_idx()].assigned.get(), Some(Allocation::Stack(0)));
+        assert_eq!(intervals[v_also.vreg_idx()].assigned.get(), Some(Allocation::Stack(1)));
+        assert!(matches!(intervals[v_few.vreg_idx()].assigned.get(), Some(Allocation::Reg(_))));
+        assert_eq!(num_stack_slots, 2);
     }
 
     #[test]
