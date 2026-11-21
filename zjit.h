@@ -158,6 +158,18 @@ CFP_ZJIT_FRAME_P(const rb_control_frame_t *cfp)
     return cfp->jit_return != NULL;
 }
 
+// Return true if a given CFP is a frame of an ISEQ that ZJIT code runs. Its JITFrame always
+// has a PC and an ISEQ, so CFP_PC() and CFP_ISEQ() return non-NULL without reading it.
+static inline bool
+ZJIT_ISEQ_FRAME_P(const rb_control_frame_t *cfp)
+{
+#if USE_ZJIT
+    return CFP_ZJIT_FRAME_P(cfp) && (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_C_FRAME;
+#else
+    return false;
+#endif
+}
+
 static inline const VALUE*
 CFP_PC(const rb_control_frame_t *cfp)
 {

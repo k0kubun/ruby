@@ -10867,6 +10867,21 @@ fn test_non_nil_nil() {
 }
 
 #[test]
+fn test_backref_set_by_cfunc_in_jit_frames() {
+    // C methods called from JIT code find the frame for $~ through ZJIT frames, including
+    // inlined ones and blocks, whose svar lives in the method's local EP.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        def match_in_method(s) = (s.start_with?(/a(.)/); $1)
+        def callee(s) = s.start_with?(/x(.)/)
+        def match_in_callee(s) = (callee(s); $1)
+        def match_in_block(s) = ([s].each { |t| t.start_with?(/b(.)/) }; $1)
+        def keep_caller_match(s) = (s =~ /(c)/; callee("x9"); [$1, $~.pre_match])
+        5.times.map { [match_in_method("abc"), match_in_callee("x7"), match_in_block("bz"), keep_caller_match("acd")] }.uniq
+    "#), @r#"[["b", nil, "z", ["c", "a"]]]"#);
+}
+
+#[test]
 fn test_getspecial_last_match() {
     eval(r#"
         def test(str)
