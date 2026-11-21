@@ -990,7 +990,7 @@ ivdiag_dump(VALUE _)
         uint64_t objs = s->count - s->not_obj;
         fprintf(f, "%s %llu %s:%d %s @%s ic=%p shapes=%d%s lasthit=%.1f%% top8=%.1f%% top16=%.1f%% complex=%llu notobj=%llu classes=",
                 s->kind ? "SET" : "GET", (unsigned long long)s->count,
-                RSTRING_PTR(path), FIX2INT(ISEQ_BODY(s->iseq)->location.first_lineno),
+                RSTRING_PTR(path), (int)ISEQ_BODY(s->iseq)->location.first_lineno,
                 RSTRING_PTR(rb_iseq_label(s->iseq)), rb_id2name(s->id), s->ic, s->nshapes, s->nshapes >= 64 ? "+" : "",
                 objs ? 100.0 * s->last_hit / objs : 0.0, objs ? 100.0 * top8 / objs : 0.0, objs ? 100.0 * top16 / objs : 0.0,
                 (unsigned long long)s->complex, (unsigned long long)s->not_obj);
