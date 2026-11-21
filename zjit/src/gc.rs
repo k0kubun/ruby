@@ -143,6 +143,9 @@ fn iseq_mark(payload: &IseqPayload) {
             }
         }
 
+        // Mark objects referenced by side-exit descriptors
+        crate::exit_desc::mark(&unsafe { version.as_ref() }.exit_descs);
+
         // Mark the classes cached by the JIT code
         for klass_cache in unsafe { version.as_ref() }.klass_caches.iter() {
             if **klass_cache != Qfalse {
@@ -195,6 +198,9 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
             **klass_cache = unsafe { rb_gc_location(**klass_cache) };
         }
     }
+
+    // Move objects referenced by side-exit descriptors
+    crate::exit_desc::update_references(&unsafe { version.as_ref() }.exit_descs);
 
     // Move objects baked in JIT code.
     // The code region is already writable because rb_zjit_mark_all_writable() was called
