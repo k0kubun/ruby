@@ -3625,6 +3625,105 @@ fn test_function_stub_exit_initializes_block_param() {
 }
 
 #[test]
+fn test_function_stub_runs_cant_compile_callee_in_interpreter() {
+    // A callee that can't be compiled (its stack_max is too large) runs in the interpreter and
+    // returns to the compiled caller, instead of exiting the caller on every call.
+    set_inline_threshold(0);
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval(r#"
+        elems = (["a"] * 130).join(", ")
+        eval <<~RUBY
+          def zjit_cc_callee(a) = [#{elems}].size + a
+          def zjit_cc_opt(a, b = 10, c = 20) = [#{elems}].size + a + b + c
+          def zjit_cc_yield(a) = [#{elems}].size + yield(a)
+          def zjit_cc_raise(a) = [#{elems}].size + (a == 0 ? raise("boom #{'#'}{a}") : a)
+        RUBY
+
+        def kaller(a) = zjit_cc_callee(a) + 1
+        def kaller_opt(a) = [zjit_cc_opt(a), zjit_cc_opt(a, 2), zjit_cc_opt(a, 2, 3)]
+        def kaller_yield(a) = zjit_cc_yield(a) { |x| x * 2 }
+        def kaller_raise(a)
+          zjit_cc_raise(a)
+        rescue => e
+          e.message
+        end
+        def kallers(a) = [kaller(a), kaller_opt(a), kaller_yield(a), kaller_raise(a)]
+        10.times { kallers(1) }
+    "#);
+    let side_exits_before = counters.side_exit_count;
+    let interp_calls_before = counters.function_stub_interp_after_compile_error;
+    assert_snapshot!(inspect("100.times.map { kallers(it) }.uniq.first(2)"), @r#"[[131, [160, 152, 135], 130, "boom 0"], [132, [161, 153, 136], 132, 131]]"#);
+    assert_eq!(0, counters.side_exit_count - side_exits_before, "the compiled callers shouldn't exit");
+    assert_eq!(100 * 6, counters.function_stub_interp_after_compile_error - interp_calls_before, "the callers should stay compiled");
+}
+
+#[test]
+fn test_function_stub_runs_callee_in_interpreter_after_oom() {
+    // Once the code region is full, a callee whose compilation fails with OutOfMemory runs in
+    // the interpreter and returns to the compiled caller, instead of exiting the caller on
+    // every call.
+    set_mem_bytes(1024 * 1024);
+    set_inline_threshold(0);
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval(r#"
+        # Make the callee big enough that compiling it exhausts the code region.
+        body = (0...400).map { |k| "u#{k} = #{k} + n" }.join("\n")
+        eval <<~RUBY
+          def zjit_oom_callee(n)
+            #{body}
+            raise "boom" if n < 0
+            n + (block_given? ? yield(u399) : u399)
+          end
+        RUBY
+
+        # Compile the callers, which generates the function stubs, without running them, so
+        # the callee is still uncompiled when a stub is first hit.
+        def kaller(run, n) = (run ? zjit_oom_callee(n) : n) + 1
+        def kaller_yield(run, n) = run ? zjit_oom_callee(n) { |x| x * 2 } : nil
+        def kaller_raise(run, n)
+          run ? zjit_oom_callee(-1) : raise("warmup")
+        rescue => e
+          e.message
+        end
+        def kallers(run, n) = [kaller(run, n), kaller_yield(run, n), kaller_raise(run, n)]
+        300.times { kallers(false, 1) }
+        # The calls to the callee weren't profiled, so the first few calls side-exit until they
+        # are recompiled with function stubs.
+        20.times { kallers(true, 1) }
+    "#);
+    assert!(crate::state::ZJITState::get_code_block().has_dropped_bytes(), "the code region should be full");
+    let side_exits_before = counters.side_exit_count;
+    let interp_calls_before = counters.function_stub_interp_after_compile_error;
+    assert_snapshot!(inspect("100.times.map { kallers(true, it) }.uniq.first(2)"), @r#"[[400, 798, "boom"], [402, 801, "boom"]]"#);
+    assert_eq!(0, counters.side_exit_count - side_exits_before, "the compiled callers shouldn't exit");
+    assert_eq!(100 * 3, counters.function_stub_interp_after_compile_error - interp_calls_before, "the callers should stay compiled");
+}
+
+#[test]
+fn test_function_stub_fallback_for_compile_error() {
+    // Only a full native stack, which is transient, exits the caller. The other compile errors
+    // run the callee in the interpreter.
+    use crate::state::ZJITState;
+    use crate::stats::CompileError;
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let exit = ZJITState::get_materialize_exit_trampoline_with_counter();
+    let exec_callee = ZJITState::get_exec_callee_trampoline();
+    assert_eq!(exit, super::stub_fallback_for_compile_error(&CompileError::NativeStackTooLarge));
+    for compile_error in [
+        CompileError::OutOfMemory,
+        CompileError::IseqStackTooLarge,
+        CompileError::IseqVersionLimitReached,
+        CompileError::LabelLinkingFailure,
+    ] {
+        assert_eq!(exec_callee, super::stub_fallback_for_compile_error(&compile_error), "{compile_error:?}");
+    }
+}
+
+#[test]
 fn test_no_ep_escape_side_exit_restores_locals_while_oom() {
     // A regression test for stub compilation failures on OOM. Functions patched by NoEPEscape
     // used to be unsafe to enter (FrameState used without_locals() and didn't spill the entry
