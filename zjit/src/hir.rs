@@ -9837,13 +9837,19 @@ impl Function {
         }
         let mut necessary = InsnSet::with_capacity(self.insns.len());
         // Now recursively traverse their data dependencies and mark those as necessary
+        let union_find = self.union_find.borrow();
         while let Some(insn_id) = worklist.pop_front() {
             if !necessary.insert(insn_id) { continue; }
-            let insn_id = self.union_find.borrow().find_const(insn_id);
+            let insn_id = union_find.find_const(insn_id);
             self.insns[insn_id].for_each_operand(|operand| {
-                worklist.push_back(self.union_find.borrow().find_const(operand));
+                let operand = union_find.find_const(operand);
+                // An operand marked already would be skipped when popped
+                if !necessary.get(operand) {
+                    worklist.push_back(operand);
+                }
             });
         }
+        drop(union_find);
         // Now remove all unnecessary instructions
         for block_id in &rpo {
             self.blocks[*block_id].insns.retain(|&insn_id| necessary.get(insn_id));
