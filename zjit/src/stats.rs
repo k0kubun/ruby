@@ -159,6 +159,9 @@ make_counters! {
         jit_frame_heap_bytes,
         jit_frame_stack_map_bytes,
         skipped_native_stack_full,
+        // Calls through a function stub whose callee couldn't be compiled, run in the interpreter
+        // and returned to the JIT caller. See stub_fallback_for_compile_error().
+        function_stub_interp_after_compile_error,
 
         compile_time_ns,
         profile_time_ns,
