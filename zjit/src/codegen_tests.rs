@@ -7343,6 +7343,27 @@ fn test_send_on_method_entry_cached_class() {
 }
 
 #[test]
+fn test_send_on_method_entry_cached_classes() {
+    // The site caches several classes. Alternating classes, a redefinition in a class cached
+    // behind others, and a compaction that moves the cached classes must all be handled.
+    assert_snapshot!(inspect("
+        class Base
+          def foo = 1
+        end
+        CLASSES = 10.times.map { Class.new(Base) }
+        OBJECTS = CLASSES.map(&:new)
+        def test(o) = o.foo
+        test(OBJECTS[0]); test(OBJECTS[1])
+        r = 3.times.map { OBJECTS.sum { test(it) } }
+        3.times { OBJECTS.first(4).each { test(it) } }
+        CLASSES[1].class_eval { def foo = 2 }
+        r << OBJECTS.first(4).map { test(it) }
+        GC.verify_compaction_references(expand_heap: true, toward: :empty) rescue nil
+        r << OBJECTS.map { test(it) }.sum
+    "), @"[10, 10, 10, [1, 2, 1, 1], 11]");
+}
+
+#[test]
 fn test_send_on_method_entry_cfunc() {
     assert_snapshot!(inspect("
         class Base; end

@@ -76,7 +76,7 @@ pub struct IseqVersion {
 
     /// Per-call-site caches of a receiver class that the JIT code writes at run time. See
     /// [`crate::hir::Function::klass_caches`]. Marked and moved by [`crate::gc`].
-    pub klass_caches: Vec<Box<VALUE>>,
+    pub klass_caches: Vec<Box<crate::hir::KlassCache>>,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
