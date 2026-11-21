@@ -12630,6 +12630,107 @@ fn test_is_a_normal_case() {
 }
 
 #[test]
+fn test_instance_of_megamorphic_receivers() {
+    // Profile each site with more receiver classes than a polymorphic dispatch splits on, so
+    // receivers outside the profile run IsInstanceOf instead of a folded constant.
+    set_call_threshold(7);
+    assert_snapshot!(inspect(r#"
+        class Sub < String; end
+        module M; end
+        singleton = Object.new
+        def singleton.x = nil
+        extended = Object.new.extend(M)
+        recvs = [:sym, 1, 1.5, true, nil, false, "s", Sub.new("x"), 2**70, 1e300, 0.0, "dyn#{1}".to_sym,
+                 singleton, extended, Object.new, String, M]
+        classes = %w[String Sub Integer Float Symbol TrueClass FalseClass NilClass Object BasicObject Class Module M Comparable]
+        classes.each_with_index { |c, i| eval("def t#{i}(x) = x.instance_of?(#{c})") }
+        classes.each_index { |i| recvs.first(6).each { |r| send(:"t#{i}", r) } }
+        mismatches = []
+        2.times do
+          classes.each_with_index do |c, i|
+            recvs.each do |r|
+              expected = Kernel.instance_method(:instance_of?).bind_call(r, Object.const_get(c))
+              actual = send(:"t#{i}", r)
+              mismatches << [c, r.__id__, actual] if actual != expected
+            end
+          end
+        end
+        mismatches
+    "#), @"[]");
+}
+
+#[test]
+fn test_instance_of_singleton_class_receiver() {
+    assert_snapshot!(inspect("
+        o = Object.new
+        def o.x = nil
+        def test(x) = [x.instance_of?(Object), x.instance_of?(x.singleton_class), x.instance_of?(BasicObject)]
+        test(o)
+        test(o)
+    "), @"[true, false, false]");
+}
+
+#[test]
+fn test_instance_of_singleton_class_argument() {
+    assert_snapshot!(inspect("
+        O = Object.new
+        S = O.singleton_class
+        def test(x) = x.instance_of?(S)
+        test(O)
+        [test(O), test(Object.new)]
+    "), @"[false, false]");
+}
+
+#[test]
+fn test_instance_of_module_argument() {
+    assert_snapshot!(inspect("
+        def test(x) = x.instance_of?(Kernel)
+        test(Object.new)
+        [test(Object.new), test(Kernel)]
+    "), @"[false, false]");
+}
+
+#[test]
+fn test_instance_of_non_class_argument_raises() {
+    assert_snapshot!(inspect("
+        def test(x) = begin; x.instance_of?(1); rescue TypeError => e; e.message; end
+        test('a')
+        test('a')
+    "), @r#""class or module required""#);
+}
+
+#[test]
+fn test_instance_of_redefined() {
+    assert_snapshot!(inspect(r#"
+        def test(x) = x.instance_of?(String)
+        test("a")
+        before = test("a")
+        class String
+          def instance_of?(c) = :redefined
+        end
+        [before, test("a")]
+    "#), @"[true, :redefined]");
+}
+
+#[test]
+fn test_instance_of_redefined_megamorphic() {
+    set_call_threshold(7);
+    assert_snapshot!(inspect(r#"
+        def test(x) = x.instance_of?(Integer)
+        recvs = [:sym, 1, 1.5, true, nil, false, "s", 2**70]
+        recvs.first(6).each { test(it) }
+        before = recvs.map { test(it) }
+        class Integer
+          def instance_of?(c) = :int
+        end
+        module Kernel
+          def instance_of?(c) = :kernel
+        end
+        [before, recvs.map { test(it) }]
+    "#), @"[[false, true, false, false, false, false, false, true], [:kernel, :int, :kernel, :kernel, :kernel, :kernel, :kernel, :int]]");
+}
+
+#[test]
 fn test_fixnum_div_zero() {
     eval("
         def test(n)

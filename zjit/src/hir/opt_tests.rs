@@ -23835,6 +23835,435 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_specialize_instance_of_class() {
+        eval(r#"
+            def test(o) = o.instance_of?(String)
+            test("asdf")
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, String)
+          v16:ClassSubclass[String@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          PatchPoint NoSingletonClass(String@0x1010)
+          PatchPoint MethodRedefined(String@0x1010, instance_of?@0x1011, cme:0x1018)
+          v31:StringExact = GuardType v10, StringExact recompile
+          v33:TrueClass = Const Value(true)
+          CheckInterrupts
+          Return v33
+        ");
+    }
+
+    #[test]
+    fn test_fold_instance_of_superclass_false() {
+        eval(r#"
+            def test = 5.instance_of?(Numeric)
+            test
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          v10:Fixnum[5] = Const Value(5)
+          PatchPoint StableConstantNames(0x1000, Numeric)
+          v13:ClassSubclass[Numeric@0x1008] = Const Value(VALUE(0x1008))
+          PatchPoint MethodRedefined(Integer@0x1010, instance_of?@0x1018, cme:0x1020)
+          v25:FalseClass = Const Value(false)
+          CheckInterrupts
+          Return v25
+        ");
+    }
+
+    #[test]
+    fn test_fold_instance_of_unrelated_class_false() {
+        eval(r#"
+            def test(o) = o.instance_of?(Symbol)
+            test(nil)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, Symbol)
+          v16:ClassSubclass[Symbol@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          PatchPoint MethodRedefined(NilClass@0x1018, instance_of?@0x1020, cme:0x1028)
+          v30:NilClass = GuardType v10, NilClass recompile
+          v32:FalseClass = Const Value(false)
+          CheckInterrupts
+          Return v32
+        ");
+    }
+
+    #[test]
+    fn test_fold_instance_of_module_false() {
+        eval(r#"
+            def test(o) = o.instance_of?(Kernel)
+            test("asdf")
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, Kernel)
+          v16:ModuleSubclass[Kernel@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          PatchPoint NoSingletonClass(String@0x1018)
+          PatchPoint MethodRedefined(String@0x1018, instance_of?@0x1020, cme:0x1028)
+          v31:StringExact = GuardType v10, StringExact recompile
+          v32:FalseClass = Const Value(false)
+          CheckInterrupts
+          Return v32
+        ");
+    }
+
+    #[test]
+    fn test_fold_instance_of_singleton_class_false() {
+        eval(r#"
+            S = Object.new.singleton_class
+            def test(o) = o.instance_of?(S)
+            test("asdf")
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, S)
+          v16:ClassSubclass[Object@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          PatchPoint NoSingletonClass(String@0x1018)
+          PatchPoint MethodRedefined(String@0x1018, instance_of?@0x1020, cme:0x1028)
+          v31:StringExact = GuardType v10, StringExact recompile
+          v33:FalseClass = Const Value(false)
+          CheckInterrupts
+          Return v33
+        ");
+    }
+
+    #[test]
+    fn test_dont_specialize_instance_of_non_class() {
+        eval(r#"
+            def test(o) = o.instance_of?(1) rescue nil
+            test("asdf")
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Fixnum[1] = Const Value(1)
+          PatchPoint NoSingletonClass(String@0x1008)
+          PatchPoint MethodRedefined(String@0x1008, instance_of?@0x1010, cme:0x1018)
+          v29:StringExact = GuardType v10, StringExact recompile
+          v30:BasicObject = CCallWithFrame v29, :Kernel#instance_of?@0x1040, v15
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v30
+        ");
+    }
+
+    #[test]
+    fn test_specialize_instance_of_polymorphic() {
+        set_call_threshold(4);
+        eval(r#"
+            def test(o) = o.instance_of?(String)
+            test("asdf")
+            test(4)
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, String)
+          v16:ClassSubclass[String@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          CondBranchHasType v10, Fixnum, bb6(), bb7()
+        bb6():
+          PatchPoint MethodRedefined(Integer@0x1018, instance_of?@0x1020, cme:0x1028)
+          v69:FalseClass = Const Value(false)
+          Jump bb4(v69)
+        bb7():
+          CondBranchHasType v10, StringExact, bb8(), bb5()
+        bb8():
+          PatchPoint NoSingletonClass(String@0x1010)
+          PatchPoint MethodRedefined(String@0x1010, instance_of?@0x1020, cme:0x1028)
+          v70:TrueClass = Const Value(true)
+          Jump bb4(v70)
+        bb5():
+          PatchPoint MethodRedefined(Integer@0x1018, instance_of?@0x1020, cme:0x1028)
+          v50:StaticSymbol[:instance_of?] = Const Value(VALUE(0x1050))
+          v51:CPtr[CPtr(0x1058)] = Const CPtr(0x1058)
+          v52:Iseq[VALUE(0x1060)] = Const Value(VALUE(0x1060))
+          v53:CallableMethodEntry[VALUE(0x1028)] = Const Value(VALUE(0x1028))
+          v54:CBool[false] = Const CBool(false)
+          CondBranchHasType v10, HeapBasicObject, bb13(), bb12()
+        bb13():
+          v56:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1068
+          v57:CUInt64 = LoadKlassCacheEntry v51, v56
+          v58:CBool = IsBitEqual v56, v57
+          CondBranch v58, bb9(), bb12()
+        bb12():
+          v60:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1069, v50, v51, v52, v53, v54
+          v61:CBool = IsBitEqual v60, v53
+          CondBranch v61, bb9(), bb10()
+        bb9():
+          v64:BoolExact = IsInstanceOf v10, v16
+          Jump bb11(v64)
+        bb10():
+          v66:BasicObject = Send v10, :instance_of?, v16 # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb11(v66)
+        bb11(v68:BasicObject):
+          Jump bb4(v68)
+        bb4(v20:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v20
+        ");
+    }
+
+    #[test]
+    fn test_specialize_instance_of_megamorphic() {
+        set_call_threshold(7);
+        eval(r#"
+            def test(o) = o.instance_of?(String)
+            ["a", 1, 1.5, true, nil, :sym].each { test(it) }
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :o@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :o@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint StableConstantNames(0x1008, String)
+          v16:ClassSubclass[String@0x1010] = Const Value(VALUE(0x1010))
+          PatchPoint NoEPEscape(test)
+          CondBranchHasType v10, StaticSymbol, bb6(), bb7()
+        bb6():
+          PatchPoint MethodRedefined(Symbol@0x1018, instance_of?@0x1020, cme:0x1028)
+          v95:FalseClass = Const Value(false)
+          Jump bb4(v95)
+        bb7():
+          CondBranchHasType v10, Fixnum, bb8(), bb9()
+        bb8():
+          PatchPoint MethodRedefined(Integer@0x1050, instance_of?@0x1020, cme:0x1028)
+          v96:FalseClass = Const Value(false)
+          Jump bb4(v96)
+        bb9():
+          CondBranchHasType v10, Flonum, bb10(), bb11()
+        bb10():
+          PatchPoint MethodRedefined(Float@0x1058, instance_of?@0x1020, cme:0x1028)
+          v97:FalseClass = Const Value(false)
+          Jump bb4(v97)
+        bb11():
+          CondBranchHasType v10, TrueClass, bb12(), bb13()
+        bb12():
+          PatchPoint MethodRedefined(TrueClass@0x1060, instance_of?@0x1020, cme:0x1028)
+          v98:FalseClass = Const Value(false)
+          Jump bb4(v98)
+        bb13():
+          CondBranchHasType v10, NilClass, bb14(), bb5()
+        bb14():
+          PatchPoint MethodRedefined(NilClass@0x1068, instance_of?@0x1020, cme:0x1028)
+          v99:FalseClass = Const Value(false)
+          Jump bb4(v99)
+        bb5():
+          PatchPoint MethodRedefined(Symbol@0x1018, instance_of?@0x1020, cme:0x1028)
+          v76:StaticSymbol[:instance_of?] = Const Value(VALUE(0x1070))
+          v77:CPtr[CPtr(0x1078)] = Const CPtr(0x1078)
+          v78:Iseq[VALUE(0x1080)] = Const Value(VALUE(0x1080))
+          v79:CallableMethodEntry[VALUE(0x1028)] = Const Value(VALUE(0x1028))
+          v80:CBool[false] = Const CBool(false)
+          CondBranchHasType v10, HeapBasicObject, bb19(), bb18()
+        bb19():
+          v82:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1088
+          v83:CUInt64 = LoadKlassCacheEntry v77, v82
+          v84:CBool = IsBitEqual v82, v83
+          CondBranch v84, bb15(), bb18()
+        bb18():
+          v86:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1089, v76, v77, v78, v79, v80
+          v87:CBool = IsBitEqual v86, v79
+          CondBranch v87, bb15(), bb16()
+        bb15():
+          v90:BoolExact = IsInstanceOf v10, v16
+          Jump bb17(v90)
+        bb16():
+          v92:BasicObject = Send v10, :instance_of?, v16 # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb17(v92)
+        bb17(v94:BasicObject):
+          Jump bb4(v94)
+        bb4(v20:BasicObject):
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v20
+        ");
+    }
+
+    #[test]
+    fn test_dont_specialize_instance_of_non_constant_class() {
+        set_call_threshold(7);
+        eval(r#"
+            def test(a, b) = a.instance_of?(b.class)
+            ["a", 1, 1.5, true, nil, :sym].each { test("a", it) }
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          v4:BasicObject = LoadField v2, :b@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :a@1
+          v9:BasicObject = LoadArg :b@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          CondBranchHasType v13, StaticSymbol, bb6(), bb7()
+        bb6():
+          PatchPoint MethodRedefined(Symbol@0x1008, class@0x1010, cme:0x1018)
+          v60:ClassSubclass[Symbol@0x1008] = Const Value(VALUE(0x1008))
+          Jump bb4(v60)
+        bb7():
+          CondBranchHasType v13, Fixnum, bb8(), bb9()
+        bb8():
+          PatchPoint MethodRedefined(Integer@0x1040, class@0x1010, cme:0x1018)
+          v63:ClassSubclass[Integer@0x1040] = Const Value(VALUE(0x1040))
+          Jump bb4(v63)
+        bb9():
+          CondBranchHasType v13, Flonum, bb10(), bb11()
+        bb10():
+          PatchPoint MethodRedefined(Float@0x1048, class@0x1010, cme:0x1018)
+          v66:ClassSubclass[Float@0x1048] = Const Value(VALUE(0x1048))
+          Jump bb4(v66)
+        bb11():
+          CondBranchHasType v13, TrueClass, bb12(), bb13()
+        bb12():
+          PatchPoint MethodRedefined(TrueClass@0x1050, class@0x1010, cme:0x1018)
+          v69:ClassSubclass[TrueClass@0x1050] = Const Value(VALUE(0x1050))
+          Jump bb4(v69)
+        bb13():
+          CondBranchHasType v13, NilClass, bb14(), bb5()
+        bb14():
+          PatchPoint MethodRedefined(NilClass@0x1058, class@0x1010, cme:0x1018)
+          v72:ClassSubclass[NilClass@0x1058] = Const Value(VALUE(0x1058))
+          Jump bb4(v72)
+        bb5():
+          PatchPoint MethodRedefined(Symbol@0x1008, class@0x1010, cme:0x1018)
+          v74:StaticSymbol[:class] = Const Value(VALUE(0x1060))
+          v75:CPtr[CPtr(0x1068)] = Const CPtr(0x1068)
+          v76:Iseq[VALUE(0x1070)] = Const Value(VALUE(0x1070))
+          v77:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
+          v78:CBool[false] = Const CBool(false)
+          CondBranchHasType v13, HeapBasicObject, bb19(), bb18()
+        bb19():
+          v80:CUInt64 = LoadField v13, :RBASIC_KLASS@0x1078
+          v81:CUInt64 = LoadKlassCacheEntry v75, v80
+          v82:CBool = IsBitEqual v80, v81
+          CondBranch v82, bb15(), bb18()
+        bb18():
+          v84:RubyValue = CCall v13, :rb_zjit_cached_cme@0x1079, v74, v75, v76, v77, v78
+          v85:CBool = IsBitEqual v84, v77
+          CondBranch v85, bb15(), bb16()
+        bb15():
+          v87:Class = InvokeBuiltin leaf <inline_expr>, v13
+          Jump bb17(v87)
+        bb16():
+          v89:BasicObject = Send v13, :class # SendFallbackReason: Send: receiver class doesn't call the profiled method
+          Jump bb17(v89)
+        bb17(v91:BasicObject):
+          Jump bb4(v91)
+        bb4(v19:BasicObject):
+          PatchPoint NoEPEscape(test)
+          PatchPoint NoSingletonClass(String@0x1080)
+          PatchPoint MethodRedefined(String@0x1080, instance_of?@0x1088, cme:0x1090)
+          v95:StringExact = GuardType v12, StringExact recompile
+          v96:BasicObject = CCallWithFrame v95, :Kernel#instance_of?@0x10b8, v19
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v96
+        ");
+    }
+
+    #[test]
     fn test_fold_is_a_false() {
         eval(r#"
             def test = 5.is_a?(String)
