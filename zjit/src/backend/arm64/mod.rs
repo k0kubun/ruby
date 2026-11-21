@@ -2048,7 +2048,7 @@ mod tests {
                 pc: 0.into(),
                 iseq: std::ptr::dangling(),
                 vm_stack_size: 0,
-                stack_map: StackMap::new(vec![], std::ptr::dangling(), 0),
+                stack_map: StackMap::for_side_exit(vec![], 0),
                 recompile: None,
             },
         }));
