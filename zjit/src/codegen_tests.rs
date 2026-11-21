@@ -1535,14 +1535,14 @@ fn test_getblockparamproxy_polymorphic_none_and_iseq() {
 #[test]
 fn test_getblockparamproxy_proc() {
     eval("
-        val = proc { 1 }
         def test(&block)
           0.then(&block)
         end
-        test(&val)
+        def run = (val = proc { 2 }; test(&val))
+        run
     ");
     assert_contains_opcode("test", YARVINSN_getblockparamproxy);
-    assert_snapshot!(assert_compiles("val = proc { 2 }; test(&val)"), @"2");
+    assert_snapshot!(assert_compiles("run"), @"2");
 }
 
 #[test]
@@ -1807,6 +1807,170 @@ fn test_inline_block_with_arity_mismatch() {
             test
         ");
         assert_snapshot!(assert_inlines_block("test; test"), @"[[nil, nil], 1, [1, 2], 0]");
+    });
+}
+
+#[test]
+fn test_yield_to_proc_dispatches_directly() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def foo = yield(1, 2)
+        def test(pr) = foo(&pr)
+        PR = proc { |a, b| a + b }
+        test(PR)
+        test(PR)
+    ");
+    assert_snapshot!(assert_yields_directly("test(PR)"), @"3");
+}
+
+#[test]
+fn test_yield_to_proc_with_another_iseq() {
+    set_call_threshold(2);
+    eval("
+        def foo = yield(2, 3)
+        def test(pr) = foo(&pr)
+        test(proc { |a, b| a + b })
+        test(proc { |a, b| a + b })
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(proc { |a, b| a + b }), test(proc { |a, b| a * b })]"), @"[5, 6]");
+}
+
+#[test]
+fn test_yield_to_lambda_of_profiled_proc_iseq() {
+    // A lambda made from the same block ISEQ as the profiled Proc has strict arity.
+    set_call_threshold(2);
+    eval("
+        def one = yield(1)
+        def two = yield(1, 2)
+        def mk(m) = send(m) { |a, b| [a, b] }
+        def test_one(pr) = one(&pr)
+        def test_two(pr) = two(&pr)
+        PR = mk(:proc)
+        L = mk(:lambda)
+        test_one(PR); test_one(PR)
+        test_two(PR); test_two(PR)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        r = [test_one(PR), test_two(PR), test_two(L)]
+        begin
+          test_one(L)
+        rescue ArgumentError => e
+          r << e.message
+        end
+        r
+    "), @r#"[[1, nil], [1, 2], [1, 2], "wrong number of arguments (given 1, expected 2)"]"#);
+}
+
+#[test]
+fn test_yield_to_refined_proc_of_profiled_proc_iseq() {
+    // A refined copy of the profiled Proc has the same block ISEQ, but runs it with refinements.
+    set_call_threshold(2);
+    eval(r#"
+        module ShoutRefinement
+          refine String do
+            def shout = upcase + "!"
+          end
+        end
+        def foo = yield("hi")
+        def test(pr) = foo(&pr)
+        PR = proc { |s| s.shout rescue :none }
+        test(PR)
+        test(PR)
+    "#);
+    assert_snapshot!(assert_compiles_allowing_exits("[test(PR), test(PR.refined(ShoutRefinement)), test(PR)]"), @r#"[:none, "HI!", :none]"#);
+}
+
+#[test]
+fn test_yield_to_proc_subclass() {
+    set_call_threshold(2);
+    eval("
+        class MyProc < Proc; end
+        def foo = yield(1, 2)
+        def test(pr) = foo(&pr)
+        PR = proc { |a, b| a - b }
+        test(PR)
+        test(PR)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(MyProc.new { |a, b| a * 10 + b }), test(PR)]"), @"[12, -1]");
+}
+
+#[test]
+fn test_yield_to_proc_with_captured_self_and_locals() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(5);
+    eval("
+        class ProcCounter
+          attr_reader :n
+          def initialize = (@n = 0)
+          def make = proc { |x| @n += x; self }
+        end
+        def foo = yield(5)
+        def test(pr) = foo(&pr)
+        C = ProcCounter.new
+        PR = C.make
+        def make_adder = (sum = 0; [proc { |x| sum += x }, -> { sum }])
+        ADD, SUM = make_adder
+        3.times { test(PR); test(ADD) }
+    ");
+    assert_snapshot!(assert_yields_directly("[test(PR).equal?(C), C.n, test(ADD), SUM.call]"), @"[true, 20, 20, 20]");
+}
+
+#[test]
+fn test_yield_to_proc_with_next_and_arity_mismatch() {
+    set_call_threshold(2);
+    eval("
+        def one(x) = yield(x)
+        def test(pr, x) = one(x, &pr)
+        PR = proc { |a, b| next [b, a] if b; [a] }
+        test(PR, [1, 2]); test(PR, 3)
+    ");
+    // `x` may not be an Array, which the interpreter would convert with `to_ary`. It exits to the interpreter.
+    assert_snapshot!(assert_compiles_allowing_exits("[test(PR, [1, 2]), test(PR, 3), test(PR, [4])]"), @"[[2, 1], [3], [4]]");
+}
+
+#[test]
+fn test_yield_to_proc_with_break_or_return() {
+    // A Proc that may throw is not called directly. Its break and return raise LocalJumpError
+    // since the home frame is gone.
+    set_call_threshold(2);
+    eval("
+        def foo = yield(1)
+        def test(pr) = (foo(&pr) rescue $!.class)
+        def mk_break = proc { |x| break x }
+        def mk_return = proc { |x| return x }
+        test(mk_break); test(mk_return)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(mk_break), test(mk_return)]"), @"[LocalJumpError, LocalJumpError]");
+}
+
+#[test]
+fn test_yield_polymorphic_block_handlers_with_procs() {
+    set_call_threshold(6);
+    eval("
+        def foo = yield(2)
+        def test_iseq = foo { |x| x + 1 }
+        def test_proc(pr) = foo(&pr)
+        def test_none = (foo rescue $!.class)
+        PR1 = proc { |x| x * 10 }
+        PR2 = proc { |x| x * 100 }
+        def run = [test_iseq, test_proc(PR1), test_proc(PR2), foo(&:to_s), test_none, test_proc(lambda { |x| -x })]
+        run
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[run, run]"), @r#"[[3, 20, 200, "2", LocalJumpError, -2], [3, 20, 200, "2", LocalJumpError, -2]]"#);
+}
+
+#[test]
+fn test_inline_blockarg_proc_yield_dispatches_directly() {
+    crate::options::enable_zjit_stats();
+    with_inlining(|| {
+        eval("
+            def foo = yield(1, 2)
+            def test(pr) = foo(&pr)
+            PR = proc { |a, b| a + b }
+            test(PR)
+        ");
+        assert_snapshot!(assert_yields_directly("test(PR); test(PR)"), @"3");
     });
 }
 
