@@ -1931,20 +1931,31 @@ invoke_iseq_block_from_c(rb_execution_context_t *ec, const struct rb_captured_bl
     stack_check(ec);
 
 #if USE_ZJIT
-    // Skip vm_yield_setup_args() and jit_exec() when the block has ZJIT code and the
-    // arguments need no setup. A non-lambda block autosplats a single argument for
-    // a parameter list like |a, b| or |a, |, so leave that case to vm_yield_setup_args().
-    if (me == NULL && !kw_splat &&
-        (is_lambda || argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0)) {
-        rb_jit_func_t zjit_func = zjit_simple_iseq_entry(iseq, argc);
-        if (zjit_func) {
-            CHECK_VM_STACK_OVERFLOW(cfp, argc);
-            vm_check_canary(ec, sp);
+    // Skip vm_yield_setup_args() and jit_exec() when the block has ZJIT code and its
+    // arguments are simple to set up.
+    const struct rb_iseq_constant_body *body;
+    rb_jit_func_t zjit_func;
+    if (rb_zjit_entry && (zjit_func = (body = ISEQ_BODY(iseq))->jit_entry) &&
+        me == NULL && !kw_splat && rb_simple_iseq_p(iseq)) {
+        int lead_num = body->param.lead_num;
+        CHECK_VM_STACK_OVERFLOW(cfp, lead_num);
+        vm_check_canary(ec, sp);
+
+        // A non-lambda block autosplats a single argument for a parameter list like |a, b|
+        // or |a, |, so leave that case to vm_yield_setup_args().
+        if (argc == lead_num && (is_lambda || argc != 1 || body->param.flags.ambiguous_param0)) {
             // Copy a few arguments without calling memcpy()
             for (int i = 0; i < argc; i++) {
                 sp[i] = argv[i];
             }
-            invoke_block(ec, iseq, self, captured, cref, type, 0);
+            // Same frame as invoke_block() pushes
+            vm_push_frame_inline(ec, iseq, type | VM_FRAME_FLAG_FINISH, self,
+                                 VM_GUARDED_PREV_EP(captured->ep),
+                                 (VALUE)cref,
+                                 body->iseq_encoded,
+                                 sp + body->param.size,
+                                 body->local_table_size - body->param.size,
+                                 body->stack_max);
             return vm_exec_zjit_func(ec, zjit_func);
         }
     }
@@ -2930,8 +2941,9 @@ hook_before_rewind(rb_execution_context_t *ec, bool cfp_returning_with_value, in
 
 static inline VALUE
 vm_exec_handle_exception(rb_execution_context_t *ec, enum ruby_tag_type state, VALUE errinfo);
-static inline VALUE
-vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state, struct rb_vm_tag *tag, VALUE result);
+// Always inline this into vm_exec_with_jit() even though vm_exec_zjit_func() uses it too
+ALWAYS_INLINE(static inline VALUE
+              vm_exec_loop(rb_execution_context_t *ec, enum ruby_tag_type state, struct rb_vm_tag *tag, VALUE result));
 
 // for non-Emscripten Wasm build, use vm_exec with optimized setjmp for runtime performance
 #if defined(__wasm__) && !defined(__EMSCRIPTEN__)
@@ -2962,11 +2974,8 @@ vm_exec_bottom_rescue(void *context)
 }
 #endif
 
-// Run ec->cfp and return the result of its frame with VM_FRAME_FLAG_FINISH. If zjit_func
-// is given, enter it as the ZJIT code of ec->cfp. Otherwise, enter the JIT code of ec->cfp
-// if jit is true and it has one, or run the interpreter.
 static inline VALUE
-vm_exec_with_jit(rb_execution_context_t *ec, bool jit, rb_jit_func_t zjit_func)
+vm_exec_with_jit(rb_execution_context_t *ec, bool jit)
 {
     VALUE result = Qundef;
 
@@ -2991,16 +3000,7 @@ vm_exec_with_jit(rb_execution_context_t *ec, bool jit, rb_jit_func_t zjit_func)
 #else
     enum ruby_tag_type state;
     if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-#if USE_ZJIT
-        if (zjit_func) {
-            result = ((rb_zjit_func_t)rb_zjit_entry)(ec, ec->cfp, zjit_func);
-        }
-        else
-#endif
-        if (jit) {
-            result = jit_exec(ec);
-        }
-        if (UNDEF_P(result)) {
+        if (!jit || UNDEF_P(result = jit_exec(ec))) {
             result = vm_exec_core(ec);
         }
         /* fallback to the VM */
@@ -3018,7 +3018,7 @@ vm_exec_with_jit(rb_execution_context_t *ec, bool jit, rb_jit_func_t zjit_func)
 VALUE
 vm_exec(rb_execution_context_t *ec)
 {
-    return vm_exec_with_jit(ec, true, NULL);
+    return vm_exec_with_jit(ec, true);
 }
 
 #if USE_ZJIT
@@ -3027,15 +3027,35 @@ vm_exec(rb_execution_context_t *ec)
 VALUE
 rb_vm_exec_interpreter(rb_execution_context_t *ec)
 {
-    return vm_exec_with_jit(ec, false, NULL);
+    return vm_exec_with_jit(ec, false);
 }
 
 // Like vm_exec(), but enter func as the ZJIT code of the current frame. The caller has checked
-// that func is ISEQ_BODY(CFP_ISEQ(ec->cfp))->jit_entry, which jit_exec() would enter.
+// that func is ISEQ_BODY(CFP_ISEQ(ec->cfp))->jit_entry, which jit_exec() would enter. ZJIT
+// doesn't support WebAssembly, so this doesn't need the wasm path of vm_exec_with_jit().
 static VALUE
 vm_exec_zjit_func(rb_execution_context_t *ec, rb_jit_func_t func)
 {
-    return vm_exec_with_jit(ec, true, func);
+    VALUE result;
+
+    EC_PUSH_TAG(ec);
+
+    _tag.retval = Qnil;
+
+    enum ruby_tag_type state;
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        if (UNDEF_P(result = ((rb_zjit_func_t)rb_zjit_entry)(ec, ec->cfp, func))) {
+            result = vm_exec_core(ec);
+        }
+        /* fallback to the VM */
+        result = vm_exec_loop(ec, TAG_NONE, &_tag, result);
+    }
+    else {
+        result = vm_exec_loop(ec, state, &_tag, ec->errinfo);
+    }
+
+    EC_POP_TAG();
+    return result;
 }
 #endif
 

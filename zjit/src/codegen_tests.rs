@@ -1588,6 +1588,28 @@ fn test_c_call_to_compiled_method_with_block_and_frames() {
 }
 
 #[test]
+fn test_c_call_to_compiled_method_unused_block_warning() {
+    // A block passed from C to a compiled method that doesn't use it still warns with strict_unused_block.
+    set_call_threshold(2);
+    assert_snapshot!(inspect("
+        class UnusedC
+          def no_block(a) = a
+        end
+        m = UnusedC.new.method(:no_block)
+        3.times { m.call(1) }
+        warnings = []
+        Warning.singleton_class.prepend(Module.new { define_method(:warn) { |msg, **| warnings << msg } })
+        Warning[:strict_unused_block] = true
+        begin
+          m.call(1) { }
+        ensure
+          Warning[:strict_unused_block] = false
+        end
+        warnings.map { it[/the block passed to '[^']+'/] }
+    "), @r#"["the block passed to 'UnusedC#no_block'"]"#);
+}
+
+#[test]
 fn test_c_call_to_compiled_method_raises() {
     // An exception raised by JIT code called from C is rescued in the callee or propagates through the C frame.
     set_call_threshold(2);
@@ -1666,18 +1688,23 @@ fn test_c_yield_to_compiled_block_arg_setup() {
     // Blocks whose arguments need setup (autosplat, padding, truncation, lambda arity) keep their semantics.
     set_call_threshold(2);
     assert_snapshot!(inspect("
+        class ToAry
+          def to_ary = [:x, :y]
+        end
         def splat2(ary) = ary.map { |a, b| [a, b] }
         def splat1(ary) = ary.map { |a, | a }
         def no_splat(ary) = ary.map { |a| a }
         def none(ary) = ary.count { true }
+        def pad(ary) = ary.each_with_index.map { |a, i, c| [a, i, c] }
+        def trunc(ary) = ary.each_with_index.map { |a| a }
         def lam(ary, l) = ary.count(&l)
         l1 = ->(x) { x > 1 }
         l2 = ->(a, b) { true }
         5.times.map do
-          [splat2([[1, 2], 3]), splat1([[1, 2]]), no_splat([[1, 2]]), none([1, 2]), lam([1, 2], l1),
-           (lam([[1, 2]], l2) rescue $!.class)]
+          [splat2([[1, 2], 3, [4, 5, 6], [7], [], ToAry.new]), splat1([[1, 2]]), no_splat([[1, 2]]), none([1, 2]),
+           pad([:p]), trunc([:t]), lam([1, 2], l1), (lam([[1, 2]], l2) rescue $!.class)]
         end.uniq
-    "), @"[[[[1, 2], [3, nil]], [1], [[1, 2]], 2, 1, ArgumentError]]");
+    "), @"[[[[1, 2], [3, nil], [4, 5], [7, nil], [nil, nil], [:x, :y]], [1], [[1, 2]], 2, [[:p, 0, nil]], [:t], 1, ArgumentError]]");
 }
 
 #[test]
