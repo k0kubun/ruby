@@ -4025,10 +4025,12 @@ impl Function {
 
     /// Dispatch `yield` to the profiled blocks. If `monomorphic`, it guards on a single block
     /// and side-exit if it doesn't match. Otherwise, it also generates an ifunc handler and a fallback.
+    /// If `ifunc_procs`, it also calls Procs of [`crate::profile::proc_ifunc_block_p`] like IFUNC handlers.
     fn dispatch_invoke_block_iseqs(
         &mut self,
         direct_blocks: &[DirectBlock],
         monomorphic: bool,
+        ifunc_procs: bool,
         block: BlockId,
         insn_idx: u32,
         level: u32,
@@ -4037,7 +4039,7 @@ impl Function {
         args: Vec<InsnId>,
         state: InsnId,
     ) -> (BlockId, InsnId) {
-        assert!(!direct_blocks.is_empty());
+        assert!(!direct_blocks.is_empty() || ifunc_procs);
         let ep = self.get_ep(block, level);
         let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
 
@@ -4047,7 +4049,7 @@ impl Function {
 
         // Monomorphic: guard the handler and the ISEQ, then invoke directly in-place.
         // No need for new HIR blocks.
-        if direct_blocks.len() == 1 && monomorphic && !self.policy.no_side_exits {
+        if direct_blocks.len() == 1 && monomorphic && !ifunc_procs && !self.policy.no_side_exits {
             let block_iseq = direct_blocks[0].iseq();
             let captured = match direct_blocks[0] {
                 DirectBlock::Iseq(_) => {
@@ -4078,7 +4080,7 @@ impl Function {
         let join_param = self.push_insn(join_block, Insn::Param);
         let dispatch_block = (!block_iseqs.is_empty()).then(|| self.new_block(insn_idx));
         let fallback_block = self.new_block(insn_idx);
-        let not_iseq_block = if proc_iseqs.is_empty() && lambda_iseqs.is_empty() { fallback_block } else { self.new_block(insn_idx) };
+        let not_iseq_block = if proc_iseqs.is_empty() && lambda_iseqs.is_empty() && !ifunc_procs { fallback_block } else { self.new_block(insn_idx) };
 
         // Compare captured->code.iseq against each candidate ISEQ, starting from compare_block.
         let dispatch_captured_iseqs = |fun: &mut Function, compare_block: BlockId, captured: InsnId, iseqs: &[IseqPtr], lambda: bool| {
@@ -4117,7 +4119,7 @@ impl Function {
             self.push_insn(block, Insn::Jump(BranchEdge { target: not_iseq_block, args: vec![] }));
         }
 
-        if !proc_iseqs.is_empty() || !lambda_iseqs.is_empty() {
+        if !proc_iseqs.is_empty() || !lambda_iseqs.is_empty() || ifunc_procs {
             // Check what guard_proc_block_handler guards, branching to the fallback instead.
             let low_bits_mask = self.push_insn(not_iseq_block, Insn::Const { val: Const::CInt64(RUBY_IMMEDIATE_MASK as i64) });
             let low_bits = self.push_insn(not_iseq_block, Insn::IntAnd { left: block_handler, right: low_bits_mask });
@@ -4142,11 +4144,23 @@ impl Function {
                 } else {
                     zero
                 };
-                let miss_block = if i + 1 == groups.len() { fallback_block } else { self.new_block(insn_idx) };
+                let miss_block = if i + 1 == groups.len() && !ifunc_procs { fallback_block } else { self.new_block(insn_idx) };
                 let iseq_proc_block = self.branch_if_bit_equal(header_block, insn_idx, header, expected, miss_block);
                 let captured = self.proc_captured_block(iseq_proc_block, proc_data);
                 dispatch_captured_iseqs(self, iseq_proc_block, captured, iseqs, lambda);
                 header_block = miss_block;
+            }
+            if ifunc_procs {
+                // vm_invoke_proc_block runs the IFUNC block of a Proc like an IFUNC block handler,
+                // lambda or not. InvokeBlockIfunc untags the handler into the captured block.
+                let header = self.load_field(header_block, proc_data, FieldName::proc_header, 0, types::CInt64);
+                let type_mask = self.push_insn(header_block, Insn::Const { val: Const::CInt64(crate::profile::proc_header_block_type_mask() as i64) });
+                let block_type = self.push_insn(header_block, Insn::IntAnd { left: header, right: type_mask });
+                let ifunc_type = self.push_insn(header_block, Insn::Const { val: Const::CInt64(block_type_ifunc as i64) });
+                let ifunc_proc_block = self.branch_if_bit_equal(header_block, insn_idx, block_type, ifunc_type, fallback_block);
+                let captured = self.proc_captured_block(ifunc_proc_block, proc_data);
+                let ifunc_result = self.push_insn(ifunc_proc_block, Insn::InvokeBlockIfunc { cd, block_handler: captured, args: args.clone(), state });
+                self.push_insn(ifunc_proc_block, Insn::Jump(BranchEdge { target: join_block, args: vec![ifunc_result] }));
             }
         }
         self.mark_cold(fallback_block);
@@ -13679,6 +13693,8 @@ fn add_iseq_to_hir(
                     let mut fallback_reason = InvokeBlockNotSpecialized;
                     // The first entry of buckets is the most common type, so it will be inserted to direct_blocks first too.
                     let mut direct_blocks: Vec<DirectBlock> = vec![];
+                    // Whether the profile has Procs of IFUNC blocks
+                    let mut ifunc_procs = false;
                     if let Some(summary) = block_handler_summary.as_ref() {
                         if can_direct_invoke_block(flags)
                             && (summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
@@ -13687,6 +13703,10 @@ fn add_iseq_to_hir(
                                     break;
                                 }
                                 let obj = profiled_type.class();
+                                if profiled_type.is_ifunc_proc_block_handler() {
+                                    ifunc_procs = true;
+                                    continue;
+                                }
                                 let direct_block = if let Some((iseq, lambda)) = profiled_type.proc_block_iseq() {
                                     if !lambda {
                                         DirectBlock::Proc(iseq)
@@ -13756,15 +13776,15 @@ fn add_iseq_to_hir(
 
                     let result = if let Some(block_iseq) = inlined_known_block {
                         fun.push_invoke_block_iseq_direct(block, block_iseq, get_lvar_level(exit_state.iseq), args, exit_id)
-                    } else if inlined_blockarg_proc && direct_blocks.is_empty() {
+                    } else if inlined_blockarg_proc && direct_blocks.is_empty() && !ifunc_procs {
                         // TODO: Specialize a known BlockArgProc without a profile, e.g. from the
                         // profile of the block argument.
                         fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
                     } else {
                         let level = get_lvar_level(exit_state.iseq);
-                        let (continue_block, result) = if !direct_blocks.is_empty() {
+                        let (continue_block, result) = if !direct_blocks.is_empty() || ifunc_procs {
                             let monomorphic = block_handler_summary.as_ref().is_some_and(|summary| summary.is_monomorphic());
-                            fun.dispatch_invoke_block_iseqs(&direct_blocks, monomorphic, block, insn_idx, level, cd, flags, args, exit_id)
+                            fun.dispatch_invoke_block_iseqs(&direct_blocks, monomorphic, ifunc_procs, block, insn_idx, level, cd, flags, args, exit_id)
                         } else {
                             fun.dispatch_invoke_block_fallback(block, insn_idx, level, None, cd, flags, args, exit_id, fallback_reason)
                         };

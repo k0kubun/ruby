@@ -373,6 +373,8 @@ impl Flags {
     const IS_SHAPE_ONLY: u32 = 1 << 7;
     /// The profiled Proc block handler with an ISEQ is a lambda
     const IS_LAMBDA_BLOCK_HANDLER: u32 = 1 << 8;
+    /// The profiled Proc block handler wraps an IFUNC block. See [`proc_ifunc_block_p`].
+    const IS_IFUNC_PROC_BLOCK_HANDLER: u32 = 1 << 9;
 
     pub fn none() -> Self { Self(Self::NONE) }
 
@@ -407,6 +409,22 @@ pub fn proc_block_iseq(procv: VALUE) -> Option<(IseqPtr, bool)> {
         return None;
     }
     Some((unsafe { *(*proc).captured.as_ref().captured.code.iseq.as_ref() }, header.is_lambda() != 0))
+}
+
+/// Whether `yield` to the Proc `procv` runs its IFUNC block like an IFUNC block handler, e.g. a
+/// Proc made by Method#to_proc. That's a Proc of exactly class Proc with an IFUNC block.
+pub fn proc_ifunc_block_p(procv: VALUE) -> bool {
+    if procv.special_const_p() || procv.class_of() != unsafe { rb_cProc } {
+        return false;
+    }
+    let proc = unsafe { rb_jit_get_proc_ptr(procv) };
+    let data = unsafe { *((procv.0 + RUBY_OFFSET_RTYPEDDATA_DATA as usize) as *const *mut rb_proc_t) };
+    data == proc && unsafe { (*proc).header.as_ref() }.type_() == block_type_ifunc
+}
+
+/// Mask of the block type in the header of a Proc
+pub fn proc_header_block_type_mask() -> u64 {
+    proc_header_bits(|header| header.set_type(0xff))
 }
 
 /// Offset of `data` in `struct RTypedData`: after RBasic (flags, klass), fields_obj, and type.
@@ -484,11 +502,17 @@ impl ProfiledType {
         let (recorded, flag) = match proc_block_iseq(block_handler) {
             Some((iseq, false)) if flag == Flags::IS_PROC_BLOCK_HANDLER => (VALUE::from(iseq), flag),
             Some((iseq, true)) if flag == Flags::IS_PROC_BLOCK_HANDLER => (VALUE::from(iseq), flag | Flags::IS_LAMBDA_BLOCK_HANDLER),
+            None if flag == Flags::IS_PROC_BLOCK_HANDLER && proc_ifunc_block_p(block_handler) => (Qnil, flag | Flags::IS_IFUNC_PROC_BLOCK_HANDLER),
             _ => (Qnil, flag),
         };
         let mut ty = Self::object(recorded);
         ty.flags.0 |= flag;
         ty
+    }
+
+    /// Whether the profiled block handler is a Proc of [`proc_ifunc_block_p`]
+    pub fn is_ifunc_proc_block_handler(&self) -> bool {
+        self.flags.0 & Flags::IS_IFUNC_PROC_BLOCK_HANDLER != 0
     }
 
     /// The ISEQ of a profiled Proc block handler that `yield` can call like an ISEQ block, and
