@@ -366,7 +366,8 @@ impl Flags {
     const IS_OBJECT_PROFILING: u32 = 1 << 4;
     /// The profiled block handler is an IFUNC. The imemo itself is not retained.
     const IS_IFUNC_BLOCK_HANDLER: u32 = 1 << 5;
-    /// The profiled block handler is a Proc. The Proc object itself is not retained.
+    /// The profiled block handler is a Proc. The Proc object itself is not retained, but the
+    /// ISEQ of a Proc that `yield` can call like an ISEQ block is. See [`proc_block_iseq`].
     const IS_PROC_BLOCK_HANDLER: u32 = 1 << 6;
     /// Only the shape and layout flags were recorded; the class is not retained.
     const IS_SHAPE_ONLY: u32 = 1 << 7;
@@ -384,6 +385,41 @@ impl Flags {
     pub fn is_shape_only(self) -> bool { (self.0 & Self::IS_SHAPE_ONLY) != 0 }
     /// Whether the flags are the same except for IS_EMBEDDED
     pub fn eq_ignoring_embedded(self, other: Self) -> bool { (self.0 & !Self::IS_EMBEDDED) == (other.0 & !Self::IS_EMBEDDED) }
+}
+
+/// If `yield` to the Proc `procv` would run its block like an ISEQ block handler, return the ISEQ.
+/// That's a Proc of exactly class Proc, so that the class tells a guard it's a Proc, which wraps an
+/// ISEQ block and is neither a lambda nor refined (Proc#refined). See `vm_invoke_proc_block`.
+pub fn proc_block_iseq(procv: VALUE) -> Option<IseqPtr> {
+    if procv.special_const_p() || procv.class_of() != unsafe { rb_cProc } {
+        return None;
+    }
+    let proc = unsafe { rb_jit_get_proc_ptr(procv) };
+    // JIT code loads the rb_proc_t from RTypedData::data. Proc isn't RUBY_TYPED_EMBEDDABLE.
+    if unsafe { *((procv.0 + RUBY_OFFSET_RTYPEDDATA_DATA as usize) as *const *mut rb_proc_t) } != proc {
+        return None;
+    }
+    let header = unsafe { (*proc).header.as_ref() };
+    if header.type_() != block_type_iseq || header.is_lambda() != 0 || header.is_refined() != 0 {
+        return None;
+    }
+    Some(unsafe { *(*proc).captured.as_ref().captured.code.iseq.as_ref() })
+}
+
+/// Offset of `data` in `struct RTypedData`: after RBasic (flags, klass), fields_obj, and type.
+pub const RUBY_OFFSET_RTYPEDDATA_DATA: i32 = 4 * SIZEOF_VALUE_I32;
+
+/// Mask of the bits in the header of a Proc that need to be zero for [`proc_block_iseq`]:
+/// the block type (`block_type_iseq` is 0), `is_lambda`, and `is_refined`.
+pub fn proc_header_iseq_block_mask() -> u64 {
+    const _: () = assert!(block_type_iseq == 0);
+    let mut header: rb_proc_header_t = unsafe { std::mem::zeroed() };
+    header.set_type(0xff);
+    header.set_is_lambda(1);
+    header.set_is_refined(1);
+    let mut bits = [0u8; 4];
+    unsafe { std::ptr::copy_nonoverlapping(&header as *const rb_proc_header_t as *const u8, bits.as_mut_ptr(), 4) };
+    u32::from_ne_bytes(bits) as u64
 }
 
 /// opt_send_without_block/opt_plus/... should store:
@@ -420,6 +456,8 @@ impl ProfiledType {
 
     /// Profile an untagged block handler. ISEQ, Symbol, and no-block handlers are profiled as the object itself.
     /// IFUNC and Proc handlers are recorded only as a flag to avoid retaining them and to reduce GC marking pressure.
+    /// A Proc that `yield` can call like an ISEQ block handler is recorded as its ISEQ with the flag.
+    /// See [`proc_block_iseq`].
     fn block_handler(block_handler: VALUE) -> Self {
         let flag = if unsafe { rb_IMEMO_TYPE_P(block_handler, imemo_ifunc) == 1 } {
             Flags::IS_IFUNC_BLOCK_HANDLER
@@ -428,9 +466,23 @@ impl ProfiledType {
         } else {
             return Self::object(block_handler);
         };
-        let mut ty = Self::object(Qnil);
+        let recorded = match proc_block_iseq(block_handler) {
+            Some(iseq) if flag == Flags::IS_PROC_BLOCK_HANDLER => VALUE::from(iseq),
+            _ => Qnil,
+        };
+        let mut ty = Self::object(recorded);
         ty.flags.0 |= flag;
         ty
+    }
+
+    /// The ISEQ of a profiled Proc block handler that `yield` can call like an ISEQ block.
+    /// See [`proc_block_iseq`].
+    pub fn proc_block_iseq(&self) -> Option<IseqPtr> {
+        if self.flags.is_proc_block_handler() && self.class != Qnil {
+            Some(self.class.as_iseq())
+        } else {
+            None
+        }
     }
 
     /// Profile the class and shape of the given object

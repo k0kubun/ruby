@@ -665,6 +665,7 @@ pub enum SideExitReason {
     Interrupt,
     InvokeBlockHandlerNotIseq,
     InvokeBlockIseqChanged,
+    InvokeBlockHandlerNotProc,
     BlockParamWbRequired,
     StackOverflow,
     FixnumModByZero,
@@ -947,6 +948,8 @@ pub enum FieldName {
     klass_cache,
     code_iseq,
     captured_self,
+    proc_data,
+    proc_header,
     shape_id,
     as_heap,
     fields_obj,
@@ -3739,6 +3742,25 @@ fn block_arg0_splat_p(iseq: IseqPtr, argc: usize) -> bool {
         && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) }
 }
 
+/// A block handler that `yield` can call by pushing the frame of its ISEQ block, as
+/// [`Insn::InvokeBlockIseqDirect`] does. See [`Function::dispatch_invoke_block_iseqs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectBlock {
+    /// An ISEQ block handler, e.g. a literal block
+    Iseq(IseqPtr),
+    /// A Proc block handler that runs its ISEQ block like an ISEQ block handler, e.g. `&block`
+    /// passing a Proc. See [`crate::profile::proc_block_iseq`].
+    Proc(IseqPtr),
+}
+
+impl DirectBlock {
+    fn iseq(self) -> IseqPtr {
+        match self {
+            DirectBlock::Iseq(iseq) | DirectBlock::Proc(iseq) => iseq,
+        }
+    }
+}
+
 /// Ok if `yield` can dispatch by inlining the block ISEQ frame. The block must take the
 /// simple callee-setup path (`rb_simple_iseq_p`), which accepts any number of arguments (see
 /// [`Function::setup_block_args`]), and contain no `throw` (break / non-local return) unless
@@ -3945,12 +3967,56 @@ impl Function {
         }).collect()
     }
 
-    /// Dispatch `yield` to the profiled ISEQ blocks. If `monomorphic_iseq`, it guards on a single ISEQ
+    /// Guard that `block_handler` is a Proc that runs its ISEQ block like an ISEQ block handler
+    /// (see [`crate::profile::proc_block_iseq`]) and return the Proc's `struct rb_captured_block *`.
+    fn guard_proc_block_handler(&mut self, block: BlockId, block_handler: InsnId, state: InsnId) -> InsnId {
+        let reason = || Box::new(SideExitReason::InvokeBlockHandlerNotProc);
+        // A Proc is a heap object: no tag bits and not VM_BLOCK_HANDLER_NONE
+        let low_bits_mask = self.push_insn(block, Insn::Const { val: Const::CInt64(RUBY_IMMEDIATE_MASK as i64) });
+        let low_bits = self.push_insn(block, Insn::IntAnd { left: block_handler, right: low_bits_mask });
+        self.push_insn(block, Insn::GuardBitEquals { val: low_bits, expected: Const::CInt64(0), reason: reason(), state, recompile: Some(Recompile) });
+        self.push_insn(block, Insn::GuardAnyBitSet { val: block_handler, mask: Const::CUInt64(!(RUBY_IMMEDIATE_MASK as u64)), mask_name: None, reason: reason(), state, recompile: Some(Recompile) });
+        let klass = self.load_field(block, block_handler, FieldName::RBASIC_KLASS, RUBY_OFFSET_RBASIC_KLASS, types::Class);
+        self.push_insn(block, Insn::GuardBitEquals { val: klass, expected: Const::Value(unsafe { rb_cProc }), reason: reason(), state, recompile: Some(Recompile) });
+        let (proc_data, header) = self.load_proc_header(block, block_handler);
+        self.push_insn(block, Insn::GuardBitEquals { val: header, expected: Const::CInt64(0), reason: reason(), state, recompile: Some(Recompile) });
+        self.proc_captured_block(block, proc_data)
+    }
+
+    /// Load the `rb_proc_t *` of the Proc `procv` and the bits of its header that are zero for a
+    /// Proc that runs its ISEQ block like an ISEQ block handler.
+    fn load_proc_header(&mut self, block: BlockId, procv: InsnId) -> (InsnId, InsnId) {
+        let proc_data = self.load_field(block, procv, FieldName::proc_data, crate::profile::RUBY_OFFSET_RTYPEDDATA_DATA, types::CInt64);
+        let header = self.load_field(block, proc_data, FieldName::proc_header, 0, types::CInt64);
+        let header_mask = self.push_insn(block, Insn::Const { val: Const::CInt64(crate::profile::proc_header_iseq_block_mask() as i64) });
+        (proc_data, self.push_insn(block, Insn::IntAnd { left: header, right: header_mask }))
+    }
+
+    /// The `struct rb_captured_block *` of a Proc's ISEQ block from its `rb_proc_t *`.
+    fn proc_captured_block(&mut self, block: BlockId, proc_data: InsnId) -> InsnId {
+        let captured_offset = std::mem::offset_of!(rb_proc_captured_t, captured) as i64;
+        let captured_offset = self.push_insn(block, Insn::Const { val: Const::CInt64(captured_offset) });
+        self.push_insn(block, Insn::IntAdd { left: proc_data, right: captured_offset })
+    }
+
+    /// Branch to `if_true` if `left == right`, or to a new block it returns otherwise.
+    fn branch_if_bit_equal(&mut self, block: BlockId, insn_idx: u32, left: InsnId, right: InsnId, if_false: BlockId) -> BlockId {
+        let if_true = self.new_block(insn_idx);
+        let equal = self.push_insn(block, Insn::IsBitEqual { left, right });
+        self.push_insn(block, Insn::CondBranch {
+            val: equal,
+            if_true: BranchEdge { target: if_true, args: vec![] },
+            if_false: BranchEdge { target: if_false, args: vec![] },
+        });
+        if_true
+    }
+
+    /// Dispatch `yield` to the profiled blocks. If `monomorphic`, it guards on a single block
     /// and side-exit if it doesn't match. Otherwise, it also generates an ifunc handler and a fallback.
     fn dispatch_invoke_block_iseqs(
         &mut self,
-        iseqs: &[IseqPtr],
-        monomorphic_iseq: bool,
+        direct_blocks: &[DirectBlock],
+        monomorphic: bool,
         block: BlockId,
         insn_idx: u32,
         level: u32,
@@ -3959,7 +4025,7 @@ impl Function {
         args: Vec<InsnId>,
         state: InsnId,
     ) -> (BlockId, InsnId) {
-        assert!(!iseqs.is_empty());
+        assert!(!direct_blocks.is_empty());
         let ep = self.get_ep(block, level);
         let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
 
@@ -3967,12 +4033,17 @@ impl Function {
         let tag_mask = self.push_insn(block, Insn::Const { val: Const::CInt64(0x3) });
         let tag = self.push_insn(block, Insn::IntAnd { left: block_handler, right: tag_mask });
 
-        // Monomorphic: guard the tag and the ISEQ, then invoke directly in-place.
+        // Monomorphic: guard the handler and the ISEQ, then invoke directly in-place.
         // No need for new HIR blocks.
-        if iseqs.len() == 1 && monomorphic_iseq && !self.policy.no_side_exits {
-            let block_iseq = iseqs[0];
-            self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile) });
-            let captured = self.untag_block_handler(block, block_handler);
+        if direct_blocks.len() == 1 && monomorphic && !self.policy.no_side_exits {
+            let block_iseq = direct_blocks[0].iseq();
+            let captured = match direct_blocks[0] {
+                DirectBlock::Iseq(_) => {
+                    self.push_insn(block, Insn::GuardBitEquals { val: tag, expected: Const::CInt64(0x1), reason: Box::new(SideExitReason::InvokeBlockHandlerNotIseq), state, recompile: Some(Recompile) });
+                    self.untag_block_handler(block, block_handler)
+                }
+                DirectBlock::Proc(_) => self.guard_proc_block_handler(block, block_handler, state),
+            };
 
             // Guard captured->code.iseq is the profiled block iseq. The ISEQ is a GC object that
             // can be moved by compaction, so bake it in as a `Const::Value` rather than a raw
@@ -3987,40 +4058,72 @@ impl Function {
         }
 
         // Otherwise, compare the handler against each candidate and use the fallback if missed.
+        let block_iseqs: Vec<IseqPtr> = direct_blocks.iter().filter_map(|b| match b { DirectBlock::Iseq(iseq) => Some(*iseq), _ => None }).collect();
+        let proc_iseqs: Vec<IseqPtr> = direct_blocks.iter().filter_map(|b| match b { DirectBlock::Proc(iseq) => Some(*iseq), _ => None }).collect();
         let join_block = self.new_block(insn_idx);
         let join_param = self.push_insn(join_block, Insn::Param);
-        let dispatch_block = self.new_block(insn_idx);
+        let dispatch_block = (!block_iseqs.is_empty()).then(|| self.new_block(insn_idx));
         let fallback_block = self.new_block(insn_idx);
+        let not_iseq_block = if proc_iseqs.is_empty() { fallback_block } else { self.new_block(insn_idx) };
 
-        let iseq_tag = self.push_insn(block, Insn::Const { val: Const::CInt64(0x1) });
-        let tag_matches = self.push_insn(block, Insn::IsBitEqual { left: tag, right: iseq_tag });
-        self.push_insn(block, Insn::CondBranch {
-            val: tag_matches,
-            if_true: BranchEdge { target: dispatch_block, args: vec![] },
-            if_false: BranchEdge { target: fallback_block, args: vec![] },
-        });
+        // Compare captured->code.iseq against each candidate ISEQ, starting from compare_block.
+        let dispatch_captured_iseqs = |fun: &mut Function, compare_block: BlockId, captured: InsnId, iseqs: &[IseqPtr]| {
+            let captured_iseq = fun.load_captured_code_iseq(compare_block, captured);
+            let mut compare_block = compare_block;
+            for &block_iseq in iseqs {
+                // Use `Const::Value` so that the GC updates the ISEQ pointer on compaction. See above.
+                let expected = fun.push_insn(compare_block, Insn::Const { val: Const::Value(VALUE::from(block_iseq)) });
+                let iseq_matches = fun.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
+                let direct_block = fun.new_block(insn_idx);
+                let miss_block = fun.new_block(insn_idx);
+                fun.push_insn(compare_block, Insn::CondBranch {
+                    val: iseq_matches,
+                    if_true: BranchEdge { target: direct_block, args: vec![] },
+                    if_false: BranchEdge { target: miss_block, args: vec![] },
+                });
+                let direct_args = fun.setup_block_args(direct_block, block_iseq, args.clone(), state);
+                let direct_result = fun.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: direct_args, stack_argc: args.len(), state });
+                fun.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
+                compare_block = miss_block;
+            }
+            fun.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+        };
 
-        let captured = self.untag_block_handler(dispatch_block, block_handler);
-        let captured_iseq = self.load_captured_code_iseq(dispatch_block, captured);
-
-        let mut compare_block = dispatch_block;
-        for &block_iseq in iseqs {
-            // Use `Const::Value` so that the GC updates the ISEQ pointer on compaction. See above.
-            let expected = self.push_insn(compare_block, Insn::Const { val: Const::Value(VALUE::from(block_iseq)) });
-            let iseq_matches = self.push_insn(compare_block, Insn::IsBitEqual { left: captured_iseq, right: expected });
-            let direct_block = self.new_block(insn_idx);
-            let miss_block = self.new_block(insn_idx);
-            self.push_insn(compare_block, Insn::CondBranch {
-                val: iseq_matches,
-                if_true: BranchEdge { target: direct_block, args: vec![] },
-                if_false: BranchEdge { target: miss_block, args: vec![] },
+        if let Some(dispatch_block) = dispatch_block {
+            let iseq_tag = self.push_insn(block, Insn::Const { val: Const::CInt64(0x1) });
+            let tag_matches = self.push_insn(block, Insn::IsBitEqual { left: tag, right: iseq_tag });
+            self.push_insn(block, Insn::CondBranch {
+                val: tag_matches,
+                if_true: BranchEdge { target: dispatch_block, args: vec![] },
+                if_false: BranchEdge { target: not_iseq_block, args: vec![] },
             });
-            let direct_args = self.setup_block_args(direct_block, block_iseq, args.clone(), state);
-            let direct_result = self.push_insn(direct_block, Insn::InvokeBlockIseqDirect { iseq: block_iseq, captured, args: direct_args, stack_argc: args.len(), state });
-            self.push_insn(direct_block, Insn::Jump(BranchEdge { target: join_block, args: vec![direct_result] }));
-            compare_block = miss_block;
+            let captured = self.untag_block_handler(dispatch_block, block_handler);
+            dispatch_captured_iseqs(self, dispatch_block, captured, &block_iseqs);
+        } else {
+            self.push_insn(block, Insn::Jump(BranchEdge { target: not_iseq_block, args: vec![] }));
         }
-        self.push_insn(compare_block, Insn::Jump(BranchEdge { target: fallback_block, args: vec![] }));
+
+        if !proc_iseqs.is_empty() {
+            // Check what guard_proc_block_handler guards, branching to the fallback instead.
+            let low_bits_mask = self.push_insn(not_iseq_block, Insn::Const { val: Const::CInt64(RUBY_IMMEDIATE_MASK as i64) });
+            let low_bits = self.push_insn(not_iseq_block, Insn::IntAnd { left: block_handler, right: low_bits_mask });
+            let zero = self.push_insn(not_iseq_block, Insn::Const { val: Const::CInt64(0) });
+            let heap_block = self.branch_if_bit_equal(not_iseq_block, insn_idx, low_bits, zero, fallback_block);
+            let not_none = self.push_insn(heap_block, Insn::IsBitNotEqual { left: block_handler, right: zero });
+            let object_block = self.new_block(insn_idx);
+            self.push_insn(heap_block, Insn::CondBranch {
+                val: not_none,
+                if_true: BranchEdge { target: object_block, args: vec![] },
+                if_false: BranchEdge { target: fallback_block, args: vec![] },
+            });
+            let klass = self.load_field(object_block, block_handler, FieldName::RBASIC_KLASS, RUBY_OFFSET_RBASIC_KLASS, types::Class);
+            let proc_class = self.push_insn(object_block, Insn::Const { val: Const::Value(unsafe { rb_cProc }) });
+            let proc_block = self.branch_if_bit_equal(object_block, insn_idx, klass, proc_class, fallback_block);
+            let (proc_data, header) = self.load_proc_header(proc_block, block_handler);
+            let iseq_proc_block = self.branch_if_bit_equal(proc_block, insn_idx, header, zero, fallback_block);
+            let captured = self.proc_captured_block(iseq_proc_block, proc_data);
+            dispatch_captured_iseqs(self, iseq_proc_block, captured, &proc_iseqs);
+        }
         self.mark_cold(fallback_block);
 
         let (fallback_block, fallback_result) = self.dispatch_invoke_block_fallback(
@@ -13544,9 +13647,9 @@ fn add_iseq_to_hir(
 
                     // Collect the profiled ISEQ blocks that can be invoked directly with a JIT-to-JIT call.
                     let mut fallback_reason = InvokeBlockNotSpecialized;
-                    // The first entry of buckets is the most common type, so it will be inserted to direct_iseqs first too.
-                    let mut direct_iseqs: Vec<IseqPtr> = vec![];
-                    if let Some(summary) = block_handler_summary.as_ref().filter(|_| !inlined_blockarg_proc) {
+                    // The first entry of buckets is the most common type, so it will be inserted to direct_blocks first too.
+                    let mut direct_blocks: Vec<DirectBlock> = vec![];
+                    if let Some(summary) = block_handler_summary.as_ref() {
                         if can_direct_invoke_block(flags)
                             && (summary.is_monomorphic() || summary.is_polymorphic() || summary.is_skewed_polymorphic()) {
                             for &profiled_type in summary.buckets() {
@@ -13554,15 +13657,23 @@ fn add_iseq_to_hir(
                                     break;
                                 }
                                 let obj = profiled_type.class();
-                                if unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
-                                    let iseq = obj.as_iseq();
-                                    match can_direct_invoke_block_iseq(iseq, false) {
-                                        // Push an ISEQ that can be dispatched directly, deduplicating direct_iseqs.
-                                        Ok(()) => if !direct_iseqs.contains(&iseq) {
-                                            direct_iseqs.push(iseq);
-                                        }
-                                        Err(reason) => fallback_reason = reason,
+                                let direct_block = if let Some(iseq) = profiled_type.proc_block_iseq() {
+                                    DirectBlock::Proc(iseq)
+                                } else if inlined_blockarg_proc {
+                                    // The profile is per callee ISEQ and may describe other callers' blocks.
+                                    // For a known &proc, only Proc handlers may match.
+                                    continue;
+                                } else if !profiled_type.flags().is_proc_block_handler() && unsafe { rb_IMEMO_TYPE_P(obj, imemo_iseq) == 1 } {
+                                    DirectBlock::Iseq(obj.as_iseq())
+                                } else {
+                                    continue;
+                                };
+                                match can_direct_invoke_block_iseq(direct_block.iseq(), false) {
+                                    // Push a block that can be dispatched directly, deduplicating direct_blocks.
+                                    Ok(()) => if !direct_blocks.contains(&direct_block) {
+                                        direct_blocks.push(direct_block);
                                     }
+                                    Err(reason) => fallback_reason = reason,
                                 }
                             }
                         }
@@ -13608,15 +13719,15 @@ fn add_iseq_to_hir(
 
                     let result = if let Some(block_iseq) = inlined_known_block {
                         fun.push_invoke_block_iseq_direct(block, block_iseq, get_lvar_level(exit_state.iseq), args, exit_id)
-                    } else if inlined_blockarg_proc {
-                        // TODO: Specialize a known BlockArgProc. InvokeBlockIseqDirect assumes a non-lambda
-                        // ISEQ block, so it needs guards on what the Proc wraps.
+                    } else if inlined_blockarg_proc && direct_blocks.is_empty() {
+                        // TODO: Specialize a known BlockArgProc without a profile, e.g. from the
+                        // profile of the block argument.
                         fun.push_insn(block, Insn::InvokeBlock { cd, args, state: exit_id, reason: fallback_reason })
                     } else {
                         let level = get_lvar_level(exit_state.iseq);
-                        let (continue_block, result) = if !direct_iseqs.is_empty() {
-                            let monomorphic_iseq = block_handler_summary.as_ref().is_some_and(|summary| summary.is_monomorphic());
-                            fun.dispatch_invoke_block_iseqs(&direct_iseqs, monomorphic_iseq, block, insn_idx, level, cd, flags, args, exit_id)
+                        let (continue_block, result) = if !direct_blocks.is_empty() {
+                            let monomorphic = block_handler_summary.as_ref().is_some_and(|summary| summary.is_monomorphic());
+                            fun.dispatch_invoke_block_iseqs(&direct_blocks, monomorphic, block, insn_idx, level, cd, flags, args, exit_id)
                         } else {
                             fun.dispatch_invoke_block_fallback(block, insn_idx, level, None, cd, flags, args, exit_id, fallback_reason)
                         };
