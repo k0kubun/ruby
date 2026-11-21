@@ -9238,18 +9238,20 @@ impl Function {
         let intervals = dominators.tree_intervals();
         // operand -> [(dominator tree interval of the guard's block, guard)], in the order recorded
         let mut guards: HashMap<InsnId, Vec<((u32, u32), InsnId)>> = HashMap::default();
+        // Operands that have an entry in `guards`, to skip looking up the others
+        let mut guarded = InsnSet::with_capacity(self.insns.len());
+        let union_find = self.union_find.borrow();
         for &block in dominators.cfi.reverse_post_order() {
             let block_interval = intervals[block.0 as usize];
             let block_pre = block_interval.0;
             for i in 0..self.blocks[block].insns.len() {
                 let insn_id = self.blocks[block].insns[i];
-                let canonical_id = self.union_find.borrow().find_const(insn_id);
+                let canonical_id = union_find.find_const(insn_id);
 
-                let union_find = &self.union_find;
                 self.insns[canonical_id].for_each_operand_mut(|operand| {
-                    let canon = union_find.borrow().find_const(*operand);
+                    let canon = union_find.find_const(*operand);
                     let mut rewritten = canon;
-                    if let Some(candidates) = guards.get(&canon) {
+                    if guarded.get(canon) && let Some(candidates) = guards.get(&canon) {
                         // The guard blocks that dominate `block` form a chain in the dominator
                         // tree, and the innermost one has the largest preorder index. Among the
                         // guards of `block` itself, the last one wins.
@@ -9274,12 +9276,14 @@ impl Function {
                     | Insn::GuardNotNull   { val:  src, .. }
                     | Insn::GuardGreaterEq { left: src, .. }
                     | Insn::GuardLess      { left: src, .. } => {
+                        guarded.insert(*src);
                         guards.entry(*src).or_default().push((block_interval, canonical_id));
                     }
                     _ => {}
                 }
             }
         }
+        drop(union_find);
 
         crate::stats::trace_compile_phase("infer_types", || self.infer_types());
     }
