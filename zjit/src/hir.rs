@@ -4818,6 +4818,33 @@ impl Function {
         }
     }
 
+    /// Read (StructAref) or write (StructAset with one argument) the struct member at `index` of
+    /// `recv`, a struct whose members are embedded iff `is_embedded`. All structs of a Struct class
+    /// have the same length, so all of them are embedded or none of them is, and the embedding of
+    /// one profiled instance applies to the others without a GuardShape.
+    fn emit_struct_member_access(&mut self, block: BlockId, recv: InsnId, mid: ID, opt_type: OptimizedMethodType, index: i32, is_embedded: bool, args: &[InsnId], state: InsnId) -> InsnId {
+        if let OptimizedMethodType::StructAset = opt_type {
+            self.guard_not_frozen(block, recv, state);
+        }
+
+        let (target, offset) = if is_embedded {
+            let offset = RUBY_OFFSET_RSTRUCT_AS_ARY + (SIZEOF_VALUE_I32 * index);
+            (recv, offset)
+        } else {
+            let as_heap = self.load_field(block, recv, FieldName::as_heap, RUBY_OFFSET_RSTRUCT_AS_HEAP_PTR, types::CPtr);
+            let offset = SIZEOF_VALUE_I32 * index;
+            (as_heap, offset)
+        };
+
+        if let (OptimizedMethodType::StructAset, &[val]) = (opt_type, args) {
+            self.push_insn(block, Insn::StoreField { recv: target, id: mid.into(), offset, val, num_bits: types::BasicObject.num_bits() });
+            self.write_barrier(block, recv, val);
+            val
+        } else { // StructAref
+            self.load_field(block, target, mid.into(), offset, types::BasicObject)
+        }
+    }
+
     /// Return the profiled type of the HIR instruction at the given Snapshot, if it is known to be
     /// monomorphic or skewed polymorphic. This historical type
     /// record is not a guarantee and must be checked with a GuardType or similar.
@@ -6806,18 +6833,10 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ComplexArgPass);
                                         self.push_insn_id(block, insn_id); continue;
                                     }
-                                    let index: i32 = unsafe { get_cme_def_body_optimized_index(cme) }
-                                                    .try_into()
-                                                    .unwrap();
-                                    // We are going to use an encoding that takes a 4-byte immediate which
-                                    // limits the offset to INT32_MAX.
-                                    {
-                                        let native_index = (index as i64) * (SIZEOF_VALUE as i64);
-                                        if native_index > (i32::MAX as i64) {
-                                            self.set_dynamic_send_reason(insn_id, OperandTooLarge);
-                                            self.push_insn_id(block, insn_id); continue;
-                                        }
-                                    }
+                                    let Some(index) = struct_member_index(cme) else {
+                                        self.set_dynamic_send_reason(insn_id, OperandTooLarge);
+                                        self.push_insn_id(block, insn_id); continue;
+                                    };
                                     // Get the profiled type to check if the fields is embedded or heap allocated.
                                     let Some(is_embedded) = self.profiled_type_of_at(recv, state).map(|t| t.flags().is_struct_embedded()) else {
                                         // No (monomorphic/skewed polymorphic) profile info
@@ -6834,32 +6853,7 @@ impl Function {
                                         recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
                                     }
                                     self.guard_protected_send(block, protected_class, state);
-                                    // All structs from the same Struct class should have the same
-                                    // length. So if our recv is embedded all runtime
-                                    // structs of the same class should be as well, and the same is
-                                    // true of the converse.
-                                    //
-                                    // No need for a GuardShape.
-                                    if let OptimizedMethodType::StructAset = opt_type {
-                                        self.guard_not_frozen(block, recv, state);
-                                    }
-
-                                    let (target, offset) = if is_embedded {
-                                        let offset = RUBY_OFFSET_RSTRUCT_AS_ARY + (SIZEOF_VALUE_I32 * index);
-                                        (recv, offset)
-                                    } else {
-                                        let as_heap = self.load_field(block, recv, FieldName::as_heap, RUBY_OFFSET_RSTRUCT_AS_HEAP_PTR, types::CPtr);
-                                        let offset = SIZEOF_VALUE_I32 * index;
-                                        (as_heap, offset)
-                                    };
-
-                                    let replacement = if let (OptimizedMethodType::StructAset, &[val]) = (opt_type, args.as_slice()) {
-                                        self.push_insn(block, Insn::StoreField { recv: target, id: mid.into(), offset, val, num_bits: types::BasicObject.num_bits() });
-                                        self.write_barrier(block, recv, val);
-                                        val
-                                    } else { // StructAref
-                                        self.load_field(block, target, mid.into(), offset, types::BasicObject)
-                                    };
+                                    let replacement = self.emit_struct_member_access(block, recv, mid, opt_type, index, is_embedded, &args, state);
                                     self.make_equal_to(insn_id, replacement);
                                 },
                                 _ => {
@@ -7525,8 +7519,28 @@ impl Function {
                                 }
                                 _ => unreachable!("unknown cfunc argc: {}", cfunc_argc)
                             }
+                        } else if let Some(opt_type) = (def_type == VM_METHOD_TYPE_OPTIMIZED)
+                            .then(|| OptimizedMethodType::from(unsafe { get_cme_def_body_optimized_type(super_cme) }))
+                            .filter(|&opt_type| matches!(opt_type, OptimizedMethodType::StructAref | OptimizedMethodType::StructAset)
+                                && args.len() == usize::from(opt_type == OptimizedMethodType::StructAset)) {
+                            // `super` into a Struct or Data member, e.g. a member reader overridden in a
+                            // subclass. The receiver passing the method entry guard is an instance of
+                            // the struct class that defines the member, so it has the member at `index`.
+                            let Some(index) = struct_member_index(super_cme) else {
+                                self.push_insn_id(block, insn_id);
+                                self.set_dynamic_send_reason(insn_id, OperandTooLarge);
+                                continue;
+                            };
+                            let Some(is_embedded) = self.profiled_type_of_at(recv, state).map(|t| t.flags().is_struct_embedded()) else {
+                                self.push_insn_id(block, insn_id);
+                                self.set_dynamic_send_reason(insn_id, SuperNoProfiles);
+                                continue;
+                            };
+                            block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                            let replacement = self.emit_struct_member_access(block, recv, mid, opt_type, index, is_embedded, &args, state);
+                            self.make_equal_to(insn_id, replacement);
                         } else {
-                            // Other method types (not ISEQ or CFUNC)
+                            // Other method types (not ISEQ, CFUNC, or struct members)
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperNotOptimizedMethodType(MethodType::from(def_type)));
                             continue;
@@ -11829,6 +11843,14 @@ fn unhandled_call_type(flags: u32) -> Result<(), CallType> {
 fn unspecializable_c_call_type(flags: u32) -> bool {
     ((flags & VM_CALL_KWARG) != 0) ||
     unspecializable_call_type(flags)
+}
+
+/// The index of the member that a StructAref or StructAset method entry reads or writes, if its
+/// byte offset fits the 32-bit displacement of a memory operand.
+fn struct_member_index(cme: *const rb_callable_method_entry_t) -> Option<i32> {
+    let index: i32 = unsafe { get_cme_def_body_optimized_index(cme) }.try_into().ok()?;
+    let native_index = (index as i64) * (SIZEOF_VALUE as i64);
+    (native_index <= (i32::MAX as i64)).then_some(index)
 }
 
 /// If a given call uses overly complex arguments, then we won't specialize.
