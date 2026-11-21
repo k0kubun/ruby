@@ -145,8 +145,8 @@ fn iseq_mark(payload: &IseqPayload) {
 
         // Mark the classes cached by the JIT code
         for klass_cache in unsafe { version.as_ref() }.klass_caches.iter() {
-            if **klass_cache != Qfalse {
-                unsafe { rb_gc_mark_movable(**klass_cache); }
+            for &klass in klass_cache.0.iter().filter(|&&klass| klass != Qfalse) {
+                unsafe { rb_gc_mark_movable(klass); }
             }
         }
     }
@@ -191,8 +191,8 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
 
     // Move the classes cached by the JIT code
     for klass_cache in unsafe { version.as_mut() }.klass_caches.iter_mut() {
-        if **klass_cache != Qfalse {
-            **klass_cache = unsafe { rb_gc_location(**klass_cache) };
+        for klass in klass_cache.0.iter_mut().filter(|klass| **klass != Qfalse) {
+            *klass = unsafe { rb_gc_location(*klass) };
         }
     }
 

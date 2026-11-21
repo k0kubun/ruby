@@ -408,8 +408,9 @@ object_singleton_class_p(VALUE klass)
 // so it never allocates or takes the VM lock. JIT code calls it to check the callee of a call site
 // whose receiver classes vary but which always calls the same method.
 //
-// `klass_cache` is the call site's cache of the last class found to resolve to `expected_cme`.
-// A hit skips the method cache lookup, whose hash table probe and the loads of the class's
+// `klass_cache` is the call site's cache of the last ZJIT_KLASS_CACHE_SIZE classes found to resolve
+// to `expected_cme`, most recently used first, which the JIT code checks the first of. A hit skips
+// the method cache lookup, whose hash table probe and the loads of the class's
 // method cache entries miss the CPU cache on most calls. `cache_owner` is the ISEQ whose JIT
 // code owns the cache and marks the class in it. The JIT code that calls this is invalidated
 // when `expected_cme` is, and a class that resolves `mid_sym` to `expected_cme` keeps doing so
@@ -417,12 +418,19 @@ object_singleton_class_p(VALUE klass)
 //
 // With `match_def`, a method entry of the same method definition, e.g. of a module method included
 // in another class, is a hit as well. It isn't cached since `expected_cme` doesn't guard it.
+#define ZJIT_KLASS_CACHE_SIZE 8 // KLASS_CACHE_SIZE in zjit/src/hir.rs
+
 const rb_callable_method_entry_t *
 rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_owner, const rb_callable_method_entry_t *expected_cme, bool match_def)
 {
     VALUE klass = CLASS_OF(recv);
-    if (LIKELY(*klass_cache == klass)) {
-        return expected_cme;
+    for (int i = 0; i < ZJIT_KLASS_CACHE_SIZE; i++) {
+        if (klass_cache[i] == klass) {
+            // Move it to the front for the JIT code to find it inline next time
+            memmove(&klass_cache[1], &klass_cache[0], i * sizeof(VALUE));
+            klass_cache[0] = klass;
+            return expected_cme;
+        }
     }
 
     ID mid = rb_sym2id(mid_sym);
@@ -435,7 +443,8 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
                 // The cache keeps the class alive. Don't let it keep a short-lived object alive
                 // through its singleton class.
                 if (!object_singleton_class_p(klass) || RB_OBJ_PROMOTED(klass)) {
-                    *klass_cache = klass;
+                    memmove(&klass_cache[1], &klass_cache[0], (ZJIT_KLASS_CACHE_SIZE - 1) * sizeof(VALUE));
+                    klass_cache[0] = klass;
                     RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
                 }
             }
