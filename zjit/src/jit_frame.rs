@@ -319,11 +319,17 @@ impl JITFrame {
         StackMapWriter::new(self.materialize_block_code())
     }
 
+    /// Return true if [Self::set_stack_map] has installed a stack map. Later stack maps for the
+    /// JITFrame are ignored, so callers can skip building them.
+    pub fn has_stack_map(&self) -> bool {
+        EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty.as_ptr()))
+    }
+
     /// Install a stack map built from [Self::stack_map_writer].
     pub fn set_stack_map(&mut self, writer: StackMapWriter) {
         debug_assert_eq!(writer.bytes.first().map(|byte| byte & 1 != 0), Some(self.materialize_block_code()));
         // Avoid allocating memory more than once for the same stack map
-        if EMPTY_STACK_MAPS.iter().all(|empty| !ptr::eq(self.stack_map, empty.as_ptr())) {
+        if self.has_stack_map() {
             return;
         }
         let bytes = writer.finish();
