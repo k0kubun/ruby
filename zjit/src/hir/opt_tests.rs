@@ -26579,6 +26579,72 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_invokesuper_with_kwarg_to_iseq_optimizes() {
+        eval("
+            class A
+              def foo(a, k:, j: 2) = [a, k, j]
+            end
+            class B < A
+              def foo(a)
+                super(a, k: 1)
+              end
+            end
+
+            B.new.foo(0)
+        ");
+
+        let hir = hir_string_proc("B.new.method(:foo)");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
+        assert_snapshot!(hir, @"
+        fn foo@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v27:CPtr = GetEP 0
+          v28:RubyValue = LoadField v27, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v29:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v28, Value(VALUE(0x1048))
+          v30:RubyValue = LoadField v27, :VM_ENV_DATA_INDEX_SPECVAL@0x1050
+          v31:FalseClass = GuardBitEquals v30, Value(false) recompile
+          v32:Fixnum[2] = Const Value(2)
+          v51:Fixnum[0] = Const Value(0)
+          PushInlineFrame :foo, v9 (0x1058), num_args=3
+          v47:ArrayExact = NewArray v10, v16, v32
+          PopInlineFrame
+          PatchPoint NoEPEscape(foo)
+          CheckInterrupts
+          Return v47
+        ");
+    }
+
+    #[test]
+    fn test_invokesuper_with_kwarg_to_cfunc_remains_invokesuper() {
+        eval("
+            S = Struct.new(:a, keyword_init: true)
+            class C < S
+              def initialize(x)
+                super(a: x)
+              end
+            end
+
+            C.new(1)
+        ");
+
+        let hir = hir_string_proc("C.instance_method(:initialize).bind(C.allocate)");
+        assert!(hir.contains("InvokeSuper "), "Expected an unoptimized InvokeSuper but got:\n{hir}");
+    }
+
+    #[test]
     fn test_invokesuper_with_blockarg_remains_invokesuper() {
         eval("
             class A
@@ -26681,7 +26747,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_invokesuper_with_keyword_args_remains_invokesuper() {
+    fn test_invokesuper_with_keyword_args_to_positional_hash_optimizes() {
         eval("
           class A
             def foo(attributes = {})
@@ -26699,7 +26765,7 @@ mod hir_opt_tests {
         ");
 
         let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
+        assert!(!hir.contains("InvokeSuper "), "Expected an optimized InvokeSuper but got:\n{hir}");
 
         assert_snapshot!(hir, @"
         fn foo@<compiled>:9:
@@ -26729,10 +26795,26 @@ mod hir_opt_tests {
           v15:BasicObject = LoadArg :content@1
           Jump bb5(v14, v15)
         bb5(v25:HeapBasicObject, v26:BasicObject):
-          v32:BasicObject = InvokeSuper v25, 0x1010, v26 # SendFallbackReason: super: complex argument passing to `super` call
+          PatchPoint MethodRedefined(A@0x1010, foo@0x1018, cme:0x1020)
+          v41:CPtr = GetEP 0
+          v42:RubyValue = LoadField v41, :VM_ENV_DATA_INDEX_ME_CREF@0x1048
+          v43:CallableMethodEntry[VALUE(0x1050)] = GuardBitEquals v42, Value(VALUE(0x1050))
+          v44:RubyValue = LoadField v41, :VM_ENV_DATA_INDEX_SPECVAL@0x1058
+          v45:FalseClass = GuardBitEquals v44, Value(false) recompile
+          v46:StaticSymbol[:content] = Const Value(VALUE(0x1060))
+          v47:HashExact = NewHash v46: v26
+          PushInlineFrame :foo, v25 (0x1068), num_args=1
+          v59:CShape = LoadField v25, :shape_id@0x1088
+          v60:CShape[0x1089] = GuardBitEquals v59, CShape(0x1089) recompile
+          StoreField v25, :@attributes@0x108a, v47
+          WriteBarrier v25, v47
+          v63:CShape[0x108b] = Const CShape(0x108b)
+          StoreField v25, :shape_id@0x1088, v63
+          PatchPoint NoEPEscape(foo)
+          PopInlineFrame
           PatchPoint NoEPEscape(foo)
           CheckInterrupts
-          Return v32
+          Return v47
         ");
     }
 

@@ -4737,6 +4737,47 @@ fn test_invokesuper_to_data_member() {
 }
 
 #[test]
+fn test_invokesuper_with_kwarg() {
+    assert_snapshot!(inspect(r#"
+        class A
+          def foo(a, k:, j: 2) = [a, k, j]
+          def bar(**kw) = kw
+          def baz(k:) = k
+        end
+        class B < A
+          def foo(a) = super(a, k: a + 1)
+          def bar = super(k: 1, j: 2)
+          def baz(missing) = (missing ? super(j: 1) : super(k: 1, j: 2))
+        end
+        S = Struct.new(:a, keyword_init: true)
+        class C < S
+          def initialize(x) = super(a: x)
+        end
+        T = Struct.new(:a)
+        class D < T
+          def a=(val)
+            super(k: val)
+          end
+        end
+
+        def test(b, missing)
+          d = D.new(0)
+          d.a = 3
+          errors = [true, false].map do |m|
+            b.baz(m)
+          rescue ArgumentError => e
+            e.message
+          end
+          [b.foo(1), b.bar, C.new(4).a, d.a, errors]
+        end
+
+        b = B.new
+        test(b, false)
+        test(b, false)
+    "#), @r#"[[1, 2, 2], {k: 1, j: 2}, 4, {k: 3}, ["missing keyword: :k", "unknown keyword: :j"]]"#);
+}
+
+#[test]
 fn test_invokesuper_to_cfunc_simple_args() {
     assert_snapshot!(inspect(r#"
         class MyString < String
