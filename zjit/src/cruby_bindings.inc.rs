@@ -2499,6 +2499,7 @@ unsafe extern "C" {
         expected_cme: *const rb_callable_method_entry_t,
         match_def: bool,
     ) -> *const rb_callable_method_entry_t;
+    pub fn rb_zjit_call_data_cme(cd: *const rb_call_data) -> *const rb_callable_method_entry_t;
     pub fn rb_zjit_defined_ivar(obj: VALUE, id: ID, pushval: VALUE) -> VALUE;
     pub fn rb_zjit_method_tracing_currently_enabled() -> bool;
     pub fn rb_zjit_iseq_tracing_currently_enabled() -> bool;

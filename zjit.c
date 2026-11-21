@@ -301,6 +301,15 @@ rb_zjit_singleton_class_p(VALUE klass)
     return RCLASS_SINGLETON_P(klass);
 }
 
+// Whether `klass` is the singleton class of an object that isn't a class or module
+static bool
+object_singleton_class_p(VALUE klass)
+{
+    if (!RCLASS_SINGLETON_P(klass)) return false;
+    VALUE attached = RCLASS_ATTACHED_OBJECT(klass);
+    return !RB_TYPE_P(attached, T_CLASS) && !RB_TYPE_P(attached, T_MODULE);
+}
+
 // Return the method entry for the Symbol `mid_sym` cached on the class of `recv`, or NULL if the class's method
 // cache doesn't have a valid one. Unlike rb_callable_method_entry(), this never fills the cache,
 // so it never allocates or takes the VM lock. JIT code calls it to check the callee of a call site
@@ -330,13 +339,33 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
         const struct rb_class_cc_entries *ccs = (const struct rb_class_cc_entries *)ccs_data;
         if (LIKELY(!METHOD_ENTRY_INVALIDATED(ccs->cme))) {
             if (ccs->cme == expected_cme) {
-                *klass_cache = klass;
-                RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
+                // The cache keeps the class alive. Don't let it keep a short-lived object alive
+                // through its singleton class.
+                if (!object_singleton_class_p(klass) || RB_OBJ_PROMOTED(klass)) {
+                    *klass_cache = klass;
+                    RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
+                }
             }
             else if (match_def && ccs->cme->def == expected_cme->def) {
                 return expected_cme;
             }
             return ccs->cme;
+        }
+    }
+    return NULL;
+}
+
+// The method entry that the call cache of `cd` holds, or NULL if it's empty or invalidated. It's
+// the method that the last call from the interpreter or a dynamic send of JIT code dispatched to.
+const rb_callable_method_entry_t *
+rb_zjit_call_data_cme(const struct rb_call_data *cd)
+{
+    const struct rb_callcache *cc = cd->cc;
+    if (cc && vm_cc_markable(cc) && !vm_cc_invalidated_p(cc)) {
+        // JIT code that refers to a method of a singleton class keeps the object alive
+        const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
+        if (!object_singleton_class_p(cme->owner) && !object_singleton_class_p(cme->defined_class)) {
+            return cme;
         }
     }
     return NULL;
