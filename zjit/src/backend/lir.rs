@@ -3281,7 +3281,12 @@ impl Assembler
             // ccall doesn't clobber caller-saved registers
             // holding stack/local operands.
             compile_exit_save_state(asm, exit);
-            if let Some(reason) = trace_reason {
+            if let Some(reason) = trace_reason && crate::zp_sites::enabled() {
+                let pc = match exit.pc { Opnd::UImm(pc) => pc as *const VALUE, _ => std::ptr::null() };
+                let site = crate::zp_sites::new_exit_site(&reason, exit.iseq, pc, exit.recompile.is_some());
+                use crate::zp_sites::rb_zjit_zp_site_hit;
+                asm_ccall!(asm, rb_zjit_zp_site_hit, Opnd::const_ptr(site));
+            } else if let Some(reason) = trace_reason {
                 // Leak a CString with the reason so it's available at runtime
                 let reason_cstr = std::ffi::CString::new(reason.to_string())
                     .unwrap_or_else(|_| std::ffi::CString::new("unknown").unwrap());
@@ -3353,7 +3358,7 @@ impl Assembler
                     TraceExits::All => true,
                     TraceExits::Counter(counter) if counter == side_exit_counter(reason) => true,
                     _ => false,
-                }).unwrap_or(false);
+                }).unwrap_or(false) || crate::zp_sites::enabled();
 
                 // If enabled, instrument exits first, and then jump to a shared exit.
                 let counted_exit = if get_option!(stats) || should_record_exit || cfg!(test) {

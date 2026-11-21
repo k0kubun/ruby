@@ -39,6 +39,7 @@ mod fxhash;
 mod gc;
 mod jit_frame;
 mod payload;
+mod zp_sites;
 mod json;
 mod ttycolors;
 

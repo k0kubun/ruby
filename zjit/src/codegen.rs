@@ -292,6 +292,7 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
         && let IseqStatus::Compiled(code_ptrs) = &unsafe { version.as_ref() }.status
     {
         incr_counter!(resumed_frame_count);
+        crate::zp_sites::resume_hit(iseq, insn_idx, stack_size, "resumed_jit", 0);
         // Without the VM lock, another Ractor may be writing code, so don't borrow the code block.
         return code_ptrs.start_ptr.raw_ptr(&ZJITState::get_code_region_base());
     }
@@ -313,6 +314,7 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
             IseqStatus::Compiled(_) => unreachable!("compiled entries are returned above"),
             IseqStatus::CantCompile(_) => {
                 incr_counter!(exit_exception_handler);
+                crate::zp_sites::resume_hit(iseq, insn_idx, stack_size, "interp_cant_compile", entry.num_versions);
                 return std::ptr::null();
             }
             IseqStatus::NotCompiled | IseqStatus::Invalidated => {}
@@ -320,6 +322,7 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
     }
     if entry.num_versions >= max_iseq_versions() {
         incr_counter!(exit_exception_handler);
+        crate::zp_sites::resume_hit(iseq, insn_idx, stack_size, "interp_max_versions", entry.num_versions);
         return std::ptr::null();
     }
 
@@ -333,6 +336,8 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
     if entry.count < resume_threshold()
         || unsafe { !rb_zjit_compiling_p } || unsafe { rb_ec_stack_check(ec as _) } != 0
     {
+        let outcome = if entry.count < resume_threshold() { "interp_below_threshold" } else { "interp_not_compiling" };
+        crate::zp_sites::resume_hit(iseq, insn_idx, stack_size, outcome, entry.num_versions);
         return std::ptr::null();
     }
 
@@ -351,6 +356,7 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
         cb.mark_all_executable();
         code_ptr.map_or_else(|_| {
             incr_counter!(exit_exception_handler);
+            crate::zp_sites::resume_hit(iseq, insn_idx, stack_size, "interp_compile_failed", 0);
             std::ptr::null()
         }, |code_ptr| code_ptr.raw_ptr(cb))
     })
@@ -596,6 +602,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
         // One more slot below those holds the saved SP register that stack maps
         // are anchored on (see base_ptr_slot_offset()).
         let jit_frame_size = function.inlining_depth() + 2;
+        crate::zp_sites::set_current(iseq, get_or_create_iseq_payload(iseq).versions.len(), get_or_create_iseq_payload(iseq).max_versions(), function.is_lukewarm(), unsafe { version.as_ref() }.is_resume);
         let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), jit_frame_size);
         let mut asm = Assembler::new_with_stack_slots(jit_frame_size);
 
