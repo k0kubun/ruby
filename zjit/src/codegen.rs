@@ -288,7 +288,7 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
         .position(|entry| entry.insn_idx == insn_idx && entry.stack_size == stack_size);
     let entry_idx = unsafe { payload.as_ref() }.and_then(find_entry);
     if let Some(entry_idx) = entry_idx
-        && let Some(version) = unsafe { (*payload).resume_entries[entry_idx].version }
+        && let Some(version) = unsafe { &*payload }.resume_entries[entry_idx].version
         && let IseqStatus::Compiled(code_ptrs) = &unsafe { version.as_ref() }.status
     {
         incr_counter!(resumed_frame_count);
