@@ -623,6 +623,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
             }
         }
 
+        let print_snapshots = lir::comments_enabled() || perf::hir_symbol_ranges_enabled();
+
         // Compile each basic block
         for &block_id in reverse_post_order.iter() {
             // Skip the entries superblock -- it's an internal CFG artifact
@@ -669,6 +671,11 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, func
 
             // Compile all instructions
             for (insn_idx, &insn_id) in block.insns().enumerate() {
+                // A Snapshot generates no code, so don't clone it with its FrameState unless
+                // it's printed in a comment or the perf map.
+                if !print_snapshots && matches!(function.find_ref(insn_id), Insn::Snapshot { .. }) {
+                    continue;
+                }
                 let insn = function.find(insn_id);
                 let symbol_range = perf::hir_symbol_range_start(&mut asm, &insn);
 

@@ -105,8 +105,13 @@ fn start_synthetic_hir_symbol_range(
     Some(symbol_range)
 }
 
+/// Return true if HIR instructions get symbol ranges in the perf map.
+pub(crate) fn hir_symbol_ranges_enabled() -> bool {
+    get_option!(perf) == Some(PerfMap::HIR)
+}
+
 fn new_hir_symbol_range() -> Option<SymbolRange> {
-    (get_option!(perf) == Some(PerfMap::HIR)).then(|| Rc::new(RefCell::new(None)))
+    hir_symbol_ranges_enabled().then(|| Rc::new(RefCell::new(None)))
 }
 
 fn install_symbol_range_start(

@@ -4574,14 +4574,18 @@ impl Assembler {
 
 /// Macro to use format! for Insn::Comment, which skips a format! call
 /// when not dumping disassembly.
+/// Return true if [asm_comment] adds comments.
+pub fn comments_enabled() -> bool {
+    // If --zjit-dump-disasm or --zjit-dump-lir is given, enrich them with comments.
+    // Also allow --zjit-debug on dev builds to enable comments since dev builds dump LIR on panic.
+    crate::options::get_option_ref!(dump_disasm).is_some() ||
+        crate::options::get_option!(dump_lir).is_some() ||
+        (cfg!(debug_assertions) && crate::options::get_option!(debug))
+}
+
 macro_rules! asm_comment {
     ($asm:expr, $($fmt:tt)*) => {
-        // If --zjit-dump-disasm or --zjit-dump-lir is given, enrich them with comments.
-        // Also allow --zjit-debug on dev builds to enable comments since dev builds dump LIR on panic.
-        let enable_comment = $crate::options::get_option_ref!(dump_disasm).is_some() ||
-            $crate::options::get_option!(dump_lir).is_some() ||
-            (cfg!(debug_assertions) && $crate::options::get_option!(debug));
-        if enable_comment {
+        if $crate::backend::lir::comments_enabled() {
             $asm.push_insn(crate::backend::lir::Insn::Comment(format!($($fmt)*)));
         }
     };
