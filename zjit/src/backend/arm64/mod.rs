@@ -1779,8 +1779,14 @@ impl Assembler {
             asm.cache_block_orders();
             trace_compile_phase("number_instructions", || asm.number_instructions(0));
 
-            let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());
-            let mut intervals = trace_compile_phase("build_intervals", || asm.build_intervals(live_in));
+            // Without VRegs, e.g. in stubs, there's nothing to allocate.
+            let has_vregs = asm.num_vregs > 0;
+            let mut intervals = if has_vregs {
+                let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());
+                trace_compile_phase("build_intervals", || asm.build_intervals(live_in))
+            } else {
+                vec![]
+            };
 
             // Dump live intervals if requested
             if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
@@ -1789,8 +1795,12 @@ impl Assembler {
                 }
             }
 
-            trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
-            let num_stack_slots = trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs));
+            let num_stack_slots = if has_vregs {
+                trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&mut intervals, &mut regs));
+                trace_compile_phase("linear_scan", || asm.linear_scan(&intervals, &regs))
+            } else {
+                0
+            };
 
             asm.stack_state.set_spill_slots(num_stack_slots);
             asm.stack_state.num_side_exit_stack_map_slots = asm.side_exit_stack_map_slots(&intervals);
