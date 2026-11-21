@@ -369,17 +369,22 @@ STATIC_ASSERT(VM_ENV_DATA_INDEX_ME_CREF, VM_ENV_DATA_INDEX_ME_CREF == -2);
 STATIC_ASSERT(VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL == -1);
 STATIC_ASSERT(VM_ENV_DATA_INDEX_FLAGS,   VM_ENV_DATA_INDEX_FLAGS   == -0);
 
-static void
-vm_push_frame(rb_execution_context_t *ec,
-              const rb_iseq_t *iseq,
-              VALUE type,
-              VALUE self,
-              VALUE specval,
-              VALUE cref_or_me,
-              const VALUE *pc,
-              VALUE *sp,
-              int local_size,
-              int stack_max)
+// vm_push_frame() for hot paths that should inline it regardless of the compiler's heuristics
+ALWAYS_INLINE(static void
+              vm_push_frame_inline(rb_execution_context_t *ec, const rb_iseq_t *iseq, VALUE type, VALUE self, VALUE specval,
+                                   VALUE cref_or_me, const VALUE *pc, VALUE *sp, int local_size, int stack_max));
+
+static inline void
+vm_push_frame_inline(rb_execution_context_t *ec,
+                     const rb_iseq_t *iseq,
+                     VALUE type,
+                     VALUE self,
+                     VALUE specval,
+                     VALUE cref_or_me,
+                     const VALUE *pc,
+                     VALUE *sp,
+                     int local_size,
+                     int stack_max)
 {
     rb_control_frame_t *const cfp = RUBY_VM_NEXT_CONTROL_FRAME(ec->cfp);
 
@@ -430,6 +435,21 @@ vm_push_frame(rb_execution_context_t *ec,
         SDR();
     }
     vm_push_frame_debug_counter_inc(ec, cfp, type);
+}
+
+static void
+vm_push_frame(rb_execution_context_t *ec,
+              const rb_iseq_t *iseq,
+              VALUE type,
+              VALUE self,
+              VALUE specval,
+              VALUE cref_or_me,
+              const VALUE *pc,
+              VALUE *sp,
+              int local_size,
+              int stack_max)
+{
+    vm_push_frame_inline(ec, iseq, type, self, specval, cref_or_me, pc, sp, local_size, stack_max);
 }
 
 void
