@@ -13586,6 +13586,55 @@ fn test_ivar_inline_cache_on_final_version() {
 }
 
 #[test]
+fn test_setivar_inline_cache_transition_on_final_version() {
+    // A final version adds @foo to objects in shapes it didn't profile through the inline
+    // cache's shape transition. Add it to objects with more and more ivars, twice per shape so
+    // the second write hits the cache, until the fields no longer fit in the embedded capacity.
+    // Also add it to an object that has an object_id and to a frozen object.
+    rb_zjit_prepare_options();
+    let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+    let old_max_versions = get_option!(max_versions);
+    set_call_threshold(2);
+    set_max_versions(2);
+    let result = inspect(r#"
+        class TransitionIC
+          def initialize(n) = n.times { |i| instance_variable_set(:"@x#{i}", i) }
+          def set(v, x) = [(@foo = v), x.succ]
+          def get = @foo
+        end
+
+        TransitionIC.new(0).set(0, 1); TransitionIC.new(0).set(0, 1)      # compile v1
+        TransitionIC.new(0).set(0, "a"); TransitionIC.new(0).set(0, "a")  # invalidate v1, compile the final version
+        TransitionIC.new(6).set(0, "a")  # make new objects embed several fields
+
+        result = []
+        (1..12).each do |n|
+          2.times do |k|
+            o = TransitionIC.new(n)
+            o.set(n * 10 + k, "a")
+            o.set(n * 10 + k + 1, "a")
+            result << [o.get, o.instance_variables.size, o.instance_variable_get(:"@x#{n - 1}")]
+          end
+        end
+        2.times do |k|
+          o = TransitionIC.new(2)
+          id = o.object_id
+          o.set(k, "a")
+          result << [o.get, o.object_id == id, o.instance_variables]
+        end
+        frozen = TransitionIC.new(2).freeze
+        result << begin; frozen.set(1, "a"); rescue FrozenError; :frozen; end
+        result << frozen.instance_variables
+        GC.start
+        GC.verify_internal_consistency
+        result
+    "#);
+    set_max_versions(old_max_versions);
+    set_call_threshold(old_call_threshold);
+    assert_snapshot!(result, @"[[11, 2, 0], [12, 2, 0], [21, 3, 1], [22, 3, 1], [31, 4, 2], [32, 4, 2], [41, 5, 3], [42, 5, 3], [51, 6, 4], [52, 6, 4], [61, 7, 5], [62, 7, 5], [71, 8, 6], [72, 8, 6], [81, 9, 7], [82, 9, 7], [91, 10, 8], [92, 10, 8], [101, 11, 9], [102, 11, 9], [111, 12, 10], [112, 12, 10], [121, 13, 11], [122, 13, 11], [0, true, [:@x0, :@x1, :@foo]], [1, true, [:@x0, :@x1, :@foo]], :frozen, [:@x0, :@x1]]");
+}
+
+#[test]
 fn test_ivar_inline_cache_refill_on_final_version() {
     // On an inline cache miss, JIT code caches the object's shape. The interpreter would cache
     // the shape that @foo was added in, which objects that got more ivars after @foo don't have.
