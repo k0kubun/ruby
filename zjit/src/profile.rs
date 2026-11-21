@@ -339,9 +339,19 @@ fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     if entry.opnd_types.is_empty() {
         entry.opnd_types = vec![TypeDistribution::new()];
     }
-    let ty = ProfiledType::block_handler(profiler.peek_at_block_handler());
+    let block_handler = profiler.peek_at_block_handler();
+    let ty = ProfiledType::block_handler(block_handler);
     VALUE::from(profiler.iseq).write_barrier(ty.class());
     entry.opnd_types[0].observe(ty);
+
+    // `yield x, ...` to a Symbol block handler calls the method on x. Profile the class of x.
+    let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
+    let argc = num_arguments_on_stack(cd);
+    if block_handler.static_sym_p() && argc > 0 {
+        let recv_ty = ProfiledType::new(profiler.peek_at_stack((argc - 1) as isize));
+        VALUE::from(profiler.iseq).write_barrier(recv_ty.class());
+        profile.yield_symbol_recv.entry(profiler.insn_idx).or_insert_with(TypeDistribution::new).observe(recv_ty);
+    }
 }
 
 fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
@@ -677,6 +687,9 @@ pub struct IseqProfile {
 
     /// Procs passed as `&block` to sends, profiled like block handlers. See [`profile_block_arg_proc`].
     block_arg_procs: HashMap<YarvInsnIdx, TypeDistribution>,
+
+    /// Receivers of `invokeblock` to a static Symbol block handler, i.e. the first yielded values.
+    yield_symbol_recv: HashMap<YarvInsnIdx, TypeDistribution>,
 }
 
 impl IseqProfile {
@@ -687,6 +700,7 @@ impl IseqProfile {
             splat_lengths: HashMap::new(),
             send_symbols: HashMap::new(),
             block_arg_procs: HashMap::new(),
+            yield_symbol_recv: HashMap::new(),
         }
     }
 
@@ -729,6 +743,11 @@ impl IseqProfile {
         self.block_arg_procs.get(&insn_idx)
     }
 
+    /// The receivers of `invokeblock` to a static Symbol block handler at `insn_idx`.
+    pub fn get_yield_symbol_recv(&self, insn_idx: YarvInsnIdx) -> Option<&TypeDistribution> {
+        self.yield_symbol_recv.get(&insn_idx)
+    }
+
     /// Get the static Symbols profiled as the method name of `send`, most common first.
     pub fn get_send_symbols(&self, insn_idx: YarvInsnIdx) -> Vec<VALUE> {
         let Some(distribution) = self.send_symbols.get(&insn_idx) else { return vec![] };
@@ -767,7 +786,7 @@ impl IseqProfile {
             }
         }
 
-        for distribution in self.block_arg_procs.values() {
+        for distribution in self.block_arg_procs.values().chain(self.yield_symbol_recv.values()) {
             for profiled_type in distribution.each_item() {
                 callback(profiled_type.class)
             }
@@ -792,7 +811,7 @@ impl IseqProfile {
             }
         }
 
-        for distribution in self.block_arg_procs.values_mut() {
+        for distribution in self.block_arg_procs.values_mut().chain(self.yield_symbol_recv.values_mut()) {
             for ref mut profiled_type in distribution.each_item_mut() {
                 callback(&mut profiled_type.class)
             }

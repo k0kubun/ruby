@@ -2128,6 +2128,121 @@ fn test_inline_blockarg_proc_yield_dispatches_directly() {
 }
 
 #[test]
+fn test_yield_to_symbol_calls_cfunc() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        def one(x) = yield(x)
+        def neg(x) = yield(x)
+        def two(x, y) = yield(x, y)
+        def test(x) = [one(x, &:to_s), two(x, 10, &:+), neg(-x, &:-@)]
+        test(1)
+        test(2)
+    ");
+    assert_snapshot!(assert_no_invokeblock_fallback("test(3)"), @r#"["3", 13, 3]"#);
+}
+
+#[test]
+fn test_yield_to_symbol_calls_iseq_method() {
+    crate::options::enable_zjit_stats();
+    set_call_threshold(2);
+    eval("
+        class SymRecv
+          def initialize(v) = @v = v
+          def double = @v * 2
+          def add(x) = @v + x
+        end
+        def one(x) = yield(x)
+        def two(x, y) = yield(x, y)
+        def test(x) = [one(x, &:double), two(x, 5, &:add)]
+        test(SymRecv.new(1))
+        test(SymRecv.new(2))
+    ");
+    assert_snapshot!(assert_no_invokeblock_fallback("test(SymRecv.new(3))"), @"[6, 8]");
+}
+
+#[test]
+fn test_yield_to_most_common_symbol_of_polymorphic_handlers() {
+    // The most common Symbol is called directly without guards, and the others take the fallback.
+    set_call_threshold(5);
+    eval("
+        def one(x) = yield(x)
+        def test(x) = [one(x, &:to_s), one(x, &:to_s), one(x, &:to_s), one(x, &:inspect)]
+        test(1)
+    ");
+    assert_snapshot!(assert_compiles("[test(2), test(:a), test([])]"), @r#"[["2", "2", "2", "2"], ["a", "a", "a", ":a"], ["[]", "[]", "[]", "[]"]]"#);
+}
+
+#[test]
+fn test_yield_to_symbol_with_another_receiver_class() {
+    set_call_threshold(2);
+    eval("
+        def one(x) = yield(x)
+        def test(x) = one(x, &:to_s)
+        test(1)
+        test(2)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("[test(3), test(:sym), test(nil), test(4)]"), @r#"["3", "sym", "", "4"]"#);
+}
+
+#[test]
+fn test_yield_to_symbol_of_method_that_becomes_private() {
+    // Symbol blocks only call public methods, and NoMethodError is raised otherwise.
+    set_call_threshold(2);
+    eval("
+        class SymVisibility
+          def foo = :public
+        end
+        def one(x) = yield(x)
+        def test(x) = one(x, &:foo)
+        test(SymVisibility.new)
+        test(SymVisibility.new)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("
+        r = [test(SymVisibility.new)]
+        class SymVisibility; private :foo; end
+        r << (test(SymVisibility.new) rescue $!.class)
+        class SymVisibility; public :foo; def foo = :redefined; end
+        r << test(SymVisibility.new)
+    "), @"[:public, NoMethodError, :redefined]");
+}
+
+#[test]
+fn test_yield_to_symbol_of_private_or_protected_method() {
+    set_call_threshold(2);
+    eval("
+        class SymPrivate
+          def call_priv = one(self, &:priv)
+          def call_prot = one(self, &:prot)
+          private def priv = :priv
+          protected def prot = :prot
+          def one(x) = yield(x)
+        end
+        def test(x) = [(x.call_priv rescue $!.class), (x.call_prot rescue $!.class)]
+        test(SymPrivate.new)
+        test(SymPrivate.new)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test(SymPrivate.new)"), @"[NoMethodError, NoMethodError]");
+}
+
+#[test]
+fn test_yield_to_symbol_of_method_missing_and_no_receiver() {
+    set_call_threshold(2);
+    eval("
+        class SymMissing
+          def method_missing(name, *) = name == :ghost ? :ghost : super
+          def respond_to_missing?(name, priv) = name == :ghost
+        end
+        def one(x) = yield(x)
+        def none = yield
+        def test(x) = [one(x, &:ghost), (none(&:ghost) rescue $!.message)]
+        test(SymMissing.new)
+        test(SymMissing.new)
+    ");
+    assert_snapshot!(assert_compiles_allowing_exits("test(SymMissing.new)"), @r#"[:ghost, "no receiver given"]"#);
+}
+
+#[test]
 fn test_yield_with_more_args_than_abi_registers() {
     // `self` + eight yield args don't fit in C argument registers (6 on x86_64, 8 on
     // arm64), so the direct block invocation passes the overflow arguments on the

@@ -666,6 +666,7 @@ pub enum SideExitReason {
     InvokeBlockHandlerNotIseq,
     InvokeBlockIseqChanged,
     InvokeBlockHandlerNotProc,
+    InvokeBlockHandlerNotSymbol,
     BlockParamWbRequired,
     StackOverflow,
     FixnumModByZero,
@@ -3745,6 +3746,17 @@ fn block_arg0_splat_p(iseq: IseqPtr, argc: usize) -> bool {
         && !unsafe { rb_get_iseq_flags_ambiguous_param0(iseq) }
 }
 
+/// The method that `yield` to a Symbol block handler calls. See [`Function::resolve_invoke_block_symbol`].
+struct InvokeBlockSymbolTarget {
+    klass: VALUE,
+    mid: ID,
+    /// The method entry that the method lookup returns, for invalidation
+    lookup_cme: *const rb_callable_method_entry_t,
+    cme: *const rb_callable_method_entry_t,
+    /// The ISEQ and the arguments of an ISEQ method, or None for a C method
+    iseq_call: Option<(IseqPtr, SendDirectCall)>,
+}
+
 /// A block handler that `yield` can call by pushing the frame of its ISEQ block, as
 /// [`Insn::InvokeBlockIseqDirect`] does. See [`Function::dispatch_invoke_block_iseqs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4021,6 +4033,121 @@ impl Function {
             if_false: BranchEdge { target: if_false, args: vec![] },
         });
         if_true
+    }
+
+    /// Resolve the method that `yield` to the static Symbol block handler `symbol`, e.g.
+    /// `each(&:to_s)`, calls on the first yielded value of the class `klass` with `argc - 1`
+    /// arguments. Like `vm_call_symbol`, only a public method is called.
+    fn resolve_invoke_block_symbol(&self, symbol: VALUE, klass: VALUE, cd: *const rb_call_data, rest: &[InsnId]) -> Option<InvokeBlockSymbolTarget> {
+        let mid = unsafe { rb_sym2id(symbol) };
+        let ci = unsafe { (*cd).ci };
+        let lookup_cme = unsafe { rb_callable_method_entry(klass, mid) };
+        if lookup_cme.is_null() || unsafe { METHOD_ENTRY_VISI(lookup_cme) } != METHOD_VISI_PUBLIC {
+            return None;
+        }
+        let mut cme = unsafe { rb_check_overloaded_cme(lookup_cme, ci) };
+        while unsafe { get_cme_def_type(cme) } == VM_METHOD_TYPE_ALIAS {
+            cme = unsafe { rb_aliased_callable_method_entry(cme) };
+        }
+        // A refined method has VM_METHOD_TYPE_REFINED, so it falls back.
+        let iseq_call = match unsafe { get_cme_def_type(cme) } {
+            VM_METHOD_TYPE_ISEQ => {
+                let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
+                // A forwardable callee would need the callinfo of the target method.
+                if unsafe { iseq.params() }.flags.forwardable() != 0 {
+                    return None;
+                }
+                Some((iseq, self.build_send_direct_args(&CallerArguments::new(rest, ci), None, iseq, false).ok()?))
+            }
+            VM_METHOD_TYPE_CFUNC if !unsafe { rb_zjit_method_tracing_currently_enabled() } => {
+                let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(cme)) };
+                if cfunc_argc != -1 && cfunc_argc as usize != rest.len() {
+                    return None;
+                }
+                None
+            }
+            _ => return None,
+        };
+        Some(InvokeBlockSymbolTarget { klass, mid, lookup_cme, cme, iseq_call })
+    }
+
+    /// Call the method of [`Function::resolve_invoke_block_symbol`] on `recv`, which is known to
+    /// be an instance of `target.klass`. The stack of `yield` has the receiver and the rest of the
+    /// arguments like a send.
+    fn emit_invoke_block_symbol_call(&mut self, block: BlockId, recv: InsnId, target: InvokeBlockSymbolTarget, cd: *const rb_call_data, rest: &[InsnId], state: InsnId) -> InsnId {
+        let InvokeBlockSymbolTarget { klass, mid, lookup_cme, cme, iseq_call } = target;
+        self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
+        match iseq_call {
+            Some((iseq, call)) => {
+                let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+                    self.emit_send_direct_args(block, call, rest, state, state);
+                self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: None })))
+            }
+            None => self.emit_cfunc_call_on_method_entry(block, recv, cd, cme, None, rest, state),
+        }
+    }
+
+    /// Dispatch `yield` to the static Symbol block handler `symbol` by calling the method of the
+    /// first yielded value for the first of the profiled `recv_types` that has a method to call.
+    /// If `guard`, it guards on the handler and the class and side-exits otherwise. Otherwise, it
+    /// branches to the generic fallback. Return None if it can't be dispatched.
+    fn try_dispatch_invoke_block_symbol(
+        &mut self,
+        block: BlockId,
+        insn_idx: u32,
+        level: u32,
+        symbol: VALUE,
+        recv_types: &[ProfiledType],
+        guard: bool,
+        cd: *const rb_call_data,
+        flags: u32,
+        args: Vec<InsnId>,
+        state: InsnId,
+    ) -> Option<(BlockId, InsnId)> {
+        let (&recv, rest) = args.split_first()?;
+        let (recv_type, target) = recv_types.iter().filter(|recv_type| !recv_type.is_empty()).find_map(|&recv_type| {
+            Some((recv_type, self.resolve_invoke_block_symbol(symbol, recv_type.class(), cd, rest)?))
+        })?;
+        if !self.assume_no_singleton_classes(block, target.klass, state) {
+            return None;
+        }
+        let ep = self.get_ep(block, level);
+        let block_handler = self.load_ep_env_field(block, ep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64);
+        let recv_class_type = Type::from_profiled_type(recv_type);
+        if guard {
+            self.push_insn(block, Insn::GuardBitEquals { val: block_handler, expected: Const::CInt64(symbol.0 as i64), reason: Box::new(SideExitReason::InvokeBlockHandlerNotSymbol), state, recompile: Some(Recompile) });
+            let recv = self.guard_type_recompile(block, recv, recv_class_type, state, Recompile);
+            return Some((block, self.emit_invoke_block_symbol_call(block, recv, target, cd, rest, state)));
+        }
+
+        let join_block = self.new_block(insn_idx);
+        let join_param = self.push_insn(join_block, Insn::Param);
+        let symbol_block = self.new_block(insn_idx);
+        let call_block = self.new_block(insn_idx);
+        let fallback_block = self.new_block(insn_idx);
+        let expected = self.push_insn(block, Insn::Const { val: Const::CInt64(symbol.0 as i64) });
+        let is_symbol = self.push_insn(block, Insn::IsBitEqual { left: block_handler, right: expected });
+        self.push_insn(block, Insn::CondBranch {
+            val: is_symbol,
+            if_true: BranchEdge { target: symbol_block, args: vec![] },
+            if_false: BranchEdge { target: fallback_block, args: vec![] },
+        });
+        self.push_insn(symbol_block, Insn::CondBranchHasType(Box::new(CondBranchHasTypeData {
+            val: recv,
+            expected: recv_class_type,
+            if_true: BranchEdge { target: call_block, args: vec![] },
+            if_false: BranchEdge { target: fallback_block, args: vec![] },
+        })));
+        let recv = self.push_insn(call_block, Insn::RefineType { val: recv, new_type: self.type_of(recv).intersection(recv_class_type) });
+        let result = self.emit_invoke_block_symbol_call(call_block, recv, target, cd, rest, state);
+        self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+
+        self.mark_cold(fallback_block);
+        let (fallback_block, fallback_result) = self.dispatch_invoke_block_fallback(
+            fallback_block, insn_idx, level, None, cd, flags, args.clone(), state, InvokeBlockPolymorphicMiss,
+        );
+        self.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback_result] }));
+        Some((join_block, join_param))
     }
 
     /// Dispatch `yield` to the profiled blocks. If `monomorphic`, it guards on a single block
@@ -13784,8 +13911,26 @@ fn add_iseq_to_hir(
                             })
                     } else { None };
 
+                    // A static Symbol block handler with a profiled receiver class. If it's the only
+                    // block handler, guard on it. Otherwise, call it if it's the most common one.
+                    let symbol_dispatch = block_handler_summary.as_ref()
+                        .filter(|_| direct_blocks.is_empty() && !ifunc_procs && inlined_known_block.is_none() && !inlined_blockarg_proc && can_direct_invoke_block(flags))
+                        .map(|summary| (summary.buckets()[0].class(), summary.is_monomorphic() && !fun.policy.no_side_exits))
+                        .filter(|(symbol, _)| symbol.static_sym_p())
+                        .and_then(|(symbol, guard)| {
+                            let recv_summary = TypeDistributionSummary::new(payload.profile.get_yield_symbol_recv(exit_state.insn_idx)?);
+                            let recv_types = if guard {
+                                recv_summary.is_monomorphic().then(|| vec![recv_summary.buckets()[0]])?
+                            } else {
+                                recv_summary.buckets().to_vec()
+                            };
+                            fun.try_dispatch_invoke_block_symbol(block, insn_idx, get_lvar_level(exit_state.iseq), symbol, &recv_types, guard, cd, flags, args.clone(), exit_id)
+                        });
                     let result = if let Some(block_iseq) = inlined_known_block {
                         fun.push_invoke_block_iseq_direct(block, block_iseq, get_lvar_level(exit_state.iseq), args, exit_id)
+                    } else if let Some((continue_block, result)) = symbol_dispatch {
+                        block = continue_block;
+                        result
                     } else if inlined_blockarg_proc && direct_blocks.is_empty() && !ifunc_procs {
                         // TODO: Specialize a known BlockArgProc without a profile, e.g. from the
                         // profile of the block argument.

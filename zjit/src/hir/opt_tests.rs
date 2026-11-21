@@ -5664,6 +5664,43 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_yield_to_symbol_calls_method_of_profiled_receiver() {
+        // `one` is called with `&:-@`, so its yield guards the Symbol block handler and calls
+        // the method of the profiled receiver class, here String#-@, with the rest of the args.
+        eval(r#"
+            def one(x) = yield(x)
+            def test(x) = one(x, &:-@)
+            test("a")
+            test("b")
+        "#);
+        assert_snapshot!(hir_string("one"), @"
+        fn one@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint NoSingletonClass(String@0x1008)
+          v16:CPtr = GetEP 0
+          v17:CInt64 = LoadField v16, :VM_ENV_DATA_INDEX_SPECVAL@0x1010
+          v18:CInt64[34060] = GuardBitEquals v17, CInt64(34060) recompile
+          v19:StringExact = GuardType v10, StringExact recompile
+          PatchPoint MethodRedefined(String@0x1008, -@@0x1011, cme:0x1018)
+          v22:BasicObject = CCallWithFrame v19, :String#-@@0x1040
+          PatchPoint NoEPEscape(one)
+          CheckInterrupts
+          Return v22
+        ");
+    }
+
+    #[test]
     fn test_yield_live_stack_below_args_inlines_invocation() {
         // A live value sits on the stack below the yield args (base > 0): the no-receiver-slot
         // SP math must preserve it.
