@@ -212,10 +212,39 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, const
             CHECK_VM_STACK_OVERFLOW(reg_cfp, calling->argc + 1);
             vm_check_canary(ec, reg_cfp->sp);
 
+#if USE_ZJIT
+            // Skip vm_callee_setup_arg() and jit_exec() when the callee has ZJIT code
+            // and the arguments need no setup. vm_callee_setup_arg() warns about an
+            // unused block, so leave that case to it.
+            const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
+            const rb_iseq_t *iseq = def_iseq_ptr(cme->def);
+            rb_jit_func_t zjit_func = zjit_simple_iseq_entry(iseq, calling->argc);
+            if (zjit_func &&
+                !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_TAILCALL)) &&
+                !calling->kw_splat &&
+                (calling->block_handler == VM_BLOCK_HANDLER_NONE || ISEQ_BODY(iseq)->param.flags.use_block)) {
+                // Same as pushing the receiver and arguments and calling vm_call_iseq_setup_normal(),
+                // which leaves reg_cfp->sp at the receiver.
+                VALUE *sp = reg_cfp->sp;
+                *sp++ = calling->recv;
+                for (i = 0; i < calling->argc; i++) {
+                    sp[i] = argv[i];
+                }
+                const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+                vm_push_frame(ec, iseq, VM_FRAME_MAGIC_METHOD | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH, calling->recv,
+                              calling->block_handler, (VALUE)cme,
+                              body->iseq_encoded, sp + body->param.size,
+                              body->local_table_size - body->param.size,
+                              body->stack_max);
+                return vm_exec_zjit_func(ec, zjit_func);
+            }
+#endif
+
             *reg_cfp->sp++ = calling->recv;
             for (i = 0; i < calling->argc; i++) {
                 *reg_cfp->sp++ = argv[i];
             }
+
 
             if (ISEQ_BODY(def_iseq_ptr(vm_cc_cme(cc)->def))->param.flags.forwardable) {
                 vm_call_iseq_fwd_setup(ec, reg_cfp, calling);
