@@ -1037,6 +1037,15 @@ pub fn zjit_alloc_bytes() -> usize {
 
 /// Record a Perfetto duration event spanning the execution of `func`.
 /// Uses Begin/End pairs so nested calls produce properly nested slices.
+/// Like [trace_compile_phase], but compute the name only when tracing compiles, e.g. an ISEQ's
+/// location, which takes a few allocations.
+pub fn trace_compile_phase_lazy<N, F, R>(name: N, func: F) -> R where N: FnOnce() -> String, F: FnOnce() -> R {
+    if !get_option!(trace_compiles, /*default=*/false) {
+        return func();
+    }
+    trace_compile_phase(&name(), func)
+}
+
 pub fn trace_compile_phase<F, R>(name: &str, func: F) -> R where F: FnOnce() -> R {
     if !get_option!(trace_compiles, /*default=*/false) {
         return func();

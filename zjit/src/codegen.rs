@@ -253,8 +253,7 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, ec: EcPtr) -> *con
 
 /// Compile an entry point for a given ISEQ
 fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr) -> Result<CodePtr, CompileError> {
-    let iseq_name = iseq_get_location(iseq, 0);
-    trace_compile_phase(&iseq_name, || {
+    crate::stats::trace_compile_phase_lazy(|| iseq_get_location(iseq, 0), || {
         // Compile ISEQ into High-level IR
         let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq).inspect_err(|_| {
             incr_counter!(failed_iseq_count);
@@ -371,7 +370,7 @@ fn gen_resume_entry(cb: &mut CodeBlock, iseq: IseqPtr, entry_idx: usize) -> Resu
     let ResumeEntry { insn_idx, stack_size, .. } = payload.resume_entries[entry_idx];
     let mut version = IseqVersion::new(iseq);
     unsafe { version.as_mut() }.is_resume = true;
-    let code_ptrs = trace_compile_phase(&iseq_get_location(iseq, insn_idx.into()), || {
+    let code_ptrs = crate::stats::trace_compile_phase_lazy(|| iseq_get_location(iseq, insn_idx.into()), || {
         let function = crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq_with_resume(iseq, Some((insn_idx, stack_size))))?;
         gen_iseq_body(cb, iseq, version, Some(&function))
     });
@@ -504,7 +503,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
     let mut version = IseqVersion::new(iseq);
     let start_pos = cb.get_write_pos();
     let code_ptrs = if function.is_none() {
-        trace_compile_phase(&iseq_get_location(iseq, 0), || gen_iseq_body(cb, iseq, version, function))
+        crate::stats::trace_compile_phase_lazy(|| iseq_get_location(iseq, 0), || gen_iseq_body(cb, iseq, version, function))
     } else {
         gen_iseq_body(cb, iseq, version, function)
     };
@@ -517,7 +516,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
             // the exit leaves the rest of the loop to the interpreter, which profiles it for
             // the recompile, and waiting for more exits would interpret more such loops.
             payload.num_exits_until_invalidate = if payload.hot_loop { 1 } else { get_option!(num_exits_until_invalidate) };
-            trace_compile_size(cb, &iseq_get_location(iseq, 0), start_pos);
+            trace_compile_size(cb, || iseq_get_location(iseq, 0), start_pos);
         }
         Err(err) => {
             unsafe { version.as_mut() }.status = IseqStatus::CantCompile(err.clone());
@@ -533,12 +532,12 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
 /// `name`) and as a point on the running "code size" graph. We call this for
 /// method compiles and the startup trampolines, so the code-size graph is
 /// attributable from the moment ZJIT starts up.
-pub fn trace_compile_size(cb: &CodeBlock, name: &str, start_pos: usize) {
+pub fn trace_compile_size(cb: &CodeBlock, name: impl FnOnce() -> String, start_pos: usize) {
     if get_option!(trace_compiles, false) {
         if let Some(tracer) = ZJITState::get_tracer() {
             let end_pos = cb.get_write_pos();
             let size = end_pos.saturating_sub(start_pos) as u64;
-            tracer.write_compile_size(name, size, end_pos as u64);
+            tracer.write_compile_size(&name(), size, end_pos as u64);
             tracer.write_code_size_counter(size, end_pos as u64);
         }
     }

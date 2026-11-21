@@ -259,7 +259,7 @@ impl ZJITState {
 
         // Record the machine code generated during startup (entry/exit/materialize
         // trampolines).
-        trace_compile_size(ZJITState::get_code_block(), "startup trampolines", startup_start_pos);
+        trace_compile_size(ZJITState::get_code_block(), || "startup trampolines".to_string(), startup_start_pos);
 
         entry_trampoline
     }
