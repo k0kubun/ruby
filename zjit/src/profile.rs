@@ -606,6 +606,20 @@ impl IseqProfile {
         self.entry(insn_idx).map(|e| e.opnd_types.as_slice()).filter(|s| !s.is_empty())
     }
 
+    /// The number of times the call at `insn_idx` was profiled, or None if it's unknown whether
+    /// it ran: the ISEQ was never profiled, or the interpreter doesn't profile the opcode.
+    pub fn num_call_samples(&self, insn_idx: YarvInsnIdx, opcode: ruby_vminsn_type) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        match opcode {
+            YARVINSN_invokesuper => Some(self.super_cme.get(&insn_idx).map_or(0, |d| d.num_samples())),
+            YARVINSN_send | YARVINSN_opt_send_without_block | YARVINSN_sendforward | YARVINSN_opt_new =>
+                Some(self.entry(insn_idx).and_then(|e| e.opnd_types.first()).map_or(0, |d| d.num_samples())),
+            _ => None,
+        }
+    }
+
     pub fn get_splat_length_summary(&self, insn_idx: YarvInsnIdx) -> Option<SplatLengthDistributionSummary> {
         self.splat_lengths.get(&insn_idx)
             .map(SplatLengthDistributionSummary::new)
