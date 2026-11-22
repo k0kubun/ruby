@@ -8012,6 +8012,33 @@ impl Function {
         budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
     }
 
+    /// Whether the call at `state`, or an inlined call that encloses it, didn't run while the
+    /// interpreter profiled the ISEQ before this compile. The callee's code would most likely
+    /// never run, so inlining it would only cost compile time and memory.
+    ///
+    /// `yield`s are not judged by their profile: an inlined method's `yield` was profiled with
+    /// the blocks of all its callers, e.g. `Array#each` may have been profiled on empty Arrays.
+    fn is_unprofiled_call_path(&self, state: InsnId, callee_iseq: IseqPtr) -> bool {
+        // With --zjit-call-threshold=1, nothing is profiled.
+        if unsafe { crate::options::rb_zjit_profile_threshold } == 0 {
+            return false;
+        }
+        // These are cheaper to inline than to call. See should_inline().
+        if unsafe { rb_jit_iseq_builtin_attrs(callee_iseq) } & BUILTIN_ATTR_ALWAYS_INLINE != 0 {
+            return false;
+        }
+        let mut frame = Some(state);
+        while let Some(snapshot) = frame {
+            let state = self.frame_state_ref(snapshot);
+            let opcode = unsafe { rb_iseq_bare_opcode_at_pc(state.iseq, state.pc) } as ruby_vminsn_type;
+            if get_or_create_iseq_payload(state.iseq).profile.num_call_samples(state.insn_idx, opcode) == Some(0) {
+                return true;
+            }
+            frame = state.caller;
+        }
+        false
+    }
+
     fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
@@ -8174,6 +8201,11 @@ impl Function {
                 let tiny_past_budget = self.over_inline_budget()
                     && self.tiny_inlines_past_budget < MAX_TINY_INLINES_PAST_BUDGET
                     && unsafe { get_iseq_encoded_size(iseq) } as usize <= TINY_INLINE_MAX_CALLEE_SIZE;
+                if !frame_block && self.is_unprofiled_call_path(state, iseq) {
+                    incr_counter!(inline_reject_unprofiled);
+                    search_start = send_pos + 1;
+                    continue;
+                }
                 if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable || tiny_past_budget) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
@@ -8627,6 +8659,10 @@ impl Function {
         // blocks in the inlined methods' callers.
         let throw_inlinable = (throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq))
             || self.yields_to_throwing_block(iseq, &call_state);
+        if self.is_unprofiled_call_path(state, iseq) {
+            incr_counter!(inline_reject_unprofiled);
+            return None;
+        }
         if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
             return None;
         }
