@@ -14177,6 +14177,7 @@ fn add_iseq_to_hir(
                     let summary = fun.profile_summary(&profiles, self_param, exit_id);
                     let self_param = fun.guard_heap(block, self_param, exit_id);
                     // Filter out profiled types we don't care to optimize
+                    let mut saw_complex_shape = false;
                     let profiled_types = summary.buckets().iter().filter(|profiled_type| {
                         // Don't read past the end of the profiled types
                         !profiled_type.is_empty()
@@ -14185,7 +14186,7 @@ fn add_iseq_to_hir(
                         // Too-complex shapes use hash tables for ivars;
                         // rb_shape_get_iv_index doesn't work for them.
                         // Let the fallthrough GetIvar handle these.
-                        && !profiled_type.shape().is_complex()
+                        && if profiled_type.shape().is_complex() { saw_complex_shape = true; false } else { true }
                     }).collect::<Vec<_>>();
                     // We might have two objects of class A and B with the same shape; de-duplicate
                     // profiled types by shape. This is just an optimization to reduce code size.
@@ -14196,6 +14197,15 @@ fn add_iseq_to_hir(
                         }
                         profiled_types_unique_shapes.push(profiled_type);
                     }
+                    // If only too-complex shapes were profiled, a recompile would see the same
+                    // profiles and exit here again. Use the fallback like the final version.
+                    let (allow_exit, fallback_counter) = if profiled_types_unique_shapes.is_empty() && saw_complex_shape {
+                        (false, Counter::getivar_fallback_complex)
+                    } else if profiled_types_unique_shapes.is_empty() {
+                        (!fun.policy.no_side_exits, Counter::getivar_fallback_no_side_exits_no_profile)
+                    } else {
+                        (!fun.policy.no_side_exits, Counter::getivar_fallback_no_side_exits)
+                    };
                     let Some((new_block, result)) = fun.dispatch_getivar(
                         &profiled_types_unique_shapes,
                         block,
@@ -14204,8 +14214,8 @@ fn add_iseq_to_hir(
                         id,
                         ic,
                         exit_id,
-                        !fun.policy.no_side_exits,
-                        if profiled_types_unique_shapes.is_empty() { Counter::getivar_fallback_no_side_exits_no_profile } else { Counter::getivar_fallback_no_side_exits },
+                        allow_exit,
+                        fallback_counter,
                     ) else {
                         // Side-exiting unconditionally; end the block
                         break;
