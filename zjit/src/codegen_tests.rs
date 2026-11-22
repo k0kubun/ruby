@@ -14826,6 +14826,18 @@ fn test_ivar_shape_chain_falls_back_for_too_complex_shapes() {
 }
 
 #[test]
+fn test_builtin_array_push_past_allocated_capacity() {
+    // Array#map and #select push to an Array sized for the receiver, which the block may grow
+    eval(r#"
+        def test(a)
+          [a.map { |x| a << x + 10 if a.size < 6; x * 2 }, a.select { |x| x.odd? }, Array.new(3) { |i| i * 3 }]
+        end
+        test([1, 2, 3])
+    "#);
+    assert_snapshot!(assert_compiles("test([1, 2, 3])"), @"[[2, 4, 6, 22, 24, 26], [1, 3, 11, 13], [0, 3, 6]]");
+}
+
+#[test]
 fn test_array_each_is_defined_in_ruby() {
     assert_snapshot!(inspect("Array.instance_method(:each).source_location&.first"), @r#""<internal:array>""#);
 }

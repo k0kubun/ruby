@@ -21,6 +21,7 @@ unsafe extern "C" {
     fn rb_builtin_ary_first(ec: EcPtr, self_: VALUE) -> VALUE;
     fn rb_builtin_fixnum_inc(ec: EcPtr, self_: VALUE, num: VALUE) -> VALUE;
     fn rb_builtin_bool_negate(ec: EcPtr, self_: VALUE, value: VALUE) -> VALUE;
+    fn rb_jit_ary_push(ec: EcPtr, self_: VALUE, ary: VALUE, val: VALUE) -> VALUE;
 }
 
 pub struct Annotations {
@@ -351,6 +352,7 @@ pub fn init() -> Annotations {
     annotate_builtin!(rb_builtin_ary_at, inline_ary_at);
     annotate_builtin!(rb_builtin_ary_at_end, inline_ary_at_end, types::BoolExact);
     annotate_builtin!(rb_builtin_ary_first, inline_ary_first);
+    annotate_builtin!(rb_jit_ary_push, inline_jit_ary_push);
 
     Annotations {
         cfuncs: std::mem::take(cfuncs),
@@ -1586,6 +1588,18 @@ fn inline_ary_at(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnI
     let index = fun.push_insn(block, hir::Insn::UnboxFixnum { val: index });
     let result = fun.push_insn(block, hir::Insn::ArrayAref { array: recv, index });
     Some(result)
+}
+
+/// Inline `rb_jit_ary_push(ec, self, ary, val)` into ArrayPush, which doesn't need the locals
+/// spilled for the builtin. Called from Array#map etc. with the Array they allocated for the
+/// result, which nothing else can see, so it isn't frozen. Returns `val` like the builtin.
+fn inline_jit_ary_push(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[_self, array, val] = args else { return None; };
+    let array = fun.push_insn(block, hir::Insn::RefineType { val: array, new_type: types::Array });
+    fun.push_insn(block, hir::Insn::ArrayPush { array, val, state });
+    // `val` may be a block parameter whose type isn't known while building HIR, which
+    // try_inline_invoke_builtin() can't infer, so return a new instruction for it.
+    Some(fun.push_insn(block, hir::Insn::RefineType { val, new_type: types::BasicObject }))
 }
 
 /// Inline `ary_at_end(ec, self, index)` implies index >= ArrayLength(self).
