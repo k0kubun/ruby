@@ -283,7 +283,8 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
     let (Ok(insn_idx), Ok(stack_size)) = (u16::try_from(insn_idx), u8::try_from(stack_size)) else { return std::ptr::null() };
 
     // The payload is written only while holding the VM lock, which also stops other Ractors
-    // at a barrier, so reading it here without the lock is safe.
+    // at a barrier, so reading it here without the lock is safe. This fast path only returns
+    // compiled entries.
     let find_entry = |payload: &IseqPayload| payload.resume_entries.iter()
         .position(|entry| entry.insn_idx == insn_idx && entry.stack_size == stack_size);
     let entry_idx = unsafe { payload.as_ref() }.and_then(find_entry);
@@ -295,55 +296,50 @@ pub extern "C" fn rb_zjit_resume_entry(ec: EcPtr, iseq: IseqPtr, payload: *const
         // Without the VM lock, another Ractor may be writing code, so don't borrow the code block.
         return code_ptrs.start_ptr.raw_ptr(&ZJITState::get_code_region_base());
     }
-    let entry_idx = match entry_idx {
-        Some(entry_idx) => entry_idx,
-        None => with_vm_lock(src_loc!(), || {
-            let payload = get_or_create_iseq_payload(iseq);
-            find_entry(payload).unwrap_or_else(|| {
-                payload.resume_entries.push(ResumeEntry { insn_idx, stack_size, count: 0, num_versions: 0, version: None });
-                payload.resume_entries.len() - 1
-            })
-        }),
-    };
-    let payload = payload_ptr_as_mut(get_iseq_payload_ptr(iseq));
-    let profiled = !payload.versions.is_empty();
-    let entry = &mut payload.resume_entries[entry_idx];
-    if let Some(version) = entry.version {
-        match &unsafe { version.as_ref() }.status {
-            IseqStatus::Compiled(_) => unreachable!("compiled entries are returned above"),
-            IseqStatus::CantCompile(_) => {
-                incr_counter!(exit_exception_handler);
-                return std::ptr::null();
-            }
-            IseqStatus::NotCompiled | IseqStatus::Invalidated => {}
-        }
-    }
-    if entry.num_versions >= max_iseq_versions() {
-        incr_counter!(exit_exception_handler);
-        return std::ptr::null();
-    }
-
-    // Like a call to the ISEQ, profile the frames resumed here before compiling the entry,
-    // unless calls to the ISEQ already profiled it. Rescue and ensure ISEQs, for example,
-    // run only on this path.
-    entry.count += 1;
-    if !profiled && entry.count == unsafe { crate::options::rb_zjit_profile_threshold } {
-        unsafe { rb_zjit_profile_enable(iseq) };
-    }
-    if entry.count < resume_threshold()
-        || unsafe { !rb_zjit_compiling_p } || unsafe { rb_ec_stack_check(ec as _) } != 0
-    {
-        return std::ptr::null();
-    }
-
+    // Otherwise, count the resume and maybe compile the entry. Other Ractors may be doing the same
+    // for this entry, or creating others in resume_entries, so do it all while holding the VM lock.
+    // The entry may have been compiled by another Ractor since the check above.
     with_vm_lock(src_loc!(), || {
-        let cb = ZJITState::get_code_block();
-        let entry = &mut get_or_create_iseq_payload(iseq).resume_entries[entry_idx];
-        entry.count = 0;
-        // Another Ractor may have compiled the entry while this one waited for the lock.
-        if let Some(version) = entry.version && let IseqStatus::Compiled(code_ptrs) = &unsafe { version.as_ref() }.status {
-            return code_ptrs.start_ptr.raw_ptr(cb);
+        let payload = get_or_create_iseq_payload(iseq);
+        let profiled = !payload.versions.is_empty();
+        let entry_idx = find_entry(payload).unwrap_or_else(|| {
+            payload.resume_entries.push(ResumeEntry { insn_idx, stack_size, count: 0, num_versions: 0, version: None });
+            payload.resume_entries.len() - 1
+        });
+        let entry = &mut payload.resume_entries[entry_idx];
+        if let Some(version) = entry.version {
+            match &unsafe { version.as_ref() }.status {
+                IseqStatus::Compiled(code_ptrs) => {
+                    incr_counter!(resumed_frame_count);
+                    return code_ptrs.start_ptr.raw_ptr(ZJITState::get_code_block());
+                }
+                IseqStatus::CantCompile(_) => {
+                    incr_counter!(exit_exception_handler);
+                    return std::ptr::null();
+                }
+                IseqStatus::NotCompiled | IseqStatus::Invalidated => {}
+            }
         }
+        if entry.num_versions >= max_iseq_versions() {
+            incr_counter!(exit_exception_handler);
+            return std::ptr::null();
+        }
+
+        // Like a call to the ISEQ, profile the frames resumed here before compiling the entry,
+        // unless calls to the ISEQ already profiled it. Rescue and ensure ISEQs, for example,
+        // run only on this path.
+        entry.count += 1;
+        if !profiled && entry.count == unsafe { crate::options::rb_zjit_profile_threshold } {
+            unsafe { rb_zjit_profile_enable(iseq) };
+        }
+        if entry.count < resume_threshold()
+            || unsafe { !rb_zjit_compiling_p } || unsafe { rb_ec_stack_check(ec as _) } != 0
+        {
+            return std::ptr::null();
+        }
+
+        entry.count = 0;
+        let cb = ZJITState::get_code_block();
         let code_ptr = with_compile_time_stat(compile_time_ns, || gen_resume_entry(cb, iseq, entry_idx));
         if matches!(code_ptr, Err(CompileError::OutOfMemory)) {
             unsafe { rb_zjit_compiling_p = false; }
