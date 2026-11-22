@@ -1028,6 +1028,14 @@ rb_vm_symbol_block_arg_refined_p(VALUE sym)
     return cref && !NIL_P(CREF_REFINEMENTS(cref));
 }
 
+// For JITs: the method entry in ep[VM_ENV_DATA_INDEX_ME_CREF] of a method frame's EP. It's wrapped
+// in an svar once the method sets $~ or $_ (e.g. with =~ or gsub). `recv` is unused.
+VALUE
+rb_vm_lep_method_entry(VALUE recv, VALUE me_or_svar)
+{
+    return (VALUE)check_method_entry(me_or_svar, TRUE);
+}
+
 // For JITs: non-zero when refinements are active in a cref
 size_t
 rb_vm_cref_has_refinements_p(VALUE cref)
