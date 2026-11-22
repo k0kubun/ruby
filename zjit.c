@@ -530,16 +530,33 @@ struct zjit_ivar_cache_entry {
 };
 static struct zjit_ivar_cache_entry zjit_ivar_cache[1 << ZJIT_IVAR_CACHE_BITS];
 
-// Find the fields of a T_OBJECT `obj` and the index of `id` in them (ATTR_INDEX_NOT_SET if
-// unset). Return false if `obj` is not a T_OBJECT with a non-complex shape or multiple
-// Ractors are running.
+// Find the fields of a T_OBJECT, T_CLASS or T_MODULE `obj` and the index of the instance
+// variable `id` in them (ATTR_INDEX_NOT_SET if unset). Return false if `obj` is not one of them
+// with a non-complex shape, or multiple Ractors are running. Class instance variables, e.g. of
+// the models of an Active Record app, are read by sites whose receivers are many classes.
 static inline bool
 zjit_obj_ivar_index(VALUE obj, ID id, VALUE *fields_obj, attr_index_t *index)
 {
-    if (SPECIAL_CONST_P(obj) || BUILTIN_TYPE(obj) != T_OBJECT || rb_multi_ractor_p()) {
+    if (SPECIAL_CONST_P(obj) || rb_multi_ractor_p()) {
         return false;
     }
-    *fields_obj = ROBJECT_FIELDS_OBJ(obj);
+    switch (BUILTIN_TYPE(obj)) {
+      case T_OBJECT:
+        *fields_obj = ROBJECT_FIELDS_OBJ(obj);
+        break;
+      case T_CLASS:
+      case T_MODULE:
+        // Like rb_ivar_lookup(). A class that another Ractor created may raise on the read.
+        if (RCLASS_OWNER_RACTOR_ID(obj)) return false;
+        *fields_obj = RCLASS_WRITABLE_FIELDS_OBJ(obj);
+        if (!*fields_obj) {
+            *index = ATTR_INDEX_NOT_SET;
+            return true;
+        }
+        break;
+      default:
+        return false;
+    }
     shape_id_t shape_id = RBASIC_SHAPE_ID(*fields_obj);
     if (rb_shape_complex_p(shape_id)) {
         return false;
@@ -574,8 +591,8 @@ rb_zjit_getivar(VALUE obj, ID id)
 
 VALUE rb_vm_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic);
 
-// rb_vm_getinstancevariable() that doesn't use the inline cache for T_OBJECTs. The inline
-// cache holds one shape, so it misses on every read at a site whose receivers alternate.
+// rb_vm_getinstancevariable() that doesn't use the inline cache for T_OBJECTs and classes. The
+// inline cache holds one shape, so it misses on every read at a site whose receivers alternate.
 VALUE
 rb_zjit_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
 {
@@ -588,8 +605,8 @@ rb_zjit_getinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, IVC ic)
 }
 
 // rb_vm_getinstancevariable() for JIT code that missed the instruction's inline cache. For a
-// T_OBJECT, look up the index in the (shape, name) cache instead of walking the shape tree, and
-// put the object's shape in the inline cache, which the JIT code checks before calling this, for
+// T_OBJECT or a class, look up the index in the (shape, name) cache instead of walking the shape
+// tree. For a T_OBJECT, also put the object's shape in the inline cache, which the JIT code checks before calling this, for
 // the next read of an object in the same shape. On a miss, the interpreter caches the shape that
 // the ivar was added in, which serves it as a hint for the tree walk, but never matches the
 // object's shape exactly when ivars were added after it.
@@ -599,8 +616,11 @@ rb_zjit_getinstancevariable_on_cache_miss(const rb_iseq_t *iseq, VALUE obj, ID i
     VALUE fields_obj;
     attr_index_t index;
     if (zjit_obj_ivar_index(obj, id, &fields_obj, &index)) {
-        shape_id_t shape_id = RBASIC_SHAPE_ID_FOR_READ(fields_obj);
-        ATOMIC_U64_SET_RELAXED(ic->value, rb_getivar_cache_pack(RSHAPE_OFFSET(shape_id), index));
+        // The JIT code checks the cache only for T_OBJECTs
+        if (BUILTIN_TYPE(obj) == T_OBJECT) {
+            shape_id_t shape_id = RBASIC_SHAPE_ID_FOR_READ(fields_obj);
+            ATOMIC_U64_SET_RELAXED(ic->value, rb_getivar_cache_pack(RSHAPE_OFFSET(shape_id), index));
+        }
         return index == ATTR_INDEX_NOT_SET ? Qnil : rb_imemo_fields_ptr(fields_obj)[index];
     }
     return rb_vm_getinstancevariable(iseq, obj, id, ic);
