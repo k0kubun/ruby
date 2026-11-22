@@ -8917,6 +8917,26 @@ fn test_if_fixnum_compare_kinds() {
 }
 
 #[test]
+fn test_fused_bit_equal_with_replaced_operand() {
+    // `type` reaches `type == :enum` through a block param that is later replaced with
+    // the StaticSymbol guard of `!type`, so the IsBitEqual fused into the CondBranch
+    // must read its operands through the union-find.
+    assert_snapshot!(inspect("
+        def test(type, block)
+          if block
+            raise
+          elsif !type
+            type = :string
+          end
+          type == :enum ? 1 : 2
+        end
+        test(:integer, nil)
+        test(:enum, nil)
+        [test(:integer, nil), test(:enum, nil), test(nil, nil)]
+    "), @"[2, 1, 2]");
+}
+
+#[test]
 fn test_if_compare_result_also_used() {
     // The comparison result is both branched on and returned, so it cannot be
     // folded away into the branch and must still be materialized.
