@@ -88,8 +88,8 @@ pub struct Options {
     pub num_exits_until_invalidate: NumExits,
 
     /// Number of GCs that must run during the profiling window of an ISEQ for its compile to
-    /// treat it as lukewarm and only inline small callees. 0 disables it. See
-    /// `IseqPayload::is_lukewarm`.
+    /// treat it as lukewarm and only inline small callees. 0 disables it, and also counting
+    /// recompile exits per GC (see `exit_recompile`). See `IseqPayload::is_lukewarm`.
     pub lukewarm_gc_count: usize,
 
     /// Number of returns and loop back-edges a lukewarm version runs before it's invalidated to

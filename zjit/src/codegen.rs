@@ -4894,6 +4894,19 @@ c_callable! {
                 return;
             }
 
+            // Recompile only for exits that come in a burst. Recompiling the whole ISEQ costs as
+            // much as its first compile, which is more than a guard that fails a few times between
+            // GCs, e.g. once per request, costs as exits. So start counting the exits again when a
+            // GC has run since the first one. Like for lukewarm ISEQs, GCs measure how much the
+            // program ran without counting compile time. --zjit-lukewarm-gc-count=0 disables it.
+            if get_option!(lukewarm_gc_count) > 0 && !payload.hot_loop {
+                let gc_count = unsafe { rb_gc_count() };
+                if payload.exits_gc_count != gc_count {
+                    payload.exits_gc_count = gc_count;
+                    payload.num_exits_until_invalidate = get_option!(num_exits_until_invalidate);
+                }
+            }
+
             // Wait for the configured number of recompile exits before invalidation.
             payload.num_exits_until_invalidate = payload.num_exits_until_invalidate.saturating_sub(1);
             if payload.num_exits_until_invalidate > 0 {

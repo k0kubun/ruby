@@ -662,6 +662,30 @@ fn test_recompile_exit_waits_for_exit_budget() {
 }
 
 #[test]
+fn test_recompile_exit_budget_restarts_after_gc() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(3);
+    set_lukewarm_gc_count(1);
+    eval("
+        def recompile_exit_burst(a, b) = a + b
+        recompile_exit_burst(1, 2)
+        recompile_exit_burst(1, 2)
+    ");
+    let iseq = get_method_iseq("self", "recompile_exit_burst");
+    let is_invalidated = || unsafe { get_or_create_iseq_payload(iseq).versions.last().unwrap().as_ref() }.is_invalidated();
+
+    // Two exits, then a GC: the exits before the GC don't count towards the third one
+    eval("recompile_exit_burst(1.5, 2.5); recompile_exit_burst(1.5, 2.5); GC.start");
+    eval("recompile_exit_burst(1.5, 2.5); recompile_exit_burst(1.5, 2.5)");
+    assert!(!is_invalidated());
+
+    // Three exits without a GC in between invalidate the version
+    eval("recompile_exit_burst(1.5, 2.5)");
+    assert!(is_invalidated());
+    assert_eq!(1, get_or_create_iseq_payload(iseq).versions.len());
+}
+
+#[test]
 fn test_many_unprofiled_exits_compile_final_version_next() {
     set_call_threshold(2);
     set_num_exits_until_invalidate(1);

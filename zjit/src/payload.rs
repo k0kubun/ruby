@@ -42,6 +42,9 @@ pub struct IseqPayload {
     pub compile_cref: Option<VALUE>,
     /// Number of recompile exits before invalidating the current version. See `exit_recompile`.
     pub num_exits_until_invalidate: NumExits,
+    /// The GC count (`rb_gc_count()`) when `num_exits_until_invalidate` started counting down.
+    /// See `exit_recompile`.
+    pub exits_gc_count: usize,
     /// Cached result of [`crate::codegen::iseq_may_write_block_code`].
     pub may_write_block_code: Option<bool>,
     /// Whether the interpreter's back-edges, rather than calls, opened the profiling window
@@ -69,6 +72,7 @@ impl IseqPayload {
             self_is_heap_object: false,
             compile_cref: None,
             num_exits_until_invalidate: get_option!(num_exits_until_invalidate),
+            exits_gc_count: 0,
             may_write_block_code: None,
             hot_loop: false,
             profile_start_gc_count: 0,
