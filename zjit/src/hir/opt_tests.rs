@@ -12400,6 +12400,41 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_getivar_on_complex_shape_falls_back_without_recompile_exit() {
+        eval(r#"
+            class C
+              def initialize
+                1000.times do |i|
+                  instance_variable_set("@v#{i}", i)
+                end
+                @foo = 42
+              end
+              def foo = @foo
+            end
+
+            O = C.new
+            O.foo
+            O.foo
+            TEST = C.instance_method(:foo)
+        "#);
+        assert_snapshot!(hir_string_proc("TEST"), @"
+        fn foo@<compiled>:9:
+        bb1():
+          EntryPoint interpreter
+          v1:HeapBasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:HeapBasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:HeapBasicObject):
+          v11:BasicObject = GetIvar v6, :@foo
+          CheckInterrupts
+          Return v11
+        ");
+    }
+
+    #[test]
     fn test_getivar_shape_guard_recompile() {
         // Call with one shape to compile, then call with a different shape to
         // trigger shape guard exits and recompilation. On the recompiled version,
@@ -12996,7 +13031,9 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:HeapBasicObject = GuardType v6, HeapBasicObject
-          SideExit NoProfileGetIvar recompile
+          v11:BasicObject = GetIvar v10, :@foo
+          CheckInterrupts
+          Return v11
         ");
     }
 
@@ -13065,7 +13102,9 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:HeapBasicObject = GuardType v6, HeapBasicObject
-          SideExit NoProfileGetIvar recompile
+          v11:BasicObject = GetIvar v10, :@foo
+          CheckInterrupts
+          Return v11
         ");
     }
 
@@ -13162,7 +13201,9 @@ mod hir_opt_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v10:HeapBasicObject = GuardType v6, HeapBasicObject
-          SideExit NoProfileGetIvar recompile
+          v11:BasicObject = GetIvar v10, :@var1000
+          CheckInterrupts
+          Return v11
         ");
     }
 
