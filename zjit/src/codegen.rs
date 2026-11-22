@@ -670,6 +670,10 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
                 if fused_bit_equals[function.find_id(insn_id)] {
                     continue;
                 }
+                // Snapshots generate no code. Skip them before find() clones their FrameState.
+                if matches!(function.find_ref(insn_id), Insn::Snapshot { .. }) {
+                    continue;
+                }
                 let insn = function.find(insn_id);
                 let symbol_range = perf::hir_symbol_range_start(&mut asm, &insn);
 
