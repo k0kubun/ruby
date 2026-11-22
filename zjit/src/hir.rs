@@ -3339,6 +3339,10 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// Number of PushInlineFrame/PopInlineFrame instructions removed by
+    /// [`Function::eliminate_empty_inline_frames`]. They still count against the inlining
+    /// budget, so that eliding frames doesn't change which calls get inlined.
+    num_elided_frame_insns: usize,
     /// The reverse post-order of the CFG, cached by [`Function::optimize`] for the passes that
     /// don't change the CFG.
     reverse_post_order_cache: Option<Vec<BlockId>>,
@@ -3869,6 +3873,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            num_elided_frame_insns: 0,
             reverse_post_order_cache: None,
             inline_frames: HashMap::default(),
             inline_pass: 0,
@@ -7983,7 +7988,7 @@ impl Function {
     /// Whether the function has spent its inlining budget. See [`Self::should_inline`].
     fn over_inline_budget(&self) -> bool {
         let budget = get_option!(inline_budget);
-        budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
+        budget != INLINE_BUDGET_UNLIMITED && self.num_instructions + self.num_elided_frame_insns > budget
     }
 
     fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
@@ -10679,6 +10684,7 @@ impl Function {
             // that with --zjit-stats it's replaced with a counter of how many
             // times execution passes an elided pair at run-time.
             let mut rewrites: HashMap<InsnId, Option<InsnId>> = HashMap::default();
+            self.num_elided_frame_insns += 2 * elided_pairs.len();
             for (push_id, pop_id) in elided_pairs {
                 let replacement = get_option!(stats)
                     .then(|| self.new_insn(Insn::IncrCounter(Counter::empty_inline_frame_count)));
