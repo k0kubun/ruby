@@ -13872,59 +13872,30 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :o@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
-        bb6():
-          v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          v16:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v33:CShape = LoadField v18, :shape_id@0x1040
-          v35:CShape[0x1041] = Const CShape(0x1041)
-          v36:CBool = IsBitEqual v33, v35
-          CondBranch v36, bb8(), bb9()
-        bb8():
-          v38:BasicObject = LoadField v18, :@foo@0x1042
-          Jump bb7(v38)
-        bb9():
-          v40:CShape[0x1043] = Const CShape(0x1043)
-          v41:CBool = IsBitEqual v33, v40
-          CondBranch v41, bb10(), bb11()
-        bb10():
-          v45:BasicObject = LoadField v18, :@foo@0x1044
-          Jump bb7(v45)
-        bb11():
-          v43:BasicObject = GetIvar v18, :@foo
-          Jump bb7(v43)
-        bb7(v34:BasicObject):
-          Jump bb4(v34)
+          v28:CShape = LoadField v16, :shape_id@0x1040
+          v30:CShape[0x1041] = Const CShape(0x1041)
+          v31:CBool = IsBitEqual v28, v30
+          CondBranch v31, bb5(), bb6()
         bb5():
-          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v48:StaticSymbol[:foo] = Const Value(VALUE(0x1048))
-          v49:CPtr[CPtr(0x1050)] = Const CPtr(0x1050)
-          v50:Iseq[VALUE(0x1058)] = Const Value(VALUE(0x1058))
-          v51:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
-          v52:CBool[false] = Const CBool(false)
-          CondBranchHasType v10, HeapBasicObject, bb16(), bb15()
-        bb16():
-          v54:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v55:CUInt64 = LoadKlassCacheEntry v49, v54
-          v56:CBool = IsBitEqual v54, v55
-          CondBranch v56, bb12(), bb15()
-        bb15():
-          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v48, v49, v50, v51, v52
-          v59:CBool = IsBitEqual v58, v51
-          CondBranch v59, bb12(), bb13()
-        bb12():
-          v61:BasicObject = GetIvar v10, :@foo
-          Jump bb14(v61)
-        bb13():
-          v63:BasicObject = Send v10, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb14(v63)
-        bb14(v65:BasicObject):
-          Jump bb4(v65)
-        bb4(v15:BasicObject):
+          v33:BasicObject = LoadField v16, :@foo@0x1042
+          Jump bb4(v33)
+        bb6():
+          v35:CShape[0x1043] = Const CShape(0x1043)
+          v36:CBool = IsBitEqual v28, v35
+          CondBranch v36, bb7(), bb8()
+        bb7():
+          v40:BasicObject = LoadField v16, :@foo@0x1044
+          Jump bb4(v40)
+        bb8():
+          v38:BasicObject = GetIvar v16, :@foo
+          Jump bb4(v38)
+        bb4(v29:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v15
+          Return v29
         ");
     }
 
@@ -13961,32 +13932,51 @@ mod hir_opt_tests {
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
           v17:Fixnum[5] = Const Value(5)
-          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
+          CondBranchHasType v10, ObjectSubclass[class_exact:D], bb6(), bb7()
         bb6():
-          v23:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
-          PatchPoint MethodRedefined(C@0x1008, foo=@0x1010, cme:0x1018)
-          v38:CShape = LoadField v23, :shape_id@0x1040
-          v39:CShape[0x1041] = Const CShape(0x1041)
-          v40:CBool = IsBitEqual v38, v39
-          CondBranch v40, bb8(), bb9()
-        bb8():
-          StoreField v23, :@foo@0x1042, v17
-          Jump bb7()
-        bb9():
-          v44:CShape[0x1043] = Const CShape(0x1043)
-          v45:CBool = IsBitEqual v38, v44
-          CondBranch v45, bb10(), bb11()
+          v23:ObjectSubclass[class_exact:D] = RefineType v10, ObjectSubclass[class_exact:D]
+          PatchPoint MethodRedefined(D@0x1008, foo=@0x1010, cme:0x1018)
+          v44:CShape = LoadField v23, :shape_id@0x1040
+          v45:CShape[0x1041] = Const CShape(0x1041)
+          v46:CBool = IsBitEqual v44, v45
+          CondBranch v46, bb10(), bb11()
         bb10():
-          StoreField v23, :@foo@0x1044, v17
-          Jump bb7()
+          StoreField v23, :@foo@0x1042, v17
+          v51:CShape[0x1043] = Const CShape(0x1043)
+          StoreField v23, :shape_id@0x1040, v51
+          Jump bb9()
         bb11():
           SetIvar v23, :@foo, v17
-          Jump bb7()
+          Jump bb9()
+        bb9():
+          Jump bb4(v17)
         bb7():
+          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb8(), bb5()
+        bb8():
+          v28:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          PatchPoint MethodRedefined(C@0x1048, foo=@0x1010, cme:0x1050)
+          v56:CShape = LoadField v28, :shape_id@0x1040
+          v57:CShape[0x1043] = Const CShape(0x1043)
+          v58:CBool = IsBitEqual v56, v57
+          CondBranch v58, bb13(), bb14()
+        bb13():
+          StoreField v28, :@foo@0x1042, v17
+          Jump bb12()
+        bb14():
+          v62:CShape[0x1078] = Const CShape(0x1078)
+          v63:CBool = IsBitEqual v56, v62
+          CondBranch v63, bb15(), bb16()
+        bb15():
+          StoreField v28, :@foo@0x1079, v17
+          Jump bb12()
+        bb16():
+          SetIvar v28, :@foo, v17
+          Jump bb12()
+        bb12():
           Jump bb4(v17)
         bb5():
-          v26:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
-          Jump bb4(v26)
+          v31:BasicObject = Send v10, :foo=, v17 # SendFallbackReason: Send: polymorphic fallback
+          Jump bb4(v31)
         bb4(v20:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
@@ -14100,59 +14090,30 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :o@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
-        bb6():
-          v18:ObjectSubclass[class_exact:C] = RefineType v10, ObjectSubclass[class_exact:C]
+          v16:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, x@0x1010, cme:0x1018)
-          v33:CShape = LoadField v18, :shape_id@0x1040
-          v35:CShape[0x1041] = Const CShape(0x1041)
-          v36:CBool = IsBitEqual v33, v35
-          CondBranch v36, bb8(), bb9()
-        bb8():
-          v38:BasicObject = LoadField v18, :@x@0x1042
-          Jump bb7(v38)
-        bb9():
-          v40:CShape[0x1043] = Const CShape(0x1043)
-          v41:CBool = IsBitEqual v33, v40
-          CondBranch v41, bb10(), bb11()
-        bb10():
-          v45:NilClass = Const Value(nil)
-          Jump bb7(v45)
-        bb11():
-          v43:BasicObject = GetIvar v18, :@x
-          Jump bb7(v43)
-        bb7(v34:BasicObject):
-          Jump bb4(v34)
+          v28:CShape = LoadField v16, :shape_id@0x1040
+          v30:CShape[0x1041] = Const CShape(0x1041)
+          v31:CBool = IsBitEqual v28, v30
+          CondBranch v31, bb5(), bb6()
         bb5():
-          PatchPoint MethodRedefined(C@0x1008, x@0x1010, cme:0x1018)
-          v48:StaticSymbol[:x] = Const Value(VALUE(0x1048))
-          v49:CPtr[CPtr(0x1050)] = Const CPtr(0x1050)
-          v50:Iseq[VALUE(0x1058)] = Const Value(VALUE(0x1058))
-          v51:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
-          v52:CBool[false] = Const CBool(false)
-          CondBranchHasType v10, HeapBasicObject, bb16(), bb15()
-        bb16():
-          v54:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v55:CUInt64 = LoadKlassCacheEntry v49, v54
-          v56:CBool = IsBitEqual v54, v55
-          CondBranch v56, bb12(), bb15()
-        bb15():
-          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v48, v49, v50, v51, v52
-          v59:CBool = IsBitEqual v58, v51
-          CondBranch v59, bb12(), bb13()
-        bb12():
-          v61:BasicObject = GetIvar v10, :@x
-          Jump bb14(v61)
-        bb13():
-          v63:BasicObject = Send v10, :x # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb14(v63)
-        bb14(v65:BasicObject):
-          Jump bb4(v65)
-        bb4(v15:BasicObject):
+          v33:BasicObject = LoadField v16, :@x@0x1042
+          Jump bb4(v33)
+        bb6():
+          v35:CShape[0x1043] = Const CShape(0x1043)
+          v36:CBool = IsBitEqual v28, v35
+          CondBranch v36, bb7(), bb8()
+        bb7():
+          v40:NilClass = Const Value(nil)
+          Jump bb4(v40)
+        bb8():
+          v38:BasicObject = GetIvar v16, :@x
+          Jump bb4(v38)
+        bb4(v29:BasicObject):
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v15
+          Return v29
         ");
     }
 
@@ -27137,41 +27098,13 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :o@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          CondBranchHasType v10, ObjectSubclass[class_exact:C], bb6(), bb5()
-        bb6():
+          v16:ObjectSubclass[class_exact:C] = GuardType v10, ObjectSubclass[class_exact:C] recompile
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v32:Fixnum[3] = Const Value(3)
-          Jump bb4(v32)
-        bb5():
-          PatchPoint MethodRedefined(C@0x1008, foo@0x1010, cme:0x1018)
-          v34:StaticSymbol[:foo] = Const Value(VALUE(0x1040))
-          v35:CPtr[CPtr(0x1048)] = Const CPtr(0x1048)
-          v36:Iseq[VALUE(0x1050)] = Const Value(VALUE(0x1050))
-          v37:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
-          v38:CBool[false] = Const CBool(false)
-          CondBranchHasType v10, HeapBasicObject, bb11(), bb10()
-        bb11():
-          v40:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1058
-          v41:CUInt64 = LoadKlassCacheEntry v35, v40
-          v42:CBool = IsBitEqual v40, v41
-          CondBranch v42, bb7(), bb10()
-        bb10():
-          v44:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1059, v34, v35, v36, v37, v38
-          v45:CBool = IsBitEqual v44, v37
-          CondBranch v45, bb7(), bb8()
-        bb7():
-          v47:Fixnum[3] = Const Value(3)
-          Jump bb9(v47)
-        bb8():
-          v49:BasicObject = Send v10, :foo # SendFallbackReason: Send: receiver class doesn't call the profiled method
-          Jump bb9(v49)
-        bb9(v51:BasicObject):
-          Jump bb4(v51)
-        bb4(v15:BasicObject):
+          v27:Fixnum[3] = Const Value(3)
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v15
+          Return v27
         ");
     }
 
@@ -31797,6 +31730,44 @@ mod hir_opt_tests {
           PatchPoint NoEPEscape(test)
           CheckInterrupts
           Return v15
+        ");
+    }
+
+    #[test]
+    fn test_specialize_send_with_block_to_two_shapes_of_one_class() {
+        set_call_threshold(3);
+        eval(r#"
+            class A
+              def initialize(extra) = (@bar = 1 if extra; @foo = 0)
+              def foo = yield
+            end
+            def test(obj)
+              obj.foo { }
+            end
+            test(A.new(false))
+            test(A.new(true))
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:7:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :obj@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :obj@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:ObjectSubclass[class_exact:A] = GuardType v10, ObjectSubclass[class_exact:A] recompile
+          PatchPoint NoSingletonClass(A@0x1008)
+          PatchPoint MethodRedefined(A@0x1008, foo@0x1010, cme:0x1018)
+          v50:NilClass = Const Value(nil)
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v50
         ");
     }
 

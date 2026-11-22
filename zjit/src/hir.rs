@@ -12472,6 +12472,16 @@ fn polymorphic_arms(summary: &TypeDistributionSummary) -> Vec<(Type, Vec<Profile
     arms
 }
 
+/// The receiver Type of a polymorphic profile whose types all have one class, e.g. objects of a
+/// class with several shapes. Method lookup only depends on the class, so the send can guard the
+/// class like a monomorphic receiver instead of branching to a generic send for other classes.
+fn single_class_arm(summary: &TypeDistributionSummary) -> Option<Type> {
+    match polymorphic_arms(summary)[..] {
+        [(expected, _)] if expected.runtime_exact_ruby_class().is_some() => Some(expected),
+        _ => None,
+    }
+}
+
 fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
     match opcode {
         // Control-flow is non-leaf in the interpreter because it can execute arbitrary code on
@@ -13856,7 +13866,16 @@ fn add_iseq_to_hir(
                     let lengths = fun.caller_splat_lengths(call_info, recv, exit_id, &profiles);
                     let caller_splat_length = if lengths.len() == 1 { Some(lengths[0]) } else { None };
 
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    let summary = fun.polymorphic_summary(&profiles, recv, exit_id);
+                    if let Some((summary, expected)) = summary.as_ref().filter(|_| lengths.len() <= 1).and_then(|summary| Some((summary, single_class_arm(summary)?))) {
+                        let snapshot = fun.push_insn(block, Insn::Snapshot { state: Box::new(exit_state.clone()) });
+                        profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                        profiles.record_refined_receiver_types(snapshot, summary, expected.runtime_exact_ruby_class());
+                        let recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: expected, state: exit_id, recompile: Some(Recompile) });
+                        fun.insn_types[recv] = expected;
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: None, args, caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
+                        state.stack_push(send);
+                    } else if let Some(summary) = summary {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         let fallback_block = fun.new_block(insn_idx);
@@ -13959,7 +13978,16 @@ fn add_iseq_to_hir(
                     let caller_splat_length = if lengths.len() == 1 { Some(lengths[0]) } else { None };
                     // Spill once for all arms in the polymorphic dispatch tree
                     let send_state = spill_locals_for_block(fun, &mut profiles, block, blockiseq, &exit_state, exit_id, ep_escaped);
-                    if let Some(summary) = fun.polymorphic_summary(&profiles, recv, exit_id) {
+                    let summary = fun.polymorphic_summary(&profiles, recv, exit_id);
+                    if let Some((summary, expected)) = summary.as_ref().and_then(|summary| Some((summary, single_class_arm(summary)?))) {
+                        let snapshot = fun.push_insn(block, Insn::Snapshot { state: Box::new(fun.frame_state(send_state)) });
+                        profiles.copy_entries_except(exit_id, snapshot, recv, fun);
+                        profiles.record_refined_receiver_types(snapshot, summary, expected.runtime_exact_ruby_class());
+                        let recv = fun.push_insn(block, Insn::GuardType { val: recv, guard_type: expected, state: send_state, recompile: Some(Recompile) });
+                        fun.insn_types[recv] = expected;
+                        let send = fun.push_insn(block, Insn::Send { recv, cd, block: block_handler, args, caller_splat_length, state: snapshot, reason: Uncategorized(opcode.into()) });
+                        state.stack_push(send);
+                    } else if let Some(summary) = summary {
                         let join_block = fun.new_block(insn_idx);
                         let join_param = fun.push_insn(join_block, Insn::Param);
                         for (expected, buckets) in polymorphic_arms(&summary) {

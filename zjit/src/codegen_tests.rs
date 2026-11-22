@@ -9650,6 +9650,25 @@ fn test_polymorphic_iseq_dispatch_same_site() {
 }
 
 #[test]
+fn test_two_shapes_of_one_class_then_another_class() {
+    set_call_threshold(3);
+    assert_snapshot!(inspect("
+        class A
+          def initialize(extra) = (@bar = 1 if extra; @foo = 1)
+          attr_reader :foo
+          def baz = yield + @foo
+        end
+        class B
+          def foo = 2
+          def baz = yield + 20
+        end
+        def test(obj) = obj.foo + obj.baz { 10 }
+        test(A.new(false)); test(A.new(true)) # profile two shapes of A
+        [test(A.new(false)), test(A.new(true)), test(B.new), test(A.new(true))]
+    "), @"[12, 12, 32, 12]");
+}
+
+#[test]
 fn test_recursive_fact() {
     assert_snapshot!(inspect("
         def fact(n)
