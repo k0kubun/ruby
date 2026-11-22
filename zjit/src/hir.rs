@@ -3103,6 +3103,7 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
 
 unsafe extern "C" {
     fn rb_hash_dup(hash: VALUE) -> VALUE;
+    fn rb_vm_lep_method_entry(recv: VALUE, me_or_svar: VALUE) -> VALUE;
 }
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
@@ -7124,12 +7125,13 @@ impl Function {
                         fn emit_super_call_guards(
                             fun: &mut Function,
                             block: BlockId,
+                            recv: InsnId,
                             super_cme: *const rb_callable_method_entry_t,
                             current_cme: *const rb_callable_method_entry_t,
                             mid: ID,
                             state: InsnId,
                             local_iseq: IseqPtr,
-                        ) {
+                        ) -> BlockId {
                             fun.push_insn(block, Insn::PatchPoint {
                                 invariant: Invariant::MethodRedefined {
                                     klass: unsafe { (*super_cme).defined_class },
@@ -7147,8 +7149,30 @@ impl Function {
                             let lep = fun.get_ep(block, level);
                             // Load ep[VM_ENV_DATA_INDEX_ME_CREF]
                             let method_entry = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
-                            // Guard that it matches the expected CME
-                            fun.push_insn(block, Insn::GuardBitEquals { val: method_entry, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
+                            // Check that it matches the expected CME. Once the method sets $~ or $_ (e.g. with
+                            // =~ or gsub before `super`), the slot holds an svar that wraps the CME, so unwrap
+                            // it before guarding instead of side-exiting on every call.
+                            let expected_cme = fun.push_insn(block, Insn::Const { val: Const::Value(current_cme.into()) });
+                            let is_cme = fun.push_insn(block, Insn::IsBitEqual { left: method_entry, right: expected_cme });
+                            let svar_block = fun.new_block(u32::MAX);
+                            let join_block = fun.new_block(u32::MAX);
+                            fun.push_insn(block, Insn::CondBranch {
+                                val: is_cme,
+                                if_true: BranchEdge { target: join_block, args: vec![] },
+                                if_false: BranchEdge { target: svar_block, args: vec![] },
+                            });
+                            let unwrapped = fun.push_insn(svar_block, Insn::CCall {
+                                cfunc: rb_vm_lep_method_entry as *const u8,
+                                recv,
+                                args: vec![method_entry],
+                                name: ID!(rb_vm_lep_method_entry),
+                                owner: Qnil,
+                                return_type: types::RubyValue,
+                                elidable: true,
+                            });
+                            fun.push_insn(svar_block, Insn::GuardBitEquals { val: unwrapped, expected: Const::Value(current_cme.into()), reason: Box::new(SideExitReason::GuardSuperMethodEntry), state, recompile: None });
+                            fun.push_insn(svar_block, Insn::Jump(BranchEdge { target: join_block, args: vec![] }));
+                            let block = join_block;
 
                             let block_handler = fun.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
                             fun.push_insn(block, Insn::GuardBitEquals {
@@ -7158,6 +7182,7 @@ impl Function {
                                 state,
                                 recompile: Some(Recompile),
                             });
+                            block
                         }
 
                         // Don't handle calls with literal blocks (e.g., super { ... })
@@ -7269,7 +7294,7 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
-                            emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                            block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
@@ -7308,7 +7333,7 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7359,7 +7384,7 @@ impl Function {
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
-                                    emit_super_call_guards(self, block, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);

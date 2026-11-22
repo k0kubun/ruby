@@ -1019,6 +1019,14 @@ vm_get_cref(const VALUE *ep)
     }
 }
 
+// For JITs: the method entry in ep[VM_ENV_DATA_INDEX_ME_CREF] of a method frame's EP. It's wrapped
+// in an svar once the method sets $~ or $_ (e.g. with =~ or gsub). `recv` is unused.
+VALUE
+rb_vm_lep_method_entry(VALUE recv, VALUE me_or_svar)
+{
+    return (VALUE)check_method_entry(me_or_svar, TRUE);
+}
+
 rb_cref_t *
 rb_vm_get_cref(const VALUE *ep)
 {
