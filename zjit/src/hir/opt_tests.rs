@@ -15210,6 +15210,47 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_cfunc_with_symbol_block_arg_in_inlined_method() {
+        // The inlined method frame runs with the cref of its method entry, which has no
+        // refinements, so it doesn't check for them at run time
+        eval(r#"
+            def callee(h) = h.fetch(:a, &:to_s)
+            def test(h) = callee(h)
+            test({}); test({})
+        "#);
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :h@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :h@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, callee@0x1010, cme:0x1018)
+          v25:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :callee, v25 (0x1040), num_args=1
+          v34:StaticSymbol[:a] = Const Value(VALUE(0x1060))
+          v36:StaticSymbol[:to_s] = Const Value(VALUE(0x1068))
+          PatchPoint MethodRedefined(Symbol@0x1070, to_proc@0x1078, cme:0x1080)
+          PatchPoint NoSingletonClass(Hash@0x10a8)
+          PatchPoint MethodRedefined(Hash@0x10a8, fetch@0x10b0, cme:0x10b8)
+          v54:HashExact = GuardType v10, HashExact recompile
+          v55:BasicObject = CCallVariadic v54, :Hash#fetch@0x10e0, v34, block=&v36
+          PatchPoint NoEPEscape(callee)
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v55
+        ");
+    }
+
+    #[test]
     fn test_send_with_non_nil_block_arg() {
         eval(r#"
             def foo = 42
