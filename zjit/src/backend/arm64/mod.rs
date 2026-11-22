@@ -233,6 +233,15 @@ fn cpu_has_lse() -> bool {
 /// stack slot otherwise. Must not overlap with ALLOC_REGS or other preserved
 /// registers.
 pub const SCRATCH_REG: Reg = X15_REG;
+
+/// Callee-saved registers that the register allocator may also hand out. See the
+/// x86_64 backend. None on arm64 for now: x22-x28 are free, but this hasn't been
+/// tested on arm64 hardware yet.
+pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[];
+
+/// Registers the entry trampoline saves for its C caller: the ones pinned to
+/// CFP/SP/EC and the callee-saved ones the register allocator uses.
+pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC];
 const SCRATCH2_OPND: Opnd = Opnd::Reg(X14_REG);
 
 impl Assembler {
@@ -254,7 +263,7 @@ impl Assembler {
 
     /// Get the list of registers from which we will allocate on this platform
     pub fn get_alloc_regs() -> Vec<Reg> {
-        ALLOC_REGS.to_vec()
+        ALLOC_REGS.iter().chain(CALLEE_SAVED_ALLOC_REGS).copied().collect()
     }
 
     /// Get a list of all of the caller-saved registers

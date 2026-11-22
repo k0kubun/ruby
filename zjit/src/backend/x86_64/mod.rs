@@ -117,6 +117,19 @@ const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 /// registers.
 pub const SCRATCH_REG: Reg = R11_REG;
 
+/// Callee-saved registers that the register allocator may also hand out, for
+/// values that live across C calls. C functions preserve them, so such values
+/// need no push/pop around the call. JIT code doesn't preserve them, so a call
+/// into JIT code (`CCallData::jit_call`) saves them like the caller-saved ones,
+/// and the entry trampoline, the only way C code enters JIT code, saves them
+/// for its C caller (see JIT_PRESERVED_REGS). Must not overlap with ALLOC_REGS,
+/// the scratch registers, or CFP/EC/SP.
+pub const CALLEE_SAVED_ALLOC_REGS: &[Reg] = &[R14_REG, R15_REG];
+
+/// Registers the entry trampoline saves for its C caller: the ones pinned to
+/// CFP/SP/EC and the callee-saved ones the register allocator uses.
+pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC, Opnd::Reg(R14_REG), Opnd::Reg(R15_REG)];
+
 impl Assembler {
     // This keeps frame growth below the +/-4096-byte displacement range we rely
     // on for common stack-slot accesses on x86_64.
@@ -134,7 +147,7 @@ impl Assembler {
 
     /// Get the list of registers from which we can allocate on this platform
     pub fn get_alloc_regs() -> Vec<Reg> {
-        ALLOC_REGS.to_vec()
+        ALLOC_REGS.iter().chain(CALLEE_SAVED_ALLOC_REGS).copied().collect()
     }
 
     /// Get a list of all of the caller-save registers
@@ -1665,7 +1678,7 @@ mod tests {
         test():
         bb0():
           # bb0(): foo@/tmp/a.rb:1
-          FrameSetup 1, r13, rbx, r12
+          FrameSetup 1, r13, rbx, r12, r14, r15
           v0 = Add r13, 0x40
           Store [rbx + 0x10], v0
           Joz Exit(Interrupt), v0
@@ -1675,7 +1688,7 @@ mod tests {
           Store Mem32[r12 + 0x10], VReg32(v1)
           Je bb0
           CRet v0
-          FrameTeardown r13, rbx, r12
+          FrameTeardown r13, rbx, r12, r14, r15
         ");
     }
 
@@ -2559,15 +2572,19 @@ mod tests {
         0x4: push r13
         0x6: push rbx
         0x7: push r12
-        0x9: sub rsp, 8
-        0xd: mov r13, qword ptr [rbp - 8]
-        0x11: mov rbx, qword ptr [rbp - 0x10]
-        0x15: mov r12, qword ptr [rbp - 0x18]
-        0x19: mov rsp, rbp
-        0x1c: pop rbp
-        0x1d: ret
+        0x9: push r14
+        0xb: push r15
+        0xd: sub rsp, 8
+        0x11: mov r13, qword ptr [rbp - 8]
+        0x15: mov rbx, qword ptr [rbp - 0x10]
+        0x19: mov r12, qword ptr [rbp - 0x18]
+        0x1d: mov r14, qword ptr [rbp - 0x20]
+        0x21: mov r15, qword ptr [rbp - 0x28]
+        0x25: mov rsp, rbp
+        0x28: pop rbp
+        0x29: ret
         ");
-        assert_snapshot!(cb.hexdump(), @"554889e541555341544883ec084c8b6df8488b5df04c8b65e84889ec5dc3");
+        assert_snapshot!(cb.hexdump(), @"554889e54155534154415641574883ec084c8b6df8488b5df04c8b65e84c8b75e04c8b7dd84889ec5dc3");
     }
 
     #[test]

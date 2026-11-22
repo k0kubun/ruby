@@ -256,9 +256,8 @@ pub use crate::backend::current::{
     EC, CFP, SP,
     NATIVE_BASE_PTR, NATIVE_STACK_PTR,
     C_ARG_OPNDS, C_RET_OPND,
+    JIT_PRESERVED_REGS,
 };
-
-pub static JIT_PRESERVED_REGS: &[Opnd] = &[CFP, SP, EC];
 
 /// Where the C calling convention passes an argument.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -745,6 +744,9 @@ pub struct CCallData {
     /// that are split from this CCall during register assignment.
     pub end_marker: Option<PosMarkerFn>,
     pub out: Opnd,
+    /// Whether this calls JIT code rather than a C function. JIT code doesn't
+    /// preserve CALLEE_SAVED_ALLOC_REGS, so they're saved around such a call.
+    pub jit_call: bool,
 }
 
 /// Cold fields of `Insn::PatchPoint`, boxed to keep `Insn` small. `target` is
@@ -1496,6 +1498,9 @@ pub struct Interval {
     /// Whether linear_scan() should put this interval in a stack slot rather than in a
     /// register. See [Assembler::stack_slots_for_call_crossing_intervals].
     pub prefer_stack: bool,
+    /// Whether linear_scan() should try a callee-saved register first, which C calls
+    /// preserve for free. See [Assembler::stack_slots_for_call_crossing_intervals].
+    pub prefer_callee_saved: bool,
 }
 
 impl Interval {
@@ -1508,6 +1513,7 @@ impl Interval {
             assigned: Cell::new(None),
             preferred: None,
             prefer_stack: false,
+            prefer_callee_saved: false,
         }
     }
 
@@ -1651,19 +1657,30 @@ impl Allocation {
 pub struct RegPool {
     regs: Vec<Reg>,
     allocatable: usize,
+    /// Bit `i` is set if `regs[i]` is allocatable and one of CALLEE_SAVED_ALLOC_REGS.
+    callee_saved: u64,
 }
 
 impl RegPool {
     /// Build a pool in which every register is allocatable.
     pub fn new(regs: Vec<Reg>) -> Self {
         let allocatable = regs.len();
-        Self { regs, allocatable }
+        Self::with_allocatable(regs, allocatable)
     }
 
-    #[cfg(test)]
     pub fn with_allocatable(regs: Vec<Reg>, allocatable: usize) -> Self {
-        assert!(allocatable <= regs.len());
-        Self { regs, allocatable }
+        use crate::backend::current::CALLEE_SAVED_ALLOC_REGS;
+        assert!(allocatable <= regs.len() && allocatable <= u64::BITS as usize);
+        let callee_saved = regs[..allocatable].iter().enumerate()
+            .filter(|(_, reg)| CALLEE_SAVED_ALLOC_REGS.iter().any(|callee_saved| callee_saved.reg_no == reg.reg_no))
+            .fold(0, |mask, (idx, _)| mask | (1 << idx));
+        Self { regs, allocatable, callee_saved }
+    }
+
+    /// Whether the register at `index` is an allocatable callee-saved register, which
+    /// C calls preserve.
+    pub fn is_callee_saved(&self, index: usize) -> bool {
+        index < u64::BITS as usize && self.callee_saved & (1 << index) != 0
     }
 
     /// The number of registers linear_scan() is free to allocate.
@@ -2395,8 +2412,14 @@ impl Assembler
     /// uses, e.g. a local that only side exits and stack maps read across a loop of C
     /// method calls. Operands in side exits and stack maps don't count as uses since they
     /// read a stack slot as well as a register.
+    ///
+    /// Also mark intervals that should try a callee-saved register first: the ones live
+    /// across C calls but no JIT call. C calls preserve callee-saved registers, so those
+    /// intervals need no push/pop or stack slot at all. Calls into JIT code push and pop
+    /// them like caller-saved registers, so they're no better for other intervals.
     pub fn stack_slots_for_call_crossing_intervals(&self, intervals: &mut [Interval]) {
-        let mut ccall_numbers: Vec<usize> = vec![];
+        // (insn number, whether it calls JIT code)
+        let mut ccall_numbers: Vec<(usize, bool)> = vec![];
         let mut uses: Vec<isize> = vec![0; intervals.len()];
         let mut count = |opnd: Opnd, delta: isize| {
             match opnd {
@@ -2412,7 +2435,7 @@ impl Assembler
                 }
                 let stack_map = match insn {
                     Insn::CCall { data } => {
-                        ccall_numbers.push(insn_id.map(|id| id.0).unwrap_or(0));
+                        ccall_numbers.push((insn_id.map(|id| id.0).unwrap_or(0), data.jit_call));
                         data.stack_map.as_ref()
                     }
                     _ => match insn.target() {
@@ -2436,12 +2459,17 @@ impl Assembler
         for interval in intervals.iter_mut().filter(|interval| interval.has_bounds() && interval.preferred.is_none()) {
             // A CCall defining the interval doesn't preserve it.
             let start = interval.start();
-            let mut crossings = 0;
+            let mut c_crossings = 0;
+            let mut jit_crossings = 0;
             for range in interval.ranges.iter() {
-                let first = ccall_numbers.partition_point(|&n| n < range.from);
-                crossings += ccall_numbers[first..].iter().take_while(|&&n| n < range.to).filter(|&&n| n != start).count();
+                let first = ccall_numbers.partition_point(|&(n, _)| n < range.from);
+                for &(_, jit_call) in ccall_numbers[first..].iter().take_while(|&&(n, _)| n < range.to).filter(|&&(n, _)| n != start) {
+                    if jit_call { jit_crossings += 1 } else { c_crossings += 1 }
+                }
             }
-            interval.prefer_stack = crossings as isize > uses[interval.vreg_id.0 as usize];
+            let uses = uses[interval.vreg_id.0 as usize];
+            interval.prefer_stack = (c_crossings + jit_crossings) as isize > uses;
+            interval.prefer_callee_saved = c_crossings > 0 && jit_crossings == 0;
         }
     }
 
@@ -2478,7 +2506,7 @@ impl Assembler
             let position = cur.start();
             let cur_end = cur.end();
 
-            if cur.prefer_stack {
+            if cur.prefer_stack && !cur.prefer_callee_saved {
                 cur.assigned.set(Some(Allocation::Stack(num_stack_slots)));
                 num_stack_slots += 1;
                 cur.state.set(IntervalState::Handled);
@@ -2572,9 +2600,21 @@ impl Assembler
             // Find a reg with the highest "free until use" point, then check if that "free until
             // use" point is greater than or eq to than the current interval's end.  If it is, then
             // we know the current interval can fit in the window this register is available.
-            let best_reg = (0..num_registers).rev()
+            let find_reg = |callee_saved: bool| (0..num_registers).rev()
+                .filter(|&reg| regs.is_callee_saved(reg) == callee_saved)
                 .max_by_key(|&reg| free_registers[reg])
                 .filter(|&reg| free_registers[reg] >= cur_end);
+            // An interval live across C calls wants a callee-saved register. Others take a
+            // caller-saved one first to leave the callee-saved ones to such intervals.
+            let best_reg = if cur.prefer_callee_saved { find_reg(true) } else { None }
+                .or_else(|| if cur.prefer_stack { None } else { find_reg(false).or_else(|| find_reg(true)) });
+
+            if best_reg.is_none() && cur.prefer_stack {
+                cur.assigned.set(Some(Allocation::Stack(num_stack_slots)));
+                num_stack_slots += 1;
+                cur.state.set(IntervalState::Handled);
+                continue;
+            }
 
             match best_reg {
                 // We couldn't find a best register, so we need to spill
@@ -2883,19 +2923,27 @@ impl Assembler
         // compile time of huge functions, so instead we binary-search the sorted
         // CCall positions inside each live range. Intervals are visited in VRegId
         // order, so each list ends up sorted by VRegId.
-        let mut ccall_numbers: Vec<usize> = self.basic_blocks.iter()
+        // A C call preserves callee-saved registers, so only calls into JIT code need them saved.
+        let mut ccalls: Vec<(usize, bool)> = self.basic_blocks.iter()
             .flat_map(|block| block.insns.iter().zip(block.insn_ids.iter()))
-            .filter(|(insn, _)| matches!(insn, Insn::CCall { .. }))
-            .map(|(_, insn_id)| insn_id.map(|id| id.0).unwrap_or(0))
+            .filter_map(|(insn, insn_id)| match insn {
+                Insn::CCall { data } => Some((insn_id.map(|id| id.0).unwrap_or(0), data.jit_call)),
+                _ => None,
+            })
             .collect();
-        ccall_numbers.sort_unstable();
-        ccall_numbers.dedup();
+        ccalls.sort_unstable();
+        ccalls.dedup_by_key(|&mut (n, _)| n);
+        let ccall_numbers: Vec<usize> = ccalls.iter().map(|&(n, _)| n).collect();
         let mut covering: Vec<Vec<VRegId>> = vec![vec![]; ccall_numbers.len()];
         for interval in intervals.iter().filter(|interval| is_register(interval)) {
+            let callee_saved = interval.assigned.get().and_then(|alloc| alloc.alloc_pool_index(alloc_regs))
+                .is_some_and(|idx| alloc_regs.is_callee_saved(idx));
             for range in interval.ranges.iter() {
                 let first = ccall_numbers.partition_point(|&n| n < range.from);
                 for (idx, _) in ccall_numbers[first..].iter().enumerate().take_while(|&(_, &n)| n < range.to) {
-                    covering[first + idx].push(interval.vreg_id);
+                    if !callee_saved || ccalls[first + idx].1 {
+                        covering[first + idx].push(interval.vreg_id);
+                    }
                 }
             }
         }
@@ -2914,7 +2962,7 @@ impl Assembler
 
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids) {
                 if let Insn::CCall { data } = insn {
-                    let CCallData { opnds, stack_map, out, start_marker, end_marker, fptr } = *data;
+                    let CCallData { opnds, stack_map, out, start_marker, end_marker, fptr, jit_call } = *data;
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
                     // Do we have a case where a ccall is emitted, but nobody
                     // uses the result?
@@ -3068,6 +3116,7 @@ impl Assembler
                             start_marker: None,
                             end_marker: None,
                             fptr,
+                            jit_call,
                         }),
                     });
                     new_ids.push(insn_id);
@@ -4255,7 +4304,7 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&opnds));
         let fptr = Opnd::const_ptr(fptr);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: false }) });
         self.clear_stack_canary(canary_opnd);
         out
     }
@@ -4265,20 +4314,20 @@ impl Assembler {
     pub fn ccall_into(&mut self, out: Opnd, fptr: *const u8, opnds: Vec<Opnd>) {
         let fptr = Opnd::const_ptr(fptr);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: false }) });
     }
 
-    /// Call a C function stored in a register
+    /// Call JIT code whose address is stored in a register
     pub fn ccall_reg(&mut self, fptr: Opnd, num_bits: u8) -> Opnd {
         assert!(matches!(fptr, Opnd::Reg(_)), "ccall_reg must be called with Opnd::Reg: {fptr:?}");
         let out = self.new_vreg(num_bits);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds: vec![], stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds: vec![], stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: true }) });
         out
     }
 
-    /// Call a C function with PosMarkers. This is used for recording the start and end
-    /// addresses of the C call and rewriting it with a different function address later.
+    /// Call JIT code with PosMarkers. This is used for recording the start and end
+    /// addresses of a JIT-to-JIT call and rewriting it with a different JIT code address later.
     pub fn ccall_with_pos_markers(
         &mut self,
         fptr: *const u8,
@@ -4296,6 +4345,7 @@ impl Assembler {
                 start_marker: Some(Rc::new(start_marker)),
                 end_marker: Some(Rc::new(end_marker)),
                 out,
+                jit_call: true,
             }),
         });
         out
@@ -5656,7 +5706,7 @@ mod tests {
         let ccall = |asm: &mut Assembler| {
             let out = asm.new_vreg(64);
             asm.basic_blocks[b1.0].push_insn(Insn::CCall {
-                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out }),
+                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out, jit_call: false }),
             });
         };
         let load = |asm: &mut Assembler| {
@@ -5701,6 +5751,102 @@ mod tests {
         assert_eq!(num_stack_slots, 2);
     }
 
+    /// Build `v = load; <calls>; store v` and allocate it with `num_caller_saved`
+    /// caller-saved and the callee-saved registers. `calls` lists whether each call
+    /// is a JIT call. Returns the Assembler after handle_caller_saved_regs(), the
+    /// register `v` got (None if it's on the stack), and whether that register is
+    /// callee-saved.
+    #[cfg(target_arch = "x86_64")]
+    fn alloc_across_calls(calls: &[bool], num_caller_saved: usize) -> (Assembler, Option<Reg>, bool) {
+        use crate::backend::current::{ALLOC_REGS, CALLEE_SAVED_ALLOC_REGS};
+        let mut asm = Assembler::new();
+        let b1 = asm.new_block(hir::BlockId(0), true, 0);
+        asm.set_current_block(b1);
+        let label = asm.new_label("bb0");
+        asm.write_label(label);
+
+        let v = asm.new_vreg(64);
+        asm.basic_blocks[b1.0].push_insn(Insn::Load { opnd: Opnd::UImm(5), out: v });
+        for &jit_call in calls {
+            let out = asm.new_vreg(64);
+            asm.basic_blocks[b1.0].push_insn(Insn::CCall {
+                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out, jit_call }),
+            });
+        }
+        // A short interval that crosses no call
+        let short = asm.new_vreg(64);
+        asm.basic_blocks[b1.0].push_insn(Insn::Load { opnd: Opnd::UImm(6), out: short });
+        asm.basic_blocks[b1.0].push_insn(Insn::Store { dest: Opnd::mem(64, SP, 0), src: short });
+        asm.basic_blocks[b1.0].push_insn(Insn::Store { dest: Opnd::mem(64, SP, 8), src: v });
+        asm.basic_blocks[b1.0].push_insn(Insn::CRet(Opnd::UImm(0)));
+
+        let live_in = asm.analyze_liveness();
+        asm.number_instructions(0);
+        let mut intervals = asm.build_intervals(live_in);
+        let regs: Vec<Reg> = ALLOC_REGS[..num_caller_saved].iter().chain(CALLEE_SAVED_ALLOC_REGS).copied().collect();
+        let mut regs = RegPool::new(regs);
+        asm.preferred_register_assignments(&mut intervals, &mut regs);
+        asm.stack_slots_for_call_crossing_intervals(&mut intervals);
+        let num_stack_slots = asm.linear_scan(&intervals, &regs);
+        asm.stack_state.set_spill_slots(num_stack_slots);
+
+        // The short interval prefers a caller-saved register
+        let short_alloc = intervals[short.vreg_idx()].assigned.get().unwrap();
+        assert_eq!(short_alloc.alloc_pool_index(&regs).is_some_and(|idx| regs.is_callee_saved(idx)), num_caller_saved == 0, "{short_alloc:?}");
+
+        let alloc = intervals[v.vreg_idx()].assigned.get().unwrap();
+        let callee_saved = alloc.alloc_pool_index(&regs).is_some_and(|idx| regs.is_callee_saved(idx));
+        let reg = alloc.assigned_reg(&regs);
+        asm.handle_caller_saved_regs(&intervals, &regs, &ALLOC_REGS[..2]);
+        (asm, reg, callee_saved)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pushed_regs(asm: &Assembler) -> Vec<Opnd> {
+        asm.basic_blocks[0].insns.iter().filter_map(|insn| match *insn {
+            Insn::CPushPair(Some(first), second) => Some([first, second]),
+            _ => None,
+        }).flatten().filter(|opnd| matches!(opnd, Opnd::Reg(_))).collect()
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_callee_saved_reg_across_c_calls() {
+        // A value live across C calls goes to a callee-saved register, which needs no push/pop.
+        let (asm, reg, callee_saved) = alloc_across_calls(&[false, false, false], 2);
+        assert!(reg.is_some() && callee_saved);
+        assert_eq!(pushed_regs(&asm), vec![]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_caller_saved_reg_across_jit_call() {
+        // JIT code doesn't preserve callee-saved registers, so they're no better across a JIT call.
+        let (asm, reg, callee_saved) = alloc_across_calls(&[false, true], 2);
+        let reg = Opnd::Reg(reg.unwrap());
+        assert!(!callee_saved);
+        assert_eq!(pushed_regs(&asm), vec![reg, reg]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_callee_saved_reg_saved_around_jit_call() {
+        // With no caller-saved register, a callee-saved one is used and saved around a JIT call.
+        let (asm, reg, callee_saved) = alloc_across_calls(&[false, true], 0);
+        let reg = Opnd::Reg(reg.unwrap());
+        assert!(callee_saved);
+        assert_eq!(pushed_regs(&asm), vec![reg]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_stack_slot_across_many_calls() {
+        // More calls than uses: a stack slot is still cheaper than pushing a register.
+        let (asm, reg, _) = alloc_across_calls(&[false, true, true], 2);
+        assert_eq!(reg, None);
+        assert_eq!(pushed_regs(&asm), vec![]);
+    }
+
     #[test]
     fn test_call() {
         use crate::backend::current::ALLOC_REGS;
@@ -5735,6 +5881,7 @@ mod tests {
                 start_marker: None,
                 end_marker: None,
                 out: v3,
+                jit_call: false,
             }),
         });
 
