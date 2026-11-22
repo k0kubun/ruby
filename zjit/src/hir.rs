@@ -837,6 +837,9 @@ pub enum SendFallbackReason {
     SuperFromBlock,
     /// The profiled super class cannot be found.
     SuperClassNotFound,
+    /// The `super` is in a method defined in a refinement, whose super method the VM looks up
+    /// differently (vm_search_normal_superclass()).
+    SuperFromRefinement,
     /// The `super` call uses a complex argument pattern that the optimizer does not support.
     SuperComplexArgsPass,
     /// The cached target of a `super` call could not be found.
@@ -901,6 +904,7 @@ impl Display for SendFallbackReason {
             SuperFromBlock => write!(f, "super: call from within a block"),
             SuperCallWithBlock => write!(f, "super: call made with a block"),
             SuperClassNotFound => write!(f, "super: profiled class cannot be found"),
+            SuperFromRefinement => write!(f, "super: call from a method defined in a refinement"),
             SuperComplexArgsPass => write!(f, "super: complex argument passing to `super` call"),
             SuperNoProfiles => write!(f, "super: no profile data available"),
             SuperNotOptimizedMethodType(method_type) => write!(f, "super: unsupported target method type {:?}", method_type),
@@ -7603,6 +7607,21 @@ impl Function {
                         // Get defined_class and method ID from the profiled CME.
                         let current_defined_class = unsafe { (*current_cme).defined_class };
                         let mid = unsafe { get_def_original_id((*current_cme).def) };
+
+                        // `super` in a method defined in a refinement calls the method of the
+                        // refined class, not that of the class after the refinement in the
+                        // ancestry, e.g. another refinement activated by the same `using`. Leave it
+                        // to vm_search_normal_superclass().
+                        let is_refinement = |module: VALUE| unsafe {
+                            RB_TYPE_P(module, RUBY_T_MODULE) && FL_TEST_RAW(module, VALUE(RMODULE_IS_REFINEMENT as usize)) != VALUE(0)
+                        };
+                        let defined_in_refinement_iclass = unsafe { RB_TYPE_P(current_defined_class, RUBY_T_ICLASS) }
+                            && is_refinement(unsafe { current_defined_class.class_of() });
+                        if is_refinement(unsafe { (*current_cme).owner }) || defined_in_refinement_iclass {
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperFromRefinement);
+                            continue;
+                        }
 
                         // Compute superclass: RCLASS_SUPER(RCLASS_ORIGIN(defined_class))
                         let superclass = unsafe { rb_class_get_superclass(RCLASS_ORIGIN(current_defined_class)) };
