@@ -22398,6 +22398,7 @@ mod hir_opt_tests {
 
     #[test]
     fn test_not_fold_string_equal_non_string_through_guard() {
+        set_call_threshold(10);
         eval(r#"
             # frozen_string_literal: true
             class Foo
@@ -22411,7 +22412,11 @@ mod hir_opt_tests {
                 foo.bar("a", :sym)
               end
             end
-            test(true)
+            # Compile Foo.bar with a full profile of only Strings, so its side exit for a Symbol
+            # doesn't profile it again. Then profile both branches of test so they're inlined.
+            10.times { Foo.bar("a", "b") }
+            4.times { test(true) }
+            test(false)
             test(true)
         "#);
         assert_snapshot!(hir_string("test"), @"
@@ -22428,7 +22433,7 @@ mod hir_opt_tests {
           v8:BasicObject = LoadArg :flag@1
           Jump bb3(v7, v8)
         bb3(v11:BasicObject, v12:BasicObject):
-          v102:NilClass = Const Value(nil)
+          v103:NilClass = Const Value(nil)
           PatchPoint StableConstantNames(0x1008, Foo)
           v18:ClassSubclass[Foo@0x1010] = Const Value(VALUE(0x1010))
           PatchPoint NoEPEscape(test)
@@ -22441,9 +22446,9 @@ mod hir_opt_tests {
           PatchPoint MethodRedefined(Class@0x1028, bar@0x1030, cme:0x1038)
           PatchPoint NoSingletonClass(String@0x1060)
           PatchPoint MethodRedefined(String@0x1060, ==@0x1068, cme:0x1070)
-          v114:FalseClass = Const Value(false)
+          v115:FalseClass = Const Value(false)
           CheckInterrupts
-          Return v114
+          Return v115
         bb4():
           v49:StringExact[VALUE(0x1018)] = Const Value(VALUE(0x1018))
           v51:StaticSymbol[:sym] = Const Value(VALUE(0x1098))
@@ -22451,11 +22456,11 @@ mod hir_opt_tests {
           PushInlineFrame :bar, v18 (0x10a0), num_args=2
           PatchPoint NoSingletonClass(String@0x1060)
           PatchPoint MethodRedefined(String@0x1060, ==@0x1068, cme:0x1070)
-          v112 = GuardType v51, String recompile
-          v113:BoolExact = StringEqual v49, v112
+          v113 = GuardType v51, String recompile
+          v114:BoolExact = StringEqual v49, v113
           PopInlineFrame
           CheckInterrupts
-          Return v113
+          Return v114
         ");
     }
 
@@ -26930,6 +26935,61 @@ mod hir_opt_tests {
         assert!(hir.contains("rb_zjit_cached_cme"), "{hir}");
         assert!(hir.contains("CBool(true)"), "{hir}");
         assert!(!hir.contains("polymorphic fallback"), "{hir}");
+    }
+
+    #[test]
+    fn test_dont_inline_unprofiled_call() {
+        eval("
+        class Foo
+          def run(flag) = flag ? hot : cold
+          def hot = 1 + 2
+          def cold = 3 + 4
+        end
+        # Inlined into test, `self` of Foo#run is known, so `cold` can be a direct send, but
+        # it never ran, so it's not inlined.
+        def test(foo, flag) = foo.run(flag)
+        test(Foo.new, true); test(Foo.new, true)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:9:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :foo@0x1000
+          v4:BasicObject = LoadField v2, :flag@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :foo@1
+          v9:BasicObject = LoadArg :flag@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          PatchPoint NoSingletonClass(Foo@0x1008)
+          PatchPoint MethodRedefined(Foo@0x1008, run@0x1010, cme:0x1018)
+          v29:ObjectSubclass[class_exact:Foo] = GuardType v12, ObjectSubclass[class_exact:Foo] recompile
+          PushInlineFrame :run, v29 (0x1040), num_args=1
+          v38:Falsy = RefineType v13, Falsy
+          CondBranchTest v13, bb7(), bb6()
+        bb7():
+          v40:Truthy = RefineType v13, Truthy
+          PatchPoint MethodRedefined(Foo@0x1008, hot@0x1060, cme:0x1068)
+          PatchPoint MethodRedefined(Integer@0x1090, +@0x1098, cme:0x10a0)
+          v93:Fixnum[3] = Const Value(3)
+          PatchPoint NoEPEscape(run)
+          Jump bb4(v93)
+        bb6():
+          PatchPoint MethodRedefined(Foo@0x1008, cold@0x10c8, cme:0x10d0)
+          v70:BasicObject = SendDirect v29, 0x0, :cold (0x10f8)
+          PatchPoint NoEPEscape(run)
+          Jump bb4(v70)
+        bb4(v60:BasicObject):
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v60
+        ");
     }
 
     #[test]

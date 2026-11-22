@@ -517,6 +517,7 @@ make_counters! {
     inline_throw_count,
     empty_inline_frame_count,
     inline_reject_too_large,
+    inline_reject_unprofiled,
     inline_reject_complex_params,
     inline_reject_ep_escapes,
     inline_reject_denied,
