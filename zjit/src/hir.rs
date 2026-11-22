@@ -935,7 +935,6 @@ pub enum FieldName {
     VM_ENV_DATA_INDEX_FLAGS,
     RBASIC_FLAGS,
     RBASIC_KLASS,
-    klass_cache,
     code_iseq,
     captured_self,
     shape_id,
@@ -1218,6 +1217,9 @@ pub enum Insn {
     /// Load cfp->self
     LoadSelf,
     LoadField { recv: InsnId, id: FieldName, offset: i32, return_type: Type, num_bits: u8 },
+    /// Load the entry of the [`KlassCache`] at `cache` that the class `klass` hashes to. See
+    /// [`KLASS_CACHE_INDEX_SHIFT1`].
+    LoadKlassCacheEntry { cache: InsnId, klass: InsnId },
     /// Write `val` at an offset of `recv`.
     /// When writing a Ruby object to a Ruby object, one must use GuardNotFrozen (or equivalent) before and WriteBarrier after.
     StoreField { recv: InsnId, id: FieldName, offset: i32, val: InsnId, num_bits: u8 },
@@ -1858,6 +1860,10 @@ macro_rules! for_each_operand_impl {
             Insn::LoadField { recv, .. } => {
                 $visit_one!(*recv);
             }
+            Insn::LoadKlassCacheEntry { cache, klass } => {
+                $visit_one!(*cache);
+                $visit_one!(*klass);
+            }
             Insn::StoreField { recv, val, .. }
             | Insn::WriteBarrier { recv, val } => {
                 $visit_one!(*recv);
@@ -2042,6 +2048,7 @@ impl Insn {
             Insn::GetEP { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::LoadSelf { .. } => Effect::read_write(abstract_heaps::Frame, abstract_heaps::Empty),
             Insn::LoadField { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
+            Insn::LoadKlassCacheEntry { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
             Insn::StoreField { .. } => Effect::read_write(abstract_heaps::Empty, abstract_heaps::Memory),
             // TODO: Refine CheckMatch effects by flag.
             Insn::CheckMatch { .. } => effects::Any,
@@ -2582,6 +2589,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::IntAdd     { left, right } => { write!(f, "IntAdd {left}, {right}") },
             Insn::IntLt      { left, right } => { write!(f, "IntLt {left}, {right}") },
             Insn::IntAnd     { left, right } => { write!(f, "IntAnd {left}, {right}") },
+            Insn::LoadKlassCacheEntry { cache, klass } => { write!(f, "LoadKlassCacheEntry {cache}, {klass}") },
             Insn::IntOr      { left, right } => { write!(f, "IntOr {left}, {right}") },
             Insn::FixnumLShift { left, right, .. } => { write!(f, "FixnumLShift {left}, {right}") },
             Insn::FixnumRShift { left, right, .. } => { write!(f, "FixnumRShift {left}, {right}") },
@@ -3193,13 +3201,20 @@ pub struct Function {
     pub klass_caches: std::cell::RefCell<Vec<Box<KlassCache>>>,
 }
 
-/// Number of receiver classes that a method entry check caches per call site. JIT code checks
-/// the first one inline, and rb_zjit_cached_cme() checks the rest before the class's method
-/// cache. They fill one cache line. Keep it in sync with ZJIT_KLASS_CACHE_SIZE in zjit.c.
-pub const KLASS_CACHE_SIZE: usize = 8;
+/// Number of receiver classes that a method entry check caches per call site, enough for the
+/// Relation subclasses of the models of a Rails app. They fill four cache lines. Keep it in sync
+/// with ZJIT_KLASS_CACHE_SIZE in zjit.c.
+pub const KLASS_CACHE_SIZE: usize = 32;
 
-/// A per-call-site cache of the receiver classes found to resolve to a method entry, most
-/// recently used first. Unused entries are Qfalse.
+/// JIT code checks the [`KlassCache`] entry `((klass >> KLASS_CACHE_INDEX_SHIFT1) ^ (klass >>
+/// KLASS_CACHE_INDEX_SHIFT2)) % KLASS_CACHE_SIZE` for the class `klass`, a hash of the address of
+/// the class. rb_zjit_cached_cme() checks the other entries and moves the class to this entry.
+/// Keep it in sync with zjit_klass_cache_index() in zjit.c.
+pub const KLASS_CACHE_INDEX_SHIFT1: u64 = 5;
+pub const KLASS_CACHE_INDEX_SHIFT2: u64 = 10;
+
+/// A per-call-site cache of the receiver classes found to resolve to a method entry. JIT code
+/// checks the entry that the receiver's class hashes to. Unused entries are Qfalse.
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct KlassCache(pub [VALUE; KLASS_CACHE_SIZE]);
@@ -4271,6 +4286,7 @@ impl Function {
             Insn::GetEP { .. } => types::CPtr,
             Insn::LoadSelf => if self.self_is_heap_object { types::HeapBasicObject } else { types::BasicObject },
             &Insn::LoadField { return_type, .. } => return_type,
+            Insn::LoadKlassCacheEntry { .. } => types::CUInt64,
             Insn::GetSpecialSymbol { .. } => types::StringExact.union(types::NilClass),
             Insn::GetSpecialNumber { .. } => types::StringExact.union(types::NilClass),
             Insn::GetClassVar { .. } => types::BasicObject,
@@ -5184,7 +5200,7 @@ impl Function {
             })));
         }
         let recv_klass = self.load_field(cache_block, recv, FieldName::RBASIC_KLASS, RUBY_OFFSET_RBASIC_KLASS, types::CUInt64);
-        let cached_klass = self.load_field(cache_block, klass_cache_opnd, FieldName::klass_cache, 0, types::CUInt64);
+        let cached_klass = self.push_insn(cache_block, Insn::LoadKlassCacheEntry { cache: klass_cache_opnd, klass: recv_klass });
         let is_cached = self.push_insn(cache_block, Insn::IsBitEqual { left: recv_klass, right: cached_klass });
         self.push_insn(cache_block, Insn::CondBranch {
             val: is_cached,
@@ -9582,6 +9598,7 @@ impl Function {
             | Insn::LoadArg { .. }
             | Insn::PutSpecialObject { .. }
             | Insn::LoadField { .. }
+            | Insn::LoadKlassCacheEntry { .. }
             | Insn::GetConstantPath { .. }
             | Insn::IsBlockGiven { .. }
             | Insn::GetGlobal { .. }
