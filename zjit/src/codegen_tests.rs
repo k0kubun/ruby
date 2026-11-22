@@ -14305,3 +14305,37 @@ fn test_regression_stub_frame_block_code_cleared_for_gc() {
     let caller_version = unsafe { caller_payload.versions.last().unwrap().as_ref() };
     assert_eq!(1, caller_version.outgoing.len(), "expected a JIT-to-JIT function stub");
 }
+
+#[test]
+fn test_forward_load_across_branch_join_with_store_on_one_arm() {
+    // A store on one arm of the `if` must not let the read after the join reuse the read before it.
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        class C
+          def initialize
+            @a = 1
+          end
+
+          def test(x)
+            y = @a
+            @a = 10 if x
+            @a + y
+          end
+
+          def test_local(x)
+            a = 1
+            r = nil
+            [1].each do
+              b = a
+              a += 1 if x
+              r = a + b
+            end
+            r
+          end
+        end
+        c = C.new
+        r = []
+        5.times { r << c.test(false) << C.new.test(true) << C.new.test_local(true) << C.new.test_local(false) }
+        r << c.test(true) << c.test(false)
+        r
+    "#), @"[2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 11, 20]");
+}
