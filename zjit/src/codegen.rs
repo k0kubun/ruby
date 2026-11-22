@@ -18,7 +18,7 @@ use crate::invariants::{
     track_root_box_assumption, track_no_newobj_hook_assumption
 };
 use crate::gc::append_gc_offsets;
-use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, IseqPayload, JITFrame, ResumeEntry, get_iseq_payload_ptr, get_or_create_iseq_payload, payload_ptr_as_mut};
+use crate::payload::{IseqCodePtrs, IseqStatus, IseqVersion, IseqVersionRef, IseqPayload, JITFrame, ResumeEntry, get_iseq_payload_ptr, get_or_create_iseq_payload};
 use crate::profile::reset_profiles_remaining;
 use crate::perf;
 use crate::state::{rb_zjit_compiling_p, ZJITState};

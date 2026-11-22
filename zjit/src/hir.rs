@@ -7616,7 +7616,7 @@ impl Function {
                             RB_TYPE_P(module, RUBY_T_MODULE) && FL_TEST_RAW(module, VALUE(RMODULE_IS_REFINEMENT as usize)) != VALUE(0)
                         };
                         let defined_in_refinement_iclass = unsafe { RB_TYPE_P(current_defined_class, RUBY_T_ICLASS) }
-                            && is_refinement(unsafe { current_defined_class.class_of() });
+                            && is_refinement(current_defined_class.class_of());
                         if is_refinement(unsafe { (*current_cme).owner }) || defined_in_refinement_iclass {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperFromRefinement);
