@@ -4896,6 +4896,49 @@ fn test_invokesuper_to_iseq() {
 }
 
 #[test]
+fn test_invokesuper_from_refinement() {
+    // `super` in a refined method calls the refined class's method, not the next refinement
+    // activated by the same `using`.
+    assert_snapshot!(inspect(r#"
+        class Foo
+          def y = "Foo#y"
+        end
+        module FooExt
+          refine(Foo) { def y = "FooExt#y " + super }
+        end
+        module FooExt2
+          refine(Foo) { def y = "FooExt2#y " + super }
+        end
+        module Both
+          include FooExt
+          include FooExt2
+        end
+
+        module Mod
+          def m = "Mod#m"
+        end
+        class IncludesMod
+          include Mod
+        end
+        module ModExt
+          refine(Mod) { def m = "ModExt#m " + super }
+        end
+
+        module Client
+          using Both
+          using ModExt
+          def self.test(foo, obj) = [foo.y, obj.m]
+        end
+
+        foo = Foo.new
+        obj = IncludesMod.new
+        Client.test(foo, obj) # profile
+        Client.test(foo, obj) # compile
+        Client.test(foo, obj)
+    "#), @r#"["FooExt2#y Foo#y", "ModExt#m Mod#m"]"#);
+}
+
+#[test]
 fn test_invokesuper_with_args() {
     assert_snapshot!(inspect(r#"
         class A
