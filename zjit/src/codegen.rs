@@ -1777,6 +1777,10 @@ fn gen_setglobal(jit: &mut JITState, asm: &mut Assembler, function: &Function, i
 
 /// Side-exit into the interpreter
 fn gen_side_exit(jit: &mut JITState, asm: &mut Assembler, function: &Function, reason: &SideExitReason, recompile: Option<Recompile>, state: &FrameState) {
+    // A SideExit that recompiles is on a path that ran no profiled code. See IseqPayload::max_versions().
+    if recompile.is_some() {
+        unsafe { jit.version.as_mut() }.num_unprofiled_exits += 1;
+    }
     asm.jmp(side_exit_with_recompile(jit, function, state, *reason, recompile));
 }
 

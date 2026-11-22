@@ -662,6 +662,44 @@ fn test_recompile_exit_waits_for_exit_budget() {
 }
 
 #[test]
+fn test_many_unprofiled_exits_compile_final_version_next() {
+    set_call_threshold(2);
+    set_num_exits_until_invalidate(1);
+    // 60 sends on `o` that don't run before the compile
+    let branches: String = (1..=60).map(|i| format!("x = o.to_s if n == {i}\n")).collect();
+    eval(&format!("
+        def many_unprofiled_exits(n, o)
+          x = 0
+          {branches}
+          x
+        end
+        many_unprofiled_exits(0, 1)
+        many_unprofiled_exits(0, 1)
+    "));
+
+    let iseq = get_method_iseq("self", "many_unprofiled_exits");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(1, payload.versions.len());
+    assert!(unsafe { payload.versions[0].as_ref() }.num_unprofiled_exits >= 50);
+    assert_eq!(max_iseq_versions(), payload.max_versions());
+
+    // Reaching an unprofiled branch invalidates the first version, which makes the next one final
+    eval("many_unprofiled_exits(1, 1)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert!(unsafe { payload.versions[0].as_ref() }.is_invalidated());
+    assert_eq!(2, payload.max_versions());
+
+    // The final version has no recompile exits, and other branches don't invalidate it
+    eval("5.times { many_unprofiled_exits(0, 1) }; many_unprofiled_exits(2, 1); many_unprofiled_exits(3, 1)");
+    let payload = get_or_create_iseq_payload(iseq);
+    assert_eq!(2, payload.versions.len());
+    let version = unsafe { payload.versions[1].as_ref() };
+    assert!(matches!(version.status, IseqStatus::Compiled(_)));
+    assert_eq!(0, version.num_unprofiled_exits);
+    assert_snapshot!(inspect("[many_unprofiled_exits(0, 1), many_unprofiled_exits(60, :a), many_unprofiled_exits(61, 1)]"), @r#"[0, "a", 0]"#);
+}
+
+#[test]
 fn test_function_stub_reprofiles_after_invalidation() {
     rb_zjit_prepare_options();
     set_inline_threshold(0);

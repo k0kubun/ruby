@@ -7,6 +7,10 @@ use crate::{cruby::*, profile::IseqProfile, virtualmem::CodePtr};
 
 pub use crate::jit_frame::JITFrame;
 
+/// Number of recompile exits on unprofiled paths that makes the version after an invalidated
+/// version the final one. See [`IseqPayload::max_versions`].
+const MANY_UNPROFILED_EXITS: usize = 50;
+
 /// This is all the data ZJIT stores on an ISEQ. We mark objects in this struct on GC.
 #[derive(Debug)]
 pub struct IseqPayload {
@@ -75,8 +79,21 @@ impl IseqPayload {
 
     /// Maximum number of versions of this ISEQ. Tiering up from a lukewarm version doesn't use
     /// up a version that could fix a failed speculation.
+    ///
+    /// A version with many recompile exits on unprofiled paths, e.g. of a big state machine
+    /// like a lexer, keeps reaching paths that none of its versions profiled, and each recompile
+    /// costs as much as compiling the whole ISEQ again. Once such a version is invalidated, the
+    /// next version is the final one, which compiles every path once.
     pub fn max_versions(&self) -> usize {
-        crate::codegen::max_iseq_versions() + self.tiered_up as usize
+        let max_versions = crate::codegen::max_iseq_versions() + self.tiered_up as usize;
+        let many_exits = self.versions.iter().position(|version| {
+            let version = unsafe { version.as_ref() };
+            version.is_invalidated() && version.num_unprofiled_exits >= MANY_UNPROFILED_EXITS
+        });
+        match many_exits {
+            Some(index) => max_versions.min(index + 2),
+            None => max_versions,
+        }
     }
 
     /// Whether the ISEQ about to be compiled is lukewarm: it reached the call threshold, but
@@ -173,6 +190,10 @@ pub struct IseqVersion {
 
     /// Whether this version is for a [`ResumeEntry`] rather than the start of the ISEQ.
     pub is_resume: bool,
+
+    /// Number of side exits that recompile the ISEQ because they're on a path that ran no
+    /// profiled code, e.g. a send without profiles. See [`IseqPayload::max_versions`].
+    pub num_unprofiled_exits: usize,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -197,6 +218,7 @@ impl IseqVersion {
             klass_caches: vec![],
             ivar_caches: vec![],
             is_resume: false,
+            num_unprofiled_exits: 0,
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
