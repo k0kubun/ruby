@@ -157,6 +157,8 @@ make_counters! {
         compiled_iseq_count,
         // Number of ISEQ compiles that only inlined small callees because the ISEQ was lukewarm
         compiled_lukewarm_iseq_count,
+        // Number of ISEQ compiles with half the inline budget because a GC ran while profiling the ISEQ
+        compiled_warm_iseq_count,
         // Number of lukewarm versions that got hot and were invalidated to recompile them fully
         lukewarm_tier_up_count,
         compiled_resume_entry_count,

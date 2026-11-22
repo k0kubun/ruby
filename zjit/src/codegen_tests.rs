@@ -6,7 +6,7 @@ use crate::backend::lir::Assembler;
 use crate::codegen::max_iseq_versions;
 use crate::cruby::*;
 use crate::hir::{Insn, iseq_to_hir};
-use crate::options::{CallThreshold, disable_hir_opt, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_threshold, set_lukewarm_gc_count, set_lukewarm_tier_up_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
+use crate::options::{CallThreshold, disable_hir_opt, get_option, rb_zjit_prepare_options, set_call_threshold, set_inline_budget, set_inline_threshold, set_lukewarm_gc_count, set_lukewarm_tier_up_threshold, set_max_versions, set_mem_bytes, set_num_exits_until_invalidate};
 use crate::payload::IseqVersion;
 use crate::hir::tests::hir_build_tests::assert_contains_opcode;
 use crate::payload::*;
@@ -537,6 +537,34 @@ fn test_lukewarm_iseq_inlines_only_small_callees() {
         assert_eq!(1, payload.versions.len());
         assert_ne!(i64::MAX, payload.tier_up_counter);
 
+        set_lukewarm_gc_count(0);
+    });
+}
+
+#[test]
+fn test_warm_iseq_gets_half_the_inline_budget() {
+    with_inlining(|| {
+        set_lukewarm_gc_count(2);
+        // A budget that the caller spends on its first callee when halved
+        set_inline_budget(30);
+        let counters = crate::state::ZJITState::get_counters();
+
+        // No GC in the profiling window: both callees are inlined. Make sure that allocations
+        // don't start a GC there.
+        let warm_count_before = counters.compiled_warm_iseq_count;
+        eval("GC.disable");
+        assert_eq!(2, compile_lukewarm_candidate("hot_budget", ""));
+        eval("GC.enable");
+        assert_eq!(warm_count_before, counters.compiled_warm_iseq_count);
+
+        // A GC in the profiling window makes the ISEQ warm, but not lukewarm: the first callee
+        // spends half the budget.
+        assert_eq!(1, compile_lukewarm_candidate("warm_budget", "GC.start"));
+        assert!(counters.compiled_warm_iseq_count > warm_count_before);
+        let payload = get_or_create_iseq_payload(get_method_iseq("self", "warm_budget_caller"));
+        assert_eq!(i64::MAX, payload.tier_up_counter);
+
+        set_inline_budget(crate::options::DEFAULT_INLINE_BUDGET);
         set_lukewarm_gc_count(0);
     });
 }

@@ -3252,6 +3252,9 @@ struct CompilePolicy {
     /// When true, the ISEQ is lukewarm (see [`crate::payload::IseqPayload::is_lukewarm`]), so
     /// only small callees are inlined into it.
     lukewarm: bool,
+    /// When true, the ISEQ is warm (see [`crate::payload::IseqPayload::is_warm`]), so it gets
+    /// half the inline budget.
+    warm: bool,
 }
 
 /// Callee size threshold for inlining into lukewarm ISEQs. Small callees like accessors and
@@ -3270,13 +3273,13 @@ impl CompilePolicy {
         // When a previous version was invalidated and we've reached the version
         // limit, avoid speculative optimizations that may side-exit.
         if iseq.is_null() {
-            return Self { no_side_exits: false, lukewarm: false };
+            return Self { no_side_exits: false, lukewarm: false, warm: false };
         }
         let payload = get_or_create_iseq_payload(iseq);
         let no_side_exits = payload.versions.iter().any(
             |v| unsafe { v.as_ref() }.is_invalidated()
         ) && payload.versions.len() + 1 >= payload.max_versions();
-        Self { no_side_exits, lukewarm: payload.is_lukewarm() }
+        Self { no_side_exits, lukewarm: payload.is_lukewarm(), warm: payload.is_warm() }
     }
 }
 
@@ -3893,6 +3896,11 @@ impl Function {
     /// Whether this compile treats the ISEQ as lukewarm. See [`CompilePolicy::lukewarm`].
     pub fn is_lukewarm(&self) -> bool {
         self.policy.lukewarm
+    }
+
+    /// Whether this compile treats the ISEQ as warm. See [`CompilePolicy::warm`].
+    pub fn is_warm(&self) -> bool {
+        self.policy.warm
     }
 
     // Add an instruction to the function without adding it to any block
@@ -7970,6 +7978,7 @@ impl Function {
     /// Whether the function has spent its inlining budget. See [`Self::should_inline`].
     fn over_inline_budget(&self) -> bool {
         let budget = get_option!(inline_budget);
+        let budget = if self.policy.warm { budget.div_ceil(2) } else { budget };
         budget != INLINE_BUDGET_UNLIMITED && self.num_instructions > budget
     }
 
