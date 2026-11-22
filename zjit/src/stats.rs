@@ -510,6 +510,7 @@ make_counters! {
     inline_method_count,
     inline_block_count,
     inline_throw_count,
+    inline_frame_push_count,
     empty_inline_frame_count,
     inline_reject_too_large,
     inline_reject_complex_params,
