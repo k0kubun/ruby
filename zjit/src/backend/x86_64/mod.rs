@@ -590,6 +590,12 @@ impl Assembler {
                     asm.push_insn(insn);
                     asm_mov(asm, out, opnd, SCRATCH0_OPND);
                 }
+                // x86_split turns `cmp opnd, 0` into `test opnd, opnd`. If opnd got spilled to a
+                // stack slot, `test` would need to load it into a register first, so compare the
+                // slot with 0 instead, which sets the same flags.
+                &mut Insn::Test { left: left @ Opnd::Mem(Mem { base: MemBase::Stack { .. }, .. }), right } if left == right => {
+                    asm.cmp(lower_stack_membase(asm, left), Opnd::UImm(0));
+                }
                 Insn::Test { left, right } |
                 Insn::Cmp { left, right } => {
                     *left = split_stack_membase(asm, *left, SCRATCH1_OPND);
@@ -2490,6 +2496,33 @@ mod tests {
             0x6: mov dword ptr [rax], 0x80000001
         ");
         assert_snapshot!(cb.hexdump(), @"c70001000080c70001000080");
+    }
+
+    #[test]
+    fn test_cmp_spilled_opnd_with_zero() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // With no registers to allocate, the loaded value lives in a stack slot. Comparing it
+        // with 0 shouldn't load it into a register for `test`.
+        let val = asm.load(Opnd::mem(64, C_ARG_OPNDS[0], 0));
+        asm.cmp(val, Opnd::UImm(0));
+        let result = asm.csel_e(Qtrue.into(), Qfalse.into());
+        asm.mov(C_RET_OPND, result);
+
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov r11, qword ptr [rdi]
+        0x3: mov qword ptr [rbp - 8], r11
+        0x7: cmp qword ptr [rbp - 8], 0
+        0xc: mov r11d, 0x14
+        0x12: mov qword ptr [rbp - 0x10], r11
+        0x16: mov r11d, 0
+        0x1c: mov qword ptr [rbp - 0x18], r11
+        0x20: mov r11, qword ptr [rbp - 0x18]
+        0x24: mov rax, r11
+        0x27: cmove rax, qword ptr [rbp - 0x10]
+        ");
     }
 
     #[test]
