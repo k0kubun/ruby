@@ -315,29 +315,42 @@ object_singleton_class_p(VALUE klass)
 // so it never allocates or takes the VM lock. JIT code calls it to check the callee of a call site
 // whose receiver classes vary but which always calls the same method.
 //
-// `klass_cache` is the call site's cache of the last ZJIT_KLASS_CACHE_SIZE classes found to resolve
-// to `expected_cme`, most recently used first, which the JIT code checks the first of. A hit skips
-// the method cache lookup, whose hash table probe and the loads of the class's
-// method cache entries miss the CPU cache on most calls. `cache_owner` is the ISEQ whose JIT
-// code owns the cache and marks the class in it. The JIT code that calls this is invalidated
+// `klass_cache` is the call site's cache of up to ZJIT_KLASS_CACHE_SIZE classes found to resolve
+// to `expected_cme`. The JIT code checks the entry that the receiver's class hashes to, see
+// zjit_klass_cache_index(), and calls this on a miss. A hit skips the method cache lookup, whose
+// hash table probe and the loads of the class's method cache entries miss the CPU cache on most
+// calls. `cache_owner` is the ISEQ whose JIT code owns the cache and marks the class in it. The JIT code that calls this is invalidated
 // when `expected_cme` is, and a class that resolves `mid_sym` to `expected_cme` keeps doing so
 // until `expected_cme` is invalidated, which is what makes a cached class a valid hit.
 //
 // With `match_def`, a method entry of the same method definition, e.g. of a module method included
 // in another class, is a hit as well. It isn't cached since `expected_cme` doesn't guard it.
-#define ZJIT_KLASS_CACHE_SIZE 8 // KLASS_CACHE_SIZE in zjit/src/hir.rs
+#define ZJIT_KLASS_CACHE_SIZE 32 // KLASS_CACHE_SIZE in zjit/src/hir.rs
+
+// The entry of a klass_cache that JIT code checks for `klass`. Keep it in sync with
+// KLASS_CACHE_INDEX_SHIFT1 in zjit/src/hir.rs.
+static inline int
+zjit_klass_cache_index(VALUE klass)
+{
+    return (int)(((klass >> 5) ^ (klass >> 10)) & (ZJIT_KLASS_CACHE_SIZE - 1));
+}
 
 const rb_callable_method_entry_t *
 rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_owner, const rb_callable_method_entry_t *expected_cme, bool match_def)
 {
     VALUE klass = CLASS_OF(recv);
-    for (int i = 0; i < ZJIT_KLASS_CACHE_SIZE; i++) {
-        if (klass_cache[i] == klass) {
-            // Move it to the front for the JIT code to find it inline next time
-            memmove(&klass_cache[1], &klass_cache[0], i * sizeof(VALUE));
-            klass_cache[0] = klass;
-            return expected_cme;
-        }
+    int home = zjit_klass_cache_index(klass);
+    // A class is cached in its entry or the entry paired with it, like a 2-way set-associative
+    // cache. JIT code doesn't check the cache for immediates, so check their entry here too.
+    if (klass_cache[home] == klass) {
+        return expected_cme;
+    }
+    int pair = home ^ 1;
+    if (klass_cache[pair] == klass) {
+        // Swap it into its entry for the JIT code to find it inline next time
+        klass_cache[pair] = klass_cache[home];
+        klass_cache[home] = klass;
+        return expected_cme;
     }
 
     ID mid = rb_sym2id(mid_sym);
@@ -350,8 +363,13 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
                 // The cache keeps the class alive. Don't let it keep a short-lived object alive
                 // through its singleton class.
                 if (!object_singleton_class_p(klass) || RB_OBJ_PROMOTED(klass)) {
-                    memmove(&klass_cache[1], &klass_cache[0], (ZJIT_KLASS_CACHE_SIZE - 1) * sizeof(VALUE));
-                    klass_cache[0] = klass;
+                    // Put it in its entry and move the class there to the paired entry, evicting
+                    // the class in it. Sites whose receiver classes are, e.g., the Relation
+                    // subclasses of every Active Record model see many classes in turn.
+                    if (klass_cache[home] != Qfalse) {
+                        klass_cache[pair] = klass_cache[home];
+                    }
+                    klass_cache[home] = klass;
                     RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
                 }
             }

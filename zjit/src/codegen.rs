@@ -817,6 +817,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
             asm.csel_l(1.into(), 0.into())
         }
         Insn::IntAnd { left, right } => asm.and(opnd!(left), opnd!(right)),
+        Insn::LoadKlassCacheEntry { cache, klass } => gen_load_klass_cache_entry(asm, opnd!(cache), opnd!(klass)),
         Insn::IntOr { left, right } => gen_int_or(asm, opnd!(left), opnd!(right)),
         &Insn::FixnumLShift { left, right, state } => {
             // We only create FixnumLShift when we know the shift amount statically and it's in [0,
@@ -1346,6 +1347,21 @@ fn gen_ccall_variadic(
     asm.mov(SP, new_sp);
 
     result
+}
+
+/// Load the entry of the KlassCache at `cache` for `klass`. See [`crate::hir::KLASS_CACHE_INDEX_SHIFT1`].
+fn gen_load_klass_cache_entry(asm: &mut Assembler, cache: Opnd, klass: Opnd) -> Opnd {
+    use crate::hir::{KLASS_CACHE_INDEX_SHIFT1, KLASS_CACHE_INDEX_SHIFT2, KLASS_CACHE_SIZE};
+    asm_comment!(asm, "load klass cache entry");
+    let klass = asm.load(klass);
+    let hash1 = asm.urshift(klass, Opnd::UImm(KLASS_CACHE_INDEX_SHIFT1));
+    let hash2 = asm.urshift(klass, Opnd::UImm(KLASS_CACHE_INDEX_SHIFT2));
+    let hash = asm.xor(hash1, hash2);
+    let index = asm.and(hash, Opnd::UImm(KLASS_CACHE_SIZE as u64 - 1));
+    let offset = asm.lshift(index, Opnd::UImm(SIZEOF_VALUE.trailing_zeros() as u64));
+    let cache = asm.load(cache);
+    let entry_ptr = asm.add(cache, offset);
+    asm.load(Opnd::mem(64, entry_ptr, 0))
 }
 
 /// Emit an uncached instance variable lookup
