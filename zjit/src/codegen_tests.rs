@@ -10667,6 +10667,19 @@ fn test_getspecial_match_last_group() {
 }
 
 #[test]
+fn test_getspecial_through_cfunc_and_block_frames() {
+    // C methods set $~ in the frame of the method that called them, skipping C frames and
+    // going to the method from blocks, including blocks yielded from C methods.
+    eval(r#"
+        def test(str)
+          [str.sub(/(l+)/) { $1.upcase }, $~[1], str.scan(/o./) { $~[0] }.size, $~[0], [1].map { str =~ /w(.)/; $1 }, $~[0]]
+        end
+        test("hello world")
+    "#);
+    assert_snapshot!(assert_compiles(r#"test("hello world")"#), @r#"["heLLo world", "ll", 11, "or", ["o"], "wo"]"#);
+}
+
+#[test]
 fn test_getspecial_numbered_match_1() {
     eval(r#"
         def test(str)
