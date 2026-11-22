@@ -426,13 +426,17 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
 {
     VALUE klass = CLASS_OF(recv);
     int home = zjit_klass_cache_index(klass);
-    for (int i = 0; i < ZJIT_KLASS_CACHE_SIZE; i++) {
-        if (klass_cache[i] == klass) {
-            // Swap it into its entry for the JIT code to find it inline next time
-            klass_cache[i] = klass_cache[home];
-            klass_cache[home] = klass;
-            return expected_cme;
-        }
+    // A class is cached in its entry or the entry paired with it, like a 2-way set-associative
+    // cache. JIT code doesn't check the cache for immediates, so check their entry here too.
+    if (klass_cache[home] == klass) {
+        return expected_cme;
+    }
+    int pair = home ^ 1;
+    if (klass_cache[pair] == klass) {
+        // Swap it into its entry for the JIT code to find it inline next time
+        klass_cache[pair] = klass_cache[home];
+        klass_cache[home] = klass;
+        return expected_cme;
     }
 
     ID mid = rb_sym2id(mid_sym);
@@ -445,16 +449,11 @@ rb_zjit_cached_cme(VALUE recv, VALUE mid_sym, VALUE *klass_cache, VALUE cache_ow
                 // The cache keeps the class alive. Don't let it keep a short-lived object alive
                 // through its singleton class.
                 if (!object_singleton_class_p(klass) || RB_OBJ_PROMOTED(klass)) {
-                    // Put it in its entry and move the class there to an unused entry, if any.
-                    // Sites whose receiver classes are, e.g., the Relation subclasses of every
-                    // Active Record model see many classes in turn.
+                    // Put it in its entry and move the class there to the paired entry, evicting
+                    // the class in it. Sites whose receiver classes are, e.g., the Relation
+                    // subclasses of every Active Record model see many classes in turn.
                     if (klass_cache[home] != Qfalse) {
-                        for (int i = 0; i < ZJIT_KLASS_CACHE_SIZE; i++) {
-                            if (klass_cache[i] == Qfalse) {
-                                klass_cache[i] = klass_cache[home];
-                                break;
-                            }
-                        }
+                        klass_cache[pair] = klass_cache[home];
                     }
                     klass_cache[home] = klass;
                     RB_OBJ_WRITTEN(cache_owner, Qundef, klass);
