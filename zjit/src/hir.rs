@@ -3408,6 +3408,19 @@ struct InlineFrame {
     cref: Option<VALUE>,
 }
 
+/// How an instruction between a PushInlineFrame/PopInlineFrame pair uses the frame.
+/// See [`Function::elided_frame_use`].
+enum ElidedFrameUse {
+    /// It doesn't use the frame.
+    None,
+    /// It may side-exit, but doesn't use the frame otherwise.
+    Exit,
+    /// It writes the heap, but doesn't use the frame otherwise.
+    Write,
+    /// It may observe the frame.
+    Frame,
+}
+
 /// Operands of an [`Insn::PopInlineFrame`]
 #[derive(Debug, Clone, Copy)]
 struct InlineFramePop {
@@ -10441,48 +10454,89 @@ impl Function {
         }
     }
 
-    /// Whether `insn` may stay between a PushInlineFrame/PopInlineFrame pair
-    /// that gets elided, i.e. whether it can neither take a side exit nor
-    /// observe the frame:
-    /// * Its effects must be confined to the Stats heap, so it doesn't read
-    ///   or write anything observable (in particular Frame and Control).
-    ///   Stats counters only bump a global counter, so allowing them keeps
-    ///   this pass enabled when --zjit-stats inserts IncrCounter between
-    ///   every PushInlineFrame/PopInlineFrame.
-    /// * It must not reference a FrameState `Snapshot` operand: a side exit
-    ///   materializes the enclosing inlined frame, and effects don't model
-    ///   deopt for otherwise pure instructions like `FixnumAdd`.
-    ///   (`Snapshot` instructions themselves are exempt: they are inert data
-    ///   that cannot side-exit, so they should not prevent elision.)
-    /// * `LoadSP` reads the frame-dependent SP register despite having empty
-    ///   effects, so it's excluded explicitly.
-    fn can_elide_enclosing_frame(&self, insn: &Insn) -> bool {
+    /// Whether `insn_id` may be a pointer into the current frame, i.e. a frame register or a
+    /// raw pointer loaded through one, e.g. `ec->cfp`. Eliding the enclosing frame would change
+    /// what it points to. A Ruby object loaded through one, e.g. a local, is not.
+    fn is_frame_pointer(&self, insn_id: InsnId) -> bool {
+        let mut insn_id = self.union_find.borrow().find_const(insn_id);
+        loop {
+            match &self.insns[insn_id] {
+                Insn::LoadSP | Insn::LoadEC | Insn::LoadPC | Insn::GetEP { .. } => return true,
+                &Insn::LoadField { recv, return_type, .. } if !return_type.is_subtype(types::BasicObject) => {
+                    insn_id = self.union_find.borrow().find_const(recv);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// How `insn` constrains eliding an enclosing PushInlineFrame/PopInlineFrame pair:
+    /// * [`ElidedFrameUse::None`]: it can neither take a side exit nor observe the frame.
+    ///   Its writes must be confined to the Stats heap. Stats counters only bump a global
+    ///   counter, so allowing them keeps this pass enabled when --zjit-stats inserts
+    ///   IncrCounter between every PushInlineFrame/PopInlineFrame. It may read memory
+    ///   other than the frame, which the frame push doesn't write.
+    /// * [`ElidedFrameUse::Exit`]: like `None`, except that it may take a side exit with
+    ///   a FrameState `Snapshot` in the frame. Such an exit can re-execute the send that
+    ///   pushed the frame instead, as long as nothing before it in the frame has an effect.
+    /// * [`ElidedFrameUse::Write`]: it writes the heap without using the frame, e.g. a
+    ///   setter's ivar store. A side exit after it in the frame keeps the frame.
+    /// * [`ElidedFrameUse::Frame`]: anything else, e.g. a call, a write, or a read of a
+    ///   frame register (`LoadSP` reads the SP register despite having empty effects).
+    fn elided_frame_use(&self, insn: &Insn) -> ElidedFrameUse {
         // A `Snapshot` only matters as the deopt state of an instruction
         // that can side-exit. It shouldn't prevent elision on its own.
         // Side-exiting instructions will block elision when they're scanned.
         // TODO (nirvdrum 2026-09-02) Replace this specific instruction check with a check of the instruction's effects.
         if matches!(insn, Insn::Snapshot { .. }) {
-            return true;
+            return ElidedFrameUse::None;
         }
-        // TODO: Model LoadSP as reading from the control frame and drop this
+        // TODO: Model frame registers as reading from the control frame and drop this
         // special case.
-        if matches!(insn, Insn::LoadSP) {
-            return false;
+        if matches!(insn, Insn::LoadSP | Insn::LoadEC | Insn::LoadPC | Insn::LoadSelf | Insn::GetEP { .. }) {
+            return ElidedFrameUse::Frame;
         }
-        let effects = insn.effects_of();
-        if !(abstract_heaps::Stats.includes(effects.read_bits()) && abstract_heaps::Stats.includes(effects.write_bits())) {
-            return false;
-        }
-        // TODO: Model the possibility of taking a side exit as a subeffect of
-        // Control so that the effect check above subsumes this operand scan.
+        let mut uses_frame = false;
         let mut references_snapshot = false;
         insn.for_each_operand(|opnd| {
             let opnd = self.union_find.borrow().find_const(opnd);
             if matches!(&self.insns[opnd], Insn::Snapshot { .. }) {
                 references_snapshot = true;
+            } else if self.is_frame_pointer(opnd) {
+                uses_frame = true;
             }
         });
-        !references_snapshot
+        if uses_frame {
+            return ElidedFrameUse::Frame;
+        }
+        let writes = insn.effects_of().write_bits();
+        // TODO: Model the possibility of taking a side exit as a subeffect of
+        // Control so that the effect check doesn't need the operand scan.
+        if !references_snapshot && abstract_heaps::Stats.includes(writes) {
+            return ElidedFrameUse::None;
+        }
+        // Writes to the heap don't observe the frame, but a side exit after them can't
+        // re-execute the send. WriteBarrier only updates GC metadata of the written object.
+        if matches!(insn, Insn::StoreField { .. } | Insn::WriteBarrier { .. }) {
+            return ElidedFrameUse::Write;
+        }
+        let exits_only = matches!(insn,
+            Insn::PatchPoint { .. }
+            | Insn::GuardType { .. }
+            | Insn::GuardBitEquals { .. }
+            | Insn::GuardAnyBitSet { .. }
+            | Insn::GuardNoBitsSet { .. }
+            | Insn::GuardNotNull { .. }
+            | Insn::GuardGreaterEq { .. }
+            | Insn::GuardLess { .. }
+            | Insn::FixnumAdd { .. }
+            | Insn::FixnumSub { .. }
+            | Insn::FixnumMult { .. });
+        if exits_only && abstract_heaps::Control.union(abstract_heaps::Stats).includes(writes) {
+            ElidedFrameUse::Exit
+        } else {
+            ElidedFrameUse::Frame
+        }
     }
 
     /// Remove PushInlineFrame/PopInlineFrame pairs whose inlined body has been
@@ -10498,64 +10552,70 @@ impl Function {
     /// walk the frame chain, so pushing and popping the frame is pure overhead.
     /// This pass deletes both instructions of each such pair.
     ///
-    /// A `PatchPoint` in a method frame doesn't keep it either, e.g. the one on `Integer#==`
-    /// in an inlined `BasicObject#!=`. It only exits when its invariant is invalidated, and
-    /// nothing before it in the frame has an effect, so it can exit by re-executing the send
-    /// that pushed the frame instead. HotSpot and V8 similarly never materialize an inlined
-    /// frame unless they deoptimize.
+    /// A side exit in a method frame doesn't keep it either, e.g. a `PatchPoint` on `Integer#==`
+    /// in an inlined `BasicObject#!=`, or the shape guard and the `GuardType` of an inlined
+    /// `def foo = @foo + 1`. Nothing before it in the frame has an effect, so it can exit by
+    /// re-executing the send that pushed the frame instead. HotSpot and V8 similarly never
+    /// materialize an inlined frame unless they deoptimize.
     ///
     /// Pairs are matched per basic block with a stack so that nested pairs are
     /// handled: an inner elided pair doesn't prevent the outer pair from being
     /// elided, while an inner pair that must be kept also keeps the outer one
     /// (the kept push/pop observe and modify the frame chain). A PushInlineFrame
     /// whose PopInlineFrame lives in another block is left untouched.
-    fn eliminate_empty_inline_frames(&mut self) {
+    /// Returns whether it removed any pair.
+    fn eliminate_empty_inline_frames(&mut self) -> bool {
         /// A PushInlineFrame whose matching PopInlineFrame hasn't been seen yet.
         struct PendingPush {
             /// The PushInlineFrame's instruction ID.
             push_id: InsnId,
-            /// Snapshot of the send that pushed the frame, if exits can re-execute it.
-            exit_state: Option<InsnId>,
-            /// Whether an instruction that may take a side exit or observe the
-            /// frame has been seen since the push. If so, the pair must be kept.
+            /// The ISEQ of the frame.
+            iseq: IseqPtr,
+            /// Snapshot of the send or the yield that pushed the frame. Exits re-execute it.
+            exit_state: InsnId,
+            /// Whether an instruction that may observe the frame, or a side exit after
+            /// a write, has been seen since the push. If so, the pair must be kept.
             frame_observed: bool,
-            /// PatchPoints in the frame. They exit only when invalidated, and nothing before them
-            /// in the frame has an effect, so they can exit by re-executing the send instead.
-            patch_points: Vec<InsnId>,
+            /// Whether an instruction in the frame has written memory.
+            written: bool,
+            /// Instructions that may side-exit in the frame. Nothing before them in the frame
+            /// has an effect, so they can exit by re-executing the send instead.
+            exits: Vec<InsnId>,
+            /// NoEPEscape PatchPoints on the frame's own ISEQ. Nothing in an elided frame can
+            /// escape its EP, so they're removed with the frame.
+            ep_patch_points: Vec<InsnId>,
         }
 
+        let mut elided_any = false;
         for block_id in self.reverse_post_order() {
             // First, find the (PushInlineFrame, PopInlineFrame) pairs to elide.
             let mut elided_pairs: Vec<(InsnId, InsnId)> = Vec::new();
             let mut pending_pushes: Vec<PendingPush> = Vec::new();
-            // PatchPoints to move out of elided frames, with the exit state to move them to.
-            let mut rehomed_patch_points: HashMap<InsnId, InsnId> = HashMap::default();
+            // Side exits to move out of elided frames, with the exit state to move them to.
+            let mut rehomed_exits: HashMap<InsnId, InsnId> = HashMap::default();
+            let mut removed_patch_points: Vec<InsnId> = Vec::new();
             for &insn_id in &self.blocks[block_id].insns {
                 match self.find_ref(insn_id) {
-                    &Insn::PushInlineFrame { exit_state, .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, exit_state: Some(exit_state), frame_observed: false, patch_points: vec![] });
-                    }
-                    Insn::PushInlineBlockFrame { .. } => {
-                        pending_pushes.push(PendingPush { push_id: insn_id, exit_state: None, frame_observed: false, patch_points: vec![] });
+                    // A block frame's state is the yield's, which its stack overflow check exits with.
+                    &Insn::PushInlineFrame { iseq, exit_state, .. } | &Insn::PushInlineBlockFrame { iseq, state: exit_state, .. } => {
+                        pending_pushes.push(PendingPush { push_id: insn_id, iseq, exit_state, frame_observed: false, written: false, exits: vec![], ep_patch_points: vec![] });
                     }
                     Insn::PopInlineFrame { .. } => {
                         match pending_pushes.pop() {
-                            Some(PendingPush { push_id, exit_state, frame_observed: false, patch_points }) => {
-                                // Empty pair: elide both the push and this pop.
+                            Some(PendingPush { push_id, exit_state, frame_observed: false, written, exits, ep_patch_points, .. }) => {
+                                // Unobserved pair: elide both the push and this pop.
                                 elided_pairs.push((push_id, insn_id));
-                                if !patch_points.is_empty() {
-                                    let exit_state = exit_state.expect("frames with PatchPoints have an exit state");
-                                    for &patch_point in &patch_points {
-                                        rehomed_patch_points.insert(patch_point, exit_state);
+                                removed_patch_points.extend(ep_patch_points);
+                                for &exit in &exits {
+                                    rehomed_exits.insert(exit, exit_state);
+                                }
+                                // The side exits and writes are now in the enclosing frame.
+                                if let Some(outer) = pending_pushes.last_mut() {
+                                    if !exits.is_empty() && outer.written {
+                                        outer.frame_observed = true;
                                     }
-                                    // The PatchPoints now exit in the enclosing frame.
-                                    if let Some(outer) = pending_pushes.last_mut() {
-                                        if outer.exit_state.is_some() {
-                                            outer.patch_points.extend(patch_points);
-                                        } else {
-                                            outer.frame_observed = true;
-                                        }
-                                    }
+                                    outer.exits.extend(exits);
+                                    outer.written |= written;
                                 }
                             }
                             Some(PendingPush { frame_observed: true, .. }) => {
@@ -10570,17 +10630,25 @@ impl Function {
                             }
                         }
                     }
-                    Insn::PatchPoint { .. } if pending_pushes.last().is_some_and(|push| push.exit_state.is_some()) => {
-                        pending_pushes.last_mut().unwrap().patch_points.push(insn_id);
+                    &Insn::PatchPoint { invariant: Invariant::NoEPEscape(iseq), .. }
+                        if pending_pushes.last().is_some_and(|push| push.iseq == iseq) => {
+                        pending_pushes.last_mut().unwrap().ep_patch_points.push(insn_id);
                     }
                     insn => {
-                        if !pending_pushes.is_empty() && !self.can_elide_enclosing_frame(insn) {
-                            // The instruction may take a side exit or observe the frame,
-                            // so the innermost pending pair must be kept. Enclosing pairs
-                            // don't need to be marked here: a kept pair marks its
-                            // enclosing pair when its PopInlineFrame is reached, so the
-                            // flag propagates outward one pop at a time.
-                            pending_pushes.last_mut().unwrap().frame_observed = true;
+                        let Some(push) = pending_pushes.last_mut() else { continue };
+                        match self.elided_frame_use(insn) {
+                            ElidedFrameUse::None => {}
+                            ElidedFrameUse::Exit if !push.written => push.exits.push(self.union_find.borrow().find_const(insn_id)),
+                            ElidedFrameUse::Write => push.written = true,
+                            ElidedFrameUse::Exit | ElidedFrameUse::Frame => {
+                                // The instruction may observe the frame, or it may take a side
+                                // exit that can't re-execute the send after a write, so the
+                                // innermost pending pair must be kept. Enclosing pairs don't
+                                // need to be marked here: a kept pair marks its enclosing pair
+                                // when its PopInlineFrame is reached, so the flag propagates
+                                // outward one pop at a time.
+                                push.frame_observed = true;
+                            }
                         }
                     }
                 }
@@ -10588,10 +10656,23 @@ impl Function {
             if elided_pairs.is_empty() {
                 continue;
             }
+            elided_any = true;
 
-            for (patch_point, exit_state) in rehomed_patch_points {
-                let Insn::PatchPoint { state, .. } = &mut self.insns[patch_point] else { unreachable!() };
-                *state = exit_state;
+            for (exit, exit_state) in rehomed_exits {
+                match &mut self.insns[exit] {
+                    Insn::PatchPoint { state, .. }
+                    | Insn::GuardType { state, .. }
+                    | Insn::GuardBitEquals { state, .. }
+                    | Insn::GuardAnyBitSet { state, .. }
+                    | Insn::GuardNoBitsSet { state, .. }
+                    | Insn::GuardNotNull { state, .. }
+                    | Insn::GuardGreaterEq { state, .. }
+                    | Insn::GuardLess { state, .. }
+                    | Insn::FixnumAdd { state, .. }
+                    | Insn::FixnumSub { state, .. }
+                    | Insn::FixnumMult { state, .. } => *state = exit_state,
+                    insn => unreachable!("unexpected side exit in an elided frame: {insn:?}"),
+                }
             }
 
             // Elide each pair: drop the pop, and drop the push as well, except
@@ -10604,6 +10685,9 @@ impl Function {
                 rewrites.insert(push_id, replacement);
                 rewrites.insert(pop_id, None);
             }
+            for patch_point in removed_patch_points {
+                rewrites.insert(patch_point, None);
+            }
             self.blocks[block_id].insns.retain_mut(|insn_id| {
                 match rewrites.get(insn_id) {
                     Some(Some(replacement)) => {
@@ -10615,6 +10699,7 @@ impl Function {
                 }
             });
         }
+        elided_any
     }
 
     /// Return a list that has entry_block and then jit_entry_blocks
@@ -10903,7 +10988,11 @@ impl Function {
             run_pass!(remove_redundant_patch_points, preserves_cfg);
             run_pass!(remove_duplicate_check_interrupts, preserves_cfg);
             if has_ever_inlined {
-                run_pass!(eliminate_empty_inline_frames, preserves_cfg);
+                // Eliding a frame can make reads of the enclosing frame dead, e.g. the block
+                // handler load for an elided block frame, so retry after removing them.
+                while run_pass!(eliminate_empty_inline_frames, preserves_cfg) {
+                    run_pass!(eliminate_dead_code, preserves_cfg);
+                }
             }
             run_pass!(eliminate_dead_code, preserves_cfg);
             // After DCE so that dead Snapshots (one per YARV instruction) no longer count as

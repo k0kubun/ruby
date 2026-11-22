@@ -296,7 +296,6 @@ mod snapshot_tests {
           PatchPoint MethodRedefined(Object@0x1010, inner@0x1048, cme:0x1050), v12
           PatchPoint MethodRedefined(Integer@0x1078, +@0x1080, cme:0x1088), v12
           v65:Fixnum[2] = Const Value(2)
-          PatchPoint NoEPEscape(middle), v12
           v14:Any = Snapshot FrameState { pc: 0x10b0, stack: [v65], locals: [] }
           CheckInterrupts
           Return v65

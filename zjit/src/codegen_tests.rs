@@ -6205,9 +6205,9 @@ fn test_exit_descriptor_survives_compaction() {
 #[test]
 fn test_exit_descriptor_stack_map() {
     // The exit out of the inlined callee also has to materialize the caller's frame,
-    // whose stack holds `a` and `x` at the call.
+    // whose stack holds `a` and `x` at the call. The ivar write keeps the callee's frame.
     let result = with_inlining(|| assert_inlines_allowing_exits("
-        def exit_desc_callee(n) = n + 1
+        def exit_desc_callee(n) = (@exit_desc = n) + 1
         def exit_desc_caller(a, n)
           x = a * 2
           [a, x, exit_desc_callee(n)]
@@ -6221,6 +6221,112 @@ fn test_exit_descriptor_stack_map() {
 
     let descs = exit_descriptors_of("exit_desc_caller");
     assert!(descs.iter().any(|desc| desc.frame_depth > 0), "expected an exit out of an inlined frame");
+}
+
+#[test]
+fn test_elided_inline_frame_exits_reexecute_send() {
+    // `a1` and `wrapper` don't push frames. Each exit out of them re-executes `o.wrapper(3)`.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        class ElidedIvar
+          attr_writer :a
+          def initialize = @a = 1
+          def a1 = @a + 1
+          def wrapper(x) = x + a1
+        end
+        def elided_frame_exits(o) = o.wrapper(3)
+        o = ElidedIvar.new
+        3.times { elided_frame_exits(o) }
+        r = [elided_frame_exits(o)]
+        o.a = (2**62) - 1; r << elided_frame_exits(o) # Fixnum overflow
+        o.a = 1.5; r << elided_frame_exits(o) # GuardType
+        o2 = ElidedIvar.new; o2.instance_variable_set(:@b, 0); o2.a = 10; r << elided_frame_exits(o2) # shape guard
+        class ElidedIvar; def a1 = 100; end # PatchPoint
+        r << elided_frame_exits(o)
+    "));
+    assert_snapshot!(result, @"[5, 4611686018427387907, 5.5, 14, 103]");
+}
+
+#[test]
+fn test_elided_inline_frame_exits_before_write() {
+    // `bump` doesn't push a frame. Its exits come before the ivar write, so re-executing
+    // the send doesn't increment twice.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        class ElidedCounter
+          attr_reader :n
+          def initialize = @n = 0
+          def bump = @n += 1
+          def set_n(v) = @n = v
+        end
+        def elided_setter(c) = c.bump
+        c = ElidedCounter.new
+        3.times { elided_setter(c) }
+        r = [c.n]
+        c.set_n((2**62) - 1); r << elided_setter(c) << c.n
+        c.set_n(1.5); r << elided_setter(c) << c.n
+    "));
+    assert_snapshot!(result, @"[3, 4611686018427387904, 4611686018427387904, 2.5, 2.5]");
+}
+
+#[test]
+fn test_elided_inline_frame_exit_then_raise() {
+    // The exit out of `a1`, which doesn't push a frame, re-executes the send, so the
+    // interpreter raises in `a1`'s own frame.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        class ElidedRaise
+          attr_writer :a
+          def initialize = @a = 1
+          def a1 = @a + 1
+        end
+        def elided_raise(o) = o.a1
+        o = ElidedRaise.new
+        3.times { elided_raise(o) }
+        o.a = nil
+        begin
+          elided_raise(o)
+        rescue NoMethodError => e
+          [e.message, e.backtrace_locations.first(2).map { [_1.label, _1.lineno] }]
+        end
+    "));
+    assert_snapshot!(result, @r#"["undefined method '+' for nil", [["ElidedRaise#a1", 5], ["Object#elided_raise", 7]]]"#);
+}
+
+#[test]
+fn test_elided_inline_block_frame_exit_reexecutes_yield() {
+    // The inlined block doesn't push a frame. Its exit re-executes the `yield` in `each`.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        class ElidedBlock
+          attr_reader :sum
+          def initialize = @sum = 0
+          def add_all(arr) = arr.each { |v| @sum += v }
+        end
+        def elided_block(o, arr) = o.add_all(arr)
+        o = ElidedBlock.new
+        3.times { elided_block(o, [1, 2, 3]) }
+        r = [o.sum]
+        elided_block(o, [1, 2.5, 3]); r << o.sum
+    "));
+    assert_snapshot!(result, @"[18, 24.5]");
+}
+
+#[test]
+fn test_kept_inline_frames_are_observable() {
+    // Inlined callees that walk, scan or switch away from their frames keep them.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        class KeptFrames
+          def initialize = @a = 1
+          def locs = caller_locations(0, 2).map { [_1.label, _1.lineno] }
+          def gc = (GC.start; @a + 1)
+          def pass = (Thread.pass; @a + 2)
+          def bind(x) = binding.local_variable_get(:x)
+          def boom = raise(ArgumentError, 'boom')
+          def rescued = (boom rescue $!.backtrace_locations.first(3).map { [_1.label, _1.lineno] })
+        end
+        def kept_frames(o) = [o.locs, o.gc, o.pass, o.bind(5), o.rescued]
+        o = KeptFrames.new
+        3.times { kept_frames(o) }
+        kept_frames(o)
+    "));
+    assert_snapshot!(result, @r#"[[["KeptFrames#locs", 4], ["Object#kept_frames", 11]], 2, 3, 5, [["KeptFrames#boom", 8], ["KeptFrames#rescued", 9], ["Object#kept_frames", 11]]]"#);
 }
 
 #[test]
