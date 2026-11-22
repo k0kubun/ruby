@@ -286,6 +286,7 @@ make_counters! {
         send_fallback_send_polymorphic_fallback,
         send_fallback_send_name_miss,
         send_fallback_send_method_entry_miss,
+        send_fallback_send_catching_throw,
         send_fallback_send_direct_keyword_mismatch,
         send_fallback_send_direct_keyword_count_mismatch,
         send_fallback_send_direct_missing_keyword,
@@ -523,6 +524,7 @@ make_counters! {
     inline_reject_compile_failure,
     inline_reject_no_returns,
     inline_reject_budget_exceeded,
+    inline_reject_catches_throw,
 
     total_native_stack_bytes,
 }
@@ -717,6 +719,7 @@ pub fn send_fallback_counter(reason: crate::hir::SendFallbackReason) -> Counter 
         SendPolymorphicFallback                   => send_fallback_send_polymorphic_fallback,
         SendNameMiss                              => send_fallback_send_name_miss,
         SendMethodEntryMiss                       => send_fallback_send_method_entry_miss,
+        SendCatchingThrow                         => send_fallback_send_catching_throw,
         SendDirectKeywordMismatch                 => send_fallback_send_direct_keyword_mismatch,
         SendDirectKeywordCountMismatch            => send_fallback_send_direct_keyword_count_mismatch,
         SendDirectMissingKeyword                  => send_fallback_send_direct_missing_keyword,

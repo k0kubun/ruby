@@ -3416,6 +3416,51 @@ rb_zjit_ccall_catching_throw(rb_execution_context_t *ec, const rb_callable_metho
     return val;
 }
 
+// Like rb_zjit_ccall_catching_throw(), but for a send from a JIT frame to a method of any type
+// with a literal block, e.g. `recognize(req) { |route| return route.app.serve(req) }` in
+// ActionDispatch::Journey::Router#serve. A `throw` from the block would otherwise longjmp to a
+// vm_exec() below the JIT frame `cfp`, and then the interpreter resumes `cfp` and every JIT caller
+// below it one by one. With the tag here, the vm_exec() of the callee pops the frames above `cfp`,
+// running their ensure clauses, and the throw stops here.
+VALUE
+rb_zjit_send_catching_throw(rb_execution_context_t *ec, rb_control_frame_t *cfp, CALL_DATA cd, ISEQ blockiseq,
+                            bool catch_return)
+{
+    volatile VALUE val = Qnil;
+    enum ruby_tag_type state;
+
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        val = rb_vm_send(ec, cfp, cd, blockiseq);
+    }
+    else if (state == TAG_BREAK || (state == TAG_RETURN && catch_return)) {
+        struct vm_throw_data *err = (struct vm_throw_data *)ec->errinfo;
+        // Leave it to the VM when hooks need to see the frames unwound or the method return
+        if (THROW_DATA_CATCH_FRAME(err) == cfp &&
+            !(ruby_vm_event_flags & ISEQ_TRACE_EVENTS) && CFP_ISEQ(cfp)->aux.exec.local_hooks_cnt == 0) {
+            // A C method callee leaves its frame, which vm_exec() didn't pop
+            rb_vm_rewind_cfp(ec, cfp);
+            ec->tag->state = TAG_NONE;
+            if (state == TAG_RETURN) {
+                THROW_DATA_CATCH_FRAME_SET(err, cfp + 1);
+                ec->errinfo = vm_throw_data_take_val(err);
+                val = Qundef;
+            }
+            else {
+                ec->errinfo = Qnil;
+                val = vm_throw_data_take_val(err);
+            }
+            state = TAG_NONE;
+        }
+    }
+    EC_POP_TAG();
+
+    if (state != TAG_NONE) {
+        EC_JUMP_TAG(ec, state);
+    }
+    return val;
+}
+
 #endif
 
 static inline VALUE

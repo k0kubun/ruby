@@ -801,6 +801,9 @@ pub enum SendFallbackReason {
     /// The fallback of a send whose profiled receiver classes all call one method, when the
     /// receiver's class doesn't have that method cached
     SendMethodEntryMiss,
+    /// A direct send that wasn't inlined and makes a dynamic send to catch a throw from its block.
+    /// See rb_zjit_send_catching_throw().
+    SendCatchingThrow,
     SendDirectKeywordMismatch,
     SendDirectKeywordCountMismatch,
     SendDirectMissingKeyword,
@@ -883,6 +886,7 @@ impl Display for SendFallbackReason {
             SendPolymorphicFallback => write!(f, "Send: polymorphic fallback"),
             SendNameMiss => write!(f, "Send: send name is not a profiled method name"),
             SendMethodEntryMiss => write!(f, "Send: receiver class doesn't call the profiled method"),
+            SendCatchingThrow => write!(f, "Send: catching a throw from the block"),
             SendDirectKeywordMismatch => write!(f, "SendDirect: keyword mismatch"),
             SendDirectKeywordCountMismatch => write!(f, "SendDirect: keyword count mismatch"),
             SendDirectMissingKeyword => write!(f, "SendDirect: missing keyword"),
@@ -4664,7 +4668,8 @@ impl Function {
             Insn::FixnumLShift { .. } => types::Fixnum,
             Insn::FixnumRShift { .. } => types::Fixnum,
             Insn::PutSpecialObject { .. } => types::BasicObject,
-            Insn::SendDirect(_) => types::BasicObject,
+            // A SendDirect that isn't inlined may catch a `return` like a Send. See rb_zjit_send_catching_throw().
+            Insn::SendDirect(insn) => self.cfunc_call_return_type(types::BasicObject, insn.block, insn.exit_state),
             // A Send may still become a C method call that catches a `return`
             Insn::Send { block, state, .. } => self.cfunc_call_return_type(types::BasicObject, *block, *state),
             Insn::SendForward { .. } => types::BasicObject,
@@ -8133,6 +8138,17 @@ impl Function {
                     && self.tiny_inlines_past_budget < MAX_TINY_INLINES_PAST_BUDGET
                     && unsafe { get_iseq_encoded_size(iseq) } as usize <= TINY_INLINE_MAX_CALLEE_SIZE;
                 if frame_block || !self.should_inline(iseq, cme, inline_block || throw_inlinable, throw_inlinable || tiny_past_budget) || !Self::can_inline(iseq) {
+                    search_start = send_pos + 1;
+                    continue;
+                }
+                // If the literal block may throw but inlining isn't expected to turn the throw into
+                // a jump, e.g. because the callee is too large to be an iterator, keep the call so
+                // that it catches the throw instead of letting it unwind the JIT code of this
+                // function and its callers. See rb_zjit_send_catching_throw().
+                if let Some(blockiseq) = blockiseq && throw_block && !throw_inlinable
+                    && crate::codegen::send_catches_throw(self, blockiseq, &self.frame_state(exit_state)).is_some()
+                {
+                    incr_counter!(inline_reject_catches_throw);
                     search_start = send_pos + 1;
                     continue;
                 }
