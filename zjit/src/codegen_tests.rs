@@ -4971,6 +4971,47 @@ fn test_invokesuper_to_iseq() {
 }
 
 #[test]
+fn test_invokesuper_after_setting_backref() {
+    // A regexp match or gsub in the method stores an svar for $~ in the method frame's
+    // ep[VM_ENV_DATA_INDEX_ME_CREF], where the super call reads its method entry from.
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval(r#"
+        class SvarA
+          def foo(s) = "A(#{s})"
+          def bar(s) = "A(#{s})"
+          def baz(s) = "A(#{s})"
+        end
+
+        class SvarB < SvarA
+          def foo(s)
+            s = $1 if s =~ /x(\d)/
+            [super(s), $~&.[](0)]
+          end
+
+          def bar(s)
+            s = s.gsub(/y/, "z")
+            [super(s), $~&.[](0)]
+          end
+
+          def baz(s)
+            [super(s), $~]
+          end
+        end
+
+        def test(s)
+          b = SvarB.new
+          [b.foo(s), b.bar(s), b.baz(s)]
+        end
+        test("x1y"); test("x1y")
+    "#);
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(inspect(r#"[test("x2y"), test("y"), test("x3")]"#), @r#"[[["A(2)", "x2"], ["A(x2z)", "y"], ["A(x2y)", nil]], [["A(y)", nil], ["A(z)", "y"], ["A(y)", nil]], [["A(3)", "x3"], ["A(x3)", nil], ["A(x3)", nil]]]"#);
+    assert_eq!(0, counters.side_exit_count - side_exits_before, "super after setting $~ shouldn't exit");
+}
+
+#[test]
 fn test_invokesuper_from_refinement() {
     // `super` in a refined method calls the refined class's method, not the next refinement
     // activated by the same `using`.
