@@ -2922,6 +2922,51 @@ fn test_ccall_catching_return_with_trace_point() {
     "), @"[2, [[:c_return, :+], [:b_return, :call!], [:c_return, :catch], [:return, :call!], [:return, :run], [:b_return, nil]]]");
 }
 
+fn assert_return_jumps(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let inline_throw_count_before = counters.inline_throw_count;
+    let result = assert_no_resumes(warmup, program);
+    assert!(counters.inline_throw_count > inline_throw_count_before, "expected a non-local return to become a jump");
+    result
+}
+
+#[test]
+fn test_inlined_block_return_through_block_that_yields() {
+    // Like Journey::Router#serve and #recognize: the block of recognize is too large to inline
+    // by itself, but it yields to the block of serve, whose `return` becomes a jump once both
+    // blocks are inlined.
+    set_call_threshold(2);
+    let warmup = "
+        class Router
+          def initialize(routes) = @routes = routes
+          def recognize(path)
+            routes = @routes.select { |r| path.start_with?(r[0]) }
+            routes.each do |r|
+              params = {path: path, name: r[0]}
+              params[:size] = path.size
+              params[:upcase] = path.upcase
+              params[:downcase] = path.downcase
+              params[:route] = r
+              yield r[1], params
+            end
+            :not_found
+          end
+          def serve(path)
+            recognize(path) do |app, params|
+              response = [app, params[:size]]
+              return response unless app == :pass
+            end
+            [404, path]
+          end
+        end
+        R = Router.new([['/a', :pass], ['/ab', :app]])
+        def run = [R.serve('/ab'), R.serve('/c')]
+        30.times { run } # enough to compile resume entries if it threw
+    ";
+    assert_snapshot!(assert_return_jumps(warmup, "run"), @r#"[[:app, 3], [404, "/c"]]"#);
+}
+
 #[test]
 fn test_throw_return_from_proc() {
     set_call_threshold(2);
