@@ -11046,94 +11046,57 @@ impl Function {
         Ok(())
     }
 
-    // This performs a dataflow def-analysis over the entire CFG to detect any
-    // possibly undefined instruction operands.
+    // Detect any possibly undefined instruction operands. In SSA, an operand is definitely
+    // assigned iff its definition dominates the use: a parameter or an earlier instruction of
+    // the same block, or a parameter or an instruction of a dominating block. Unlike a dataflow
+    // analysis over sets of every instruction, this is linear in the size of the function.
     fn validate_definite_assignment(&self) -> Result<(), ValidationError> {
-        // Map of block ID -> InsnSet
-        // Initialize with all missing values at first, to catch if a jump target points to a
-        // missing location.
-        let mut assigned_in = vec![None; self.num_blocks()];
         let rpo = self.reverse_post_order();
-        // Begin with every block having every variable defined, except for entries_block, which
-        // starts with nothing defined.
+        let mut in_rpo = vec![false; self.num_blocks()];
         for &block in &rpo {
-            if block == self.entries_block {
-                assigned_in[block] = Some(InsnSet::with_capacity(self.insns.len()));
-            } else {
-                let mut all_ones = InsnSet::with_capacity(self.insns.len());
-                all_ones.insert_all();
-                assigned_in[block] = Some(all_ones);
-            }
+            in_rpo[block.0 as usize] = true;
         }
-        let mut worklist = VecDeque::with_capacity(self.num_blocks());
-        worklist.push_back(self.entries_block);
-        while let Some(block) = worklist.pop_front() {
-            let mut assigned = assigned_in[block].clone().unwrap();
+        // Preorder intervals of the dominator tree. See Dominators::tree_intervals().
+        let intervals = Dominators::new(self).tree_intervals();
+        // The block of each definition and its position there: 0 for parameters, and the index
+        // plus 1 for instructions
+        let mut defs: Vec<Option<(BlockId, usize)>> = vec![None; self.insns.len()];
+        for &block in &rpo {
             for &param in &self.blocks[block].params {
-                assigned.insert(param);
+                defs[param.0 as usize] = Some((block, 0));
             }
-            for &insn_id in &self.blocks[block].insns {
+            for (idx, &insn_id) in self.blocks[block].insns.iter().enumerate() {
                 let insn_id = self.union_find.borrow().find_const(insn_id);
-                // No need for resolve(): we only look at jump targets here, and the
-                // operand check below resolves each operand itself.
-                let insn = self.find_ref(insn_id);
-                let mut propagate = |target: BlockId| -> Result<(), ValidationError> {
-                    let Some(block_in) = assigned_in[target].as_mut() else {
-                        return Err(ValidationError::JumpTargetNotInRPO(target));
-                    };
-                    if block_in.intersect_with(&assigned) {
-                        worklist.push_back(target);
-                    }
-                    Ok(())
-                };
-                match insn {
-                    Insn::Jump(edge) => propagate(edge.target)?,
-                    Insn::CondBranch { if_true, if_false, .. } => {
-                        propagate(if_true.target)?;
-                        propagate(if_false.target)?;
-                    }
-                    Insn::CondBranchHasType(insn) => {
-                        propagate(insn.if_true.target)?;
-                        propagate(insn.if_false.target)?;
-                    }
-                    Insn::CondBranchTest { if_true, if_false, .. } => {
-                        propagate(if_true.target)?;
-                        propagate(if_false.target)?;
-                    }
-                    Insn::CondBranchFixnumCmp(insn) => {
-                        propagate(insn.if_true.target)?;
-                        propagate(insn.if_false.target)?;
-                    }
-                    Insn::Entries { targets } => {
-                        for &target in targets {
-                            propagate(target)?;
-                        }
-                    }
-                    insn if insn.has_output() => {
-                        assigned.insert(insn_id);
-                    }
-                    _ => {}
+                if self.insns[insn_id].has_output() {
+                    defs[insn_id.0 as usize].get_or_insert((block, idx + 1));
                 }
             }
         }
         // Check that each instruction's operands are assigned
         for &block in &rpo {
-            let mut assigned = assigned_in[block].clone().unwrap();
-            for &param in &self.blocks[block].params {
-                assigned.insert(param);
+            for target in self.successors(block) {
+                if !in_rpo[target.0 as usize] {
+                    return Err(ValidationError::JumpTargetNotInRPO(target));
+                }
             }
-            for &insn_id in &self.blocks[block].insns {
+            let (block_pre, _) = intervals[block.0 as usize];
+            for (idx, &insn_id) in self.blocks[block].insns.iter().enumerate() {
                 let insn_id = self.union_find.borrow().find_const(insn_id);
                 self.insns[insn_id].try_for_each_operand(|operand| {
                     let operand = self.union_find.borrow().find_const(operand);
-                    if !assigned.get(operand) {
+                    let defined = match defs[operand.0 as usize] {
+                        Some((def_block, def_pos)) if def_block == block => def_pos <= idx,
+                        Some((def_block, _)) => {
+                            let (def_pre, def_last) = intervals[def_block.0 as usize];
+                            def_pre <= block_pre && block_pre <= def_last
+                        }
+                        None => false,
+                    };
+                    if !defined {
                         return Err(ValidationError::OperandNotDefined(block, insn_id, operand));
                     }
                     Ok(())
                 })?;
-                if self.insns[insn_id].has_output() {
-                    assigned.insert(insn_id);
-                }
             }
         }
         Ok(())
