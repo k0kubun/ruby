@@ -1035,6 +1035,9 @@ pub struct SendDirectData {
     pub exit_state: InsnId,
 }
 
+/// The `optimize_load_store` state: the known values of fields, and the GetEP of each level.
+type LoadStoreState = (HashMap<(InsnId, i32), InsnId>, HashMap<u32, InsnId>);
+
 /// Payload of [`Insn::CondBranchHasType`]. Boxed in the enum to keep `Insn` small.
 #[derive(Debug, Clone)]
 pub struct CondBranchHasTypeData {
@@ -8976,12 +8979,19 @@ impl Function {
 
 
     fn optimize_load_store(&mut self) {
-        for block in self.reverse_post_order() {
-            let mut compile_time_heap: HashMap<(InsnId, i32), InsnId>  = HashMap::default();
-            // GetEP of each level, which stays the same until the frame changes or a write to
-            // memory may have moved the environment to the heap. Reusing it lets the loads of
-            // a local from a parent EP share a key in compile_time_heap.
-            let mut ep_cache: HashMap<u32, InsnId> = HashMap::default();
+        // The state is a compile-time heap of (recv, offset) -> value, and the GetEP of each
+        // level, which stays the same until the frame changes or a write to memory may have moved
+        // the environment to the heap. Reusing it lets the loads of a local from a parent EP share
+        // a key in the compile-time heap.
+        let cfi = ControlFlowInfo::new(self);
+        // The state at the end of each visited block. A block starts with the entries that all of
+        // its predecessors agree on, so that a field loaded before a branch, e.g. the shape check
+        // of an ivar read, is still known after the branches join. A predecessor that hasn't been
+        // visited yet, i.e. a loop back edge, may have written anything, so it empties the state.
+        // An entry is only kept if it's on every path to the block, so its value dominates it.
+        let mut out_states: Vec<Option<LoadStoreState>> = vec![None; self.num_blocks()];
+        for &block in cfi.reverse_post_order() {
+            let (mut compile_time_heap, mut ep_cache) = self.load_store_state_at_entry(&cfi, &out_states, block);
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             let mut new_insns = Vec::with_capacity(old_insns.len());
             for insn_id in old_insns {
@@ -9066,6 +9076,11 @@ impl Function {
                         compile_time_heap.retain(|(_, off), _| *off != offset);
                         insn_id
                     },
+                    // Branches only pass values to their targets.
+                    insn if insn.is_terminator() => insn_id,
+                    // Reading an ivar may fill the instruction's inline cache, but it doesn't write
+                    // any field or local. On a Module, it may raise and spill the frame for it.
+                    &Insn::GetIvar { self_val, .. } if !self.type_of(self_val).could_be(types::Module) => insn_id,
                     insn => {
                         // If an instruction affects memory and we haven't modeled it, the compile_time_heap is invalidated
                         let effects = insn.effects_of();
@@ -9081,7 +9096,35 @@ impl Function {
                 new_insns.push(replacement_insn);
             }
             self.blocks[block].insns = new_insns;
+            out_states[block.0 as usize] = Some((compile_time_heap, ep_cache));
         }
+    }
+
+    /// Return the entries of the `optimize_load_store` state that all predecessors of `block`
+    /// agree on, or an empty state if any of them hasn't been visited.
+    fn load_store_state_at_entry(
+        &self,
+        cfi: &ControlFlowInfo,
+        out_states: &[Option<LoadStoreState>],
+        block: BlockId,
+    ) -> LoadStoreState {
+        let preds = cfi.predecessors(block);
+        let Some((&first, rest)) = preds.split_first() else { return Default::default() };
+        let Some((first_heap, first_eps)) = &out_states[first.0 as usize] else { return Default::default() };
+        let mut others = Vec::with_capacity(rest.len());
+        for &pred in rest {
+            let Some(state) = &out_states[pred.0 as usize] else { return Default::default() };
+            others.push(state);
+        }
+        let heap = first_heap.iter()
+            .filter(|&(key, &val)| others.iter().all(|(heap, _)| heap.get(key).is_some_and(|&other| self.find_id(other) == self.find_id(val))))
+            .map(|(&key, &val)| (key, val))
+            .collect();
+        let eps = first_eps.iter()
+            .filter(|&(level, &val)| others.iter().all(|(_, eps)| eps.get(level).is_some_and(|&other| self.find_id(other) == self.find_id(val))))
+            .map(|(&level, &val)| (level, val))
+            .collect();
+        (heap, eps)
     }
 
     /// Fold a binary operator on fixnums.
