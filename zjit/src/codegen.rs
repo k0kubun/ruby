@@ -691,7 +691,8 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
 
                         let val = function.find_id(*val);
                         if fused_bit_equals[val] {
-                            let &Insn::IsBitEqual { left, right } = function.find_ref(val) else { unreachable!() };
+                            // Read the operands through the union-find; they may have been replaced since.
+                            let Insn::IsBitEqual { left, right } = function.find(val) else { unreachable!() };
                             asm.cmp(jit.get_opnd(left), jit.get_opnd(right));
                             asm.push_insn(lir::Insn::Je(Target::Block(Box::new(true_branch))));
                         } else {
