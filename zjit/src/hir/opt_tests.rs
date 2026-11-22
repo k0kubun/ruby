@@ -13597,11 +13597,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb16(), bb15()
         bb16():
           v54:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v55:CUInt64 = LoadField v49, :klass_cache@0x1061
+          v55:CUInt64 = LoadKlassCacheEntry v49, v54
           v56:CBool = IsBitEqual v54, v55
           CondBranch v56, bb12(), bb15()
         bb15():
-          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v48, v49, v50, v51, v52
+          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v48, v49, v50, v51, v52
           v59:CBool = IsBitEqual v58, v51
           CondBranch v59, bb12(), bb13()
         bb12():
@@ -13830,11 +13830,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb16(), bb15()
         bb16():
           v54:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v55:CUInt64 = LoadField v49, :klass_cache@0x1061
+          v55:CUInt64 = LoadKlassCacheEntry v49, v54
           v56:CBool = IsBitEqual v54, v55
           CondBranch v56, bb12(), bb15()
         bb15():
-          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v48, v49, v50, v51, v52
+          v58:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v48, v49, v50, v51, v52
           v59:CBool = IsBitEqual v58, v51
           CondBranch v59, bb12(), bb13()
         bb12():
@@ -22512,11 +22512,11 @@ mod hir_opt_tests {
           CondBranchHasType v12, HeapBasicObject, bb13(), bb12()
         bb13():
           v52:CUInt64 = LoadField v12, :RBASIC_KLASS@0x10e8
-          v53:CUInt64 = LoadField v47, :klass_cache@0x10e9
+          v53:CUInt64 = LoadKlassCacheEntry v47, v52
           v54:CBool = IsBitEqual v52, v53
           CondBranch v54, bb9(), bb12()
         bb12():
-          v56:RubyValue = CCall v12, :rb_zjit_cached_cme@0x10ea, v46, v47, v48, v49, v50
+          v56:RubyValue = CCall v12, :rb_zjit_cached_cme@0x10e9, v46, v47, v48, v49, v50
           v57:CBool = IsBitEqual v56, v49
           CondBranch v57, bb9(), bb10()
         bb9():
@@ -22651,11 +22651,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb13(), bb12()
         bb13():
           v49:CUInt64 = LoadField v10, :RBASIC_KLASS@0x10e0
-          v50:CUInt64 = LoadField v44, :klass_cache@0x10e1
+          v50:CUInt64 = LoadKlassCacheEntry v44, v49
           v51:CBool = IsBitEqual v49, v50
           CondBranch v51, bb9(), bb12()
         bb12():
-          v53:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10e2, v43, v44, v45, v46, v47
+          v53:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10e1, v43, v44, v45, v46, v47
           v54:CBool = IsBitEqual v53, v46
           CondBranch v54, bb9(), bb10()
         bb9():
@@ -23155,11 +23155,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb13(), bb12()
         bb13():
           v56:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1068
-          v57:CUInt64 = LoadField v51, :klass_cache@0x1069
+          v57:CUInt64 = LoadKlassCacheEntry v51, v56
           v58:CBool = IsBitEqual v56, v57
           CondBranch v58, bb9(), bb12()
         bb12():
-          v60:RubyValue = CCall v10, :rb_zjit_cached_cme@0x106a, v50, v51, v52, v53, v54
+          v60:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1069, v50, v51, v52, v53, v54
           v61:CBool = IsBitEqual v60, v53
           CondBranch v61, bb9(), bb10()
         bb9():
@@ -26208,11 +26208,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb13(), bb12()
         bb13():
           v49:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v50:CUInt64 = LoadField v44, :klass_cache@0x1061
+          v50:CUInt64 = LoadKlassCacheEntry v44, v49
           v51:CBool = IsBitEqual v49, v50
           CondBranch v51, bb9(), bb12()
         bb12():
-          v53:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v43, v44, v45, v46, v47
+          v53:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v43, v44, v45, v46, v47
           v54:CBool = IsBitEqual v53, v46
           CondBranch v54, bb9(), bb10()
         bb9():
@@ -26387,11 +26387,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb15(), bb14()
         bb15():
           v50:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v51:CUInt64 = LoadField v45, :klass_cache@0x1061
+          v51:CUInt64 = LoadKlassCacheEntry v45, v50
           v52:CBool = IsBitEqual v50, v51
           CondBranch v52, bb11(), bb14()
         bb14():
-          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v44, v45, v46, v47, v48
+          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v44, v45, v46, v47, v48
           v55:CBool = IsBitEqual v54, v47
           CondBranch v55, bb11(), bb12()
         bb11():
@@ -26461,11 +26461,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb15(), bb14()
         bb15():
           v50:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v51:CUInt64 = LoadField v45, :klass_cache@0x1061
+          v51:CUInt64 = LoadKlassCacheEntry v45, v50
           v52:CBool = IsBitEqual v50, v51
           CondBranch v52, bb11(), bb14()
         bb14():
-          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v44, v45, v46, v47, v48
+          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v44, v45, v46, v47, v48
           v55:CBool = IsBitEqual v54, v47
           CondBranch v55, bb11(), bb12()
         bb11():
@@ -26535,11 +26535,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb15(), bb14()
         bb15():
           v48:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1058
-          v49:CUInt64 = LoadField v43, :klass_cache@0x1059
+          v49:CUInt64 = LoadKlassCacheEntry v43, v48
           v50:CBool = IsBitEqual v48, v49
           CondBranch v50, bb11(), bb14()
         bb14():
-          v52:RubyValue = CCall v10, :rb_zjit_cached_cme@0x105a, v42, v43, v44, v45, v46
+          v52:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1059, v42, v43, v44, v45, v46
           v53:CBool = IsBitEqual v52, v45
           CondBranch v53, bb11(), bb12()
         bb11():
@@ -26610,11 +26610,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb13(), bb12()
         bb13():
           v50:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1060
-          v51:CUInt64 = LoadField v45, :klass_cache@0x1061
+          v51:CUInt64 = LoadKlassCacheEntry v45, v50
           v52:CBool = IsBitEqual v50, v51
           CondBranch v52, bb9(), bb12()
         bb12():
-          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1062, v44, v45, v46, v47, v48
+          v54:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1061, v44, v45, v46, v47, v48
           v55:CBool = IsBitEqual v54, v47
           CondBranch v55, bb9(), bb10()
         bb9():
@@ -26713,11 +26713,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb8(), bb7()
         bb8():
           v30:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1058
-          v31:CUInt64 = LoadField v25, :klass_cache@0x1059
+          v31:CUInt64 = LoadKlassCacheEntry v25, v30
           v32:CBool = IsBitEqual v30, v31
           CondBranch v32, bb4(), bb7()
         bb7():
-          v34:RubyValue = CCall v10, :rb_zjit_cached_cme@0x105a, v24, v25, v26, v27, v28
+          v34:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1059, v24, v25, v26, v27, v28
           v35:CBool = IsBitEqual v34, v27
           CondBranch v35, bb4(), bb5()
         bb4():
@@ -26832,11 +26832,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb11(), bb10()
         bb11():
           v40:CUInt64 = LoadField v10, :RBASIC_KLASS@0x1058
-          v41:CUInt64 = LoadField v35, :klass_cache@0x1059
+          v41:CUInt64 = LoadKlassCacheEntry v35, v40
           v42:CBool = IsBitEqual v40, v41
           CondBranch v42, bb7(), bb10()
         bb10():
-          v44:RubyValue = CCall v10, :rb_zjit_cached_cme@0x105a, v34, v35, v36, v37, v38
+          v44:RubyValue = CCall v10, :rb_zjit_cached_cme@0x1059, v34, v35, v36, v37, v38
           v45:CBool = IsBitEqual v44, v37
           CondBranch v45, bb7(), bb8()
         bb7():
@@ -28697,11 +28697,11 @@ mod hir_opt_tests {
           CondBranchHasType v12, HeapBasicObject, bb14(), bb13()
         bb14():
           v54:CUInt64 = LoadField v12, :RBASIC_KLASS@0x1060
-          v55:CUInt64 = LoadField v49, :klass_cache@0x1061
+          v55:CUInt64 = LoadKlassCacheEntry v49, v54
           v56:CBool = IsBitEqual v54, v55
           CondBranch v56, bb10(), bb13()
         bb13():
-          v58:RubyValue = CCall v12, :rb_zjit_cached_cme@0x1062, v48, v49, v50, v51, v52
+          v58:RubyValue = CCall v12, :rb_zjit_cached_cme@0x1061, v48, v49, v50, v51, v52
           v59:CBool = IsBitEqual v58, v51
           CondBranch v59, bb10(), bb11()
         bb10():
@@ -31273,11 +31273,11 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb15(), bb14()
         bb15():
           v59:CUInt64 = LoadField v10, :RBASIC_KLASS@0x10a8
-          v60:CUInt64 = LoadField v54, :klass_cache@0x10a9
+          v60:CUInt64 = LoadKlassCacheEntry v54, v59
           v61:CBool = IsBitEqual v59, v60
           CondBranch v61, bb11(), bb14()
         bb14():
-          v63:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10aa, v53, v54, v55, v56, v57
+          v63:RubyValue = CCall v10, :rb_zjit_cached_cme@0x10a9, v53, v54, v55, v56, v57
           v64:CBool = IsBitEqual v63, v56
           CondBranch v64, bb11(), bb12()
         bb11():
@@ -31392,7 +31392,7 @@ mod hir_opt_tests {
           CondBranchHasType v10, HeapBasicObject, bb15(), bb14()
         bb15():
           v64:CUInt64 = LoadField v10, :RBASIC_KLASS@0x10b0
-          v65:CUInt64 = LoadField v59, :klass_cache@0x1081
+          v65:CUInt64 = LoadKlassCacheEntry v59, v64
           v66:CBool = IsBitEqual v64, v65
           CondBranch v66, bb11(), bb14()
         bb14():
