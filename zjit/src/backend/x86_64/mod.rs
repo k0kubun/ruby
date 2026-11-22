@@ -758,6 +758,17 @@ impl Assembler {
             }
         }
 
+        /// Emit a mov unless it's a 64-bit one from a register to itself, which does nothing.
+        /// Splitting loads the input of an instruction that writes its operand in place, e.g. a
+        /// shift, into the output, and the register allocator may give both the same register.
+        /// A 32-bit mov zero-extends the upper bits, so it's emitted.
+        fn emit_mov_unless_same_reg(cb: &mut CodeBlock, dest: Opnd, src: Opnd) {
+            if let (Opnd::Reg(dest_reg), Opnd::Reg(src_reg)) = (dest, src) && dest_reg == src_reg && dest_reg.num_bits == 64 {
+                return;
+            }
+            mov(cb, dest.into(), src.into());
+        }
+
         fn emit_load_gc_value(cb: &mut CodeBlock, gc_offsets: &mut Vec<CodePtr>, dest_reg: X86Opnd, value: VALUE) {
             // Using movabs because mov might write value in 32 bits
             movabs(cb, dest_reg, value.0 as _);
@@ -904,7 +915,7 @@ impl Assembler {
                         Opnd::Value(val) if val.heap_object_p() => {
                             emit_load_gc_value(cb, &mut gc_offsets, out.into(), *val);
                         }
-                        _ => mov(cb, out.into(), opnd.into())
+                        _ => emit_mov_unless_same_reg(cb, *out, *opnd)
                     }
                 },
 
@@ -912,9 +923,11 @@ impl Assembler {
                     movsx(cb, out.into(), opnd.into());
                 },
 
-                Insn::Store { dest, src } |
-                Insn::Mov { dest, src } => {
+                Insn::Store { dest, src } => {
                     mov(cb, dest.into(), src.into());
+                },
+                Insn::Mov { dest, src } => {
+                    emit_mov_unless_same_reg(cb, *dest, *src);
                 },
 
                 // Load effective address
@@ -1631,10 +1644,9 @@ mod tests {
 
         assert_disasm_snapshot!(cb.disasm(), @"
         0x0: mov rdi, qword ptr [rbx]
-        0x3: mov rdi, rdi
-        0x6: bswap rdi
+        0x3: bswap rdi
         ");
-        assert_snapshot!(cb.hexdump(), @"488b3b4889ff480fcf");
+        assert_snapshot!(cb.hexdump(), @"488b3b480fcf");
     }
 
     #[test]
@@ -2345,6 +2357,26 @@ mod tests {
             0x6: mov dword ptr [rax], 0x80000001
         ");
         assert_snapshot!(cb.hexdump(), @"c70001000080c70001000080");
+    }
+
+    #[test]
+    fn test_no_mov_reg_to_itself() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // The shift reads and writes the register allocated for both its input and output,
+        // so the mov that copies the input to the output isn't needed.
+        let len = asm.and(Opnd::mem(64, C_ARG_OPNDS[0], 0), Opnd::UImm(0x3f8000));
+        let len = asm.rshift(len, Opnd::UImm(0xf));
+        asm.mov(C_RET_OPND, len);
+
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov rdi, qword ptr [rdi]
+        0x3: and rdi, 0x3f8000
+        0xa: sar rdi, 0xf
+        0xe: mov rax, rdi
+        ");
     }
 
     #[test]
