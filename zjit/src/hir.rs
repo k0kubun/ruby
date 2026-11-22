@@ -6756,22 +6756,28 @@ impl Function {
                                     let guarded = self.guard_type_recompile(block, block_arg, types::StaticSymbol, state, Recompile);
                                     let symbol_class = unsafe { rb_cSymbol };
                                     self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass: symbol_class, method: ID!(to_proc), cme: to_proc_cme }, state });
-                                    let refined = self.push_insn(block, Insn::CCall {
-                                        cfunc: rb_vm_symbol_block_arg_refined_p as *const u8,
-                                        recv: guarded,
-                                        args: vec![],
-                                        name: ID!(rb_vm_symbol_block_arg_refined_p),
-                                        owner: Qnil,
-                                        return_type: types::CInt64,
-                                        elidable: false,
-                                    });
-                                    self.push_insn(block, Insn::GuardBitEquals {
-                                        val: refined,
-                                        expected: Const::CInt64(0),
-                                        reason: Box::new(SideExitReason::SymbolBlockArgRefined),
-                                        state,
-                                        recompile: None,
-                                    });
+                                    // An inlined method frame runs with the cref of its method entry, which
+                                    // frame_may_have_refinements() checked. `using` duplicates the cref it
+                                    // activates refinements in, so that cref never gets any. Check at run time
+                                    // in case the ISEQ of this function runs with another cref.
+                                    if self.frame_state_ref(state).caller().is_none() {
+                                        let refined = self.push_insn(block, Insn::CCall {
+                                            cfunc: rb_vm_symbol_block_arg_refined_p as *const u8,
+                                            recv: guarded,
+                                            args: vec![],
+                                            name: ID!(rb_vm_symbol_block_arg_refined_p),
+                                            owner: Qnil,
+                                            return_type: types::CInt64,
+                                            elidable: false,
+                                        });
+                                        self.push_insn(block, Insn::GuardBitEquals {
+                                            val: refined,
+                                            expected: Const::CInt64(0),
+                                            reason: Box::new(SideExitReason::SymbolBlockArgRefined),
+                                            state,
+                                            recompile: None,
+                                        });
+                                    }
                                     _ = args.pop();
                                     send_block = Some(BlockHandler::BlockArgSymbol(guarded));
                                     stripped_block_arg = true;
