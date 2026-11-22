@@ -9286,6 +9286,26 @@ fn test_send_on_method_entry_cached_classes() {
 }
 
 #[test]
+fn test_send_on_method_entry_more_classes_than_cached() {
+    // More receiver classes than the cache holds: classes that collide on their cache entry or
+    // don't fit call rb_zjit_cached_cme(), and a redefinition or a compaction is still handled.
+    assert_snapshot!(inspect("
+        class Base
+          def foo = 1
+        end
+        CLASSES = 40.times.map { Class.new(Base) }
+        OBJECTS = CLASSES.map(&:new)
+        def test(o) = o.foo
+        test(OBJECTS[0]); test(OBJECTS[1])
+        r = 3.times.map { OBJECTS.sum { test(it) } }
+        CLASSES[20].class_eval { def foo = 2 }
+        r << OBJECTS.sum { test(it) }
+        GC.verify_compaction_references(expand_heap: true, toward: :empty) rescue nil
+        r << 2.times.map { OBJECTS.sum { test(it) } }
+    "), @"[40, 40, 40, 41, [41, 41]]");
+}
+
+#[test]
 fn test_array_new_with_block() {
     assert_snapshot!(inspect("
         class SubArray < Array; end
