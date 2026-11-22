@@ -7717,6 +7717,30 @@ impl Function {
         Some(InlinedBlockThrowTargets { block_pop, break_target, return_target })
     }
 
+    /// Return true if the block `block_iseq`, about to be inlined at the `yield` suspended at
+    /// `yield_state`, yields to a literal block of an inlined method frame that may `break` or
+    /// `return`. Inlining it lets the inliner inline that block next, whose throw then becomes a
+    /// jump, e.g. for `return` in `recognize(req) { |route| return route.app.serve(req) }` where
+    /// `def recognize(req) = routes.each { |r| yield r }`.
+    fn yields_to_throwing_block(&self, block_iseq: IseqPtr, yield_state: &FrameState) -> bool {
+        if !crate::codegen::iseq_may_yield(block_iseq) {
+            return false;
+        }
+        // The block's `yield` goes to the block of the block's local method frame, which is the
+        // home frame of the block: the frame that passed it to the yielder of this `yield`.
+        let Some(yielder_state) = self.inlined_local_frame_state(yield_state, None) else { return false };
+        let Some(yielder) = yielder_state.caller().and_then(|caller| self.inline_frames.get(&caller)) else { return false };
+        if yielder.iseq != yielder_state.iseq || yielder.blockiseq != Some(block_iseq) {
+            return false;
+        }
+        let home_state = self.frame_state(yielder.pop.state);
+        if unsafe { rb_get_iseq_body_type(home_state.iseq) } != ISEQ_TYPE_METHOD {
+            return false;
+        }
+        home_state.caller().and_then(|caller| self.inline_frames.get(&caller))
+            .is_some_and(|home| home.iseq == home_state.iseq && home.blockiseq.is_some_and(crate::codegen::block_iseq_may_throw))
+    }
+
     /// Inline the block body of the [`Insn::InvokeBlockIseqDirect`] at `pos` in `block`.
     /// Like the method inliner, this splits `block` at the call: the pre-call instructions
     /// stay in `block`, which pushes a block frame and jumps to the inlined block body, and
@@ -7734,9 +7758,11 @@ impl Function {
         let throw_targets = self.inlined_block_throw_targets(block_pop, &call_state);
 
         // Inlining a block whose `break` or `return` can become a jump saves an expensive
-        // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
-        // This is bounded by the number of literal blocks in the inlined methods' callers.
-        let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
+        // `throw` and interpreter re-entry, so skip the size and budget heuristics for it, and
+        // for a block that yields to such a block. This is bounded by the number of literal
+        // blocks in the inlined methods' callers.
+        let throw_inlinable = (throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq))
+            || self.yields_to_throwing_block(iseq, &call_state);
         if !self.should_inline(iseq, ptr::null(), throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
             return None;
         }
