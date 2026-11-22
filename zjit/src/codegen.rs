@@ -2204,6 +2204,7 @@ fn gen_push_inline_frame(
     exit_state: &FrameState,
     block: Option<lir::BlockHandler>,
 ) {
+    gen_incr_counter(asm, Counter::inline_frame_push_count);
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, exit_state, stack_growth);
@@ -2314,6 +2315,7 @@ fn gen_push_inline_block_frame(
     num_args: u16,
     state: &FrameState,
 ) {
+    gen_incr_counter(asm, Counter::inline_frame_push_count);
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, state, stack_growth);
