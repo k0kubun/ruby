@@ -14773,6 +14773,26 @@ fn test_getivar_shape_chain_falls_back_instead_of_exiting() {
 }
 
 #[test]
+fn test_getivar_of_many_classes() {
+    // Class instance variables read by a site whose receivers are many classes take the
+    // (shape, name) cache. Unset ones, defined?, a later write and a compaction are handled.
+    assert_snapshot!(inspect("
+        class Base
+          def self.cfg = @cfg
+          def self.cfg_defined = defined?(@cfg)
+          def self.set(v) = (@cfg = v)
+        end
+        C = 20.times.map { |i| k = Class.new(Base); k.set(i) if i.even?; k }
+        module M; @x = :m; def self.x = @x; end
+        def run = [C.map(&:cfg).compact.sum, C.map(&:cfg_defined).compact.size, M.x]
+        r = 5.times.map { run }
+        GC.verify_compaction_references(expand_heap: true, toward: :empty) rescue nil
+        C[1].set(100)
+        r << run
+    "), @"[[90, 10, :m], [90, 10, :m], [90, 10, :m], [90, 10, :m], [90, 10, :m], [190, 11, :m]]");
+}
+
+#[test]
 fn test_getivar_shape_chain_miss_takes_the_fallback_arm() {
     crate::options::enable_zjit_stats();
     set_call_threshold(6);
