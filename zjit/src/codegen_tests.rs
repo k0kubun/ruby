@@ -112,6 +112,7 @@ fn test_breakpoint_hir_codegen() {
         function.num_insns(),
         function.num_blocks(),
         0,
+        0,
     );
     let mut asm = Assembler::new();
     asm.new_block_without_id("test");
@@ -11876,6 +11877,25 @@ fn test_stack_overflow() {
         rescue SystemStackError
         end
     "), @"nil");
+}
+
+#[test]
+fn test_stack_overflow_in_nested_inline_frames() {
+    // Only the outermost inlined frame push checks for stack overflow, for all the inlined
+    // frames. Near the limit, it exits to the interpreter, which raises only when they don't fit.
+    let result = with_inlining(|| assert_inlines_allowing_exits("
+        def so_leaf(n) = n.zero? ? 0 : so_recurse(n - 1)
+        def so_middle(n) = so_leaf(n)
+        def so_recurse(n) = so_middle(n) + 1
+        so_recurse(2); so_recurse(2); so_recurse(2)
+        depth = 0
+        begin
+          depth = so_recurse(depth + 100) while true
+        rescue SystemStackError
+        end
+        [so_recurse(depth) == depth + 1, depth > 1000]
+    "));
+    assert_snapshot!(result, @"[true, true]");
 }
 
 #[test]
