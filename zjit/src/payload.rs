@@ -110,8 +110,25 @@ impl IseqPayload {
     /// window is recompiled once with full inlining.
     pub fn is_lukewarm(&self) -> bool {
         let gc_count = get_option!(lukewarm_gc_count);
-        gc_count > 0 && !self.hot_loop && !self.tiered_up
-            && unsafe { rb_gc_count() }.wrapping_sub(self.profile_start_gc_count) >= gc_count
+        gc_count > 0 && self.profile_gc_span() >= Some(gc_count)
+    }
+
+    /// Whether the ISEQ about to be compiled is warm: a GC ran during its profiling window, so it
+    /// isn't called nearly as often as the ISEQs whose windows fit between two GCs. Most of the
+    /// compile time is spent in ISEQs called less than a few thousand times, where inlining
+    /// pays back less than its compile time, so warm ISEQs get half the inline budget.
+    /// Disabled along with [`Self::is_lukewarm`].
+    pub fn is_warm(&self) -> bool {
+        get_option!(lukewarm_gc_count) > 0 && self.profile_gc_span() >= Some(1)
+    }
+
+    /// The number of GCs since the profiling window of the ISEQ started, or None if the
+    /// ISEQ's hotness is not judged by it: loops made it hot, or it tiered up from lukewarm.
+    fn profile_gc_span(&self) -> Option<usize> {
+        if self.hot_loop || self.tiered_up {
+            return None;
+        }
+        Some(unsafe { rb_gc_count() }.wrapping_sub(self.profile_start_gc_count))
     }
 
     /// Every JIT code version of the ISEQ, including the ones for resume entries.
