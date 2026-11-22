@@ -2196,10 +2196,24 @@ rb_vm_invoke_proc_with_self(rb_execution_context_t *ec, rb_proc_t *proc, VALUE s
 
 /* special variable */
 
+// Return true if CFP_PC(cfp) and CFP_ISEQ(cfp) are both non-NULL
+static inline bool
+vm_cfp_has_pc_and_iseq_p(const rb_control_frame_t *cfp)
+{
+#if USE_ZJIT
+    // Only ISEQ frames have their own JITFrame, which always has a PC and an ISEQ. Checking
+    // that skips loading the JITFrame, which is often a cache miss.
+    if (CFP_ZJIT_FRAME_P(cfp)) {
+        return (VALUE)cfp->jit_return != ZJIT_JIT_RETURN_C_FRAME;
+    }
+#endif
+    return cfp->pc && cfp->_iseq;
+}
+
 VALUE *
 rb_vm_svar_lep(const rb_execution_context_t *ec, const rb_control_frame_t *cfp)
 {
-    while (!CFP_PC(cfp) || !CFP_ISEQ(cfp)) {
+    while (!vm_cfp_has_pc_and_iseq_p(cfp)) {
         if (VM_FRAME_TYPE(cfp) == VM_FRAME_MAGIC_IFUNC) {
             struct vm_ifunc *ifunc = (struct vm_ifunc *)CFP_ISEQ(cfp);
             return ifunc->svar_lep;
