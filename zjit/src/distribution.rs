@@ -49,6 +49,11 @@ impl<T: Copy + PartialEq + Default, const N: usize> Distribution<T, N> {
         }
     }
 
+    /// The number of observed items, including the ones that didn't fit in the buckets
+    pub fn num_samples(&self) -> usize {
+        self.counts.iter().map(|&c| c as usize).sum::<usize>() + self.other as usize
+    }
+
     pub fn each_item(&self) -> impl Iterator<Item = T> + '_ {
         self.buckets.iter().zip(self.counts.iter())
             .filter_map(|(&bucket, &count)| if count > 0 { Some(bucket) } else { None })
