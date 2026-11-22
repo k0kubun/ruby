@@ -74,11 +74,15 @@ struct JITState {
     /// HIR instruction of the Float. Only reused within the same HIR block, where the
     /// definition dominates every later instruction.
     raw_doubles: HashMap<InsnId, (BlockId, Opnd)>,
+
+    /// Bytes above the top-level SP that the stack overflow check of an outermost inlined frame
+    /// push needs to cover every inlined frame push of the function. See inline_frames_stack_peak().
+    inline_frames_stack_peak: usize,
 }
 
 impl JITState {
     /// Create a new JITState instance
-    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, jit_frame_size: usize) -> Self {
+    fn new(version: IseqVersionRef, num_insns: usize, num_blocks: usize, jit_frame_size: usize, inline_frames_stack_peak: usize) -> Self {
         JITState {
             version,
             opnds: vec![None; num_insns],
@@ -87,6 +91,7 @@ impl JITState {
             iseq_calls: Vec::default(),
             jit_frame_size,
             raw_doubles: HashMap::default(),
+            inline_frames_stack_peak,
         }
     }
 
@@ -591,7 +596,7 @@ fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, 
         // One more slot below those holds the saved SP register that stack maps
         // are anchored on (see base_ptr_slot_offset()).
         let jit_frame_size = function.inlining_depth() + 2;
-        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), jit_frame_size);
+        let mut jit = JITState::new(version, function.num_insns(), function.num_blocks(), jit_frame_size, inline_frames_stack_peak(function));
         let mut asm = Assembler::new_with_stack_slots(jit_frame_size);
 
         // Mapping from HIR block IDs to LIR block IDs.
@@ -2146,9 +2151,8 @@ fn gen_push_inline_frame(
     block: Option<lir::BlockHandler>,
 ) {
     gen_incr_counter(asm, Counter::inline_frame_push_count);
+    gen_inline_frame_stack_overflow_check(jit, asm, function, state, exit_state);
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
-    let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
-    gen_stack_overflow_check(jit, asm, function, exit_state, stack_growth);
 
     // Save cfp->pc and cfp->sp for the caller frame.
     // Cannot use gen_prepare_non_leaf_call because we need special SP math.
@@ -2257,9 +2261,8 @@ fn gen_push_inline_block_frame(
     state: &FrameState,
 ) {
     gen_incr_counter(asm, Counter::inline_frame_push_count);
+    gen_inline_frame_stack_overflow_check(jit, asm, function, state, state);
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
-    let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
-    gen_stack_overflow_check(jit, asm, function, state, stack_growth);
 
     // Save cfp->pc and cfp->sp for the caller frame. The block's arguments are
     // the top `num_args` stack slots and become the block's leading locals.
@@ -4598,15 +4601,63 @@ fn gen_push_frame(asm: &mut Assembler, argc: usize, state: &FrameState, frame: C
 
 /// Stack overflow check: fails if CFP<=SP at any point in the callee.
 fn gen_stack_overflow_check(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState, stack_growth: usize) {
-    asm_comment!(asm, "stack overflow check");
+    gen_stack_overflow_check_at(jit, asm, function, state, stack_overflow_check_peak(stack_growth));
+}
+
+/// The offset from SP that gen_stack_overflow_check() compares CFP with.
+fn stack_overflow_check_peak(stack_growth: usize) -> usize {
     // vm_push_frame() checks it against a decremented cfp, and CHECK_VM_STACK_OVERFLOW0
     // adds to the margin another control frame with `&bounds[1]`.
     const { assert!(RUBY_SIZEOF_CONTROL_FRAME % SIZEOF_VALUE == 0, "sizeof(rb_control_frame_t) is a multiple of sizeof(VALUE)"); }
     let cfp_growth = 2 * (RUBY_SIZEOF_CONTROL_FRAME / SIZEOF_VALUE);
-    let peak_offset = (cfp_growth + stack_growth) * SIZEOF_VALUE;
+    (cfp_growth + stack_growth) * SIZEOF_VALUE
+}
+
+/// Side-exit if CFP <= SP + peak_offset.
+fn gen_stack_overflow_check_at(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState, peak_offset: usize) {
+    asm_comment!(asm, "stack overflow check");
     let stack_limit = asm.lea(Opnd::mem(64, SP, peak_offset as i32));
     asm.cmp(CFP, stack_limit);
     asm.jbe(jit, side_exit(jit, function, state, StackOverflow));
+}
+
+/// The stack overflow check of an inlined frame push from the frame state `state`. A nested push
+/// can only run after the outermost push of its frame chain, while SP and CFP are still the
+/// function's own, so the outermost pushes check for every push of the function instead and
+/// nested pushes don't check. A failed check exits by re-executing the outermost call, and the
+/// interpreter raises SystemStackError only if the frames really don't fit.
+fn gen_inline_frame_stack_overflow_check(jit: &mut JITState, asm: &mut Assembler, function: &Function, state: &FrameState, exit_state: &FrameState) {
+    if state.depth == 0 {
+        gen_stack_overflow_check_at(jit, asm, function, exit_state, jit.inline_frames_stack_peak);
+    }
+}
+
+/// The largest offset from the function's own SP that the stack overflow checks of its inlined
+/// frame pushes compare its own CFP with. A push from a frame at depth `d` compares CFP - d frames
+/// with SP + the sizes of the d frames below it + its own peak.
+fn inline_frames_stack_peak(function: &Function) -> usize {
+    let mut max_peak = 0;
+    for block_id in function.reverse_post_order() {
+        for &insn_id in function.block(block_id).insns() {
+            let (iseq, state) = match function.find_ref(insn_id) {
+                &Insn::PushInlineFrame { iseq, state, .. } | &Insn::PushInlineBlockFrame { iseq, state, .. } => (iseq, state),
+                _ => continue,
+            };
+            let mut state = function.frame_state_ref(state);
+            let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize();
+            let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
+            let mut peak = stack_overflow_check_peak(stack_growth) + state.depth * RUBY_SIZEOF_CONTROL_FRAME;
+            // Add the SP offset of each inlined frame below, like gen_push_inline_frame() does.
+            while let Some(caller) = state.caller() {
+                let caller_state = function.frame_state_ref(caller);
+                let local_size = unsafe { get_iseq_body_local_table_size(state.iseq) }.to_usize();
+                peak += (caller_state.stack_size() + usize::from(inlined_frame_has_receiver(caller_state)) + local_size + VM_ENV_DATA_SIZE.to_usize()) * SIZEOF_VALUE;
+                state = caller_state;
+            }
+            max_peak = max_peak.max(peak);
+        }
+    }
+    max_peak
 }
 
 /// Convert ISEQ into High-level IR
