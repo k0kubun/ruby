@@ -4785,6 +4785,9 @@ fn compile_iseq_with_resume(iseq: IseqPtr, resume: Option<(u16, u8)>) -> Result<
     if resume.is_none() {
         let payload = get_or_create_iseq_payload(iseq);
         // Lukewarm code counts down executions until it tiers up. See exit_recompile().
+        if function.is_warm() {
+            incr_counter!(compiled_warm_iseq_count);
+        }
         payload.tier_up_counter = if function.is_lukewarm() {
             incr_counter!(compiled_lukewarm_iseq_count);
             get_option!(lukewarm_tier_up_threshold).into()
