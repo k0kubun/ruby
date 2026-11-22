@@ -2768,17 +2768,17 @@ mod hir_opt_tests {
           PatchPoint NoSingletonClass(C@0x1008)
           PatchPoint MethodRedefined(C@0x1008, fun_new_map@0x1010, cme:0x1018)
           v25:ArraySubclass[class_exact:C] = GuardType v10, ArraySubclass[class_exact:C] recompile
-          v160:NilClass = Const Value(nil)
-          v161:NilClass = Const Value(nil)
+          v157:NilClass = Const Value(nil)
+          v158:NilClass = Const Value(nil)
           PushInlineFrame :fun_new_map, v25 (0x1040), num_args=0, block=0x1060
           v67:Fixnum[0] = Const Value(0)
           v71:CPtr = LoadSP
           StoreField v71, :i@0x1080, v67
-          StoreField v71, :result@0x1081, v160
-          StoreField v71, :value@0x1000, v161
+          StoreField v71, :result@0x1081, v157
+          StoreField v71, :value@0x1000, v158
           v76:BasicObject = InvokeBuiltin ary_sized_alloc, v25
           PatchPoint NoEPEscape(map)
-          Jump bb10(v67, v161)
+          Jump bb10(v67, v158)
         bb10(v93:Fixnum, v95:BasicObject):
           v99:CInt64 = ArrayLength v25
           v100:Fixnum = BoxFixnum v99
@@ -2793,15 +2793,12 @@ mod hir_opt_tests {
         bb9():
           v126:CInt64 = UnboxFixnum v93
           v127:BasicObject = ArrayAref v25, v126
-          v141:CPtr = LoadSP
-          StoreField v141, :i@0x1080, v93
-          StoreField v141, :result@0x1081, v76
-          StoreField v141, :value@0x1000, v127
-          v146:BasicObject = InvokeBuiltin rb_jit_ary_push, v25, v76, v127
+          v141:Array = RefineType v76, Array
+          ArrayPush v141, v127
           PatchPoint NoEPEscape(map)
-          v153:Fixnum[1] = Const Value(1)
-          v154:Fixnum = FixnumAdd v93, v153
-          Jump bb10(v154, v127)
+          v150:Fixnum[1] = Const Value(1)
+          v151:Fixnum = FixnumAdd v93, v150
+          Jump bb10(v151, v127)
         ");
     }
 
@@ -14221,17 +14218,17 @@ mod hir_opt_tests {
           v11:ArrayExact = ArrayDup v10
           PatchPoint NoSingletonClass(Array@0x1008)
           PatchPoint MethodRedefined(Array@0x1008, map@0x1010, cme:0x1018)
-          v156:NilClass = Const Value(nil)
-          v157:NilClass = Const Value(nil)
+          v153:NilClass = Const Value(nil)
+          v154:NilClass = Const Value(nil)
           PushInlineFrame :map, v11 (0x1040), num_args=0, block=0x1060
           v63:Fixnum[0] = Const Value(0)
           v67:CPtr = LoadSP
           StoreField v67, :i@0x1080, v63
-          StoreField v67, :result@0x1081, v156
-          StoreField v67, :value@0x1082, v157
+          StoreField v67, :result@0x1081, v153
+          StoreField v67, :value@0x1082, v154
           v72:BasicObject = InvokeBuiltin ary_sized_alloc, v11
           PatchPoint NoEPEscape(map)
-          Jump bb10(v63, v157)
+          Jump bb10(v63, v154)
         bb10(v89:Fixnum, v91:NilClass|Fixnum):
           v95:CInt64 = ArrayLength v11
           v96:Fixnum = BoxFixnum v95
@@ -14249,22 +14246,19 @@ mod hir_opt_tests {
           v128:CInt64 = LoadField v127, :VM_ENV_DATA_INDEX_SPECVAL@0x1083
           v129:CInt64[-4] = Const CInt64(-4)
           v130:CInt64 = IntAnd v128, v129
-          v176:BasicObject = LoadField v130, :captured_self@0x1084
-          PushInlineBlockFrame v176, v130 (0x1060), num_args=1
-          v169:Fixnum[2] = Const Value(2)
+          v173:BasicObject = LoadField v130, :captured_self@0x1084
+          PushInlineBlockFrame v173, v130 (0x1060), num_args=1
+          v166:Fixnum[2] = Const Value(2)
           PatchPoint MethodRedefined(Integer@0x1088, *@0x1090, cme:0x1098)
-          v184:Fixnum = GuardType v123, Fixnum recompile
-          v185:Fixnum = FixnumMult v184, v169
+          v181:Fixnum = GuardType v123, Fixnum recompile
+          v182:Fixnum = FixnumMult v181, v166
           PopInlineFrame
-          v137:CPtr = LoadSP
-          StoreField v137, :i@0x1080, v89
-          StoreField v137, :result@0x1081, v72
-          StoreField v137, :value@0x1082, v185
-          v142:BasicObject = InvokeBuiltin rb_jit_ary_push, v11, v72, v185
+          v137:Array = RefineType v72, Array
+          ArrayPush v137, v182
           PatchPoint NoEPEscape(map)
-          v149:Fixnum[1] = Const Value(1)
-          v150:Fixnum = FixnumAdd v89, v149
-          Jump bb10(v150, v185)
+          v146:Fixnum[1] = Const Value(1)
+          v147:Fixnum = FixnumAdd v89, v146
+          Jump bb10(v147, v182)
         ");
     }
 
@@ -14464,14 +14458,14 @@ mod hir_opt_tests {
           v60:NilClass = GuardBitEquals v16, Value(nil) recompile
           PatchPoint NoSingletonClass(Array@0x1010)
           PatchPoint MethodRedefined(Array@0x1010, map@0x1018, cme:0x1020)
-          v205:NilClass = Const Value(nil)
-          v206:NilClass = Const Value(nil)
-          v207:NilClass = Const Value(nil)
+          v202:NilClass = Const Value(nil)
+          v203:NilClass = Const Value(nil)
+          v204:NilClass = Const Value(nil)
           PushInlineFrame :map, v14 (0x1048), num_args=0
           v90:CPtr = LoadSP
-          StoreField v90, :i@0x1068, v205
-          StoreField v90, :result@0x1069, v206
-          StoreField v90, :value@0x1000, v207
+          StoreField v90, :i@0x1068, v202
+          StoreField v90, :result@0x1069, v203
+          StoreField v90, :value@0x1000, v204
           v95:BasicObject = InvokeBuiltin <inline_expr>, v14
           PatchPoint NoEPEscape(map)
           PopInlineFrame
