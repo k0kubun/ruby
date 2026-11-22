@@ -3133,6 +3133,109 @@ fn test_ccall_catching_return_with_trace_point() {
     "), @"[2, [[:c_return, :+], [:b_return, :call!], [:c_return, :catch], [:return, :call!], [:return, :run], [:b_return, nil]]]");
 }
 
+#[test]
+fn test_send_catches_return_from_block() {
+    // Like Journey::Router#serve: a non-local `return` from the block passed to a method that
+    // isn't inlined returns from serve without unwinding the JIT code of its callers.
+    set_call_threshold(2);
+    set_inline_threshold(0); // Keep the callee a separate JIT frame
+    let warmup = "
+        def recognize(routes)
+          routes.each do |r|
+            x = r * 2
+            yield x
+          end
+          :not_found
+        end
+        def serve(routes)
+          recognize(routes) { |x| return x + 1 if x > 2 }
+          :none
+        end
+        def call(routes) = [serve(routes), :after]
+        def run = [call([1, 2, 3]), call([1])]
+        30.times { run } # enough to compile resume entries without the catch
+    ";
+    assert_snapshot!(assert_no_resumes(warmup, "run"), @"[[5, :after], [:none, :after]]");
+}
+
+#[test]
+fn test_send_catches_break_from_block() {
+    set_call_threshold(2);
+    set_inline_threshold(0); // Keep the callee a separate JIT frame
+    let warmup = "
+        def each_twice(ary)
+          ary.each { |x| yield x; yield x }
+          :done
+        end
+        def find_value(ary) = [each_twice(ary) { |x| break x * 10 if x == 2 }, :after]
+        def run = [find_value([1, 2]), find_value([1])]
+        30.times { run } # enough to compile resume entries without the catch
+    ";
+    assert_snapshot!(assert_no_resumes(warmup, "run"), @"[[20, :after], [:done, :after]]");
+}
+
+#[test]
+fn test_send_catching_return_runs_callee_ensure() {
+    // The callee's ensure clause runs before the `return` reaches the caller
+    set_call_threshold(2);
+    set_inline_threshold(0); // Keep the callee a separate JIT frame
+    assert_snapshot!(inspect("
+        def with_log(log)
+          yield
+          log << :not_reached
+        ensure
+          log << :callee_ensure
+        end
+        def call!(log)
+          with_log(log) { return log << :return }
+          log << :not_reached
+        end
+        def run = call!([])
+        3.times { run }
+        run
+    "), @"[:return, :callee_ensure]");
+}
+
+#[test]
+fn test_send_catching_return_passes_outer_return_and_raise() {
+    // A `return` from an outer method's frame and an exception from the block go past the call
+    set_call_threshold(2);
+    set_inline_threshold(0); // Keep the callee a separate JIT frame
+    assert_snapshot!(inspect("
+        def yielder = yield
+        def outer(x)
+          [1].each do
+            r = yielder do
+              return :from_outer if x == 1
+              raise 'boom' if x == 2
+              next :next_value
+            end
+            return [r, :after]
+          end
+        end
+        def run = [1, 2, 3].map { |x| outer(x) rescue $!.message }
+        3.times { run }
+        run
+    "), @r#"[:from_outer, "boom", [:next_value, :after]]"#);
+}
+
+#[test]
+fn test_send_catching_return_with_trace_point() {
+    // With a TracePoint enabled, the VM unwinds the frames and fires their return events like the interpreter
+    set_call_threshold(2);
+    set_inline_threshold(0); // Keep the callee a separate JIT frame
+    assert_snapshot!(inspect("
+        def yielder = yield
+        def call!(x) = yielder { return x + 1 }
+        def run = call!(1)
+        3.times { run }
+        events = []
+        tp = TracePoint.new(:return, :b_return) { |tp| events << [tp.event, tp.method_id] }
+        result = tp.enable { run }
+        [result, events]
+    "), @"[2, [[:b_return, :call!], [:return, :yielder], [:return, :call!], [:return, :run], [:b_return, nil]]]");
+}
+
 /// Run `program` after `warmup`, asserting that the warmup turned a non-local `return` into a jump.
 fn assert_return_jumps(warmup: &str, program: &str) -> String {
     ensure_rubyvm(); // ZJITState is not available until the VM is booted

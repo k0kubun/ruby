@@ -932,6 +932,13 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::Snapshot { .. } => return Ok(()), // we don't need to do anything for this instruction at the moment
         &Insn::Send { cd, block: None, state, reason, .. } => gen_send_without_block(jit, asm, function, cd, &function.frame_state(state), reason),
         &Insn::Send { cd, block: Some(BlockHandler::BlockIseq(blockiseq)), state, reason, .. } => gen_send(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
+        // A non-inlined direct send that should catch a throw from its block makes a dynamic send
+        // that catches it instead. See rb_zjit_send_catching_throw().
+        Insn::SendDirect(insn) if matches!(insn.block, Some(BlockHandler::BlockIseq(blockiseq))
+            if send_catches_throw(function, blockiseq, &function.frame_state(insn.exit_state)).is_some()) => {
+            let Some(BlockHandler::BlockIseq(blockiseq)) = insn.block else { unreachable!() };
+            gen_send(jit, asm, function, insn.cd, blockiseq, &function.frame_state(insn.exit_state), SendFallbackReason::SendCatchingThrow)
+        }
         &Insn::Send { cd, block: Some(BlockHandler::BlockArg), state, reason, .. } => gen_send(jit, asm, function, cd, std::ptr::null(), &function.frame_state(state), reason),
         &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_) | BlockHandler::FrameBlock(_)), .. } => unreachable!("BlockArgProc, BlockArgSymbol, and FrameBlock only appear in direct calls"),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
@@ -2110,12 +2117,34 @@ fn gen_send(
     asm_comment!(asm, "call #{} with dynamic dispatch", ruby_call_method_name(cd));
     unsafe extern "C" {
         fn rb_vm_send(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr) -> VALUE;
+        fn rb_zjit_send_catching_throw(ec: EcPtr, cfp: CfpPtr, cd: VALUE, blockiseq: IseqPtr, catch_return: bool) -> VALUE;
+    }
+    if !blockiseq.is_null() && let Some(catch_return) = send_catches_throw(function, blockiseq, state) {
+        return asm_ccall!(
+            asm,
+            rb_zjit_send_catching_throw,
+            EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into(), Opnd::UImm(catch_return.into())
+        );
     }
     asm_ccall!(
         asm,
         rb_vm_send,
         EC, CFP, Opnd::const_ptr(cd), VALUE::from(blockiseq).into()
     )
+}
+
+/// If a `send` with the literal block `blockiseq` should catch a `break` or a non-local `return`
+/// from the block that unwinds to the calling frame, return whether it catches `return`. Like
+/// [`cfunc_call_catches_throw`], but for a send to a method of any type, which takes the dynamic
+/// dispatch of rb_zjit_send_catching_throw(). The code after a `send` that catches `return`
+/// checks if it returned Qundef. See [`Function::catches_return_at`].
+pub fn send_catches_throw(function: &Function, blockiseq: IseqPtr, state: &FrameState) -> Option<bool> {
+    let insn_idx = state.insn_idx() as u32;
+    let pc = unsafe { rb_iseq_pc_at_idx(state.iseq, insn_idx) };
+    if unsafe { rb_iseq_bare_opcode_at_pc(state.iseq, pc) } as u32 != YARVINSN_send {
+        return None;
+    }
+    cfunc_call_catches_throw(function, Some(BlockHandler::BlockIseq(blockiseq)), state)
 }
 
 /// Compile a dynamic dispatch with `...`
