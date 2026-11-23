@@ -15951,3 +15951,81 @@ fn test_invokesuper_with_keywords_to_positional_hash() {
         5.times.flat_map { [o.foo, o.foo('data')] }.uniq
     "), @r#"[{content: ""}, {content: "data"}]"#);
 }
+
+#[test]
+fn test_invokesuper_with_kw_splat_to_kwrest() {
+    // Like ActiveSupport::Messages::Rotator#initialize
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperKwrestParent
+          def initialize(secret, **options)
+            options[:mutated] = true
+            @args = [secret, options]
+          end
+          attr_reader :args
+        end
+        class SuperKwrestChild < SuperKwrestParent
+          def initialize(*args, on_rotation: nil, **options)
+            super(*args, **options)
+            @options = options
+          end
+          attr_reader :options
+        end
+        def test(**kw) = SuperKwrestChild.new(:s, **kw).then { [_1.args, _1.options] }
+        test(a: 1); test(a: 1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(a: 1), test(b: 2, on_rotation: 3), test]"),
+        @"[[[:s, {a: 1, mutated: true}], {a: 1}], [[:s, {b: 2, mutated: true}], {b: 2}], [[:s, {mutated: true}], {}]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_invokesuper_with_kw_splat_to_anonymous_kwrest() {
+    assert_snapshot!(inspect("
+        class SuperAnonKwrestTarget
+          def foo(**kw) = kw
+        end
+        class SuperAnonKwrestParent < SuperAnonKwrestTarget
+          def foo(**) = super(**)
+        end
+        class SuperAnonKwrestChild < SuperAnonKwrestParent
+          def foo(h) = super(**h)
+        end
+        o = SuperAnonKwrestChild.new
+        h = { a: 1 }
+        r = 5.times.map { x = o.foo(h); x[:b] = 2; x }.uniq
+        r + [h]
+    "), @"[{a: 1, b: 2}, {a: 1}]");
+}
+
+#[test]
+fn test_invokesuper_with_kw_splat_to_keywords() {
+    assert_snapshot!(inspect("
+        class SuperKwSplatKwParent
+          def foo(a: 0, **rest) = [a, rest]
+        end
+        class SuperKwSplatKwChild < SuperKwSplatKwParent
+          def foo(**opts) = super(**opts)
+        end
+        o = SuperKwSplatKwChild.new
+        5.times.flat_map { [o.foo(a: 1, b: 2), o.foo] }.uniq
+    "), @"[[1, {b: 2}], [0, {}]]");
+}
+
+#[test]
+fn test_invokesuper_with_kw_splat_type_changes() {
+    assert_snapshot!(inspect(r#"
+        class SuperKwSplatTypeParent
+          def foo(**opts) = opts
+        end
+        class SuperKwSplatTypeChild < SuperKwSplatTypeParent
+          def foo(h) = super(**h)
+        end
+        o = SuperKwSplatTypeChild.new
+        r = 5.times.map { o.foo({ a: 1 }) }.uniq
+        r + [o.foo(nil), (o.foo(1) rescue $!.class)]
+    "#), @"[{a: 1}, {}, TypeError]");
+}
