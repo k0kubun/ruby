@@ -7599,6 +7599,12 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
                             continue;
+                        } else if let (VM_METHOD_TYPE_ATTRSET, &[val]) = (def_type, args.as_slice()) {
+                            // An attr_writer, e.g. from `def foo=(v) = super(...)`
+                            block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, false);
+                            let id = unsafe { get_cme_def_body_attr_id(super_cme) };
+                            self.push_insn(block, Insn::SetIvar { self_val: recv, id, ic: std::ptr::null(), val, state });
+                            self.make_equal_to(insn_id, val);
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
                             let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(super_cme)) };
                             if get_option!(stats) && ZJITState::get_method_annotations().get_cfunc_properties(super_cme).is_none() {
