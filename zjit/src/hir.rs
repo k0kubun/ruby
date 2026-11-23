@@ -3544,6 +3544,8 @@ struct SuperTarget {
     def_type: rb_method_type_t,
     /// Whether the frame is an inlined method frame, whose method entry and block are known
     frame_known: bool,
+    /// Whether the profile saw the frame have a block, which `super` passes on
+    saw_frame_block: bool,
 }
 
 /// The profiled callinfo of the call that entered a `def foo(...)` frame. See
@@ -7560,7 +7562,7 @@ impl Function {
                         // `**hash` are handled below for an ISEQ method.
                         let args_rejection = unspecializable_call_type(flags & !(VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT))
                             .then_some(SuperComplexArgsPass);
-                        let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = match self.resolve_super_target(state, args_rejection) {
+                        let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known, saw_frame_block } = match self.resolve_super_target(state, args_rejection) {
                             Ok(target) => target,
                             Err(reason) => {
                                 if matches!(reason, SuperPolymorphic) && let Some(next_block) = self.try_specialize_polymorphic_super(block, insn_id) {
@@ -7579,8 +7581,20 @@ impl Function {
                             _ => unreachable!("expected InvokeSuper insn"),
                         };
 
+                        // Like `bar(...)`, pass on the frame's block, which is only known at run time,
+                        // to a method that may take a block.
+                        let pass_frame_block = saw_frame_block && blockiseq.is_none() && def_type == VM_METHOD_TYPE_ISEQ && {
+                            let params = unsafe { get_def_iseq_ptr((*super_cme).def).params() };
+                            params.flags.use_block() != 0 && params.flags.accepts_no_block() == 0
+                        };
+                        if saw_frame_block && blockiseq.is_none() && !pass_frame_block {
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
+                            continue;
+                        }
+
                         if def_type == VM_METHOD_TYPE_ISEQ {
-                            let plan = match self.plan_super_iseq_call(&args, ci, super_cme, blockiseq, state) {
+                            let plan = match self.plan_super_iseq_call(&args, ci, super_cme, blockiseq.is_some() || pass_frame_block, state) {
                                 Ok(plan) => plan,
                                 Err(failure) => {
                                     failure.record(self, block, insn_id);
@@ -7588,8 +7602,14 @@ impl Function {
                                     continue;
                                 }
                             };
-                            block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, blockiseq.is_some());
-                            let replacement = self.emit_super_iseq_call(block, recv, cd, super_cme, plan, &args, blockiseq, state);
+                            block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, blockiseq.is_some() || pass_frame_block);
+                            let send_block = if pass_frame_block {
+                                let lep = self.get_ep(block, get_lvar_level(frame_state_iseq));
+                                Some(BlockHandler::FrameBlock(self.load_ep_env_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, VM_ENV_DATA_INDEX_SPECVAL, types::CInt64)))
+                            } else {
+                                blockiseq.map(BlockHandler::BlockIseq)
+                            };
+                            let replacement = self.emit_super_iseq_call(block, recv, cd, super_cme, plan, &args, send_block, state);
                             self.make_equal_to(insn_id, replacement);
                         } else if blockiseq.is_some() {
                             self.push_insn_id(block, insn_id);
@@ -7771,12 +7791,11 @@ impl Function {
                 return Err(SuperPolymorphic);
             };
 
-            if local_payload.profile.super_saw_block(frame_state_insn_idx) {
-                return Err(SuperCallWithBlock);
-            }
             current_cme
         };
-        Self::super_target_of(current_cme, frame_known)
+        let mut target = Self::super_target_of(current_cme, frame_known)?;
+        target.saw_frame_block = !frame_known && get_or_create_iseq_payload(frame_state_iseq).profile.super_saw_block(frame_state_insn_idx);
+        Ok(target)
     }
 
     /// Resolve the method that `super` calls from a frame running `current_cme`.
@@ -7817,12 +7836,12 @@ impl Function {
             super_cme = unsafe { rb_aliased_callable_method_entry(super_cme) };
             def_type = unsafe { get_cme_def_type(super_cme) };
         }
-        Ok(SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known })
+        Ok(SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known, saw_frame_block: false })
     }
 
     /// Plan calling the ISEQ method `super_cme` directly for a `super` with `args`, before
     /// emitting any instruction.
-    fn plan_super_iseq_call(&self, args: &[InsnId], ci: *const rb_callinfo, super_cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>, state: InsnId) -> Result<SuperIseqCall, SuperIseqCallFailure> {
+    fn plan_super_iseq_call(&self, args: &[InsnId], ci: *const rb_callinfo, super_cme: *const rb_callable_method_entry_t, has_block: bool, state: InsnId) -> Result<SuperIseqCall, SuperIseqCallFailure> {
         let flags = unsafe { rb_vm_ci_flag(ci) };
         let iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
         let params = unsafe { iseq.params() };
@@ -7856,7 +7875,7 @@ impl Function {
                 Some(CallerSplat { arg_idx, array: args[arg_idx], length })
             }
         };
-        let call = self.build_send_direct_args(&caller_args, caller_splat, iseq, blockiseq.is_some())
+        let call = self.build_send_direct_args(&caller_args, caller_splat, iseq, has_block)
             .map_err(SuperIseqCallFailure::SendDirect)?;
         Ok(SuperIseqCall { iseq, call, caller_splat, kw_splat })
     }
@@ -7875,7 +7894,7 @@ impl Function {
     /// Call the ISEQ method `super_cme` of a `super` with `args` as planned by
     /// [`Self::plan_super_iseq_call`], after the guards of the call. Return the result.
     fn emit_super_iseq_call(&mut self, block: BlockId, recv: InsnId, cd: *const rb_call_data, super_cme: *const rb_callable_method_entry_t,
-                            plan: SuperIseqCall, args: &[InsnId], blockiseq: Option<IseqPtr>, state: InsnId) -> InsnId {
+                            plan: SuperIseqCall, args: &[InsnId], send_block: Option<BlockHandler>, state: InsnId) -> InsnId {
         let SuperIseqCall { iseq, mut call, caller_splat, kw_splat } = plan;
         if let Some(caller_splat) = caller_splat {
             self.emit_caller_splat(block, caller_splat, state);
@@ -7886,7 +7905,7 @@ impl Function {
         if let Some(SuperKwSplat { hash, hash_type, dup }) = kw_splat {
             let hash = self.guard_type_recompile(block, hash, Type::from_profiled_type(hash_type), state, Recompile);
             let caller_args = Self::super_caller_args(positional_args, unsafe { (*cd).ci }, Some(KwrestHash { hash, dup }));
-            call = self.build_send_direct_args(&caller_args, caller_splat, iseq, blockiseq.is_some())
+            call = self.build_send_direct_args(&caller_args, caller_splat, iseq, send_block.is_some())
                 .unwrap_or_else(|_| unreachable!("the guarded `**hash` passes like the unguarded one"));
             let new_state = self.frame_state(state).with_replaced_args(positional_args, args.len());
             send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
@@ -7903,7 +7922,7 @@ impl Function {
             jit_entry_idx,
             state: send_state,
             exit_state: state,
-            block: blockiseq.map(BlockHandler::BlockIseq),
+            block: send_block,
             forwarded_ci: None,
         })))
     }
@@ -7932,7 +7951,7 @@ impl Function {
             let Ok(target) = Self::super_target_of(current_cme, false) else { continue };
             let plan = match target.def_type {
                 VM_METHOD_TYPE_ISEQ => {
-                    let Ok(plan) = self.plan_super_iseq_call(&args, ci, target.super_cme, blockiseq, state) else { continue };
+                    let Ok(plan) = self.plan_super_iseq_call(&args, ci, target.super_cme, blockiseq.is_some(), state) else { continue };
                     Some(plan)
                 }
                 // Like the C method case of `super` in type_specialize()
@@ -7982,7 +8001,7 @@ impl Function {
                 state,
             });
             let result = match plan {
-                Some(plan) => self.emit_super_iseq_call(call_block, recv, cd, target.super_cme, plan, &args, blockiseq, state),
+                Some(plan) => self.emit_super_iseq_call(call_block, recv, cd, target.super_cme, plan, &args, blockiseq.map(BlockHandler::BlockIseq), state),
                 None => self.emit_super_cfunc_call(call_block, recv, cd, args.clone(), target.super_cme, state, state),
             };
             self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
@@ -8370,7 +8389,7 @@ impl Function {
         }
         let forwarded_ci = self.profiled_forwarded_ci(&args, state)?;
         let ForwardedCallInfo { caller_ci, caller_flags, .. } = forwarded_ci;
-        let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = self.resolve_super_target(state, None)?;
+        let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known, .. } = self.resolve_super_target(state, None)?;
         let frame_iseq = self.frame_state_ref(state).iseq;
         if def_type == VM_METHOD_TYPE_CFUNC {
             // A C method takes keywords in a Hash, which the merged arguments would need to build.
