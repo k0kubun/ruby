@@ -26155,7 +26155,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn test_invokesuper_with_block_literal_remains_invokesuper() {
+    fn test_invokesuper_with_block_literal_optimizes() {
         eval("
             class A
               def foo
@@ -26172,12 +26172,8 @@ mod hir_opt_tests {
             B.new.foo; B.new.foo
         ");
 
-        let hir = hir_string_proc("B.new.method(:foo)");
-        assert!(hir.contains("InvokeSuper "), "Expected unoptimized InvokeSuper but got:\n{hir}");
-        assert!(!hir.contains("SendDirect"), "Should not optimize to SendDirect for block literal:\n{hir}");
-
-        // With a block, we don't optimize to SendDirect
-        assert_snapshot!(hir, @"
+        // The literal block is passed instead of the frame's block, which needs no guard.
+        assert_snapshot!(hir_string_proc("B.new.method(:foo)"), @"
         fn foo@<compiled>:10:
         bb1():
           EntryPoint interpreter
@@ -26188,9 +26184,43 @@ mod hir_opt_tests {
           v4:HeapBasicObject = LoadArg :self@0
           Jump bb3(v4)
         bb3(v6:HeapBasicObject):
-          v11:BasicObject = InvokeSuper v6, 0x1000 # SendFallbackReason: super: call made with a block
+          PatchPoint MethodRedefined(A@0x1000, foo@0x1008, cme:0x1010)
+          v18:CPtr = GetEP 0
+          v19:RubyValue = LoadField v18, :VM_ENV_DATA_INDEX_ME_CREF@0x1038
+          v20:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
+          v21:CBool = IsBitEqual v19, v20
+          CondBranch v21, bb5(), bb4()
+        bb4():
+          v23:RubyValue = CCall v6, :rb_vm_lep_method_entry@0x1048, v19
+          v24:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v23, Value(VALUE(0x1040))
+          Jump bb5()
+        bb5():
+          PushInlineFrame :foo, v6 (0x1050), num_args=0, block=0x1070
+          PatchPoint NoSingletonClass(B@0x1090)
+          PatchPoint MethodRedefined(B@0x1090, block_given?@0x1098, cme:0x10a0)
+          v77:ObjectSubclass[class_exact:B] = GuardType v6, ObjectSubclass[class_exact:B] recompile
+          v78:CPtr = GetEP 0
+          v79:RubyValue = LoadField v78, :VM_ENV_DATA_INDEX_SPECVAL@0x10c8
+          v80:BoolExact = IsBlockGiven v79
+          CondBranchTest v80, bb9(), bb8()
+        bb9():
+          v40:CInt64 = LoadField v78, :VM_ENV_DATA_INDEX_SPECVAL@0x10c8
+          v41:CInt64[-4] = Const CInt64(-4)
+          v42:CInt64 = IntAnd v40, v41
+          v69:BasicObject = LoadField v42, :captured_self@0x10c9
+          PushInlineBlockFrame v69, v42 (0x1070), num_args=0
+          v64:StringExact[VALUE(0x10d0)] = Const Value(VALUE(0x10d0))
+          v65:StringExact = StringCopy v64
+          PopInlineFrame
+          Jump bb6(v65)
+        bb8():
+          v50:StringExact[VALUE(0x10d8)] = Const Value(VALUE(0x10d8))
+          v51:StringExact = StringCopy v50
+          Jump bb6(v51)
+        bb6(v55:StringExact):
+          PopInlineFrame
           CheckInterrupts
-          Return v11
+          Return v55
         ");
     }
 

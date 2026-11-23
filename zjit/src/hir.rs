@@ -7480,12 +7480,8 @@ impl Function {
                         };
                     }
                     &Insn::InvokeSuper { recv, cd, blockiseq, state, .. } => {
-                        // Don't handle calls with literal blocks (e.g., super { ... })
-                        if !blockiseq.is_null() {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
-                            continue;
-                        }
+                        // A literal block (e.g., super { ... }) is passed only to an ISEQ method below.
+                        let blockiseq = (!blockiseq.is_null()).then_some(blockiseq);
 
                         let ci = unsafe { (*cd).ci };
                         let flags = unsafe { rb_vm_ci_flag(ci) };
@@ -7512,14 +7508,13 @@ impl Function {
                             // Check if the super method's parameters support direct send.
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-                            // TODO: pass Option<blockiseq> to build_send_direct_args when we start specializing `super { ... }`.
                             let caller_args = CallerArguments::new(&args, ci);
-                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, false)
+                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, blockiseq.is_some())
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
-                            block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
+                            block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, blockiseq.is_some());
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
@@ -7534,10 +7529,14 @@ impl Function {
                                 jit_entry_idx,
                                 state: send_state,
                                 exit_state: state,
-                                block: None,
+                                block: blockiseq.map(BlockHandler::BlockIseq),
                             })));
                             self.make_equal_to(insn_id, replacement);
 
+                        } else if blockiseq.is_some() {
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
+                            continue;
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
                             let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
                             let cfunc_argc = unsafe { get_mct_argc(cfunc) };
@@ -7558,7 +7557,7 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
+                                    block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, false);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7608,7 +7607,7 @@ impl Function {
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
-                                    block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
+                                    block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, false);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7841,7 +7840,8 @@ impl Function {
 
     /// Emit the guards for calling the `super` method `super_cme` that was found from
     /// `current_cme`: a patch point for the lookup and, unless the frame is an inlined method
-    /// frame, checks that the frame runs `current_cme` and has no block to pass on.
+    /// frame, checks that the frame runs `current_cme` and, unless `passes_own_block`, has no
+    /// block to pass on.
     fn emit_super_call_guards(
         &mut self,
         block: BlockId,
@@ -7852,6 +7852,7 @@ impl Function {
         state: InsnId,
         local_iseq: IseqPtr,
         frame_known: bool,
+        passes_own_block: bool,
     ) -> BlockId {
         self.push_insn(block, Insn::PatchPoint {
             invariant: Invariant::MethodRedefined {
@@ -7900,6 +7901,10 @@ impl Function {
         self.push_insn(svar_block, Insn::Jump(BranchEdge { target: join_block, args: vec![] }));
         let block = join_block;
 
+        // `super { ... }` passes its own block instead of the frame's.
+        if passes_own_block {
+            return block;
+        }
         let block_handler = self.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
         self.push_insn(block, Insn::GuardBitEquals {
             val: block_handler,
@@ -8124,7 +8129,7 @@ impl Function {
             state,
             recompile: Some(Recompile),
         });
-        let block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_iseq, frame_known);
+        let block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_iseq, frame_known, false);
         let send_frame_state = {
             let new_state = self.frame_state(state).with_replaced_args(&merged_args, args.len());
             self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) })
