@@ -15463,3 +15463,208 @@ fn test_inlined_invokesuper_after_super_method_changes() {
         "), @"[[:child, :parent], [:child, :parent], [:child, :redefined], [:child, :mod]]");
     });
 }
+
+#[test]
+fn test_invokesuperforward_positional_args() {
+    assert_snapshot!(inspect("
+        class SuperFwdPosParent
+          def initialize(a, b = 2) = @ab = [a, b]
+          attr_reader :ab
+        end
+        class SuperFwdPosChild < SuperFwdPosParent
+          def initialize(...)
+            super
+            @child = true
+          end
+        end
+        5.times.flat_map { [SuperFwdPosChild.new(1).ab, SuperFwdPosChild.new(3, 4).ab] }.uniq
+    "), @"[[1, 2], [3, 4]]");
+}
+
+#[test]
+fn test_invokesuperforward_leading_args() {
+    assert_snapshot!(inspect("
+        class SuperFwdLeadParent2
+          def foo(a, b, c) = [a, b, c]
+        end
+        class SuperFwdLeadChild2 < SuperFwdLeadParent2
+          def foo(...) = super(0, ...)
+        end
+        o = SuperFwdLeadChild2.new
+        5.times.map { o.foo(1, 2) }.uniq
+    "), @"[[0, 1, 2]]");
+}
+
+#[test]
+fn test_invokesuperforward_callinfo_changes() {
+    assert_snapshot!(inspect("
+        class SuperFwdCiParent
+          def foo(a, b = :default, k: :none) = [a, b, k]
+        end
+        class SuperFwdCiChild < SuperFwdCiParent
+          def foo(...) = super
+        end
+        o = SuperFwdCiChild.new
+        r = 5.times.map { o.foo(1) }.uniq
+        r + 5.times.flat_map { [o.foo(1, 2), o.foo(3, k: 4)] }.uniq
+    "), @"[[1, :default, :none], [1, 2, :none], [3, :default, 4]]");
+}
+
+#[test]
+fn test_invokesuperforward_passes_frame_block() {
+    assert_snapshot!(inspect("
+        class SuperFwdBlockParent
+          def foo(a) = block_given? ? yield(a) : [:no_block, a]
+        end
+        class SuperFwdBlockChild < SuperFwdBlockParent
+          def foo(...) = super
+        end
+        o = SuperFwdBlockChild.new
+        r = 5.times.map { o.foo(1) }.uniq
+        r + 5.times.flat_map { [o.foo(2) { |v| v * 2 }, o.foo(3)] }.uniq
+    "), @"[[:no_block, 1], 4, [:no_block, 3]]");
+}
+
+#[test]
+fn test_invokesuperforward_wrong_number_of_arguments() {
+    assert_snapshot!(inspect(r#"
+        class SuperFwdArityParent
+          def foo(a, b) = [a, b]
+        end
+        class SuperFwdArityChild < SuperFwdArityParent
+          def foo(...) = super
+        end
+        o = SuperFwdArityChild.new
+        5.times.map { (o.foo(1) rescue $!.message) }.uniq
+    "#), @r#"["wrong number of arguments (given 1, expected 2)"]"#);
+}
+
+#[test]
+fn test_invokesuperforward_in_module_method() {
+    // A module method has a method entry for each class it's included into, whose super
+    // methods differ.
+    assert_snapshot!(inspect("
+        module SuperFwdMod
+          def foo(...) = [:mod, super]
+        end
+        class SuperFwdModA; def foo(a) = [:a, a]; end
+        class SuperFwdModB; def foo(a) = [:b, a]; end
+        class SuperFwdModA2 < SuperFwdModA; include SuperFwdMod; end
+        class SuperFwdModB2 < SuperFwdModB; include SuperFwdMod; end
+        a = SuperFwdModA2.new
+        b = SuperFwdModB2.new
+        r = 5.times.map { a.foo(1) }.uniq
+        r + 5.times.flat_map { [b.foo(2), a.foo(3)] }.uniq
+    "), @"[[:mod, [:a, 1]], [:mod, [:b, 2]], [:mod, [:a, 3]]]");
+}
+
+#[test]
+fn test_invokesuperforward_from_aliased_method() {
+    // `super` in an aliased method looks up the original method name.
+    assert_snapshot!(inspect("
+        class SuperFwdAliasParent
+          def foo(a) = [:parent_foo, a]
+          def bar(a) = [:parent_bar, a]
+        end
+        class SuperFwdAliasChild < SuperFwdAliasParent
+          def foo(...) = [:child, super]
+          alias bar foo
+        end
+        o = SuperFwdAliasChild.new
+        5.times.flat_map { [o.bar(1), o.foo(2)] }.uniq
+    "), @"[[:child, [:parent_foo, 1]], [:child, [:parent_foo, 2]]]");
+}
+
+#[test]
+fn test_invokesuperforward_to_method_missing() {
+    assert_snapshot!(inspect("
+        class SuperFwdMMParent
+          def method_missing(name, *args) = [:mm, name, *args]
+          def respond_to_missing?(*) = true
+        end
+        class SuperFwdMMChild < SuperFwdMMParent
+          def foo(...) = super
+        end
+        o = SuperFwdMMChild.new
+        5.times.map { o.foo(1, 2) }.uniq
+    "), @"[[:mm, :foo, 1, 2]]");
+}
+
+#[test]
+fn test_invokesuperforward_from_refinement() {
+    assert_snapshot!(inspect(r#"
+        class SuperFwdRefined
+          def foo(a) = "base #{a}"
+        end
+        module SuperFwdRefinement
+          refine(SuperFwdRefined) { def foo(...) = "refined " + super }
+        end
+        module SuperFwdRefinementClient
+          using SuperFwdRefinement
+          def self.test(o) = o.foo(1)
+        end
+        o = SuperFwdRefined.new
+        5.times.map { SuperFwdRefinementClient.test(o) }.uniq
+    "#), @r#"["refined base 1"]"#);
+}
+
+#[test]
+fn test_invokesuperforward_after_super_method_changes() {
+    assert_snapshot!(inspect("
+        class SuperFwdChangeParent
+          def foo(a) = [:parent, a]
+        end
+        class SuperFwdChangeChild < SuperFwdChangeParent
+          def foo(...) = [:child, super]
+        end
+        o = SuperFwdChangeChild.new
+        r = 5.times.map { o.foo(1) }.uniq
+        class SuperFwdChangeParent
+          def foo(a) = [:redefined, a]
+        end
+        r += 5.times.map { o.foo(2) }.uniq
+        module SuperFwdChangeMod
+          def foo(a) = [:mod, a]
+        end
+        SuperFwdChangeChild.include(SuperFwdChangeMod)
+        r + 5.times.map { o.foo(3) }.uniq
+    "), @"[[:child, [:parent, 1]], [:child, [:redefined, 2]], [:child, [:mod, 3]]]");
+}
+
+#[test]
+fn test_invokesuperforward_ep_escape() {
+    assert_snapshot!(inspect("
+        class SuperFwdEscParent
+          def foo(a, b) = [a, b]
+        end
+        class SuperFwdEscChild < SuperFwdEscParent
+          def foo(...)
+            b = binding
+            super
+          end
+        end
+        o = SuperFwdEscChild.new
+        5.times.map { o.foo(1, 2) }.uniq
+    "), @"[[1, 2]]");
+}
+
+#[test]
+fn test_invokesuperforward_compiles_to_send_direct() {
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperFwdDirectParent
+          def foo(a, b) = a + b
+        end
+        class SuperFwdDirectChild < SuperFwdDirectParent
+          def foo(...) = super
+        end
+        SuperFwdDirectO = SuperFwdDirectChild.new
+        def test = SuperFwdDirectO.foo(1, 2)
+        test; test
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test, test, test]"), @"[3, 3, 3]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
