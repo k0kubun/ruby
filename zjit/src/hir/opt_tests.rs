@@ -24081,7 +24081,7 @@ mod hir_opt_tests {
     }
 
     #[test]
-    fn dont_specialize_invokesuperforward_to_cfunc() {
+    fn specialize_invokesuperforward_to_cfunc() {
         eval("
            class SuperFwdCfunc
              def initialize(...) = super
@@ -24102,10 +24102,69 @@ mod hir_opt_tests {
           v7:BasicObject = LoadArg :...@1
           Jump bb3(v6, v7)
         bb3(v9:BasicObject, v10:BasicObject):
-          v16:BasicObject = InvokeSuperForward v9, 0x1008, v10 # SendFallbackReason: super: unsupported target method type Cfunc
+          v24:CPtr = GetEP 0
+          v25:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(BasicObject@0x1008, initialize@0x1010, cme:0x1018)
+          v28:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v29:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v30:CBool = IsBitEqual v28, v29
+          CondBranch v30, bb5(), bb4()
+        bb4():
+          v32:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v28
+          v33:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v32, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v35:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v36:FalseClass = GuardBitEquals v35, Value(false) recompile
+          v38:NilClass = Const Value(nil)
           PatchPoint NoEPEscape(initialize)
           CheckInterrupts
-          Return v16
+          Return v38
+        ");
+    }
+
+    #[test]
+    fn specialize_invokesuperforward_to_variadic_cfunc() {
+        eval("
+           class SuperFwdVariadic < Array
+             def push(...) = super
+           end
+           SuperFwdVariadic.new.push(1, 2)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdVariadic.instance_method(:push)")), @"
+        fn push@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1001
+          v26:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v27:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(Array@0x1008, push@0x1010, cme:0x1018)
+          v30:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v31:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v32:CBool = IsBitEqual v30, v31
+          CondBranch v32, bb5(), bb4()
+        bb4():
+          v34:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v30
+          v35:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v34, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v37:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v38:FalseClass = GuardBitEquals v37, Value(false) recompile
+          v40:BasicObject = CCallVariadic v9, :Array#push@0x1052, v25, v26
+          PatchPoint NoEPEscape(push)
+          CheckInterrupts
+          Return v40
         ");
     }
 
