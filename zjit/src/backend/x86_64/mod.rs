@@ -1397,6 +1397,10 @@ impl Assembler {
                 asm.resolve_ssa(&intervals, &regs);
             });
 
+            // The CFG doesn't change from here through linearize_instructions; the block that
+            // compile_exits creates is outside it.
+            asm.cache_reverse_post_order();
+
             Ok(())
         })?;
         asm_dump!(asm, alloc_regs);

@@ -1951,8 +1951,12 @@ pub struct Assembler {
     cold_hir_blocks: HashSet<hir::BlockId>,
 
     /// The reverse post-order of the CFG, cached by [`Assembler::cache_reverse_post_order`] for
-    /// the passes that don't change the CFG. Creating a block clears it.
+    /// the passes that don't change the CFG. Creating a block clears it, except for a block
+    /// outside the CFG (see [`Assembler::new_block`]).
     reverse_post_order_cache: Option<Vec<BlockId>>,
+
+    /// [`Assembler::block_order`] of the cached reverse post-order
+    block_order_cache: Option<Vec<BlockId>>,
 }
 
 impl Assembler
@@ -1971,6 +1975,7 @@ impl Assembler
             stack_map: None,
             cold_hir_blocks: HashSet::default(),
             reverse_post_order_cache: None,
+            block_order_cache: None,
         }
     }
 
@@ -2018,8 +2023,18 @@ impl Assembler
 
     // Create a new LIR basic block.  Returns the newly created block ID
     pub fn new_block(&mut self, hir_block_id: hir::BlockId, is_entry: bool, rpo_index: usize) -> BlockId {
-        self.reverse_post_order_cache = None;
         let bb_id = BlockId(self.basic_blocks.len());
+        if is_entry && rpo_index == DUMMY_RPO_INDEX {
+            // A new entry block outside the CFG has no successors, and the post-order traversal
+            // visits the last entry block first, so it comes last in the reverse post-order and
+            // in the block order. Keep the caches valid for compile_exits' block of exit code.
+            if let (Some(rpo), Some(order)) = (&mut self.reverse_post_order_cache, &mut self.block_order_cache) {
+                rpo.push(bb_id);
+                order.push(bb_id);
+            }
+        } else {
+            self.clear_reverse_post_order_cache();
+        }
         let lir_bb = BasicBlock::new(bb_id, hir_block_id, is_entry, rpo_index);
         self.basic_blocks.push(lir_bb);
         if is_entry {
@@ -2032,7 +2047,7 @@ impl Assembler
     // when creating new assemblers during passes when we want to translate
     // one assembler to a new one.
     pub fn new_block_from_old_block(&mut self, old_block: &BasicBlock) -> BlockId {
-        self.reverse_post_order_cache = None;
+        self.clear_reverse_post_order_cache();
         let bb_id = BlockId(self.basic_blocks.len());
         let mut lir_bb = BasicBlock::new(bb_id, old_block.hir_block_id, old_block.is_entry, old_block.rpo_index);
         lir_bb.parameters = old_block.parameters.clone();
@@ -3517,8 +3532,19 @@ impl Assembler
 
     /// Cache the reverse post-order of the CFG for the passes that follow until a block is
     /// created. The passes must not change the CFG in other ways, e.g. jump targets.
+    /// Does nothing if it's cached already.
     pub fn cache_reverse_post_order(&mut self) {
-        self.reverse_post_order_cache = Some(self.compute_reverse_post_order());
+        if self.reverse_post_order_cache.is_some() {
+            return;
+        }
+        let rpo = self.compute_reverse_post_order();
+        self.block_order_cache = Some(self.compute_block_order(rpo.clone()));
+        self.reverse_post_order_cache = Some(rpo);
+    }
+
+    fn clear_reverse_post_order_cache(&mut self) {
+        self.reverse_post_order_cache = None;
+        self.block_order_cache = None;
     }
 
     fn compute_reverse_post_order(&self) -> Vec<BlockId> {
@@ -3668,7 +3694,14 @@ impl Assembler
     /// hot code together like V8's deferred blocks. Blocks outside the CFG, e.g. the one that
     /// side exits are appended to, stay last.
     pub fn block_order(&self) -> Vec<BlockId> {
-        let rpo = self.reverse_post_order();
+        if let Some(order) = &self.block_order_cache {
+            debug_assert_eq!(*order, self.compute_block_order(self.compute_reverse_post_order()), "the CFG changed after cache_reverse_post_order");
+            return order.clone();
+        }
+        self.compute_block_order(self.reverse_post_order())
+    }
+
+    fn compute_block_order(&self, rpo: Vec<BlockId>) -> Vec<BlockId> {
         if self.cold_hir_blocks.is_empty() {
             return rpo;
         }
@@ -3686,7 +3719,7 @@ impl Assembler
 
     /// Mark a HIR block as a slow path to be placed after the other blocks.
     pub fn mark_cold_hir_block(&mut self, hir_block_id: hir::BlockId) {
-        self.reverse_post_order_cache = None;
+        self.clear_reverse_post_order_cache();
         self.cold_hir_blocks.insert(hir_block_id);
     }
 
