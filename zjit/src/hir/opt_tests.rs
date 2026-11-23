@@ -24169,6 +24169,56 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_invokesuperforward_to_forwardable_method() {
+        eval("
+           class SuperFwdChainParent
+             def foo(a) = a
+           end
+           class SuperFwdChainMid < SuperFwdChainParent
+             def foo(...) = super
+           end
+           class SuperFwdChainLeaf < SuperFwdChainMid
+             def foo(...) = super
+           end
+           SuperFwdChainLeaf.new.foo(1)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdChainLeaf.instance_method(:foo)")), @"
+        fn foo@<compiled>:9:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v26:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(SuperFwdChainMid@0x1008, foo@0x1010, cme:0x1018)
+          v29:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v30:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v31:CBool = IsBitEqual v29, v30
+          CondBranch v31, bb5(), bb4()
+        bb4():
+          v33:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v29
+          v34:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v33, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v36:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v37:FalseClass = GuardBitEquals v36, Value(false) recompile
+          v39:BasicObject = SendDirect v9, 0x0, :foo (0x1058), v25
+          PatchPoint NoEPEscape(foo)
+          CheckInterrupts
+          Return v39
+        ");
+    }
+
+    #[test]
     fn specialize_send_forward_passes_frame_block() {
         eval("
            def target(a) = yield(a)
