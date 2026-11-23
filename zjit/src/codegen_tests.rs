@@ -15668,3 +15668,86 @@ fn test_invokesuperforward_compiles_to_send_direct() {
     assert_snapshot!(assert_compiles("[test, test, test]"), @"[3, 3, 3]");
     assert_eq!(0, counters.side_exit_count - side_exits_before);
 }
+
+#[test]
+fn test_invokesuper_with_literal_block_to_iseq() {
+    assert_snapshot!(inspect("
+        class SuperLitBlockParent
+          def foo(a) = block_given? ? yield(a) : [:no_block, a]
+        end
+        class SuperLitBlockChild < SuperLitBlockParent
+          def foo(a)
+            x = 10
+            r = super(a) { |v| x += v; v * 2 }
+            [r, x]
+          end
+        end
+        o = SuperLitBlockChild.new
+        5.times.flat_map { [o.foo(1), o.foo(2) { :ignored }] }.uniq
+    "), @"[[2, 11], [4, 12]]");
+}
+
+#[test]
+fn test_invokesuper_with_literal_block_to_hash_initialize() {
+    // Like ActiveSupport::InheritableOptions#initialize
+    assert_snapshot!(inspect("
+        class SuperLitBlockHash < Hash
+          def initialize(parent = nil)
+            @parent = parent
+            if parent
+              super() { |h, k| @parent[k] }
+            else
+              super()
+            end
+          end
+        end
+        parent = { a: 1 }
+        5.times.map { [SuperLitBlockHash.new(parent)[:a], SuperLitBlockHash.new[:a]] }.uniq
+    "), @"[[1, nil]]");
+}
+
+#[test]
+fn test_invokesuper_with_literal_block_break_and_return() {
+    assert_snapshot!(inspect("
+        class SuperLitBlockThrowParent
+          def foo(a) = [:parent, yield(a)]
+        end
+        class SuperLitBlockThrowChild < SuperLitBlockThrowParent
+          def foo(a)
+            r = super(a) { |v| break [:broke, v] if v == 1; v }
+            return [:returned, r] if a <= 2
+            super(a) { |v| return [:non_local, v] if v == 3; v }
+          end
+        end
+        o = SuperLitBlockThrowChild.new
+        5.times.map { [o.foo(1), o.foo(2), o.foo(3), o.foo(4)] }.uniq
+    "), @"[[[:returned, [:broke, 1]], [:returned, [:parent, 2]], [:non_local, 3], [:parent, 4]]]");
+}
+
+#[test]
+fn test_invokesuper_with_literal_block_to_cfunc() {
+    assert_snapshot!(inspect("
+        class SuperLitBlockArray < Array
+          def each = super { |x| yield x * 2 }
+        end
+        a = SuperLitBlockArray[1, 2]
+        5.times.map { r = []; a.each { |x| r << x }; r }.uniq
+    "), @"[[2, 4]]");
+}
+
+#[test]
+fn test_inlined_invokesuper_with_literal_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperLitBlockParent
+              def foo(a) = yield(a) + 1
+            end
+            class InlSuperLitBlockChild < InlSuperLitBlockParent
+              def foo(a) = super(a) { |v| v * 10 }
+            end
+            def test(o) = o.foo(2)
+            o = InlSuperLitBlockChild.new
+            [test(o), test(o), test(o)]
+        "), @"[21, 21, 21]");
+    });
+}
