@@ -151,6 +151,13 @@ impl Assembler {
         emit(self, target);
         self.jmp(Target::Block(Box::new(fall_through_edge)));
 
+        // The rest of the HIR block is lowered into the fall-through block. Reserve the room
+        // that gen_function reserved for it in the current block.
+        let spare = self.current_block().insns.capacity() - self.current_block().insns.len();
+        let fall_through_block = &mut self.basic_blocks[fall_through_target.0];
+        fall_through_block.insns.reserve(spare);
+        fall_through_block.insn_ids.reserve(spare);
+
         self.set_current_block(fall_through_target);
 
         let label = jit.get_label(self, fall_through_target, hir_block_id);
