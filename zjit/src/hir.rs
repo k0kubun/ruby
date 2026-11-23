@@ -7538,15 +7538,10 @@ impl Function {
                             self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
                             continue;
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
-                            let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
-                            let cfunc_argc = unsafe { get_mct_argc(cfunc) };
-                            let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
-
-                            let props = ZJITState::get_method_annotations().get_cfunc_properties(super_cme);
-                            if props.is_none() && get_option!(stats) {
+                            let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(super_cme)) };
+                            if get_option!(stats) && ZJITState::get_method_annotations().get_cfunc_properties(super_cme).is_none() {
                                 self.count_not_annotated_cfunc(block, insn_id, super_cme);
                             }
-                            let props = props.unwrap_or_default();
 
                             match cfunc_argc {
                                 // C function with fixed argument count.
@@ -7558,100 +7553,15 @@ impl Function {
                                         continue;
                                     }
                                     block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, false);
-
-                                    // Try inlining the cfunc into HIR
-                                    let tmp_block = self.new_block(u32::MAX);
-                                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
-                                        // Copy contents of tmp_block to block
-                                        assert_ne!(block, tmp_block);
-                                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
-                                        self.blocks[block].insns.extend(insns);
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement] = self.infer_type(replacement);
-                                        }
-                                        self.remove_block(tmp_block);
-                                        continue;
-                                    }
-
-                                    // Use CCallWithFrame for the C function.
-                                    let name = unsafe { (*super_cme).called_id };
-                                    let owner = unsafe { (*super_cme).owner };
-                                    let return_type = props.return_type;
-                                    let elidable = props.elidable;
-                                    // Filter for a leaf and GC free function
-                                    let ccall = if props.leaf && props.no_gc {
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
-                                    } else {
-                                        if get_option!(stats) {
-                                            self.count_not_inlined_cfunc(block, super_cme);
-                                        }
-                                        self.push_insn(block, Insn::CCallWithFrame(Box::new(CCallWithFrameData {
-                                            cd,
-                                            cfunc: cfunc_ptr,
-                                            recv,
-                                            args,
-                                            cme: super_cme,
-                                            name,
-                                            state,
-                                            return_type,
-                                            elidable,
-                                            block: None,
-                                        })))
-                                    };
-                                    self.make_equal_to(insn_id, ccall);
+                                    let replacement = self.emit_super_cfunc_call(block, recv, cd, args, super_cme, state, state);
+                                    self.make_equal_to(insn_id, replacement);
                                 }
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
                                     block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, false);
-
-                                    // Try inlining the cfunc into HIR
-                                    let tmp_block = self.new_block(u32::MAX);
-                                    if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, state) {
-                                        // Copy contents of tmp_block to block
-                                        assert_ne!(block, tmp_block);
-                                        let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
-                                        self.blocks[block].insns.extend(insns);
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.make_equal_to(insn_id, replacement);
-                                        if self.type_of(replacement).bit_equal(types::Any) {
-                                            // Not set yet; infer type
-                                            self.insn_types[replacement] = self.infer_type(replacement);
-                                        }
-                                        self.remove_block(tmp_block);
-                                        continue;
-                                    }
-
-                                    // Use CCallVariadic for the variadic C function.
-                                    let name = unsafe { (*super_cme).called_id };
-                                    let owner = unsafe { (*super_cme).owner };
-                                    let return_type = props.return_type;
-                                    let elidable = props.elidable;
-                                    // Filter for a leaf and GC free function
-                                    let ccall = if props.leaf && props.no_gc {
-                                        self.count(block, Counter::inline_cfunc_optimized_send_count);
-                                        self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable })
-                                    } else {
-                                        if get_option!(stats) {
-                                            self.count_not_inlined_cfunc(block, super_cme);
-                                        }
-                                        self.push_insn(block, Insn::CCallVariadic(Box::new(CCallVariadicData {
-                                            cfunc: cfunc_ptr,
-                                            recv,
-                                            args,
-                                            cme: super_cme,
-                                            name,
-                                            state,
-                                            return_type,
-                                            elidable,
-                                            block: None,
-                                        })))
-                                    };
-                                    self.make_equal_to(insn_id, ccall);
+                                    let replacement = self.emit_super_cfunc_call(block, recv, cd, args, super_cme, state, state);
+                                    self.make_equal_to(insn_id, replacement);
                                 }
 
                                 // Array-variadic: (self, args_ruby_array).
@@ -7836,6 +7746,72 @@ impl Function {
             def_type = unsafe { get_cme_def_type(super_cme) };
         }
         Ok(SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known })
+    }
+
+    /// Call the C method `super_cme` of a `super` with `args`, after the guards of the call: inline
+    /// it if it has an inliner, or call it directly. Return the instruction that replaces the call.
+    /// `state` has `args` on the stack, and `exit_state` is the state to side-exit with.
+    fn emit_super_cfunc_call(&mut self, block: BlockId, recv: InsnId, cd: *const rb_call_data, args: Vec<InsnId>, super_cme: *const rb_callable_method_entry_t, state: InsnId, exit_state: InsnId) -> InsnId {
+        let cfunc = unsafe { get_cme_def_body_cfunc(super_cme) };
+        let cfunc_argc = unsafe { get_mct_argc(cfunc) };
+        let cfunc_ptr = unsafe { get_mct_func(cfunc) }.cast();
+        let props = ZJITState::get_method_annotations().get_cfunc_properties(super_cme).unwrap_or_default();
+
+        // Try inlining the cfunc into HIR
+        let tmp_block = self.new_block(u32::MAX);
+        if let Some(replacement) = (props.inline)(self, tmp_block, recv, &args, exit_state) {
+            // Copy contents of tmp_block to block
+            assert_ne!(block, tmp_block);
+            let insns = std::mem::take(&mut self.blocks[tmp_block].insns);
+            self.blocks[block].insns.extend(insns);
+            self.count(block, Counter::inline_cfunc_optimized_send_count);
+            if self.type_of(replacement).bit_equal(types::Any) {
+                // Not set yet; infer type
+                self.insn_types[replacement] = self.infer_type(replacement);
+            }
+            self.remove_block(tmp_block);
+            return replacement;
+        }
+
+        let name = unsafe { (*super_cme).called_id };
+        let owner = unsafe { (*super_cme).owner };
+        let return_type = props.return_type;
+        let elidable = props.elidable;
+        // Filter for a leaf and GC free function
+        if props.leaf && props.no_gc {
+            self.count(block, Counter::inline_cfunc_optimized_send_count);
+            return self.push_insn(block, Insn::CCall { cfunc: cfunc_ptr, recv, args, name, owner, return_type, elidable });
+        }
+        if get_option!(stats) {
+            self.count_not_inlined_cfunc(block, super_cme);
+        }
+        if cfunc_argc == -1 {
+            // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
+            self.push_insn(block, Insn::CCallVariadic(Box::new(CCallVariadicData {
+                cfunc: cfunc_ptr,
+                recv,
+                args,
+                cme: super_cme,
+                name,
+                state,
+                return_type,
+                elidable,
+                block: None,
+            })))
+        } else {
+            self.push_insn(block, Insn::CCallWithFrame(Box::new(CCallWithFrameData {
+                cd,
+                cfunc: cfunc_ptr,
+                recv,
+                args,
+                cme: super_cme,
+                name,
+                state,
+                return_type,
+                elidable,
+                block: None,
+            })))
+        }
     }
 
     /// Emit the guards for calling the `super` method `super_cme` that was found from
@@ -8096,6 +8072,42 @@ impl Function {
         }
         let ForwardedCallInfo { ci_opnd, caller_ci_value, caller_ci, caller_flags } = self.profiled_forwarded_ci(&args, state)?;
         let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = self.resolve_super_target(state, None)?;
+        let frame_iseq = self.frame_state_ref(state).iseq;
+        if def_type == VM_METHOD_TYPE_CFUNC {
+            // A C method takes keywords in a Hash, which the merged arguments would need to build.
+            let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(super_cme)) };
+            let argc = args.len() - 1 + unsafe { vm_ci_argc(caller_ci) } as usize;
+            if caller_flags & VM_CALL_KWARG != 0 {
+                return Err(SendForwardComplexArgs);
+            }
+            if cfunc_argc < -1 {
+                return Err(SuperNotOptimizedMethodType(MethodType::Cfunc));
+            }
+            if cfunc_argc >= 0 && argc != cfunc_argc as usize {
+                return Err(ArgcParamMismatch);
+            }
+            if get_option!(stats) && ZJITState::get_method_annotations().get_cfunc_properties(super_cme).is_none() {
+                self.count_not_annotated_cfunc(block, insn_id, super_cme);
+            }
+
+            // Commit to the direct call. A guard miss re-executes the `invokesuperforward` in the interpreter.
+            let (_, merged_args) = self.load_forwarded_args(block, frame_iseq, caller_ci, &args[..args.len() - 1]);
+            self.push_insn(block, Insn::GuardBitEquals {
+                val: ci_opnd,
+                expected: Const::Value(caller_ci_value),
+                reason: Box::new(SideExitReason::GuardForwardedCallInfo),
+                state,
+                recompile: Some(Recompile),
+            });
+            let block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_iseq, frame_known, false);
+            let call_state = {
+                let new_state = self.frame_state(state).with_replaced_args(&merged_args, args.len());
+                self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) })
+            };
+            let replacement = self.emit_super_cfunc_call(block, recv, cd, merged_args, super_cme, call_state, state);
+            self.make_equal_to(insn_id, replacement);
+            return Ok(block);
+        }
         if def_type != VM_METHOD_TYPE_ISEQ {
             return Err(SuperNotOptimizedMethodType(MethodType::from(def_type)));
         }
@@ -8106,7 +8118,6 @@ impl Function {
             return Err(SendForwardComplexArgs);
         }
 
-        let frame_iseq = self.frame_state_ref(state).iseq;
         let (_, merged_args) = self.load_forwarded_args(block, frame_iseq, caller_ci, &args[..args.len() - 1]);
         let kwarg = unsafe { rb_vm_ci_kwarg(caller_ci) };
         let caller_args = CallerArguments {

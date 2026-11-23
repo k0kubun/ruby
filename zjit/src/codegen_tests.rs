@@ -15751,3 +15751,54 @@ fn test_inlined_invokesuper_with_literal_block() {
         "), @"[21, 21, 21]");
     });
 }
+
+#[test]
+fn test_invokesuperforward_to_cfunc() {
+    // Like MonitorMixin#initialize
+    assert_snapshot!(inspect("
+        module SuperFwdCfuncMod
+          def initialize(...)
+            super
+            @initialized = true
+          end
+          attr_reader :initialized
+        end
+        class SuperFwdCfuncClass
+          include SuperFwdCfuncMod
+        end
+        r = 5.times.map { SuperFwdCfuncClass.new.initialized }.uniq
+        r + [(SuperFwdCfuncClass.new(1) rescue $!.message)]
+    "), @r#"[true, "wrong number of arguments (given 1, expected 0)"]"#);
+}
+
+#[test]
+fn test_invokesuperforward_to_variadic_cfunc() {
+    assert_snapshot!(inspect("
+        class SuperFwdVariadicArray < Array
+          def push(...) = super
+        end
+        5.times.map { a = SuperFwdVariadicArray.new; a.push(1, 2); a.push; a.push(*[0, 3]); a.to_a }.uniq
+    "), @"[[1, 2, 0, 3]]");
+}
+
+#[test]
+fn test_invokesuperforward_to_cfunc_with_kwargs() {
+    assert_snapshot!(inspect(r#"
+        class SuperFwdKwString < String
+          def initialize(...) = super
+        end
+        5.times.flat_map { [SuperFwdKwString.new("a", capacity: 10), SuperFwdKwString.new("b")] }.uniq
+    "#), @r#"["a", "b"]"#);
+}
+
+#[test]
+fn test_invokesuperforward_to_cfunc_passes_frame_block() {
+    assert_snapshot!(inspect("
+        class SuperFwdCfuncBlock < Array
+          def each(...) = super
+        end
+        a = SuperFwdCfuncBlock[1, 2]
+        r = 5.times.map { a.each.to_a }.uniq
+        r + 5.times.map { s = 0; a.each { |x| s += x }; s }.uniq
+    "), @"[[1, 2], 3]");
+}
