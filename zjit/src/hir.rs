@@ -9188,20 +9188,14 @@ impl Function {
             return;
         }
         for block in self.take_reverse_post_order() {
-            // Most instructions are pushed back, so reserve room for them upfront
-            let capacity = self.blocks[block].insns.len();
-            let old_insns = std::mem::replace(&mut self.blocks[block].insns, Vec::with_capacity(capacity));
-            assert!(self.blocks[block].insns.is_empty());
-            for insn_id in old_insns {
-                match self.resolve(insn_id).insn(self) {
-                    &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } => {
-                        self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile) });
-                        // SideExit is a terminator; don't add remaining instructions
-                        break;
-                    }
-                    _ => {
-                        self.push_insn_id(block, insn_id);
-                    }
+            // Rewrite the block in place: most blocks have no such send
+            for idx in 0..self.blocks[block].insns.len() {
+                let insn_id = self.blocks[block].insns[idx];
+                if let &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } = self.resolve(insn_id).insn(self) {
+                    // SideExit is a terminator; drop the remaining instructions
+                    self.blocks[block].insns.truncate(idx);
+                    self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile) });
+                    break;
                 }
             }
         }
