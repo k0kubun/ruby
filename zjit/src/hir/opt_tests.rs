@@ -16574,28 +16574,12 @@ mod hir_opt_tests {
           v46:ObjectSubclass[class_exact:D] = ObjectAllocClass D:VALUE(0x1008)
           PatchPoint NoSingletonClass(D@0x1008)
           PatchPoint MethodRedefined(D@0x1008, initialize@0x1038, cme:0x1040)
-          PushInlineFrame :initialize, v46 (0x1068), num_args=1
           v62:Fixnum[2] = Const Value(2)
-          PatchPoint MethodRedefined(Struct@0x1088, initialize@0x1038, cme:0x1090)
-          v76:CPtr = GetEP 0
-          v77:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_ME_CREF@0x10b8
-          v78:CallableMethodEntry[VALUE(0x1040)] = Const Value(VALUE(0x1040))
-          v79:CBool = IsBitEqual v77, v78
-          CondBranch v79, bb11(), bb10()
-        bb10():
-          v81:RubyValue = CCall v46, :rb_vm_lep_method_entry@0x10b9, v77
-          v82:CallableMethodEntry[VALUE(0x1040)] = GuardBitEquals v81, Value(VALUE(0x1040))
-          Jump bb11()
-        bb11():
-          v84:RubyValue = LoadField v76, :VM_ENV_DATA_INDEX_SPECVAL@0x10ba
-          v85:FalseClass = GuardBitEquals v84, Value(false) recompile
-          v86:CUInt64 = LoadField v46, :RBASIC_FLAGS@0x10bb
-          v87:CUInt64 = GuardNoBitsSet v86, RUBY_FL_FREEZE=CUInt64(2048)
-          v88:NilClass = Const Value(nil)
-          StoreField v46, :a@0x10bc, v15
-          StoreField v46, :b@0x10bd, v62
-          PatchPoint NoEPEscape(initialize)
-          PopInlineFrame
+          PatchPoint MethodRedefined(Struct@0x1068, initialize@0x1038, cme:0x1070)
+          v76:CUInt64 = LoadField v46, :RBASIC_FLAGS@0x1098
+          v77:CUInt64 = GuardNoBitsSet v76, RUBY_FL_FREEZE=CUInt64(2048)
+          StoreField v46, :a@0x1099, v15
+          StoreField v46, :b@0x109a, v62
           CheckInterrupts
           Return v46
         ");
@@ -30594,31 +30578,19 @@ mod hir_opt_tests {
           v25:ObjectSubclass[class_exact:Child] = GuardType v10, ObjectSubclass[class_exact:Child] recompile
           PushInlineFrame :greet, v25 (0x1040), num_args=0
           PatchPoint MethodRedefined(Parent@0x1060, greet@0x1010, cme:0x1068)
-          v48:CPtr = GetEP 0
-          v49:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_ME_CREF@0x1090
-          v50:CallableMethodEntry[VALUE(0x1018)] = Const Value(VALUE(0x1018))
-          v51:CBool = IsBitEqual v49, v50
-          CondBranch v51, bb7(), bb6()
-        bb6():
-          v53:RubyValue = CCall v25, :rb_vm_lep_method_entry@0x1091, v49
-          v54:CallableMethodEntry[VALUE(0x1018)] = GuardBitEquals v53, Value(VALUE(0x1018))
-          Jump bb7()
-        bb7():
-          v56:RubyValue = LoadField v48, :VM_ENV_DATA_INDEX_SPECVAL@0x1092
-          v57:FalseClass = GuardBitEquals v56, Value(false) recompile
-          PushInlineFrame :greet, v25 (0x1098), num_args=0
-          v69:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
-          v70:StringExact = StringCopy v69
+          PushInlineFrame :greet, v25 (0x1090), num_args=0
+          v59:StringExact[VALUE(0x10b0)] = Const Value(VALUE(0x10b0))
+          v60:StringExact = StringCopy v59
           PopInlineFrame
-          v35:StringExact[VALUE(0x10c0)] = Const Value(VALUE(0x10c0))
+          v35:StringExact[VALUE(0x10b8)] = Const Value(VALUE(0x10b8))
           v36:StringExact = StringCopy v35
-          PatchPoint NoSingletonClass(String@0x10c8)
-          PatchPoint MethodRedefined(String@0x10c8, +@0x10d0, cme:0x10d8)
-          v63:BasicObject = CCallWithFrame v70, :String#+@0x1100, v36
+          PatchPoint NoSingletonClass(String@0x10c0)
+          PatchPoint MethodRedefined(String@0x10c0, +@0x10c8, cme:0x10d0)
+          v53:BasicObject = CCallWithFrame v60, :String#+@0x10f8, v36
           PopInlineFrame
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v63
+          Return v53
         ");
     }
 
