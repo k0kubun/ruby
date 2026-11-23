@@ -15297,3 +15297,169 @@ fn test_forward_load_across_branch_join_with_store_on_one_arm() {
         r
     "#), @"[2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 2, 11, 3, 2, 11, 20]");
 }
+
+#[test]
+fn test_inlined_invokesuper_to_iseq_and_cfunc() {
+    // The inlined method's `super` is resolved with the method entry the frame is pushed with.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines("
+            class InlSuperParent
+              def foo(a) = a + 1
+            end
+            class InlSuperChild < InlSuperParent
+              def foo(a) = super(a * 10)
+            end
+            class InlSuperHash < Hash
+              def [](key) = super(key.to_sym)
+            end
+            def test(c, h) = [c.foo(1), h['k']]
+            c = InlSuperChild.new
+            h = InlSuperHash.new; h[:k] = 2
+            test(c, h)
+            test(c, h)
+        "), @"[11, 2]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_in_module_method() {
+    // A module method has a method entry for each class it's included into, whose super
+    // methods differ.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            module InlSuperMod
+              def foo = [:mod, super]
+            end
+            class InlSuperModA; def foo = :a; end
+            class InlSuperModB; def foo = :b; end
+            class InlSuperModA2 < InlSuperModA; include InlSuperMod; end
+            class InlSuperModB2 < InlSuperModB; include InlSuperMod; end
+            def test(o) = o.foo
+            a = InlSuperModA2.new
+            b = InlSuperModB2.new
+            r = [test(a), test(a)]
+            r << test(b) << test(b) << test(a)
+        "), @"[[:mod, :a], [:mod, :a], [:mod, :b], [:mod, :b], [:mod, :a]]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_from_aliased_method() {
+    // `super` in an aliased method looks up the original method name.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperAliasParent
+              def foo = :parent_foo
+              def bar = :parent_bar
+            end
+            class InlSuperAliasChild < InlSuperAliasParent
+              def foo = [:child, super]
+              alias bar foo
+            end
+            def test(o) = o.bar
+            o = InlSuperAliasChild.new
+            [test(o), test(o), test(o)]
+        "), @"[[:child, :parent_foo], [:child, :parent_foo], [:child, :parent_foo]]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_to_method_missing() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperMMParent
+              def method_missing(name, *args) = [:mm, name, *args]
+              def respond_to_missing?(*) = true
+            end
+            class InlSuperMMChild < InlSuperMMParent
+              def foo(a) = super(a)
+            end
+            def test(o) = o.foo(1)
+            o = InlSuperMMChild.new
+            [test(o), test(o), test(o)]
+        "), @"[[:mm, :foo, 1], [:mm, :foo, 1], [:mm, :foo, 1]]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_from_refinement() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits(r#"
+            class InlSuperRefined
+              def foo = "base"
+            end
+            module InlSuperRefinement
+              refine(InlSuperRefined) { def foo = "refined " + super }
+            end
+            module InlSuperRefinementClient
+              using InlSuperRefinement
+              def self.test(o) = o.foo
+            end
+            o = InlSuperRefined.new
+            [InlSuperRefinementClient.test(o), InlSuperRefinementClient.test(o), InlSuperRefinementClient.test(o)]
+        "#), @r#"["refined base", "refined base", "refined base"]"#);
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_from_block_and_define_method() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperBlockParent
+              def foo(a) = a + 1
+              def bar(a) = a + 2
+            end
+            class InlSuperBlockChild < InlSuperBlockParent
+              def foo(a) = [1].map { super(a) }
+              define_method(:bar) { |a| super(a) * 10 }
+            end
+            def test(o) = [o.foo(1), o.bar(1)]
+            o = InlSuperBlockChild.new
+            [test(o), test(o), test(o)]
+        "), @"[[[2], 30], [[2], 30], [[2], 30]]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_passes_literal_block() {
+    // A method inlined with a literal block passes the block to `super` implicitly.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperYieldParent
+              def foo = block_given? ? yield(1) : :no_block
+            end
+            class InlSuperYieldChild < InlSuperYieldParent
+              def foo = super
+            end
+            def test(o) = [o.foo { |x| x + 1 }, o.foo]
+            o = InlSuperYieldChild.new
+            [test(o), test(o), test(o)]
+        "), @"[[2, :no_block], [2, :no_block], [2, :no_block]]");
+    });
+}
+
+#[test]
+fn test_inlined_invokesuper_after_super_method_changes() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            class InlSuperChangeParent
+              def foo = :parent
+            end
+            class InlSuperChangeChild < InlSuperChangeParent
+              def foo = [:child, super]
+            end
+            def test(o) = o.foo
+            o = InlSuperChangeChild.new
+            r = [test(o), test(o)]
+            class InlSuperChangeParent
+              def foo = :redefined
+            end
+            r << test(o)
+            module InlSuperChangeMod
+              def foo = :mod
+            end
+            InlSuperChangeChild.include(InlSuperChangeMod)
+            r << test(o)
+        "), @"[[:child, :parent], [:child, :parent], [:child, :redefined], [:child, :mod]]");
+    });
+}
