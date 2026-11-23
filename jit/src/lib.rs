@@ -36,11 +36,16 @@ impl StatsAlloc {
     }
 }
 
-/// Blocks of up to this many bytes are recycled through [`SmallCache`].
-const SMALL_MAX: usize = 1024;
-/// Small blocks are rounded up to a multiple of this, which is also their alignment.
+/// Small blocks are spaced this far apart in size. It's also their alignment, which malloc()
+/// guarantees on the 64-bit platforms YJIT and ZJIT support.
 const SMALL_ALIGN: usize = 16;
-const NUM_CLASSES: usize = SMALL_MAX / SMALL_ALIGN;
+/// The smallest block size. Size classes are the usable sizes of glibc's chunks (a multiple of
+/// 16 bytes minus an 8-byte header) so that a block isn't bigger than malloc(size) would give.
+const SMALL_MIN: usize = 24;
+const NUM_CLASSES: usize = 64;
+/// Blocks of up to this many bytes are recycled through [`SmallCache`]. It's glibc's largest
+/// tcache size.
+const SMALL_MAX: usize = SMALL_MIN + (NUM_CLASSES - 1) * SMALL_ALIGN;
 /// Free bytes each size class may keep before blocks go back to the system allocator.
 const CLASS_CACHE_BYTES: usize = 32 * 1024;
 
@@ -138,18 +143,20 @@ impl SmallCache {
 /// The size class of a layout if it's served by [`SmallCache`]
 fn small_class(layout: Layout) -> Option<usize> {
     if layout.size() != 0 && layout.size() <= SMALL_MAX && layout.align() <= SMALL_ALIGN {
-        Some((layout.size() - 1) / SMALL_ALIGN)
+        // The smallest class whose class_size() fits: ceil((size - SMALL_MIN) / SMALL_ALIGN), or 0
+        Some(layout.size().saturating_sub(SMALL_MIN - SMALL_ALIGN + 1) / SMALL_ALIGN)
     } else {
         None
     }
 }
 
 fn class_size(class: usize) -> usize {
-    (class + 1) * SMALL_ALIGN
+    SMALL_MIN + class * SMALL_ALIGN
 }
 
 fn class_layout(class: usize) -> Layout {
-    // SAFETY: the size is a non-zero multiple of the alignment, which is a power of two
+    // SAFETY: the alignment is a power of two, and the size is at least the alignment,
+    // so System.alloc() uses malloc(), whose blocks have that alignment.
     unsafe { Layout::from_size_align_unchecked(class_size(class), SMALL_ALIGN) }
 }
 
@@ -237,8 +244,11 @@ mod tests {
     fn small_class_boundaries() {
         assert_eq!(small_class(layout(0, 1)), None);
         assert_eq!(small_class(layout(1, 1)), Some(0));
-        assert_eq!(small_class(layout(16, 8)), Some(0));
-        assert_eq!(small_class(layout(17, 8)), Some(1));
+        assert_eq!(small_class(layout(24, 8)), Some(0));
+        assert_eq!(small_class(layout(25, 8)), Some(1));
+        assert_eq!(small_class(layout(40, 16)), Some(1));
+        assert_eq!(small_class(layout(41, 8)), Some(2));
+        assert_eq!(SMALL_MAX, 1032);
         assert_eq!(small_class(layout(SMALL_MAX, 16)), Some(NUM_CLASSES - 1));
         assert_eq!(small_class(layout(SMALL_MAX + 1, 8)), None);
         assert_eq!(small_class(layout(64, 32)), None);
@@ -254,8 +264,8 @@ mod tests {
             // A block of the class has class_size() bytes
             p.write_bytes(0xff, class_size(class));
             cache.dealloc(p, class, 40);
-            // 33..=48 bytes share a class
-            assert_eq!(small_class(layout(48, 16)), Some(class));
+            // 25..=40 bytes share a class
+            assert_eq!(small_class(layout(25, 16)), Some(class));
             let q = cache.alloc(class, 40);
             assert_eq!(p, q);
             assert_ne!(cache.alloc(class, 40), p);
@@ -273,7 +283,8 @@ mod tests {
                 cache.dealloc(p, class, 40);
             }
         }
-        assert_eq!(cache.try_with(|lists| lists.free_bytes[class]), Some(CLASS_CACHE_BYTES));
+        let free_bytes = cache.try_with(|lists| lists.free_bytes[class]).unwrap();
+        assert!(free_bytes <= CLASS_CACHE_BYTES && free_bytes + class_size(class) > CLASS_CACHE_BYTES);
     }
 
     #[test]
@@ -331,9 +342,9 @@ mod tests {
         unsafe {
             let p = GLOBAL_ALLOCATOR.alloc(layout(20, 8));
             p.write_bytes(7, 20);
-            // Same class: the block already has 32 bytes
-            assert_eq!(GLOBAL_ALLOCATOR.realloc(p, layout(20, 8), 30), p);
-            let big = GLOBAL_ALLOCATOR.realloc(p, layout(30, 8), 4000);
+            // Same class: the block already has 24 bytes
+            assert_eq!(GLOBAL_ALLOCATOR.realloc(p, layout(20, 8), 24), p);
+            let big = GLOBAL_ALLOCATOR.realloc(p, layout(24, 8), 4000);
             assert!(std::slice::from_raw_parts(big, 20).iter().all(|&b| b == 7));
             let small = GLOBAL_ALLOCATOR.realloc(big, layout(4000, 8), 8);
             assert!(std::slice::from_raw_parts(small, 8).iter().all(|&b| b == 7));
