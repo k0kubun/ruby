@@ -3413,6 +3413,8 @@ struct InlineFrame {
     recv: InsnId,
     /// The lexical scope of an inlined method frame. None if unknown, e.g. for a block.
     cref: Option<VALUE>,
+    /// The method entry of an inlined method frame. None for a block.
+    cme: Option<*const rb_callable_method_entry_t>,
 }
 
 /// How an instruction between a PushInlineFrame/PopInlineFrame pair uses the frame.
@@ -4264,6 +4266,18 @@ impl Function {
             None => Some(self.load_self(block)),
             Some(caller) => self.inline_frames.get(&caller).map(|frame| frame.recv),
         }
+    }
+
+    /// Return the method entry of the inlined method frame that `state` belongs to if the
+    /// frame was pushed without a block. Such a frame's method entry and block handler are
+    /// known statically, so they don't need to be read from the frame or profiled.
+    fn inlined_method_frame_cme_without_block(&self, state: InsnId) -> Option<*const rb_callable_method_entry_t> {
+        let frame = self.inline_frames.get(&self.frame_state_ref(state).caller()?)?;
+        // The inliner rejects calls passing a block handler other than a literal block.
+        if frame.blockiseq.is_some() {
+            return None;
+        }
+        frame.cme
     }
 
     /// Return whether the representative of `insn_id` is a `SendDirect` without
@@ -7452,6 +7466,7 @@ impl Function {
                             mid: ID,
                             state: InsnId,
                             local_iseq: IseqPtr,
+                            frame_known: bool,
                         ) -> BlockId {
                             fun.push_insn(block, Insn::PatchPoint {
                                 invariant: Invariant::MethodRedefined {
@@ -7461,6 +7476,10 @@ impl Function {
                                 },
                                 state
                             });
+                            // An inlined method frame has the method entry it was pushed with and no block.
+                            if frame_known {
+                                return block;
+                            }
 
                             // Get the EP of the ISeq of the containing method, or "local level", skipping over block-level EPs.
                             // Equivalent of GET_LEP() macro. The iseq is the FrameState's, not the
@@ -7537,33 +7556,44 @@ impl Function {
                             continue;
                         }
 
-                        // Get the profiled CME from the current method.
-                        if self.profiles.is_none() {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperNoProfiles);
-                            continue;
-                        }
+                        // In an inlined method frame, the current method is the inlined one. Its
+                        // `super` may not be profiled, e.g. when the method has been called only
+                        // from JIT code.
+                        let inlined_frame_cme = self.inlined_method_frame_cme_without_block(state);
+                        let frame_known = inlined_frame_cme.is_some();
+                        let current_cme = if let Some(cme) = inlined_frame_cme {
+                            cme
+                        } else {
+                            // Get the profiled CME from the current method.
+                            if self.profiles.is_none() {
+                                self.push_insn_id(block, insn_id);
+                                self.set_dynamic_send_reason(insn_id, SuperNoProfiles);
+                                continue;
+                            }
 
-                        // Use frame_state_iseq so that an inlined super call looks up its
-                        // profiled CME against the callee's payload rather than the outer
-                        // compilation's. The runtime guard walks from the live CFP, which is
-                        // the callee's CFP for inlined code, so the profile lookup must agree.
-                        let local_payload = get_or_create_iseq_payload(frame_state_iseq);
-                        let Some(current_cme) = local_payload.profile.get_super_method_entry(frame_state_insn_idx) else {
-                            self.push_insn_id(block, insn_id);
+                            // Use frame_state_iseq so that an inlined super call looks up its
+                            // profiled CME against the callee's payload rather than the outer
+                            // compilation's. The runtime guard walks from the live CFP, which is
+                            // the callee's CFP for inlined code, so the profile lookup must agree.
+                            let local_payload = get_or_create_iseq_payload(frame_state_iseq);
+                            let Some(current_cme) = local_payload.profile.get_super_method_entry(frame_state_insn_idx) else {
+                                self.push_insn_id(block, insn_id);
+                                if local_payload.profile.num_call_samples(frame_state_insn_idx, YARVINSN_invokesuper) == Some(0) {
+                                    self.set_dynamic_send_reason(insn_id, SuperNoProfiles);
+                                } else {
+                                    // The call is at least polymorphic and possibly megamorphic.
+                                    self.set_dynamic_send_reason(insn_id, SuperPolymorphic);
+                                }
+                                continue;
+                            };
 
-                            // The absence of the super CME could be due to a missing profile, but
-                            // if we've made it this far the value would have been deleted, indicating
-                            // that the call is at least polymorphic and possibly megamorphic.
-                            self.set_dynamic_send_reason(insn_id, SuperPolymorphic);
-                            continue;
+                            if local_payload.profile.super_saw_block(frame_state_insn_idx) {
+                                self.push_insn_id(block, insn_id);
+                                self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
+                                continue;
+                            }
+                            current_cme
                         };
-
-                        if local_payload.profile.super_saw_block(frame_state_insn_idx) {
-                            self.push_insn_id(block, insn_id);
-                            self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
-                            continue;
-                        }
 
                         // Get defined_class and method ID from the profiled CME.
                         let current_defined_class = unsafe { (*current_cme).defined_class };
@@ -7624,7 +7654,7 @@ impl Function {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
-                            block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                            block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
@@ -7663,7 +7693,7 @@ impl Function {
                                         self.set_dynamic_send_reason(insn_id, ArgcParamMismatch);
                                         continue;
                                     }
-                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -7713,7 +7743,7 @@ impl Function {
 
                                 // Variadic C function: func(int argc, VALUE *argv, VALUE recv)
                                 -1 => {
-                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq);
+                                    block = emit_super_call_guards(self, block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known);
 
                                     // Try inlining the cfunc into HIR
                                     let tmp_block = self.new_block(u32::MAX);
@@ -8321,6 +8351,7 @@ impl Function {
                     inline_pass: self.inline_pass,
                     recv,
                     cref: frame_cref,
+                    cme: Some(cme),
                 });
 
                 let args = match send.insn(self) {
@@ -8737,6 +8768,7 @@ impl Function {
             inline_pass: self.inline_pass,
             recv: block_self,
             cref: None,
+            cme: None,
         });
 
         // Map the block body entry params [self, local0, local1, ...] to caller values.
