@@ -3108,8 +3108,9 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
     // case: pass `...` to a `...` callee, which sets the caller's callinfo into the callee's `...`
     // local variable. It needs to be specialized differently.
     VM_CALL_FORWARDING
-    // We only support `def foo(...)` cases for now.
-    | VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG;
+    // We only support `def foo(...)` cases for now. A caller splat is passed unexpanded with the
+    // callinfo like the interpreter does, but not when it's expanded by a CallerSplat.
+    | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG;
 
 unsafe extern "C" {
     fn rb_vm_symbol_block_arg_refined_p(sym: VALUE) -> usize;
@@ -3126,7 +3127,7 @@ fn can_direct_send(iseq: *const rb_iseq_t, caller_args: &CallerArguments, has_bl
 
     use Counter::*;
     let forwardable = 0 != params.flags.forwardable();
-    if forwardable && caller_args.flags & FORWARDABLE_CALLEE_BLOCKERS != 0
+    if forwardable && (caller_args.flags & FORWARDABLE_CALLEE_BLOCKERS != 0 || caller_splat.is_some())
                                        { count_failure(complex_arg_pass_param_forwardable) }
     // A caller **hash would have to be split into the callee's keywords and a copy for **kwrest.
     // Explicit caller keywords are known statically, so they can be packed into a new Hash.
@@ -7566,8 +7567,10 @@ impl Function {
                                 caller_args.kwrest_hash = Some(KwrestHash { hash, dup });
                             }
                             // Expand a caller splat, e.g. of `def foo(*) = super`, with its profiled length.
+                            // A forwardable method takes it unexpanded with the callinfo instead.
                             let caller_splat = match caller_args.splat_arg_idx {
                                 None => None,
+                                Some(_) if unsafe { super_iseq.params() }.flags.forwardable() != 0 => None,
                                 Some(arg_idx) => {
                                     let Some(length) = self.monomorphic_caller_splat_length(state) else {
                                         self.push_insn_id(block, insn_id);
