@@ -949,11 +949,12 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         &Insn::Send { block: Some(BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_) | BlockHandler::FrameBlock(_)), .. } => unreachable!("BlockArgProc, BlockArgSymbol, and FrameBlock only appear in direct calls"),
         &Insn::SendForward { cd, blockiseq, state, reason, .. } => gen_send_forward(jit, asm, function, cd, blockiseq, &function.frame_state(state), reason),
         Insn::SendDirect(insn) => {
-            let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, state, exit_state, .. } = &**insn;
+            let SendDirectData { cd, cme, iseq, recv, args, kw_bits, jit_entry_idx, block, forwarded_ci, state, exit_state, .. } = &**insn;
             gen_send_iseq_direct(
                 cb, jit, asm,
                 function, *cd, *cme, *iseq, opnd!(recv), opnds!(args),
                 *kw_bits, *jit_entry_idx, &function.frame_state(*state), &function.frame_state(*exit_state), block.map(|bh| lower_block_handler(jit, bh)),
+                *forwarded_ci,
             )
         }
         Insn::PushInlineFrame { cme, iseq, recv, num_args, block, state, exit_state, .. } => {
@@ -2409,6 +2410,7 @@ fn gen_send_iseq_direct(
     state: &FrameState,
     exit_state: &FrameState,
     block: Option<lir::BlockHandler>,
+    forwarded_ci: Option<VALUE>,
 ) -> lir::Opnd {
     gen_incr_counter(asm, Counter::iseq_optimized_send_count);
 
@@ -2418,7 +2420,7 @@ fn gen_send_iseq_direct(
     let forwarding = unsafe { rb_get_iseq_flags_forwardable(iseq) };
     let forwarded_argc = if forwarding { args.len() } else { 0 };
     // Bake the callinfo as a GC offset since a non-packed (`vm_ci_packed_p`) callinfo is a movable imemo_callinfo.
-    let forwarded_ci = Opnd::Value(unsafe { (*cd).ci }.into());
+    let forwarded_ci = Opnd::Value(forwarded_ci.unwrap_or_else(|| unsafe { (*cd).ci }.into()));
     let local_size = unsafe { get_iseq_body_local_table_size(iseq) }.to_usize() + forwarded_argc;
     let stack_growth = state.stack_size() + local_size + unsafe { get_iseq_body_stack_max(iseq) }.to_usize();
     gen_stack_overflow_check(jit, asm, function, exit_state, stack_growth);

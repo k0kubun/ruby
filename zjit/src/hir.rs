@@ -1030,6 +1030,9 @@ pub struct SendDirectData {
     pub kw_bits: u32,
     pub jit_entry_idx: u16,
     pub block: Option<BlockHandler>,
+    /// The callinfo for the `...` parameter of a forwardable callee if it's not the one of `cd`,
+    /// i.e. the caller's callinfo that `bar(...)` or `super(...)` passes on as is
+    pub forwarded_ci: Option<VALUE>,
     /// Frame state with the callee's normalized arguments; don't exit with it
     pub state: InsnId,
     /// Snapshot of the original send, for exits that re-execute it in the interpreter
@@ -5698,7 +5701,7 @@ impl Function {
             self.emit_send_direct_args(block, call, &[size], state, state);
         Some(self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
             recv, cd, cme: helper_cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state,
-            block: Some(BlockHandler::BlockIseq(blockiseq)),
+            block: Some(BlockHandler::BlockIseq(blockiseq)), forwarded_ci: None,
         }))))
     }
 
@@ -5881,7 +5884,7 @@ impl Function {
             Target::Iseq(iseq, call) => {
                 let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                     self.emit_send_direct_args(call_block, call, args, state, state);
-                self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block })))
+                self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block, forwarded_ci: None })))
             }
             Target::Ivar(id) => self.push_insn(call_block, Insn::GetIvar { self_val: recv, id, ic: std::ptr::null(), state }),
             Target::Cfunc => self.emit_cfunc_call_on_method_entry(call_block, recv, cd, cme, send_block, args, state),
@@ -6037,7 +6040,7 @@ impl Function {
             self.push_insn(call_block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme }, state });
             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                 self.emit_send_direct_args(call_block, call, rest, send_frame_state, state);
-            let result = self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block })));
+            let result = self.try_inline_send_direct(call_block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block, forwarded_ci: None })));
             match join_block {
                 Some(join_block) => { self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] })); }
                 None => { self.make_equal_to(insn_id, result); return Some(call_block); }
@@ -6971,7 +6974,7 @@ impl Function {
                             }
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state, state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block })));
+                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block, forwarded_ci: None })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_BMETHOD {
                             let procv = unsafe { rb_get_def_bmethod_proc((*cme).def) };
@@ -7013,7 +7016,7 @@ impl Function {
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, send_frame_state, state);
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: None })));
+                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData { recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: None, forwarded_ci: None })));
                             self.make_equal_to(insn_id, replacement);
                         } else if !has_block && def_type == VM_METHOD_TYPE_IVAR && args.is_empty() {
                             // Check singleton class assumption first, before emitting other patchpoints
@@ -7608,6 +7611,7 @@ impl Function {
                                 state: send_state,
                                 exit_state: state,
                                 block: blockiseq.map(BlockHandler::BlockIseq),
+                                forwarded_ci: None,
                             })));
                             self.make_equal_to(insn_id, replacement);
 
@@ -8046,6 +8050,21 @@ impl Function {
         });
     }
 
+    /// The callinfo to give the `...` parameter of `iseq` if it's forwardable, when a `bar(...)` or
+    /// `super(...)` with `args` (including the callinfo operand) calls it. Like the interpreter
+    /// (vm_callee_setup_arg()), pass on the caller's callinfo when the call has no leading arguments.
+    /// Otherwise, there is no callinfo describing the merged arguments to give it.
+    fn forwarded_ci_for_callee(&self, iseq: IseqPtr, ci: &ForwardedCallInfo, num_args: usize) -> Result<Option<VALUE>, SendFallbackReason> {
+        if unsafe { iseq.params() }.flags.forwardable() == 0 {
+            return Ok(None);
+        }
+        // Passing on the profiled callinfo requires it to be guarded as a whole.
+        if num_args != 1 || ci.args_shape_only {
+            return Err(SendForwardComplexArgs);
+        }
+        Ok(Some(ci.caller_ci_value))
+    }
+
     /// Load the arguments that the call that entered the method frame of `frame_iseq` passed, and
     /// append them to the explicit arguments of a `bar(...)` or `super(...)` (`args` without its
     /// callinfo operand). Return the EP of the frame and the merged arguments.
@@ -8108,12 +8127,8 @@ impl Function {
             return Err(SendNotOptimizedMethodType(MethodType::from(def_type)));
         }
         let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
-        // A forwardable target would take a callinfo describing the merged arguments in its `...`
-        // local, and there is no such callinfo to give it.
         let params = unsafe { iseq.params() };
-        if params.flags.forwardable() != 0 {
-            return Err(SendForwardComplexArgs);
-        }
+        let callee_forwarded_ci = self.forwarded_ci_for_callee(iseq, &forwarded_ci, args.len())?;
 
         let (ep, merged_args) = self.load_forwarded_args(block, frame_iseq, caller_ci, &args[..args.len() - 1]);
         // The merged callinfo of vm_caller_setup_fwd_args(): the caller's arguments and keywords
@@ -8163,6 +8178,7 @@ impl Function {
             self.emit_send_direct_args(block, call, &merged_args, send_frame_state, state);
         let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
             recv, cd, cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: send_block,
+            forwarded_ci: callee_forwarded_ci,
         })));
         self.make_equal_to(insn_id, replacement);
         Ok(())
@@ -8222,11 +8238,7 @@ impl Function {
             return Err(SuperNotOptimizedMethodType(MethodType::from(def_type)));
         }
         let iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-        // A forwardable target would take a callinfo describing the merged arguments in its `...`
-        // local, and there is no such callinfo to give it.
-        if unsafe { iseq.params() }.flags.forwardable() != 0 {
-            return Err(SendForwardComplexArgs);
-        }
+        let callee_forwarded_ci = self.forwarded_ci_for_callee(iseq, &forwarded_ci, args.len())?;
 
         let (_, merged_args) = self.load_forwarded_args(block, frame_iseq, caller_ci, &args[..args.len() - 1]);
         let kwarg = unsafe { rb_vm_ci_kwarg(caller_ci) };
@@ -8253,6 +8265,7 @@ impl Function {
             self.emit_send_direct_args(block, call, &merged_args, send_frame_state, state);
         let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
             recv, cd, cme: super_cme, iseq, args: send_args, kw_bits, jit_entry_idx, state: send_state, exit_state: state, block: None,
+            forwarded_ci: callee_forwarded_ci,
         })));
         self.make_equal_to(insn_id, replacement);
         Ok(block)

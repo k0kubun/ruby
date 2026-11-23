@@ -16029,3 +16029,61 @@ fn test_invokesuper_with_kw_splat_type_changes() {
         r + [o.foo(nil), (o.foo(1) rescue $!.class)]
     "#), @"[{a: 1}, {}, TypeError]");
 }
+
+#[test]
+fn test_invokesuperforward_to_forwardable_method() {
+    // Like `def initialize(...)` in the modules of a Rails controller
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperFwdChainBase
+          def initialize(a, b = :b) = @ab = [a, b]
+          attr_reader :ab
+        end
+        module SuperFwdChainA
+          def initialize(...) = super
+        end
+        module SuperFwdChainB
+          def initialize(...) = super
+        end
+        class SuperFwdChain < SuperFwdChainBase
+          include SuperFwdChainA
+          include SuperFwdChainB
+        end
+        def test(a) = SuperFwdChain.new(a).ab
+        test(1); test(1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(1), test(2)]"), @"[[1, :b], [2, :b]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+    assert_snapshot!(inspect("[SuperFwdChain.new(1, 2).ab, SuperFwdChain.new(3).ab, (SuperFwdChain.new rescue $!.class)]"), @"[[1, 2], [3, :b], ArgumentError]");
+}
+
+#[test]
+fn test_send_forward_to_forwardable_method() {
+    assert_snapshot!(inspect("
+        def fwd_chain_target(a, b = :b) = [a, b]
+        def fwd_chain_inner(...) = fwd_chain_target(...)
+        def fwd_chain_outer(...) = fwd_chain_inner(...)
+        r = 5.times.map { fwd_chain_outer(1) }.uniq
+        r + 5.times.flat_map { [fwd_chain_outer(1, 2), fwd_chain_outer(3)] }.uniq
+    "), @"[[1, :b], [1, 2], [3, :b]]");
+}
+
+#[test]
+fn test_invokesuperforward_with_leading_args_to_forwardable_method() {
+    assert_snapshot!(inspect("
+        class SuperFwdLeadChainBase
+          def foo(*args) = args
+        end
+        class SuperFwdLeadChainMid < SuperFwdLeadChainBase
+          def foo(...) = super
+        end
+        class SuperFwdLeadChain < SuperFwdLeadChainMid
+          def foo(...) = super(0, ...)
+        end
+        o = SuperFwdLeadChain.new
+        5.times.flat_map { [o.foo(1), o.foo(1, 2)] }.uniq
+    "), @"[[0, 1], [0, 1, 2]]");
+}
