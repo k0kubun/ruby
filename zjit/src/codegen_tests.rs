@@ -16294,3 +16294,56 @@ fn test_invokesuper_to_attr_writer_on_frozen_object() {
         r + [begin; frozen.x = 1; rescue => e; e.class; end]
     "), @"[2, 2, 2, 2, 2, FrozenError]");
 }
+
+#[test]
+fn test_invokesuper_passes_frame_block_to_iseq() {
+    // Like ActiveRecord::Railties::ControllerRuntime#cleanup_view_runtime
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperFrameBlockParent
+          def foo(a) = block_given? ? [:block, yield(a)] : [:no_block, a]
+        end
+        class SuperFrameBlockChild < SuperFrameBlockParent
+          def foo(a) = super
+        end
+        SuperFrameBlockO = SuperFrameBlockChild.new
+        def test(a) = [SuperFrameBlockO.foo(a) { _1 * 10 }, SuperFrameBlockO.foo(a)]
+        test(1); test(1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(2), test(3)]"), @"[[[:block, 20], [:no_block, 2]], [[:block, 30], [:no_block, 3]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_invokesuper_passes_frame_block_break_and_proc() {
+    assert_snapshot!(inspect("
+        class SuperFrameBlockThrowParent
+          def foo = [:parent, yield]
+        end
+        class SuperFrameBlockThrowChild < SuperFrameBlockThrowParent
+          def foo = super
+        end
+        o = SuperFrameBlockThrowChild.new
+        pr = proc { :proc }
+        5.times.map { [o.foo { break :broke }, o.foo { :value }, o.foo(&pr), (o.foo rescue $!.class)] }.uniq
+    "), @"[[:broke, [:parent, :value], [:parent, :proc], LocalJumpError]]");
+}
+
+#[test]
+fn test_invokesuper_frame_block_to_method_without_block() {
+    assert_snapshot!(inspect(r#"
+        class SuperFrameBlockNoBlockParent
+          def foo(a) = a
+          def bar(a, &nil) = a
+        end
+        class SuperFrameBlockNoBlockChild < SuperFrameBlockNoBlockParent
+          def foo(a) = super
+          def bar(a) = super
+        end
+        o = SuperFrameBlockNoBlockChild.new
+        5.times.map { [o.foo(1) { }, o.foo(2), (o.bar(3) { } rescue $!.class), o.bar(4)] }.uniq
+    "#), @"[[1, 2, ArgumentError, 4]]");
+}
