@@ -3517,7 +3517,21 @@ struct ForwardedCallInfo {
     caller_ci_value: VALUE,
     caller_ci: *const rb_callinfo,
     caller_flags: u32,
+    /// Whether callinfos that pass arguments like `caller_ci_value` but differ in other bits were
+    /// seen, so that only how arguments are passed should be guarded
+    args_shape_only: bool,
 }
+
+/// The bits of a packed callinfo (`vm_ci_packed_p`) that describe how arguments are passed: the
+/// argc and the flags of argument kinds. See CI_EMBED_* in vm_callinfo.h.
+const PACKED_CI_ARGS_SHAPE_MASK: usize = {
+    const ARGC_SHIFT: u32 = 1; // CI_EMBED_ARGC_SHFT
+    const ARGC_MASK: usize = (1 << 15) - 1; // CI_EMBED_ARGC_MASK
+    const FLAG_SHIFT: u32 = 16; // CI_EMBED_FLAG_SHFT
+    const ARGS_FLAGS: u32 = VM_CALL_ARGS_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_KWARG | VM_CALL_KW_SPLAT
+        | VM_CALL_KW_SPLAT_MUT | VM_CALL_ARGS_SPLAT_MUT | VM_CALL_FORWARDING;
+    (ARGC_MASK << ARGC_SHIFT) | ((ARGS_FLAGS as usize) << FLAG_SHIFT)
+};
 
 struct CallerArguments<'a> {
     /// Argument values in the order stored by the original Send.
@@ -7912,8 +7926,18 @@ impl Function {
         let ci_summary = self.profiles.as_ref()
             .map(|profiles| self.profile_summary(profiles, ci_opnd, state))
             .unwrap_or_else(TypeDistributionSummary::empty);
-        if !ci_summary.is_monomorphic() {
-            return Err(SendForwardPolymorphicCallInfo);
+        // Callers of the same method may pass callinfos that differ in the method ID or in flags
+        // that don't change how arguments are passed, e.g. `Foo.new` (opt_new) and `Foo.send(:new)`
+        // calling `def initialize(...)`. Guard only how arguments are passed then.
+        let args_shape_only = !ci_summary.is_monomorphic();
+        if args_shape_only {
+            let args_shape = |ci: VALUE| ci.0 & PACKED_CI_ARGS_SHAPE_MASK;
+            let first_shape = args_shape(ci_summary.bucket(0).class());
+            if !(ci_summary.is_polymorphic() || ci_summary.is_skewed_polymorphic())
+                || !ci_summary.buckets().iter().filter(|ty| !ty.is_empty()).all(|ty| args_shape(ty.class()) == first_shape)
+            {
+                return Err(SendForwardPolymorphicCallInfo);
+            }
         }
         // Only packed callinfos are profiled, so that the guard below is a comparison with an immediate.
         let caller_ci_value = ci_summary.bucket(0).class();
@@ -7923,7 +7947,35 @@ impl Function {
         if caller_flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_ARGS_BLOCKARG | VM_CALL_FORWARDING) != 0 {
             return Err(SendForwardComplexArgs);
         }
-        Ok(ForwardedCallInfo { ci_opnd, caller_ci_value, caller_ci, caller_flags })
+        Ok(ForwardedCallInfo { ci_opnd, caller_ci_value, caller_ci, caller_flags, args_shape_only })
+    }
+
+    /// Guard that the call that entered a `def foo(...)` frame passed the profiled callinfo. A miss
+    /// re-executes the `bar(...)` or `super(...)` at `state` in the interpreter.
+    fn guard_forwarded_ci(&mut self, block: BlockId, ci: &ForwardedCallInfo, state: InsnId) {
+        if !ci.args_shape_only {
+            self.push_insn(block, Insn::GuardBitEquals {
+                val: ci.ci_opnd,
+                expected: Const::Value(ci.caller_ci_value),
+                reason: Box::new(SideExitReason::GuardForwardedCallInfo),
+                state,
+                recompile: Some(Recompile),
+            });
+            return;
+        }
+        // A packed callinfo is tagged like a Fixnum. Compare its argc and argument flags.
+        let ci_fixnum = self.push_insn(block, Insn::GuardType { val: ci.ci_opnd, guard_type: types::Fixnum, state, recompile: Some(Recompile) });
+        let ci_bits = self.push_insn(block, Insn::UnboxFixnum { val: ci_fixnum });
+        let mask = (PACKED_CI_ARGS_SHAPE_MASK >> 1) as i64;
+        let mask_opnd = self.push_insn(block, Insn::Const { val: Const::CInt64(mask) });
+        let masked = self.push_insn(block, Insn::IntAnd { left: ci_bits, right: mask_opnd });
+        self.push_insn(block, Insn::GuardBitEquals {
+            val: masked,
+            expected: Const::CInt64((ci.caller_ci_value.0 >> 1) as i64 & mask),
+            reason: Box::new(SideExitReason::GuardForwardedCallInfo),
+            state,
+            recompile: Some(Recompile),
+        });
     }
 
     /// Load the arguments that the call that entered the method frame of `frame_iseq` passed, and
@@ -7957,7 +8009,8 @@ impl Function {
             return Err(SendForwardComplexArgs);
         }
 
-        let ForwardedCallInfo { ci_opnd, caller_ci_value, caller_ci, caller_flags } = self.profiled_forwarded_ci(&args, state)?;
+        let forwarded_ci = self.profiled_forwarded_ci(&args, state)?;
+        let ForwardedCallInfo { caller_ci, caller_flags, .. } = forwarded_ci;
         let frame_iseq = self.frame_state_ref(state).iseq;
 
         let (klass, profiled_type) = match self.resolve_receiver_type(recv, self.type_of(recv), state) {
@@ -8016,13 +8069,7 @@ impl Function {
         }
 
         // Commit to the direct send. A guard miss re-executes the `sendforward` in the interpreter.
-        self.push_insn(block, Insn::GuardBitEquals {
-            val: ci_opnd,
-            expected: Const::Value(caller_ci_value),
-            reason: Box::new(SideExitReason::GuardForwardedCallInfo),
-            state,
-            recompile: Some(Recompile),
-        });
+        self.guard_forwarded_ci(block, &forwarded_ci, state);
         self.push_insn(block, Insn::PatchPoint { invariant: Invariant::MethodRedefined { klass, method: mid, cme: lookup_cme }, state });
         if let Some(profiled_type) = profiled_type {
             recv = self.guard_type_recompile(block, recv, Type::from_profiled_type(profiled_type), state, Recompile);
@@ -8070,7 +8117,8 @@ impl Function {
         {
             return Err(SuperComplexArgsPass);
         }
-        let ForwardedCallInfo { ci_opnd, caller_ci_value, caller_ci, caller_flags } = self.profiled_forwarded_ci(&args, state)?;
+        let forwarded_ci = self.profiled_forwarded_ci(&args, state)?;
+        let ForwardedCallInfo { caller_ci, caller_flags, .. } = forwarded_ci;
         let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = self.resolve_super_target(state, None)?;
         let frame_iseq = self.frame_state_ref(state).iseq;
         if def_type == VM_METHOD_TYPE_CFUNC {
@@ -8092,13 +8140,7 @@ impl Function {
 
             // Commit to the direct call. A guard miss re-executes the `invokesuperforward` in the interpreter.
             let (_, merged_args) = self.load_forwarded_args(block, frame_iseq, caller_ci, &args[..args.len() - 1]);
-            self.push_insn(block, Insn::GuardBitEquals {
-                val: ci_opnd,
-                expected: Const::Value(caller_ci_value),
-                reason: Box::new(SideExitReason::GuardForwardedCallInfo),
-                state,
-                recompile: Some(Recompile),
-            });
+            self.guard_forwarded_ci(block, &forwarded_ci, state);
             let block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_iseq, frame_known, false);
             let call_state = {
                 let new_state = self.frame_state(state).with_replaced_args(&merged_args, args.len());
@@ -8133,13 +8175,7 @@ impl Function {
         let call = self.build_send_direct_args(&caller_args, None, iseq, false).map_err(|failure| failure.reason)?;
 
         // Commit to the direct send. A guard miss re-executes the `invokesuperforward` in the interpreter.
-        self.push_insn(block, Insn::GuardBitEquals {
-            val: ci_opnd,
-            expected: Const::Value(caller_ci_value),
-            reason: Box::new(SideExitReason::GuardForwardedCallInfo),
-            state,
-            recompile: Some(Recompile),
-        });
+        self.guard_forwarded_ci(block, &forwarded_ci, state);
         let block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_iseq, frame_known, false);
         let send_frame_state = {
             let new_state = self.frame_state(state).with_replaced_args(&merged_args, args.len());
