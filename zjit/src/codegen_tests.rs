@@ -16131,3 +16131,123 @@ fn test_invokesuper_with_splat_to_forwardable_method() {
         r + 5.times.flat_map { [o.foo(1), o.foo(1, 2, 3)] }.uniq
     "), @"[[1, [2], :none], [1, [], :none], [1, [2, 3], :none]]");
 }
+
+#[test]
+fn test_polymorphic_invokesuper_in_module_method() {
+    // Like ActiveSupport::Messages::Rotator, included in MessageVerifier and MessageEncryptor
+    // Profile both classes before compiling
+    set_call_threshold(3);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        module PolySuperRotator
+          def initialize(*args, on_rotation: nil, **options)
+            super(*args, **options)
+          end
+        end
+        class PolySuperVerifierBase
+          def initialize(secret, **options) = @r = [:verifier, secret, options]
+          attr_reader :r
+        end
+        class PolySuperEncryptorBase
+          def initialize(secret, sign_secret = nil, **options) = @r = [:encryptor, secret, sign_secret, options]
+          attr_reader :r
+        end
+        class PolySuperVerifier < PolySuperVerifierBase; include PolySuperRotator; end
+        class PolySuperEncryptor < PolySuperEncryptorBase; include PolySuperRotator; end
+        def test(i) = [PolySuperVerifier.new(i, a: 1).r, PolySuperEncryptor.new(i, a: 2).r]
+        test(0); test(0)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(1), test(2)]"),
+        @"[[[:verifier, 1, {a: 1}], [:encryptor, 1, nil, {a: 2}]], [[:verifier, 2, {a: 1}], [:encryptor, 2, nil, {a: 2}]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_polymorphic_invokesuper_fallback() {
+    assert_snapshot!(inspect(r#"
+        module PolySuperFallbackMod
+          def foo(a) = [:mod, super(a)]
+        end
+        class PolySuperFallbackA; def foo(a) = [:a, a]; end
+        class PolySuperFallbackB; def foo(a) = [:b, a]; end
+        class PolySuperFallbackC; def foo(a) = [:c, a]; end
+        class PolySuperFallbackD < Struct.new(:x); end
+        class PolySuperFallbackA2 < PolySuperFallbackA; include PolySuperFallbackMod; end
+        class PolySuperFallbackB2 < PolySuperFallbackB; include PolySuperFallbackMod; end
+        class PolySuperFallbackC2 < PolySuperFallbackC; include PolySuperFallbackMod; end
+        class PolySuperFallbackD2 < PolySuperFallbackD
+          include PolySuperFallbackMod
+          def initialize = super(1)
+        end
+        objs = [PolySuperFallbackA2.new, PolySuperFallbackB2.new]
+        r = 5.times.flat_map { objs.map { _1.foo(1) } }.uniq
+        # A class that wasn't profiled takes the fallback, and so does $~ set in the frame.
+        r += [PolySuperFallbackC2.new.foo(2), (PolySuperFallbackD2.new.foo(3) rescue $!.class)]
+        module PolySuperFallbackMod
+          def bar(s)
+            s =~ /x/
+            [super(s), $~]
+          end
+        end
+        class PolySuperFallbackA; def bar(s) = :a; end
+        class PolySuperFallbackB; def bar(s) = :b; end
+        r + 5.times.flat_map { objs.map { _1.bar("x") } }.uniq.map(&:inspect)
+    "#), @r#"[[:mod, [:a, 1]], [:mod, [:b, 1]], [:mod, [:c, 2]], NoMethodError, "[:a, #<MatchData \"x\">]", "[:b, #<MatchData \"x\">]"]"#);
+}
+
+#[test]
+fn test_polymorphic_invokesuper_after_super_method_changes() {
+    assert_snapshot!(inspect("
+        module PolySuperChangeMod
+          def foo = [:mod, super]
+        end
+        class PolySuperChangeA; def foo = :a; end
+        class PolySuperChangeB; def foo = :b; end
+        class PolySuperChangeA2 < PolySuperChangeA; include PolySuperChangeMod; end
+        class PolySuperChangeB2 < PolySuperChangeB; include PolySuperChangeMod; end
+        objs = [PolySuperChangeA2.new, PolySuperChangeB2.new]
+        r = 5.times.flat_map { objs.map(&:foo) }.uniq
+        class PolySuperChangeB; def foo = :b_redefined; end
+        r + 5.times.flat_map { objs.map(&:foo) }.uniq
+    "), @"[[:mod, :a], [:mod, :b], [:mod, :a], [:mod, :b_redefined]]");
+}
+
+#[test]
+fn test_polymorphic_invokesuper_with_literal_block_and_frame_block() {
+    assert_snapshot!(inspect("
+        module PolySuperBlockMod
+          def foo = super { |x| x * 2 }
+          def bar = super
+        end
+        class PolySuperBlockA; def foo = yield(1); def bar = block_given? ? yield : :a_no_block; end
+        class PolySuperBlockB; def foo = yield(2); def bar = block_given? ? yield : :b_no_block; end
+        class PolySuperBlockA2 < PolySuperBlockA; include PolySuperBlockMod; end
+        class PolySuperBlockB2 < PolySuperBlockB; include PolySuperBlockMod; end
+        objs = [PolySuperBlockA2.new, PolySuperBlockB2.new]
+        r = 5.times.flat_map { objs.map { [_1.foo, _1.bar] } }.uniq
+        r + objs.map { _1.bar { :block } }
+    "), @"[[2, :a_no_block], [4, :b_no_block], :block, :block]");
+}
+
+#[test]
+fn test_polymorphic_invokesuper_to_cfuncs() {
+    // Profile both classes before compiling
+    set_call_threshold(3);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        module PolySuperCfuncMod
+          def size = super + 100
+        end
+        class PolySuperCfuncString < String; include PolySuperCfuncMod; end
+        class PolySuperCfuncArray < Array; include PolySuperCfuncMod; end
+        PolySuperCfuncObjs = [PolySuperCfuncString.new('ab'), PolySuperCfuncArray.new([1, 2, 3])]
+        def test = PolySuperCfuncObjs.map(&:size)
+        test; test
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test, test]"), @"[[102, 103], [102, 103]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}

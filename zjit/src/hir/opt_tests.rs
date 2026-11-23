@@ -26353,6 +26353,67 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_polymorphic_invokesuper_dispatches_on_method_entry() {
+        eval("
+            module PolySuperHirMod
+              def foo(a) = super(a) + 1
+            end
+            class PolySuperHirA; def foo(a) = a; end
+            class PolySuperHirB; def foo(a) = a * 2; end
+            class PolySuperHirA2 < PolySuperHirA; include PolySuperHirMod; end
+            class PolySuperHirB2 < PolySuperHirB; include PolySuperHirMod; end
+            PolySuperHirA2.new.foo(1); PolySuperHirB2.new.foo(1)
+        ");
+        assert_snapshot!(hir_string_proc("PolySuperHirMod.instance_method(:foo)"), @"
+        fn foo@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :a@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :a@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v29:CPtr = GetEP 0
+          v30:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_SPECVAL@0x1001
+          v31:FalseClass = GuardBitEquals v30, Value(false) recompile
+          v32:RubyValue = LoadField v29, :VM_ENV_DATA_INDEX_ME_CREF@0x1002
+          v33:CallableMethodEntry[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb6(), bb7()
+        bb6():
+          PatchPoint MethodRedefined(PolySuperHirB@0x1010, foo@0x1018, cme:0x1020)
+          v58:Fixnum[2] = Const Value(2)
+          PatchPoint MethodRedefined(Integer@0x1048, *@0x1050, cme:0x1058)
+          v71:Fixnum = GuardType v10, Fixnum recompile
+          v72:Fixnum = FixnumMult v71, v58
+          Jump bb5(v72)
+        bb7():
+          v39:CallableMethodEntry[VALUE(0x1080)] = Const Value(VALUE(0x1080))
+          v40:CBool = IsBitEqual v32, v39
+          CondBranch v40, bb8(), bb4()
+        bb8():
+          PatchPoint MethodRedefined(PolySuperHirA@0x1088, foo@0x1018, cme:0x1090)
+          Jump bb5(v10)
+        bb4():
+          v44:BasicObject = InvokeSuper v9, 0x10b8, v10 # SendFallbackReason: super: polymorphic call site
+          Jump bb5(v44)
+        bb5(v46:BasicObject):
+          PatchPoint NoEPEscape(foo)
+          v20:Fixnum[1] = Const Value(1)
+          PatchPoint MethodRedefined(Integer@0x1048, +@0x10d8, cme:0x10e0)
+          v49:Fixnum = GuardType v46, Fixnum recompile
+          v50:Fixnum = FixnumAdd v49, v20
+          CheckInterrupts
+          Return v50
+        ");
+    }
+
+    #[test]
     fn test_invokesuper_to_cfunc_optimizes_to_ccall() {
         eval("
             class C < Hash

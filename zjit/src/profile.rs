@@ -651,6 +651,11 @@ impl IseqProfile {
         }
     }
 
+    /// The distribution of the method entries of the frames that ran the `super` at `insn_idx`
+    pub fn get_super_method_entry_summary(&self, insn_idx: YarvInsnIdx) -> Option<TypeDistributionSummary> {
+        self.super_cme.get(&insn_idx).map(TypeDistributionSummary::new)
+    }
+
     pub fn super_saw_block(&self, insn_idx: YarvInsnIdx) -> bool {
         self.entry(insn_idx).is_some_and(|e| e.super_saw_block)
     }

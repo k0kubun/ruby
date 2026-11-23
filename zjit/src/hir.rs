@@ -3499,6 +3499,39 @@ struct SendDirectArgs {
 }
 
 /// Caller Arguments as they appear on the original Send instruction.
+/// A direct call of an ISEQ super method. See [`Function::plan_super_iseq_call`].
+struct SuperIseqCall {
+    iseq: IseqPtr,
+    call: SendDirectCall,
+    caller_splat: Option<CallerSplat>,
+    kw_splat: Option<SuperKwSplat>,
+}
+
+/// A `**hash` of `super` that the super method takes as its `**kwrest`
+#[derive(Clone, Copy)]
+struct SuperKwSplat {
+    hash: InsnId,
+    /// The profiled type of `hash`, which is guarded
+    hash_type: ProfiledType,
+    /// Whether to copy `hash` for the super method
+    dup: bool,
+}
+
+/// Why a `super` can't call an ISEQ super method directly
+enum SuperIseqCallFailure {
+    Reason(SendFallbackReason),
+    SendDirect(SendDirectFailure),
+}
+
+impl SuperIseqCallFailure {
+    fn record(&self, function: &mut Function, block: BlockId, insn_id: InsnId) {
+        match self {
+            Self::Reason(reason) => function.set_dynamic_send_reason(insn_id, *reason),
+            Self::SendDirect(failure) => failure.record(function, block, insn_id, SendDirectFallbackContext::Super),
+        }
+    }
+}
+
 /// The method that a `super` calls. See [`Function::resolve_super_target`].
 struct SuperTarget {
     /// The method entry of the frame running `super`
@@ -7510,7 +7543,12 @@ impl Function {
                             self.push_insn_id(block, insn_id);
                         };
                     }
-                    &Insn::InvokeSuper { recv, cd, blockiseq, state, .. } => {
+                    &Insn::InvokeSuper { recv, cd, blockiseq, state, reason, .. } => {
+                        // The fallback of try_specialize_polymorphic_super() stays dynamic.
+                        if matches!(reason, SuperPolymorphic) {
+                            self.push_insn_id(block, insn_id);
+                            continue;
+                        }
                         // A literal block (e.g., super { ... }) is passed only to an ISEQ method below.
                         let blockiseq = (!blockiseq.is_null()).then_some(blockiseq);
 
@@ -7525,6 +7563,10 @@ impl Function {
                         let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = match self.resolve_super_target(state, args_rejection) {
                             Ok(target) => target,
                             Err(reason) => {
+                                if matches!(reason, SuperPolymorphic) && let Some(next_block) = self.try_specialize_polymorphic_super(block, insn_id) {
+                                    block = next_block;
+                                    continue;
+                                }
                                 self.push_insn_id(block, insn_id);
                                 self.set_dynamic_send_reason(insn_id, reason);
                                 continue;
@@ -7538,86 +7580,17 @@ impl Function {
                         };
 
                         if def_type == VM_METHOD_TYPE_ISEQ {
-                            // Check if the super method's parameters support direct send.
-                            // If not, we can't do direct dispatch.
-                            let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-                            // Like for Send, a `**hash` to a method with only `**kwrest` becomes its kwrest Hash.
-                            let kw_splat = if flags & VM_CALL_KW_SPLAT != 0 {
-                                let params = unsafe { super_iseq.params() };
-                                let hash = *args.last().unwrap();
-                                let hash_type = match self.resolve_receiver_type_from_profile(hash, state) {
-                                    ReceiverTypeResolution::Monomorphic { profiled_type } if profiled_type.class() == unsafe { rb_cHash } => Some(profiled_type),
-                                    _ => None,
-                                };
-                                let Some(hash_type) = hash_type.filter(|_| params.flags.has_kwrest() != 0 && params.flags.has_kw() == 0
-                                    && params.flags.ruby2_keywords() == 0 && params.flags.forwardable() == 0) else {
+                            let plan = match self.plan_super_iseq_call(&args, ci, super_cme, blockiseq, state) {
+                                Ok(plan) => plan,
+                                Err(failure) => {
+                                    failure.record(self, block, insn_id);
                                     self.push_insn_id(block, insn_id);
-                                    self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
                                     continue;
-                                };
-                                let dup = flags & VM_CALL_KW_SPLAT_MUT == 0 && params.flags.anon_kwrest() == 0;
-                                Some((hash, hash_type, dup))
-                            } else {
-                                None
-                            };
-                            let positional_args = &args[..args.len() - usize::from(kw_splat.is_some())];
-                            let mut caller_args = CallerArguments::new(positional_args, ci);
-                            if let Some((hash, _, dup)) = kw_splat {
-                                caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
-                                caller_args.kwrest_hash = Some(KwrestHash { hash, dup });
-                            }
-                            // Expand a caller splat, e.g. of `def foo(*) = super`, with its profiled length.
-                            // A forwardable method takes it unexpanded with the callinfo instead.
-                            let caller_splat = match caller_args.splat_arg_idx {
-                                None => None,
-                                Some(_) if unsafe { super_iseq.params() }.flags.forwardable() != 0 => None,
-                                Some(arg_idx) => {
-                                    let Some(length) = self.monomorphic_caller_splat_length(state) else {
-                                        self.push_insn_id(block, insn_id);
-                                        self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
-                                        continue;
-                                    };
-                                    Some(CallerSplat { arg_idx, array: args[arg_idx], length })
                                 }
                             };
-                            let Ok(mut call) = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
-                                .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
-                                self.push_insn_id(block, insn_id); continue;
-                            };
-
                             block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, blockiseq.is_some());
-                            if let Some(caller_splat) = caller_splat {
-                                self.emit_caller_splat(block, caller_splat, state);
-                                self.count(block, Counter::caller_splat_optimized);
-                            }
-                            let mut send_frame_state = state;
-                            if let Some((hash, hash_type, dup)) = kw_splat {
-                                let hash = self.guard_type_recompile(block, hash, Type::from_profiled_type(hash_type), state, Recompile);
-                                caller_args.kwrest_hash = Some(KwrestHash { hash, dup });
-                                call = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
-                                    .unwrap_or_else(|_| unreachable!("the guarded `**hash` passes like the unguarded one"));
-                                let new_state = self.frame_state(state).with_replaced_args(positional_args, args.len());
-                                send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
-                            }
-
-                            let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
-                                self.emit_send_direct_args(block, call, positional_args, send_frame_state, state);
-                            // Use SendDirect with the super method's CME and ISEQ.
-                            let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
-                                recv,
-                                cd,
-                                cme: super_cme,
-                                iseq: super_iseq,
-                                args: send_args,
-                                kw_bits,
-                                jit_entry_idx,
-                                state: send_state,
-                                exit_state: state,
-                                block: blockiseq.map(BlockHandler::BlockIseq),
-                                forwarded_ci: None,
-                            })));
+                            let replacement = self.emit_super_iseq_call(block, recv, cd, super_cme, plan, &args, blockiseq, state);
                             self.make_equal_to(insn_id, replacement);
-
                         } else if blockiseq.is_some() {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
@@ -7797,7 +7770,11 @@ impl Function {
             }
             current_cme
         };
+        Self::super_target_of(current_cme, frame_known)
+    }
 
+    /// Resolve the method that `super` calls from a frame running `current_cme`.
+    fn super_target_of(current_cme: *const rb_callable_method_entry_t, frame_known: bool) -> Result<SuperTarget, SendFallbackReason> {
         // Get defined_class and method ID from the profiled CME.
         let current_defined_class = unsafe { (*current_cme).defined_class };
         let mid = unsafe { get_def_original_id((*current_cme).def) };
@@ -7835,6 +7812,187 @@ impl Function {
             def_type = unsafe { get_cme_def_type(super_cme) };
         }
         Ok(SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known })
+    }
+
+    /// Plan calling the ISEQ method `super_cme` directly for a `super` with `args`, before
+    /// emitting any instruction.
+    fn plan_super_iseq_call(&self, args: &[InsnId], ci: *const rb_callinfo, super_cme: *const rb_callable_method_entry_t, blockiseq: Option<IseqPtr>, state: InsnId) -> Result<SuperIseqCall, SuperIseqCallFailure> {
+        let flags = unsafe { rb_vm_ci_flag(ci) };
+        let iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
+        let params = unsafe { iseq.params() };
+        // Like for Send, a `**hash` to a method with only `**kwrest` becomes its kwrest Hash.
+        let kw_splat = if flags & VM_CALL_KW_SPLAT != 0 {
+            let hash = *args.last().unwrap();
+            let hash_type = match self.resolve_receiver_type_from_profile(hash, state) {
+                ReceiverTypeResolution::Monomorphic { profiled_type } if profiled_type.class() == unsafe { rb_cHash } => Some(profiled_type),
+                _ => None,
+            };
+            let Some(hash_type) = hash_type.filter(|_| params.flags.has_kwrest() != 0 && params.flags.has_kw() == 0
+                && params.flags.ruby2_keywords() == 0 && params.flags.forwardable() == 0) else {
+                return Err(SuperIseqCallFailure::Reason(SuperComplexArgsPass));
+            };
+            let dup = flags & VM_CALL_KW_SPLAT_MUT == 0 && params.flags.anon_kwrest() == 0;
+            Some(SuperKwSplat { hash, hash_type, dup })
+        } else {
+            None
+        };
+        let positional_args = &args[..args.len() - usize::from(kw_splat.is_some())];
+        let caller_args = Self::super_caller_args(positional_args, ci, kw_splat.map(|kw_splat| KwrestHash { hash: kw_splat.hash, dup: kw_splat.dup }));
+        // Expand a caller splat, e.g. of `def foo(*) = super`, with its profiled length.
+        // A forwardable method takes it unexpanded with the callinfo instead.
+        let caller_splat = match caller_args.splat_arg_idx {
+            None => None,
+            Some(_) if params.flags.forwardable() != 0 => None,
+            Some(arg_idx) => {
+                let Some(length) = self.monomorphic_caller_splat_length(state) else {
+                    return Err(SuperIseqCallFailure::Reason(SuperComplexArgsPass));
+                };
+                Some(CallerSplat { arg_idx, array: args[arg_idx], length })
+            }
+        };
+        let call = self.build_send_direct_args(&caller_args, caller_splat, iseq, blockiseq.is_some())
+            .map_err(SuperIseqCallFailure::SendDirect)?;
+        Ok(SuperIseqCall { iseq, call, caller_splat, kw_splat })
+    }
+
+    /// The arguments of a `super` with `positional_args` that passes `kwrest_hash` as the `**kwrest`
+    /// of the super method instead of its `**hash`.
+    fn super_caller_args(positional_args: &[InsnId], ci: *const rb_callinfo, kwrest_hash: Option<KwrestHash>) -> CallerArguments<'_> {
+        let mut caller_args = CallerArguments::new(positional_args, ci);
+        if kwrest_hash.is_some() {
+            caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+            caller_args.kwrest_hash = kwrest_hash;
+        }
+        caller_args
+    }
+
+    /// Call the ISEQ method `super_cme` of a `super` with `args` as planned by
+    /// [`Self::plan_super_iseq_call`], after the guards of the call. Return the result.
+    fn emit_super_iseq_call(&mut self, block: BlockId, recv: InsnId, cd: *const rb_call_data, super_cme: *const rb_callable_method_entry_t,
+                            plan: SuperIseqCall, args: &[InsnId], blockiseq: Option<IseqPtr>, state: InsnId) -> InsnId {
+        let SuperIseqCall { iseq, mut call, caller_splat, kw_splat } = plan;
+        if let Some(caller_splat) = caller_splat {
+            self.emit_caller_splat(block, caller_splat, state);
+            self.count(block, Counter::caller_splat_optimized);
+        }
+        let positional_args = &args[..args.len() - usize::from(kw_splat.is_some())];
+        let mut send_frame_state = state;
+        if let Some(SuperKwSplat { hash, hash_type, dup }) = kw_splat {
+            let hash = self.guard_type_recompile(block, hash, Type::from_profiled_type(hash_type), state, Recompile);
+            let caller_args = Self::super_caller_args(positional_args, unsafe { (*cd).ci }, Some(KwrestHash { hash, dup }));
+            call = self.build_send_direct_args(&caller_args, caller_splat, iseq, blockiseq.is_some())
+                .unwrap_or_else(|_| unreachable!("the guarded `**hash` passes like the unguarded one"));
+            let new_state = self.frame_state(state).with_replaced_args(positional_args, args.len());
+            send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+        }
+        let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
+            self.emit_send_direct_args(block, call, positional_args, send_frame_state, state);
+        self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
+            recv,
+            cd,
+            cme: super_cme,
+            iseq,
+            args: send_args,
+            kw_bits,
+            jit_entry_idx,
+            state: send_state,
+            exit_state: state,
+            block: blockiseq.map(BlockHandler::BlockIseq),
+            forwarded_ci: None,
+        })))
+    }
+
+    /// Specialize a `super` whose frame has run a few different methods, e.g. a method of a module
+    /// included in a few classes, which have different super methods. Dispatch on the method entry
+    /// of the frame to a direct call of each ISEQ or C super method, and fall back to the `super`
+    /// otherwise.
+    fn try_specialize_polymorphic_super(&mut self, block: BlockId, insn_id: InsnId) -> Option<BlockId> {
+        let super_insn = self.resolve(insn_id).insn(self).clone();
+        let Insn::InvokeSuper { recv, cd, blockiseq, ref args, state, .. } = super_insn else { unreachable!() };
+        let args = args.to_vec();
+        let blockiseq = (!blockiseq.is_null()).then_some(blockiseq);
+        let ci = unsafe { (*cd).ci };
+        let (frame_iseq, insn_idx) = { let frame_state = self.frame_state_ref(state); (frame_state.iseq, frame_state.insn_idx) };
+        let profile = &get_or_create_iseq_payload(frame_iseq).profile;
+        let summary = profile.get_super_method_entry_summary(insn_idx)?;
+        if !(summary.is_polymorphic() || summary.is_skewed_polymorphic()) || profile.super_saw_block(insn_idx) {
+            return None;
+        }
+
+        // Call each profiled method's super method that can be called directly.
+        let mut arms = vec![];
+        for profiled_type in summary.buckets().iter().filter(|ty| !ty.is_empty()) {
+            let current_cme = profiled_type.class().as_ptr::<rb_callable_method_entry_t>();
+            let Ok(target) = Self::super_target_of(current_cme, false) else { continue };
+            let plan = match target.def_type {
+                VM_METHOD_TYPE_ISEQ => {
+                    let Ok(plan) = self.plan_super_iseq_call(&args, ci, target.super_cme, blockiseq, state) else { continue };
+                    Some(plan)
+                }
+                // Like the C method case of `super` in type_specialize()
+                VM_METHOD_TYPE_CFUNC if blockiseq.is_none() && !unspecializable_c_call_type(unsafe { rb_vm_ci_flag(ci) }) => {
+                    let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(target.super_cme)) };
+                    if !(cfunc_argc == -1 || cfunc_argc >= 0 && args.len() == cfunc_argc as usize) { continue; }
+                    None
+                }
+                _ => continue,
+            };
+            arms.push((target, plan));
+        }
+        if arms.is_empty() {
+            return None;
+        }
+
+        // Like emit_super_call_guards(), but compare the method entry of the frame with each one.
+        // An svar for $~ or $_ that wraps it takes the fallback.
+        let lep = self.get_ep(block, get_lvar_level(frame_iseq));
+        if blockiseq.is_none() {
+            let block_handler = self.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_SPECVAL, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL, types::RubyValue);
+            self.push_insn(block, Insn::GuardBitEquals {
+                val: block_handler,
+                expected: Const::Value(VALUE(VM_BLOCK_HANDLER_NONE as usize)),
+                reason: Box::new(SideExitReason::UnhandledBlockArg),
+                state,
+                recompile: Some(Recompile),
+            });
+        }
+        let method_entry = self.load_field(block, lep, FieldName::VM_ENV_DATA_INDEX_ME_CREF, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_ME_CREF, types::RubyValue);
+        let fallback_block = self.new_block(u32::MAX);
+        let join_block = self.new_block(u32::MAX);
+        let num_arms = arms.len();
+        let mut block = block;
+        for (index, (target, plan)) in arms.into_iter().enumerate() {
+            let expected_cme = self.push_insn(block, Insn::Const { val: Const::Value(target.current_cme.into()) });
+            let is_cme = self.push_insn(block, Insn::IsBitEqual { left: method_entry, right: expected_cme });
+            let call_block = self.new_block(u32::MAX);
+            let next_block = if index + 1 == num_arms { fallback_block } else { self.new_block(u32::MAX) };
+            self.push_insn(block, Insn::CondBranch {
+                val: is_cme,
+                if_true: BranchEdge { target: call_block, args: vec![] },
+                if_false: BranchEdge { target: next_block, args: vec![] },
+            });
+            self.push_insn(call_block, Insn::PatchPoint {
+                invariant: Invariant::MethodRedefined { klass: unsafe { (*target.lookup_cme).defined_class }, method: target.mid, cme: target.lookup_cme },
+                state,
+            });
+            let result = match plan {
+                Some(plan) => self.emit_super_iseq_call(call_block, recv, cd, target.super_cme, plan, &args, blockiseq, state),
+                None => self.emit_super_cfunc_call(call_block, recv, cd, args.clone(), target.super_cme, state, state),
+            };
+            self.push_insn(call_block, Insn::Jump(BranchEdge { target: join_block, args: vec![result] }));
+            block = next_block;
+        }
+
+        self.mark_cold(fallback_block);
+        let mut fallback = super_insn;
+        if let Insn::InvokeSuper { reason, .. } = &mut fallback { *reason = SuperPolymorphic; }
+        let fallback = self.push_insn(fallback_block, fallback);
+        self.push_insn(fallback_block, Insn::Jump(BranchEdge { target: join_block, args: vec![fallback] }));
+
+        let result = self.push_insn(join_block, Insn::Param);
+        self.insn_types[result] = types::BasicObject;
+        self.make_equal_to(insn_id, result);
+        Some(join_block)
     }
 
     /// Call the C method `super_cme` of a `super` with `args`, after the guards of the call: inline
