@@ -15802,3 +15802,42 @@ fn test_invokesuperforward_to_cfunc_passes_frame_block() {
         r + 5.times.map { s = 0; a.each { |x| s += x }; s }.uniq
     "), @"[[1, 2], 3]");
 }
+
+#[test]
+fn test_invokesuperforward_callinfos_differing_in_flags() {
+    // `Foo.new` (opt_new) and `Foo.send(:new)` call `initialize` with callinfos that differ in
+    // flags that don't change how arguments are passed.
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperFwdFlagsParent
+          def initialize(a) = @a = a
+          attr_reader :a
+        end
+        class SuperFwdFlagsChild < SuperFwdFlagsParent
+          def initialize(...) = super
+        end
+        def test(i) = [SuperFwdFlagsChild.new(i).a, SuperFwdFlagsChild.send(:new, i).a]
+        5.times { |i| test(i) }
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(1), test(2)]"), @"[[1, 1], [2, 2]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_send_forward_callinfos_differing_in_flags() {
+    assert_snapshot!(inspect("
+        class FwdFlagsTarget
+          def initialize(a, b = :b) = @ab = [a, b]
+          attr_reader :ab
+        end
+        class FwdFlagsDelegator
+          def initialize(...) = @obj = FwdFlagsTarget.new(...)
+          def ab = @obj.ab
+        end
+        r = 5.times.flat_map { |i| [FwdFlagsDelegator.new(i).ab, FwdFlagsDelegator.send(:new, i).ab] }.uniq
+        r + 5.times.map { FwdFlagsDelegator.new(1, 2).ab }.uniq
+    "), @"[[0, :b], [1, :b], [2, :b], [3, :b], [4, :b], [1, 2]]");
+}
