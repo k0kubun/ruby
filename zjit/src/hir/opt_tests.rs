@@ -23904,6 +23904,212 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn specialize_invokesuperforward_on_profiled_callinfo() {
+        eval("
+           class SuperFwdParent
+             def initialize(a, b) = @ab = [a, b]
+           end
+           class SuperFwdChild < SuperFwdParent
+             def initialize(...) = super
+           end
+           SuperFwdChild.new(1, 2)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdChild.instance_method(:initialize)")), @"
+        fn initialize@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1001
+          v26:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v27:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(SuperFwdParent@0x1008, initialize@0x1010, cme:0x1018)
+          v30:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v31:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v32:CBool = IsBitEqual v30, v31
+          CondBranch v32, bb5(), bb4()
+        bb4():
+          v34:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v30
+          v35:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v34, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v37:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v38:FalseClass = GuardBitEquals v37, Value(false) recompile
+          PushInlineFrame :initialize, v9 (0x1058), num_args=2
+          v50:ArrayExact = NewArray v25, v26
+          v53:HeapBasicObject = GuardType v9, HeapBasicObject
+          v54:CShape = LoadField v53, :shape_id@0x1078
+          v55:CShape[0x1079] = GuardBitEquals v54, CShape(0x1079) recompile
+          StoreField v53, :@ab@0x107a, v50
+          WriteBarrier v53, v50
+          v58:CShape[0x107b] = Const CShape(0x107b)
+          StoreField v53, :shape_id@0x1078, v58
+          PatchPoint NoEPEscape(initialize)
+          PopInlineFrame
+          PatchPoint NoEPEscape(initialize)
+          CheckInterrupts
+          Return v50
+        ");
+    }
+
+    #[test]
+    fn specialize_invokesuperforward_with_leading_args() {
+        eval("
+           class SuperFwdLeadParent
+             def foo(a, b, c) = [a, b, c]
+           end
+           class SuperFwdLeadChild < SuperFwdLeadParent
+             def foo(...) = super(0, ...)
+           end
+           SuperFwdLeadChild.new.foo(1, 2)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdLeadChild.instance_method(:foo)")), @"
+        fn foo@<compiled>:6:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v15:Fixnum[0] = Const Value(0)
+          v26:CPtr = GetEP 0
+          v27:BasicObject = LoadField v26, :forwarded_arg@0x1001
+          v28:BasicObject = LoadField v26, :forwarded_arg@0x1000
+          v29:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(SuperFwdLeadParent@0x1008, foo@0x1010, cme:0x1018)
+          v32:RubyValue = LoadField v26, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v33:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v34:CBool = IsBitEqual v32, v33
+          CondBranch v34, bb5(), bb4()
+        bb4():
+          v36:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v32
+          v37:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v36, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v39:RubyValue = LoadField v26, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v40:FalseClass = GuardBitEquals v39, Value(false) recompile
+          PushInlineFrame :foo, v9 (0x1058), num_args=3
+          v54:ArrayExact = NewArray v15, v27, v28
+          PopInlineFrame
+          PatchPoint NoEPEscape(foo)
+          CheckInterrupts
+          Return v54
+        ");
+    }
+
+    #[test]
+    fn specialize_invokesuperforward_to_builtin_iseq() {
+        eval("
+           class SuperFwdBuiltin < Hash
+             def initialize(...) = super
+           end
+           SuperFwdBuiltin.new(1)
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdBuiltin.instance_method(:initialize)")), @"
+        fn initialize@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v24:CPtr = GetEP 0
+          v25:BasicObject = LoadField v24, :forwarded_arg@0x1000
+          v26:Fixnum[[run-dependent]] = GuardBitEquals v10, Value([run-dependent]) recompile
+          PatchPoint MethodRedefined(Hash@0x1008, initialize@0x1010, cme:0x1018)
+          v29:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_ME_CREF@0x1040
+          v30:CallableMethodEntry[VALUE(0x1048)] = Const Value(VALUE(0x1048))
+          v31:CBool = IsBitEqual v29, v30
+          CondBranch v31, bb5(), bb4()
+        bb4():
+          v33:RubyValue = CCall v9, :rb_vm_lep_method_entry@0x1050, v29
+          v34:CallableMethodEntry[VALUE(0x1048)] = GuardBitEquals v33, Value(VALUE(0x1048))
+          Jump bb5()
+        bb5():
+          v36:RubyValue = LoadField v24, :VM_ENV_DATA_INDEX_SPECVAL@0x1051
+          v37:FalseClass = GuardBitEquals v36, Value(false) recompile
+          v39:Fixnum[0] = Const Value(0)
+          v78:Fixnum[0] = Const Value(0)
+          v79:NilClass = Const Value(nil)
+          v80:NilClass = Const Value(nil)
+          PushInlineFrame :initialize, v9 (0x1058), num_args=2
+          v56:CPtr = GetEP 0
+          v57:CUInt64 = LoadField v56, :VM_ENV_DATA_INDEX_FLAGS@0x1078
+          v58:CBool = IsBlockParamModified v57
+          CondBranch v58, bb8(), bb9()
+        bb8():
+          v60:BasicObject = LoadField v56, :block@0x1000
+          Jump bb10(v60)
+        bb9():
+          v62:BasicObject = GetBlockParam :block, l0, EP@4
+          Jump bb10(v62)
+        bb10(v55:BasicObject):
+          v65:CPtr = LoadSP
+          StoreField v65, :ifnone@0x1079, v25
+          StoreField v65, :capacity@0x107a, v39
+          StoreField v65, :<empty>@0x107b, v78
+          StoreField v65, :block@0x107c, v55
+          StoreField v65, :ifnone_unset@0x1000, v80
+          v72:BasicObject = InvokeBuiltin rb_hash_init, v9, v39, v80, v25, v55
+          PatchPoint NoEPEscape(initialize)
+          PopInlineFrame
+          PatchPoint NoEPEscape(initialize)
+          CheckInterrupts
+          Return v72
+        ");
+    }
+
+    #[test]
+    fn dont_specialize_invokesuperforward_to_cfunc() {
+        eval("
+           class SuperFwdCfunc
+             def initialize(...) = super
+           end
+           SuperFwdCfunc.new
+        ");
+        assert_snapshot!(mask_run_dependent_immediates(&hir_string_proc("SuperFwdCfunc.instance_method(:initialize)")), @"
+        fn initialize@<compiled>:3:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :...@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :...@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          v16:BasicObject = InvokeSuperForward v9, 0x1008, v10 # SendFallbackReason: super: unsupported target method type Cfunc
+          PatchPoint NoEPEscape(initialize)
+          CheckInterrupts
+          Return v16
+        ");
+    }
+
+    #[test]
     fn specialize_send_forward_passes_frame_block() {
         eval("
            def target(a) = yield(a)
