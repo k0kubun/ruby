@@ -5192,6 +5192,19 @@ impl Function {
         args
     }
 
+    /// The length of the caller splat of the call at `state` if the profile saw only one.
+    fn monomorphic_caller_splat_length(&self, state: InsnId) -> Option<SplatLength> {
+        if self.policy.no_side_exits {
+            return None;
+        }
+        let frame_state = self.frame_state_ref(state);
+        let summary = get_or_create_iseq_payload(frame_state.iseq).profile.get_splat_length_summary(frame_state.insn_idx)?;
+        if !summary.is_monomorphic() {
+            return None;
+        }
+        summary.bucket(0)
+    }
+
     /// Select caller-splat lengths for a callsite.
     fn caller_splat_lengths(&self, ci: *const rb_callinfo, recv: InsnId, state: InsnId, profiles: &ProfileOracle) -> Vec<SplatLength> {
         if self.policy.no_side_exits || unsafe { rb_vm_ci_flag(ci) } & VM_CALL_ARGS_SPLAT == 0 {
@@ -7501,8 +7514,9 @@ impl Function {
                         let flags = unsafe { rb_vm_ci_flag(ci) };
                         assert!(flags & VM_CALL_FCALL != 0);
 
-                        // Reject calls with complex argument handling.
-                        let args_rejection = unspecializable_c_call_type(flags).then_some(SuperComplexArgsPass);
+                        // Reject calls with complex argument handling. A caller splat and keywords are
+                        // handled below for an ISEQ method.
+                        let args_rejection = unspecializable_call_type(flags & !VM_CALL_ARGS_SPLAT).then_some(SuperComplexArgsPass);
                         let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = match self.resolve_super_target(state, args_rejection) {
                             Ok(target) => target,
                             Err(reason) => {
@@ -7523,12 +7537,28 @@ impl Function {
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
                             let caller_args = CallerArguments::new(&args, ci);
-                            let Ok(call) = self.build_send_direct_args(&caller_args, None, super_iseq, blockiseq.is_some())
+                            // Expand a caller splat, e.g. of `def foo(*) = super`, with its profiled length.
+                            let caller_splat = match caller_args.splat_arg_idx {
+                                None => None,
+                                Some(arg_idx) => {
+                                    let Some(length) = self.monomorphic_caller_splat_length(state) else {
+                                        self.push_insn_id(block, insn_id);
+                                        self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
+                                        continue;
+                                    };
+                                    Some(CallerSplat { arg_idx, array: args[arg_idx], length })
+                                }
+                            };
+                            let Ok(call) = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
 
                             block = self.emit_super_call_guards(block, recv, lookup_cme, current_cme, mid, state, frame_state_iseq, frame_known, blockiseq.is_some());
+                            if let Some(caller_splat) = caller_splat {
+                                self.emit_caller_splat(block, caller_splat, state);
+                                self.count(block, Counter::caller_splat_optimized);
+                            }
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
                                 self.emit_send_direct_args(block, call, &args, state, state);
@@ -7550,6 +7580,10 @@ impl Function {
                         } else if blockiseq.is_some() {
                             self.push_insn_id(block, insn_id);
                             self.set_dynamic_send_reason(insn_id, SuperCallWithBlock);
+                            continue;
+                        } else if unspecializable_c_call_type(flags) {
+                            self.push_insn_id(block, insn_id);
+                            self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
                             continue;
                         } else if def_type == VM_METHOD_TYPE_CFUNC {
                             let cfunc_argc = unsafe { get_mct_argc(get_cme_def_body_cfunc(super_cme)) };
