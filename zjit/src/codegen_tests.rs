@@ -16251,3 +16251,46 @@ fn test_polymorphic_invokesuper_to_cfuncs() {
     assert_snapshot!(assert_compiles("[test, test]"), @"[[102, 103], [102, 103]]");
     assert_eq!(0, counters.side_exit_count - side_exits_before);
 }
+
+#[test]
+fn test_invokesuper_to_attr_writer() {
+    // Like ActionController::Metal#response_body=
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperAttrsetParent
+          attr_accessor :body
+        end
+        class SuperAttrsetChild < SuperAttrsetParent
+          def body=(body)
+            body = [body]
+            super
+          end
+        end
+        SuperAttrsetO = SuperAttrsetChild.new
+        def test(v) = [(SuperAttrsetO.body = v), SuperAttrsetO.body]
+        test(1); test(1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(2), test(3)]"), @"[[2, [2]], [3, [3]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_invokesuper_to_attr_writer_on_frozen_object() {
+    assert_snapshot!(inspect("
+        class SuperAttrsetFrozenParent
+          attr_writer :x
+        end
+        class SuperAttrsetFrozenChild < SuperAttrsetFrozenParent
+          def x=(v)
+            super(v * 2)
+          end
+        end
+        objs = Array.new(5) { SuperAttrsetFrozenChild.new }
+        r = objs.map { _1.x = 1; _1.instance_variable_get(:@x) }
+        frozen = SuperAttrsetFrozenChild.new.freeze
+        r + [begin; frozen.x = 1; rescue => e; e.class; end]
+    "), @"[2, 2, 2, 2, 2, FrozenError]");
+}
