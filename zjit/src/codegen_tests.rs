@@ -16087,3 +16087,47 @@ fn test_invokesuperforward_with_leading_args_to_forwardable_method() {
         5.times.flat_map { [o.foo(1), o.foo(1, 2)] }.uniq
     "), @"[[0, 1], [0, 1, 2]]");
 }
+
+#[test]
+fn test_zsuper_with_anonymous_rest_to_forwardable_method() {
+    // Like ActionController's `def process_action(*) ... super` calling AbstractController's
+    // `def process_action(...)`
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class ZsuperFwdTargetBase
+          def process(...) = send_action(...)
+          def send_action(name, *args) = [name, args]
+        end
+        class ZsuperFwdTarget < ZsuperFwdTargetBase
+          def process(*)
+            processed = true
+            super if processed
+          end
+        end
+        ZsuperFwdO = ZsuperFwdTarget.new
+        def test(*args) = ZsuperFwdO.process(*args)
+        test(:a, 1); test(:a, 1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(:b, 2), test(:c, 3)]"), @"[[:b, [2]], [:c, [3]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+    assert_snapshot!(inspect("[test(:d), test(:e, 1, 2), (test rescue $!.class)]"), @"[[:d, []], [:e, [1, 2]], ArgumentError]");
+}
+
+#[test]
+fn test_invokesuper_with_splat_to_forwardable_method() {
+    assert_snapshot!(inspect("
+        class SuperSplatFwdBase
+          def foo(...) = bar(...)
+          def bar(a, *rest, k: :none) = [a, rest, k]
+        end
+        class SuperSplatFwd < SuperSplatFwdBase
+          def foo(x, *args) = super(x, *args)
+        end
+        o = SuperSplatFwd.new
+        r = 5.times.map { o.foo(1, 2) }.uniq
+        r + 5.times.flat_map { [o.foo(1), o.foo(1, 2, 3)] }.uniq
+    "), @"[[1, [2], :none], [1, [], :none], [1, [2, 3], :none]]");
+}
