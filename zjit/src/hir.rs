@@ -7514,9 +7514,10 @@ impl Function {
                         let flags = unsafe { rb_vm_ci_flag(ci) };
                         assert!(flags & VM_CALL_FCALL != 0);
 
-                        // Reject calls with complex argument handling. A caller splat and keywords are
-                        // handled below for an ISEQ method.
-                        let args_rejection = unspecializable_call_type(flags & !VM_CALL_ARGS_SPLAT).then_some(SuperComplexArgsPass);
+                        // Reject calls with complex argument handling. A caller splat, keywords, and a
+                        // `**hash` are handled below for an ISEQ method.
+                        let args_rejection = unspecializable_call_type(flags & !(VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT))
+                            .then_some(SuperComplexArgsPass);
                         let SuperTarget { current_cme, lookup_cme, super_cme, mid, def_type, frame_known } = match self.resolve_super_target(state, args_rejection) {
                             Ok(target) => target,
                             Err(reason) => {
@@ -7536,7 +7537,31 @@ impl Function {
                             // Check if the super method's parameters support direct send.
                             // If not, we can't do direct dispatch.
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
-                            let caller_args = CallerArguments::new(&args, ci);
+                            // Like for Send, a `**hash` to a method with only `**kwrest` becomes its kwrest Hash.
+                            let kw_splat = if flags & VM_CALL_KW_SPLAT != 0 {
+                                let params = unsafe { super_iseq.params() };
+                                let hash = *args.last().unwrap();
+                                let hash_type = match self.resolve_receiver_type_from_profile(hash, state) {
+                                    ReceiverTypeResolution::Monomorphic { profiled_type } if profiled_type.class() == unsafe { rb_cHash } => Some(profiled_type),
+                                    _ => None,
+                                };
+                                let Some(hash_type) = hash_type.filter(|_| params.flags.has_kwrest() != 0 && params.flags.has_kw() == 0
+                                    && params.flags.ruby2_keywords() == 0 && params.flags.forwardable() == 0) else {
+                                    self.push_insn_id(block, insn_id);
+                                    self.set_dynamic_send_reason(insn_id, SuperComplexArgsPass);
+                                    continue;
+                                };
+                                let dup = flags & VM_CALL_KW_SPLAT_MUT == 0 && params.flags.anon_kwrest() == 0;
+                                Some((hash, hash_type, dup))
+                            } else {
+                                None
+                            };
+                            let positional_args = &args[..args.len() - usize::from(kw_splat.is_some())];
+                            let mut caller_args = CallerArguments::new(positional_args, ci);
+                            if let Some((hash, _, dup)) = kw_splat {
+                                caller_args.flags &= !(VM_CALL_KW_SPLAT | VM_CALL_KW_SPLAT_MUT);
+                                caller_args.kwrest_hash = Some(KwrestHash { hash, dup });
+                            }
                             // Expand a caller splat, e.g. of `def foo(*) = super`, with its profiled length.
                             let caller_splat = match caller_args.splat_arg_idx {
                                 None => None,
@@ -7549,7 +7574,7 @@ impl Function {
                                     Some(CallerSplat { arg_idx, array: args[arg_idx], length })
                                 }
                             };
-                            let Ok(call) = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
+                            let Ok(mut call) = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
                                 .inspect_err(|failure| failure.record(self, block, insn_id, SendDirectFallbackContext::Super)) else {
                                 self.push_insn_id(block, insn_id); continue;
                             };
@@ -7559,9 +7584,18 @@ impl Function {
                                 self.emit_caller_splat(block, caller_splat, state);
                                 self.count(block, Counter::caller_splat_optimized);
                             }
+                            let mut send_frame_state = state;
+                            if let Some((hash, hash_type, dup)) = kw_splat {
+                                let hash = self.guard_type_recompile(block, hash, Type::from_profiled_type(hash_type), state, Recompile);
+                                caller_args.kwrest_hash = Some(KwrestHash { hash, dup });
+                                call = self.build_send_direct_args(&caller_args, caller_splat, super_iseq, blockiseq.is_some())
+                                    .unwrap_or_else(|_| unreachable!("the guarded `**hash` passes like the unguarded one"));
+                                let new_state = self.frame_state(state).with_replaced_args(positional_args, args.len());
+                                send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
+                            }
 
                             let SendDirectArgs { state: send_state, args: send_args, kw_bits, jit_entry_idx } =
-                                self.emit_send_direct_args(block, call, &args, state, state);
+                                self.emit_send_direct_args(block, call, positional_args, send_frame_state, state);
                             // Use SendDirect with the super method's CME and ISEQ.
                             let replacement = self.try_inline_send_direct(block, Insn::SendDirect(Box::new(SendDirectData {
                                 recv,
