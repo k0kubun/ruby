@@ -3795,6 +3795,23 @@ impl Assembler
         let mut live_in: Vec<BitSet<usize>> = vec![BitSet::with_capacity(num_live); num_blocks];
         let mut block_live = BitSet::with_capacity(num_live);
 
+        // A block reads the live_in of its successors. In postorder, a successor comes before
+        // its predecessor unless the edge is a back edge, so a change to a block's live_in is
+        // seen in the same walk unless the block is the target of a back edge. Only a change to
+        // such a block needs another walk.
+        let mut po_index = vec![usize::MAX; num_blocks];
+        for (idx, &block_id) in po_blocks.iter().enumerate() {
+            po_index[block_id.0] = idx;
+        }
+        let mut is_back_edge_target = vec![false; num_blocks];
+        for (idx, &block_id) in po_blocks.iter().enumerate() {
+            for succ_id in self.basic_blocks[block_id.0].successors() {
+                if po_index[succ_id.0] >= idx {
+                    is_back_edge_target[succ_id.0] = true;
+                }
+            }
+        }
+
         // Fixed-point iteration
         let mut changed = true;
         while changed {
@@ -3823,9 +3840,26 @@ impl Assembler
                 // Update live_in if changed
                 if !live_in[block_id.0].equals(&block_live) {
                     std::mem::swap(&mut live_in[block_id.0], &mut block_live);
-                    changed = true;
+                    changed |= is_back_edge_target[block_id.0];
                 }
             }
+        }
+
+        // Check that another walk wouldn't change anything
+        #[cfg(debug_assertions)]
+        for &block_id in &po_blocks {
+            let block = &self.basic_blocks[block_id.0];
+            block_live.clear();
+            for succ_id in block.successors() {
+                block_live.union_with(&live_in[succ_id.0]);
+            }
+            for &idx in &kill_sets[block_id.0] {
+                block_live.remove(idx);
+            }
+            for &idx in &gen_sets[block_id.0] {
+                block_live.insert(idx);
+            }
+            assert!(live_in[block_id.0].equals(&block_live), "analyze_liveness stopped before the fixed point");
         }
 
         Liveness { live_in, vregs }
