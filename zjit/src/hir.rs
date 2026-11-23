@@ -3346,6 +3346,9 @@ pub struct Function {
     /// The reverse post-order of the CFG, cached by [`Function::optimize`] for the passes that
     /// don't change the CFG.
     reverse_post_order_cache: Option<Vec<BlockId>>,
+    /// The cached reverse post-order as of the start of a pass that may change the CFG, for
+    /// [`Function::take_reverse_post_order`]
+    reverse_post_order_at_pass_start: Option<Vec<BlockId>>,
     /// Frames inlined into this function, keyed by the caller `Snapshot` that the inlined
     /// frame's FrameStates point to as their `caller`.
     inline_frames: HashMap<InsnId, InlineFrame>,
@@ -3874,6 +3877,7 @@ impl Function {
             profiles: None,
             num_instructions: 0,
             reverse_post_order_cache: None,
+            reverse_post_order_at_pass_start: None,
             inline_frames: HashMap::default(),
             inline_pass: 0,
             tiny_inlines_past_budget: 0,
@@ -6498,7 +6502,7 @@ impl Function {
     /// Also try and inline constant caches, specialize object allocations, and more.
     fn type_specialize(&mut self) {
         let send_counters = std::mem::take(&mut self.send_counters);
-        for block in self.reverse_post_order() {
+        for block in self.take_reverse_post_order() {
             // Specializing an instruction may split `block`; the rest of the old instructions
             // are then pushed onto its join block.
             let mut block = block;
@@ -8127,7 +8131,7 @@ impl Function {
         // The callee body blocks emitted by add_iseq_to_hir are deliberately
         // NOT enqueued: any Sends they contain are next-level work that only becomes
         // inlinable after a later type_specialize pass promotes them to SendDirect.
-        let mut worklist: VecDeque<BlockId> = self.reverse_post_order().into_iter().collect();
+        let mut worklist: VecDeque<BlockId> = self.take_reverse_post_order().into_iter().collect();
 
         while let Some(block) = worklist.pop_front() {
             // Walk this block looking for an inlinable SendDirect. Under the
@@ -9183,7 +9187,7 @@ impl Function {
         if payload.versions.len() + 1 >= payload.max_versions() {
             return;
         }
-        for block in self.reverse_post_order() {
+        for block in self.take_reverse_post_order() {
             // Most instructions are pushed back, so reserve room for them upfront
             let capacity = self.blocks[block].insns.len();
             let old_insns = std::mem::replace(&mut self.blocks[block].insns, Vec::with_capacity(capacity));
@@ -9697,7 +9701,7 @@ impl Function {
         //
         // This would require 1) fixpointing, 2) worklist, or 3) (slightly less powerful) calling a
         // function-level infer_types after each pruned branch.
-        for block in self.reverse_post_order() {
+        for block in self.take_reverse_post_order() {
             let old_insns = std::mem::take(&mut self.blocks[block].insns);
             let mut new_insns = Vec::with_capacity(old_insns.len());
             for insn_id in old_insns {
@@ -10423,21 +10427,22 @@ impl Function {
     }
 
     /// Clean up linked lists of blocks A -> B -> C into A (with B's and C's instructions).
-    fn clean_cfg(&mut self) {
+    /// Returns the reverse post-order of the cleaned CFG.
+    fn clean_cfg(&mut self) -> Vec<BlockId> {
         // num_in_edges is invariant throughout cleaning the CFG:
         // * we don't allocate new blocks
         // * blocks that get absorbed are not in RPO anymore
         // * blocks pointed to by blocks that get absorbed retain the same number of in-edges
         let mut num_in_edges = vec![0; self.blocks.len()];
-        for block in self.reverse_post_order() {
+        let mut rpo = self.take_reverse_post_order();
+        for &block in &rpo {
             for target in self.successors(block) {
                 num_in_edges[target] += 1;
             }
         }
         let mut changed = false;
-        let rpo = loop {
+        loop {
             let mut iter_changed = false;
-            let rpo = self.reverse_post_order();
             for &block in &rpo {
                 // Ignore transient empty blocks
                 if self.blocks[block].insns.is_empty() { continue; }
@@ -10448,12 +10453,14 @@ impl Function {
                 }
             }
             // The last walk didn't change the CFG, so its reverse post-order is still valid
-            if !iter_changed { break rpo; }
+            if !iter_changed { break; }
             changed = true;
-        };
+            rpo = self.compute_reverse_post_order();
+        }
         if changed {
             crate::stats::trace_compile_phase("infer_types", || self.infer_types_with_rpo(&rpo));
         }
+        rpo
     }
 
     /// Remove duplicate PatchPoint instructions, within each basic block and across forward edges.
@@ -10800,6 +10807,18 @@ impl Function {
         self.compute_reverse_post_order()
     }
 
+    /// The reverse post-order for a pass that may change the CFG, to be called before the pass
+    /// changes it. It reuses the reverse post-order cached for the previous pass if any.
+    fn take_reverse_post_order(&mut self) -> Vec<BlockId> {
+        match self.reverse_post_order_at_pass_start.take() {
+            Some(rpo) => {
+                debug_assert_eq!(rpo, self.compute_reverse_post_order(), "take_reverse_post_order after changing the CFG");
+                rpo
+            }
+            None => self.compute_reverse_post_order(),
+        }
+    }
+
     fn compute_reverse_post_order(&self) -> Vec<BlockId> {
         let mut result = self.post_order_from(self.entries_block);
         result.reverse();
@@ -10996,10 +11015,13 @@ impl Function {
         }
 
         macro_rules! run_pass {
-            // A pass that may change the CFG computes its reverse post-order afresh
+            // A pass that may change the CFG computes its reverse post-order afresh, except that
+            // it may take the cached one before changing the CFG
             ($name:ident) => {{
-                self.reverse_post_order_cache = None;
-                run_pass!(@run $name)
+                self.reverse_post_order_at_pass_start = self.reverse_post_order_cache.take();
+                let result = run_pass!(@run $name);
+                self.reverse_post_order_at_pass_start = None;
+                result
             }};
             // A pass that doesn't change the CFG reuses the reverse post-order of the previous
             // such pass if no pass changed the CFG in between
@@ -11055,7 +11077,9 @@ impl Function {
             run_pass!(canonicalize, preserves_cfg);
             run_pass!(fold_constants);
             run_pass!(eliminate_dominated_branches);
-            run_pass!(clean_cfg);
+            // Cache the reverse post-order of the cleaned CFG for the passes that follow
+            let rpo = run_pass!(clean_cfg);
+            self.reverse_post_order_cache = Some(rpo);
             run_pass!(remove_redundant_patch_points, preserves_cfg);
             run_pass!(remove_duplicate_check_interrupts, preserves_cfg);
             if has_ever_inlined {
