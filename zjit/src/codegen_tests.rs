@@ -15841,3 +15841,113 @@ fn test_send_forward_callinfos_differing_in_flags() {
         r + 5.times.map { FwdFlagsDelegator.new(1, 2).ab }.uniq
     "), @"[[0, :b], [1, :b], [2, :b], [3, :b], [4, :b], [1, 2]]");
 }
+
+#[test]
+fn test_zsuper_with_anonymous_rest() {
+    // Like ActionController's `def process_action(*) ... super`
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class ZsuperRestParent
+          def process(name, *args) = [name, args]
+        end
+        class ZsuperRestChild < ZsuperRestParent
+          def process(*)
+            processed = true
+            super if processed
+          end
+        end
+        ZsuperRestO = ZsuperRestChild.new
+        def test(*args) = ZsuperRestO.process(*args)
+        test(:a, 1); test(:a, 1)
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test(:b, 2), test(:c, 3)]"), @"[[:b, [2]], [:c, [3]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_invokesuper_with_splat_length_changes() {
+    assert_snapshot!(inspect("
+        class SuperSplatLenParent
+          def foo(a, b = :b, *rest) = [a, b, rest]
+        end
+        class SuperSplatLenChild < SuperSplatLenParent
+          def foo(x, *args) = super(x, *args)
+        end
+        o = SuperSplatLenChild.new
+        r = 5.times.map { o.foo(1, 2) }.uniq
+        r + 5.times.flat_map { [o.foo(1), o.foo(1, 2, 3, 4), (o.foo rescue $!.class)] }.uniq
+    "), @"[[1, 2, []], [1, :b, []], [1, 2, [3, 4]], ArgumentError]");
+}
+
+#[test]
+fn test_invokesuper_with_splat_ruby2_keywords() {
+    assert_snapshot!(inspect("
+        class SuperSplatR2KParent
+          def foo(a, k: :none) = [a, k]
+        end
+        class SuperSplatR2KChild < SuperSplatR2KParent
+          ruby2_keywords def foo(*args) = super(*args)
+        end
+        o = SuperSplatR2KChild.new
+        r = 5.times.map { o.foo(1) }.uniq
+        r + 5.times.flat_map { [o.foo(1, k: :kw), o.foo(2)] }.uniq
+    "), @"[[1, :none], [1, :kw], [2, :none]]");
+}
+
+#[test]
+fn test_invokesuper_with_splat_to_cfunc() {
+    assert_snapshot!(inspect("
+        class SuperSplatArray < Array
+          def push(*args) = super
+        end
+        5.times.map { a = SuperSplatArray.new; a.push(1, 2); a.push; a.to_a }.uniq
+    "), @"[[1, 2]]");
+}
+
+#[test]
+fn test_invokesuper_with_keywords_to_iseq() {
+    set_call_threshold(2);
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    eval("
+        class SuperKwParent
+          def foo(a, k: :default, j: 0) = [a, k, j]
+        end
+        class SuperKwChild < SuperKwParent
+          def foo(a, k: :child) = super(a, k: k, j: 1)
+        end
+        SuperKwO = SuperKwChild.new
+        def test = [SuperKwO.foo(1), SuperKwO.foo(2, k: :given)]
+        test; test
+    ");
+    let side_exits_before = counters.side_exit_count;
+    assert_snapshot!(assert_compiles("[test, test]"), @"[[[1, :child, 1], [2, :given, 1]], [[1, :child, 1], [2, :given, 1]]]");
+    assert_eq!(0, counters.side_exit_count - side_exits_before);
+}
+
+#[test]
+fn test_invokesuper_with_keywords_to_cfunc() {
+    assert_snapshot!(inspect(r#"
+        class SuperKwString < String
+          def initialize(s) = super(s, capacity: 10)
+        end
+        5.times.map { SuperKwString.new("a") }.uniq
+    "#), @r#"["a"]"#);
+}
+
+#[test]
+fn test_invokesuper_with_keywords_to_positional_hash() {
+    assert_snapshot!(inspect("
+        class SuperKwHashParent
+          def foo(attributes = {}) = attributes
+        end
+        class SuperKwHashChild < SuperKwHashParent
+          def foo(content = '') = super(content: content)
+        end
+        o = SuperKwHashChild.new
+        5.times.flat_map { [o.foo, o.foo('data')] }.uniq
+    "), @r#"[{content: ""}, {content: "data"}]"#);
+}
