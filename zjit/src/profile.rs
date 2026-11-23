@@ -98,6 +98,10 @@ fn profile_insn_sample(
         YARVINSN_invokesuper   => profile_invokesuper(profiler, profile),
         YARVINSN_opt_new => profile_opt_new(profiler, profile),
         YARVINSN_sendforward => profile_sendforward(profiler, profile),
+        YARVINSN_invokesuperforward => {
+            profile_super_cme(profiler, profile);
+            profile_sendforward(profiler, profile);
+        }
         YARVINSN_opt_send_without_block | YARVINSN_send => {
             let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
             let argc = num_arguments_on_stack(cd);
@@ -327,7 +331,8 @@ fn profile_block_handler(profiler: &mut Profiler, profile: &mut IseqProfile) {
     entry.opnd_types[0].observe(ty);
 }
 
-fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
+/// Profile the method entry of the frame running `super`, which `super` searches the super method from.
+fn profile_super_cme(profiler: &mut Profiler, profile: &mut IseqProfile) {
     let cme = unsafe { rb_vm_frame_method_entry(profiler.cfp) };
     let cme_value = VALUE(cme as usize);  // CME is a T_IMEMO, which is a VALUE
 
@@ -335,6 +340,10 @@ fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
         .or_insert_with(|| TypeDistribution::new()).observe(ProfiledType::object(cme_value));
 
     unsafe { rb_gc_writebarrier(profiler.iseq.into(), cme_value) };
+}
+
+fn profile_invokesuper(profiler: &mut Profiler, profile: &mut IseqProfile) {
+    profile_super_cme(profiler, profile);
 
     let cd: *const rb_call_data = profiler.insn_opnd(0).as_ptr();
     // super(&block) and super { } pass their own block, so the frame's block doesn't matter
@@ -613,7 +622,7 @@ impl IseqProfile {
             return None;
         }
         match opcode {
-            YARVINSN_invokesuper => Some(self.super_cme.get(&insn_idx).map_or(0, |d| d.num_samples())),
+            YARVINSN_invokesuper | YARVINSN_invokesuperforward => Some(self.super_cme.get(&insn_idx).map_or(0, |d| d.num_samples())),
             YARVINSN_send | YARVINSN_opt_send_without_block | YARVINSN_sendforward | YARVINSN_opt_new =>
                 Some(self.entry(insn_idx).and_then(|e| e.opnd_types.first()).map_or(0, |d| d.num_samples())),
             _ => None,
