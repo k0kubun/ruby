@@ -6151,7 +6151,7 @@ impl Function {
 
     /// Decide whether an inlinable callee ISEQ is worth inlining into this
     /// function based on heuristics.
-    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, insns_at_pass_start: usize) -> bool {
+    fn should_inline(&self, callee_iseq: IseqPtr, cme: *const rb_callable_method_entry_t, insns_at_pass_start: usize, ignore_size_threshold: bool, ignore_budget: bool) -> bool {
         let threshold = get_option!(inline_threshold);
         if threshold == 0 {
             return false;
@@ -6190,14 +6190,14 @@ impl Function {
         // is rejected and the optimization fixed-point loop reaches its terminal iteration. See
         // `Options::inline_budget` for the full unit/semantics caveat.
         let budget = get_option!(inline_budget);
-        if budget != INLINE_BUDGET_UNLIMITED && (insns_at_pass_start > budget || self.num_instructions > budget) {
+        if budget != INLINE_BUDGET_UNLIMITED && !ignore_budget && (insns_at_pass_start > budget || self.num_instructions > budget) {
             incr_counter!(inline_reject_budget_exceeded);
             return false;
         }
 
         // Check callee bytecode size against threshold.
         let callee_size = unsafe { get_iseq_encoded_size(callee_iseq) } as usize;
-        if callee_size > threshold {
+        if callee_size > threshold && !ignore_size_threshold {
             incr_counter!(inline_reject_too_large);
             return false;
         }
@@ -6284,11 +6284,22 @@ impl Function {
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
-                // Inlining a block whose `break` or `return` can become a jump saves an expensive
-                // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
-                // This is bounded by the number of literal blocks in the inlined methods' callers.
-                let throw_inlinable = throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq);
-                if (!throw_inlinable && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
+                // Builtin methods marked with `Primitive.attr! :inline_block`, e.g. Array#each,
+                // are designed to be inlined together with a literal block, which lets the
+                // inliner inline the block into the caller as well. Skip the size heuristic
+                // for them when the caller passes a literal block.
+                let inline_block = blockiseq.is_some()
+                    && unsafe { rb_jit_iseq_builtin_attrs(iseq) } & BUILTIN_ATTR_INLINE_BLOCK != 0;
+                let throw_inlinable = match call_recv {
+                    // If the literal block may `break` or `return`, inlining both the method and the
+                    // block may turn the throw into a jump, so skip the budget heuristic as well.
+                    InlineRecv::Recv(_) => inline_block && blockiseq.is_some_and(crate::codegen::block_iseq_may_throw),
+                    // Inlining a block whose `break` or `return` can become a jump saves an expensive
+                    // `throw` and interpreter re-entry, so skip the size and budget heuristics for it.
+                    // This is bounded by the number of literal blocks in the inlined methods' callers.
+                    InlineRecv::Captured(_) => throw_targets.is_some() && crate::codegen::block_iseq_may_throw(iseq),
+                };
+                if !self.should_inline(iseq, cme, insns_at_pass_start, inline_block || throw_inlinable, throw_inlinable) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
