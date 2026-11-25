@@ -1391,6 +1391,64 @@ fn test_inline_block_break_jumps_to_caller() {
 }
 
 #[test]
+fn test_inline_block_return_from_home_method() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a, key)
+              a.each do |h|
+                v = h[key]
+                return v if v
+              end
+              nil
+            end
+            A = [{}, { a: 1 }]
+            test(A, :a)
+            test(A, :a)
+        ", "test(A, :a)"), @"1");
+        assert_snapshot!(assert_compiles("test(A, :b)"), @"nil");
+    });
+}
+
+#[test]
+fn test_inline_block_break_and_return_in_same_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              r = a.each do |x|
+                return :ret if x == :r
+                break :brk if x == :b
+              end
+              [r]
+            end
+            test([:b])
+            test([:r])
+        ", "test([:b])"), @"[:brk]");
+        assert_snapshot!(assert_compiles("test([:r])"), @":ret");
+        assert_snapshot!(assert_compiles("test([:x])"), @"[[:x]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_runs_home_ensure() {
+    // The ensure clause in the home method must run, so the return stays a throw.
+    with_inlining(|| {
+        eval("
+            def test(a, log)
+              begin
+                a.each { |x| return x if x == 2 }
+                nil
+              ensure
+                log << :ensure
+              end
+            end
+            test([1, 2], [])
+            test([1, 2], [])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test([1, 2], log), log]"), @"[2, [:ensure]]");
+    });
+}
+
+#[test]
 fn test_inline_block_break_runs_block_ensure() {
     // The ensure clause in the block must run, so the break stays a throw.
     with_inlining(|| {
