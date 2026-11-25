@@ -29913,4 +29913,64 @@ mod hir_opt_tests {
           Return v42
         ");
     }
+
+    #[test]
+    fn test_inline_block_return_jumps_to_inlined_home_return_block() {
+        eval(r"
+            def yielder = yield
+            def find(x) = yielder { return x if x }
+            def test(x) = find(x)
+            test(1)
+            test(1)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :x@0x1000
+          Jump bb3(v1, v3)
+        bb2():
+          EntryPoint JIT(0)
+          v6:BasicObject = LoadArg :self@0
+          v7:BasicObject = LoadArg :x@1
+          Jump bb3(v6, v7)
+        bb3(v9:BasicObject, v10:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1008, find@0x1010, cme:0x1018)
+          v25:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v9, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
+          PushInlineFrame :find, v25 (0x1040), num_args=1
+          v34:CPtr = LoadSP
+          StoreField v34, :x@0x1000, v10
+          PatchPoint MethodRedefined(Object@0x1008, yielder@0x1060, cme:0x1068)
+          PushInlineFrame :yielder, v25 (0x1090), num_args=0, block=0x10b0
+          v55:CPtr = GetEP 0
+          v56:CInt64 = LoadField v55, :VM_ENV_DATA_INDEX_SPECVAL@0x10d0
+          v57:CInt64[-4] = Const CInt64(-4)
+          v58:CInt64 = IntAnd v56, v57
+          v95:BasicObject = LoadField v58, :captured_self@0x10d1
+          PushInlineFrame <block>, v95 (0x10b0), captured=v58, num_args=0
+          v74:CPtr = GetEP 1
+          v75:BasicObject = LoadField v74, :x@0x10d2
+          v77:CBool = Test v75
+          CondBranch v77, bb11(), bb10()
+        bb11():
+          v82:CPtr = GetEP 1
+          v83:BasicObject = LoadField v82, :x@0x10d2
+          PopInlineFrame
+          PopInlineFrame
+          Jump bb4(v83)
+        bb10():
+          v91:NilClass = Const Value(nil)
+          PopInlineFrame
+          PopInlineFrame
+          PatchPoint NoEPEscape(find)
+          Jump bb4(v91)
+        bb4(v43:BasicObject):
+          PopInlineFrame
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v43
+        ");
+    }
 }

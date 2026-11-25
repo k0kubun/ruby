@@ -1449,6 +1449,64 @@ fn test_inline_block_return_runs_home_ensure() {
 }
 
 #[test]
+fn test_inline_block_return_from_inlined_home_method() {
+    // The home method of the block is inlined into the caller, so the return jumps to the
+    // return block of the inlined home method frame.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def find(a) = a.each { |x| return x if x.even? }
+            def test(a) = [find(a)]
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"[2]");
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[[1, 3]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_inlined_home_method_with_other_type() {
+    // The code after the inlined home method call must not be specialized for the type
+    // of the home method's normal return value.
+    with_inlining(|| {
+        eval(r#"
+            def find(a)
+              a.each { |x| return x if x.is_a?(String) }
+              0
+            end
+            def test(a) = find(a).succ
+            test([1])
+            test([1, "a"])
+            test([1])
+            test([1, "a"])
+        "#);
+        assert_snapshot!(assert_compiles_allowing_exits(r#"[test([1]), test([1, "a"])]"#), @r#"[1, "b"]"#);
+    });
+}
+
+#[test]
+fn test_inline_block_return_skips_guard_in_inlined_home_method() {
+    // objtostring guards `x` after the `each` call in find(). The `return` from the block
+    // doesn't run that guard, so the code after find() must not use the guarded `x`.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw(r##"
+            def find(a, x)
+              a.each { |e| return e if e }
+              "#{x}"
+            end
+            def test(a, x)
+              r = find(a, x)
+              [r, "#{x}"]
+            end
+            test([nil], "s")
+            test([1], "s")
+            test([nil], "s")
+            test([1], "s")
+        "##, r#"test([1], "t")"#), @r#"[1, "t"]"#);
+        assert_snapshot!(assert_compiles(r#"test([nil], "t")"#), @r#"["t", "t"]"#);
+    });
+}
+
+#[test]
 fn test_inline_block_break_runs_block_ensure() {
     // The ensure clause in the block must run, so the break stays a throw.
     with_inlining(|| {
