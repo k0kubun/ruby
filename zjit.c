@@ -419,6 +419,13 @@ rb_zjit_frame_cref(const rb_control_frame_t *cfp)
     return rb_vm_get_cref(cfp->ep);
 }
 
+// Return the lexical scope (cref) of a method entry, or NULL if it's not an ISEQ method
+const rb_cref_t *
+rb_zjit_cme_cref(const rb_callable_method_entry_t *cme)
+{
+    return cme->def->type == VM_METHOD_TYPE_ISEQ ? cme->def->body.iseq.cref : NULL;
+}
+
 // Return true if a constant lookup in the lexical scope `cref` may search `klass`. It checks the
 // scopes and the ancestors that vm_get_ev_const() searches for a constant without a scope (`Foo`).
 bool

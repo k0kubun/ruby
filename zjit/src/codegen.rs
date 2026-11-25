@@ -185,7 +185,7 @@ fn update_self_is_heap_object(iseq: IseqPtr, cfp: CfpPtr) {
 /// Record the lexical scope (cref) of `iseq` on the payload if it's not known yet. Folded constant
 /// paths use it in [`crate::invariants::rb_zjit_constant_state_changed`].
 /// Must be called while holding the VM lock.
-fn update_cref(iseq: IseqPtr, cref: *const rb_cref_t) {
+pub fn update_cref(iseq: IseqPtr, cref: *const rb_cref_t) {
     let payload = get_or_create_iseq_payload(iseq);
     if payload.cref.is_none() && !cref.is_null() {
         let cref = VALUE::from(cref);

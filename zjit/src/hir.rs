@@ -6225,6 +6225,9 @@ impl Function {
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
                 };
+                // The callee may not have been compiled by itself. Its constants are resolved
+                // in the lexical scope of its method entry.
+                crate::codegen::update_cref(iseq, unsafe { rb_zjit_cme_cref(cme) });
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
                     Err(_) => {

@@ -7272,6 +7272,26 @@ fn test_constant_definition_outside_lexical_scope_keeps_code() {
 }
 
 #[test]
+fn test_constant_definition_outside_lexical_scope_keeps_inlined_code() {
+    with_inlining(|| {
+        eval("
+            module KeepC
+              class Base; end
+              def self.base = Base
+            end
+            def test = KeepC.base
+            test
+            test
+            module KeepD
+              class Base; end
+            end
+        ");
+        assert!(!last_version_invalidated(get_method_iseq("self", "test")));
+        assert_snapshot!(assert_compiles("test"), @"KeepC::Base");
+    });
+}
+
+#[test]
 fn test_constant_definition_in_lexical_scope_invalidates_code() {
     eval("
         X = :outer
