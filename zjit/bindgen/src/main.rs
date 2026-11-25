@@ -371,6 +371,7 @@ fn main() {
         .allowlist_function("rb_jit_multi_ractor_p")
         .allowlist_function("rb_jit_constcache_shareable")
         .allowlist_function("rb_zjit_frame_cref")
+        .allowlist_function("rb_zjit_cme_cref")
         .allowlist_function("rb_zjit_constant_path_resolves_to")
         .allowlist_function("rb_objspace_garbage_object_p")
         .allowlist_function("rb_jit_vm_lock_then_barrier")

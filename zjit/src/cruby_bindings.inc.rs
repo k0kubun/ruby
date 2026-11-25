@@ -2518,6 +2518,7 @@ unsafe extern "C" {
         out: *mut VALUE,
     ) -> bool;
     pub fn rb_zjit_frame_cref(cfp: *const rb_control_frame_t) -> *const rb_cref_t;
+    pub fn rb_zjit_cme_cref(cme: *const rb_callable_method_entry_t) -> *const rb_cref_t;
     pub fn rb_zjit_constant_path_resolves_to(
         cref: *const rb_cref_t,
         segments: *const ID,

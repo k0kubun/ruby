@@ -6227,6 +6227,10 @@ impl Function {
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
+                    cref: {
+                        let cref = unsafe { rb_zjit_cme_cref(cme) };
+                        if cref.is_null() { None } else { Some(cref.into()) }
+                    },
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -9506,6 +9510,8 @@ enum AddIseqMode {
         jit_entry_idx: usize,
         /// The block the caller passed to this frame, if any.
         block: Option<BlockHandler>,
+        /// The lexical scope (`rb_cref_t`) of the inlined method, if known.
+        cref: Option<VALUE>,
     },
 }
 
@@ -9569,6 +9575,12 @@ fn add_iseq_to_hir(
 ) -> Result<AddIseqResult, ParseError> {
     let payload = get_or_create_iseq_payload(iseq);
     let mut profiles = ProfileOracle::new();
+
+    // The lexical scope to record with folded constant paths. See Invariant::StableConstantNames.
+    let const_cref = match mode {
+        AddIseqMode::Standalone => payload.compile_cref,
+        AddIseqMode::Inlined { cref, .. } => cref,
+    };
 
     // Build the initial FrameState for a block being translated. In inlined
     // mode it carries the caller's post-send Snapshot and this frame's depth;
@@ -10126,7 +10138,7 @@ fn add_iseq_to_hir(
                         // Invalidate output code on any constant writes associated with constants
                         // referenced after the PatchPoint.
                         let value = unsafe { (*ice).value };
-                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist, cref: payload.compile_cref, value }, state: exit_id });
+                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist, cref: const_cref, value }, state: exit_id });
                         fun.push_insn(block, Insn::Const { val: Const::Value(value) })
                     } else {
                         fun.push_insn(block, Insn::GetConstantPath { ic, state: exit_id })

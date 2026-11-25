@@ -7279,6 +7279,29 @@ fn test_constant_unrelated_definition_keeps_code() {
 }
 
 #[test]
+fn test_constant_unrelated_definition_keeps_inlined_code() {
+    with_inlining(|| {
+        eval("
+            module PCIg
+              class Base; end
+              module Handling
+                def self.base = Base
+              end
+            end
+            def test = PCIg::Handling.base
+            test
+            test
+            module PCIgOther
+              class Base; end
+            end
+        ");
+        let iseq = get_method_iseq("self", "test");
+        assert!(!last_version_invalidated(iseq));
+        assert_snapshot!(assert_compiles("test.equal?(PCIg::Base)"), @"true");
+    });
+}
+
+#[test]
 fn test_constant_lexical_shadowing_invalidates_code() {
     eval("
         PCIbX = :outer

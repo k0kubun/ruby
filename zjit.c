@@ -419,6 +419,16 @@ rb_zjit_frame_cref(const rb_control_frame_t *cfp)
     return rb_vm_get_cref(cfp->ep);
 }
 
+// Return the lexical scope (cref) a method entry runs with, or NULL if unknown.
+const rb_cref_t *
+rb_zjit_cme_cref(const rb_callable_method_entry_t *cme)
+{
+    if (cme && cme->def && cme->def->type == VM_METHOD_TYPE_ISEQ) {
+        return cme->def->body.iseq.cref;
+    }
+    return NULL;
+}
+
 enum zjit_const_lookup {
     ZJIT_CONST_LOOKUP_FOUND,
     ZJIT_CONST_LOOKUP_MISS,
