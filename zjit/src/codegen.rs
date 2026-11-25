@@ -3518,6 +3518,11 @@ fn scan_may_write_block_code(iseq: IseqPtr) -> bool {
 /// These blocks fall back to `vm_yield`, which handles the non-local exit in C.
 /// (`next`/`redo` lower to `leave`/`jump`, not `throw`, so they stay inlinable.)
 pub(crate) fn block_iseq_may_throw(iseq: IseqPtr) -> bool {
+    iseq_any_insn(iseq, |_pc, opcode| opcode == YARVINSN_throw)
+}
+
+/// True if `f(pc, opcode)` is true for any instruction in the ISEQ
+pub(crate) fn iseq_any_insn(iseq: IseqPtr, f: impl Fn(*const VALUE, u32) -> bool) -> bool {
     let encoded_size = unsafe { rb_iseq_encoded_size(iseq) };
     let mut insn_idx: u32 = 0;
 
@@ -3525,7 +3530,7 @@ pub(crate) fn block_iseq_may_throw(iseq: IseqPtr) -> bool {
         let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
         let opcode = unsafe { rb_iseq_bare_opcode_at_pc(iseq, pc) } as u32;
 
-        if opcode == YARVINSN_throw {
+        if f(pc, opcode) {
             return true;
         }
 
