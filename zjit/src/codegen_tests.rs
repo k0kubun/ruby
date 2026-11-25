@@ -1378,17 +1378,49 @@ fn test_inline_block_defined_yield_checks_method_block() {
 }
 
 #[test]
-fn test_inline_block_with_break() {
-    // A block with `break` is inlined, and the `break` throws from the inlined block frame.
+fn test_inline_block_break_jumps_to_caller() {
     with_inlining(|| {
-        let counters = crate::state::ZJITState::get_counters();
-        let inline_count_before = counters.inline_block_count;
-        assert_snapshot!(assert_compiles_allowing_exits("
+        assert_snapshot!(assert_inlines_throw("
             def test(a) = a.each { |x| break x * 10 if x == 2 }
             test([1, 2, 3])
             test([1, 2, 3])
-        "), @"20");
-        assert!(counters.inline_block_count > inline_count_before, "expected the block with `break` to be inlined");
+        ", "test([1, 2, 3])"), @"20");
+        // The loop finishes without breaking
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[1, 3]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_and_return_in_same_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              r = a.each do |x|
+                return :ret if x == :r
+                break :brk if x == :b
+              end
+              [r]
+            end
+            test([:b])
+            test([:r])
+        ", "test([:b])"), @"[:brk]");
+        assert_snapshot!(assert_compiles("test([:r])"), @":ret");
+        assert_snapshot!(assert_compiles("test([:x])"), @"[[:x]]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_from_nested_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def test(a)
+              a.map do |row|
+                row.each { |x| break x if x > 1 }
+              end
+            end
+            test([[1, 2], [3]])
+            test([[1, 2], [3]])
+        "), @"[2, 3]");
     });
 }
 
@@ -1421,6 +1453,24 @@ fn test_inline_large_block_with_return() {
               a.each do |x|
                 y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
                 return y if y > 7
+              end
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2])"), @"8");
+    });
+}
+
+#[test]
+fn test_inline_large_block_with_break() {
+    // The block is larger than the inline threshold, but it's inlined since its `break`
+    // can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              a.each do |x|
+                y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+                break y if y > 7
               end
             end
             test([1, 2])
