@@ -1378,17 +1378,49 @@ fn test_inline_block_defined_yield_checks_method_block() {
 }
 
 #[test]
-fn test_inline_block_with_break() {
-    // A block with `break` is inlined, and the `break` throws from the inlined block frame.
+fn test_inline_block_break_jumps_to_caller() {
     with_inlining(|| {
-        let counters = crate::state::ZJITState::get_counters();
-        let inline_count_before = counters.inline_block_count;
-        assert_snapshot!(assert_compiles_allowing_exits("
+        assert_snapshot!(assert_inlines_throw("
             def test(a) = a.each { |x| break x * 10 if x == 2 }
             test([1, 2, 3])
             test([1, 2, 3])
-        "), @"20");
-        assert!(counters.inline_block_count > inline_count_before, "expected the block with `break` to be inlined");
+        ", "test([1, 2, 3])"), @"20");
+        // The loop finishes without breaking
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[1, 3]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_and_return_in_same_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              r = a.each do |x|
+                return :ret if x == :r
+                break :brk if x == :b
+              end
+              [r]
+            end
+            test([:b])
+            test([:r])
+        ", "test([:b])"), @"[:brk]");
+        assert_snapshot!(assert_compiles("test([:r])"), @":ret");
+        assert_snapshot!(assert_compiles("test([:x])"), @"[[:x]]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_from_nested_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def test(a)
+              a.map do |row|
+                row.each { |x| break x if x > 1 }
+              end
+            end
+            test([[1, 2], [3]])
+            test([[1, 2], [3]])
+        "), @"[2, 3]");
     });
 }
 
@@ -1412,6 +1444,64 @@ fn test_inline_block_return_from_home_method() {
 }
 
 #[test]
+fn test_inline_block_return_from_inlined_home_method() {
+    // The home method of the block is inlined into the caller, so the return jumps to the
+    // return block of the inlined home method frame.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def find(a) = a.each { |x| return x if x.even? }
+            def test(a) = [find(a)]
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"[2]");
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[[1, 3]]");
+    });
+}
+
+#[test]
+fn test_inline_block_return_from_inlined_home_method_with_other_type() {
+    // The code after the inlined home method call must not be specialized for the type
+    // of the home method's normal return value.
+    with_inlining(|| {
+        eval(r#"
+            def find(a)
+              a.each { |x| return x if x.is_a?(String) }
+              0
+            end
+            def test(a) = find(a).succ
+            test([1])
+            test([1, "a"])
+            test([1])
+            test([1, "a"])
+        "#);
+        assert_snapshot!(assert_compiles_allowing_exits(r#"[test([1]), test([1, "a"])]"#), @r#"[1, "b"]"#);
+    });
+}
+
+#[test]
+fn test_inline_block_return_skips_guard_in_inlined_home_method() {
+    // objtostring guards `x` after the `each` call in find(). The `return` from the block
+    // doesn't run that guard, so the code after find() must not use the guarded `x`.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw(r##"
+            def find(a, x)
+              a.each { |e| return e if e }
+              "#{x}"
+            end
+            def test(a, x)
+              r = find(a, x)
+              [r, "#{x}"]
+            end
+            test([nil], "s")
+            test([1], "s")
+            test([nil], "s")
+            test([1], "s")
+        "##, r#"test([1], "t")"#), @r#"[1, "t"]"#);
+        assert_snapshot!(assert_compiles(r#"test([nil], "t")"#), @r#"["t", "t"]"#);
+    });
+}
+
+#[test]
 fn test_inline_large_block_with_return() {
     // The block is larger than the inline threshold, but it's inlined since its `return`
     // can skip a `throw`.
@@ -1421,6 +1511,24 @@ fn test_inline_large_block_with_return() {
               a.each do |x|
                 y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
                 return y if y > 7
+              end
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2])"), @"8");
+    });
+}
+
+#[test]
+fn test_inline_large_block_with_break() {
+    // The block is larger than the inline threshold, but it's inlined since its `break`
+    // can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              a.each do |x|
+                y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+                break y if y > 7
               end
             end
             test([1, 2])
