@@ -983,6 +983,44 @@ enum InlineRecv {
     Captured(InsnId),
 }
 
+/// Operands of an [`Insn::PopInlineFrame`]
+#[derive(Clone, Copy)]
+struct InlineFramePop {
+    iseq: IseqPtr,
+    argc: usize,
+    /// FrameState of the call that pushed the frame
+    state: InsnId,
+}
+
+impl InlineFramePop {
+    fn insn(self) -> Insn {
+        Insn::PopInlineFrame { iseq: self.iseq, argc: self.argc, state: self.state }
+    }
+}
+
+/// A method frame inlined with a literal block that may throw. If the block is inlined in the
+/// same `inline_methods` pass, a `break` from the block can jump to the frame's return block.
+#[derive(Clone, Copy)]
+struct InlinedYielder {
+    /// The literal block passed to the method
+    blockiseq: IseqPtr,
+    /// Block the method's `leave` jumps to. It takes the return value as its parameter,
+    /// pops the method frame, and continues in the caller after the call.
+    return_block: BlockId,
+    /// Operands for a PopInlineFrame that pops the method frame
+    pop: InlineFramePop,
+}
+
+/// Where a `break` from an inlined block can jump to instead of unwinding frames with a `throw`
+#[derive(Clone, Copy)]
+struct InlinedBlockThrowTargets {
+    /// Pops the inlined block frame
+    block_pop: InlineFramePop,
+    /// The return block of the method frame that yielded to the block. It takes the break
+    /// value as the return value of the method and pops the method frame.
+    break_target: BlockId,
+}
+
 /// Payload of [`Insn::CondBranchHasType`]. Boxed in the enum to keep `Insn` small.
 #[derive(Debug, Clone)]
 pub struct CondBranchHasTypeData {
@@ -6142,6 +6180,10 @@ impl Function {
         // inlinable after a later type_specialize pass promotes them to SendDirect.
         let mut worklist: VecDeque<BlockId> = self.reverse_post_order().into_iter().collect();
 
+        // Method frames inlined in this pass with a literal block that may throw, keyed by the
+        // caller Snapshot that FrameStates in the frame point to. See inlined_block_throw_targets.
+        let mut yielders: HashMap<InsnId, InlinedYielder> = HashMap::new();
+
         while let Some(block) = worklist.pop_front() {
             // Walk this block looking for an inlinable SendDirect. Under the
             // basic-block invariant, the terminator is the last instruction in
@@ -6180,10 +6222,19 @@ impl Function {
                 // being inlined, too.
                 assert!(!matches!(call_block, Some(BlockHandler::BlockArg)), "BlockArg in SendDirect");
 
+                // For an inlined block, find where its `break` can jump to.
+                let throw_targets = match call_recv {
+                    InlineRecv::Recv(_) => None,
+                    InlineRecv::Captured(_) => self.inlined_block_throw_targets(&yielders, InlineFramePop { iseq, argc: args_len, state }),
+                };
+
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
-                if !self.should_inline(iseq, cme, insns_at_pass_start) || !Self::can_inline(iseq) {
+                // Inlining a block whose `break` can become a jump saves an expensive `throw` and
+                // interpreter re-entry, so skip the size and budget heuristics for it. This is
+                // bounded by the number of literal blocks passed to the methods inlined in this pass.
+                if (throw_targets.is_none() && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -6244,6 +6295,7 @@ impl Function {
                     depth: caller_depth + 1,
                     jit_entry_idx: passed_opt_num,
                     block: call_block,
+                    throw_targets,
                 };
                 let add_result = match add_iseq_to_hir(self, iseq, mode) {
                     Ok(r) => r,
@@ -6266,6 +6318,14 @@ impl Function {
                     InlineRecv::Captured(_) => incr_counter!(inline_block_count),
                 }
                 did_inline = true;
+                let throwing_blockiseq = match call_block {
+                    Some(BlockHandler::BlockIseq(blockiseq)) if crate::codegen::block_iseq_may_throw(blockiseq) => Some(blockiseq),
+                    _ => None,
+                };
+                if let Some(blockiseq) = throwing_blockiseq {
+                    let pop = InlineFramePop { iseq, argc: args_len, state };
+                    yielders.insert(post_send_caller, InlinedYielder { blockiseq, return_block: continuation, pop });
+                }
 
                 let args = match send.insn(self) {
                     Insn::SendDirect(data) => data.args.to_vec(),
@@ -6417,6 +6477,13 @@ impl Function {
                 // single inline_methods call.
                 worklist.push_back(continuation);
 
+                // The callee's `yield`s to a literal block are InvokeBlockIseqDirect already.
+                // If the block may throw, inline it in this pass, while no other optimization
+                // has touched `continuation`, so that its `break` can jump to `continuation`.
+                if throwing_blockiseq.is_some() {
+                    worklist.extend((pre_blocks_len..self.blocks.len()).map(BlockId::from).filter(|&b| b != continuation));
+                }
+
                 // Done with this block: the rest of it is in `continuation`.
                 break;
             }
@@ -6427,6 +6494,36 @@ impl Function {
         }
 
         did_inline
+    }
+
+    /// Find where a `break` from an inlined block can jump to without a `throw`. That's possible
+    /// when the method frame that yields to the block was inlined with the block as its literal
+    /// block in this `inline_methods` pass, so its return block can still take new edges.
+    ///
+    /// Like vm_throw_start() and vm_exec_handle_exception(), a `break` pops the method frame and
+    /// resumes its caller after the call. This gives up when popping the method frame would run
+    /// an ensure clause.
+    fn inlined_block_throw_targets(&self, yielders: &HashMap<InsnId, InlinedYielder>, block_pop: InlineFramePop) -> Option<InlinedBlockThrowTargets> {
+        // The `yield` must be in the method frame. If it were in a block in the method,
+        // the caller of `yield_state` would be the caller Snapshot of the block's frame.
+        let yield_state = self.frame_state_ref(block_pop.state);
+        let yielder = yielders.get(&yield_state.caller()?)?;
+        if yielder.blockiseq != block_pop.iseq {
+            return None;
+        }
+        let yield_epc = u32::try_from(yield_state.insn_idx()).unwrap() + insn_len(YARVINSN_invokeblock.to_usize());
+        if unsafe { rb_zjit_iseq_ensure_covers_p(yielder.pop.iseq, yield_epc) } {
+            return None;
+        }
+
+        // `break` resumes the caller after the call, which is where `return_block` starts, if the
+        // catch table says it's not an orphan `break`.
+        let caller_iseq = self.frame_state_ref(yielder.pop.state).iseq;
+        let call_epc = self.blocks[yielder.return_block].insn_idx;
+        if !unsafe { rb_zjit_iseq_break_lands_p(caller_iseq, block_pop.iseq, call_epc) } {
+            return None;
+        }
+        Some(InlinedBlockThrowTargets { block_pop, break_target: yielder.return_block })
     }
 
     fn load_shape(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -9535,6 +9632,8 @@ enum AddIseqMode {
         jit_entry_idx: usize,
         /// The block the caller passed to this frame, if any.
         block: Option<BlockHandler>,
+        /// For an inlined block, where `break` can jump to.
+        throw_targets: Option<InlinedBlockThrowTargets>,
     },
 }
 
@@ -10650,7 +10749,23 @@ fn add_iseq_to_hir(
                     break;  // Don't enqueue the next block as a successor
                 }
                 YARVINSN_throw => {
-                    fun.push_insn(block, Insn::Throw { throw_state: get_arg(pc, 0).as_u32(), val: state.stack_pop()?, state: exit_id });
+                    let throw_state = get_arg(pc, 0).as_u32();
+                    let val = state.stack_pop()?;
+                    // In an inlined block, turn a `break` into a jump when the frame it unwinds to
+                    // is part of this function. See inlined_block_throw_targets.
+                    if let AddIseqMode::Inlined { throw_targets: Some(targets), .. } = mode {
+                        let is_break = throw_state & VM_THROW_STATE_MASK == RUBY_TAG_BREAK;
+                        let no_escape = throw_state & VM_THROW_NO_ESCAPE_FLAG != 0;
+                        // Unwinding the block frame must not run an ensure clause. `insn_idx` is
+                        // already past the throw.
+                        if is_break && !no_escape && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, insn_idx) } {
+                            incr_counter!(inline_throw_count);
+                            fun.push_insn(block, targets.block_pop.insn());
+                            fun.push_insn(block, Insn::Jump(BranchEdge { target: targets.break_target, args: vec![val] }));
+                            break;  // Don't enqueue the next block as a successor
+                        }
+                    }
+                    fun.push_insn(block, Insn::Throw { throw_state, val, state: exit_id });
                     break;  // Don't enqueue the next block as a successor
                 }
 

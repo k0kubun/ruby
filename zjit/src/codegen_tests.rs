@@ -81,6 +81,22 @@ fn assert_inlines_block(program: &str) -> String {
     result
 }
 
+/// Run `warmup`, which must compile at least one `throw` in an inlined block into a jump.
+/// Then run `program` like `assert_compiles` and assert that it executes no `throw` instruction.
+#[track_caller]
+fn assert_inlines_throw(warmup: &str, program: &str) -> String {
+    ensure_rubyvm(); // ZJITState is not available until the VM is booted
+    let counters = crate::state::ZJITState::get_counters();
+    let inline_throw_count_before = counters.inline_throw_count;
+    eval(warmup);
+    assert!(counters.inline_throw_count > inline_throw_count_before,
+        "expected the warmup to compile a throw into a jump, but inline_throw_count did not increase");
+    let throw_count_before = counters.throw_count;
+    let result = assert_compiles(program);
+    assert_eq!(counters.throw_count, throw_count_before, "Program executed a throw instruction");
+    result
+}
+
 #[test]
 fn test_breakpoint_hir_codegen() {
     rb_zjit_prepare_options();
@@ -1362,17 +1378,89 @@ fn test_inline_block_defined_yield_checks_method_block() {
 }
 
 #[test]
-fn test_inline_block_with_break() {
-    // A block with `break` is inlined, and the `break` throws from the inlined block frame.
+fn test_inline_block_break_jumps_to_caller() {
     with_inlining(|| {
-        let counters = crate::state::ZJITState::get_counters();
-        let inline_count_before = counters.inline_block_count;
-        assert_snapshot!(assert_compiles_allowing_exits("
+        assert_snapshot!(assert_inlines_throw("
             def test(a) = a.each { |x| break x * 10 if x == 2 }
             test([1, 2, 3])
             test([1, 2, 3])
-        "), @"20");
-        assert!(counters.inline_block_count > inline_count_before, "expected the block with `break` to be inlined");
+        ", "test([1, 2, 3])"), @"20");
+        // The loop finishes without breaking
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[1, 3]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_runs_block_ensure() {
+    // The ensure clause in the block must run, so the break stays a throw.
+    with_inlining(|| {
+        eval("
+            def test(a)
+              log = []
+              r = a.each do |x|
+                begin
+                  break x if x == 2
+                ensure
+                  log << x
+                end
+              end
+              [r, log]
+            end
+            test([1, 2, 3])
+            test([1, 2, 3])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[2, [1, 2]]");
+    });
+}
+
+#[test]
+fn test_inline_block_break_runs_yielder_ensure() {
+    // The ensure clause in the method that yields must run, so the break stays a throw.
+    with_inlining(|| {
+        eval("
+            def yielder(log)
+              yield
+            ensure
+              log << :ensure
+            end
+            def test(log) = yielder(log) { break 1 }
+            test([])
+            test([])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test(log), log]"), @"[1, [:ensure]]");
+    });
+}
+
+#[test]
+fn test_inline_large_block_with_break() {
+    // The block is larger than the inline threshold, but it's inlined since its `break`
+    // can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def test(a)
+              a.each do |x|
+                y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+                break y if y > 7
+              end
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2])"), @"8");
+    });
+}
+
+#[test]
+fn test_inline_block_break_from_nested_block() {
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def test(a)
+              a.map do |row|
+                row.each { |x| break x if x > 1 }
+              end
+            end
+            test([[1, 2], [3]])
+            test([[1, 2], [3]])
+        "), @"[2, 3]");
     });
 }
 
