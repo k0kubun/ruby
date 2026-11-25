@@ -218,6 +218,12 @@ pub enum Invariant {
     /// following code to be valid.
     StableConstantNames {
         idlist: *const ID,
+        /// The lexical scope (`rb_cref_t`) the path was resolved in, if known. With it,
+        /// a constant definition re-resolves the path and keeps the code if the path still
+        /// resolves to `value`. Without it, any write to the names invalidates the code.
+        cref: Option<VALUE>,
+        /// The value the path resolved to at compile time
+        value: VALUE,
     },
     /// TracePoint is not enabled. If TracePoint is enabled, this is invalidated.
     NoTracePoint,
@@ -352,7 +358,7 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
                     self.ptr_map.map_ptr(cme)
                 )
             }
-            Invariant::StableConstantNames { idlist } => {
+            Invariant::StableConstantNames { idlist, .. } => {
                 write!(f, "StableConstantNames({:p}, ", self.ptr_map.map_ptr(idlist))?;
                 let mut idx = 0;
                 let mut sep = "";
@@ -10119,8 +10125,9 @@ fn add_iseq_to_hir(
                     let result = if can_fold {
                         // Invalidate output code on any constant writes associated with constants
                         // referenced after the PatchPoint.
-                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist }, state: exit_id });
-                        fun.push_insn(block, Insn::Const { val: Const::Value(unsafe { (*ice).value }) })
+                        let value = unsafe { (*ice).value };
+                        fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::StableConstantNames { idlist, cref: payload.compile_cref, value }, state: exit_id });
+                        fun.push_insn(block, Insn::Const { val: Const::Value(value) })
                     } else {
                         fun.push_insn(block, Insn::GetConstantPath { ic, state: exit_id })
                     };

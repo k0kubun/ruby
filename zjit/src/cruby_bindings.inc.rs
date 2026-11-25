@@ -2346,6 +2346,7 @@ unsafe extern "C" {
         buff_size: usize,
         obj: VALUE,
     ) -> *const ::std::os::raw::c_char;
+    pub fn rb_objspace_garbage_object_p(obj: VALUE) -> ::std::os::raw::c_int;
     pub fn rb_gc_writebarrier_remember(obj: VALUE);
     pub fn rb_ec_stack_check(ec: *mut rb_execution_context_struct) -> ::std::os::raw::c_int;
     pub fn rb_id_table_lookup(
@@ -2515,6 +2516,12 @@ unsafe extern "C" {
         ary: VALUE,
         index: rb_len_t,
         out: *mut VALUE,
+    ) -> bool;
+    pub fn rb_zjit_frame_cref(cfp: *const rb_control_frame_t) -> *const rb_cref_t;
+    pub fn rb_zjit_constant_path_resolves_to(
+        cref: *const rb_cref_t,
+        segments: *const ID,
+        expected: VALUE,
     ) -> bool;
     pub fn rb_nil_to_s(obj: VALUE) -> VALUE;
     pub fn rb_true_to_s(obj: VALUE) -> VALUE;
