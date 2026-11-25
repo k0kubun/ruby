@@ -2493,6 +2493,11 @@ unsafe extern "C" {
         iseq: *const rb_iseq_t,
         epc: ::std::os::raw::c_uint,
     ) -> bool;
+    pub fn rb_zjit_iseq_break_lands_p(
+        iseq: *const rb_iseq_t,
+        block_iseq: *const rb_iseq_t,
+        epc: ::std::os::raw::c_uint,
+    ) -> bool;
     pub fn rb_zjit_cme_is_cfunc(
         me: *const rb_callable_method_entry_t,
         func: *const ::std::os::raw::c_void,

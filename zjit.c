@@ -372,6 +372,24 @@ rb_zjit_iseq_ensure_covers_p(const rb_iseq_t *iseq, unsigned int epc)
     return false;
 }
 
+// Return true if a `break` from `block_iseq` lands at `epc` (the PC offset after the
+// call that was passed `block_iseq`) in a frame of `iseq`. This mirrors the catch
+// table lookup that vm_throw_start() does to check for an orphan `break`.
+bool
+rb_zjit_iseq_break_lands_p(const rb_iseq_t *iseq, const rb_iseq_t *block_iseq, unsigned int epc)
+{
+    const struct iseq_catch_table *ct = ISEQ_BODY(iseq)->catch_table;
+    if (!ct) return false;
+    for (unsigned int i = 0; i < ct->size; i++) {
+        const struct iseq_catch_table_entry *entry = UNALIGNED_MEMBER_PTR(ct, entries[i]);
+        if (entry->type == CATCH_TYPE_BREAK && entry->iseq == block_iseq &&
+            entry->start < epc && entry->end >= epc) {
+            return entry->cont == epc;
+        }
+    }
+    return false;
+}
+
 bool rb_zjit_cme_is_cfunc(const rb_callable_method_entry_t *me, const void *func);
 
 const struct rb_callable_method_entry_struct *
