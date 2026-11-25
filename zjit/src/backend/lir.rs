@@ -2823,10 +2823,16 @@ impl Assembler
                             new_ids.push(None);
                         }
                     } else {
-                        if call_result_live {
+                        // When no pop writes C_RET, the result can be moved after the pops directly.
+                        let result_reg = if survivor_regs.contains(&C_RET_OPND) {
+                            Opnd::Reg(SCRATCH_REG)
+                        } else {
+                            C_RET_OPND
+                        };
+                        if call_result_live && result_reg != C_RET_OPND {
                             // Save CCall result to scratch immediately, before pops
                             // can clobber either C_RET or the output register.
-                            new_insns.push(Insn::Mov { dest: Opnd::Reg(SCRATCH_REG), src: C_RET_OPND });
+                            new_insns.push(Insn::Mov { dest: result_reg, src: C_RET_OPND });
                             new_ids.push(None);
                         }
 
@@ -2843,7 +2849,7 @@ impl Assembler
                         if call_result_live {
                             // Move result from scratch to output AFTER all pops.
                             let out = Self::rewritten_opnd(out, intervals, alloc_regs);
-                            new_insns.push(Insn::Mov { dest: out, src: Opnd::Reg(SCRATCH_REG) });
+                            new_insns.push(Insn::Mov { dest: out, src: result_reg });
                             new_ids.push(None);
                         }
                     }
