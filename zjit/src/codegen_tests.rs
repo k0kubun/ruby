@@ -1219,6 +1219,26 @@ fn test_yield_inline_invocation_live_stack_below_args() {
 }
 
 #[test]
+fn test_yield_to_literal_block_with_break() {
+    // The yield in the inlined foo calls the literal block's JIT code, which throws. m3 runs in the
+    // interpreter at the depth of the block frame, so the block frame's cfp->_iseq is m3's ISEQ
+    // when the `break` throws.
+    with_inlining(|| {
+        assert_snapshot!(assert_compiles_allowing_exits("
+            def foo = yield
+            def test(x) = foo { break x + 1 if x > 0; 0 }
+            test(1)
+            test(1)
+            def m1 = m2
+            def m2 = m3
+            def m3 = 1
+            m1
+            [test(1), test(-10)]
+        "), @"[2, 0]");
+    });
+}
+
+#[test]
 fn test_yield_inlined_caller_block_dispatches_without_guards() {
     // When the yielding method is inlined into a caller that passes a literal block, the block
     // handler is written into the inlined frame's EP from a compile-time constant, so the yield
