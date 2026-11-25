@@ -3967,10 +3967,11 @@ const_set(VALUE klass, ID id, VALUE val)
         if (!tbl) {
             tbl = rb_id_table_create(0);
             RCLASS_WRITE_CONST_TBL(klass, tbl, false);
-            rb_clear_constant_cache_for_id(id);
             ce = ZALLOC(rb_const_entry_t);
             rb_id_table_insert(tbl, id, (VALUE)ce);
             setup_const_entry(ce, klass, val, CONST_PUBLIC);
+            // Clear after the update so that JITs notified by it see the new entry
+            rb_clear_constant_cache_for_id(id);
         }
         else {
             struct autoload_const ac = {
@@ -4084,16 +4085,17 @@ const_tbl_update(struct autoload_const *ac, int autoload_force, struct const_war
             warning->file = ce->u.file;
             warning->line = ce->line;
         }
-        rb_clear_constant_cache_for_id(id);
         setup_const_entry(ce, klass, val, visibility);
+        // Clear after the update so that JITs notified by it see the new entry
+        rb_clear_constant_cache_for_id(id);
     }
     else {
         tbl = RCLASS_WRITABLE_CONST_TBL(klass);
-        rb_clear_constant_cache_for_id(id);
 
         ce = ZALLOC(rb_const_entry_t);
         rb_id_table_insert(tbl, id, (VALUE)ce);
         setup_const_entry(ce, klass, val, visibility);
+        rb_clear_constant_cache_for_id(id);
     }
 }
 
