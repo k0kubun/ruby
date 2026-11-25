@@ -1021,9 +1021,11 @@ struct InlinedBlockThrowTargets {
     /// For `break`: the return block of the method frame that yielded to the block. It takes
     /// the break value as the return value of the method and pops the method frame.
     break_target: Option<BlockId>,
-    /// For a non-local `return`: pops the method frame that yielded to the block. Then the
-    /// `return` returns from this function, whose frame is the block's home frame.
+    /// For a non-local `return`: pops the method frame that yielded to the block. Then the `return`
+    /// returns from this function, whose frame is the block's home frame, or jumps to `home_return_block`.
     return_yielder_pop: Option<InlineFramePop>,
+    /// The return block of the home frame if it's an inlined method frame
+    home_return_block: Option<BlockId>,
 }
 
 /// Payload of [`Insn::CondBranchHasType`]. Boxed in the enum to keep `Insn` small.
@@ -2692,6 +2694,10 @@ pub struct Block {
     pub insn_idx: u32,
     params: Vec<InsnId>,
     insns: Vec<InsnId>,
+    /// The return block of an inlined method frame that may get new incoming edges later,
+    /// when a non-local `return` from a block inlined later is compiled into a jump to it.
+    /// Optimizations must not merge it into its predecessor or narrow its params.
+    pinned: bool,
 }
 
 impl Block {
@@ -3083,6 +3089,9 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
+    /// Pinned return blocks of inlined method frames, keyed by the caller Snapshot that
+    /// FrameStates in the frame point to. See inlined_block_throw_targets.
+    pinned_return_blocks: HashMap<InsnId, BlockId>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3306,6 +3315,18 @@ fn can_direct_invoke_block(flags: u32) -> bool {
     (flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG | VM_CALL_ARGS_BLOCKARG)) == 0
 }
 
+/// Return true if `iseq` passes a literal block that may do a non-local `return`.
+fn iseq_has_literal_block_with_return(iseq: IseqPtr) -> bool {
+    use crate::codegen::iseq_any_insn;
+    iseq_any_insn(iseq, |pc, opcode| opcode == YARVINSN_send && {
+        let block_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+        !block_iseq.is_null() && iseq_any_insn(block_iseq, |pc, opcode| opcode == YARVINSN_throw && {
+            let throw_state = unsafe { *pc.add(1) }.as_u32();
+            throw_state & VM_THROW_STATE_MASK == RUBY_TAG_RETURN && throw_state & VM_THROW_NO_ESCAPE_FLAG == 0
+        })
+    })
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
@@ -3346,6 +3367,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
+            pinned_return_blocks: HashMap::new(),
         }
     }
 
@@ -4107,6 +4129,14 @@ impl Function {
 
         // Fill entry parameter types
         self.copy_param_types();
+
+        // Pinned blocks may get incoming edges with any value later. Don't let optimizations
+        // specialize code on the values of their existing incoming edges.
+        for block in self.blocks.iter().filter(|block| block.pinned) {
+            for &param in &block.params {
+                self.insn_types[param] = types::BasicObject;
+            }
+        }
 
         // Assign `new_type` to `insn` if it differs from the recorded type.
         // Returns `true` if a write actually happened, `false` if the type
@@ -6328,6 +6358,12 @@ impl Function {
                     let pop = InlineFramePop { iseq, argc: args_len, state };
                     yielders.insert(post_send_caller, InlinedYielder { blockiseq, return_block: continuation, pop });
                 }
+                // A non-local `return` from a literal block in the callee may jump to
+                // `continuation` once the block is inlined in a later pass.
+                if matches!(call_recv, InlineRecv::Recv(_)) && iseq_has_literal_block_with_return(iseq) {
+                    self.blocks[continuation].pinned = true;
+                    self.pinned_return_blocks.insert(post_send_caller, continuation);
+                }
 
                 let args = match send.insn(self) {
                     Insn::SendDirect(data) => data.args.to_vec(),
@@ -6527,8 +6563,18 @@ impl Function {
             .then_some(yielder.return_block);
 
         // `return` returns from the home frame if it's a method frame whose ensure clause doesn't
-        // cover the call. A home frame without a caller is the frame of this function.
-        let return_yielder_pop = (home_state.caller().is_none()
+        // cover the call. A home frame without a caller is the frame of this function. If the home
+        // frame is inlined, we jump to its return block, which must be pinned so that it's not
+        // optimized assuming its existing incoming edges. It also must still be reachable: dead
+        // code elimination doesn't keep values that only unreachable blocks use.
+        let (can_return, home_return_block) = match home_state.caller() {
+            None => (true, None),
+            Some(home_caller) => match self.pinned_return_blocks.get(&home_caller) {
+                Some(&block) if self.reverse_post_order().contains(&block) => (true, Some(block)),
+                _ => (false, None),
+            },
+        };
+        let return_yielder_pop = (can_return
             && unsafe { rb_get_iseq_body_type(home_state.iseq) } == ISEQ_TYPE_METHOD
             && !unsafe { rb_zjit_iseq_ensure_covers_p(home_state.iseq, call_epc) })
             .then_some(yielder.pop);
@@ -6536,7 +6582,7 @@ impl Function {
         if break_target.is_none() && return_yielder_pop.is_none() {
             return None;
         }
-        Some(InlinedBlockThrowTargets { block_pop, break_target, return_yielder_pop })
+        Some(InlinedBlockThrowTargets { block_pop, break_target, return_yielder_pop, home_return_block })
     }
 
     fn load_shape(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -7017,9 +7063,10 @@ impl Function {
             .collect();
 
         // We only need to update blocks that have params. (Blocks without params cannot be improved)
+        // Pinned blocks may get more incoming edges later, so their params are not trivial.
         let blocks_receiving_params: Vec<BlockId> = blocks.iter().copied()
             .filter(|&block_id|
-                self.blocks[block_id].params().len() != 0)
+                self.blocks[block_id].params().len() != 0 && !self.blocks[block_id].pinned)
             .collect();
 
         // Create a vec to represent trivial indices
@@ -7223,7 +7270,13 @@ impl Function {
         let mut rewrite_maps: Vec<Option<HashMap<InsnId, InsnId>>> = vec![None; self.blocks.len()];
         let dominators = Dominators::new(self);
         for &block in dominators.cfi.reverse_post_order() {
-            let mut rewrite_map = rewrite_maps[dominators.idom(block)].clone().unwrap_or_else(|| HashMap::new());
+            // A pinned block may get an incoming edge later that its current dominators don't dominate,
+            // so don't rewrite its operands to values that only they define.
+            let mut rewrite_map = if self.blocks[block].pinned {
+                HashMap::new()
+            } else {
+                rewrite_maps[dominators.idom(block)].clone().unwrap_or_else(|| HashMap::new())
+            };
             for i in 0..self.blocks[block].insns.len() {
                 let insn_id = self.blocks[block].insns[i];
                 let canonical_id = self.union_find.borrow().find_const(insn_id);
@@ -7746,6 +7799,10 @@ impl Function {
     fn absorb_dst_block(&mut self, num_in_edges: &[u32], block: BlockId) -> bool {
         let Some(&terminator_id) = self.blocks[block].insns.last()
             else { return false };
+        if matches!(self.find_ref(terminator_id), Insn::Jump(edge) if self.blocks[edge.target].pinned) {
+            // The block may get more incoming edges later
+            return false;
+        }
         let &mut Insn::Jump(ref mut edge) = self.resolve(terminator_id).insn_mut(self)
             else { return false };
         if edge.target == block {
@@ -10783,7 +10840,10 @@ fn add_iseq_to_hir(
                                 incr_counter!(inline_throw_count);
                                 fun.push_insn(block, targets.block_pop.insn());
                                 fun.push_insn(block, yielder_pop.insn());
-                                fun.push_insn(block, Insn::Return { val });
+                                match targets.home_return_block {
+                                    Some(target) => fun.push_insn(block, Insn::Jump(BranchEdge { target, args: vec![val] })),
+                                    None => fun.push_insn(block, Insn::Return { val }),
+                                };
                                 break;  // Don't enqueue the next block as a successor
                             }
                             _ => {}
