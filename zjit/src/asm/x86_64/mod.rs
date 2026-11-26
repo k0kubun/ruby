@@ -700,6 +700,40 @@ pub fn call_ptr(cb: &mut CodeBlock, scratch_opnd: X86Opnd, dst_ptr: *const u8) {
     }
 }
 
+/// Call JIT code at dst_ptr without `call`. It pushes the address after this sequence and jumps,
+/// so the callee must return with `pop` and `jmp`, which doesn't use the return stack buffer either.
+pub fn jit_call_ptr(cb: &mut CodeBlock, scratch_opnd: X86Opnd, dst_ptr: *const u8) {
+    push_return_addr_and_jump(cb, scratch_opnd, |cb| {
+        // Pointer to the end of a jmp with a 32-bit offset
+        let end_ptr = cb.get_ptr(cb.write_pos + 5);
+        let rel64: i64 = dst_ptr as i64 - end_ptr.raw_ptr(cb) as i64;
+        match i32::try_from(rel64) {
+            Ok(rel32) => jmp32(cb, rel32),
+            Err(_) => {
+                mov(cb, scratch_opnd, const_ptr_opnd(dst_ptr));
+                jmp_rm(cb, scratch_opnd);
+            }
+        }
+    });
+}
+
+/// Call JIT code at the address in dst_reg without `call`, like jit_call_ptr()
+pub fn jit_call_reg(cb: &mut CodeBlock, scratch_opnd: X86Opnd, dst_reg: X86Opnd) {
+    push_return_addr_and_jump(cb, scratch_opnd, |cb| jmp_rm(cb, dst_reg));
+}
+
+/// Push the address after the jump that `jump` writes, then write the jump
+fn push_return_addr_and_jump(cb: &mut CodeBlock, scratch_opnd: X86Opnd, jump: impl FnOnce(&mut CodeBlock)) {
+    // The lea's offset is written after the jump, whose size isn't known yet
+    let lea_ptr = cb.get_write_ptr();
+    lea(cb, scratch_opnd, mem_opnd(64, RIP, 0));
+    let lea_end = cb.get_write_pos();
+    push(cb, scratch_opnd);
+    jump(cb);
+    let offset = i32::try_from(cb.get_write_pos() - lea_end).unwrap();
+    cb.with_write_ptr(lea_ptr, |cb| lea(cb, scratch_opnd, mem_opnd(64, RIP, offset)));
+}
+
 /// call - Call to label with 32-bit offset
 pub fn call_label(cb: &mut CodeBlock, label: Label) {
     cb.label_ref(label, 5, |cb, src_addr, dst_addr| {

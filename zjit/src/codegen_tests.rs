@@ -6321,6 +6321,16 @@ fn test_opt_plus_minus_const_overflow() {
 }
 
 #[test]
+fn test_side_exit_from_deep_recursion() {
+    assert_snapshot!(assert_compiles_allowing_exits("
+        def test(n, x) = n == 0 ? x + 1 : test(n - 1, x)
+        test(1, 1) # profile
+        test(1, 1) # compile
+        [test(1000, 1), test(1000, 1.5), test(1000, 2)]
+    "), @"[2, 2.5, 3]");
+}
+
+#[test]
 fn test_side_exit_count_without_stats() {
     // side_exit_count is incremented by materialize_exit_trampoline, not by --zjit-stats code.
     ensure_rubyvm(); // ZJITState and options are not available until the VM is booted
