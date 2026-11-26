@@ -111,6 +111,12 @@ const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 /// Must not overlap with ALLOC_REGS or other preserved registers.
 pub const SCRATCH_REG: Reg = R11_REG;
 
+/// Whether an instruction is a conditional jump that a preceding cmp/test fuses with
+fn is_jcc(insn: Option<&Insn>) -> bool {
+    matches!(insn, Some(Insn::Je(_) | Insn::Jne(_) | Insn::Jl(_) | Insn::Jle(_) | Insn::Jg(_) |
+        Insn::Jge(_) | Insn::Jbe(_) | Insn::Jb(_) | Insn::Jz(_) | Insn::Jnz(_)))
+}
+
 impl Assembler {
     // This keeps frame growth below the +/-4096-byte displacement range we rely
     // on for common stack-slot accesses on x86_64.
@@ -829,6 +835,31 @@ impl Assembler {
         let insns = &self.basic_blocks[0].insns;
 
         while let Some(insn) = insns.get(insn_idx) {
+            // Skylake-derived CPUs don't keep a 32-byte window of code in the decoded uop cache when a branch
+            // (or a cmp/test fused with the next jcc) crosses or ends at a 32-byte boundary, so that code runs
+            // from the legacy decoder. Pad to the boundary first, like LLVM's -x86-align-branch-boundary=32.
+            let branch_len = match insn {
+                // Measure a cmp/test fused with the next jcc by writing it, then write it again after padding
+                Insn::Cmp { left, right } | Insn::Test { left, right } if is_jcc(insns.get(insn_idx + 1)) => {
+                    let start = cb.get_write_ptr();
+                    if matches!(insn, Insn::Cmp { .. }) { cmp(cb, left.into(), right.into()) } else { test(cb, left.into(), right.into()) }
+                    let len = cb.get_write_ptr().as_offset() - start.as_offset();
+                    cb.set_write_ptr(start);
+                    Some(usize::try_from(len).unwrap() + 6)
+                }
+                Insn::Jmp(_) | Insn::CCall { .. } => Some(5),
+                Insn::Jo(_) | Insn::JoMul(_) => Some(6),
+                _ if is_jcc(Some(insn)) => Some(6),
+                Insn::JmpOpnd(_) => Some(7),
+                Insn::CRet(opnd) => Some(if *opnd == Opnd::Reg(C_RET_REG) { 1 } else { 4 }),
+                _ => None,
+            };
+            if let Some(len) = branch_len {
+                let offset = cb.get_write_pos() % 32;
+                if offset + len >= 32 {
+                    nop(cb, u32::try_from(32 - offset).unwrap());
+                }
+            }
             match insn {
                 Insn::Comment(text) => {
                     cb.add_comment(text);
@@ -1765,6 +1796,34 @@ mod tests {
         0x3: bswap rdi
         ");
         assert_snapshot!(cb.hexdump(), @"488b3b480fcf");
+    }
+
+    #[test]
+    fn test_fused_cmp_jcc_does_not_cross_32_byte_boundary() {
+        let (mut asm, mut cb) = setup_asm();
+        let label = asm.new_label("target");
+        for _ in 0..7 {
+            asm.mov(Opnd::Reg(RAX_REG), Opnd::Reg(RCX_REG));
+        }
+        asm.cmp(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
+        asm.push_insn(Insn::Je(label.clone()));
+        asm.write_label(label);
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        // The cmp and je would span 0x15..0x22, so they're padded to start at 0x20
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov rax, rcx
+        0x3: mov rax, rcx
+        0x6: mov rax, rcx
+        0x9: mov rax, rcx
+        0xc: mov rax, rcx
+        0xf: mov rax, rcx
+        0x12: mov rax, rcx
+        0x15: nop word ptr [rax + rax]
+        0x1e: nop
+        0x20: cmp rax, 0xff
+        0x27: je 0x2d
+        ");
     }
 
     #[test]
