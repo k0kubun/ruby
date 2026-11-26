@@ -25706,6 +25706,23 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn skip_refinement_check_of_symbol_block_arg_in_inlined_method() {
+        set_inline_threshold(100);
+        eval("
+            def foo = yield 3
+            def callee = [foo(&:succ), [3].map(&:succ)]
+            def test = callee
+            test
+            test
+        ");
+        let hir = hir_string("test");
+        assert!(hir.contains("PushInlineFrame :callee"), "{hir}");
+        assert!(!hir.contains("GetCref"), "{hir}");
+        let hir = hir_string("callee");
+        assert!(hir.contains("GetCref"), "{hir}");
+    }
+
+    #[test]
     fn test_send_cfunc_with_proc_block_arg() {
         eval("
             def test(h, blk) = h.merge({a: 2}, &blk)

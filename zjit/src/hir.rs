@@ -3104,6 +3104,7 @@ const FORWARDABLE_CALLEE_BLOCKERS: u32 =
 unsafe extern "C" {
     fn rb_hash_dup(hash: VALUE) -> VALUE;
     fn rb_vm_lep_method_entry(recv: VALUE, me_or_svar: VALUE) -> VALUE;
+    fn rb_zjit_iseq_method_unrefined_p(cme: *const rb_callable_method_entry_t) -> bool;
 }
 
 /// Check if we can emit SendDirect to the given ISEQ with the given arguments.
@@ -3337,6 +3338,8 @@ pub struct Function {
     /// `self` of inlined method and block frames, keyed by the caller Snapshot that FrameStates
     /// in the frame point to: the receiver of a method or the captured self of a block
     inline_frame_selfs: HashMap<InsnId, InsnId>,
+    /// Inlined method frames whose method entry's cref has no refinements, by caller Snapshot
+    unrefined_inline_method_frames: HashSet<InsnId>,
     /// Per-call-site caches of the last receiver classes found to resolve to the method entry
     /// that `try_send_direct_on_method_entry` checks for. The compiled code refers to them,
     /// so codegen hands them over to the [`crate::payload::IseqVersion`], which marks them.
@@ -3712,6 +3715,7 @@ impl Function {
             num_instructions: 0,
             inlined_frames: HashMap::new(),
             inline_frame_selfs: HashMap::new(),
+            unrefined_inline_method_frames: HashSet::default(),
             klass_caches: Default::default(),
             catch_return_sites: HashSet::default(),
         }
@@ -8023,6 +8027,9 @@ impl Function {
                     }
                 };
                 self.inline_frame_selfs.insert(post_send_caller, recv);
+                if matches!(inline_call, InlineCall::Send { .. }) && unsafe { rb_zjit_iseq_method_unrefined_p(cme) } {
+                    self.unrefined_inline_method_frames.insert(post_send_caller);
+                }
                 if !callee_body_params.is_empty() {
                     self.make_equal_to(callee_body_params[0], recv);
                 }
@@ -8495,16 +8502,21 @@ impl Function {
                 state,
                 recompile: Some(Recompile),
             });
-            // With refinements in the caller's cref, vm_caller_setup_arg_block() makes a refined lambda
-            let cref = self.push_insn(block, Insn::GetCref);
-            let refinements = self.load_field(block, cref, FieldName::refinements, RUBY_OFFSET_CREF_REFINEMENTS, types::RubyValue);
-            self.push_insn(block, Insn::GuardBitEquals {
-                val: refinements,
-                expected: Const::Value(Qnil),
-                reason: Box::new(SideExitReason::BlockArgRefinements),
-                state,
-                recompile: Some(Recompile),
-            });
+            // With refinements in the caller's cref, vm_caller_setup_arg_block() makes a refined lambda.
+            // An inlined method frame runs with the cref of its method entry, which never gets
+            // refinements later, so check it at run time only if it may have some now.
+            let unrefined = self.frame_state_ref(state).caller().is_some_and(|caller| self.unrefined_inline_method_frames.contains(&caller));
+            if !unrefined {
+                let cref = self.push_insn(block, Insn::GetCref);
+                let refinements = self.load_field(block, cref, FieldName::refinements, RUBY_OFFSET_CREF_REFINEMENTS, types::RubyValue);
+                self.push_insn(block, Insn::GuardBitEquals {
+                    val: refinements,
+                    expected: Const::Value(Qnil),
+                    reason: Box::new(SideExitReason::BlockArgRefinements),
+                    state,
+                    recompile: Some(Recompile),
+                });
+            }
         }
     }
 
