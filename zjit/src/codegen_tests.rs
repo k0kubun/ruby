@@ -6299,6 +6299,16 @@ fn test_opt_plus_overflow() {
 }
 
 #[test]
+fn test_opt_plus_minus_const_overflow() {
+    assert_snapshot!(assert_compiles_allowing_exits("
+        def test(a) = [a + 1, a - 1, a + -2, a - -2, a - 4611686018427387903, a + -4611686018427387904]
+        test(1) # profile opt_plus and opt_minus
+        test(1) # compile
+        [test(3), test(4611686018427387903), test(-4611686018427387904)]
+    "), @"[[4, 2, 1, 5, -4611686018427387900, -4611686018427387901], [4611686018427387904, 4611686018427387902, 4611686018427387901, 4611686018427387905, 0, -1], [-4611686018427387903, -4611686018427387905, -4611686018427387906, -4611686018427387902, -9223372036854775807, -9223372036854775808]]");
+}
+
+#[test]
 fn test_side_exit_count_without_stats() {
     // side_exit_count is incremented by materialize_exit_trampoline, not by --zjit-stats code.
     ensure_rubyvm(); // ZJITState and options are not available until the VM is booted
