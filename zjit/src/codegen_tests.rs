@@ -3570,6 +3570,27 @@ fn test_send_with_local_written_by_blockiseq() {
 }
 
 #[test]
+fn test_send_with_heap_object_written_to_local_by_blockiseq() {
+    // A block writes non-immediate values to its method's local, first while the env is on the
+    // stack, then after a lambda moved it to the heap and a full GC set VM_ENV_FLAG_WB_REQUIRED.
+    assert_snapshot!(inspect("
+        def test
+          a = nil
+          tap { a = 'stack' * 2 }
+          stack = a
+          get = -> { a }
+          GC.start
+          tap { a = 'heap' * 2 }
+          GC.start
+          [stack, a, get.call]
+        end
+
+        test
+        test
+    "), @r#"["stackstack", "heapheap", "heapheap"]"#);
+}
+
+#[test]
 fn test_send_does_not_reload_local_untouched_by_blockiseq() {
     // https://github.com/Shopify/ruby/issues/976: a call with a block must not
     // reload locals the block never assigns, otherwise it reads a stale stack
