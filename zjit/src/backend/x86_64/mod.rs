@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::LazyLock;
 
 use crate::asm::*;
 use crate::asm::x86_64::*;
@@ -110,6 +111,52 @@ const SCRATCH1_OPND: Opnd = Opnd::Reg(R10_REG);
 /// A scratch register available for use by resolve_ssa to break register copy cycles.
 /// Must not overlap with ALLOC_REGS or other preserved registers.
 pub const SCRATCH_REG: Reg = R11_REG;
+
+/// Whether the CPU has Intel's JCC erratum, decided once like HotSpot's VM_Version::has_intel_jcc_erratum()
+static CPU_HAS_JCC_ERRATUM: LazyLock<bool> = LazyLock::new(cpu_has_jcc_erratum);
+
+/// Return true for the Intel family 6 models and steppings in HotSpot's compute_has_intel_jcc_erratum()
+#[allow(unused_unsafe)] // __cpuid is unsafe before Rust 1.87
+fn cpu_has_jcc_erratum() -> bool {
+    use std::arch::x86_64::__cpuid;
+    // "GenuineIntel" in ebx, edx and ecx
+    let vendor = unsafe { __cpuid(0) };
+    if (vendor.ebx, vendor.edx, vendor.ecx) != (0x756e_6547, 0x4965_6e69, 0x6c65_746e) {
+        return false;
+    }
+    let eax = unsafe { __cpuid(1) }.eax;
+    let (family, model, stepping) = ((eax >> 8) & 0xf, ((eax >> 12) & 0xf0) | ((eax >> 4) & 0xf), eax & 0xf);
+    family == 6 && match model {
+        0x4E | 0x5E => stepping == 0x3,
+        0x55 => matches!(stepping, 0x4 | 0x7),
+        0x8E => matches!(stepping, 0x9..=0xC),
+        0x9E => matches!(stepping, 0x9 | 0xA | 0xB | 0xD),
+        0xA5 => true,
+        0xA6 => stepping == 0x0,
+        0xAE => stepping == 0xA,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests pad branches only when they set this, so that snapshots don't depend on the host CPU
+    static TEST_ALIGN_BRANCHES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether x86_emit() keeps branches from crossing or ending at 32-byte boundaries
+fn align_branches() -> bool {
+    #[cfg(test)]
+    { TEST_ALIGN_BRANCHES.get() }
+    #[cfg(not(test))]
+    { *CPU_HAS_JCC_ERRATUM }
+}
+
+/// Whether an instruction is a conditional jump that a preceding cmp/test fuses with
+fn is_jcc(insn: Option<&Insn>) -> bool {
+    matches!(insn, Some(Insn::Je(_) | Insn::Jne(_) | Insn::Jl(_) | Insn::Jle(_) | Insn::Jg(_) |
+        Insn::Jge(_) | Insn::Jbe(_) | Insn::Jb(_) | Insn::Jz(_) | Insn::Jnz(_)))
+}
 
 impl Assembler {
     // This keeps frame growth below the +/-4096-byte displacement range we rely
@@ -821,8 +868,39 @@ impl Assembler {
         let mut insn_idx: usize = 0;
         assert_eq!(self.basic_blocks.len(), 1, "Assembler should be linearized into a single block before arm64_emit");
         let insns = &self.basic_blocks[0].insns;
+        let align_branches = align_branches();
 
         while let Some(insn) = insns.get(insn_idx) {
+            // CPUs with Intel's JCC erratum don't keep a 32-byte window of code in the decoded uop cache when a
+            // branch (or a cmp/test fused with the next jcc) crosses or ends at a 32-byte boundary, so that code
+            // runs from the legacy decoder. Pad to the boundary first, like LLVM's -x86-align-branch-boundary=32.
+            if align_branches {
+                let branch_len = match insn {
+                    // Measure a cmp/test fused with the next jcc by writing it, then write it again after padding
+                    Insn::Cmp { left, right } | Insn::Test { left, right } if is_jcc(insns.get(insn_idx + 1)) => {
+                        let start = cb.get_write_ptr();
+                        match insn {
+                            Insn::Cmp { .. } => cmp(cb, left.into(), right.into()),
+                            _ => test(cb, left.into(), right.into()),
+                        }
+                        let len = cb.get_write_ptr().as_offset() - start.as_offset();
+                        cb.set_write_ptr(start);
+                        Some(usize::try_from(len).unwrap() + 6)
+                    }
+                    Insn::Jmp(_) | Insn::CCall { .. } => Some(5),
+                    Insn::Jo(_) | Insn::JoMul(_) => Some(6),
+                    _ if is_jcc(Some(insn)) => Some(6),
+                    Insn::JmpOpnd(_) => Some(7),
+                    Insn::CRet(opnd) => Some(if *opnd == Opnd::Reg(C_RET_REG) { 1 } else { 4 }),
+                    _ => None,
+                };
+                if let Some(len) = branch_len {
+                    let offset = cb.get_write_pos() % 32;
+                    if offset + len >= 32 {
+                        nop(cb, u32::try_from(32 - offset).unwrap());
+                    }
+                }
+            }
             match insn {
                 Insn::Comment(text) => {
                     cb.add_comment(text);
@@ -1759,6 +1837,41 @@ mod tests {
         0x3: bswap rdi
         ");
         assert_snapshot!(cb.hexdump(), @"488b3b480fcf");
+    }
+
+    #[test]
+    fn test_cpu_has_jcc_erratum() {
+        // The result depends on the host. This only runs the detection.
+        let _ = *CPU_HAS_JCC_ERRATUM;
+    }
+
+    #[test]
+    fn test_fused_cmp_jcc_does_not_cross_32_byte_boundary() {
+        TEST_ALIGN_BRANCHES.set(true);
+        let (mut asm, mut cb) = setup_asm();
+        let label = asm.new_label("target");
+        for _ in 0..7 {
+            asm.mov(Opnd::Reg(RAX_REG), Opnd::Reg(RCX_REG));
+        }
+        asm.cmp(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
+        asm.push_insn(Insn::Je(label.clone()));
+        asm.write_label(label);
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        // The cmp and je would span 0x15..0x22, so they're padded to start at 0x20
+        assert_disasm_snapshot!(cb.disasm(), @"
+        0x0: mov rax, rcx
+        0x3: mov rax, rcx
+        0x6: mov rax, rcx
+        0x9: mov rax, rcx
+        0xc: mov rax, rcx
+        0xf: mov rax, rcx
+        0x12: mov rax, rcx
+        0x15: nop word ptr [rax + rax]
+        0x1e: nop
+        0x20: cmp rax, 0xff
+        0x27: je 0x2d
+        ");
     }
 
     #[test]
