@@ -1979,6 +1979,19 @@ fn test_inline_block_return_from_splatted_block() {
 }
 
 #[test]
+fn test_send_cfunc_with_nil_and_proc_block_args() {
+    eval("
+        def test(h, blk) = h.merge({a: 2}, &blk)
+        def entry = [test({a: 1}, nil), test({a: 1}, nil)]
+        def entry_proc(blk) = [test({a: 1}, blk), test({a: 1}, blk)]
+        entry
+    ");
+    assert_snapshot!(assert_compiles("entry"), @"[{a: 2}, {a: 2}]");
+    // A Proc after nil side-exits and recompiles
+    assert_snapshot!(inspect("blk = proc { |k, o, n| o + n }; entry_proc(blk); entry_proc(blk)"), @"[{a: 3}, {a: 3}]");
+}
+
+#[test]
 fn test_for_loop_binds_array_element_unsplatted() {
     with_inlining(|| {
         assert_snapshot!(assert_compiles(r#"
