@@ -201,6 +201,32 @@ fn test_call_ptr() {
 }
 
 #[test]
+fn test_jit_call_ptr() {
+    // calling a lower address
+    let cb = compile(|cb| {
+        let ptr = cb.get_write_ptr();
+        jit_call_ptr(cb, RAX, ptr.raw_ptr(cb));
+    });
+    assert_disasm_snapshot!(cb.disasm(), @"
+    0x0: lea rax, [rip + 6]
+    0x7: push rax
+    0x8: jmp 0
+    ");
+    assert_snapshot!(cb.hexdump(), @"488d050600000050e9f3ffffff");
+}
+
+#[test]
+fn test_jit_call_reg() {
+    let cb = compile(|cb| jit_call_reg(cb, RAX, RDX));
+    assert_disasm_snapshot!(cb.disasm(), @"
+    0x0: lea rax, [rip + 3]
+    0x7: push rax
+    0x8: jmp rdx
+    ");
+    assert_snapshot!(cb.hexdump(), @"488d050300000050ffe2");
+}
+
+#[test]
 fn test_call_reg() {
     let cb = compile(|cb| call(cb, RAX));
     assert_disasm_snapshot!(cb.disasm(), @"  0x0: call rax");

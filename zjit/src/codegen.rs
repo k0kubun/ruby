@@ -456,7 +456,7 @@ pub fn gen_iseq_call(cb: &mut CodeBlock, iseq_call: &IseqCallRef) -> Result<(), 
         let iseq = iseq_call.iseq.get();
         iseq_call.regenerate(cb, |asm| {
             asm_comment!(asm, "call function stub: {}", iseq_get_location(iseq, 0));
-            asm.ccall_into(C_RET_OPND, stub_addr, vec![]);
+            asm.jit_call_into(C_RET_OPND, stub_addr, vec![]);
         });
         Ok(())
     })
@@ -472,7 +472,7 @@ pub fn gen_entry_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError>
     // Jump to the first block using a call instruction. This trampoline is used
     // as rb_zjit_func_t in jit_exec(), which takes (EC, CFP, rb_jit_func_t).
     // So C_ARG_OPNDS[2] is rb_jit_func_t, which is (EC, CFP) -> VALUE.
-    let out = asm.ccall_reg(C_ARG_OPNDS[2], VALUE_BITS);
+    let out = asm.jit_call_reg(C_ARG_OPNDS[2], VALUE_BITS);
 
     // Restore registers for CFP, EC, and SP after use
     asm_comment!(asm, "return to the interpreter");
@@ -3578,7 +3578,7 @@ fn gen_return(asm: &mut Assembler, val: lir::Opnd) {
 
     // Return from the function
     asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
-    asm.cret(C_RET_OPND);
+    asm.jit_ret(C_RET_OPND);
 }
 
 fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, throw_state: u32, val: lir::Opnd, state: &FrameState) {
@@ -5162,7 +5162,7 @@ fn function_stub_hit_body(cb: &mut CodeBlock, iseq_call: &IseqCallRef) -> Result
     trace_compile_phase("compile_stub", || {
         iseq_call.regenerate(cb, |asm| {
             asm_comment!(asm, "call compiled function: {}", iseq_get_location(iseq, 0));
-            asm.ccall_into(C_RET_OPND, code_addr, vec![]);
+            asm.jit_call_into(C_RET_OPND, code_addr, vec![]);
         });
     });
 
@@ -5310,7 +5310,7 @@ pub fn gen_exit_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError> 
 
     asm_comment!(asm, "side-exit trampoline");
     asm.frame_teardown(&[]); // matching the setup in gen_entry_point()
-    asm.cret(Qundef.into());
+    asm.jit_ret(Qundef.into());
 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
@@ -5342,7 +5342,7 @@ pub fn gen_exec_callee_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, Compile
 
     asm.load_into(C_RET_OPND, ret);
     asm.frame_teardown(&[]);
-    asm.cret(C_RET_OPND);
+    asm.jit_ret(C_RET_OPND);
 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(gc_offsets.len(), 0);
@@ -5740,7 +5740,7 @@ fn gen_compile_error_counter(cb: &mut CodeBlock, compile_error: &CompileError) -
     gen_count_side_exit(&mut asm);
     gen_incr_exit_counter(&mut asm, exit_compile_error);
     gen_incr_exit_counter(&mut asm, exit_counter_for_compile_error(compile_error));
-    asm.cret(Qundef.into());
+    asm.jit_ret(Qundef.into());
 
     asm.compile(cb).map(|(code_ptr, gc_offsets)| {
         assert_eq!(0, gc_offsets.len());
@@ -5789,7 +5789,7 @@ impl Assembler {
         let start_iseq_call = iseq_call.clone();
         let end_iseq_call = iseq_call.clone();
 
-        self.ccall_with_pos_markers(
+        self.jit_call_with_pos_markers(
             fptr,
             opnds,
             move |code_ptr, _| {

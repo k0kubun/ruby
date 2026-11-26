@@ -1035,8 +1035,14 @@ impl Assembler {
                 Insn::CCall { data, .. } => {
                     let fptr = &data.fptr;
                     match fptr {
+                        Opnd::UImm(fptr) if data.jit_call => {
+                            jit_call_ptr(cb, RAX, *fptr as *const u8);
+                        }
                         Opnd::UImm(fptr) => {
                             call_ptr(cb, RAX, *fptr as *const u8);
+                        }
+                        Opnd::Reg(_) if data.jit_call => {
+                            jit_call_reg(cb, RAX, fptr.into());
                         }
                         Opnd::Reg(_) => {
                             call(cb, fptr.into());
