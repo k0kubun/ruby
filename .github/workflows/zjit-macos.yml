@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - 'zjit-ci/**'
     paths-ignore:
       - 'doc/**'
       - '**/man/*'
