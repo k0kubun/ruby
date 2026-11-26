@@ -685,6 +685,16 @@ rb_zjit_array_aref_with_adjusted_index(VALUE ary, rb_len_t index, VALUE *out)
 
 rb_cref_t *rb_vm_get_cref(const VALUE *ep);
 
+// Return true if the ISEQ method entry `cme` runs with a lexical scope (cref) without refinements.
+// `using` activates refinements in a duplicate of the cref of its frame, so this doesn't change later.
+bool
+rb_zjit_iseq_method_unrefined_p(const rb_callable_method_entry_t *cme)
+{
+    if (cme->def->type != VM_METHOD_TYPE_ISEQ) return false;
+    const rb_cref_t *cref = cme->def->body.iseq.cref;
+    return cref && NIL_P(CREF_REFINEMENTS(cref));
+}
+
 // Return the lexical scope (cref) of an ISEQ frame, or NULL if a scope in it is pushed by eval
 const rb_cref_t *
 rb_zjit_frame_cref(const rb_control_frame_t *cfp)
