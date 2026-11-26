@@ -3557,6 +3557,13 @@ fn gen_throw(jit: &mut JITState, asm: &mut Assembler, function: &Function, throw
 
 /// Compile Fixnum + Fixnum
 fn gen_fixnum_add(jit: &mut JITState, asm: &mut Assembler, function: &Function, left: lir::Opnd, right: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    // With a constant on the right, add its value without the tag bit in one instruction
+    if let Some(right_untag) = fixnum_opnd_without_tag(right) {
+        let out_val = asm.add(left, right_untag);
+        asm.jo(jit, side_exit(jit, function, state, FixnumAddOverflow));
+        return out_val;
+    }
+
     // Add left + right and test for overflow
     let left_untag = asm.sub(left, Opnd::Imm(1));
     let out_val = asm.add(left_untag, right);
@@ -3567,10 +3574,26 @@ fn gen_fixnum_add(jit: &mut JITState, asm: &mut Assembler, function: &Function, 
 
 /// Compile Fixnum - Fixnum
 fn gen_fixnum_sub(jit: &mut JITState, asm: &mut Assembler, function: &Function, left: lir::Opnd, right: lir::Opnd, state: &FrameState) -> lir::Opnd {
+    // With a constant on the right, subtract its value without the tag bit in one instruction
+    if let Some(right_untag) = fixnum_opnd_without_tag(right) {
+        let out_val = asm.sub(left, right_untag);
+        asm.jo(jit, side_exit(jit, function, state, FixnumSubOverflow));
+        return out_val;
+    }
+
     // Subtract left - right and test for overflow
     let val_untag = asm.sub(left, right);
     asm.jo(jit, side_exit(jit, function, state, FixnumSubOverflow));
     asm.add(val_untag, Opnd::Imm(1))
+}
+
+/// For a constant Fixnum operand, return the tagged VALUE minus the tag bit, i.e. 2 * n.
+/// Adding it to or subtracting it from a tagged Fixnum gives the tagged result.
+fn fixnum_opnd_without_tag(opnd: lir::Opnd) -> Option<lir::Opnd> {
+    match opnd {
+        Opnd::Value(value) if value.fixnum_p() => Some(Opnd::Imm(value.as_i64() - 1)),
+        _ => None,
+    }
 }
 
 /// Compile Fixnum * Fixnum
