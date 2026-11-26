@@ -1421,14 +1421,14 @@ fn gen_block_handler_specval(asm: &mut Assembler, blockiseq: IseqPtr) -> lir::Op
     asm.or(cfp_self_addr, Opnd::Imm(1))
 }
 
-/// Specval for a C method frame given an optional literal block, Symbol block arg, or forwarded frame block handler.
+/// Specval for a C method frame given an optional literal block, Proc or Symbol block arg, or forwarded frame block handler.
 fn gen_cfunc_block_handler_specval(jit: &JITState, asm: &mut Assembler, block: Option<BlockHandler>) -> lir::Opnd {
     match block {
         Some(BlockHandler::BlockIseq(blockiseq)) => gen_block_handler_specval(asm, blockiseq),
-        Some(BlockHandler::BlockArgSymbol(symbol)) => jit.get_opnd(symbol),
+        Some(BlockHandler::BlockArgProc(block_arg) | BlockHandler::BlockArgSymbol(block_arg)) => jit.get_opnd(block_arg),
         Some(BlockHandler::FrameBlock(block_handler)) => jit.get_opnd(block_handler),
         None => VM_BLOCK_HANDLER_NONE.into(),
-        Some(BlockHandler::BlockArg | BlockHandler::BlockArgProc(_)) => unreachable!("unsupported block handler in a C method call"),
+        Some(BlockHandler::BlockArg) => unreachable!("unsupported block handler in a C method call"),
     }
 }
 

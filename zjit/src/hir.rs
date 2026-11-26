@@ -1892,7 +1892,7 @@ macro_rules! for_each_operand_impl {
             Insn::CCallWithFrame(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -1901,7 +1901,7 @@ macro_rules! for_each_operand_impl {
             Insn::CCallVariadic(insn) => {
                 $visit_one!(insn.recv);
                 $visit_many!(insn.args);
-                if let Some(BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
+                if let Some(BlockHandler::BlockArgProc(id) | BlockHandler::BlockArgSymbol(id) | BlockHandler::FrameBlock(id)) = &$($mut)? insn.block {
                     $visit_one!(*id);
                 }
                 $visit_one!(insn.state);
@@ -6352,7 +6352,7 @@ impl Function {
                                 let profiled_nil = block_arg_profiled_type.map_or(false, |pt| pt.is_nil());
                                 let statically_static_symbol = self.is_a(block_arg, types::StaticSymbol);
                                 let profiled_static_symbol = block_arg_profiled_type.is_some_and(|pt| pt.is_static_symbol());
-                                if iseq_callee && (statically_nil || profiled_nil) {
+                                if statically_nil || profiled_nil {
                                     if !statically_nil {
                                         // Guard needed when relying on profiled type. Uses the original
                                         // `state` so a side exit re-executes the send with the block
@@ -6380,7 +6380,7 @@ impl Function {
                                     // from the stack so the callee frame is laid out correctly.
                                     let new_state = self.frame_state(state).with_replaced_args(&args, original_argc);
                                     send_frame_state = self.push_insn(block, Insn::Snapshot { state: Box::new(new_state) });
-                                } else if iseq_callee && block_arg_profiled_type.is_some_and(|pt| pt.is_proc()) {
+                                } else if block_arg_profiled_type.is_some_and(|pt| pt.is_proc()) {
                                     // Guard the Proc and pass it through as the callee frame's
                                     // specval.
                                     let guarded = self.guard_type_recompile(
@@ -6708,6 +6708,7 @@ impl Function {
                                 cd: *const rb_call_data,
                                 send_block: Option<BlockHandler>,
                                 forwarded_block_arg: Option<InsnId>,
+                                stripped_block_arg: bool,
                                 args: Vec<InsnId>,
                                 state: InsnId,
                                 direct_state: InsnId,
@@ -6722,8 +6723,9 @@ impl Function {
                                 let method_id = unsafe { rb_vm_ci_mid(call_info) };
 
                                 let mut ci_flags = unsafe { vm_ci_flag(call_info) };
-                                // A Symbol block arg or a forwarded frame block handler becomes the block handler, not an argument
-                                if matches!(send_block, Some(BlockHandler::BlockArgSymbol(_))) || forwarded_block_arg.is_some() {
+                                // A nil block arg is dropped, and a Proc or Symbol block arg or a forwarded frame block
+                                // handler becomes the block handler, not an argument
+                                if stripped_block_arg {
                                     ci_flags &= !VM_CALL_ARGS_BLOCKARG;
                                 }
                                 // When seeing another &block argument, fall back to dynamic dispatch for now
@@ -6739,8 +6741,8 @@ impl Function {
 
                                 let has_block = forwarded_block_arg.is_some() || match send_block {
                                     Some(BlockHandler::BlockArg) => unreachable!("unsupported &block should have been filtered out"),
-                                    Some(BlockHandler::BlockArgProc(_) | BlockHandler::FrameBlock(_)) => unreachable!("BlockArgProc and FrameBlock are built right before the call"),
-                                    Some(BlockHandler::BlockIseq(_) | BlockHandler::BlockArgSymbol(_)) => true,
+                                    Some(BlockHandler::FrameBlock(_)) => unreachable!("FrameBlock is built right before the call"),
+                                    Some(BlockHandler::BlockIseq(_) | BlockHandler::BlockArgProc(_) | BlockHandler::BlockArgSymbol(_)) => true,
                                     None => false,
                                 };
                                 // Pass the block or the forwarded frame block handler. Splitting the
@@ -6937,7 +6939,7 @@ impl Function {
                                 }
                             }
 
-                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
+                            if let Ok(join_block) = reduce_send_to_ccall(self, block, insn_id, recv, cd, send_block, forwarded_block_arg, stripped_block_arg, args, state, send_frame_state, klass, profiled_type, cme, lookup_cme, protected_class) {
                                 block = join_block;
                                 continue;
                             }
