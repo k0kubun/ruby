@@ -2256,6 +2256,18 @@ fn test_send_profiled_names() {
 }
 
 #[test]
+fn test_send_names_unprofiled_until_final_version() {
+    assert_snapshot!(assert_compiles_allowing_exits(r#"
+        class C
+          12.times { |i| class_eval "def m#{i} = #{i}" }
+          def test(name) = send(name)
+        end
+        obj = C.new
+        3.times.flat_map { 12.times.map { |i| obj.test(:"m#{i}") } }.sum
+    "#), @"198");
+}
+
+#[test]
 fn test_send_profiled_name_redefined() {
     assert_snapshot!(assert_compiles_allowing_exits(r#"
         class C

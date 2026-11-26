@@ -684,6 +684,7 @@ pub enum SideExitReason {
     DirectiveInduced,
     SendWhileTracing,
     NoProfileSend,
+    SendNameMiss,
     NoProfileGetIvar,
     NoProfileSetIvar,
     InvokeBlockNotIfunc,
@@ -8987,7 +8988,8 @@ impl Function {
     /// This runs after strength reduction passes (type_specialize, inline) so
     /// that sends that can be optimized without profiling (e.g. known CFUNCs) are already handled.
     /// The remaining no-profile sends are turned into side exits that trigger recompilation with
-    /// fresh profile data.
+    /// fresh profile data. So is the fallback of `send(name)` for a name that wasn't profiled,
+    /// like YJIT adds a version for each new name, since early calls may have seen only a few.
     fn convert_no_profile_sends(&mut self) {
         // On the final version, recompilation is not possible, so converting sends to
         // SideExits would just add overhead (the exit fires every time without benefit).
@@ -9001,8 +9003,9 @@ impl Function {
             assert!(self.blocks[block].insns.is_empty());
             for insn_id in old_insns {
                 match self.resolve(insn_id).insn(self) {
-                    &Insn::Send { state, reason: SendFallbackReason::SendNoProfiles, .. } => {
-                        self.push_insn(block, Insn::SideExit { state, reason: Box::new(SideExitReason::NoProfileSend), recompile: Some(Recompile) });
+                    &Insn::Send { state, reason: reason @ (SendFallbackReason::SendNoProfiles | SendFallbackReason::SendNameMiss), .. } => {
+                        let reason = if reason == SendNameMiss { SideExitReason::SendNameMiss } else { SideExitReason::NoProfileSend };
+                        self.push_insn(block, Insn::SideExit { state, reason: Box::new(reason), recompile: Some(Recompile) });
                         // SideExit is a terminator; don't add remaining instructions
                         break;
                     }

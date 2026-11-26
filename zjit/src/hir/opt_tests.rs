@@ -3334,19 +3334,25 @@ mod hir_opt_tests {
         bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
           PatchPoint MethodRedefined(Object@0x1008, send@0x1010, cme:0x1018)
           v29:ObjectSubclass[class_exact*:Object@VALUE(0x1008)] = GuardType v11, ObjectSubclass[class_exact*:Object@VALUE(0x1008)] recompile
-          v31:StaticSymbol[:foo] = Const Value(VALUE(0x1040))
+          v31:StaticSymbol[:bar] = Const Value(VALUE(0x1040))
           v32:CBool = IsBitEqual v12, v31
           CondBranch v32, bb5(), bb6()
         bb5():
-          PatchPoint MethodRedefined(Object@0x1008, foo@0x1048, cme:0x1050)
-          Jump bb4(v13)
+          PatchPoint MethodRedefined(Object@0x1008, bar@0x1048, cme:0x1050)
+          Jump bb4()
         bb6():
-          v36:BasicObject = Send v29, :send, v12, v13 # SendFallbackReason: Send: send name is not a profiled method name
-          Jump bb4(v36)
-        bb4(v38:BasicObject):
+          v36:StaticSymbol[:foo] = Const Value(VALUE(0x1078))
+          v37:CBool = IsBitEqual v12, v36
+          CondBranch v37, bb7(), bb8()
+        bb7():
+          PatchPoint MethodRedefined(Object@0x1008, foo@0x1080, cme:0x1088)
+          Jump bb4()
+        bb4():
           PatchPoint NoEPEscape(test)
           CheckInterrupts
-          Return v38
+          Return v13
+        bb8():
+          SideExit SendNameMiss recompile
         ");
     }
 
