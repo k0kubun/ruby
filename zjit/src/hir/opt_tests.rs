@@ -25659,6 +25659,43 @@ mod hir_opt_tests {
     }
 
     #[test]
+    fn test_send_cfunc_with_proc_block_arg() {
+        eval("
+            def test(h, blk) = h.merge({a: 2}, &blk)
+            blk = proc { |k, o, n| o + n }
+            test({a: 1}, blk)
+            test({a: 1}, blk)
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:2:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          v2:CPtr = LoadSP
+          v3:BasicObject = LoadField v2, :h@0x1000
+          v4:BasicObject = LoadField v2, :blk@0x1001
+          Jump bb3(v1, v3, v4)
+        bb2():
+          EntryPoint JIT(0)
+          v7:BasicObject = LoadArg :self@0
+          v8:BasicObject = LoadArg :h@1
+          v9:BasicObject = LoadArg :blk@2
+          Jump bb3(v7, v8, v9)
+        bb3(v11:BasicObject, v12:BasicObject, v13:BasicObject):
+          v18:HashExact[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+          v19:HashExact = HashDup v18
+          v30:ObjectSubclass[class_exact:Proc] = GuardType v13, ObjectSubclass[class_exact:Proc] recompile
+          PatchPoint NoSingletonClass(Hash@0x1010)
+          PatchPoint MethodRedefined(Hash@0x1010, merge@0x1018, cme:0x1020)
+          v35:HashExact = GuardType v12, HashExact recompile
+          v36:BasicObject = CCallVariadic v35, :Hash#merge@0x1048, v19, block=&v30
+          PatchPoint NoEPEscape(test)
+          CheckInterrupts
+          Return v36
+        ");
+    }
+
+    #[test]
     fn guard_protected_send_in_inlined_block_with_its_self() {
         set_inline_threshold(100);
         eval(r#"
