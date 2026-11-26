@@ -757,6 +757,8 @@ pub struct CCallData {
     /// that are split from this CCall during register assignment.
     pub end_marker: Option<PosMarkerFn>,
     pub out: Opnd,
+    /// Whether this calls JIT code, which returns with `jit_ret` instead of `cret`.
+    pub jit_call: bool,
 }
 
 /// Cold fields of `Insn::PatchPoint`, boxed to keep `Insn` small. `target` is
@@ -2779,7 +2781,7 @@ impl Assembler
 
             for (insn, insn_id) in old_insns.into_iter().zip(old_ids) {
                 if let Insn::CCall { data } = insn {
-                    let CCallData { opnds, stack_map, out, start_marker, end_marker, fptr } = *data;
+                    let CCallData { opnds, stack_map, out, start_marker, end_marker, fptr, jit_call } = *data;
                     let insn_number = insn_id.map(|id| id.0).unwrap_or(0);
                     // Do we have a case where a ccall is emitted, but nobody
                     // uses the result?
@@ -2930,6 +2932,7 @@ impl Assembler
                             start_marker: None,
                             end_marker: None,
                             fptr,
+                            jit_call,
                         }),
                     });
                     new_ids.push(insn_id);
@@ -4032,31 +4035,31 @@ impl Assembler {
         let out = self.new_vreg(Opnd::match_num_bits(&opnds));
         let fptr = Opnd::const_ptr(fptr);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: false }) });
         self.clear_stack_canary(canary_opnd);
         out
     }
 
-    /// Call a C function into an explicit output operand without allocating a
+    /// Call JIT code into an explicit output operand without allocating a
     /// new vreg for the result.
-    pub fn ccall_into(&mut self, out: Opnd, fptr: *const u8, opnds: Vec<Opnd>) {
+    pub fn jit_call_into(&mut self, out: Opnd, fptr: *const u8, opnds: Vec<Opnd>) {
         let fptr = Opnd::const_ptr(fptr);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds, stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: true }) });
     }
 
-    /// Call a C function stored in a register
-    pub fn ccall_reg(&mut self, fptr: Opnd, num_bits: u8) -> Opnd {
-        assert!(matches!(fptr, Opnd::Reg(_)), "ccall_reg must be called with Opnd::Reg: {fptr:?}");
+    /// Call JIT code whose address is stored in a register
+    pub fn jit_call_reg(&mut self, fptr: Opnd, num_bits: u8) -> Opnd {
+        assert!(matches!(fptr, Opnd::Reg(_)), "jit_call_reg must be called with Opnd::Reg: {fptr:?}");
         let out = self.new_vreg(num_bits);
         let stack_map = self.stack_map.take();
-        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds: vec![], stack_map, fptr, start_marker: None, end_marker: None, out }) });
+        self.push_insn(Insn::CCall { data: Box::new(CCallData { opnds: vec![], stack_map, fptr, start_marker: None, end_marker: None, out, jit_call: true }) });
         out
     }
 
-    /// Call a C function with PosMarkers. This is used for recording the start and end
-    /// addresses of the C call and rewriting it with a different function address later.
-    pub fn ccall_with_pos_markers(
+    /// Call JIT code with PosMarkers. This is used for recording the start and end
+    /// addresses of the call and rewriting it with a different function address later.
+    pub fn jit_call_with_pos_markers(
         &mut self,
         fptr: *const u8,
         opnds: Vec<Opnd>,
@@ -4073,6 +4076,7 @@ impl Assembler {
                 start_marker: Some(Rc::new(start_marker)),
                 end_marker: Some(Rc::new(end_marker)),
                 out,
+                jit_call: true,
             }),
         });
         out
@@ -4132,6 +4136,21 @@ impl Assembler {
 
     pub fn cret(&mut self, opnd: Opnd) {
         self.push_insn(Insn::CRet(opnd));
+    }
+
+    /// Return to JIT code that called with `jit_call`. On x86_64, that call pushes the return address
+    /// without `call`, so this pops it and jumps to it instead of `ret`, like YJIT. Deep recursion
+    /// then doesn't overflow the return stack buffer, which makes every `ret` past its depth mispredict.
+    pub fn jit_ret(&mut self, opnd: Opnd) {
+        if cfg!(target_arch = "x86_64") {
+            // The return value is in C_RET_OPND, so pop the return address into a dead argument register
+            use crate::backend::current::{C_ARG_OPNDS, C_RET_OPND};
+            self.mov(C_RET_OPND, opnd);
+            self.cpop_into(C_ARG_OPNDS[0]);
+            self.jmp_opnd(C_ARG_OPNDS[0]);
+        } else {
+            self.cret(opnd);
+        }
     }
 
     #[must_use]
@@ -5365,7 +5384,7 @@ mod tests {
         let ccall = |asm: &mut Assembler| {
             let out = asm.new_vreg(64);
             asm.basic_blocks[b1.0].push_insn(Insn::CCall {
-                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out }),
+                data: Box::new(CCallData { opnds: vec![], stack_map: None, fptr: Opnd::UImm(0xF00), start_marker: None, end_marker: None, out, jit_call: false }),
             });
         };
         let load = |asm: &mut Assembler| {
@@ -5444,6 +5463,7 @@ mod tests {
                 start_marker: None,
                 end_marker: None,
                 out: v3,
+                jit_call: false,
             }),
         });
 
