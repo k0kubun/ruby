@@ -12316,6 +12316,28 @@ fn test_getivar_megamorphic_shapes() {
     "#), @r#"[[[0, "instance-variable"], [1, "instance-variable"], [2, "instance-variable"], [nil, nil], [4, "instance-variable"], [5, "instance-variable"], [6, "instance-variable"], [nil, nil], [8, "instance-variable"], [9, "instance-variable"], [10, "instance-variable"], [nil, nil], [12, "instance-variable"], [13, "instance-variable"], [14, "instance-variable"], [nil, nil], [16, "instance-variable"], [17, "instance-variable"], [18, "instance-variable"], [nil, nil], [1, "instance-variable"]]]"#);
 }
 
+#[test]
+fn test_getivar_megamorphic_class_shapes() {
+    // Class and module ivars at a site with more shapes than it specializes for go through the
+    // fallback's cache of ivar indexes by shape too. The last class has no ivars at all.
+    set_call_threshold(2);
+    assert_snapshot!(inspect(r#"
+        module M
+          def a = @a
+          def a? = defined?(@a)
+        end
+        mods = 20.times.map do |n|
+          c = n == 19 ? Module.new : Class.new
+          c.extend(M)
+          n.times { |i| c.instance_variable_set(:"@x#{i}", i) }
+          c.instance_variable_set(:@a, n) unless n % 4 == 3
+          c
+        end
+        mods << Class.new.extend(M)
+        3.times.map { mods.map { |c| [c.a, c.a?] } }.uniq
+    "#), @r#"[[[0, "instance-variable"], [1, "instance-variable"], [2, "instance-variable"], [nil, nil], [4, "instance-variable"], [5, "instance-variable"], [6, "instance-variable"], [nil, nil], [8, "instance-variable"], [9, "instance-variable"], [10, "instance-variable"], [nil, nil], [12, "instance-variable"], [13, "instance-variable"], [14, "instance-variable"], [nil, nil], [16, "instance-variable"], [17, "instance-variable"], [18, "instance-variable"], [nil, nil], [nil, nil]]]"#);
+}
+
 /// Regression test:
 /// When a method with keyword defaults contains a block that creates a lambda,
 /// the lambda causes EP escape, which globally patches NoEPEscape PatchPoints.
