@@ -6038,6 +6038,16 @@ pub(crate) mod hir_build_tests {
           Jump bb3(v4)
         bb3(v6:BasicObject):
           v12:Fixnum[1] = Const Value(1)
+          v14:CPtr = GetEP 0
+          v15:CUInt64 = LoadField v14, :VM_ENV_DATA_INDEX_FLAGS@0x1000
+          v16:CUInt64[258] = Const CUInt64(258)
+          v17:CUInt64[256] = Const CUInt64(256)
+          v18:CInt64 = IntAnd v15, v16
+          v19:CBool = IsBitEqual v18, v17
+          CondBranch v19, bb4(), bb5()
+        bb4():
+          Return v12
+        bb5():
           Throw TAG_RETURN, v12
 
         fn block in <compiled>@<compiled>:3:

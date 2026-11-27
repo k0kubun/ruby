@@ -13339,14 +13339,14 @@ fn add_iseq_to_hir(
                 YARVINSN_throw => {
                     let throw_state = get_arg(pc, 0).as_u32();
                     let val = state.stack_pop()?;
+                    let tag = throw_state & VM_THROW_STATE_MASK;
+                    let no_escape = throw_state & VM_THROW_NO_ESCAPE_FLAG != 0;
+                    // Unwinding the block frame must not run an ensure clause. `insn_idx` is
+                    // already past the throw.
+                    let can_unwind = !no_escape && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, insn_idx) };
                     // In an inlined block, turn `break` and non-local `return` into jumps when the
                     // frames they unwind to are part of this function. See inlined_block_throw_targets.
                     if let AddIseqMode::Inlined { throw_targets: Some(targets), .. } = mode {
-                        let tag = throw_state & VM_THROW_STATE_MASK;
-                        let no_escape = throw_state & VM_THROW_NO_ESCAPE_FLAG != 0;
-                        // Unwinding the block frame must not run an ensure clause. `insn_idx` is
-                        // already past the throw.
-                        let can_unwind = !no_escape && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, insn_idx) };
                         match (tag, targets.break_target, targets.return_yielder_pop) {
                             (RUBY_TAG_BREAK, Some(break_target), _) if can_unwind => {
                                 incr_counter!(inline_throw_count);
@@ -13366,6 +13366,26 @@ fn add_iseq_to_hir(
                             }
                             _ => {}
                         }
+                    } else if tag == RUBY_TAG_RETURN && can_unwind && !matches!(mode, AddIseqMode::Inlined { .. })
+                        && unsafe { rb_get_iseq_body_type(iseq) } == ISEQ_TYPE_BLOCK {
+                        // A block ISEQ runs as a proc or as a lambda. In a lambda frame, vm_throw_start()
+                        // resolves `return` to the frame itself, so return from it like `leave`.
+                        let ep = fun.get_ep(block, 0);
+                        let flags = fun.load_ep_flags(block, ep);
+                        let mask = fun.push_insn(block, Insn::Const { val: Const::CUInt64((VM_FRAME_FLAG_LAMBDA | VM_ENV_FLAG_LOCAL).into()) });
+                        let lambda_flag = fun.push_insn(block, Insn::Const { val: Const::CUInt64(VM_FRAME_FLAG_LAMBDA.into()) });
+                        let masked = fun.push_insn(block, Insn::IntAnd { left: flags, right: mask });
+                        let is_lambda = fun.push_insn(block, Insn::IsBitEqual { left: masked, right: lambda_flag });
+                        let return_block = fun.new_block(insn_idx);
+                        let throw_block = fun.new_block(insn_idx);
+                        fun.push_insn(block, Insn::CondBranch {
+                            val: is_lambda,
+                            if_true: BranchEdge { target: return_block, args: vec![] },
+                            if_false: BranchEdge { target: throw_block, args: vec![] },
+                        });
+                        fun.push_insn(return_block, Insn::Return { val });
+                        fun.push_insn(throw_block, Insn::Throw { throw_state, val, state: exit_id });
+                        break;  // Don't enqueue the next block as a successor
                     }
                     fun.push_insn(block, Insn::Throw { throw_state, val, state: exit_id });
                     break;  // Don't enqueue the next block as a successor

@@ -3591,6 +3591,27 @@ fn test_send_with_heap_object_written_to_local_by_blockiseq() {
 }
 
 #[test]
+fn test_return_from_lambda_and_proc_block() {
+    // `return` returns from a lambda frame itself and from the home method of a proc, whether or not
+    // an ensure clause in the block or a nested block is in between.
+    assert_snapshot!(inspect(r#"
+        $log = []
+        def make = proc { |x| return x * 10 }
+        Object.define_method(:bm, &make)
+        def from_proc = (proc { return 1 }.call; 2)
+        def test
+          l = lambda { |n| return n * 2 if n > 0; -1 }
+          e = lambda { begin; return :e; ensure; $log << :ensure; end }
+          nested = lambda { [1].each { return :nested }; :no }
+          orphan = begin; make.call(3); rescue LocalJumpError; :lje; end
+          [l.call(2), l.call(0), e.call, nested.call, bm(4), from_proc, orphan]
+        end
+        test
+        [test, $log.size]
+    "#), @"[[4, -1, :e, :nested, 40, 1, :lje], 2]");
+}
+
+#[test]
 fn test_send_does_not_reload_local_untouched_by_blockiseq() {
     // https://github.com/Shopify/ruby/issues/976: a call with a block must not
     // reload locals the block never assigns, otherwise it reads a stale stack
