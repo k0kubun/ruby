@@ -224,8 +224,9 @@ impl StackMapWriter {
     }
 }
 
-/// The set of distinct ISEQs referenced by JITFrames. JITFrames live for the lifetime of the
-/// process and keep their ISEQs alive, so the GC marks these as roots.
+/// The set of distinct ISEQs referenced by JITFrames allocated outside the compilation of an
+/// [crate::payload::IseqVersion]. JITFrames live for the lifetime of the process and keep their
+/// ISEQs alive, so the GC marks these as roots.
 #[derive(Default)]
 pub struct JITFrameIseqs {
     /// Distinct non-null ISEQs in insertion order
@@ -276,8 +277,16 @@ impl JITFrame {
                 stack_map: &EMPTY_STACK_MAPS[usize::from(materialize_block_code)],
             });
         }
-        ZJITState::get_jit_frames().push(raw_ptr);
-        ZJITState::get_jit_frame_iseqs().insert(iseq);
+        ZJITState::incr_jit_frame_count();
+        // A JITFrame allocated while compiling a version is used only by that version's code, so
+        // the version keeps its ISEQ alive. The others are GC roots.
+        match ZJITState::get_jit_frame_owner() {
+            Some(mut version) => unsafe { version.as_mut() }.push_jit_frame(raw_ptr),
+            None => {
+                ZJITState::get_jit_frames().push(raw_ptr);
+                ZJITState::get_jit_frame_iseqs().insert(iseq);
+            }
+        }
         raw_ptr.cast_const()
     }
 

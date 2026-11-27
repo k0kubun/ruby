@@ -9,6 +9,7 @@ use crate::invariants::Invariants;
 use crate::asm::CodeBlock;
 use crate::options::{get_option, rb_zjit_prepare_options};
 use crate::jit_frame::{JITFrame, JITFrameAllocator, JITFrameIseqs};
+use crate::payload::IseqVersionRef;
 use crate::stats::{Counters, InsnCounters, PerfettoTracer};
 use crate::virtualmem::CodePtr;
 use std::sync::atomic::AtomicUsize;
@@ -120,8 +121,15 @@ pub struct ZJITState {
     /// Perfetto tracer for --zjit-trace-exits
     perfetto_tracer: Option<PerfettoTracer>,
 
-    /// Frame metadata for ISEQ and C calls that are known at compile time
+    /// Frame metadata for ISEQ and C calls that are known at compile time, except the ones
+    /// owned by an [IseqVersion]
     jit_frames: Vec<*mut JITFrame>,
+
+    /// Number of JITFrames allocated, including the ones owned by an [IseqVersion]
+    jit_frame_count: usize,
+
+    /// The version being compiled, which owns the JITFrames allocated meanwhile
+    jit_frame_owner: Option<IseqVersionRef>,
 
     /// The distinct ISEQs of `jit_frames`, which the GC marks as roots. There are far fewer
     /// of them than JITFrames, and marking them doesn't load every JITFrame.
@@ -210,6 +218,8 @@ impl ZJITState {
             iseq_calls_count_pointers: HashMap::new(),
             perfetto_tracer,
             jit_frames: vec![],
+            jit_frame_count: 0,
+            jit_frame_owner: None,
             jit_frame_iseqs: JITFrameIseqs::default(),
             jit_frame_allocator: JITFrameAllocator::new(),
             // Set after ZJIT_STATE is initialized since they reference counters in it
@@ -268,6 +278,26 @@ impl ZJITState {
 
     pub fn get_jit_frames() -> &'static mut Vec<*mut JITFrame> {
         &mut ZJITState::get_instance().jit_frames
+    }
+
+    /// Count a newly allocated JITFrame
+    pub fn incr_jit_frame_count() {
+        ZJITState::get_instance().jit_frame_count += 1;
+    }
+
+    /// Get the number of JITFrames allocated so far
+    pub fn get_jit_frame_count() -> usize {
+        ZJITState::get_instance().jit_frame_count
+    }
+
+    /// Get the version that owns JITFrames allocated now
+    pub fn get_jit_frame_owner() -> Option<IseqVersionRef> {
+        ZJITState::get_instance().jit_frame_owner
+    }
+
+    /// Set the version that owns JITFrames allocated from now on, and return the previous one
+    pub fn set_jit_frame_owner(owner: Option<IseqVersionRef>) -> Option<IseqVersionRef> {
+        std::mem::replace(&mut ZJITState::get_instance().jit_frame_owner, owner)
     }
 
     /// Get the distinct ISEQs referenced by JITFrames

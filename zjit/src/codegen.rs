@@ -409,8 +409,9 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
         None => &crate::stats::with_time_stat(Counter::compile_hir_time_ns, || compile_iseq(iseq))?,
     };
 
-    // Compile the High-level IR
-    let (iseq_code_ptrs, gc_offsets, iseq_calls) =
+    // Compile the High-level IR. The version owns the JITFrames allocated meanwhile.
+    let prev_jit_frame_owner = ZJITState::set_jit_frame_owner(Some(version));
+    let result =
         trace_compile_phase("codegen", || {
             let (iseq_code_ptrs, gc_offsets, iseq_calls) =
                 crate::stats::with_time_stat(Counter::compile_lir_time_ns, || gen_function(cb, iseq, version, function))?;
@@ -424,7 +425,9 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
             })?;
 
             Ok((iseq_code_ptrs, gc_offsets, iseq_calls))
-        })?;
+        });
+    ZJITState::set_jit_frame_owner(prev_jit_frame_owner);
+    let (iseq_code_ptrs, gc_offsets, iseq_calls) = result?;
 
     // Prepare for GC
     unsafe { version.as_mut() }.outgoing.extend(iseq_calls);

@@ -102,7 +102,7 @@ pub extern "C" fn rb_zjit_root_update_references() {
     let invariants = ZJITState::get_invariants();
     invariants.update_references();
 
-    // Update iseq pointers in all JITFrames for GC compaction.
+    // Update iseq pointers in JITFrames not owned by an IseqVersion for GC compaction.
     // rb_execution_context_update only updates JITFrames currently on the stack,
     // but JITFrames not on the stack also need their iseq pointers updated
     // because the JIT code will reuse them on the next call.
@@ -122,7 +122,17 @@ fn iseq_mark(payload: &IseqPayload) {
     // Mark objects baked in JIT code
     let cb = ZJITState::get_code_block();
     for version in payload.versions.iter() {
-        for &offset in unsafe { version.as_ref() }.gc_offsets.iter() {
+        let version = unsafe { version.as_ref() };
+
+        // Mark ISEQs of JITFrames, e.g. inlined callees, and callees of JIT-to-JIT calls
+        for &iseq in version.jit_frame_iseqs.iter() {
+            unsafe { rb_gc_mark_movable(VALUE::from(iseq)); }
+        }
+        for iseq_call in version.outgoing.iter() {
+            unsafe { rb_gc_mark_movable(VALUE::from(iseq_call.iseq.get())); }
+        }
+
+        for &offset in version.gc_offsets.iter() {
             let value_ptr: *const u8 = offset.raw_ptr(cb);
             // Creating an unaligned pointer is well defined unlike in C.
             let value_ptr = value_ptr as *const VALUE;
@@ -161,6 +171,14 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
         if old_iseq != new_iseq {
             iseq_call.iseq.set(new_iseq);
         }
+    }
+
+    // Move ISEQ references in JITFrames
+    for &jit_frame in unsafe { version.as_ref() }.jit_frames.iter() {
+        unsafe { &mut *jit_frame }.update_references();
+    }
+    for iseq in unsafe { version.as_mut() }.jit_frame_iseqs.iter_mut() {
+        *iseq = unsafe { rb_gc_location(VALUE::from(*iseq)) }.as_iseq();
     }
 
     // Move ISEQ references in outgoing IseqCalls
@@ -246,8 +264,8 @@ pub extern "C" fn rb_zjit_mark_all_executable() {
 /// Callback for marking GC objects inside [crate::invariants::Invariants].
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_root_mark() {
-    // Mark iseq pointers in all JITFrames. JITFrames that are currently on the
-    // stack are also marked via rb_execution_context_mark_ctx, but JITFrames not on
+    // Mark iseq pointers in JITFrames not owned by an IseqVersion. JITFrames that are currently
+    // on the stack are also marked via rb_execution_context_mark_ctx, but JITFrames not on
     // the stack still need their iseqs kept alive because JIT code will reuse them.
     if !ZJITState::has_instance() {
         return;
@@ -293,6 +311,40 @@ mod tests {
 
             let alloc_growth = large.saturating_sub(small);
             assert!(alloc_growth < 100_000, "zjit_alloc_bytes grew by {alloc_growth} bytes across freed ISEQs");
+        });
+    }
+
+    /// Regression test that JITFrames of compiled ISEQs must not keep the ISEQs alive after
+    /// nothing else references them.
+    #[test]
+    fn test_jit_frames_do_not_retain_freed_iseqs() {
+        with_rubyvm(|| {
+            let old_call_threshold = unsafe { crate::options::rb_zjit_call_threshold };
+            set_call_threshold(2);
+
+            eval(r#"
+                def zjit_compiled_churn(n)
+                  n.times do |i|
+                    klass = Class.new
+                    klass.class_eval("def churn(x) = x.to_s.size + x.abs", "zjit_compiled_churn#{i}.rb")
+                    object = klass.new
+                    2.times { object.churn(i) }
+                  end
+                  3.times { GC.start }
+                  ObjectSpace.count_objects[:T_IMEMO]
+                end
+            "#);
+
+            // Each iteration compiles an ISEQ whose class becomes garbage. It should not grow the
+            // number of live ISEQs.
+            let imemos_after_eval = |n: usize| eval(&format!("zjit_compiled_churn({n})")).as_fixnum();
+            let small = imemos_after_eval(100);
+            let large = imemos_after_eval(1000);
+
+            set_call_threshold(old_call_threshold);
+
+            let imemo_growth = large - small;
+            assert!(imemo_growth < 100, "T_IMEMO objects grew by {imemo_growth} across freed compiled ISEQs");
         });
     }
 }

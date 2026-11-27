@@ -61,6 +61,12 @@ pub struct IseqVersion {
 
     /// JIT-to-JIT calls to the ISEQ. The IseqPayload's ISEQ is the callee of it.
     pub incoming: Vec<IseqCallRef>,
+
+    /// JITFrames allocated for the JIT code of this version
+    pub jit_frames: Vec<*mut JITFrame>,
+
+    /// Distinct ISEQs of `jit_frames` other than `iseq`, e.g. inlined callees. Few per version.
+    pub jit_frame_iseqs: Vec<IseqPtr>,
 }
 
 /// We use a raw pointer instead of Rc to save space for refcount
@@ -72,6 +78,16 @@ impl IseqVersion {
         self.status == IseqStatus::Invalidated
     }
 
+    /// Take ownership of a JITFrame used by the JIT code of this version
+    pub fn push_jit_frame(&mut self, jit_frame: *mut JITFrame) {
+        self.jit_frames.push(jit_frame);
+        let iseq = unsafe { (*jit_frame).iseq };
+        if !iseq.is_null() && iseq != self.iseq && !self.jit_frame_iseqs.contains(&iseq) {
+            self.jit_frame_iseqs.push(iseq);
+            VALUE::from(self.iseq).write_barrier(VALUE::from(iseq));
+        }
+    }
+
     /// Allocate a new IseqVersion to be compiled
     pub fn new(iseq: IseqPtr) -> IseqVersionRef {
         let version = Self {
@@ -80,6 +96,8 @@ impl IseqVersion {
             gc_offsets: vec![],
             outgoing: vec![],
             incoming: vec![],
+            jit_frames: vec![],
+            jit_frame_iseqs: vec![],
         };
         let version_ptr = Box::into_raw(Box::new(version));
         NonNull::new(version_ptr).expect("no null from Box")
