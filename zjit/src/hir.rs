@@ -3127,7 +3127,7 @@ pub struct Function {
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
     /// Inlined frames, keyed by the caller Snapshot that FrameStates in the frame point to.
-    /// See inlined_block_throw_targets.
+    /// See inlined_local_frame.
     inlined_frames: HashMap<InsnId, InlinedFrame>,
 }
 
@@ -6372,7 +6372,7 @@ impl Function {
                 // oversized callees to bail out early. Both guards must pass.
                 // Inlining a block whose `break` or `return` can skip a `throw` saves an expensive
                 // interpreter re-entry, so skip the size and budget heuristics for it. This is
-                // bounded by the number of literal blocks passed to the methods inlined in this pass.
+                // bounded by the number of literal blocks passed to the inlined methods.
                 if (throw_targets.is_none() && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
@@ -6640,25 +6640,72 @@ impl Function {
         did_inline
     }
 
+    /// Find the inlined method frame that a `yield` in the frame of `state` yields to, i.e. the frame
+    /// of its local method, and the FrameState it's suspended at. A block frame on the way must have
+    /// been inlined at a `yield` to a literal block of an inlined method frame, whose caller is the
+    /// block's parent frame, e.g. the block of `paths.each { |path| yield path }` in an inlined method.
+    /// Like the EP walk of `yield`, each block frame goes one level up to its parent frame.
+    ///
+    /// If `pops` is given, the frames from `state`'s frame up to the method frame (exclusive) are
+    /// pushed to it, innermost first, and unwinding any of them must not run an ensure clause.
+    fn inlined_local_frame(&self, state: &FrameState, mut pops: Option<&mut Vec<InlineFramePop>>) -> Option<(InlinedFrame, FrameState)> {
+        let frame = *self.inlined_frames.get(&state.caller()?)?;
+        if frame.pop.iseq != state.iseq {
+            return None;
+        }
+        match unsafe { rb_get_iseq_body_type(state.iseq) } {
+            ISEQ_TYPE_METHOD => return Some((frame, state.clone())),
+            ISEQ_TYPE_BLOCK => {}
+            _ => return None,
+        }
+        if let Some(pops) = pops.as_deref_mut() {
+            if self.frame_runs_ensure(state) {
+                return None;
+            }
+            pops.push(frame.pop);
+        }
+        self.yielded_block_local_frame(state.iseq, self.frame_state_ref(frame.pop.state), pops)
+    }
+
+    /// Find the inlined method frame that a `yield` in the block `block_iseq` yields to, when the
+    /// block is pushed by the `yield` suspended at `yield_state`. See inlined_local_frame.
+    fn yielded_block_local_frame(&self, block_iseq: IseqPtr, yield_state: &FrameState, mut pops: Option<&mut Vec<InlineFramePop>>) -> Option<(InlinedFrame, FrameState)> {
+        let (yielder, yielder_state) = self.inlined_local_frame(yield_state, pops.as_deref_mut())?;
+        if yielder.blockiseq != Some(block_iseq) {
+            return None;
+        }
+        if let Some(pops) = pops.as_deref_mut() {
+            if self.frame_runs_ensure(&yielder_state) {
+                return None;
+            }
+            pops.push(yielder.pop);
+        }
+        // The yielder's caller passed the block as a literal block, so it's the block's parent frame.
+        self.inlined_local_frame(self.frame_state_ref(yielder.pop.state), pops)
+    }
+
+    /// Return true if unwinding the frame of `state` at the instruction it's suspended at would run
+    /// an ensure clause
+    fn frame_runs_ensure(&self, state: &FrameState) -> bool {
+        let epc = u32::try_from(state.insn_idx()).unwrap() + insn_len(usize::try_from(state.get_opcode()).unwrap());
+        unsafe { rb_zjit_iseq_ensure_covers_p(state.iseq, epc) }
+    }
+
     /// Find where a `break` or non-local `return` from an inlined block can go without a `throw`.
     /// That's possible when the method frame that yields to the block was inlined with the block
-    /// as its literal block in this `inline_methods` pass, so its return block can still take new
-    /// edges. The caller of the method frame is the block's home frame.
+    /// as its literal block. The `yield` may be in a block of the method, e.g. `paths.each { |path|
+    /// yield path }`, if the frames in between are inlined too. For a `break`, the method frame must
+    /// have been inlined in this `inline_methods` pass, so its return block can still take new edges.
+    /// The caller of the method frame is the block's home frame.
     ///
     /// Like vm_throw_start() and vm_exec_handle_exception(), a `break` pops the method frame and
     /// resumes the home frame after the call, and a `return` pops the method frame and returns
-    /// from the home frame. This gives up when popping a frame would run an ensure clause.
+    /// from the home frame. Both pop the frames in between first, see inlined_block_unwind_pops.
+    /// This gives up when popping a frame would run an ensure clause.
     fn inlined_block_throw_targets(&self, inlined_this_pass: &HashSet<InsnId>, block_pop: InlineFramePop) -> Option<InlinedBlockThrowTargets> {
-        // The `yield` must be in the method frame. If it were in a block in the method,
-        // the caller of `yield_state` would be the caller Snapshot of the block's frame.
         let yield_state = self.frame_state_ref(block_pop.state);
-        let yielder_caller = yield_state.caller()?;
-        let yielder = self.inlined_frames.get(&yielder_caller)?;
-        if !inlined_this_pass.contains(&yielder_caller) || yielder.blockiseq != Some(block_pop.iseq) {
-            return None;
-        }
-        let yield_epc = u32::try_from(yield_state.insn_idx()).unwrap() + insn_len(YARVINSN_invokeblock.to_usize());
-        if unsafe { rb_zjit_iseq_ensure_covers_p(yielder.pop.iseq, yield_epc) } {
+        let (yielder, yielder_state) = self.inlined_local_frame(yield_state, Some(&mut vec![]))?;
+        if yielder.blockiseq != Some(block_pop.iseq) || self.frame_runs_ensure(&yielder_state) {
             return None;
         }
 
@@ -6666,7 +6713,8 @@ impl Function {
         // the catch table says it's not an orphan `break`.
         let home_state = self.frame_state_ref(yielder.pop.state);
         let call_epc = self.blocks[yielder.return_block].insn_idx;
-        let break_target = unsafe { rb_zjit_iseq_break_lands_p(home_state.iseq, block_pop.iseq, call_epc) }
+        let break_target = (inlined_this_pass.contains(&yielder_state.caller()?)
+            && unsafe { rb_zjit_iseq_break_lands_p(home_state.iseq, block_pop.iseq, call_epc) })
             .then_some(yielder.return_block);
 
         // `return` returns from the home frame if it's a method frame whose ensure clause doesn't
@@ -6692,6 +6740,16 @@ impl Function {
             return None;
         }
         Some(InlinedBlockThrowTargets { block_pop, break_target, return_yielder_pop, home_return_block })
+    }
+
+    /// The frames that a `break` or non-local `return` from the block inlined with `targets` pops
+    /// before the method frame that yielded to the block: the block frame, then the frames between
+    /// the `yield` and the method frame, innermost first.
+    fn inlined_block_unwind_pops(&self, targets: &InlinedBlockThrowTargets) -> Vec<InlineFramePop> {
+        let mut pops = vec![targets.block_pop];
+        self.inlined_local_frame(self.frame_state_ref(targets.block_pop.state), Some(&mut pops))
+            .expect("checked by inlined_block_throw_targets");
+        pops
     }
 
     fn load_shape(&mut self, block: BlockId, recv: InsnId) -> InsnId {
@@ -10977,16 +11035,21 @@ fn add_iseq_to_hir(
                         // Unwinding the block frame must not run an ensure clause. `insn_idx` is
                         // already past the throw.
                         let can_unwind = !no_escape && !unsafe { rb_zjit_iseq_ensure_covers_p(iseq, insn_idx) };
+                        let pop_block_frames = |fun: &mut Function| {
+                            for pop in fun.inlined_block_unwind_pops(&targets) {
+                                fun.push_insn(block, pop.insn());
+                            }
+                        };
                         match (tag, targets.break_target, targets.return_yielder_pop) {
                             (RUBY_TAG_BREAK, Some(break_target), _) if can_unwind => {
                                 incr_counter!(inline_throw_count);
-                                fun.push_insn(block, targets.block_pop.insn());
+                                pop_block_frames(fun);
                                 fun.push_insn(block, Insn::Jump(BranchEdge { target: break_target, args: vec![val] }));
                                 break;  // Don't enqueue the next block as a successor
                             }
                             (RUBY_TAG_RETURN, _, Some(yielder_pop)) if can_unwind => {
                                 incr_counter!(inline_throw_count);
-                                fun.push_insn(block, targets.block_pop.insn());
+                                pop_block_frames(fun);
                                 fun.push_insn(block, yielder_pop.insn());
                                 match targets.home_return_block {
                                     Some(target) => fun.push_insn(block, Insn::Jump(BranchEdge { target, args: vec![val] })),
@@ -11380,9 +11443,8 @@ fn add_iseq_to_hir(
                             // `blockiseq` is only set for inlined methods, so exit_state.iseq is a method iseq and this is
                             // always 0. That matters because the emit below is guard-free and bakes in both level 0
                             // and *this* frame's block (bi) — sound only when the yield resolves to this exact frame.
-                            // Inlined blocks don't set `blockiseq` since their yield resolves to an ancestor frame (level > 0).
-                            // TODO: To stay guard-free there, we'd bake in get_lvar_level(...) as the level and fetch
-                            // that ancestor's blockiseq from the inline caller chain instead of bi.
+                            // Inlined blocks don't set `blockiseq` since their yield resolves to an ancestor frame (level > 0),
+                            // whose block is found from the inline caller chain below.
                             && get_lvar_level(exit_state.iseq) == 0 {
                             // Allow a literal block that may `throw`. Its `break` and non-local `return` unwind the
                             // frames like the interpreter, and the iterations that don't throw skip the generic dispatch.
@@ -11394,10 +11456,25 @@ fn add_iseq_to_hir(
                                 }
                             }
                         } else { None }
+                    } else if let AddIseqMode::Inlined { block: None, caller, .. } = mode {
+                        // A `yield` in an inlined block goes to the block of its local method frame. If that
+                        // frame is an inlined method that was passed a literal block, and the frames in between
+                        // are inlined too, PushInlineFrame wrote that block into the frame's EP, so it's known
+                        // like `bi` above. This frame isn't in inlined_frames yet, so start from its `yield`.
+                        fun.yielded_block_local_frame(iseq, fun.frame_state_ref(caller), None)
+                            .filter(|_| can_direct_invoke_block(flags))
+                            .and_then(|(local_frame, _)| local_frame.blockiseq)
+                            .and_then(|bi| match can_direct_invoke_block_iseq(bi, args.len(), true) {
+                                Ok(()) => Some(bi),
+                                Err(reason) => {
+                                    fallback_reason = reason;
+                                    None
+                                }
+                            })
                     } else { None };
 
                     let result = if let Some(block_iseq) = inlined_known_block {
-                        fun.push_invoke_block_iseq_direct(block, block_iseq, 0, args, exit_id)
+                        fun.push_invoke_block_iseq_direct(block, block_iseq, get_lvar_level(exit_state.iseq), args, exit_id)
                     } else if inlined_blockarg_proc {
                         // TODO: Specialize a known BlockArgProc. InvokeBlockIseqDirect assumes a non-lambda
                         // ISEQ block, so it needs guards on what the Proc wraps.

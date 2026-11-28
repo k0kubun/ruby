@@ -30533,4 +30533,35 @@ mod hir_opt_tests {
           Return v43
         ");
     }
+
+    #[test]
+    fn test_inline_nested_yield_return_becomes_return() {
+        eval(r"
+            def each1 = yield 1
+            def yielder = each1 { |x| yield x }
+            def test = yielder { |x| return x }
+            test
+        ");
+        assert_snapshot!(hir_string("test"), @"
+        fn test@<compiled>:4:
+        bb1():
+          EntryPoint interpreter
+          v1:BasicObject = LoadSelf
+          Jump bb3(v1)
+        bb2():
+          EntryPoint JIT(0)
+          v4:BasicObject = LoadArg :self@0
+          Jump bb3(v4)
+        bb3(v6:BasicObject):
+          PatchPoint MethodRedefined(Object@0x1000, yielder@0x1008, cme:0x1010)
+          v18:ObjectSubclass[class_exact*:Object@VALUE(0x1000)] = GuardType v6, ObjectSubclass[class_exact*:Object@VALUE(0x1000)] recompile
+          PushInlineFrame :yielder, v18 (0x1038), num_args=0, block=0x1058
+          PatchPoint MethodRedefined(Object@0x1000, each1@0x1078, cme:0x1080)
+          PushInlineFrame :each1, v18 (0x10a8), num_args=0, block=0x10c8
+          v42:Fixnum[1] = Const Value(1)
+          PopInlineFrame
+          PopInlineFrame
+          Return v42
+        ");
+    }
 }

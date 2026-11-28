@@ -1502,6 +1502,134 @@ fn test_inline_block_return_skips_guard_in_inlined_home_method() {
 }
 
 #[test]
+fn test_inline_nested_yield_return() {
+    // The `yield` is in a block of the method that was passed the block, so the block is
+    // known from the inlined frames, and the `return` pops every frame in between.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a) = a.each { |x| yield x }
+            def test(a)
+              search(a) { |x| return x if x.even? }
+              nil
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 4])"), @"2");
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"nil");
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_return_from_inlined_home_method() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a) = a.each { |x| yield x }
+            def find(a) = search(a) { |x| return x if x.even? }
+            def test(a) = [find(a)]
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"[2]");
+        assert_snapshot!(assert_compiles("test([1, 3])"), @"[[1, 3]]");
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_break_and_next() {
+    // A `break` through a nested `yield` stays a throw, and `next` returns from the block.
+    with_inlining(|| {
+        eval("
+            def search(a) = a.map { |x| yield x }
+            def test(a) = search(a) { |x| break x * 10 if x == 2; next 0 if x == 1; x }
+            test([1, 3])
+            test([1, 3])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("[test([1, 3]), test([1, 2, 3])]"), @"[[0, 3], 20]");
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_return_runs_ensure_in_between() {
+    // The ensure clause in the block between the `yield` and the yielder must run, so the
+    // return stays a throw.
+    with_inlining(|| {
+        eval("
+            def search(a, log)
+              a.each do |x|
+                begin
+                  yield x
+                ensure
+                  log << x
+                end
+              end
+            end
+            def test(a, log)
+              search(a, log) { |x| return x if x.even? }
+              nil
+            end
+            test([1, 2], [])
+            test([1, 2], [])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("log = []; [test([1, 2, 3], log), log]"), @"[2, [1, 2]]");
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_from_for_loop() {
+    // A `for` body is a block whose only parameter takes a yielded Array as is.
+    with_inlining(|| {
+        eval(r#"
+            def each_row(rows)
+              for kv in rows
+                yield kv
+              end
+            end
+            def test(rows)
+              out = []
+              each_row(rows) { |kv| out << [kv[0], kv[1]]; return out if kv[0] == "C" }
+              nil
+            end
+            test([["A", 1.5], ["C", 2.5]])
+            test([["A", 1.5], ["C", 2.5]])
+        "#);
+        assert_snapshot!(assert_compiles_allowing_exits(r#"test([["A", 1.5], ["C", 2.5]])"#), @r#"[["A", 1.5], ["C", 2.5]]"#);
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_of_array_to_block_params() {
+    with_inlining(|| {
+        eval("
+            def each_row(rows) = rows.each { |row| yield row }
+            def one(rows) = (each_row(rows) { |a| return a if a }; nil)
+            def two(rows) = (each_row(rows) { |a, b| return [a, b] if a }; nil)
+            def comma(rows) = (each_row(rows) { |a,| return a if a }; nil)
+            def run = [one([[1, 2]]), two([[1, 2]]), comma([[1, 2]]), two([1])]
+            run
+            run
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("run"), @"[[1, 2], [1, 2], 1, [1, nil]]");
+    });
+}
+
+#[test]
+fn test_inline_nested_yield_to_lambda() {
+    // A lambda passed as the block is not a literal block, so `return` returns from the lambda.
+    with_inlining(|| {
+        eval("
+            def search(a) = a.each { |x| yield x }
+            def test(a)
+              r = []
+              search(a, &->(x) { r << x; return x if x.even? })
+              search(a) { |x| return [r, x] if x.even? }
+            end
+            test([1, 2])
+            test([1, 2])
+        ");
+        assert_snapshot!(assert_compiles_allowing_exits("test([1, 2, 3])"), @"[[1, 2, 3], 2]");
+    });
+}
+
+#[test]
 fn test_inline_large_block_with_return() {
     // The block is larger than the inline threshold, but it's inlined since its `return`
     // can skip a `throw`.
