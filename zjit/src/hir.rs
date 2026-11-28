@@ -7418,9 +7418,14 @@ impl Function {
                     && crate::codegen::iseq_may_yield(iseq);
                 let throw_yielder = yields_literal_block
                     && matches!(call_block, Some(BlockHandler::BlockIseq(blockiseq)) if crate::codegen::block_iseq_may_throw(blockiseq));
+                // A method that yields to a literal block with a non-local `return` from one of its own blocks,
+                // e.g. `routes.each { |r| yield r }`, lets the `return` become a jump once the blocks are
+                // inlined too. Skip both heuristics for it, like for the block itself.
+                let nested_return_yielder = matches!(call_block, Some(BlockHandler::BlockIseq(blockiseq)) if block_iseq_may_throw_tag(blockiseq, RUBY_TAG_RETURN, false))
+                    && !crate::codegen::iseq_may_yield(iseq) && iseq_or_blocks_may_yield(iseq);
                 // The inliner doesn't know how to yield to a block handler loaded from the frame.
                 let frame_block = matches!(call_block, Some(BlockHandler::FrameBlock(_)));
-                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, yields_literal_block, throw_yielder)) || !Self::can_inline(iseq) {
+                if frame_block || (!skip_heuristics && !self.should_inline(iseq, cme, yields_literal_block || nested_return_yielder, throw_yielder || nested_return_yielder)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }

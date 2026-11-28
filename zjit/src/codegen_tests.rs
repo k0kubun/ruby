@@ -2132,6 +2132,27 @@ fn test_inline_large_block_that_yields_to_block_with_return() {
 }
 
 #[test]
+fn test_inline_large_method_that_yields_from_block_to_block_with_return() {
+    // search() is larger than the inline threshold, but it's inlined since it yields from its
+    // block to a literal block whose `return` can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a)
+              y = a.size; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+              a.each { |x| yield x + y }
+            end
+            def test(a)
+              search(a) { |x| return x if x > 10 }
+              nil
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"11");
+        assert_snapshot!(assert_compiles("test([])"), @"nil");
+    });
+}
+
+#[test]
 fn test_inline_nested_yield_return_from_inlined_home_method() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("
