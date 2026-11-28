@@ -1002,7 +1002,7 @@ enum InlineCall {
 }
 
 /// Operands of an [`Insn::PopInlineFrame`]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct InlineFramePop {
     iseq: IseqPtr,
     argc: usize,
@@ -1016,17 +1016,17 @@ impl InlineFramePop {
     }
 }
 
-/// A method frame inlined with a literal block that may throw. If the block is inlined in the
+/// An inlined method or block frame. If a literal block passed to the method is inlined in the
 /// same `inline_methods` pass, a `break` from the block can jump to the frame's return block,
 /// and a non-local `return` from the block can pop the frame without a `throw`.
-#[derive(Clone, Copy)]
-struct InlinedYielder {
-    /// The literal block passed to the method
-    blockiseq: IseqPtr,
-    /// Block the method's `leave` jumps to. It takes the return value as its parameter,
-    /// pops the method frame, and continues in the caller after the call.
+#[derive(Clone, Copy, Debug)]
+struct InlinedFrame {
+    /// The literal block passed to the method, if any
+    blockiseq: Option<IseqPtr>,
+    /// Block the frame's `leave` jumps to. It takes the return value as its parameter,
+    /// pops the frame, and continues in the caller after the call.
     return_block: BlockId,
-    /// Operands for a PopInlineFrame that pops the method frame
+    /// Operands for a PopInlineFrame that pops the frame
     pop: InlineFramePop,
 }
 
@@ -3126,9 +3126,9 @@ pub struct Function {
     /// not count Snapshot, PatchPoint, etc.
     /// Currently updated by `infer_types` as a heuristic but that is not a guarantee.
     num_instructions: usize,
-    /// Pinned return blocks of inlined method frames, keyed by the caller Snapshot that
-    /// FrameStates in the frame point to. See inlined_block_throw_targets.
-    pinned_return_blocks: HashMap<InsnId, BlockId>,
+    /// Inlined frames, keyed by the caller Snapshot that FrameStates in the frame point to.
+    /// See inlined_block_throw_targets.
+    inlined_frames: HashMap<InsnId, InlinedFrame>,
 }
 
 /// The kind of a value an ISEQ returns
@@ -3404,7 +3404,7 @@ impl Function {
             param_types: vec![],
             profiles: None,
             num_instructions: 0,
-            pinned_return_blocks: HashMap::new(),
+            inlined_frames: HashMap::new(),
         }
     }
 
@@ -6313,9 +6313,9 @@ impl Function {
         // inlinable after a later type_specialize pass promotes them to SendDirect.
         let mut worklist: VecDeque<BlockId> = self.reverse_post_order().into_iter().collect();
 
-        // Method frames inlined in this pass with a literal block that may throw, keyed by the
-        // caller Snapshot that FrameStates in the frame point to. See inlined_block_throw_targets.
-        let mut yielders: HashMap<InsnId, InlinedYielder> = HashMap::new();
+        // Caller Snapshots of the frames inlined in this pass, whose return blocks no other
+        // optimization has touched yet. See inlined_block_throw_targets.
+        let mut inlined_this_pass: HashSet<InsnId> = HashSet::new();
 
         while let Some(block) = worklist.pop_front() {
             // Walk this block looking for an inlinable SendDirect. Under the
@@ -6361,8 +6361,10 @@ impl Function {
 
                 // For an inlined block, find where its `break` and non-local `return` can go.
                 let throw_targets = match inline_call {
-                    InlineCall::Send { .. } => None,
-                    InlineCall::InvokeBlock { .. } => self.inlined_block_throw_targets(&yielders, InlineFramePop { iseq, argc: args_len, state }),
+                    InlineCall::InvokeBlock { .. } if crate::codegen::block_iseq_may_throw(iseq) => {
+                        self.inlined_block_throw_targets(&inlined_this_pass, InlineFramePop { iseq, argc: args_len, state })
+                    }
+                    _ => None,
                 };
 
                 // Apply the cheap optimization heuristics (size, budget, denylist)
@@ -6455,19 +6457,18 @@ impl Function {
                     InlineCall::InvokeBlock { .. } => incr_counter!(inline_block_count),
                 }
                 did_inline = true;
-                let throwing_blockiseq = match call_block {
-                    Some(BlockHandler::BlockIseq(blockiseq)) if crate::codegen::block_iseq_may_throw(blockiseq) => Some(blockiseq),
+                let blockiseq = match call_block {
+                    Some(BlockHandler::BlockIseq(blockiseq)) => Some(blockiseq),
                     _ => None,
                 };
-                if let Some(blockiseq) = throwing_blockiseq {
-                    let pop = InlineFramePop { iseq, argc: args_len, state };
-                    yielders.insert(post_send_caller, InlinedYielder { blockiseq, return_block: continuation, pop });
-                }
+                let throwing_blockiseq = blockiseq.filter(|&blockiseq| crate::codegen::block_iseq_may_throw(blockiseq));
+                let pop = InlineFramePop { iseq, argc: args_len, state };
+                self.inlined_frames.insert(post_send_caller, InlinedFrame { blockiseq, return_block: continuation, pop });
+                inlined_this_pass.insert(post_send_caller);
                 // A non-local `return` from a literal block in the callee may jump to
                 // `continuation` once the block is inlined in a later pass.
                 if matches!(inline_call, InlineCall::Send { .. }) && iseq_has_literal_block_with_return(iseq) {
                     self.blocks[continuation].pinned = true;
-                    self.pinned_return_blocks.insert(post_send_caller, continuation);
                 }
 
                 let args = match send.insn(self) {
@@ -6647,12 +6648,13 @@ impl Function {
     /// Like vm_throw_start() and vm_exec_handle_exception(), a `break` pops the method frame and
     /// resumes the home frame after the call, and a `return` pops the method frame and returns
     /// from the home frame. This gives up when popping a frame would run an ensure clause.
-    fn inlined_block_throw_targets(&self, yielders: &HashMap<InsnId, InlinedYielder>, block_pop: InlineFramePop) -> Option<InlinedBlockThrowTargets> {
+    fn inlined_block_throw_targets(&self, inlined_this_pass: &HashSet<InsnId>, block_pop: InlineFramePop) -> Option<InlinedBlockThrowTargets> {
         // The `yield` must be in the method frame. If it were in a block in the method,
         // the caller of `yield_state` would be the caller Snapshot of the block's frame.
         let yield_state = self.frame_state_ref(block_pop.state);
-        let yielder = yielders.get(&yield_state.caller()?)?;
-        if yielder.blockiseq != block_pop.iseq {
+        let yielder_caller = yield_state.caller()?;
+        let yielder = self.inlined_frames.get(&yielder_caller)?;
+        if !inlined_this_pass.contains(&yielder_caller) || yielder.blockiseq != Some(block_pop.iseq) {
             return None;
         }
         let yield_epc = u32::try_from(yield_state.insn_idx()).unwrap() + insn_len(YARVINSN_invokeblock.to_usize());
@@ -6674,8 +6676,10 @@ impl Function {
         // code elimination doesn't keep values that only unreachable blocks use.
         let (can_return, home_return_block) = match home_state.caller() {
             None => (true, None),
-            Some(home_caller) => match self.pinned_return_blocks.get(&home_caller) {
-                Some(&block) if self.reverse_post_order().contains(&block) => (true, Some(block)),
+            Some(home_caller) => match self.inlined_frames.get(&home_caller) {
+                Some(home) if self.blocks[home.return_block].pinned && self.reverse_post_order().contains(&home.return_block) => {
+                    (true, Some(home.return_block))
+                }
                 _ => (false, None),
             },
         };
