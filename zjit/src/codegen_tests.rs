@@ -1520,6 +1520,45 @@ fn test_inline_nested_yield_return() {
 }
 
 #[test]
+fn test_inline_nested_yield_return_from_two_blocks() {
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a, b) = a.each { |x| b.each { |y| yield x, y } }
+            def test(a, b)
+              search(a, b) { |x, y| return [x, y] if x == y }
+              nil
+            end
+            test([1, 2], [2])
+            test([1, 2], [2])
+        ", "test([1, 2], [2])"), @"[2, 2]");
+        assert_snapshot!(assert_compiles("test([1], [2])"), @"nil");
+    });
+}
+
+#[test]
+fn test_inline_large_block_that_yields_to_block_with_return() {
+    // The block of search() is larger than the inline threshold, but it's inlined since it
+    // yields to a block whose `return` can become a jump.
+    with_inlining(|| {
+        assert_snapshot!(assert_inlines_throw("
+            def search(a)
+              a.each do |x|
+                y = x + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1; y = y + 1
+                yield y
+              end
+            end
+            def test(a)
+              search(a) { |y| return y if y > 7 }
+              nil
+            end
+            test([1, 2])
+            test([1, 2])
+        ", "test([1, 2, 3])"), @"8");
+        assert_snapshot!(assert_compiles("test([1])"), @"nil");
+    });
+}
+
+#[test]
 fn test_inline_nested_yield_return_from_inlined_home_method() {
     with_inlining(|| {
         assert_snapshot!(assert_inlines_throw("

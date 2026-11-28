@@ -3364,6 +3364,14 @@ fn iseq_has_literal_block_with_return(iseq: IseqPtr) -> bool {
     })
 }
 
+/// Return true if `iseq` or a literal block in it, at any depth, has a `yield`.
+fn iseq_or_blocks_may_yield(iseq: IseqPtr) -> bool {
+    crate::codegen::iseq_any_insn(iseq, |pc, opcode| opcode == YARVINSN_invokeblock || (opcode == YARVINSN_send && {
+        let block_iseq: IseqPtr = unsafe { *pc.add(2) }.as_iseq();
+        !block_iseq.is_null() && iseq_or_blocks_may_yield(block_iseq)
+    }))
+}
+
 /// Ok if `yield` with `argc` positional args can dispatch by inlining the block ISEQ
 /// frame. The block must take the simple callee-setup path (`rb_simple_iseq_p`)
 /// with an exact arity match, avoid arg0 auto-splat, and contain no `throw` (break /
@@ -6366,14 +6374,24 @@ impl Function {
                     }
                     _ => None,
                 };
+                // A block may also yield to a literal block of an inlined method frame that may throw,
+                // e.g. the block of `paths.each { |path| yield path }`. Inlining it lets the inliner
+                // inline that block next, whose `return` can then skip a `throw`.
+                let yields_to_throwing_block = matches!(inline_call, InlineCall::InvokeBlock { .. })
+                    && iseq_or_blocks_may_yield(iseq)
+                    && self.yielded_block_local_frame(iseq, self.frame_state_ref(state), None)
+                        .and_then(|(frame, _)| frame.blockiseq)
+                        .is_some_and(crate::codegen::block_iseq_may_throw);
 
                 // Apply the cheap optimization heuristics (size, budget, denylist)
                 // before can_inline's more expensive elibility checks. This allows
                 // oversized callees to bail out early. Both guards must pass.
                 // Inlining a block whose `break` or `return` can skip a `throw` saves an expensive
-                // interpreter re-entry, so skip the size and budget heuristics for it. This is
-                // bounded by the number of literal blocks passed to the inlined methods.
-                if (throw_targets.is_none() && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
+                // interpreter re-entry, so skip the size and budget heuristics for it, and for a block
+                // that yields to such a block. This is bounded by the number of literal blocks passed
+                // to the inlined methods.
+                let skip_heuristics = throw_targets.is_some() || yields_to_throwing_block;
+                if (!skip_heuristics && !self.should_inline(iseq, cme, insns_at_pass_start)) || !Self::can_inline(iseq) {
                     search_start = send_pos + 1;
                     continue;
                 }
@@ -6623,8 +6641,9 @@ impl Function {
 
                 // The callee's `yield`s to a literal block are InvokeBlockIseqDirect already.
                 // If the block may throw, inline it in this pass, while no other optimization
-                // has touched `continuation`, so that its `break` can jump to `continuation`.
-                if throwing_blockiseq.is_some() {
+                // has touched `continuation`, so that its `break` can jump to `continuation`. Do the
+                // same for a block that yields to a block that may throw, to inline that block too.
+                if throwing_blockiseq.is_some() || yields_to_throwing_block {
                     worklist.extend((pre_blocks_len..self.blocks.len()).map(BlockId::from).filter(|&b| b != continuation));
                 }
 
